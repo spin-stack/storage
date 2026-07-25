@@ -146,3 +146,53 @@ func TestModeForRejectsUnknown(t *testing.T) {
 		t.Fatalf("want ErrUnknownState, got %v", err)
 	}
 }
+
+// TestRemoteModeWithoutALeaseFailsClosed is DEV-0004: the durable-ACK rule of §12.2
+// was opt-in — a remote-durability log built without a lease checker ACKed FLUSH with
+// no lease at all. A missing fence must fail closed, not open.
+func TestRemoteModeWithoutALeaseFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/active.wal")
+	vol := [16]byte{7}
+	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), nil)
+
+	if _, err := l.Write(0, []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Flush(ctx); !errors.Is(err, wal.ErrNoLease) {
+		t.Fatalf("remote FLUSH without a lease checker must fail closed, got %v", err)
+	}
+	if w := l.Watermarks(); w.Durable != 0 {
+		t.Fatalf("durable advanced to %d on a fenceless flush", w.Durable)
+	}
+}
+
+// TestLocalModeWithoutALeaseStillAcks is the other half of §14.8 rule 3: in local
+// mode the lease does not gate the FLUSH ACK, so no lease is required.
+func TestLocalModeWithoutALeaseStillAcks(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/local.wal")
+	vol := [16]byte{8}
+	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), nil)
+	l.SetDurabilityMode(wal.ModeLocal)
+
+	if _, err := l.Write(0, []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Flush(ctx); err != nil {
+		t.Fatalf("local-mode FLUSH must ACK without a lease: %v", err)
+	}
+	if w := l.Watermarks(); w.Durable == 0 {
+		t.Fatal("local-mode FLUSH did not advance durable")
+	}
+}
