@@ -18,6 +18,13 @@ var ErrSelfFenced = errors.New("wal: self-fenced (lease invalid at ACK)")
 // FLUSH fails closed (DEV-0004).
 var ErrNoLease = errors.New("wal: remote durability requires a lease checker")
 
+// ErrNoUploader is returned when a volume in `remote` durability mode has no remote
+// path (no batcher, no uploader). `remote` is the default mode, so a log that was
+// never given one would otherwise ACK a FLUSH and advance durable_sequence with an
+// empty bucket — a durability claim S3 cannot back (INV-07). The absence of an
+// uploader is not "nothing to upload".
+var ErrNoUploader = errors.New("wal: remote durability requires a batcher and an uploader")
+
 // DurabilityMode selects the FLUSH/FUA ACK contract per volume (§14.8).
 type DurabilityMode int
 
