@@ -34,6 +34,11 @@ type Checkpoint struct {
 // log. Publishing under that condition would put one writer's name on another's data.
 var ErrDurablePointMismatch = errors.New("checkpoint: durable point disagrees with the log")
 
+// ErrCheckpointConflict means a *different* checkpoint already occupies this
+// (volume, epoch, sequence). A checkpoint at a sequence is immutable, so this is not
+// a retry of our own publish: it is two writers claiming one epoch.
+var ErrCheckpointConflict = errors.New("checkpoint: a different checkpoint already exists at this sequence")
+
 // Key is the deterministic checkpoint key.
 func Key(volumeID string, epoch, seq uint64) string {
 	return fmt.Sprintf("checkpoints/%s/%d/%d.json", volumeID, epoch, seq)
@@ -122,11 +127,44 @@ func (c *Checkpointer) Create(ctx context.Context, log *wal.Log, volumeID [16]by
 		RootDigest:      Digest(durable, objects),
 	}
 	// Publish (verified: create-only) BEFORE advancing published (§21.1).
-	if err := Publish(ctx, c.store, cp); err != nil {
+	if err := c.publishOrAdopt(ctx, cp); err != nil {
 		return Checkpoint{}, err
 	}
 	if err := log.AdvancePublished(durable); err != nil {
 		return Checkpoint{}, err
 	}
 	return cp, nil
+}
+
+// publishOrAdopt performs the create-only publish, treating a checkpoint that is
+// already there and identical as done.
+//
+// The two steps of Create are separated by a crash boundary. If the PUT persists but
+// its response is lost (§14.5, §23), or the process dies before AdvancePublished,
+// every later attempt computes the same checkpoint and hits the create-only
+// precondition. Reporting that as a failure leaves published stuck, so local WAL for
+// the volume can never be truncated while it stays idle (INV-13) — the host's NVMe
+// fills and stalls writes for that volume and every co-tenant on the disk. Retrying
+// has to converge.
+//
+// A *different* checkpoint at the same sequence is the opposite case: a checkpoint at
+// a sequence is immutable, so this is not our own retry but two writers claiming one
+// epoch. It is reported as ErrCheckpointConflict rather than as an ordinary
+// precondition failure, and published does not move.
+func (c *Checkpointer) publishOrAdopt(ctx context.Context, cp Checkpoint) error {
+	err := Publish(ctx, c.store, cp)
+	if !errors.Is(err, objectstore.ErrPreconditionFailed) {
+		return err
+	}
+	existing, rerr := Read(ctx, c.store, cp.VolumeID, cp.Epoch, cp.DurableSequence)
+	if rerr != nil {
+		return fmt.Errorf("checkpoint: %s exists but cannot be read: %w",
+			Key(cp.VolumeID, cp.Epoch, cp.DurableSequence), rerr)
+	}
+	if existing.RootDigest != cp.RootDigest || existing.Epoch != cp.Epoch || existing.VolumeID != cp.VolumeID {
+		return fmt.Errorf("%w: %s holds digest %s, this log computed %s",
+			ErrCheckpointConflict, Key(cp.VolumeID, cp.Epoch, cp.DurableSequence),
+			existing.RootDigest, cp.RootDigest)
+	}
+	return nil
 }
