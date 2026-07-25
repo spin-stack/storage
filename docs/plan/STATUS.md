@@ -26,26 +26,26 @@ Nine roadmap phases have merged increments — as models.
 | Phase | State | Notes |
 |---|---|---|
 | 0 planning | done | — |
-| 01 skeleton (simio + DST harness + obs) | **model** | obs is a registry only — nothing records metrics (DEV-0010) |
+| 01 skeleton (simio + DST harness + obs) | **model** | metrics are recorded by the paths that own them (DEV-0010 closed); wiring continues with each new path |
 | 02 guest layout / 03 vhost-user | **not started** | the QEMU 11.0.2 build now exists (`task build:qemu`); the guest/vhost work does not |
 | 04 WAL/CoW format + property tests | **model** | format review still pending (human-review zone) |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
 | 06 remote WAL (batching, idempotent PUT, summary) | **model** | — |
-| 07 Control Plane + leases + fencing | **model, with gaps** | fail-open lease + non-atomic promotion (DEV-0004); operations not term-guarded (DEV-0005) |
-| 08 recovery (S3 authority) + rebuild-metadata | **model, with gaps** | unvalidated objects can raise the durable point (DEV-0003); rebuild covers volumes only (DEV-0009) |
-| 09 snapshots + clone + resize | **partial model** | synchronous sealing, no chain link persisted (DEV-0007) |
-| 10 objectization + checkpoints + GC + I/O classes | **partial model** | no segment objects, GC computes but does not mark (DEV-0006, DEV-0007) |
-| 11 cross-host + cordon/drain + capacity | **partial model** | the materialized view is discarded, drain not idempotent after promotion (DEV-0007, DEV-0008) |
+| 07 Control Plane + leases + fencing | **model** | fail-closed lease + resumable promotion + term guards (DEV-0004/0005 closed) |
+| 08 recovery (S3 authority) + rebuild-metadata | **model** | objects validated before they count as durable; rebuild includes the catalog (DEV-0003/0009 closed) |
+| 09 snapshots + clone + resize | **partial model** | synchronous sealing, no chain link persisted (DEV-0007 — needs the spine) |
+| 10 objectization + checkpoints + GC + I/O classes | **partial model** | GC now marks reversibly (DEV-0006 closed); still no segment objects (DEV-0007) |
+| 11 cross-host + cordon/drain + capacity | **partial model** | drain is idempotent across crash boundaries (DEV-0008 closed); the materialized view is still not persisted (DEV-0007) |
 | 12 warm standby + compaction + flatten | **not started** | paused by the rebaseline |
 | 13 hardening + fleet-mixed | **13.1 model** (typed lifecycles, ADR-0009) | 13.2–13.4 need infra; INV-19 still pending |
 
-## Invariants: 21 checkers run, but read the caveats
+## Invariants: 21 checkers run; the rebaseline caveats are closed
 
-`INVARIANTS.md` marks 21 of 22 active. The rebaseline narrows four of those claims —
-INV-06 (fencing is opt-in, not structural), INV-08/09 (the durable point is derived
-from unvalidated headers), INV-14 (the interface does expose permanent deletion and
-the GC does not mark), INV-20 (volumes only). Each carries a caveat pointing at its
-deviation. A checker that passes against a model is not a proof about a system.
+The four claims the review narrowed — INV-06 (fencing was opt-in), INV-08/09 (durable
+point from unvalidated headers), INV-14 (permanent deletion was reachable, GC did not
+mark) — are now true in code, and INV-20 covers volumes *and* the snapshot catalog.
+What stays true regardless: these are proofs about libraries, not about a system that
+serves a block device.
 
 ## Infrastructure available (2026-07-25)
 - **QEMU 11.0.2** — `task build:qemu` -> `_output/bin/` + firmware; `task qemu:verify`
@@ -57,14 +57,19 @@ deviation. A checker that passes against a model is not a proof about a system.
   configured, proven by the shared `objectstore` contract (`storetest`) against the
   real backend.
 
-## What to do next (from REBASELINE.md — features are paused)
-1. Object integrity + fail-closed durability (DEV-0003, DEV-0004 first half).
-2. Staged, idempotent promotion and drain (DEV-0004, DEV-0008).
-3. Term-guard the remaining CP mutations + a structural test (DEV-0005).
-4. Reversible delete and a GC that marks (DEV-0006).
-5. The spine: `api/`, `cmd/volume-agent`, `cmd/control-plane`, `cmd/volctl`, then
-   Phases 02/03 against the QEMU build. Only then can anything become *integrated*.
-6. Reopen 09/10/11 as integration work; then telemetry (DEV-0010).
+## What to do next
+
+Seven of the eight deviations are closed (DEV-0003/0004/0005/0006/0008/0009/0010).
+**DEV-0007 is the one left**, and it cannot be closed by fixing a function:
+
+1. **The spine** — `api/`, `cmd/volume-agent`, `cmd/control-plane`, `cmd/volctl`, then
+   Phases 02/03 (guest layout, vhost-user) against the QEMU build that now exists.
+   Only then can any phase move from *model* to *integrated*.
+2. **Reopen 09/10/11 as integration work**: snapshot lifecycle in the background,
+   objectization with real segment objects, chain links persisted, a materialized
+   volume that lands on the destination's disk, resize end to end.
+3. Then Phase 12, and the rest of Phase 13 (real-hardware fault injection, backend
+   conformance per version, runbooks with measured times, INV-19).
 
 ## How to resume
 1. Read `REBASELINE.md`, then `PLAN.md` (phase map), `INVARIANTS.md`, `CLAUDE.md`.

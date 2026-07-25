@@ -33,6 +33,22 @@ was wrong (nine roadmap phases had increments merged, not ten).
 Every phase in `PLAN.md` and `STATUS.md` now carries one of these three, not "done".
 Nothing in this repository is `production-verified` today.
 
+## Status of the gaps (updated 2026-07-25)
+
+Seven of the eight are closed in code, each with its failing tests committed first:
+**DEV-0003** (object integrity + prefix floor), **DEV-0004** (fail-closed lease +
+resumable staged promotion), **DEV-0005** (term guards + a structural test that
+enumerates mutating queries), **DEV-0006** (reversible delete markers everywhere and a GC that marks with a grace period), **DEV-0008** (drain driven by the recorded plan,
+capacity released exactly once), **DEV-0009** (rebuild reconstructs the snapshot
+catalog and reports what S3 cannot speak for), **DEV-0010** (metrics recorded, not
+just declared).
+
+**DEV-0007 remains open**, and it is the one that cannot be closed by fixing a
+function: snapshot lifecycle, objectization segments, chain links, and persisting a
+materialized volume all need the spine — `api/`, `cmd/volume-agent`,
+`cmd/control-plane`, Phases 02/03 — before they mean anything. That work is steps 5–6
+below and is where the *model → integrated* transition actually happens.
+
 ## Correctness gaps that must be fixed before more features
 
 These are recorded as deviations (`DEVIATIONS.md`, DEV-0003…DEV-0010) and are ordered
