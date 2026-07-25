@@ -20,6 +20,11 @@ var ErrBackpressure = errors.New("wal: backpressure (unflushed limit reached)")
 // one, violating published <= durable <= local (§5.6).
 var ErrWatermarkOrder = errors.New("wal: watermark ordering violation")
 
+// ErrTruncateAboveDurable is returned by an attempt to truncate local WAL above the
+// verified published point (§21.1, INV-13) — that would discard records not yet in a
+// verified checkpoint.
+var ErrTruncateAboveDurable = errors.New("wal: truncate above verified published point")
+
 // Watermarks are the three sequence watermarks (§5.6). In Phase 04 only Local
 // advances (durable/published need remote durability, Phase 06+); the ordering
 // invariant is enforced here regardless.
@@ -64,7 +69,28 @@ type Log struct {
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
 	discardedBytes    int64
+	truncatedUpTo     uint64          // local WAL discarded up to this sequence (§14.7)
 	uploaded          []SummaryObject // durable objects, for the summary (§22.1)
+}
+
+// TruncatedUpTo reports the sequence below which local WAL has been reclaimed.
+func (l *Log) TruncatedUpTo() uint64 { return l.truncatedUpTo }
+
+// TruncateLocal reclaims local WAL up to and including upTo. It refuses to truncate
+// above the verified published point (§21.1, INV-13): records not yet in a published,
+// verified checkpoint must never be discarded. When the whole log is objectized it
+// resets the local file.
+func (l *Log) TruncateLocal(upTo uint64) error {
+	if upTo > l.published {
+		return ErrTruncateAboveDurable
+	}
+	l.truncatedUpTo = upTo
+	if upTo >= l.local {
+		if err := l.file.Truncate(0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SetDurabilityMode selects the FLUSH/FUA ACK contract (§14.8). Default is remote.

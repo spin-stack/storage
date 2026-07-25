@@ -47,6 +47,30 @@ func TestReplayTornTailStopsClean(t *testing.T) {
 	}
 }
 
+func TestStateEqual(t *testing.T) {
+	a := wal.NewState()
+	a.Apply(wal.Record{Type: format.RecordWrite, Offset: 0, Payload: []byte{1, 2}})
+
+	// Different byte value at the same offset.
+	b := wal.NewState()
+	b.Apply(wal.Record{Type: format.RecordWrite, Offset: 0, Payload: []byte{1, 3}})
+	if a.Equal(b) {
+		t.Fatal("states with different bytes must not be equal")
+	}
+	// Different length (fewer written bytes).
+	c := wal.NewState()
+	c.Apply(wal.Record{Type: format.RecordWrite, Offset: 0, Payload: []byte{1}})
+	if a.Equal(c) {
+		t.Fatal("states with different lengths must not be equal")
+	}
+	// Identical.
+	d := wal.NewState()
+	d.Apply(wal.Record{Type: format.RecordWrite, Offset: 0, Payload: []byte{1, 2}})
+	if !a.Equal(d) {
+		t.Fatal("identical states must be equal")
+	}
+}
+
 func TestReplayDiscardReadsAsZero(t *testing.T) {
 	recs := []wal.Record{
 		{Type: format.RecordWrite, Epoch: 1, Sequence: 1, Offset: 0, Payload: []byte{1, 2, 3, 4}},

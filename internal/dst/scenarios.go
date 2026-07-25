@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/spin-stack/storage/internal/checkpoint"
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
@@ -61,7 +62,51 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "rebuild-metadata-from-s3", Run: scenarioRebuildMetadataFromS3},
 		{Name: "snapshot-pausefree-immutable", Run: scenarioSnapshotPauseFreeImmutable},
 		{Name: "same-host-clone-independent", Run: scenarioSameHostCloneIndependent},
+		{Name: "checkpoint-then-truncate", Run: scenarioCheckpointThenTruncate},
 	}
+}
+
+// scenarioCheckpointThenTruncate is INV-13 (§21.1): local WAL is truncated only up to
+// a verified, checkpoint-published point — never above it.
+func scenarioCheckpointThenTruncate(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+
+	_, _ = l.Write(0, []byte("a"), 0)
+	_, _ = l.Write(8, []byte("b"), 0)
+	if err := l.Flush(ctx); err != nil {
+		return err
+	}
+
+	// Truncating before a checkpoint (published=0) is refused.
+	if err := l.TruncateLocal(2); !errors.Is(err, wal.ErrTruncateAboveDurable) {
+		return fmt.Errorf("pre-checkpoint truncate: want ErrTruncateAboveDurable, got %v", err)
+	}
+
+	if _, err := checkpoint.NewCheckpointer(s.Store).Create(ctx, l, vol, 1); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
+	// Now truncate up to the published point — allowed.
+	if err := l.TruncateLocal(2); err != nil {
+		return fmt.Errorf("post-checkpoint truncate: %w", err)
+	}
+	s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: l.TruncatedUpTo(), Published: l.Watermarks().Published})
+
+	// A later un-checkpointed write cannot be truncated away.
+	_, _ = l.Write(16, []byte("c"), 0)
+	if err := l.TruncateLocal(3); !errors.Is(err, wal.ErrTruncateAboveDurable) {
+		return fmt.Errorf("truncate above published: want ErrTruncateAboveDurable, got %v", err)
+	}
+	s.Notef("WAL truncated to the published point (2), never above it")
+	return nil
 }
 
 // scenarioSameHostCloneIndependent (§20, §5.2): a same-host clone is a new active

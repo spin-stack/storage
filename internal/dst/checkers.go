@@ -205,6 +205,26 @@ func (c *ImmutableSnapshotChecker) Observe(e Event) {
 
 func (c *ImmutableSnapshotChecker) Check() error { return c.violation }
 
+// TruncateBelowPublishedChecker enforces INV-13 (§21.1): local WAL is never
+// truncated above the verified published point.
+type TruncateBelowPublishedChecker struct{ violation error }
+
+// NewTruncateBelowPublishedChecker returns a fresh checker.
+func NewTruncateBelowPublishedChecker() *TruncateBelowPublishedChecker {
+	return &TruncateBelowPublishedChecker{}
+}
+
+func (c *TruncateBelowPublishedChecker) Name() string { return "no-truncate-above-published" }
+
+func (c *TruncateBelowPublishedChecker) Observe(e Event) {
+	if e.Kind == EventTruncate && e.TruncatedUpTo > e.Published && c.violation == nil {
+		c.violation = fmt.Errorf("WAL truncated to %d above published %d at step %d (violates §21.1/INV-13)",
+			e.TruncatedUpTo, e.Published, e.Step)
+	}
+}
+
+func (c *TruncateBelowPublishedChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
@@ -217,5 +237,6 @@ func DefaultCheckers() []Checker {
 		NewSingleWriterChecker(),
 		NewNoLostAckedWriteChecker(),
 		NewImmutableSnapshotChecker(),
+		NewTruncateBelowPublishedChecker(),
 	}
 }

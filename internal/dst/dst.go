@@ -45,6 +45,7 @@ const (
 	EventStalePublsh EventKind = "stale-publish"
 	EventFailover    EventKind = "failover"
 	EventSnapshot    EventKind = "snapshot"
+	EventTruncate    EventKind = "truncate"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -81,6 +82,9 @@ type Event struct {
 	// Snapshot events (§5.2, §19): whether a published snapshot was later observed to
 	// change (must be false, INV-16).
 	SnapshotMutated bool
+	// Truncate events (§21.1): the sequence local WAL was reclaimed to, and the
+	// verified published point. TruncatedUpTo must be <= Published (INV-13).
+	TruncatedUpTo uint64
 }
 
 // String renders an event deterministically for the trace.
@@ -104,6 +108,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d failover acked_durable=%d recovered=%d", e.Step, e.AckedDurable, e.Recovered)
 	case EventSnapshot:
 		return fmt.Sprintf("%04d snapshot mutated=%t %s", e.Step, e.SnapshotMutated, e.Msg)
+	case EventTruncate:
+		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:
