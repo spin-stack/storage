@@ -453,3 +453,68 @@ func TestDrainOfEmptyHostIsDrained(t *testing.T) {
 		t.Fatalf("host state = %q, want DRAINING", h.State)
 	}
 }
+
+// TestDrainFinishesAVolumeItAlreadyPromoted is DEV-0008. A drain that dies after the
+// promotion — before the epoch boundary is written and before the source's capacity
+// is released — used to lose the volume on the next pass: it was no longer listed
+// under the source, so nothing ever finished it. The pass must be driven by what the
+// operation planned, not by who currently owns the volume.
+func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+	firstID := format.UUIDString(w.vols[0])
+
+	// Simulate the crash: promote the first volume by hand, leaving the recovery
+	// point unwritten and the source's capacity still committed.
+	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if err != nil {
+		t.Fatalf("drain must finish the interrupted volume: %v", err)
+	}
+	if res.Phase != lifecycle.OpSucceeded {
+		t.Fatalf("phase = %q, want SUCCEEDED", res.Phase)
+	}
+	// The interrupted volume got its epoch boundary...
+	v, _ := w.md.GetVolume(ctx, firstID)
+	if _, err := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], uint64(v.CurrentEpoch)); err != nil {
+		t.Fatalf("the interrupted volume never got its recovery point: %v", err)
+	}
+	// ...and it was not promoted a second time.
+	if v.CurrentEpoch != 2 {
+		t.Fatalf("volume epoch = %d, want 2 — the resumed drain promoted it again", v.CurrentEpoch)
+	}
+	// Capacity was released exactly once for both volumes.
+	src, _ := w.md.GetHost(ctx, cloneHostA)
+	if src.NVMeCommittedBytes != 0 {
+		t.Fatalf("source still holds %d committed bytes", src.NVMeCommittedBytes)
+	}
+}
+
+// TestDrainReleasesSourceCapacityExactlyOnce: re-running a completed drain must not
+// release capacity twice (which the non-negative guard would turn into a hard error
+// on a host that legitimately holds other volumes).
+func TestDrainReleasesSourceCapacityExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	// Give the source an extra reservation that does not belong to this drain.
+	if err := w.md.CommitHostCapacity(ctx, w.term, cloneHostA, 3*volSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+		t.Fatalf("re-running a finished drain must be a no-op: %v", err)
+	}
+	src, _ := w.md.GetHost(ctx, cloneHostA)
+	if src.NVMeCommittedBytes != 3*volSize {
+		t.Fatalf("source committed = %d, want %d — capacity was released more than once",
+			src.NVMeCommittedBytes, 3*volSize)
+	}
+}
