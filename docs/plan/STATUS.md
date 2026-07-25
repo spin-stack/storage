@@ -1,150 +1,57 @@
 # STATUS
 
-Short snapshot. Update at every increment close.
+Short snapshot + resume-from-here handoff. **Read this first** when picking up the work.
 
 - **Date:** 2026-07-25
-- **Current phase:** **Phases 01, 04, 05, 06, 07 COMPLETE.** On `main` through Phase 06;
-  **Phase 07 on branch `phase-07/control-plane-fencing`** (fencing = review zone,
-  awaiting human review before merge). Phases 02/03 planned (need infra).
-- **Active invariants (14):** INV-01, 02, 03, 04, 05, **06**, 07, **09**, **10**, **11**,
-  15, 18, 21, 22. The fencing set (06/09/10/11) is complete.
-- **Next:** Phase 08 (recovery + rebuild-metadata) — `recovery.DurablePrefix` +
-  recovery-point already seed it; or Phase 09 (snapshots/clone/resize).
-- **Branches:** `phase-01/...` (Phases 0/01, 02/03 plans) merged-forward into
-  `phase-04/wal-cow` (Phase 04). Nothing merged to `main` yet — **pending human review**,
-  especially the WAL format (ADR-0005 / DEV-0001, header size 104≠96).
-- **Blockers:** none for pure-Go work; format review recommended before merge to main.
+- **Where the work is:** everything is on branch **`main`** through **Phase 10**
+  (34 commits). The per-phase branches (`phase-01/…` … `phase-10/…`) are all
+  fast-forward-merged into `main` and are just history labels — `main` is authoritative.
+- **Gate:** `task ci` green; `task cover` ≥ 90% production floor; `task test:integration`
+  green on Postgres 18 (Docker).
 
-## Phase 06 — COMPLETE (remote WAL)
+## Progress: 9 of 13 MVP phases done; 21 of 22 invariants active
 
-- 6.1 `wal.Batcher`: closes batches only on §14.3 rules (FUA/FLUSH, 8 MiB target,
-  16 MiB max, 20 s age, explicit reasons); `ClosedBatch.Object()` assembles the on-S3
-  object (§14.2) + deterministic key.
-- 6.2 `wal.Uploader` (idempotent create-only PUT; lost-response→412→HEAD reconcile;
-  divergence hard-fails) + `Log.Flush(ctx)` implementing §14.4 (durable advances only
-  after S3 verification). **INV-07, INV-21 active; INV-04 remote-coupled.**
-- 6.3 summary objects (§22.1): `Log.WriteSummary`/`ReadSummary` — last durable seq +
-  object/range list, latest-wins, for fast recovery in Phase 08.
-- NOTE: FLUSH ordering step 5 (lease verify) is deliberately deferred to Phase 07.
+| Phase | Status | Invariants activated |
+|---|---|---|
+| 0 planning | ✓ | — |
+| 01 skeleton (simio + DST harness + obs) | ✓ | INV-01, 02 |
+| 02 guest layout / 03 vhost-user | **planned only** (need VM/QEMU infra) | — |
+| 04 WAL/CoW format + property tests | ✓ | INV-03, 04, 05, 18 |
+| 05 encryption (AES-256-GCM, DEK/KEK) | ✓ | INV-15 |
+| 06 remote WAL (batching, idempotent PUT, summary) | ✓ | INV-07, 21 |
+| 07 Control Plane + leases + **fencing** | ✓ | INV-06, 09, 10, 11, 22 |
+| 08 recovery (S3 authority) + rebuild-metadata | ✓ | INV-08, 12, 20 |
+| 09 pause-free snapshots + clone + resize | ✓ | INV-16 |
+| 10 objectization + checkpoints + GC + I/O classes | ✓ | INV-13, 14, 17 |
+| 11 cross-host + cordon/drain | not started | — |
+| 12 warm standby + WAL compaction + flatten | not started | — |
+| 13 hardening + fleet-mixed | not started | INV-19 (only one left) |
 
-## Phase 05 — COMPLETE (encryption at rest)
+**Only INV-19 (fleet-mixed read-old/write-new format gating) is still pending** — Phase 13.
 
-- 5.1 `internal/crypto`: AES-256-GCM DEK.Seal/Open, nonce derived from
-  (vol,epoch,seq) — never stored/reused (§15.2); KMS + DevKMS wrap/unwrap; injected
-  randomness. Tamper fails closed; nonce-uniqueness property (rapid).
-- 5.2 encrypted WAL end-to-end: `Log.EnableEncryption` seals payloads (WAL file =
-  ciphertext, `KeyID`/`AuthTag` set, plaintext CRC per §14.1); live reads stay
-  plaintext in host memory; replay decrypts + verifies. `format.DecodeRecord` gates
-  the payload CRC on `KeyID`. DISCARD/WRITE_ZEROES accounting (`discarded_bytes_total`),
-  crypto-shred test. **INV-15 active** (checker + DST scenario).
+## How to resume
+1. Read `docs/plan/PLAN.md` (phase map), `docs/plan/INVARIANTS.md` (21/22 active, each with
+   its checker), and `CLAUDE.md` (conventions — read it before writing code).
+2. Ritual per increment: Planner publishes the increment in `PHASE-0N.md` → Harness writes
+   failing tests/DST scenarios/checkers → Implementer makes them pass → gate green → commit.
+3. Branch per phase off `main`; **human review before merge** for data-loss zones
+   (formats, fencing, durability, GC). Merge to `main` with `--ff-only` after review.
+4. Commands: `task ci`, `task cover`, `task test:integration`, `task dst`, `task generate`
+   (sqlc), `task db:migrate:diff -- <name>` (Atlas). Atlas installed via atlasgo.sh.
 
-## Phase 04 — COMPLETE (WAL/CoW correctness spine)
+## Next candidates (all pure-Go / DST-provable except where noted)
+- **Phase 11** — cross-host materialization (via S3) + cordon/drain + capacity accounting.
+- **Phase 12** — warm standby (checkpoint hidration) + WAL-object compaction + chain flatten.
+- **Phase 13** — hardening: real-HW fault injection, backend conformance suite, runbooks,
+  and INV-19. Needs real infra.
+- **Phases 02/03** — guest layout + vhost-user/QEMU 11.0.2. Need VM/mount infra (RISK-10).
 
-- 4.1 format v2 (record+object headers, little-endian, CRC32C, crypto fields reserved,
-  golden-bytes lock, deterministic S3 key). **Format decision ADR-0005 / DEV-0001.**
-- 4.2 serialize/replay + §25.2 property test (INV-05): truncation at every byte + bit
-  corruption → exact state XOR detected error, never silently wrong.
-- 4.3 write-path Log: watermarks (INV-03), unflushed bounds + backpressure (INV-04),
-  interval-map read view (§13.2, memory ~ working set), no PUT on WRITE (INV-18).
-- 4.4 active map: roaring-bitmap presence + location table over 64 KiB segments
-  (§13.3); memory-bounded over a 1 TiB universe (10k scattered segments < 1 MiB).
-
-## Increment 1.4 — DONE
-
-- `internal/obs`: OTel tracing + W3C context propagation across the `simio.network`
-  boundary (`InjectContext`/`ExtractContext`), structured JSON logging keyed on
-  request_id/operation_id/volume_id/host_id + trace_id/span_id, and the full §26.2
-  metric taxonomy as a declarative `Catalog()` built into live OTel instruments.
-- Tests: trace propagates across a CP→Agent boundary; nested CP→Agent→objectstore
-  spans share a trace; structured log carries all correlation fields; metrics catalog
-  well-formed (no dupes, load-bearing names present) and every entry registered.
-
-## Phase 01 exit gate — GREEN
-
-- Module builds; `task ci` = build + lint(golangci + simulable) + test(-race) + dst.
-- INV-01 (simulable lint) + INV-02 (deterministic replay) active and green.
-- Four `simio` interfaces (real + sim) contract-tested; DST harness + checker
-  framework + planted-bug proof; OTel + logging + §26.2 registry.
-- No `time.Now()`/socket/disk/S3 escape anywhere (lint proves it).
-
-## Increment 1.3 — DONE
-
-- `internal/dst`: seeded harness (`Run(seed, scenario, checkers...)`) driving the sim
-  interfaces, deterministic event trace, and a `Checker` framework.
-- Checkers wired: `MonotonicClockChecker` (§12.1) and `NoPermanentDeleteChecker`
-  (INV-14 seed). `DefaultCheckers()` is the Phase-01 set that later phases append to.
-- Mandatory scenario set (interface-level arms): lost-PUT idempotent retry (§14.5),
-  crash-around-fdatasync (durable-prefix survives), clock-drift-beyond-skew (§12.1:
-  monotonic unaffected), network partition/heal (§12/§23).
-- **Planted-bug tests** prove the checkers actually catch violations and the failure
-  reports the reproducing seed (Adversary requirement).
-- `task dst` now runs the set for real; wired into CI. **INV-02 → active.**
-
-## Increment 1.2 — DONE
-
-- Four `simio` interfaces with real + deterministic-sim impls, all contract-tested
-  against each other (67 tests, `-race` clean):
-  - `clock` — monotonic + wall + timers; sim `Advance`/`SetSkew`/`PendingTimers`
-    (quiescence). Surfaced and fixed a real registration race in `Sleep`.
-  - `disk` — append/read/sync/truncate + crash model (unsynced lost); sim faults:
-    short append, sync-loss, torn tail.
-  - `objectstore` — Put(If-None-Match/If-Match CAS)/Get/Head/List/Delete; sim faults:
-    lost-response (§14.5 idempotent-retry proven), throttle, eventual LIST.
-  - `network` — message transport; sim partition/heal; real TCP framed. (Named
-    `network` to avoid shadowing stdlib `net` — minor rename from the PLAN §6 sketch.)
-- Determinism property test (seed of **INV-02**): sim components produce identical
-  traces for identical seeds.
-- **ADR-0004**: Phase-01 `real` objectstore is filesystem-backed; S3-SDK impl deferred
-  to Track D (§24).
-
-## Increment 1.1 — DONE
-
-- Go module `github.com/spin-stack/storage` (go 1.26), Taskfile, `.golangci.yml` (v2),
-  `.github/workflows/ci.yml`, stub package tree per PLAN §6.
-- Custom `simulable` analyzer (`hack/analyzers/simulable`) with golden tests
-  (violating/compliant/exempt) — all green; resolves aliased imports by type, ignores
-  local same-named methods.
-- Belt-and-suspenders `forbidigo`/`depguard` in golangci-lint (both layers proven to
-  flag a planted `time.Now()`; removed after demonstration).
-- `task ci` (build + lint + test + dst-placeholder) green locally.
-- **INV-01 → active.** Gate proof done: a planted `time.Now()` turns lint red.
-
-## What exists
-
-- `PLAN.md` — full phase map (roadmap §30 → Phases 01–13), dependencies, parallel
-  tracks, standard gate, roles, hot zones.
-- `INVARIANTS.md` — 21 invariants (INV-01…INV-21) with checkers and activating phases;
-  all `pending` (nothing built yet).
-- `PHASE-01.md` — fully expanded into 4 increments (1.1 bootstrap+lint, 1.2 simulable
-  interfaces, 1.3 DST harness+checkers, 1.4 observability).
-- `DECISIONS/ADR-0001` (stack/layout/CI), `ADR-0002` (parallel tracks), `ADR-0003`
-  (simulable-interfaces lint).
-- `DEVIATIONS.md` (empty), `RISKS.md` (RISK-01…RISK-10), this file.
-
-## Confirmed foundational decisions
-
-Go 1.26 · module `github.com/spin-stack/storage` in `spin-stack/storage/` · Taskfile +
-golangci-lint (+ custom `simulable` analyzer) · GitHub Actions · parallel tracks after
-Phase 01. (ADR-0001/0002/0003.)
-
-## Next steps
-
-1. **Phase 07** — PostgreSQL + Control Plane (verified term) + reconciliation + leases
-   + full fencing protocol (§12) under DST with partitions and clock drift. Completes
-   INV-06 (durable-ACK rule), INV-07 (lease step), INV-09/10/11 (fencing), INV-21
-   (admin idempotency). **Human-review zone (fencing).** Pure Go + a PG interface
-   (sim'd for DST; real PG behind it). **Next.**
-2. **Phase 08** — recovery with S3 as authority + recovery-point + `rebuild-metadata`
-   (INV-08, INV-12, INV-20). Uses the Phase-06 summary objects.
-3. **Track D** — S3 client subsystem (§24) can proceed in parallel (disjoint files).
-
-Deferred (need infra): Phases 02/03 (VM/mounts, QEMU 11.0.2).
-
-Phase 06 is on `phase-06/remote-wal` (not yet merged to `main`) — durability zone,
-worth a review before merge.
-
-## Open questions for the human (non-blocking; defaults recorded as assumptions)
-
-- Property-test library (`pgregory.net/rapid` assumed, ADR-0001) — confirm at Phase 04.
-- Dev backend for the conformance sim vs real (MinIO/RustFS single-node dev only per
-  §6.2) — confirm at Phase 06/13.
+## Session gotchas worth remembering (also in AGENT-MEMORY.md)
+- **ADR-0005:** WAL headers are **104 bytes**, not the doc's "96" (field lists sum to 104).
+- **ADR-0006/0007:** all SQL via sqlc; migrations via Atlas; Postgres 18; UUIDv7 enforced two
+  ways (forbidigo forbids v4 outside `internal/ids`; DB CHECK on the version nibble).
+- Two real bugs the tests caught: `Log.Discard/WriteZeroes` didn't feed the remote batcher
+  (DISCARD never reached S3); the sim network let a **closed** conn still Send. Both fixed.
+- Coverage is measured with `-coverpkg=./...` (default under-counts cross-package); the 90%
+  floor excludes generated `internal/db`, integration-only `pg`/`migrations`, `cmd`, and the
+  `dst` harness.
