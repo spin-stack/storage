@@ -47,6 +47,10 @@ linters:
         linters:
           - depguard
           - forbidigo
+      # cleanup calls whose error is intentionally ignored.
+      - linters:
+          - errcheck
+        text: "Error return value of.*(Close|Remove|Sync)` is not checked"
 
 formatters:
   enable:

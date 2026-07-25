@@ -4,9 +4,25 @@ Short snapshot. Update at every increment close.
 
 - **Date:** 2026-07-24
 - **Current phase:** Phase 01 (skeleton) — **in progress**. Plan approved by human.
-- **Current increment:** **1.1 complete** (module + CI + simulable lint); **1.2 next**
-  (simulable interfaces).
+- **Current increment:** **1.1 + 1.2 complete**; **1.3 next** (DST harness + checkers).
 - **Blockers:** none. Working on branch `phase-01/increment-1.1-skeleton-lint`.
+
+## Increment 1.2 — DONE
+
+- Four `simio` interfaces with real + deterministic-sim impls, all contract-tested
+  against each other (67 tests, `-race` clean):
+  - `clock` — monotonic + wall + timers; sim `Advance`/`SetSkew`/`PendingTimers`
+    (quiescence). Surfaced and fixed a real registration race in `Sleep`.
+  - `disk` — append/read/sync/truncate + crash model (unsynced lost); sim faults:
+    short append, sync-loss, torn tail.
+  - `objectstore` — Put(If-None-Match/If-Match CAS)/Get/Head/List/Delete; sim faults:
+    lost-response (§14.5 idempotent-retry proven), throttle, eventual LIST.
+  - `network` — message transport; sim partition/heal; real TCP framed. (Named
+    `network` to avoid shadowing stdlib `net` — minor rename from the PLAN §6 sketch.)
+- Determinism property test (seed of **INV-02**): sim components produce identical
+  traces for identical seeds.
+- **ADR-0004**: Phase-01 `real` objectstore is filesystem-backed; S3-SDK impl deferred
+  to Track D (§24).
 
 ## Increment 1.1 — DONE
 
@@ -40,14 +56,13 @@ Phase 01. (ADR-0001/0002/0003.)
 
 ## Next 3 steps
 
-1. **Increment 1.2** — define the four `simio` interfaces (clock, net, disk,
-   objectstore) with real + deterministic-sim implementations and contract tests.
-   Tests-first: contract suites run against both impls; sim-determinism property test.
-2. **Increment 1.3** — deterministic DST harness + checker framework + fault hooks +
+1. **Increment 1.3** — deterministic DST harness + checker framework + fault hooks +
    the planted-bug test. Activates **INV-02**; Adversary-reviewed.
-3. **Increment 1.4** — OTel tracing + structured logging + full §26.2 metric-name
-   registry. Then Phase 01 exit gate → unlock Track A (Phase 02) and Track D (S3
-   subsystem) per ADR-0002.
+2. **Increment 1.4** — OTel tracing + structured logging + full §26.2 metric-name
+   registry.
+3. **Phase 01 exit gate** → reassess with the human: Track A (Phase 02: guest layout,
+   OverlayFS) and Phase 03 (vhost-user/QEMU 11.0.2) need real infrastructure not present
+   in this sandbox; Track D (S3 subsystem) is pure Go and can proceed here.
 
 ## Open questions for the human (non-blocking; defaults recorded as assumptions)
 
