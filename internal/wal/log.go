@@ -60,6 +60,7 @@ type Log struct {
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
 	discardedBytes    int64
+	uploaded          []SummaryObject // durable objects, for the summary (§22.1)
 }
 
 // EnableEncryption binds an Encryption context so subsequent WRITEs seal their
@@ -209,6 +210,8 @@ func (l *Log) Flush(ctx context.Context) error {
 				l.batcher.RemoveUploaded(done)
 				return err // durable NOT advanced
 			}
+			key, _, _ := cb.Object()
+			l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
 			done++
 		}
 		l.batcher.RemoveUploaded(done)

@@ -3,13 +3,27 @@
 Short snapshot. Update at every increment close.
 
 - **Date:** 2026-07-25
-- **Current phase:** **Phases 01, 04, 05 COMPLETE** (pure-Go). Phases 02/03 planned
-  (need VM/QEMU infra). **Phase 06 (remote WAL) is next.**
-- **Active invariants:** INV-01, INV-02, INV-03, INV-04(bounds), INV-05, INV-15, INV-18.
+- **Current phase:** **Phases 01, 04, 05, 06 COMPLETE** (pure-Go), merged to `main`
+  through Phase 05; Phase 06 on branch `phase-06/remote-wal`. Phases 02/03 planned.
+  **Phase 07 (Control Plane + leases + fencing) is next.**
+- **Active invariants:** INV-01, INV-02, INV-03, INV-04, INV-05, INV-07(ordering),
+  INV-15, INV-18, INV-21(PUT). **9 active.**
 - **Branches:** `phase-01/...` (Phases 0/01, 02/03 plans) merged-forward into
   `phase-04/wal-cow` (Phase 04). Nothing merged to `main` yet — **pending human review**,
   especially the WAL format (ADR-0005 / DEV-0001, header size 104≠96).
 - **Blockers:** none for pure-Go work; format review recommended before merge to main.
+
+## Phase 06 — COMPLETE (remote WAL)
+
+- 6.1 `wal.Batcher`: closes batches only on §14.3 rules (FUA/FLUSH, 8 MiB target,
+  16 MiB max, 20 s age, explicit reasons); `ClosedBatch.Object()` assembles the on-S3
+  object (§14.2) + deterministic key.
+- 6.2 `wal.Uploader` (idempotent create-only PUT; lost-response→412→HEAD reconcile;
+  divergence hard-fails) + `Log.Flush(ctx)` implementing §14.4 (durable advances only
+  after S3 verification). **INV-07, INV-21 active; INV-04 remote-coupled.**
+- 6.3 summary objects (§22.1): `Log.WriteSummary`/`ReadSummary` — last durable seq +
+  object/range list, latest-wins, for fast recovery in Phase 08.
+- NOTE: FLUSH ordering step 5 (lease verify) is deliberately deferred to Phase 07.
 
 ## Phase 05 — COMPLETE (encryption at rest)
 
@@ -113,21 +127,19 @@ Phase 01. (ADR-0001/0002/0003.)
 
 ## Next steps
 
-Pure-Go phases that build here, in dependency order:
-
-1. **Phase 05** — per-volume encryption (AES-256-GCM, DEK/KEK, dev KMS) + DISCARD/
-   WRITE_ZEROES end-to-end. Flips on the reserved `KeyId`/`AuthTag` fields (no format
-   change). Activates INV-15 (nothing leaves the host in clear). Human-review zone
-   (crypto/durability-adjacent). **Next.**
-2. **Phase 06** — remote WAL: on-demand batching + PUT idempotency + summary objects
-   over the locked object format. Activates INV-07 (ordering), INV-21 (PUT idempotency),
-   full INV-04.
+1. **Phase 07** — PostgreSQL + Control Plane (verified term) + reconciliation + leases
+   + full fencing protocol (§12) under DST with partitions and clock drift. Completes
+   INV-06 (durable-ACK rule), INV-07 (lease step), INV-09/10/11 (fencing), INV-21
+   (admin idempotency). **Human-review zone (fencing).** Pure Go + a PG interface
+   (sim'd for DST; real PG behind it). **Next.**
+2. **Phase 08** — recovery with S3 as authority + recovery-point + `rebuild-metadata`
+   (INV-08, INV-12, INV-20). Uses the Phase-06 summary objects.
 3. **Track D** — S3 client subsystem (§24) can proceed in parallel (disjoint files).
 
 Deferred (need infra): Phases 02/03 (VM/mounts, QEMU 11.0.2).
 
-**Recommended before more phases:** human review + merge of the WAL format
-(ADR-0005 / DEV-0001) to `main`, since everything downstream builds on it.
+Phase 06 is on `phase-06/remote-wal` (not yet merged to `main`) — durability zone,
+worth a review before merge.
 
 ## Open questions for the human (non-blocking; defaults recorded as assumptions)
 
