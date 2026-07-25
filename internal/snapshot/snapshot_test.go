@@ -24,7 +24,7 @@ func remoteLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]byt
 	d := sim.NewDisk()
 	f, _ := d.Create("wal/active.wal")
 	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5))
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	return l
 }
 
@@ -107,3 +107,9 @@ func TestSnapshotManifestIsImmutable(t *testing.T) {
 		t.Fatalf("a published manifest must be immutable, got %v", err)
 	}
 }
+
+// leaseOK is the fence for tests that are not about fencing: remote durability
+// requires a lease checker (DEV-0004), and these hold a valid one.
+type leaseOK struct{}
+
+func (leaseOK) Valid() bool { return true }

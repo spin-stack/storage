@@ -21,8 +21,8 @@ func remoteLeasedLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, lm *l
 	l.EnableRemote(
 		wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(store, 5),
+		lm,
 	)
-	l.SetLease(lm)
 	return l
 }
 
@@ -105,21 +105,11 @@ func TestLocalModeIgnoresLeaseForFlush(t *testing.T) {
 	}
 }
 
-// TestNoLeaseConfiguredStillAcks: dev without a CP/lease.
-func TestNoLeaseConfiguredStillAcks(t *testing.T) {
-	ctx := context.Background()
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	l := remoteLog(t, store) // no lease set
-	_ = clk
-	_, _ = l.Write(0, []byte("data"), 0)
-	if err := l.Flush(ctx); err != nil {
-		t.Fatalf("flush without a lease gate should ACK: %v", err)
-	}
-	if l.Watermarks().Durable != 1 {
-		t.Fatalf("durable = %d, want 1", l.Watermarks().Durable)
-	}
-}
+// (Removed) TestNoLeaseConfiguredStillAcks asserted that a remote-durability log
+// with no lease checker "should ACK". That was the specification of DEV-0004: it
+// made an unfenced writer legal, and every other fencing proof was conditional on
+// somebody remembering to call SetLease. TestRemoteModeWithoutALeaseFailsClosed
+// below asserts the opposite, which is what §12.2 requires.
 
 // TestModeForCoversEveryDurability: the data path and the Control Plane must agree on
 // the §14.8 vocabulary. If a mode is added to lifecycle and not mapped here, this
@@ -192,7 +182,10 @@ func TestLocalModeWithoutALeaseStillAcks(t *testing.T) {
 	if err := l.Flush(ctx); err != nil {
 		t.Fatalf("local-mode FLUSH must ACK without a lease: %v", err)
 	}
-	if w := l.Watermarks(); w.Durable == 0 {
-		t.Fatal("local-mode FLUSH did not advance durable")
+	if l.Fenced() {
+		t.Fatal("local mode must not self-fence for a missing lease")
 	}
+	// The remote durable watermark stays put on purpose: in local mode the ACK is on
+	// fdatasync and S3 catches up asynchronously (§14.8), which is what the RPO
+	// metric measures.
 }

@@ -108,9 +108,16 @@ func (l *Log) EnableEncryption(e *Encryption) { l.enc = e }
 
 // EnableRemote wires the on-demand batcher and idempotent uploader so FLUSH/FUA
 // make records durable in S3 (§14.3–14.5). Must be set before the first WRITE.
-func (l *Log) EnableRemote(b *Batcher, u *Uploader) {
+// EnableRemote wires the remote path. The lease checker is a parameter rather than a
+// later setter so that every call site has to answer the question "what fences this
+// writer?" — nil is legal only for `local` durability (§14.8 rule 3), and a remote
+// FLUSH with a nil lease fails closed with ErrNoLease (DEV-0004).
+func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
 	l.batcher = b
 	l.uploader = u
+	if lease != nil {
+		l.lease = lease
+	}
 }
 
 // NewLog creates a log backed by file, timed by clk.
@@ -273,10 +280,17 @@ func (l *Log) Flush(ctx context.Context) error {
 	}
 
 	// step 5: verify the lease on the monotonic clock (§12.2, INV-06). If it is not
-	// valid, do NOT advance durable and do NOT ACK — self-fence.
-	if l.lease != nil && !l.lease.Valid() {
-		l.fenced = true
-		return ErrSelfFenced
+	// valid, do NOT advance durable and do NOT ACK — self-fence. In remote mode the
+	// check is mandatory: no lease checker means nothing is fencing this writer, so
+	// the ACK is refused rather than granted by default.
+	if l.mode == ModeRemote {
+		if l.lease == nil {
+			return ErrNoLease
+		}
+		if !l.lease.Valid() {
+			l.fenced = true
+			return ErrSelfFenced
+		}
 	}
 	if err := l.AdvanceDurable(target); err != nil { // step 6
 		return err

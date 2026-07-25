@@ -12,6 +12,12 @@ import (
 // may already be in S3, but it is NOT confirmed to the guest — the Agent self-fences.
 var ErrSelfFenced = errors.New("wal: self-fenced (lease invalid at ACK)")
 
+// ErrNoLease is returned when a volume in `remote` durability mode has no lease
+// checker at all. §12.2 makes a valid lease a precondition of every durable ACK, so
+// the absence of the check is not "no objection" — it is an unfenced writer, and the
+// FLUSH fails closed (DEV-0004).
+var ErrNoLease = errors.New("wal: remote durability requires a lease checker")
+
 // DurabilityMode selects the FLUSH/FUA ACK contract per volume (§14.8).
 type DurabilityMode int
 

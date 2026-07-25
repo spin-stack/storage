@@ -42,7 +42,7 @@ func newWorld(t *testing.T, enc *wal.Encryption) *world {
 		t.Fatal(err)
 	}
 	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5))
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	if enc != nil {
 		l.EnableEncryption(enc)
 	}
@@ -424,3 +424,9 @@ func (r *fixedReader) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// leaseOK is the fence for tests that are not about fencing: remote durability
+// requires a lease checker (DEV-0004), and these hold a valid one.
+type leaseOK struct{}
+
+func (leaseOK) Valid() bool { return true }

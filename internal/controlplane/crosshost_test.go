@@ -57,7 +57,7 @@ func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snap
 		t.Fatal(err)
 	}
 	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5))
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	if _, err := l.Write(0, []byte("source-data"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -181,3 +181,9 @@ func TestCloneCrossHostFromMissingSnapshotFails(t *testing.T) {
 		t.Fatalf("committed %d bytes for a clone that never started", dst.NVMeCommittedBytes)
 	}
 }
+
+// leaseOK is the fence for tests that are not about fencing: remote durability
+// requires a lease checker (DEV-0004), and these hold a valid one.
+type leaseOK struct{}
+
+func (leaseOK) Valid() bool { return true }

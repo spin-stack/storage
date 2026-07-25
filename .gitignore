@@ -23,3 +23,6 @@ cover*.out
 # BuildKit cache + build output (task build:qemu)
 /.cache/
 /_output/
+
+# Coverage intermediates
+cover.raw

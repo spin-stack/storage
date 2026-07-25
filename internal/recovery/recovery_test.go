@@ -76,7 +76,7 @@ func TestRecoverReconstructsState(t *testing.T) {
 	d := sim.NewDisk()
 	f, _ := d.Create("wal/active.wal")
 	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3))
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), leaseOK{})
 
 	_, _ = l.Write(0, []byte("hello"), 0)
 	_, _ = l.Write(8, []byte("world"), 0)
@@ -114,7 +114,7 @@ func TestRecoverEncrypted(t *testing.T) {
 	f, _ := d.Create("wal/active.wal")
 	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableEncryption(enc)
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, dek.KeyID, wal.DefaultBatchConfig()), wal.NewUploader(store, 3))
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, dek.KeyID, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), leaseOK{})
 
 	secret := []byte("SECRET-PAYLOAD")
 	_, _ = l.Write(0, secret, 0)
@@ -215,3 +215,9 @@ func TestRecoveryPointRoundTrip(t *testing.T) {
 		t.Fatalf("recovery point = %+v", rp)
 	}
 }
+
+// leaseOK is the fence for tests that are not about fencing: remote durability
+// requires a lease checker (DEV-0004), and these hold a valid one.
+type leaseOK struct{}
+
+func (leaseOK) Valid() bool { return true }

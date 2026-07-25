@@ -29,6 +29,13 @@ import (
 	"github.com/spin-stack/storage/internal/wal/format"
 )
 
+// alwaysValidLease is the fence for scenarios that are not about fencing: remote
+// durability requires a lease checker (DEV-0004), and these scenarios assert other
+// properties with the lease held.
+type alwaysValidLease struct{}
+
+func (alwaysValidLease) Valid() bool { return true }
+
 // deterministicReader yields seed-derived bytes for DEK material under DST.
 type deterministicReader struct{ b byte }
 
@@ -133,7 +140,7 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 			return err
 		}
 		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-		l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+		l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 		if _, err := l.Write(0, []byte("on-source"), 0); err != nil {
 			return err
 		}
@@ -226,7 +233,7 @@ func scenarioCrossHostMaterialization(s *Sim) error {
 		return err
 	}
 	src := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	src.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	src.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	if _, err := src.Write(0, []byte("cross-host"), 0); err != nil {
 		return err
 	}
@@ -347,7 +354,7 @@ func scenarioGCMarksOrphansNotLive(s *Sim) error {
 	_ = descriptor.Write(ctx, s.Store, descriptor.Descriptor{VolumeID: vid, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
 	lf, _ := s.Disk.Create("wal/active.wal")
 	l := wal.NewLog(lf, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = l.Write(0, []byte("live"), 0)
 	if err := l.Flush(ctx); err != nil {
 		return err
@@ -414,7 +421,7 @@ func scenarioCheckpointThenTruncate(s *Sim) error {
 		return err
 	}
 	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 
 	_, _ = l.Write(0, []byte("a"), 0)
 	_, _ = l.Write(8, []byte("b"), 0)
@@ -464,7 +471,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 	// Parent writes + snapshot.
 	pf, _ := s.Disk.Create("wal/parent.wal")
 	parent := wal.NewLog(pf, s.Clock, pv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	parent.EnableRemote(wal.NewBatcher(s.Clock, pv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	parent.EnableRemote(wal.NewBatcher(s.Clock, pv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = parent.Write(0, []byte("parent"), 0)
 	if err := parent.Flush(ctx); err != nil {
 		return err
@@ -483,7 +490,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 	}
 	cf, _ := s.Disk.Create("wal/clone.wal")
 	clone := wal.NewLog(cf, s.Clock, cv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	clone.EnableRemote(wal.NewBatcher(s.Clock, cv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	clone.EnableRemote(wal.NewBatcher(s.Clock, cv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = clone.Write(0, []byte("clone-only"), 0)
 	if err := clone.Flush(ctx); err != nil {
 		return err
@@ -518,7 +525,7 @@ func scenarioSnapshotPauseFreeImmutable(s *Sim) error {
 		return err
 	}
 	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 
 	_, _ = l.Write(0, []byte("a"), 0)
 	_, _ = l.Write(8, []byte("b"), 0)
@@ -606,7 +613,7 @@ func scenarioRecoveryAuthorityIsS3(s *Sim) error {
 		return err
 	}
 	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = l.Write(0, []byte("a"), 0)
 	_, _ = l.Write(8, []byte("b"), 0)
 	if err := l.Flush(ctx); err != nil {
@@ -672,8 +679,8 @@ func scenarioFencedWriterNoLostAck(s *Sim) error {
 	w1.EnableRemote(
 		wal.NewBatcher(s.Clock, volID, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
+		lm,
 	)
-	w1.SetLease(lm)
 
 	// W1 ACKs seq 1..2 with a valid lease.
 	_, _ = w1.Write(0, []byte("one"), 0)
@@ -791,8 +798,8 @@ func scenarioLeaseFencesDurableAck(s *Sim) error {
 	l.EnableRemote(
 		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
+		lm,
 	)
-	l.SetLease(lm)
 
 	// (1) With a valid lease, the FLUSH ACKs.
 	if _, err := l.Write(0, []byte("acked"), 0); err != nil {
@@ -838,6 +845,7 @@ func remoteLog(s *Sim, vol [16]byte) (*wal.Log, error) {
 	l.EnableRemote(
 		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
+		alwaysValidLease{},
 	)
 	return l, nil
 }
