@@ -125,7 +125,7 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 | **01** | 1 | Skeleton + simulable interfaces + minimal DST harness + tracing/logging | **DONE** ✓ (1.1–1.4; INV-01/02 active) | — |
 | 02 | 2 | Guest layout: three devices + OverlayFS | not expanded | 01 |
 | 03 | 3 | vhost-user-blk raw backend + reconnection + inflight shmfd | not expanded | 01 |
-| 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | not expanded | 01 |
+| 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | **expanded; format review pending** | 01 |
 | 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | not expanded | 04 |
 | 06 | 6 | Remote WAL: on-demand batching + PUT idempotency + summary objects | not expanded | 04 (05 for ciphertext) |
 | 07 | 7 | PostgreSQL + Control Plane (verified term) + reconciliation + leases + full fencing protocol under DST | not expanded | 06 |
