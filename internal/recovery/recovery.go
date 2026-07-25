@@ -29,6 +29,33 @@ func walPrefix(volumeID [16]byte, epoch uint64) string {
 // raise the durable point (DEV-0003): the prefix ends before it.
 var ErrObjectIntegrity = errors.New("recovery: WAL object failed integrity validation")
 
+// ErrBoundaryRegression means an epoch boundary would be recorded below one that is
+// already immutable, or below what the previous epoch's writer already ACKed. The
+// recovery-point object is create-only: everything under a boundary is under it for
+// ever, so a boundary that goes down is unrecoverable data loss (§12.5).
+var ErrBoundaryRegression = errors.New("recovery: epoch boundary would move backwards")
+
+// ErrSummaryOverclaims means the summary object names a durable sequence the
+// contiguous prefix cannot reach: an object it counted is gone. The summary is an
+// accelerator, not an authority (§22.1), so this is reported with the prefix S3 can
+// still prove rather than as an opaque failure.
+var ErrSummaryOverclaims = errors.New("recovery: the summary claims more than the contiguous prefix provides")
+
+// SummaryOverclaim carries both numbers behind ErrSummaryOverclaims so a caller can
+// act on the discrepancy — the honest prefix is still recoverable.
+type SummaryOverclaim struct {
+	Claimed    uint64
+	Contiguous uint64
+}
+
+func (e *SummaryOverclaim) Error() string {
+	return fmt.Sprintf("%s: summary says %d, prefix reaches %d",
+		ErrSummaryOverclaims.Error(), e.Claimed, e.Contiguous)
+}
+
+// Unwrap makes errors.Is(err, ErrSummaryOverclaims) work.
+func (e *SummaryOverclaim) Unwrap() error { return ErrSummaryOverclaims }
+
 // walObject is one WAL object with its parsed sequence span and raw bytes. Only
 // objects that passed validate() are ever represented here.
 type walObject struct {

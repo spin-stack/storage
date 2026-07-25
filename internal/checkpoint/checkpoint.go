@@ -34,6 +34,11 @@ type Checkpoint struct {
 // log. Publishing under that condition would put one writer's name on another's data.
 var ErrDurablePointMismatch = errors.New("checkpoint: durable point disagrees with the log")
 
+// ErrCheckpointConflict means a *different* checkpoint already occupies this
+// (volume, epoch, sequence). A checkpoint at a sequence is immutable, so this is not
+// a retry of our own publish: it is two writers claiming one epoch.
+var ErrCheckpointConflict = errors.New("checkpoint: a different checkpoint already exists at this sequence")
+
 // Key is the deterministic checkpoint key.
 func Key(volumeID string, epoch, seq uint64) string {
 	return fmt.Sprintf("checkpoints/%s/%d/%d.json", volumeID, epoch, seq)

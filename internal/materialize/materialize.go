@@ -39,6 +39,12 @@ var (
 	ErrSequenceGap = errors.New("materialize: gap in the referenced WAL sequences")
 	// ErrDigestMismatch means the manifest/checkpoint is not self-consistent.
 	ErrDigestMismatch = errors.New("materialize: root digest mismatch")
+	// ErrPrefixFloor means the referenced objects do not start at the epoch's first
+	// sequence: the rebuilt volume would have a hole at the front.
+	ErrPrefixFloor = errors.New("materialize: referenced objects do not reach the epoch floor")
+	// ErrCoverageShort means the replayed run stops below the sequence the source
+	// claims to cover.
+	ErrCoverageShort = errors.New("materialize: replayed state does not reach the claimed sequence")
 	// ErrThrottled means the background class yielded (foreground/flush in flight or
 	// the window budget is spent). Not a failure: the reconciler retries.
 	ErrThrottled = errors.New("materialize: background class yielded")
