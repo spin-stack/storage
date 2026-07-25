@@ -9,9 +9,12 @@ package gc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
@@ -69,4 +72,43 @@ func Collect(ctx context.Context, store objectstore.Store, reachable map[string]
 	}
 	sort.Strings(marks)
 	return marks, nil
+}
+
+// Mark is the GC (§21.3): it computes what is unreachable, skips anything younger
+// than grace, and places a reversible delete marker over the rest. It returns the
+// keys it marked.
+//
+// Three properties make this safe to run on a schedule against live data:
+//
+//   - it can only mark. The store interface has no permanent delete, so a
+//     reachability bug costs a restore, not the data (INV-14);
+//   - a reachable object is never marked — reachability is computed from the
+//     self-describing layout, not from a cached index;
+//   - an object younger than grace is left alone, because it may belong to a
+//     manifest that is still being published (§21.1 publishes objects before the
+//     manifest that anchors them).
+//
+// Marking is idempotent: an already-marked object is invisible to the scan, so a
+// second pass reports nothing new.
+func Mark(ctx context.Context, store objectstore.Store, clk clock.Clock, reachable map[string]bool, grace time.Duration) ([]string, error) {
+	all, err := store.List(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	now := clk.Wall()
+	var marked []string
+	for _, info := range all {
+		if reachable[info.Key] {
+			continue
+		}
+		if grace > 0 && now.Sub(info.LastModified) < grace {
+			continue // too young to judge: a publication may still be in flight
+		}
+		if err := store.Delete(ctx, info.Key); err != nil {
+			return marked, fmt.Errorf("gc: mark %s: %w", info.Key, err)
+		}
+		marked = append(marked, info.Key)
+	}
+	sort.Strings(marked)
+	return marked, nil
 }

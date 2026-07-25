@@ -16,6 +16,14 @@ import (
 // did nothing with it, and Delete removed the object outright in both store
 // implementations. These tests pin the behaviour the invariant asserts.
 
+// newStore returns a store whose object timestamps come from clk, so the grace
+// period is exercised deterministically rather than against wall time.
+func newStore(clk *sim.Clock) *sim.ObjectStore {
+	s := sim.NewObjectStore()
+	s.SetClock(clk)
+	return s
+}
+
 func seed(t *testing.T, s *sim.ObjectStore, keys ...string) {
 	t.Helper()
 	for _, k := range keys {
@@ -29,8 +37,8 @@ func seed(t *testing.T, s *sim.ObjectStore, keys ...string) {
 // marked version — that is what makes a GC mistake recoverable (§21.3).
 func TestMarkIsReversible(t *testing.T) {
 	ctx := context.Background()
-	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
 	seed(t, store, "wal/v/1/1-1-a.wal", "volumes/v/descriptor.json")
 
 	marked, err := gc.Mark(ctx, store, clk, map[string]bool{"volumes/v/descriptor.json": true}, 0)
@@ -58,8 +66,8 @@ func TestMarkIsReversible(t *testing.T) {
 // at all: reachability decides, and a live object is never marked.
 func TestMarkNeverTouchesAReachableObject(t *testing.T) {
 	ctx := context.Background()
-	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
 	seed(t, store, "wal/v/1/live.wal", "wal/v/1/orphan.wal")
 
 	if _, err := gc.Mark(ctx, store, clk, map[string]bool{"wal/v/1/live.wal": true}, 0); err != nil {
@@ -78,8 +86,8 @@ func TestMarkNeverTouchesAReachableObject(t *testing.T) {
 // keeps the GC from racing a publication.
 func TestGracePeriodProtectsFreshObjects(t *testing.T) {
 	ctx := context.Background()
-	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
 	seed(t, store, "wal/v/1/fresh.wal")
 
 	marked, err := gc.Mark(ctx, store, clk, map[string]bool{}, time.Hour)
@@ -108,8 +116,8 @@ func TestGracePeriodProtectsFreshObjects(t *testing.T) {
 // must not error or double-count.
 func TestMarkIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
 	seed(t, store, "wal/v/1/orphan.wal")
 
 	first, err := gc.Mark(ctx, store, clk, map[string]bool{}, 0)
@@ -145,5 +153,49 @@ func TestStoreHasNoPermanentDelete(t *testing.T) {
 	}
 	if _, err := s.Get(ctx, "k"); err != nil {
 		t.Fatalf("restore did not bring the object back: %v", err)
+	}
+}
+
+// TestMarkStopsAtTheFirstFailure: the GC reports what it managed to mark before an
+// error rather than claiming the whole sweep succeeded — an operator reading
+// gc_marked_bytes_total needs that number to be true.
+func TestMarkStopsAtTheFirstFailure(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
+	seed(t, store, "a.wal", "b.wal")
+
+	store.InjectThrottle(2) // the LIST succeeds, the first Delete does not
+	if _, err := gc.Mark(ctx, store, clk, map[string]bool{}, 0); err == nil {
+		t.Fatal("a failing mark must be reported")
+	}
+}
+
+// TestReachableAnchorsWALObjectsFromManifests is the safety half of the sweep: an
+// object referenced by a published manifest is live even though nothing else points
+// at it.
+func TestReachableAnchorsWALObjectsFromManifests(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
+	seed(t, store, "wal/v/1/anchored.wal", "wal/v/1/orphan.wal")
+	if _, err := store.Put(ctx, "snapshots/v/s1/manifest.json",
+		[]byte(`{"objects":["wal/v/1/anchored.wal"]}`), objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	reachable, err := gc.Reachable(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, err := gc.Mark(ctx, store, clk, reachable, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(marked) != 1 || marked[0] != "wal/v/1/orphan.wal" {
+		t.Fatalf("marked = %v, want only the orphan", marked)
+	}
+	if _, err := store.Get(ctx, "wal/v/1/anchored.wal"); err != nil {
+		t.Fatalf("a manifest-anchored object was marked: %v", err)
 	}
 }

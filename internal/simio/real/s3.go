@@ -161,9 +161,10 @@ func (s *S3Store) Head(ctx context.Context, key string) (objectstore.ObjectInfo,
 		return objectstore.ObjectInfo{}, translate(err)
 	}
 	return objectstore.ObjectInfo{
-		Key:  key,
-		Size: aws.ToInt64(out.ContentLength),
-		ETag: aws.ToString(out.ETag),
+		Key:          key,
+		Size:         aws.ToInt64(out.ContentLength),
+		ETag:         aws.ToString(out.ETag),
+		LastModified: aws.ToTime(out.LastModified),
 	}, nil
 }
 
@@ -183,9 +184,10 @@ func (s *S3Store) List(ctx context.Context, prefix string) ([]objectstore.Object
 		}
 		for _, o := range page.Contents {
 			out = append(out, objectstore.ObjectInfo{
-				Key:  aws.ToString(o.Key),
-				Size: aws.ToInt64(o.Size),
-				ETag: aws.ToString(o.ETag),
+				Key:          aws.ToString(o.Key),
+				Size:         aws.ToInt64(o.Size),
+				ETag:         aws.ToString(o.ETag),
+				LastModified: aws.ToTime(o.LastModified),
 			})
 		}
 	}

@@ -39,6 +39,13 @@ func etagOf(data []byte) string {
 
 func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	p := s.path(key)
+	if s.marked(key) {
+		// A delete marker is the latest version: to a conditional write the object
+		// does not exist. Writing clears the marker, as a new version would.
+		if err := os.Remove(s.path(key) + markerSuffix); err != nil {
+			return objectstore.PutResult{}, err
+		}
+	}
 	if opts.IfNoneMatch {
 		if _, err := os.Stat(p); err == nil {
 			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
@@ -60,6 +67,9 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 }
 
 func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
+	if s.marked(key) {
+		return nil, objectstore.ErrNotFound
+	}
 	data, err := os.ReadFile(s.path(key))
 	if os.IsNotExist(err) {
 		return nil, objectstore.ErrNotFound
@@ -68,6 +78,9 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 }
 
 func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInfo, error) {
+	if s.marked(key) {
+		return objectstore.ObjectInfo{}, objectstore.ErrNotFound
+	}
 	data, err := os.ReadFile(s.path(key))
 	if os.IsNotExist(err) {
 		return objectstore.ObjectInfo{}, objectstore.ErrNotFound
@@ -75,7 +88,13 @@ func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInf
 	if err != nil {
 		return objectstore.ObjectInfo{}, err
 	}
-	return objectstore.ObjectInfo{Key: key, Size: int64(len(data)), ETag: etagOf(data)}, nil
+	info, err := os.Stat(s.path(key))
+	if err != nil {
+		return objectstore.ObjectInfo{}, err
+	}
+	return objectstore.ObjectInfo{
+		Key: key, Size: int64(len(data)), ETag: etagOf(data), LastModified: info.ModTime(),
+	}, nil
 }
 
 func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.ObjectInfo, error) {
@@ -92,14 +111,23 @@ func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.Obje
 			return rerr
 		}
 		key := filepath.ToSlash(rel)
-		if !strings.HasPrefix(key, prefix) {
+		if strings.HasSuffix(key, markerSuffix) {
+			return nil // the marker itself is not an object
+		}
+		if !strings.HasPrefix(key, prefix) || s.marked(key) {
 			return nil
 		}
 		data, rerr := os.ReadFile(p)
 		if rerr != nil {
 			return rerr
 		}
-		out = append(out, objectstore.ObjectInfo{Key: key, Size: int64(len(data)), ETag: etagOf(data)})
+		info, ierr := entry.Info()
+		if ierr != nil {
+			return ierr
+		}
+		out = append(out, objectstore.ObjectInfo{
+			Key: key, Size: int64(len(data)), ETag: etagOf(data), LastModified: info.ModTime(),
+		})
 		return nil
 	})
 	if err != nil {
@@ -109,8 +137,38 @@ func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.Obje
 	return out, nil
 }
 
+// markerSuffix is this store's delete marker: an empty sidecar file next to the
+// object. The bytes are never removed — permanent deletion is the lifecycle's job on
+// a real bucket, and this implementation must not offer what the interface forbids
+// (§21.3, INV-14).
+const markerSuffix = ".deleted"
+
+func (s *ObjectStore) marked(key string) bool {
+	_, err := os.Stat(s.path(key) + markerSuffix)
+	return err == nil
+}
+
+// Delete places a delete marker over the object; the data stays for Restore.
 func (s *ObjectStore) Delete(_ context.Context, key string) error {
-	err := os.Remove(s.path(key))
+	if _, err := os.Stat(s.path(key)); err != nil {
+		if os.IsNotExist(err) {
+			return objectstore.ErrNotFound
+		}
+		return err
+	}
+	if s.marked(key) {
+		return objectstore.ErrNotFound
+	}
+	f, err := os.Create(s.path(key) + markerSuffix)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// Restore removes the delete marker.
+func (s *ObjectStore) Restore(_ context.Context, key string) error {
+	err := os.Remove(s.path(key) + markerSuffix)
 	if os.IsNotExist(err) {
 		return objectstore.ErrNotFound
 	}

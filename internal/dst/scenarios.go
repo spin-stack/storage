@@ -379,7 +379,9 @@ func scenarioGCMarksOrphansNotLive(s *Sim) error {
 	if err != nil {
 		return err
 	}
-	marks, err := gc.Collect(ctx, s.Store, reachable)
+	// Mark for real: the GC places reversible delete markers, it does not hand back
+	// a list for someone else to act on (DEV-0006).
+	marks, err := gc.Mark(ctx, s.Store, s.Clock, reachable, 0)
 	if err != nil {
 		return err
 	}
@@ -399,8 +401,15 @@ func scenarioGCMarksOrphansNotLive(s *Sim) error {
 	if len(marks) == 0 {
 		return errors.New("the GC should have marked the orphan")
 	}
-	// Marks are reversible: the objects still exist.
+	// A marked object is hidden from reads but its bytes survive: restoring it
+	// brings it back, which is what makes a GC mistake recoverable.
 	for _, m := range marks {
+		if _, err := s.Store.Head(ctx, m); err == nil {
+			return fmt.Errorf("a marked object must not answer reads: %q", m)
+		}
+		if err := s.Store.Restore(ctx, m); err != nil {
+			return fmt.Errorf("GC marks must be reversible, but %q cannot be restored: %w", m, err)
+		}
 		if _, err := s.Store.Head(ctx, m); err != nil {
 			return fmt.Errorf("GC marks must be reversible, but %q is gone", m)
 		}

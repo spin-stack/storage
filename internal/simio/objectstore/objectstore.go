@@ -8,6 +8,7 @@ package objectstore
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Sentinel errors mirror the S3 conditions the protocol reasons about.
@@ -32,11 +33,14 @@ type PutResult struct {
 	ETag string
 }
 
-// ObjectInfo describes a stored object.
+// ObjectInfo describes a stored object. LastModified is what the GC's grace period
+// is measured against (§21.3): an object written moments ago may belong to a manifest
+// that is still being published.
 type ObjectInfo struct {
-	Key  string
-	Size int64
-	ETag string
+	Key          string
+	Size         int64
+	ETag         string
+	LastModified time.Time
 }
 
 // Store is the object-store surface used by the Agent and Control Plane.
@@ -51,7 +55,9 @@ type Store interface {
 	// List returns objects whose key has the prefix, sorted by key. LIST may be
 	// eventually consistent with respect to recent Puts.
 	List(ctx context.Context, prefix string) ([]ObjectInfo, error)
-	// Delete removes a key. On a versioned store this is a reversible delete
-	// marker; the interface never exposes permanent deletion (§5.11, §21.3).
+	// Delete places a reversible delete marker over the key. Every implementation
+	// keeps the bytes: permanent removal belongs to the bucket lifecycle, and this
+	// interface deliberately cannot reach it (§5.11, §21.3, INV-14). A marked object
+	// stops answering Get/Head/List, so callers see it as gone.
 	Delete(ctx context.Context, key string) error
 }
