@@ -9,6 +9,7 @@ package gc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -21,6 +22,21 @@ import (
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/wal/format"
+)
+
+// Sentinel errors. Both mean the same thing operationally: the sweep refused to
+// judge, and nothing was marked. That is always the safe direction — an object that
+// is collected one cycle late costs storage, an object collected one cycle early
+// costs data (INV-14).
+var (
+	// ErrUnreadableAnchor means a manifest or checkpoint could not be parsed, does
+	// not describe itself (its RootDigest disagrees with its contents), or names a
+	// parent snapshot whose manifest is gone. An anchor we cannot read is a reason
+	// to stop, never a reason to widen the sweep.
+	ErrUnreadableAnchor = errors.New("gc: unreadable anchor")
+	// ErrClockSkew means object timestamps are ahead of the GC's clock, so the two
+	// clocks disagree and the grace period cannot be evaluated.
+	ErrClockSkew = errors.New("gc: object timestamps are ahead of the GC clock")
 )
 
 // refHolder captures the "objects" list shared by manifests and checkpoints.
