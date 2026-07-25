@@ -2,11 +2,25 @@
 
 Short snapshot. Update at every increment close.
 
-- **Date:** 2026-07-24
-- **Current phase:** **Phase 01 COMPLETE** (skeleton barrier). Plan approved by human.
-- **Increments:** 1.1, 1.2, 1.3, 1.4 all done. **INV-01 + INV-02 active.**
-- **Blockers:** none. Branch `phase-01/increment-1.1-skeleton-lint`. Phase 01 exit gate
-  green; awaiting human steer on what to build next (see "Next 3 steps").
+- **Date:** 2026-07-25
+- **Current phase:** **Phase 01 + Phase 04 COMPLETE** (pure-Go phases). Phases 02/03
+  planned (need VM/QEMU infra). Phase 05 (crypto + DISCARD) is next.
+- **Active invariants:** INV-01, INV-02, INV-03, INV-04(bounds), INV-05, INV-18.
+- **Branches:** `phase-01/...` (Phases 0/01, 02/03 plans) merged-forward into
+  `phase-04/wal-cow` (Phase 04). Nothing merged to `main` yet — **pending human review**,
+  especially the WAL format (ADR-0005 / DEV-0001, header size 104≠96).
+- **Blockers:** none for pure-Go work; format review recommended before merge to main.
+
+## Phase 04 — COMPLETE (WAL/CoW correctness spine)
+
+- 4.1 format v2 (record+object headers, little-endian, CRC32C, crypto fields reserved,
+  golden-bytes lock, deterministic S3 key). **Format decision ADR-0005 / DEV-0001.**
+- 4.2 serialize/replay + §25.2 property test (INV-05): truncation at every byte + bit
+  corruption → exact state XOR detected error, never silently wrong.
+- 4.3 write-path Log: watermarks (INV-03), unflushed bounds + backpressure (INV-04),
+  interval-map read view (§13.2, memory ~ working set), no PUT on WRITE (INV-18).
+- 4.4 active map: roaring-bitmap presence + location table over 64 KiB segments
+  (§13.3); memory-bounded over a 1 TiB universe (10k scattered segments < 1 MiB).
 
 ## Increment 1.4 — DONE
 
@@ -86,22 +100,23 @@ Go 1.26 · module `github.com/spin-stack/storage` in `spin-stack/storage/` · Ta
 golangci-lint (+ custom `simulable` analyzer) · GitHub Actions · parallel tracks after
 Phase 01. (ADR-0001/0002/0003.)
 
-## Next 3 steps (needs human steer)
+## Next steps
 
-Phase 01 barrier is done, so parallel tracks (ADR-0002) are unlocked. Options:
+Pure-Go phases that build here, in dependency order:
 
-1. **Track A — Phase 02** (guest layout: three devices + OverlayFS) and **Phase 03**
-   (vhost-user-blk + QEMU 11.0.2 inflight shmfd): highest-value data path, but need
-   real infrastructure (mounts, QEMU) **not present in this sandbox** — best done where
-   that infra exists; RISK-10 (inflight-shmfd) is *Unverified* until then.
-2. **Track A — Phase 04** (CoW 64 KiB + local WAL, real extents, format v2 w/ crypto
-   fields + WAL property tests §25.2): **pure Go, fully buildable here**, and the
-   correctness spine (activates INV-03/04/05/18). Strong candidate to continue now.
-3. **Track D — S3 client subsystem** (§24: hedged GETs, retry budget, circuit breaker
-   over the `objectstore` interface): pure Go, buildable here, feeds Phase 06/08/11.
+1. **Phase 05** — per-volume encryption (AES-256-GCM, DEK/KEK, dev KMS) + DISCARD/
+   WRITE_ZEROES end-to-end. Flips on the reserved `KeyId`/`AuthTag` fields (no format
+   change). Activates INV-15 (nothing leaves the host in clear). Human-review zone
+   (crypto/durability-adjacent). **Next.**
+2. **Phase 06** — remote WAL: on-demand batching + PUT idempotency + summary objects
+   over the locked object format. Activates INV-07 (ordering), INV-21 (PUT idempotency),
+   full INV-04.
+3. **Track D** — S3 client subsystem (§24) can proceed in parallel (disjoint files).
 
-Recommendation: continue with **Phase 04** here (pure Go, unblocks 05/06), and schedule
-Phases 02/03 for an environment with QEMU/mounts.
+Deferred (need infra): Phases 02/03 (VM/mounts, QEMU 11.0.2).
+
+**Recommended before more phases:** human review + merge of the WAL format
+(ADR-0005 / DEV-0001) to `main`, since everything downstream builds on it.
 
 ## Open questions for the human (non-blocking; defaults recorded as assumptions)
 
