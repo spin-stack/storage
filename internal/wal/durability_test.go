@@ -205,6 +205,101 @@ func TestLocalModeIgnoresLeaseForFlush(t *testing.T) {
 // somebody remembering to call SetLease. TestRemoteModeWithoutALeaseFailsClosed
 // below asserts the opposite, which is what §12.2 requires.
 
+// TestWriteFUAIsInAVerifiedObjectBeforeItReturns is the FUA half of §14.8's remote
+// contract: the three properties TestFlushAcksWhileLeaseValid asserts for a FLUSH,
+// applied to the write that carries the flag. A FUA write that returns before its
+// record is in S3 is a write the guest believes is on stable media and a host loss
+// destroys.
+func TestWriteFUAIsInAVerifiedObjectBeforeItReturns(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	lm := lease.NewManager(clk, 10*time.Second)
+	lm.Grant()
+
+	l := remoteLeasedLog(t, store, clk, lm)
+	seq, err := l.WriteFUA(ctx, 0, []byte("fua-payload"))
+	if err != nil {
+		t.Fatalf("FUA write with a valid lease: %v", err)
+	}
+	prefix, err := recovery.DurablePrefix(ctx, store, [16]byte{7}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefix < seq {
+		t.Fatalf("FUA write of sequence %d returned with S3 reproducing only %d", seq, prefix)
+	}
+	if l.Watermarks().Durable != seq {
+		t.Fatalf("durable = %d after a FUA write of %d", l.Watermarks().Durable, seq)
+	}
+}
+
+// TestWriteFUASelfFencesWhenTheLeaseExpired: §12.2 gates the FUA ACK exactly as it
+// gates the FLUSH ACK — the object may be in S3, but a host that no longer owns the
+// volume must not confirm the write.
+func TestWriteFUASelfFencesWhenTheLeaseExpired(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	lm := lease.NewManager(clk, 10*time.Second)
+	lm.Grant()
+
+	l := remoteLeasedLog(t, store, clk, lm)
+	clk.Advance(11 * time.Second) // the lease expires with no renewal
+
+	if _, err := l.WriteFUA(ctx, 0, []byte("fua-payload")); !errors.Is(err, wal.ErrSelfFenced) {
+		t.Fatalf("want ErrSelfFenced, got %v", err)
+	}
+	if l.Watermarks().Durable != 0 {
+		t.Fatalf("durable advanced to %d on an unfenced FUA write", l.Watermarks().Durable)
+	}
+	if !l.Fenced() {
+		t.Fatal("the log should have self-fenced")
+	}
+}
+
+// TestWriteFUAWithoutALeaseFailsClosed: DEV-0004 for the FUA path — a remote volume
+// with nothing fencing it must not ACK.
+func TestWriteFUAWithoutALeaseFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/active.wal")
+	vol := [16]byte{16}
+	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), nil)
+
+	if _, err := l.WriteFUA(ctx, 0, []byte("fua-payload")); !errors.Is(err, wal.ErrNoLease) {
+		t.Fatalf("want ErrNoLease, got %v", err)
+	}
+	if l.Watermarks().Durable != 0 {
+		t.Fatalf("durable advanced to %d on a fenceless FUA write", l.Watermarks().Durable)
+	}
+}
+
+// TestLocalModeWriteFUAAcksOnFdatasync: §14.8 rule 3 applies to FUA as well — a
+// `local` volume ACKs on the local sync, and S3 catches up asynchronously.
+func TestLocalModeWriteFUAAcksOnFdatasync(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/local.wal")
+	l := wal.NewLog(f, clk, [16]byte{17}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.SetDurabilityMode(wal.ModeLocal)
+
+	seq, err := l.WriteFUA(ctx, 0, []byte("fua-payload"))
+	if err != nil {
+		t.Fatalf("a local-mode FUA write must ACK on fdatasync: %v", err)
+	}
+	if seq != 1 {
+		t.Fatalf("sequence = %d, want 1", seq)
+	}
+	if l.Fenced() {
+		t.Fatal("local mode must not self-fence")
+	}
+}
+
 // TestModeForCoversEveryDurability: the data path and the Control Plane must agree on
 // the §14.8 vocabulary. If a mode is added to lifecycle and not mapped here, this
 // fails — the two ends cannot drift apart silently (ADR-0009).

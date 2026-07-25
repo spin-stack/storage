@@ -3,6 +3,7 @@ package wal_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -249,6 +250,47 @@ func TestEncryptedWriteSurvivesTheS3RoundTrip(t *testing.T) {
 	view.Read(0, buf)
 	if !bytes.Equal(buf, payload) {
 		t.Fatalf("recovered %q, want %q", buf, payload)
+	}
+}
+
+// TestDecryptRejectsAKeyVersionItDoesNotHold: rotation (§15.1) leaves history sealed
+// under older DEK versions, so a record whose KeyID this volume does not hold is a
+// *missing key*, not a tamper. Reporting it as a GCM authentication failure aborts
+// the recovery of every remaining epoch instead of naming the version to fetch — and
+// it hides a genuinely mixed-key epoch behind the same error a bit flip produces.
+func TestDecryptRejectsAKeyVersionItDoesNotHold(t *testing.T) {
+	dek, err := crypto.GenerateDEK(&ramp{b: 2}, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := &wal.Encryption{DEK: dek, VolumeID: [16]byte{9, 9, 9}}
+
+	sealed := wal.Record{Type: format.RecordWrite, Epoch: 1, Sequence: 1, KeyID: 9, Payload: []byte("ciphertext")}
+	_, err = enc.Decrypt(sealed)
+	if !errors.Is(err, wal.ErrUnknownKeyID) {
+		t.Fatalf("want ErrUnknownKeyID, got %v", err)
+	}
+	if errors.Is(err, crypto.ErrOpen) {
+		t.Fatal("a key version we do not hold must not be reported as tamper")
+	}
+}
+
+// TestNewEncryptionRefusesAnUnversionedDEK guards the checked constructor: KeyID 0 is
+// the plaintext marker, so it can never be a DEK version.
+func TestNewEncryptionRefusesAnUnversionedDEK(t *testing.T) {
+	dek, err := crypto.GenerateDEK(&ramp{b: 4}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.NewEncryption(dek, [16]byte{9}); !errors.Is(err, wal.ErrUnversionedKey) {
+		t.Fatalf("want ErrUnversionedKey, got %v", err)
+	}
+	versioned, err := crypto.GenerateDEK(&ramp{b: 4}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.NewEncryption(versioned, [16]byte{9}); err != nil {
+		t.Fatalf("a versioned DEK must be accepted: %v", err)
 	}
 }
 
