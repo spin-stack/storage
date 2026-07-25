@@ -18,6 +18,17 @@ var (
 	// ErrPreconditionFailed is a 412: If-None-Match:* on an existing key, or a
 	// failed If-Match CAS.
 	ErrPreconditionFailed = errors.New("simio/objectstore: precondition failed")
+	// ErrRestoreSuperseded means the key was written again after it was marked, so
+	// the marked version is no longer the one a restore would surface. The un-GC
+	// runbook step ("restore what the sweep marked") cannot be honoured, and
+	// returning the newer bytes instead would hand an operator a volume rebuilt from
+	// content that was never what was marked.
+	ErrRestoreSuperseded = errors.New("simio/objectstore: the marked version was superseded by a later write")
+	// ErrBucketNotFound is the container itself being absent or unreachable — a
+	// misconfiguration, never "this object is not there". Recovery reads a missing
+	// key as "nothing was written yet"; reading a missing *bucket* the same way
+	// would declare an empty durable prefix for a volume whose data is intact.
+	ErrBucketNotFound = errors.New("simio/objectstore: bucket not found")
 )
 
 // PutOptions carries conditional-write semantics.
@@ -58,6 +69,17 @@ type Store interface {
 	// Delete places a reversible delete marker over the key. Every implementation
 	// keeps the bytes: permanent removal belongs to the bucket lifecycle, and this
 	// interface deliberately cannot reach it (§5.11, §21.3, INV-14). A marked object
-	// stops answering Get/Head/List, so callers see it as gone.
+	// stops answering Get/Head/List, so callers see it as gone. Deleting a key that
+	// is already marked, or was never there, is ErrNotFound.
 	Delete(ctx context.Context, key string) error
+	// Restore removes the delete marker: the operator action the whole INV-14
+	// argument rests on ("a GC mistake costs a restore, not the data"). It is part
+	// of the interface, not an extra some implementations happen to offer, because
+	// an implementation that cannot reverse a mark makes every reachability bug
+	// permanent — and nothing would catch that at compile time.
+	//
+	// ErrNotFound if the key carries no delete marker; ErrRestoreSuperseded if it
+	// was written again after being marked, so the marked version is no longer what
+	// a restore would surface.
+	Restore(ctx context.Context, key string) error
 }

@@ -44,7 +44,12 @@ func TestGCMarksOrphansNotLive(t *testing.T) {
 	// Structural metadata + a live WAL object referenced by a checkpoint.
 	_ = descriptor.Write(ctx, store, descriptor.Descriptor{VolumeID: vol, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
 	live := putWAL(t, store, v, 1, 1, 2)
-	if err := checkpoint.Publish(ctx, store, checkpoint.Checkpoint{VolumeID: vol, Epoch: 1, DurableSequence: 2, Objects: []string{live}}); err != nil {
+	// A real checkpoint carries the digest over its own contents (§21.1); the sweep
+	// refuses an anchor that does not describe itself, so publish one that does.
+	if err := checkpoint.Publish(ctx, store, checkpoint.Checkpoint{
+		VolumeID: vol, Epoch: 1, DurableSequence: 2, Objects: []string{live},
+		RootDigest: checkpoint.Digest(2, []string{live}),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// An orphan WAL object no checkpoint/manifest references.

@@ -9,23 +9,78 @@ package gc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/spin-stack/storage/internal/checkpoint"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/snapshot"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
 
-// refHolder captures the "objects" list shared by manifests and checkpoints.
-type refHolder struct {
-	Objects []string `json:"objects"`
+// Sentinel errors. Both mean the same thing operationally: the sweep refused to
+// judge, and nothing was marked. That is always the safe direction — an object that
+// is collected one cycle late costs storage, an object collected one cycle early
+// costs data (INV-14).
+var (
+	// ErrUnreadableAnchor means a manifest or checkpoint could not be parsed, does
+	// not describe itself (its RootDigest disagrees with its contents), or names a
+	// parent snapshot whose manifest is gone. An anchor we cannot read is a reason
+	// to stop, never a reason to widen the sweep.
+	ErrUnreadableAnchor = errors.New("gc: unreadable anchor")
+	// ErrClockSkew means object timestamps are ahead of the GC's clock, so the two
+	// clocks disagree and the grace period cannot be evaluated.
+	ErrClockSkew = errors.New("gc: object timestamps are ahead of the GC clock")
+)
+
+// MaxClockSkew is how far an object's LastModified may sit in the future of the GC's
+// own clock before the sweep refuses to judge ages. The two timestamps come from two
+// machines: a little skew is normal, a lot means the grace period is meaningless.
+const MaxClockSkew = 5 * time.Second
+
+// anchor is a manifest or checkpoint: the two objects that keep WAL objects alive by
+// naming them. Both are self-describing — RootDigest is computed over (sequence,
+// object keys) — which is what lets the sweep tell a real anchor from a half-written
+// one without asking anybody.
+type anchor struct {
+	objects []string
+	// parent is the snapshot this one chains from, "" for a root snapshot.
+	parent string
+	// volume owns the parent lineage: a parent manifest lives under the same volume.
+	volume string
+}
+
+// readAnchor decodes and validates the anchor at key. Anything it cannot fully
+// verify is ErrUnreadableAnchor: the sweep's only safe response to an anchor it
+// cannot read is to stop, because "anchors nothing" and "could not be read" are
+// indistinguishable to the mark phase and one of them destroys a snapshot.
+func readAnchor(key string, body []byte) (anchor, error) {
+	if strings.HasPrefix(key, "checkpoints/") {
+		var cp checkpoint.Checkpoint
+		if err := json.Unmarshal(body, &cp); err != nil {
+			return anchor{}, fmt.Errorf("%w: %s: %w", ErrUnreadableAnchor, key, err)
+		}
+		if !cp.DigestMatches() {
+			return anchor{}, fmt.Errorf("%w: %s: root digest does not match its contents", ErrUnreadableAnchor, key)
+		}
+		return anchor{objects: cp.Objects, volume: cp.VolumeID}, nil
+	}
+	var m snapshot.Manifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return anchor{}, fmt.Errorf("%w: %s: %w", ErrUnreadableAnchor, key, err)
+	}
+	if !m.DigestMatches() {
+		return anchor{}, fmt.Errorf("%w: %s: root digest does not match its contents", ErrUnreadableAnchor, key)
+	}
+	return anchor{objects: m.Objects, parent: m.ParentSnapshotID, volume: m.VolumeID}, nil
 }
 
 // Reachable computes the set of reachable object keys: every structural object
@@ -48,6 +103,11 @@ func Reachable(ctx context.Context, store objectstore.Store) (map[string]bool, e
 	if err := addDurablePrefixes(ctx, store, all, reachable); err != nil {
 		return nil, err
 	}
+	present := make(map[string]bool, len(all))
+	for _, info := range all {
+		present[info.Key] = true
+	}
+	var lineage []anchor
 	for _, info := range all {
 		key := info.Key
 		isWALObject := strings.HasPrefix(key, "wal/") && strings.HasSuffix(key, ".wal")
@@ -55,21 +115,43 @@ func Reachable(ctx context.Context, store objectstore.Store) (map[string]bool, e
 			// Structural metadata is always reachable.
 			reachable[key] = true
 		}
-		// Manifests and checkpoints anchor their referenced WAL objects.
-		if strings.HasSuffix(key, "manifest.json") || strings.HasPrefix(key, "checkpoints/") {
-			body, err := store.Get(ctx, key)
-			if err != nil {
-				return nil, err
-			}
-			var r refHolder
-			if err := json.Unmarshal(body, &r); err == nil {
-				for _, o := range r.Objects {
-					reachable[o] = true
-				}
-			}
+		if !isAnchor(key) {
+			continue
+		}
+		// Manifests and checkpoints anchor their referenced WAL objects. A GET that
+		// fails — including the anchor being retired between the LIST and here — is
+		// a reason to abort: the alternative is to treat it as anchoring nothing.
+		body, err := store.Get(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %w", ErrUnreadableAnchor, key, err)
+		}
+		a, err := readAnchor(key, body)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range a.objects {
+			reachable[o] = true
+		}
+		if a.parent != "" {
+			lineage = append(lineage, a)
+		}
+	}
+	// A snapshot chains to its parent, and it is the *parent* manifest that
+	// enumerates the parent's objects. If the parent is gone — a cost-control
+	// lifecycle rule on old manifests, an operator expiring a snapshot — this sweep
+	// can no longer know what the parent anchored, and marking that difference
+	// destroys the child. Stop instead (finding 9).
+	for _, a := range lineage {
+		if parentKey := snapshot.ManifestKey(a.volume, a.parent); !present[parentKey] {
+			return nil, fmt.Errorf("%w: parent snapshot manifest %s is gone", ErrUnreadableAnchor, parentKey)
 		}
 	}
 	return reachable, nil
+}
+
+// isAnchor reports whether key names a manifest or a checkpoint.
+func isAnchor(key string) bool {
+	return strings.HasSuffix(key, "manifest.json") || strings.HasPrefix(key, "checkpoints/")
 }
 
 // Collect returns the keys the GC would mark: everything not in reachable. It never
@@ -105,34 +187,78 @@ func Collect(ctx context.Context, store objectstore.Store, reachable map[string]
 //     manifest that anchors them).
 //
 // Marking is idempotent: an already-marked object is invisible to the scan, so a
-// second pass reports nothing new.
+// second pass reports nothing new, and a key another sweep marked underneath this one
+// is not an error.
 func Mark(ctx context.Context, store objectstore.Store, clk clock.Clock, reachable map[string]bool, grace time.Duration) ([]string, error) {
 	return MarkWithRecorder(ctx, store, clk, reachable, grace, nil)
 }
 
 // MarkWithRecorder is Mark with the §26.2 telemetry it owns: gc_marked_bytes_total
 // and orphan_objects_total, recorded where the decision happens (DEV-0010).
+//
+// The order of the phases is the safety argument:
+//
+//  1. LIST, then refuse outright if the object timestamps sit ahead of our clock —
+//     the ages the grace period is computed from would be meaningless (ErrClockSkew);
+//  2. select the candidates: unreachable *and* aged past grace;
+//  3. re-derive reachability immediately before marking, and drop anything that has
+//     become reachable since the caller computed its set. §21.1 publishes the
+//     objects before the manifest that anchors them, so a publication landing during
+//     the sweep is exactly the case where the caller's set is stale;
+//  4. only then place the delete markers.
 func MarkWithRecorder(ctx context.Context, store objectstore.Store, clk clock.Clock, reachable map[string]bool, grace time.Duration, rec *obs.Recorder) ([]string, error) {
 	all, err := store.List(ctx, "")
 	if err != nil {
 		return nil, err
 	}
 	now := clk.Wall()
-	var marked []string
+	var candidates []objectstore.ObjectInfo
 	for _, info := range all {
+		// An object stamped in our future means the GC's clock and the backend's
+		// disagree (or ours walked backwards). Every age then reads negative, every
+		// object looks protected forever, and the bucket grows with nothing to show
+		// for it. Say so; a silent no-op is not a signal (finding 4).
+		if info.LastModified.Sub(now) > MaxClockSkew {
+			return nil, fmt.Errorf("%w: %s is stamped %s, now is %s",
+				ErrClockSkew, info.Key, info.LastModified, now)
+		}
 		if reachable[info.Key] {
 			continue
 		}
 		if grace > 0 && now.Sub(info.LastModified) < grace {
 			continue // too young to judge: a publication may still be in flight
 		}
+		candidates = append(candidates, info)
+	}
+	// The orphan population this pass observed — recorded even when the pass dies
+	// part-way, because a GC that is stuck finding the same orphans and failing to
+	// mark them is precisely what the gauge exists to show.
+	defer rec.Gauge(ctx, "orphan_objects_total", float64(len(candidates)))
+
+	var marked []string
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	confirmed, err := Reachable(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	for _, info := range candidates {
+		if confirmed[info.Key] {
+			continue // anchored while this sweep was running (§21.1)
+		}
 		if err := store.Delete(ctx, info.Key); err != nil {
+			if errors.Is(err, objectstore.ErrNotFound) {
+				// Another sweep marked it first (an overrunning cron, an operator
+				// running the sweep by hand). Already in the intended state.
+				continue
+			}
+			sort.Strings(marked)
 			return marked, fmt.Errorf("gc: mark %s: %w", info.Key, err)
 		}
 		marked = append(marked, info.Key)
 		rec.Count(ctx, "gc_marked_bytes_total", info.Size)
 	}
-	rec.Gauge(ctx, "orphan_objects_total", float64(len(marked)))
 	sort.Strings(marked)
 	return marked, nil
 }

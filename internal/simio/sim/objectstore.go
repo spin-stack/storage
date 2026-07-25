@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -46,8 +47,14 @@ type simObject struct {
 	// answering reads and listings, and its bytes stay until the lifecycle sweeps
 	// them. Nothing in this package removes a marked object's data — that is the
 	// structural half of INV-14.
-	marked    bool
-	createdAt time.Time
+	marked bool
+	// superseded records that the object was written again *after* it was marked, so
+	// the marked version is no longer what a Restore would surface. Answering such a
+	// restore with the newer bytes is the one outcome an operator must never get:
+	// they believe the un-GC runbook worked and rebuild a volume from content that
+	// was never the content that was marked (§21.3).
+	superseded bool
+	createdAt  time.Time
 }
 
 // NewObjectStore returns an empty store with strongly consistent LIST.
@@ -123,7 +130,8 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 		return objectstore.PutResult{}, ErrThrottled
 	}
 	existing, exists := s.objs[key]
-	if exists && existing.marked {
+	rewroteAMarkedKey := exists && existing.marked
+	if rewroteAMarkedKey {
 		// A delete marker is the latest version: to a conditional write the object
 		// does not exist, which is how S3 behaves on a versioned bucket.
 		exists = false
@@ -136,10 +144,11 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	}
 
 	stored := &simObject{
-		data:      append([]byte(nil), data...),
-		etag:      simEtag(data),
-		listReady: !s.eventualList,
-		createdAt: s.now(),
+		data:       append([]byte(nil), data...),
+		etag:       simEtag(data),
+		listReady:  !s.eventualList,
+		superseded: rewroteAMarkedKey,
+		createdAt:  s.now(),
 	}
 	s.objs[key] = stored
 
@@ -214,15 +223,26 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 		return objectstore.ErrNotFound
 	}
 	o.marked = true
+	// This version is now the one a restore would bring back.
+	o.superseded = false
 	return nil
 }
 
-// Restore removes the delete marker, the operator action behind "un-GC this".
+// Restore removes the delete marker, the operator action behind "un-GC this"
+// (INV-14). ErrNotFound if the key carries no marker; ErrRestoreSuperseded if it was
+// written again after being marked, because the marked version is then no longer
+// what a restore surfaces and returning the newer bytes would be silently wrong.
 func (s *ObjectStore) Restore(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	o, ok := s.objs[key]
 	if !ok {
+		return objectstore.ErrNotFound
+	}
+	if o.superseded {
+		return fmt.Errorf("%w: %s", objectstore.ErrRestoreSuperseded, key)
+	}
+	if !o.marked {
 		return objectstore.ErrNotFound
 	}
 	o.marked = false

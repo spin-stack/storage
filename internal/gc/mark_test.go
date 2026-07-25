@@ -2,6 +2,7 @@ package gc_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/spin-stack/storage/internal/gc"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/internal/snapshot"
 )
 
 // DEV-0006. INV-14 claims the GC "only marks, never deletes" and that the interface
@@ -179,8 +181,19 @@ func TestReachableAnchorsWALObjectsFromManifests(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "wal/v/1/anchored.wal", "wal/v/1/orphan.wal")
-	if _, err := store.Put(ctx, "snapshots/v/s1/manifest.json",
-		[]byte(`{"objects":["wal/v/1/anchored.wal"]}`), objectstore.PutOptions{}); err != nil {
+	// Published the way snapshot.Publish does it: with the root digest that says
+	// "these objects, this sequence". A manifest without one is not an anchor the
+	// sweep may act on (finding 2).
+	m := snapshot.Manifest{
+		SnapshotID: "s1", VolumeID: "v", Epoch: 1, TargetSequence: 1,
+		Objects: []string{"wal/v/1/anchored.wal"},
+	}
+	m.RootDigest = snapshot.Digest(m.TargetSequence, m.Objects)
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(ctx, "snapshots/v/s1/manifest.json", body, objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
