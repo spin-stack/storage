@@ -22,6 +22,27 @@ ON CONFLICT (host_id) DO UPDATE
 -- name: GetHost :one
 SELECT * FROM hosts WHERE host_id = $1;
 
+-- name: ListHosts :many
+-- Deterministic order: placement decisions must not depend on row order (INV-02).
+SELECT * FROM hosts ORDER BY host_id;
+
+-- name: SetHostState :execrows
+-- cordon / drain / mark dead (§28.1), term-guarded.
+UPDATE hosts
+   SET state = $2
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3;
+
+-- name: CommitHostCapacity :execrows
+-- Reserve (positive) or release (negative) committed NVMe bytes (§28.2), term-
+-- guarded. The non-negative guard makes an over-release affect 0 rows instead of
+-- corrupting the accounting.
+UPDATE hosts
+   SET nvme_committed_bytes = nvme_committed_bytes + $2
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND nvme_committed_bytes + $2 >= 0;
+
 -- name: RenewHostLease :execrows
 -- Grouped per-host lease renewal (§12.6), term-guarded.
 WITH valid AS (

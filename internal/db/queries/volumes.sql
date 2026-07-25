@@ -2,14 +2,19 @@
 -- Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
 -- by rebuild-metadata (§22.5) from the authoritative S3 epoch object.
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $9
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $11
 )
-INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state, dek_wrapped, kek_id)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8
+INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
+                     dek_wrapped, kek_id, primary_host_id, chain_depth)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 WHERE EXISTS (SELECT 1 FROM valid);
 
 -- name: GetVolume :one
 SELECT * FROM volumes WHERE volume_id = $1;
+
+-- name: ListVolumesByHost :many
+-- The volumes a drain must evacuate (§28.1), in a deterministic order.
+SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id;
 
 -- name: BumpVolumeEpoch :one
 -- Increment the epoch and set the primary host, term-guarded. Returns 0 rows if

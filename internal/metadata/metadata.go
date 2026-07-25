@@ -23,6 +23,18 @@ var (
 	ErrNotFound = errors.New("metadata: not found")
 	// ErrShrinkNotAllowed means a resize tried to reduce a volume's size (§3 non-goal).
 	ErrShrinkNotAllowed = errors.New("metadata: volume shrink not allowed")
+	// ErrCapacityUnderflow means a capacity release would drive a host's committed
+	// bytes below zero — an accounting bug, never silently clamped (§28.2).
+	ErrCapacityUnderflow = errors.New("metadata: committed capacity would go negative")
+)
+
+// Host states (§28.1). Only ACTIVE hosts receive new placements: CORDONED takes no
+// new work, DRAINING is being evacuated, DEAD is fenced out of the fleet.
+const (
+	HostActive   = "ACTIVE"
+	HostCordoned = "CORDONED"
+	HostDraining = "DRAINING"
+	HostDead     = "DEAD"
 )
 
 // Leader is the single-active Control Plane record (§7).
@@ -108,6 +120,14 @@ type Store interface {
 	UpsertHost(ctx context.Context, term int64, h Host) error
 	// GetHost returns a host.
 	GetHost(ctx context.Context, hostID string) (Host, error)
+	// ListHosts returns every host ordered by host id (deterministic, INV-02).
+	ListHosts(ctx context.Context) ([]Host, error)
+	// SetHostState transitions a host between the Host* states (term-guarded, §28.1).
+	SetHostState(ctx context.Context, term int64, hostID, state string) error
+	// CommitHostCapacity adds deltaBytes to a host's committed NVMe (negative
+	// releases), term-guarded. A release below zero fails with ErrCapacityUnderflow
+	// instead of being clamped (§28.2).
+	CommitHostCapacity(ctx context.Context, term int64, hostID string, deltaBytes int64) error
 	// RenewHostLease renews (or grants) a host's lease with the given TTL (term-guarded).
 	RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error
 	// GetHostLease returns a host's lease.
@@ -117,6 +137,9 @@ type Store interface {
 	CreateVolume(ctx context.Context, term int64, v Volume) error
 	// GetVolume returns a volume.
 	GetVolume(ctx context.Context, volumeID string) (Volume, error)
+	// ListVolumesByHost returns the volumes whose primary is hostID, ordered by
+	// volume id — what a drain iterates over (§28.1).
+	ListVolumesByHost(ctx context.Context, hostID string) ([]Volume, error)
 	// BumpVolumeEpoch increments the epoch and sets the primary host (term-guarded),
 	// returning the new epoch (§12.3).
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error)

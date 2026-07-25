@@ -6,6 +6,7 @@ package sim
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,6 +40,8 @@ func New(now func() time.Time) *Store {
 		snaps:  map[string]metadata.Snapshot{},
 	}
 }
+
+var _ metadata.Store = (*Store)(nil)
 
 func (s *Store) checkTerm(term int64) error {
 	if term != s.leaderTerm {
@@ -86,6 +89,50 @@ func (s *Store) GetHost(_ context.Context, hostID string) (metadata.Host, error)
 	return h, nil
 }
 
+func (s *Store) ListHosts(_ context.Context) ([]metadata.Host, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hosts := make([]metadata.Host, 0, len(s.hosts))
+	for _, h := range s.hosts {
+		hosts = append(hosts, h)
+	}
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].HostID < hosts[j].HostID })
+	return hosts, nil
+}
+
+func (s *Store) SetHostState(_ context.Context, term int64, hostID, state string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	h, ok := s.hosts[hostID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	h.State = state
+	s.hosts[hostID] = h
+	return nil
+}
+
+func (s *Store) CommitHostCapacity(_ context.Context, term int64, hostID string, deltaBytes int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	h, ok := s.hosts[hostID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	if h.NVMeCommittedBytes+deltaBytes < 0 {
+		return metadata.ErrCapacityUnderflow
+	}
+	h.NVMeCommittedBytes += deltaBytes
+	s.hosts[hostID] = h
+	return nil
+}
+
 func (s *Store) RenewHostLease(_ context.Context, term int64, hostID string, ttlSeconds int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,6 +178,19 @@ func (s *Store) GetVolume(_ context.Context, volumeID string) (metadata.Volume, 
 		return metadata.Volume{}, metadata.ErrNotFound
 	}
 	return v, nil
+}
+
+func (s *Store) ListVolumesByHost(_ context.Context, hostID string) ([]metadata.Volume, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var vols []metadata.Volume
+	for _, v := range s.vols {
+		if v.PrimaryHostID == hostID {
+			vols = append(vols, v)
+		}
+	}
+	sort.Slice(vols, func(i, j int) bool { return vols[i].VolumeID < vols[j].VolumeID })
+	return vols, nil
 }
 
 func (s *Store) BumpVolumeEpoch(_ context.Context, term int64, volumeID, primaryHostID string) (int64, error) {

@@ -177,6 +177,141 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 	}
 }
 
+// TestListHostsIsSortedAndComplete: the fleet surface used by placement must be
+// deterministic (INV-02), so ListHosts returns every host ordered by id.
+func TestListHostsIsSortedAndComplete(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	term, _ := s.AcquireLeadership(ctx, "cp")
+
+	for _, id := range []string{"h-c", "h-a", "h-b"} {
+		if err := s.UpsertHost(ctx, term, metadata.Host{HostID: id, State: "ACTIVE"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hosts, err := s.ListHosts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, h := range hosts {
+		got = append(got, h.HostID)
+	}
+	if len(got) != 3 || got[0] != "h-a" || got[1] != "h-b" || got[2] != "h-c" {
+		t.Fatalf("ListHosts = %v, want sorted [h-a h-b h-c]", got)
+	}
+}
+
+// TestSetHostState is cordon/drain (§28.1): a term-guarded state transition.
+func TestSetHostState(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	term, _ := s.AcquireLeadership(ctx, "cp")
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: "ACTIVE"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetHostState(ctx, term, "h1", "CORDONED"); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := s.GetHost(ctx, "h1")
+	if h.State != "CORDONED" {
+		t.Fatalf("state = %q, want CORDONED", h.State)
+	}
+
+	// A zombie CP cannot cordon or uncordon (§7).
+	stale := term
+	_, _ = s.AcquireLeadership(ctx, "cp-b")
+	if err := s.SetHostState(ctx, stale, "h1", "ACTIVE"); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("stale SetHostState: want ErrStaleTerm, got %v", err)
+	}
+	if h, _ := s.GetHost(ctx, "h1"); h.State != "CORDONED" {
+		t.Fatalf("zombie CP changed the state to %q", h.State)
+	}
+}
+
+// TestCommitHostCapacity is the §28.2 accounting: reservations add, releases
+// subtract, and committed bytes can never go negative.
+func TestCommitHostCapacity(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	term, _ := s.AcquireLeadership(ctx, "cp")
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: "ACTIVE", NVMeTotalBytes: 1000}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CommitHostCapacity(ctx, term, "h1", 400); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitHostCapacity(ctx, term, "h1", 300); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 700 {
+		t.Fatalf("committed = %d, want 700", h.NVMeCommittedBytes)
+	}
+
+	// Release.
+	if err := s.CommitHostCapacity(ctx, term, "h1", -400); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 300 {
+		t.Fatalf("committed after release = %d, want 300", h.NVMeCommittedBytes)
+	}
+
+	// Releasing more than is committed is a bug, not a silent negative.
+	if err := s.CommitHostCapacity(ctx, term, "h1", -301); !errors.Is(err, metadata.ErrCapacityUnderflow) {
+		t.Fatalf("underflow: want ErrCapacityUnderflow, got %v", err)
+	}
+	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 300 {
+		t.Fatalf("failed release still mutated committed to %d", h.NVMeCommittedBytes)
+	}
+
+	// Term-guarded and existence-checked.
+	stale := term
+	_, _ = s.AcquireLeadership(ctx, "cp-b")
+	if err := s.CommitHostCapacity(ctx, stale, "h1", 1); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("stale commit: want ErrStaleTerm, got %v", err)
+	}
+	newTerm, _ := s.AcquireLeadership(ctx, "cp-c")
+	if err := s.CommitHostCapacity(ctx, newTerm, "absent", 1); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("missing host: want ErrNotFound, got %v", err)
+	}
+	if err := s.SetHostState(ctx, newTerm, "absent", "CORDONED"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("missing host SetHostState: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestListVolumesByHost is what drain iterates over (§28.1): exactly the volumes
+// whose primary is that host, in a deterministic order.
+func TestListVolumesByHost(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	term, _ := s.AcquireLeadership(ctx, "cp")
+
+	vols := []metadata.Volume{
+		{VolumeID: "v-b", State: "ACTIVE", PrimaryHostID: "h1"},
+		{VolumeID: "v-a", State: "ACTIVE", PrimaryHostID: "h1"},
+		{VolumeID: "v-c", State: "ACTIVE", PrimaryHostID: "h2"},
+		{VolumeID: "v-d", State: "ACTIVE"}, // unattached
+	}
+	for _, v := range vols {
+		if err := s.CreateVolume(ctx, term, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.ListVolumesByHost(ctx, "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].VolumeID != "v-a" || got[1].VolumeID != "v-b" {
+		t.Fatalf("ListVolumesByHost(h1) = %+v, want sorted [v-a v-b]", got)
+	}
+	if got, _ := s.ListVolumesByHost(ctx, "h3"); len(got) != 0 {
+		t.Fatalf("ListVolumesByHost(h3) = %+v, want empty", got)
+	}
+}
+
 func TestHostLeaseRenewal(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()

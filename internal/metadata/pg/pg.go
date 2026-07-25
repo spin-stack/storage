@@ -25,6 +25,8 @@ type Store struct {
 // New returns a Store over any pgx DBTX (pool, conn, or tx).
 func New(conn db.DBTX) *Store { return &Store{q: db.New(conn)} }
 
+var _ metadata.Store = (*Store)(nil)
+
 // --- id / null helpers (string boundary <-> uuid columns, ADR-0007) ---
 
 func nullUUID(s string) pgtype.UUID {
@@ -110,12 +112,76 @@ func (s *Store) GetHost(ctx context.Context, hostID string) (metadata.Host, erro
 	if err != nil {
 		return metadata.Host{}, notFound(err)
 	}
+	return hostFromRow(h), nil
+}
+
+// hostFromRow converts a generated row to the interface type.
+func hostFromRow(h *db.Host) metadata.Host {
 	return metadata.Host{
 		HostID: h.HostID.String(), State: h.State, AgentVersion: h.AgentVersion,
 		MaxFormatVersion: h.MaxFormatVersion, NVMeTotalBytes: h.NvmeTotalBytes,
 		NVMeUsedBytes: h.NvmeUsedBytes, NVMeCommittedBytes: h.NvmeCommittedBytes,
 		LastHeartbeat: fromTS(h.LastHeartbeat),
-	}, nil
+	}
+}
+
+func (s *Store) ListHosts(ctx context.Context) ([]metadata.Host, error) {
+	rows, err := s.q.ListHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hosts := make([]metadata.Host, 0, len(rows))
+	for _, h := range rows {
+		hosts = append(hosts, hostFromRow(h))
+	}
+	return hosts, nil
+}
+
+func (s *Store) SetHostState(ctx context.Context, term int64, hostID, state string) error {
+	id, err := uuid.Parse(hostID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.SetHostState(ctx, db.SetHostStateParams{HostID: id, State: state, Term: term})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		// 0 rows: stale term or a host that does not exist.
+		if _, gerr := s.GetHost(ctx, hostID); errors.Is(gerr, metadata.ErrNotFound) {
+			return metadata.ErrNotFound
+		}
+		return metadata.ErrStaleTerm
+	}
+	return nil
+}
+
+func (s *Store) CommitHostCapacity(ctx context.Context, term int64, hostID string, deltaBytes int64) error {
+	id, err := uuid.Parse(hostID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.CommitHostCapacity(ctx, db.CommitHostCapacityParams{
+		HostID: id, NvmeCommittedBytes: deltaBytes, Term: term,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		// 0 rows: missing host, an over-release (the non-negative guard), or a stale
+		// term — disambiguated so the caller gets an actionable error (§28.2).
+		h, gerr := s.GetHost(ctx, hostID)
+		switch {
+		case errors.Is(gerr, metadata.ErrNotFound):
+			return metadata.ErrNotFound
+		case gerr != nil:
+			return gerr
+		case h.NVMeCommittedBytes+deltaBytes < 0:
+			return metadata.ErrCapacityUnderflow
+		}
+		return metadata.ErrStaleTerm
+	}
+	return nil
 }
 
 func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {
@@ -155,8 +221,21 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume)
 	return staleIfZero(s.q.CreateVolume(ctx, db.CreateVolumeParams{
 		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability,
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State,
-		DekWrapped: v.DEKWrapped, KekID: v.KEKID, Term: term,
+		DekWrapped: v.DEKWrapped, KekID: v.KEKID,
+		PrimaryHostID: nullUUID(v.PrimaryHostID), ChainDepth: v.ChainDepth, Term: term,
 	}))
+}
+
+// volumeFromRow converts a generated row to the interface type.
+func volumeFromRow(v *db.Volume) metadata.Volume {
+	return metadata.Volume{
+		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes, Durability: v.Durability,
+		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State,
+		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
+		ChainDepth: v.ChainDepth, DEKWrapped: v.DekWrapped, KEKID: v.KekID,
+		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
+		PublishedSequence: v.PublishedSequence,
+	}
 }
 
 func (s *Store) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
@@ -168,14 +247,23 @@ func (s *Store) GetVolume(ctx context.Context, volumeID string) (metadata.Volume
 	if err != nil {
 		return metadata.Volume{}, notFound(err)
 	}
-	return metadata.Volume{
-		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes, Durability: v.Durability,
-		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State,
-		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
-		ChainDepth: v.ChainDepth, DEKWrapped: v.DekWrapped, KEKID: v.KekID,
-		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
-		PublishedSequence: v.PublishedSequence,
-	}, nil
+	return volumeFromRow(v), nil
+}
+
+func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadata.Volume, error) {
+	id, err := uuid.Parse(hostID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListVolumesByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	vols := make([]metadata.Volume, 0, len(rows))
+	for _, v := range rows {
+		vols = append(vols, volumeFromRow(v))
+	}
+	return vols, nil
 }
 
 func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error) {

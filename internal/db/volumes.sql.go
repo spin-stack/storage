@@ -39,23 +39,26 @@ func (q *Queries) BumpVolumeEpoch(ctx context.Context, arg BumpVolumeEpochParams
 
 const createVolume = `-- name: CreateVolume :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $9
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $11
 )
-INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state, dek_wrapped, kek_id)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8
+INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
+                     dek_wrapped, kek_id, primary_host_id, chain_depth)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 WHERE EXISTS (SELECT 1 FROM valid)
 `
 
 type CreateVolumeParams struct {
-	VolumeID     uuid.UUID `json:"volume_id"`
-	SizeBytes    int64     `json:"size_bytes"`
-	Durability   string    `json:"durability"`
-	BlockSize    int32     `json:"block_size"`
-	CurrentEpoch int64     `json:"current_epoch"`
-	State        string    `json:"state"`
-	DekWrapped   []byte    `json:"dek_wrapped"`
-	KekID        string    `json:"kek_id"`
-	Term         int64     `json:"term"`
+	VolumeID      uuid.UUID   `json:"volume_id"`
+	SizeBytes     int64       `json:"size_bytes"`
+	Durability    string      `json:"durability"`
+	BlockSize     int32       `json:"block_size"`
+	CurrentEpoch  int64       `json:"current_epoch"`
+	State         string      `json:"state"`
+	DekWrapped    []byte      `json:"dek_wrapped"`
+	KekID         string      `json:"kek_id"`
+	PrimaryHostID pgtype.UUID `json:"primary_host_id"`
+	ChainDepth    int32       `json:"chain_depth"`
+	Term          int64       `json:"term"`
 }
 
 // Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
@@ -70,6 +73,8 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.State,
 		arg.DekWrapped,
 		arg.KekID,
+		arg.PrimaryHostID,
+		arg.ChainDepth,
 		arg.Term,
 	)
 	if err != nil {
@@ -106,6 +111,50 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.UpdatedAt,
 	)
 	return &i, err
+}
+
+const listVolumesByHost = `-- name: ListVolumesByHost :many
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+`
+
+// The volumes a drain must evacuate (§28.1), in a deterministic order.
+func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UUID) ([]*Volume, error) {
+	rows, err := q.db.Query(ctx, listVolumesByHost, primaryHostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*Volume{}
+	for rows.Next() {
+		var i Volume
+		if err := rows.Scan(
+			&i.VolumeID,
+			&i.SizeBytes,
+			&i.Durability,
+			&i.BlockSize,
+			&i.CurrentEpoch,
+			&i.State,
+			&i.PrimaryHostID,
+			&i.StandbyHostID,
+			&i.ActiveRootID,
+			&i.PublishedRootID,
+			&i.ChainDepth,
+			&i.DekWrapped,
+			&i.KekID,
+			&i.LocalSequence,
+			&i.DurableSequence,
+			&i.PublishedSequence,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const resizeVolume = `-- name: ResizeVolume :execrows

@@ -117,6 +117,84 @@ func TestPGOperationIdempotency(t *testing.T) {
 	}
 }
 
+// TestPGFleetSurface exercises the §28.1/§28.2 fleet operations against real
+// Postgres: cordon, capacity reservation/release with the non-negative guard, and
+// the two listings a drain iterates over.
+func TestPGFleetSurface(t *testing.T) {
+	ctx := context.Background()
+	store := pg.New(startPostgres(t))
+	term, err := store.AcquireLeadership(ctx, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hostA, hostB := ids.New().String(), ids.New().String()
+	if hostB < hostA {
+		hostA, hostB = hostB, hostA // ListHosts is ordered by id
+	}
+	for _, id := range []string{hostA, hostB} {
+		if err := store.UpsertHost(ctx, term, metadata.Host{
+			HostID: id, State: metadata.HostActive, NVMeTotalBytes: 1000,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hosts, err := store.ListHosts(ctx)
+	if err != nil || len(hosts) != 2 || hosts[0].HostID != hostA || hosts[1].HostID != hostB {
+		t.Fatalf("ListHosts = %+v err=%v", hosts, err)
+	}
+
+	// Cordon (§28.1).
+	if err := store.SetHostState(ctx, term, hostA, metadata.HostCordoned); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := store.GetHost(ctx, hostA); h.State != metadata.HostCordoned {
+		t.Fatalf("state = %q, want CORDONED", h.State)
+	}
+	if err := store.SetHostState(ctx, term, ids.New().String(), metadata.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("SetHostState on a missing host: want ErrNotFound, got %v", err)
+	}
+
+	// Capacity accounting (§28.2): reserve, release, and refuse to go negative.
+	if err := store.CommitHostCapacity(ctx, term, hostA, 700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitHostCapacity(ctx, term, hostA, -200); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 500 {
+		t.Fatalf("committed = %d, want 500", h.NVMeCommittedBytes)
+	}
+	if err := store.CommitHostCapacity(ctx, term, hostA, -501); !errors.Is(err, metadata.ErrCapacityUnderflow) {
+		t.Fatalf("over-release: want ErrCapacityUnderflow, got %v", err)
+	}
+	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 500 {
+		t.Fatalf("failed release mutated committed to %d", h.NVMeCommittedBytes)
+	}
+	staleTerm := term
+	term, _ = store.AcquireLeadership(ctx, "cp-b")
+	if err := store.CommitHostCapacity(ctx, staleTerm, hostA, 1); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("stale-term commit: want ErrStaleTerm, got %v", err)
+	}
+
+	// Volumes by host: exactly the ones whose primary is that host.
+	volID := ids.New().String()
+	if err := store.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: "ACTIVE",
+		DEKWrapped: []byte{1}, KEKID: "k", PrimaryHostID: hostA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vols, err := store.ListVolumesByHost(ctx, hostA)
+	if err != nil || len(vols) != 1 || vols[0].VolumeID != volID {
+		t.Fatalf("ListVolumesByHost(hostA) = %+v err=%v", vols, err)
+	}
+	if vols, _ := store.ListVolumesByHost(ctx, hostB); len(vols) != 0 {
+		t.Fatalf("ListVolumesByHost(hostB) = %+v, want empty", vols)
+	}
+}
+
 // TestPGRejectsNonV7 proves the DB-layer INV-22 enforcement: a v4 id is refused.
 func TestPGRejectsNonV7(t *testing.T) {
 	ctx := context.Background()

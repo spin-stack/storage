@@ -11,6 +11,31 @@ import (
 	"github.com/google/uuid"
 )
 
+const commitHostCapacity = `-- name: CommitHostCapacity :execrows
+UPDATE hosts
+   SET nvme_committed_bytes = nvme_committed_bytes + $2
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND nvme_committed_bytes + $2 >= 0
+`
+
+type CommitHostCapacityParams struct {
+	HostID             uuid.UUID `json:"host_id"`
+	NvmeCommittedBytes int64     `json:"nvme_committed_bytes"`
+	Term               int64     `json:"term"`
+}
+
+// Reserve (positive) or release (negative) committed NVMe bytes (§28.2), term-
+// guarded. The non-negative guard makes an over-release affect 0 rows instead of
+// corrupting the accounting.
+func (q *Queries) CommitHostCapacity(ctx context.Context, arg CommitHostCapacityParams) (int64, error) {
+	result, err := q.db.Exec(ctx, commitHostCapacity, arg.HostID, arg.NvmeCommittedBytes, arg.Term)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getHost = `-- name: GetHost :one
 SELECT host_id, state, agent_version, max_format_version, nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat FROM hosts WHERE host_id = $1
 `
@@ -47,6 +72,40 @@ func (q *Queries) GetHostLease(ctx context.Context, hostID uuid.UUID) (*HostLeas
 	return &i, err
 }
 
+const listHosts = `-- name: ListHosts :many
+SELECT host_id, state, agent_version, max_format_version, nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat FROM hosts ORDER BY host_id
+`
+
+// Deterministic order: placement decisions must not depend on row order (INV-02).
+func (q *Queries) ListHosts(ctx context.Context) ([]*Host, error) {
+	rows, err := q.db.Query(ctx, listHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*Host{}
+	for rows.Next() {
+		var i Host
+		if err := rows.Scan(
+			&i.HostID,
+			&i.State,
+			&i.AgentVersion,
+			&i.MaxFormatVersion,
+			&i.NvmeTotalBytes,
+			&i.NvmeUsedBytes,
+			&i.NvmeCommittedBytes,
+			&i.LastHeartbeat,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const renewHostLease = `-- name: RenewHostLease :execrows
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $3
@@ -68,6 +127,28 @@ type RenewHostLeaseParams struct {
 // Grouped per-host lease renewal (§12.6), term-guarded.
 func (q *Queries) RenewHostLease(ctx context.Context, arg RenewHostLeaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, renewHostLease, arg.HostID, arg.TtlSeconds, arg.Term)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setHostState = `-- name: SetHostState :execrows
+UPDATE hosts
+   SET state = $2
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+`
+
+type SetHostStateParams struct {
+	HostID uuid.UUID `json:"host_id"`
+	State  string    `json:"state"`
+	Term   int64     `json:"term"`
+}
+
+// cordon / drain / mark dead (§28.1), term-guarded.
+func (q *Queries) SetHostState(ctx context.Context, arg SetHostStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setHostState, arg.HostID, arg.State, arg.Term)
 	if err != nil {
 		return 0, err
 	}
