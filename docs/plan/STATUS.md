@@ -57,6 +57,20 @@ serves a block device.
   configured, proven by the shared `objectstore` contract (`storetest`) against the
   real backend.
 
+## Test coverage of failure modes
+
+`TEST-GAPS.md` is the backlog from a six-way audit of the suite (2026-07-25), each
+finding checked by an adversary before it was accepted: 78 gaps confirmed, 7 of them
+critical. Five are already closed — a rejected WAL append that left its bytes behind,
+the uploader comparing an ETag against a SHA-256, the GC not treating the durable
+prefix as a root, a drain recording an epoch boundary below the durable point, and
+nine of eleven DST checkers that had never been shown to catch anything. The rest are
+listed there by severity.
+
+Three of the seven criticals were one root cause (the GC), which is the shape to
+expect: the suite covered the happy path thoroughly and the operational worst case
+barely at all.
+
 ## What to do next
 
 Seven of the eight deviations are closed (DEV-0003/0004/0005/0006/0008/0009/0010).
