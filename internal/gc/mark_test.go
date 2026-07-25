@@ -199,3 +199,9 @@ func TestReachableAnchorsWALObjectsFromManifests(t *testing.T) {
 		t.Fatalf("a manifest-anchored object was marked: %v", err)
 	}
 }
+
+// leaseOK is the fence for tests that are not about fencing: remote durability
+// requires a lease checker (DEV-0004), and these hold a valid one.
+type leaseOK struct{}
+
+func (leaseOK) Valid() bool { return true }
