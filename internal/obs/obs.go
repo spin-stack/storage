@@ -14,6 +14,7 @@ import (
 
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
@@ -67,4 +68,21 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 		return err
 	}
 	return p.mp.Shutdown(ctx)
+}
+
+// CollectedMetrics returns the set of metric names that actually carry data, which
+// is what a test asserting "this path records telemetry" needs: the registry always
+// knows the name, so only collection can tell recorded from merely declared.
+func (p *Provider) CollectedMetrics(ctx context.Context) (map[string]bool, error) {
+	var rm metricdata.ResourceMetrics
+	if err := p.reader.Collect(ctx, &rm); err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			out[m.Name] = true
+		}
+	}
+	return out, nil
 }

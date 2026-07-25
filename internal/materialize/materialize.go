@@ -23,6 +23,7 @@ import (
 	"github.com/spin-stack/storage/internal/checkpoint"
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/ioclass"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/snapshot"
@@ -57,7 +58,12 @@ type Materializer struct {
 	store objectstore.Store
 	sched *ioclass.Scheduler
 	enc   *wal.Encryption
+	rec   *obs.Recorder // nil = telemetry not wired (no-op)
 }
+
+// SetRecorder wires the §26.2 metric this path owns: bytes_downloaded_before_boot,
+// which is the measured cold RTO input of §29.4 (DEV-0010).
+func (m *Materializer) SetRecorder(r *obs.Recorder) { m.rec = r }
 
 // New returns a Materializer.
 func New(store objectstore.Store, sched *ioclass.Scheduler, enc *wal.Encryption) *Materializer {
@@ -174,5 +180,6 @@ func (m *Materializer) fetchAndReplay(ctx context.Context, keys []string) (*cow.
 	if n := len(objs); n > 0 {
 		prog.UpTo = objs[n-1].last
 	}
+	m.rec.Gauge(ctx, "bytes_downloaded_before_boot", float64(prog.Bytes))
 	return view, prog, nil
 }

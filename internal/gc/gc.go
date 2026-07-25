@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
@@ -91,6 +92,12 @@ func Collect(ctx context.Context, store objectstore.Store, reachable map[string]
 // Marking is idempotent: an already-marked object is invisible to the scan, so a
 // second pass reports nothing new.
 func Mark(ctx context.Context, store objectstore.Store, clk clock.Clock, reachable map[string]bool, grace time.Duration) ([]string, error) {
+	return MarkWithRecorder(ctx, store, clk, reachable, grace, nil)
+}
+
+// MarkWithRecorder is Mark with the §26.2 telemetry it owns: gc_marked_bytes_total
+// and orphan_objects_total, recorded where the decision happens (DEV-0010).
+func MarkWithRecorder(ctx context.Context, store objectstore.Store, clk clock.Clock, reachable map[string]bool, grace time.Duration, rec *obs.Recorder) ([]string, error) {
 	all, err := store.List(ctx, "")
 	if err != nil {
 		return nil, err
@@ -108,7 +115,9 @@ func Mark(ctx context.Context, store objectstore.Store, clk clock.Clock, reachab
 			return marked, fmt.Errorf("gc: mark %s: %w", info.Key, err)
 		}
 		marked = append(marked, info.Key)
+		rec.Count(ctx, "gc_marked_bytes_total", info.Size)
 	}
+	rec.Gauge(ctx, "orphan_objects_total", float64(len(marked)))
 	sort.Strings(marked)
 	return marked, nil
 }

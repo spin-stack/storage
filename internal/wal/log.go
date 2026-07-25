@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/cow"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -71,6 +72,9 @@ type Log struct {
 	discardedBytes    int64
 	truncatedUpTo     uint64          // local WAL discarded up to this sequence (§14.7)
 	uploaded          []SummaryObject // durable objects, for the summary (§22.1)
+
+	rec      *obs.Recorder // nil = telemetry not wired (no-op)
+	volLabel string
 }
 
 // TruncatedUpTo reports the sequence below which local WAL has been reclaimed.
@@ -95,6 +99,29 @@ func (l *Log) TruncateLocal(upTo uint64) error {
 
 // SetDurabilityMode selects the FLUSH/FUA ACK contract (§14.8). Default is remote.
 func (l *Log) SetDurabilityMode(m DurabilityMode) { l.mode = m }
+
+// SetRecorder wires the §26.2 metrics this log owns: the watermarks, the unflushed
+// backlog, and the self-fencing counter. A nil recorder is a no-op, so the DST
+// harness and unit tests run without an exporter (DEV-0010).
+func (l *Log) SetRecorder(r *obs.Recorder, volumeLabel string) {
+	l.rec = r
+	l.volLabel = volumeLabel
+}
+
+// recordWatermarks publishes the watermark trio and the unflushed backlog. These are
+// the numbers an operator reads as the volume's RPO (§26.2), so they are recorded
+// where they change rather than sampled by a background poller.
+func (l *Log) recordWatermarks(ctx context.Context) {
+	if l.rec == nil {
+		return
+	}
+	vol := obs.String("volume", l.volLabel)
+	l.rec.Gauge(ctx, "wal_local_sequence", float64(l.local), vol)
+	l.rec.Gauge(ctx, "wal_durable_sequence", float64(l.durable), vol)
+	l.rec.Gauge(ctx, "wal_published_sequence", float64(l.published), vol)
+	l.rec.Gauge(ctx, "wal_unflushed_bytes", float64(l.unflushedBytes), vol)
+	l.rec.Gauge(ctx, "wal_durable_gap_bytes", float64(l.unflushedBytes), vol)
+}
 
 // SetLease wires the host lease checker used by the durable-ACK rule (§12.2).
 func (l *Log) SetLease(c LeaseChecker) { l.lease = c }
@@ -289,6 +316,7 @@ func (l *Log) Flush(ctx context.Context) error {
 		}
 		if !l.lease.Valid() {
 			l.fenced = true
+			l.rec.Count(ctx, "self_fenced_total", 1, obs.String("volume", l.volLabel))
 			return ErrSelfFenced
 		}
 	}
@@ -296,6 +324,7 @@ func (l *Log) Flush(ctx context.Context) error {
 		return err
 	}
 	l.clearUnflushed()
+	l.recordWatermarks(ctx)
 	return nil // step 7: ack
 }
 
