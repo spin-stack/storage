@@ -46,6 +46,7 @@ const (
 	EventFailover    EventKind = "failover"
 	EventSnapshot    EventKind = "snapshot"
 	EventTruncate    EventKind = "truncate"
+	EventIOClass     EventKind = "io-class"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -85,6 +86,10 @@ type Event struct {
 	// Truncate events (§21.1): the sequence local WAL was reclaimed to, and the
 	// verified published point. TruncatedUpTo must be <= Published (INV-13).
 	TruncatedUpTo uint64
+	// IOClass events (§5.9): whether a background op was granted while a
+	// foreground/flush op was in flight. Granted-while-high must never be true (INV-17).
+	BgGranted    bool
+	HighInFlight bool
 }
 
 // String renders an event deterministically for the trace.
@@ -110,6 +115,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d snapshot mutated=%t %s", e.Step, e.SnapshotMutated, e.Msg)
 	case EventTruncate:
 		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
+	case EventIOClass:
+		return fmt.Sprintf("%04d io-class bg_granted=%t high_in_flight=%t", e.Step, e.BgGranted, e.HighInFlight)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

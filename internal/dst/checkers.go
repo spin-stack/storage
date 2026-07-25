@@ -225,6 +225,23 @@ func (c *TruncateBelowPublishedChecker) Observe(e Event) {
 
 func (c *TruncateBelowPublishedChecker) Check() error { return c.violation }
 
+// BackgroundYieldsChecker enforces INV-17 (§5.9): a background op is never granted
+// while a foreground/flush op is in flight.
+type BackgroundYieldsChecker struct{ violation error }
+
+// NewBackgroundYieldsChecker returns a fresh checker.
+func NewBackgroundYieldsChecker() *BackgroundYieldsChecker { return &BackgroundYieldsChecker{} }
+
+func (c *BackgroundYieldsChecker) Name() string { return "background-yields" }
+
+func (c *BackgroundYieldsChecker) Observe(e Event) {
+	if e.Kind == EventIOClass && e.BgGranted && e.HighInFlight && c.violation == nil {
+		c.violation = fmt.Errorf("background I/O granted while foreground/flush in flight at step %d (violates §5.9/INV-17)", e.Step)
+	}
+}
+
+func (c *BackgroundYieldsChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
@@ -238,5 +255,6 @@ func DefaultCheckers() []Checker {
 		NewNoLostAckedWriteChecker(),
 		NewImmutableSnapshotChecker(),
 		NewTruncateBelowPublishedChecker(),
+		NewBackgroundYieldsChecker(),
 	}
 }

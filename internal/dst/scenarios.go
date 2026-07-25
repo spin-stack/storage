@@ -13,6 +13,7 @@ import (
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/gc"
+	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -65,7 +66,48 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "same-host-clone-independent", Run: scenarioSameHostCloneIndependent},
 		{Name: "checkpoint-then-truncate", Run: scenarioCheckpointThenTruncate},
 		{Name: "gc-marks-orphans-not-live", Run: scenarioGCMarksOrphansNotLive},
+		{Name: "background-yields-to-foreground", Run: scenarioBackgroundYields},
 	}
+}
+
+// scenarioBackgroundYields is INV-17 (§5.9, §11): background I/O yields whenever a
+// foreground or flush op is in flight, and stays within its token budget.
+func scenarioBackgroundYields(s *Sim) error {
+	sched := ioclass.NewScheduler(200)
+
+	// Idle: background is granted (within budget) and no high op is in flight.
+	g := sched.TryAcquire(ioclass.Background, 100)
+	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
+	if !g {
+		return errors.New("idle background within budget should be granted")
+	}
+
+	// Under contention: a foreground op in flight → background must yield.
+	sched.Begin(ioclass.Foreground)
+	g = sched.TryAcquire(ioclass.Background, 1)
+	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
+	if g {
+		return errors.New("background was granted while foreground in flight (INV-17)")
+	}
+	// A flush op too.
+	sched.Begin(ioclass.Flush)
+	g = sched.TryAcquire(ioclass.Background, 1)
+	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
+	if g {
+		return errors.New("background was granted while flush in flight (INV-17)")
+	}
+
+	// After the high ops drain, background resumes.
+	sched.End(ioclass.Foreground)
+	sched.End(ioclass.Flush)
+	sched.Refill()
+	g = sched.TryAcquire(ioclass.Background, 100)
+	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
+	if !g {
+		return errors.New("background should resume once high classes drain")
+	}
+	s.Notef("background yielded under foreground/flush contention, resumed when idle")
+	return nil
 }
 
 // scenarioGCMarksOrphansNotLive is INV-14 (§21.3, §5.11): the GC marks unreachable
