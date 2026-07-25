@@ -31,13 +31,22 @@ See ADR-0006, ADR-0007. Atlas installed via `curl -sSL https://atlasbinaries.com
 `~/.local/bin/atlas`.
 
 ## Current state (2026-07-25)
-Phases 0/01/04/05/06/07/08/09/10 complete on `main` (34 commits). 21/22 invariants active;
-only INV-19 (fleet-mixed) pending. Phases 02/03 planned (need infra). `task ci` green,
-coverage ≥ 90%, integration green on PG 18. See `docs/plan/STATUS.md` for the full handoff
-and next steps.
+Phases 0/01/04/05/06/07/08/09/10 complete on `main` (34 commits). **Phase 11 (cross-host
+materialization + cordon/drain + capacity) is done on branch `phase-11/cross-host-drain`,
+pending the human review of the fencing diff (11.2/11.3) before the `--ff-only` merge.**
+21/22 invariants active; only INV-19 (fleet-mixed) pending — Phase 11 adds no new
+invariant ID, it extends INV-08/09/10/11/16/17 to the host-move path. Phases 02/03 planned
+(need infra). `task ci` green, coverage ≥ 90%, integration green on PG 18. See
+`docs/plan/STATUS.md` for the full handoff and next steps.
 
 ## Gotchas
 - WAL headers are 104 bytes (ADR-0005), not the doc's "96".
+- Drain evacuates from the volume's durable prefix in S3, **not** from a source-taken
+  snapshot (ADR-0008 / DEV-0002): the doc's "snapshot + restore" needs a live, cooperating
+  source and the CP↔Agent RPC that Phases 02/03 will bring.
+- `sqlc` is not preinstalled: `go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0`
+  (lands in `~/go/bin`, not on PATH by default).
+- Postgres `jsonb` round-trips by value, not byte-for-byte — compare parsed JSON in tests.
 - Two real bugs the tests caught and fixed: `Log.Discard/WriteZeroes` not feeding the
   remote batcher; the sim network letting a closed conn Send.
 - Coverage: `-coverpkg=./...`; 90% floor excludes generated db / integration-only pg &

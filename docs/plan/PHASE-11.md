@@ -1,5 +1,8 @@
 # PHASE 11 — Cross-host por materialización completa + cordon/drain + capacidad
 
+> **DONE ✓** (11.1–11.3). One deviation recorded and resolved: **DEV-0002 / ADR-0008**
+> (drain evacuates from the durable prefix, not from a source-taken snapshot).
+
 > **Roadmap §30.11.** Depends on Phase 08 (recovery from S3), 09 (snapshots/clone),
 > 10 (checkpoints, I/O classes). Implements §20 (placement order, cross-host),
 > §22.3 (cold materialization), §28.1 (cordon/drain), §28.2 (capacity & placement),
@@ -97,7 +100,10 @@ reconciled operation, idempotent by `operation_id` (§18), with visible progress
 2. SetHostState(host, DRAINING).
 3. for each volume on the host (deterministic order):
      a. placement.Choose destination (prefers cached/standby, §20) + commit capacity
-     b. snapshot (pause-free, §19) → materialize on the destination (11.2)
+     b. materialize the destination from the epoch's durable prefix in S3 (11.2).
+        *(Implemented per ADR-0008: from the durable prefix, not from a source-taken
+        snapshot — the doc's "snapshot + restore" needs a live, cooperating source and
+        the CP↔Agent RPC of Phases 02/03. Same guarantee, works on a dead host.)*
      c. FENCING_WAIT → Promoter.Promote: epoch N+1 to the destination + epoch-object
         CAS + recovery-point (§12.3–12.5). The source is fenced before the destination
         writes: never two writers (INV-10).
@@ -125,14 +131,14 @@ Extends INV-09/10/11.
 
 ## Phase 11 exit gate
 
-- [ ] Placement honors the §20 order and the declared oversubscription policy; cordoned/
+- [x] Placement honors the §20 order and the declared oversubscription policy; cordoned/
       draining/dead hosts are never chosen; `host_nvme_committed_ratio` exported.
-- [ ] Capacity commit/release is term-guarded and cannot go negative.
-- [ ] Cross-host materialization uses S3 only (no host-to-host path) and refuses to
+- [x] Capacity commit/release is term-guarded and cannot go negative.
+- [x] Cross-host materialization uses S3 only (no host-to-host path) and refuses to
       produce a partial volume (missing object / gap / digest mismatch ⇒ hard error).
-- [ ] Materialization runs in the background I/O class and yields (INV-17).
-- [ ] Drain moves every volume with the full fencing protocol: no double writer, no lost
+- [x] Materialization runs in the background I/O class and yields (INV-17).
+- [x] Drain moves every volume with the full fencing protocol: no double writer, no lost
       ACKed write, no early grant; it is idempotent, resumable, and cancelable only at a
       volume boundary.
-- [ ] Both new DST scenarios in the mandatory set; `task ci` + `task cover` (≥ 90%) +
+- [x] Both new DST scenarios in the mandatory set; `task ci` + `task cover` (≥ 90%) +
       `task test:integration` green; `DEVIATIONS.md` clean.
