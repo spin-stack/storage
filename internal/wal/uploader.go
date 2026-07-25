@@ -1,9 +1,8 @@
 package wal
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -40,10 +39,6 @@ func NewUploader(store objectstore.Store, maxAttempts int) *Uploader {
 // object is verified present with the expected content.
 func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) {
 	obj := cb.Object()
-	// The store's ETag is the SHA-256 of the whole stored object (header + records),
-	// not the payload-only SHA that keys the object.
-	objSHA := sha256.Sum256(obj.Data)
-	expectedETag := hex.EncodeToString(objSHA[:])
 
 	var lastErr error
 	for attempt := 0; attempt < u.maxAttempts; attempt++ {
@@ -52,13 +47,27 @@ func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) 
 		case err == nil:
 			return obj.Key, nil
 		case errors.Is(err, objectstore.ErrPreconditionFailed):
-			// Already present: reconcile by HEAD + checksum (§14.5).
+			// Already present: reconcile against what is stored (§14.5). The ETag
+			// cannot decide this — it is a CAS token, not a content digest: S3
+			// returns a quoted MD5, and a multipart object's ETag is an MD5-of-MD5s
+			// with a `-N` suffix. Comparing our SHA-256 against it would report a
+			// byte-perfect object as divergent and wedge the volume forever. So the
+			// size is the cheap check and the bytes are the decisive one; this runs
+			// only on the rare lost-response path.
 			info, herr := u.store.Head(ctx, obj.Key)
 			if herr != nil {
 				lastErr = herr
 				continue
 			}
-			if info.Size != int64(len(obj.Data)) || info.ETag != expectedETag {
+			if info.Size != int64(len(obj.Data)) {
+				return "", ErrDivergentObject
+			}
+			stored, gerr := u.store.Get(ctx, obj.Key)
+			if gerr != nil {
+				lastErr = gerr
+				continue
+			}
+			if !bytes.Equal(stored, obj.Data) {
 				return "", ErrDivergentObject
 			}
 			return obj.Key, nil // idempotent success
