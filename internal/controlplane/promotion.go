@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/epoch"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/simio/clock"
 )
@@ -30,6 +31,21 @@ var ErrFencingWaitNotElapsed = errors.New("controlplane: fencing wait not elapse
 // grant: another Control Plane already promoted this volume further. Finishing our
 // own steps would fence the writer that won, so we stop instead (§12.4).
 var ErrEpochConflict = errors.New("controlplane: epoch object is ahead of this promotion")
+
+// ErrSourceLeaseUnknown means the Control Plane cannot say when the volume's current
+// primary last renewed its lease: there is no lease row and the caller supplied
+// nothing either. That is "I know nothing", not "the lease expired long ago" — after
+// a PITR restore or an operator cleanup of host_leases the source is very much alive
+// and valid for up to lease_ttl on its own monotonic clock. Promotion refuses until
+// a lease is observed or the host is recorded DEAD (§12.3, INV-11).
+var ErrSourceLeaseUnknown = errors.New("controlplane: the source host's lease is unknown")
+
+// ErrDestinationHostUnusable means the host being promoted to cannot take the
+// volume: it is not registered, or its fleet state does not accept placement. The
+// lease grant is the last of promotion's three writes and in PostgreSQL it has a
+// foreign key, so discovering this at that point leaves the old writer fenced and
+// nobody able to ACK (§8, §12.3).
+var ErrDestinationHostUnusable = errors.New("controlplane: destination host cannot take the volume")
 
 // Promoter runs the promotion protocol.
 type Promoter struct {
@@ -71,17 +87,34 @@ func (p *Promoter) FencingDeadline(renewedAt time.Time) time.Time {
 // skipped when the object already carries the target, and the lease grant is an
 // upsert. Two runs of the same promotion therefore grant one epoch — a second one
 // would fence the writer the first one just installed.
+//
+// oldLeaseRenewedAt is what the *caller* observed about the primary. It is a floor,
+// not the authority: the promoter reads the lease of the host it is actually fencing
+// (see fencingWaitElapsed), so a command that was overtaken — the volume moved to
+// another host since it was issued — waits on the lease of the host now serving it
+// instead of fencing a healthy writer with a stale instant.
 func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, oldLeaseRenewedAt time.Time, newHost string) (uint64, error) {
-	// Step 3: FENCING_WAIT. Adding max_clock_skew covers a CP wall clock running up
-	// to that far ahead of true time; a CP behind simply waits longer (§12.1).
-	if p.clk.Wall().Before(p.FencingDeadline(oldLeaseRenewedAt)) {
-		return 0, ErrFencingWaitNotElapsed
-	}
-
 	v, err := p.md.GetVolume(ctx, volumeID)
 	if err != nil {
 		return 0, err
 	}
+	// The host has to be able to hold the volume before anything is advanced.
+	// Starting a promotion also requires it to accept placement; finishing one that
+	// already moved the volume there does not — a cordon stops new work, it does not
+	// stop a host serving what it already holds.
+	if err := p.checkDestination(ctx, newHost, v.PrimaryHostID != newHost); err != nil {
+		return 0, err
+	}
+	// Step 3: FENCING_WAIT, measured against the host that is actually serving the
+	// volume. If that is already newHost, this is our own promotion being resumed:
+	// the wait was served the first time round, and re-waiting on the lease we just
+	// granted would strand the volume (§12.3 steps 3-5).
+	if v.PrimaryHostID != newHost {
+		if err := p.fencingWaitElapsed(ctx, v.PrimaryHostID, oldLeaseRenewedAt); err != nil {
+			return 0, err
+		}
+	}
+
 	stored, etag, err := p.epochs.Current(ctx, volumeID)
 	if err != nil {
 		return 0, err
@@ -124,4 +157,67 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 		return 0, err
 	}
 	return target, nil
+}
+
+// checkDestination refuses a host that cannot hold the volume. It is deliberately
+// the first thing Promote does: every later step is a durable write that fences
+// somebody.
+func (p *Promoter) checkDestination(ctx context.Context, hostID string, mustAcceptPlacement bool) error {
+	h, err := p.md.GetHost(ctx, hostID)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrDestinationHostUnusable, hostID, err)
+	}
+	if mustAcceptPlacement && !h.State.AcceptsPlacement() {
+		return fmt.Errorf("%w: %s is %s", ErrDestinationHostUnusable, hostID, h.State)
+	}
+	return nil
+}
+
+// fencingWaitElapsed reports whether the primary being fenced can still be ACKing
+// durability (§12.3 step 3). The caller's instant is a hint, not the authority: it
+// may have been read long ago, or from a host that is no longer the primary. The
+// promoter reads the lease of the host it is actually fencing and takes the most
+// conservative view of the two — including the TTL the lease was *granted* with,
+// which is what the Agent is counting down, even when this CP is configured with a
+// shorter one.
+//
+// With no lease row and nothing from the caller there is no conservative answer, so
+// the promotion is refused (ErrSourceLeaseUnknown) unless the fleet has recorded the
+// host as DEAD, which is the CP asserting that the writer is gone.
+func (p *Promoter) fencingWaitElapsed(ctx context.Context, primary string, callerRenewedAt time.Time) error {
+	if primary == "" {
+		return nil // no writer to fence
+	}
+	renewedAt, ttl := callerRenewedAt, p.leaseTTL
+
+	l, err := p.md.GetHostLease(ctx, primary)
+	switch {
+	case err == nil:
+		if renewedAt.Before(l.LastRenewal) {
+			renewedAt = l.LastRenewal
+		}
+		if granted := time.Duration(l.TTLSeconds) * time.Second; granted > ttl {
+			ttl = granted
+		}
+	case errors.Is(err, metadata.ErrNotFound):
+		if renewedAt.IsZero() && !p.observedDead(ctx, primary) {
+			return fmt.Errorf("%w: %s", ErrSourceLeaseUnknown, primary)
+		}
+	default:
+		return err
+	}
+
+	// Adding max_clock_skew covers a CP wall clock running up to that far ahead of
+	// true time; a CP behind simply waits longer (§12.1).
+	if p.clk.Wall().Before(renewedAt.Add(ttl + p.maxClockSkew)) {
+		return ErrFencingWaitNotElapsed
+	}
+	return nil
+}
+
+// observedDead reports whether the fleet has recorded the host as DEAD. A read
+// failure counts as "not observed": the fail-closed direction.
+func (p *Promoter) observedDead(ctx context.Context, hostID string) bool {
+	h, err := p.md.GetHost(ctx, hostID)
+	return err == nil && h.State == lifecycle.HostDead
 }
