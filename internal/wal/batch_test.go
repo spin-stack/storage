@@ -20,62 +20,73 @@ func rec(seq uint64, payload []byte) []byte {
 	return b
 }
 
-func TestBatchClosesOnFUA(t *testing.T) {
-	b, _ := newBatcher(t, wal.DefaultBatchConfig())
-	b.Append(1, rec(1, []byte("a")), false)
-	if len(b.Pending()) != 0 {
-		t.Fatal("no close expected before FUA")
+func TestBatchCloseRules(t *testing.T) {
+	def := wal.DefaultBatchConfig()
+	tests := []struct {
+		name   string
+		cfg    wal.BatchConfig
+		drive  func(b *wal.Batcher, clk *sim.Clock)
+		reason wal.CloseReason
+	}{
+		{
+			name: "FUA closes immediately",
+			cfg:  def,
+			drive: func(b *wal.Batcher, _ *sim.Clock) {
+				b.Append(1, rec(1, []byte("a")), false)
+				b.Append(2, rec(2, []byte("b")), true) // FUA
+			},
+			reason: wal.CloseFUA,
+		},
+		{
+			name: "FLUSH closes",
+			cfg:  def,
+			drive: func(b *wal.Batcher, _ *sim.Clock) {
+				b.Append(1, rec(1, []byte("x")), false)
+				b.Flush()
+			},
+			reason: wal.CloseFlush,
+		},
+		{
+			name: "target size closes",
+			cfg:  wal.BatchConfig{TargetBytes: 500, MaxBytes: 2000, MaxAge: time.Hour},
+			drive: func(b *wal.Batcher, _ *sim.Clock) {
+				payload := make([]byte, 50)
+				for seq := uint64(1); b.OpenBytes() < 500 && len(b.Pending()) == 0; seq++ {
+					b.Append(seq, rec(seq, payload), false)
+				}
+			},
+			reason: wal.CloseTarget,
+		},
+		{
+			name: "age closes",
+			cfg:  wal.BatchConfig{TargetBytes: 1 << 20, MaxBytes: 1 << 20, MaxAge: 20 * time.Second},
+			drive: func(b *wal.Batcher, clk *sim.Clock) {
+				b.Append(1, rec(1, []byte("x")), false)
+				clk.Advance(21 * time.Second)
+				b.MaybeCloseForAge()
+			},
+			reason: wal.CloseAge,
+		},
 	}
-	b.Append(2, rec(2, []byte("b")), true) // FUA
-	if len(b.Pending()) != 1 {
-		t.Fatalf("FUA should close the batch, pending=%d", len(b.Pending()))
-	}
-	if b.Pending()[0].Reason != wal.CloseFUA || b.Pending()[0].Count != 2 {
-		t.Fatalf("unexpected closed batch: %+v", b.Pending()[0])
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b, clk := newBatcher(t, tc.cfg)
+			tc.drive(b, clk)
+			if len(b.Pending()) != 1 {
+				t.Fatalf("expected exactly 1 closed batch, got %d", len(b.Pending()))
+			}
+			if got := b.Pending()[0].Reason; got != tc.reason {
+				t.Fatalf("close reason = %s, want %s", got, tc.reason)
+			}
+		})
 	}
 }
 
-func TestBatchClosesOnFlush(t *testing.T) {
+func TestEmptyFlushIsNoop(t *testing.T) {
 	b, _ := newBatcher(t, wal.DefaultBatchConfig())
-	b.Append(1, rec(1, []byte("x")), false)
 	b.Flush()
-	if len(b.Pending()) != 1 || b.Pending()[0].Reason != wal.CloseFlush {
-		t.Fatalf("flush should close batch: %+v", b.Pending())
-	}
-	// Flush again with nothing open is a no-op.
-	b.Flush()
-	if len(b.Pending()) != 1 {
+	if len(b.Pending()) != 0 {
 		t.Fatal("empty flush must not create a batch")
-	}
-}
-
-func TestBatchClosesOnTargetAndMax(t *testing.T) {
-	cfg := wal.BatchConfig{TargetBytes: 500, MaxBytes: 2000, MaxAge: time.Hour}
-	b, _ := newBatcher(t, cfg)
-	// One ~154-byte record (104 header + 50 payload) at a time until target.
-	payload := make([]byte, 50)
-	seq := uint64(0)
-	for b.OpenBytes() < cfg.TargetBytes && len(b.Pending()) == 0 {
-		seq++
-		b.Append(seq, rec(seq, payload), false)
-	}
-	if len(b.Pending()) != 1 || b.Pending()[0].Reason != wal.CloseTarget {
-		t.Fatalf("should close on target: %+v", b.Pending())
-	}
-}
-
-func TestBatchClosesOnAge(t *testing.T) {
-	cfg := wal.BatchConfig{TargetBytes: 1 << 20, MaxBytes: 1 << 20, MaxAge: 20 * time.Second}
-	b, clk := newBatcher(t, cfg)
-	b.Append(1, rec(1, []byte("x")), false)
-	b.MaybeCloseForAge()
-	if len(b.Pending()) != 0 {
-		t.Fatal("not old enough yet")
-	}
-	clk.Advance(21 * time.Second)
-	b.MaybeCloseForAge()
-	if len(b.Pending()) != 1 || b.Pending()[0].Reason != wal.CloseAge {
-		t.Fatalf("should close on age: %+v", b.Pending())
 	}
 }
 

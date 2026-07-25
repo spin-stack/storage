@@ -86,36 +86,31 @@ func TestObjectHeaderRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHeaderCorruptionDetected(t *testing.T) {
-	b, _ := sampleRecordHeader().MarshalBinary()
-	// Flip a byte in the middle (VolumeID region) — CRC must catch it.
-	corrupt := append([]byte(nil), b...)
-	corrupt[20] ^= 0xFF
-	if _, err := format.UnmarshalRecordHeader(corrupt); !errors.Is(err, format.ErrHeaderCRC) {
-		t.Fatalf("want ErrHeaderCRC on corruption, got %v", err)
-	}
-}
-
-func TestBadMagicAndVersion(t *testing.T) {
-	b, _ := sampleRecordHeader().MarshalBinary()
-
-	badMagic := append([]byte(nil), b...)
-	badMagic[0] = 'X'
-	if _, err := format.UnmarshalRecordHeader(badMagic); !errors.Is(err, format.ErrBadMagic) {
-		t.Fatalf("want ErrBadMagic, got %v", err)
+func TestRecordHeaderDecodeErrors(t *testing.T) {
+	valid, _ := sampleRecordHeader().MarshalBinary()
+	// mutate returns a copy of valid with one byte replaced.
+	mutate := func(i int, v byte) []byte {
+		b := append([]byte(nil), valid...)
+		b[i] = v
+		return b
 	}
 
-	badVer := append([]byte(nil), b...)
-	badVer[4] = 0xFF // bump version, then repair CRC so version is what fails
-	// Recompute nothing: version check happens before CRC, so this is fine.
-	if _, err := format.UnmarshalRecordHeader(badVer); !errors.Is(err, format.ErrBadVersion) {
-		t.Fatalf("want ErrBadVersion, got %v", err)
+	tests := []struct {
+		name  string
+		input []byte
+		want  error
+	}{
+		{"body corruption caught by CRC", mutate(20, valid[20]^0xFF), format.ErrHeaderCRC},
+		{"bad magic", mutate(0, 'X'), format.ErrBadMagic},      // checked before CRC
+		{"bad version", mutate(4, 0xFF), format.ErrBadVersion}, // checked before CRC
+		{"short buffer", make([]byte, 10), format.ErrShortBuf},
 	}
-}
-
-func TestShortBuffer(t *testing.T) {
-	if _, err := format.UnmarshalRecordHeader(make([]byte, 10)); !errors.Is(err, format.ErrShortBuf) {
-		t.Fatalf("want ErrShortBuf, got %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := format.UnmarshalRecordHeader(tc.input); !errors.Is(err, tc.want) {
+				t.Fatalf("want %v, got %v", tc.want, err)
+			}
+		})
 	}
 }
 

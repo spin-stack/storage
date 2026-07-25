@@ -60,23 +60,28 @@ func TestTamperFailsClosed(t *testing.T) {
 	var vol [16]byte
 	ct, tag, _ := d.Seal(vol, 1, 1, []byte("secret"))
 
-	// Flip a ciphertext bit.
-	bad := append([]byte(nil), ct...)
-	bad[0] ^= 0x01
-	if _, err := d.Open(vol, 1, 1, bad, tag); !errors.Is(err, crypto.ErrOpen) {
-		t.Fatalf("ciphertext tamper: want ErrOpen, got %v", err)
-	}
+	flippedCT := append([]byte(nil), ct...)
+	flippedCT[0] ^= 0x01
+	flippedTag := tag
+	flippedTag[0] ^= 0x01
 
-	// Flip a tag bit.
-	badTag := tag
-	badTag[0] ^= 0x01
-	if _, err := d.Open(vol, 1, 1, ct, badTag); !errors.Is(err, crypto.ErrOpen) {
-		t.Fatalf("tag tamper: want ErrOpen, got %v", err)
+	tests := []struct {
+		name       string
+		ct         []byte
+		tag        [crypto.TagSize]byte
+		epoch, seq uint64
+	}{
+		{"ciphertext bit flip", flippedCT, tag, 1, 1},
+		{"tag bit flip", ct, flippedTag, 1, 1},
+		{"wrong seq (aad/nonce mismatch)", ct, tag, 1, 2},
+		{"wrong epoch (aad/nonce mismatch)", ct, tag, 2, 1},
 	}
-
-	// Wrong (volume,epoch,seq) — AAD/nonce mismatch — must fail.
-	if _, err := d.Open(vol, 1, 2, ct, tag); !errors.Is(err, crypto.ErrOpen) {
-		t.Fatalf("wrong seq: want ErrOpen, got %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := d.Open(vol, tc.epoch, tc.seq, tc.ct, tc.tag); !errors.Is(err, crypto.ErrOpen) {
+				t.Fatalf("want ErrOpen, got %v", err)
+			}
+		})
 	}
 }
 

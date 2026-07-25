@@ -65,18 +65,36 @@ func TestZombieCPCannotMutate(t *testing.T) {
 
 func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 	ctx := context.Background()
-	s := newStore()
-	stale, _ := s.AcquireLeadership(ctx, "cp-a")
-	_, _ = s.AcquireLeadership(ctx, "cp-b") // stale is now old
-
-	if err := s.UpsertHost(ctx, stale, metadata.Host{HostID: "h"}); !errors.Is(err, metadata.ErrStaleTerm) {
-		t.Fatalf("UpsertHost stale: %v", err)
+	tests := []struct {
+		name string
+		mut  func(s *sim.Store, staleTerm int64) error
+	}{
+		{"UpsertHost", func(s *sim.Store, term int64) error {
+			return s.UpsertHost(ctx, term, metadata.Host{HostID: "h"})
+		}},
+		{"RenewHostLease", func(s *sim.Store, term int64) error {
+			return s.RenewHostLease(ctx, term, "h", 10)
+		}},
+		{"CreateVolume", func(s *sim.Store, term int64) error {
+			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v"})
+		}},
+		{"BumpVolumeEpoch", func(s *sim.Store, term int64) error {
+			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h")
+			return err
+		}},
+		{"UpdateWatermarks", func(s *sim.Store, term int64) error {
+			return s.UpdateWatermarks(ctx, term, "v", 1, 1, 1)
+		}},
 	}
-	if err := s.RenewHostLease(ctx, stale, "h", 10); !errors.Is(err, metadata.ErrStaleTerm) {
-		t.Fatalf("RenewHostLease stale: %v", err)
-	}
-	if err := s.CreateVolume(ctx, stale, metadata.Volume{VolumeID: "v"}); !errors.Is(err, metadata.ErrStaleTerm) {
-		t.Fatalf("CreateVolume stale: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore()
+			stale, _ := s.AcquireLeadership(ctx, "cp-a")
+			_, _ = s.AcquireLeadership(ctx, "cp-b") // stale is now old
+			if err := tc.mut(s, stale); !errors.Is(err, metadata.ErrStaleTerm) {
+				t.Fatalf("want ErrStaleTerm, got %v", err)
+			}
+		})
 	}
 }
 
