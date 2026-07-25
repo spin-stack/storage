@@ -1,4 +1,5 @@
-h1:ksWMf+eNg8aWMn9Jj2OuvMff1Isrud53qG2ugVd9Rss=
+h1:idIs9ApVArTRWMEl8wYeWAcc0812Rv8ZzE9sBr02hhY=
 20260725111325_initial.sql h1:Vs4MY2xFCc4g43LQt/qF49Rn0rwwrmGPwgBBc09qVVU=
 20260725112223_uuidv7_checks.sql h1:/kNOxHHrU5UTOH6nnO0/WvCOdopYAb25X/DpC+Hz+I0=
 20260725192437_lifecycle_state_checks.sql h1:5InOkSyyquNmAub+rOVXWJZK4qqZATfNIoSHOu48OU0=
+20260725194240_fk_and_query_indexes.sql h1:484cvn5Y1r5aVu2rNrf7qnOCjOipl2oVocAGQh0Iez4=

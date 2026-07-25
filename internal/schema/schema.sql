@@ -105,3 +105,42 @@ CREATE TABLE operations (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Indexes.
+--
+-- Two rules, both checked by tests:
+--
+-- 1. Every foreign-key *referencing* column is indexed. Postgres creates an index
+--    for the referenced side (the PK) but never for the referencing side, so without
+--    these every DELETE/UPDATE on a parent row (a host being decommissioned, a
+--    volume being removed) sequentially scans the child table while holding locks —
+--    and each child lookup does too. `TestPGEveryForeignKeyHasAnIndex` fails if a
+--    future FK arrives without one.
+-- 2. A query with a filter + ORDER BY gets a composite index in that order, so the
+--    planner can skip the sort. Today that is ListVolumesByHost, the loop a drain
+--    iterates (§28.1).
+--
+-- Deliberately NOT added yet (no query uses them; each has a named trigger so the
+-- index lands with its query rather than on speculation):
+--   * operations (phase) WHERE phase NOT IN ('SUCCEEDED','CANCELED') — a partial
+--     index for "find work to reconcile". Needed when the reconciler loop lands
+--     (§7); without it that scan grows with completed-operation history.
+--   * hosts (last_heartbeat) / host_leases (last_renewal) — expiry sweeps (§12.3).
+--     The fleet is hundreds of rows; a sequential scan is cheaper than the index
+--     until it is not.
+--   * snapshots (volume_id, created_at DESC) — newest-first catalog listing (§19).
+--     The FK index below covers the lookup; add the sort key when the listing query
+--     exists.
+
+-- ListVolumesByHost: WHERE primary_host_id = $1 ORDER BY volume_id (§28.1 drain).
+-- Composite so the index satisfies both the filter and the ordering; it also serves
+-- as the FK index for primary_host_id.
+CREATE INDEX volumes_primary_host_id_volume_id_idx ON volumes (primary_host_id, volume_id);
+
+-- FK indexes (rule 1).
+CREATE INDEX volumes_standby_host_id_idx ON volumes (standby_host_id);
+CREATE INDEX snapshots_volume_id_idx ON snapshots (volume_id);
+CREATE INDEX snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);
+CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
+CREATE INDEX operations_volume_id_idx ON operations (volume_id);
+CREATE INDEX operations_host_id_idx ON operations (host_id);

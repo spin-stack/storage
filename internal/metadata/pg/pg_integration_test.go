@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -369,5 +370,105 @@ func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
 	got, _ := store.GetOperation(ctx, op.OperationID)
 	if got.Phase != lifecycle.OpSucceeded {
 		t.Fatalf("phase = %q after a refused transition", got.Phase)
+	}
+}
+
+// TestPGEveryForeignKeyHasAnIndex is the structural rule from schema.sql: Postgres
+// indexes the referenced side of a foreign key (the primary key) but never the
+// referencing column, so without an explicit index every parent DELETE/UPDATE — a
+// host being decommissioned, a volume removed — sequentially scans the child table
+// while holding locks. This fails the moment a FK is added without its index.
+func TestPGEveryForeignKeyHasAnIndex(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+
+	const q = `
+SELECT c.conrelid::regclass::text AS child_table, a.attname AS column_name, c.conname
+  FROM pg_constraint c
+  JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+ WHERE c.contype = 'f'
+   AND c.connamespace = 'public'::regnamespace
+   AND NOT EXISTS (
+       SELECT 1 FROM pg_index i
+        WHERE i.indrelid = c.conrelid
+          AND i.indkey[0] = c.conkey[1]
+   )
+ ORDER BY 1, 2`
+	rows, err := pool.Query(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var unindexed []string
+	for rows.Next() {
+		var table, column, constraint string
+		if err := rows.Scan(&table, &column, &constraint); err != nil {
+			t.Fatal(err)
+		}
+		unindexed = append(unindexed, table+"."+column+" ("+constraint+")")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(unindexed) > 0 {
+		t.Fatalf("foreign keys without a supporting index: %v", unindexed)
+	}
+}
+
+// TestPGListVolumesByHostUsesItsIndex proves the composite index is not decorative:
+// with a realistic row count the planner uses it for the drain's iteration query
+// (§28.1) instead of scanning every volume in the fleet.
+func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	// Two hosts; one owns a handful of volumes, the other owns the rest.
+	hotHost, coldHost := ids.New().String(), ids.New().String()
+	for _, h := range []string{hotHost, coldHost} {
+		if err := store.UpsertHost(ctx, term, metadata.Host{HostID: h, State: lifecycle.HostActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 2000 {
+		host := coldHost
+		if i%400 == 0 {
+			host = hotHost
+		}
+		if err := store.CreateVolume(ctx, term, metadata.Volume{
+			VolumeID: ids.New().String(), SizeBytes: 1 << 30, BlockSize: 65536,
+			State: lifecycle.VolumeActive, PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `ANALYZE volumes`); err != nil {
+		t.Fatal(err)
+	}
+
+	var plan string
+	rows, err := pool.Query(ctx,
+		`EXPLAIN SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id`, hotHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan += line + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "volumes_primary_host_id_volume_id_idx") {
+		t.Fatalf("ListVolumesByHost did not use its index:\n%s", plan)
+	}
+	if strings.Contains(plan, "Seq Scan on volumes") {
+		t.Fatalf("ListVolumesByHost still scans the whole table:\n%s", plan)
 	}
 }

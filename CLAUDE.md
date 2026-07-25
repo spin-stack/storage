@@ -114,6 +114,12 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Identity columns are `uuid`** (UUIDv7), not text — `volume_id` is the same 16-byte
   id the on-disk WAL format carries. The `metadata.Store` interface uses `string` ids at
   the boundary; the `pg` adapter parses `string ↔ uuid`.
+- **Indexes are part of the schema review.** Every FK *referencing* column carries an
+  index (Postgres only indexes the referenced side), and a query with a filter +
+  `ORDER BY` gets a composite index in that order. Both rules are enforced by
+  integration tests (`TestPGEveryForeignKeyHasAnIndex`, and an `EXPLAIN` assertion for
+  the drain's `ListVolumesByHost`). Indexes for queries that do not exist yet are
+  listed as deferred in `schema.sql` with the trigger that should add them.
 - **Term-guarded writes (§7).** Every Control-Plane mutation validates the CP `term`
   (`... WHERE (SELECT term FROM control_plane_leader) = $n`, or `INSERT ... SELECT WHERE
   EXISTS(term match)`), so a zombie CP affects 0 rows → `ErrStaleTerm`.
