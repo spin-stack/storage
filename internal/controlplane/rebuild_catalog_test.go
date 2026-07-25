@@ -146,3 +146,77 @@ func TestRebuildReportsWhatItCouldNotReconstruct(t *testing.T) {
 	}
 	_ = metadata.Host{}
 }
+
+// TestRebuildRefusesACorruptManifest: a manifest that no longer matches its own
+// digest is corrupt (INV-16 says a published one never changes). Writing a catalog
+// row for it would give that corruption authority over restores.
+func TestRebuildRefusesACorruptManifest(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	epochs := epoch.NewStore(store)
+
+	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
+		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Publish(ctx, store, snapshot.Manifest{
+		SnapshotID: rebuiltSnap, VolumeID: rebuiltVol, Epoch: 1, TargetSequence: 7,
+		RootDigest: "not-the-digest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	md := metasim.New(clk.Wall)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	if _, err := controlplane.RebuildMetadata(ctx, store, epochs, md, term); err == nil {
+		t.Fatal("a manifest that fails its own digest must not become a catalog row")
+	}
+	if _, err := md.GetSnapshot(ctx, rebuiltSnap); err == nil {
+		t.Fatal("the corrupt snapshot was written to the catalog anyway")
+	}
+}
+
+// TestRebuildAddsMissingSnapshotsToAnExistingVolume: the two halves fail
+// independently — a PITR restore can bring volumes back while the catalog is still
+// short, and the rebuild has to fill that in rather than skipping the volume.
+func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	epochs := epoch.NewStore(store)
+	md := metasim.New(clk.Wall)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+
+	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
+		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := snapshot.Manifest{SnapshotID: rebuiltSnap, VolumeID: rebuiltVol, Epoch: 1, TargetSequence: 7}
+	m.RootDigest = snapshot.Digest(m.TargetSequence, m.Objects)
+	if err := snapshot.Publish(ctx, store, m); err != nil {
+		t.Fatal(err)
+	}
+	// The volume row survived; the catalog did not.
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeDetached,
+		DEKWrapped: []byte{1}, KEKID: "k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := controlplane.RebuildMetadata(ctx, store, epochs, md, term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Volumes != 0 || res.Snapshots != 1 {
+		t.Fatalf("rebuild = %+v, want 0 volumes and 1 snapshot", res)
+	}
+	if _, err := md.GetSnapshot(ctx, rebuiltSnap); err != nil {
+		t.Fatalf("the snapshot was not added to the existing volume: %v", err)
+	}
+}

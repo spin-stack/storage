@@ -39,22 +39,24 @@ func etagOf(data []byte) string {
 
 func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	p := s.path(key)
-	if s.marked(key) {
-		// A delete marker is the latest version: to a conditional write the object
-		// does not exist. Writing clears the marker, as a new version would.
-		if err := os.Remove(s.path(key) + markerSuffix); err != nil {
-			return objectstore.PutResult{}, err
-		}
-	}
+	// A delete marker is the latest version, so to a conditional write the object
+	// does not exist — the same way S3 behaves on a versioned bucket. The marker is
+	// only cleared once the write is going ahead.
+	marked := s.marked(key)
 	if opts.IfNoneMatch {
-		if _, err := os.Stat(p); err == nil {
+		if _, err := os.Stat(p); err == nil && !marked {
 			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
 		}
 	}
 	if opts.IfMatch != "" {
 		cur, err := os.ReadFile(p)
-		if err != nil || etagOf(cur) != opts.IfMatch {
+		if err != nil || marked || etagOf(cur) != opts.IfMatch {
 			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
+		}
+	}
+	if marked {
+		if err := os.Remove(p + markerSuffix); err != nil {
+			return objectstore.PutResult{}, err
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {

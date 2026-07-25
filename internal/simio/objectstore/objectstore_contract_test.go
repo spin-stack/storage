@@ -95,3 +95,62 @@ func TestSimEventualList(t *testing.T) {
 		t.Fatalf("after settle LIST should show the object: %+v", got)
 	}
 }
+
+// TestDeleteIsReversibleAcrossImplementations is the structural half of INV-14
+// (DEV-0006): every store must implement Delete as a reversible mark, so a GC
+// mistake costs a restore and not the data. The S3-backed store satisfies this via
+// the backend's delete markers, asserted in the integration lane.
+func TestDeleteIsReversibleAcrossImplementations(t *testing.T) {
+	ctx := context.Background()
+	type restorable interface {
+		objectstore.Store
+		Restore(context.Context, string) error
+	}
+	impls := map[string]restorable{"sim": sim.NewObjectStore()}
+	rs, err := real.NewObjectStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	impls["real-filesystem"] = rs
+
+	for name, s := range impls {
+		t.Run(name, func(t *testing.T) {
+			if _, err := s.Put(ctx, "wal/v/1/x.wal", []byte("payload"), objectstore.PutOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Delete(ctx, "wal/v/1/x.wal"); err != nil {
+				t.Fatal(err)
+			}
+			// Hidden from every read path, including listings.
+			if _, err := s.Get(ctx, "wal/v/1/x.wal"); !errors.Is(err, objectstore.ErrNotFound) {
+				t.Fatalf("get after delete: %v", err)
+			}
+			if objs, err := s.List(ctx, "wal/"); err != nil || len(objs) != 0 {
+				t.Fatalf("list after delete: %+v err=%v", objs, err)
+			}
+			// A second delete finds nothing to mark.
+			if err := s.Delete(ctx, "wal/v/1/x.wal"); !errors.Is(err, objectstore.ErrNotFound) {
+				t.Fatalf("double delete: %v", err)
+			}
+			// And the bytes are still there.
+			if err := s.Restore(ctx, "wal/v/1/x.wal"); err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			body, err := s.Get(ctx, "wal/v/1/x.wal")
+			if err != nil || string(body) != "payload" {
+				t.Fatalf("restored body = %q err=%v", body, err)
+			}
+			// Writing over a marked key behaves like a new version (create-only sees
+			// the object as absent, matching S3 on a versioned bucket).
+			if err := s.Delete(ctx, "wal/v/1/x.wal"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Put(ctx, "wal/v/1/x.wal", []byte("v2"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
+				t.Fatalf("create-only over a marked key must succeed: %v", err)
+			}
+			if body, _ := s.Get(ctx, "wal/v/1/x.wal"); string(body) != "v2" {
+				t.Fatalf("body after rewrite = %q", body)
+			}
+		})
+	}
+}

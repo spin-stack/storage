@@ -594,9 +594,12 @@ func scenarioRebuildMetadataFromS3(s *Sim) error {
 		return errors.New("PG should start empty")
 	}
 
-	n, err := controlplane.RebuildMetadata(ctx, s.Store, epochs, md, term)
-	if err != nil || n != 1 {
-		return fmt.Errorf("rebuild: n=%d err=%v", n, err)
+	res, err := controlplane.RebuildMetadata(ctx, s.Store, epochs, md, term)
+	if err != nil || res.Volumes != 1 {
+		return fmt.Errorf("rebuild: %+v err=%v", res, err)
+	}
+	if len(res.NotReconstructible) == 0 {
+		return errors.New("rebuild must report the state S3 cannot speak for (§22.5)")
 	}
 	v, err := md.GetVolume(ctx, vid)
 	if err != nil {

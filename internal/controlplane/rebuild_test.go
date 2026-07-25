@@ -43,8 +43,8 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
-		t.Fatalf("rebuilt %d volumes, want 2", n)
+	if n.Volumes != 2 {
+		t.Fatalf("rebuilt %+v, want 2 volumes", n)
 	}
 
 	// The rebuilt volume takes its epoch from the authoritative epoch object.
@@ -57,8 +57,8 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 	}
 
 	// Rebuild is idempotent: a second pass adds nothing.
-	if n2, _ := controlplane.RebuildMetadata(ctx, store, epochs, md, term); n2 != 0 {
-		t.Fatalf("second rebuild should add 0, added %d", n2)
+	if n2, _ := controlplane.RebuildMetadata(ctx, store, epochs, md, term); n2.Volumes != 0 {
+		t.Fatalf("second rebuild should add nothing, added %+v", n2)
 	}
 }
 

@@ -2,37 +2,59 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/snapshot"
 )
 
-// RebuildMetadata reconstructs the volume rows in a metadata.Store from the
-// self-describing S3 layout (§22.5, INV-20): for every volume descriptor it reads
-// the epoch object (the authority for the current epoch, §5.8) and recreates the
-// volume. Returns the number of volumes rebuilt. Idempotent: a volume that already
-// exists is skipped.
-func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch.Store, md metadata.Store, term int64) (int, error) {
+// RebuildResult is what a rebuild reconstructed, and — just as important — what it
+// could not. A number on its own reads as completeness; the operator running this
+// during an incident needs to know which state is simply not in S3 (§22.5).
+type RebuildResult struct {
+	Volumes   int
+	Snapshots int
+	// NotReconstructible names the tables the object store cannot speak for. They
+	// have to come back from a PostgreSQL PITR restore or from the fleet
+	// re-registering itself.
+	NotReconstructible []string
+}
+
+// RebuildMetadata reconstructs the Control-Plane rows that the self-describing S3
+// layout can speak for (§22.5, INV-20): every volume descriptor (with the epoch
+// object as the authority for the current epoch, §5.8) and every published snapshot
+// manifest, which is the catalog clones and restores are anchored to.
+//
+// It is idempotent — an operator may run it twice — and it reports what it could not
+// rebuild rather than leaving a count that looks complete.
+func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch.Store, md metadata.Store, term int64) (RebuildResult, error) {
+	res := RebuildResult{NotReconstructible: []string{
+		"hosts",       // the fleet re-registers by heartbeat (§28.2)
+		"host_leases", // leases are re-granted; a stale one must never be restored
+		"operations",  // in-flight reconciliation is not durable state (§7)
+	}}
 	ids, err := descriptor.ListVolumeIDs(ctx, store)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
-	rebuilt := 0
 	for _, id := range ids {
+		present := false
 		if _, err := md.GetVolume(ctx, id); err == nil {
-			continue // already present
+			present = true // already there; its snapshots may still be missing
 		} else if !errors.Is(err, metadata.ErrNotFound) {
-			return rebuilt, err
+			return res, err
 		}
 
 		d, err := descriptor.Read(ctx, store, id)
 		if err != nil {
-			return rebuilt, fmt.Errorf("rebuild %s: %w", id, err)
+			return res, fmt.Errorf("rebuild %s: %w", id, err)
 		}
 
 		// The epoch object is authoritative for the current epoch; fall back to the
@@ -41,7 +63,16 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 		if ep, _, err := epochs.Current(ctx, id); err == nil {
 			currentEpoch = int64(ep)
 		} else if !errors.Is(err, objectstore.ErrNotFound) {
-			return rebuilt, fmt.Errorf("rebuild %s epoch: %w", id, err)
+			return res, fmt.Errorf("rebuild %s epoch: %w", id, err)
+		}
+
+		if present {
+			n, err := rebuildSnapshots(ctx, store, md, term, id)
+			if err != nil {
+				return res, err
+			}
+			res.Snapshots += n
+			continue
 		}
 
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
@@ -58,7 +89,61 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			DEKWrapped: d.DEKWrapped,
 			KEKID:      d.KEKID,
 		}); err != nil {
-			return rebuilt, fmt.Errorf("rebuild %s create: %w", id, err)
+			return res, fmt.Errorf("rebuild %s create: %w", id, err)
+		}
+		res.Volumes++
+
+		n, err := rebuildSnapshots(ctx, store, md, term, id)
+		if err != nil {
+			return res, err
+		}
+		res.Snapshots += n
+	}
+	return res, nil
+}
+
+// rebuildSnapshots recreates the catalog rows for one volume from the manifests
+// under snapshots/<volume>/. A manifest in S3 *is* a published snapshot — it is
+// written create-only as the last step of publication (§19) — so its presence is the
+// evidence, and its contents carry everything the row needs.
+func rebuildSnapshots(ctx context.Context, store objectstore.Store, md metadata.Store, term int64, volumeID string) (int, error) {
+	infos, err := store.List(ctx, "snapshots/"+volumeID+"/")
+	if err != nil {
+		return 0, err
+	}
+	rebuilt := 0
+	for _, info := range infos {
+		if !strings.HasSuffix(info.Key, "/manifest.json") {
+			continue
+		}
+		body, err := store.Get(ctx, info.Key)
+		if err != nil {
+			return rebuilt, fmt.Errorf("rebuild snapshot %s: %w", info.Key, err)
+		}
+		var m snapshot.Manifest
+		if err := json.Unmarshal(body, &m); err != nil {
+			return rebuilt, fmt.Errorf("rebuild snapshot %s: %w", info.Key, err)
+		}
+		if !m.DigestMatches() {
+			// The manifest is immutable (INV-16); one that no longer matches its own
+			// digest is corrupt, and a catalog row would give it authority.
+			return rebuilt, fmt.Errorf("rebuild snapshot %s: root digest mismatch", info.Key)
+		}
+		if _, err := md.GetSnapshot(ctx, m.SnapshotID); err == nil {
+			continue // already in the catalog
+		} else if !errors.Is(err, metadata.ErrNotFound) {
+			return rebuilt, err
+		}
+		if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
+			SnapshotID: m.SnapshotID, VolumeID: m.VolumeID, ParentSnapshotID: m.ParentSnapshotID,
+			Epoch: int64(m.Epoch), TargetSequence: int64(m.TargetSequence), RootDigest: m.RootDigest,
+			State: lifecycle.SnapshotPublished, ManifestKey: info.Key,
+			// The client request id is not in S3; the snapshot id is itself a UUIDv7
+			// and is unique, so it stands in for the idempotency key of a request that
+			// completed long ago.
+			RequestID: m.SnapshotID,
+		}); err != nil {
+			return rebuilt, fmt.Errorf("rebuild snapshot %s: %w", m.SnapshotID, err)
 		}
 		rebuilt++
 	}
