@@ -108,6 +108,29 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 	return &i, err
 }
 
+const resizeVolume = `-- name: ResizeVolume :execrows
+UPDATE volumes
+   SET size_bytes = $2, updated_at = now()
+ WHERE volume_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND $2 >= size_bytes
+`
+
+type ResizeVolumeParams struct {
+	VolumeID  uuid.UUID `json:"volume_id"`
+	SizeBytes int64     `json:"size_bytes"`
+	Term      int64     `json:"term"`
+}
+
+// Grow-only (§3: shrink is a non-goal). The size guard rejects a shrink at the DB.
+func (q *Queries) ResizeVolume(ctx context.Context, arg ResizeVolumeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resizeVolume, arg.VolumeID, arg.SizeBytes, arg.Term)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateVolumeWatermarks = `-- name: UpdateVolumeWatermarks :execrows
 UPDATE volumes
    SET local_sequence = $2,

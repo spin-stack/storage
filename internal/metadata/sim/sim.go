@@ -25,6 +25,7 @@ type Store struct {
 	leases map[string]metadata.HostLease
 	vols   map[string]metadata.Volume
 	ops    map[string]metadata.Operation
+	snaps  map[string]metadata.Snapshot
 }
 
 // New returns an empty store whose timestamps come from now (e.g. a sim clock's Wall).
@@ -35,6 +36,7 @@ func New(now func() time.Time) *Store {
 		leases: map[string]metadata.HostLease{},
 		vols:   map[string]metadata.Volume{},
 		ops:    map[string]metadata.Operation{},
+		snaps:  map[string]metadata.Snapshot{},
 	}
 }
 
@@ -160,6 +162,44 @@ func (s *Store) UpdateWatermarks(_ context.Context, term int64, volumeID string,
 	v.LocalSequence, v.DurableSequence, v.PublishedSequence = local, durable, published
 	s.vols[volumeID] = v
 	return nil
+}
+
+func (s *Store) ResizeVolume(_ context.Context, term int64, volumeID string, newSizeBytes int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	v, ok := s.vols[volumeID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	if newSizeBytes < v.SizeBytes {
+		return metadata.ErrShrinkNotAllowed
+	}
+	v.SizeBytes = newSizeBytes
+	s.vols[volumeID] = v
+	return nil
+}
+
+func (s *Store) CreateSnapshot(_ context.Context, term int64, snap metadata.Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	s.snaps[snap.SnapshotID] = snap
+	return nil
+}
+
+func (s *Store) GetSnapshot(_ context.Context, snapshotID string) (metadata.Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snap, ok := s.snaps[snapshotID]
+	if !ok {
+		return metadata.Snapshot{}, metadata.ErrNotFound
+	}
+	return snap, nil
 }
 
 func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool, error) {

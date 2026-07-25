@@ -1,0 +1,40 @@
+package controlplane
+
+import (
+	"context"
+
+	"github.com/spin-stack/storage/internal/metadata"
+)
+
+// Clone creates a new, independent volume from a parent snapshot as a same-host
+// clone (§20): it is pure metadata — a new active child at epoch 1 that reuses the
+// parent snapshot's already-durable objects, with no data copy. Cross-host
+// materialization is Phase 11. The clone inherits the parent's size, block size,
+// durability, and DEK (so it can read the shared base), and increments the chain
+// depth (§20.1). Returns the new volume's descriptor-shaped record.
+func Clone(ctx context.Context, md metadata.Store, term int64, parentSnapshotID, newVolumeID, newHostID string) (metadata.Volume, error) {
+	snap, err := md.GetSnapshot(ctx, parentSnapshotID)
+	if err != nil {
+		return metadata.Volume{}, err
+	}
+	parent, err := md.GetVolume(ctx, snap.VolumeID)
+	if err != nil {
+		return metadata.Volume{}, err
+	}
+	clone := metadata.Volume{
+		VolumeID:      newVolumeID,
+		SizeBytes:     parent.SizeBytes,
+		Durability:    parent.Durability,
+		BlockSize:     parent.BlockSize,
+		CurrentEpoch:  1, // a fresh active child
+		State:         "ACTIVE",
+		PrimaryHostID: newHostID,
+		ChainDepth:    parent.ChainDepth + 1,
+		DEKWrapped:    parent.DEKWrapped,
+		KEKID:         parent.KEKID,
+	}
+	if err := md.CreateVolume(ctx, term, clone); err != nil {
+		return metadata.Volume{}, err
+	}
+	return clone, nil
+}

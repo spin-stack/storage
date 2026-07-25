@@ -22,6 +22,14 @@ UPDATE volumes
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
 RETURNING current_epoch;
 
+-- name: ResizeVolume :execrows
+-- Grow-only (§3: shrink is a non-goal). The size guard rejects a shrink at the DB.
+UPDATE volumes
+   SET size_bytes = $2, updated_at = now()
+ WHERE volume_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND $2 >= size_bytes;
+
 -- name: UpdateVolumeWatermarks :execrows
 -- Lazy, informative watermark update (§5.8, §12.6), term-guarded.
 UPDATE volumes

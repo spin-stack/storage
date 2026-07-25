@@ -45,6 +45,7 @@ func fromNullUUID(u pgtype.UUID) string {
 	return ""
 }
 
+func text(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
 func fromText(t pgtype.Text) string {
 	if t.Valid {
 		return t.String
@@ -201,6 +202,65 @@ func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID strin
 		VolumeID: id, LocalSequence: local, DurableSequence: durable,
 		PublishedSequence: published, Term: term,
 	}))
+}
+
+func (s *Store) ResizeVolume(ctx context.Context, term int64, volumeID string, newSizeBytes int64) error {
+	id, err := uuid.Parse(volumeID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.ResizeVolume(ctx, db.ResizeVolumeParams{VolumeID: id, SizeBytes: newSizeBytes, Term: term})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		// 0 rows: stale term, missing volume, or a rejected shrink.
+		v, gerr := s.GetVolume(ctx, volumeID)
+		if gerr == nil && newSizeBytes < v.SizeBytes {
+			return metadata.ErrShrinkNotAllowed
+		}
+		return metadata.ErrStaleTerm
+	}
+	return nil
+}
+
+func (s *Store) CreateSnapshot(ctx context.Context, term int64, snap metadata.Snapshot) error {
+	sid, err := uuid.Parse(snap.SnapshotID)
+	if err != nil {
+		return err
+	}
+	vid, err := uuid.Parse(snap.VolumeID)
+	if err != nil {
+		return err
+	}
+	rid, err := uuid.Parse(snap.RequestID)
+	if err != nil {
+		return err
+	}
+	return staleIfZero(s.q.CreateSnapshot(ctx, db.CreateSnapshotParams{
+		SnapshotID: sid, VolumeID: vid, ParentSnapshotID: nullUUID(snap.ParentSnapshotID),
+		Epoch: snap.Epoch, TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
+		SourceHostID: nullUUID(snap.SourceHostID), State: snap.State,
+		ManifestKey: text(snap.ManifestKey), RequestID: rid, Term: term,
+	}))
+}
+
+func (s *Store) GetSnapshot(ctx context.Context, snapshotID string) (metadata.Snapshot, error) {
+	id, err := uuid.Parse(snapshotID)
+	if err != nil {
+		return metadata.Snapshot{}, err
+	}
+	snap, err := s.q.GetSnapshot(ctx, id)
+	if err != nil {
+		return metadata.Snapshot{}, notFound(err)
+	}
+	return metadata.Snapshot{
+		SnapshotID: snap.SnapshotID.String(), VolumeID: snap.VolumeID.String(),
+		ParentSnapshotID: fromNullUUID(snap.ParentSnapshotID), Epoch: snap.Epoch,
+		TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
+		SourceHostID: fromNullUUID(snap.SourceHostID), State: snap.State,
+		ManifestKey: fromText(snap.ManifestKey), RequestID: snap.RequestID.String(),
+	}, nil
 }
 
 func (s *Store) RecordOperation(ctx context.Context, op metadata.Operation) (bool, error) {

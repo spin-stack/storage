@@ -60,7 +60,69 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "recovery-authority-is-s3", Run: scenarioRecoveryAuthorityIsS3},
 		{Name: "rebuild-metadata-from-s3", Run: scenarioRebuildMetadataFromS3},
 		{Name: "snapshot-pausefree-immutable", Run: scenarioSnapshotPauseFreeImmutable},
+		{Name: "same-host-clone-independent", Run: scenarioSameHostCloneIndependent},
 	}
+}
+
+// scenarioSameHostCloneIndependent (§20, §5.2): a same-host clone is a new active
+// child — writes to it land under its own key prefix and never touch the parent's
+// durable objects or the snapshot.
+func scenarioSameHostCloneIndependent(s *Sim) error {
+	ctx := context.Background()
+	var pv [16]byte
+	pv[6], pv[8] = 0x70, 0x80
+	pv[15] = 1 // parent
+	cv := pv
+	cv[15] = 2 // clone
+	pvs, cvs := format.UUIDString(pv), format.UUIDString(cv)
+
+	md := metasim.New(s.Clock.Wall)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: pvs, SizeBytes: 1 << 30, BlockSize: 65536, State: "ACTIVE", DEKWrapped: []byte{1}, KEKID: "k"})
+
+	// Parent writes + snapshot.
+	pf, _ := s.Disk.Create("wal/parent.wal")
+	parent := wal.NewLog(pf, s.Clock, pv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	parent.EnableRemote(wal.NewBatcher(s.Clock, pv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	_, _ = parent.Write(0, []byte("parent"), 0)
+	if err := parent.Flush(ctx); err != nil {
+		return err
+	}
+	m, _, err := snapshot.NewSnapshotter(s.Store, s.Clock).Create(ctx, parent, pv, 1, "00000000-0000-7000-8000-000000000071", "")
+	if err != nil {
+		return err
+	}
+	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: m.SnapshotID, VolumeID: pvs, Epoch: 1, TargetSequence: int64(m.TargetSequence), RootDigest: m.RootDigest, State: "PUBLISHED", RequestID: "00000000-0000-7000-8000-000000000072"})
+
+	parentObjsBefore, _ := s.Store.List(ctx, "wal/"+pvs+"/")
+
+	// Clone (pure metadata; no data copy) then write to the clone.
+	if _, err := controlplane.Clone(ctx, md, term, m.SnapshotID, cvs, "00000000-0000-7000-8000-0000000000f1"); err != nil {
+		return err
+	}
+	cf, _ := s.Disk.Create("wal/clone.wal")
+	clone := wal.NewLog(cf, s.Clock, cv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	clone.EnableRemote(wal.NewBatcher(s.Clock, cv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	_, _ = clone.Write(0, []byte("clone-only"), 0)
+	if err := clone.Flush(ctx); err != nil {
+		return err
+	}
+
+	// The parent's durable objects and the snapshot manifest are untouched.
+	parentObjsAfter, _ := s.Store.List(ctx, "wal/"+pvs+"/")
+	if len(parentObjsAfter) != len(parentObjsBefore) {
+		return fmt.Errorf("clone write changed the parent's objects: %d -> %d", len(parentObjsBefore), len(parentObjsAfter))
+	}
+	got, err := snapshot.Read(ctx, s.Store, pvs, m.SnapshotID)
+	if err != nil || got.TargetSequence != m.TargetSequence {
+		return fmt.Errorf("snapshot changed after clone write: %+v err=%v", got, err)
+	}
+	// The clone's data is under its own prefix.
+	if cloneObjs, _ := s.Store.List(ctx, "wal/"+cvs+"/"); len(cloneObjs) == 0 {
+		return errors.New("clone write did not land under the clone prefix")
+	}
+	s.Notef("same-host clone independent: parent + snapshot untouched")
+	return nil
 }
 
 // scenarioSnapshotPauseFreeImmutable is INV-16 + §19: a snapshot captures a sequence

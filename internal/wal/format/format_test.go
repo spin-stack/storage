@@ -30,6 +30,20 @@ func sampleRecordHeader() format.RecordHeader {
 	}
 }
 
+func TestRecordTypeString(t *testing.T) {
+	cases := map[format.RecordType]string{
+		format.RecordWrite:       "WRITE",
+		format.RecordDiscard:     "DISCARD",
+		format.RecordWriteZeroes: "WRITE_ZEROES",
+		format.RecordType(9):     "RecordType(9)",
+	}
+	for typ, want := range cases {
+		if got := typ.String(); got != want {
+			t.Fatalf("RecordType(%d).String() = %q, want %q", typ, got, want)
+		}
+	}
+}
+
 func TestRecordHeaderSizeIs104(t *testing.T) {
 	if format.RecordHeaderSize != 104 || format.ObjectHeaderSize != 104 {
 		t.Fatalf("header sizes must be 104 (ADR-0005): rec=%d obj=%d",

@@ -21,6 +21,8 @@ var (
 	ErrStaleTerm = errors.New("metadata: stale control-plane term")
 	// ErrNotFound means the row does not exist.
 	ErrNotFound = errors.New("metadata: not found")
+	// ErrShrinkNotAllowed means a resize tried to reduce a volume's size (§3 non-goal).
+	ErrShrinkNotAllowed = errors.New("metadata: volume shrink not allowed")
 )
 
 // Leader is the single-active Control Plane record (§7).
@@ -68,6 +70,20 @@ type Volume struct {
 	PublishedSequence int64
 }
 
+// Snapshot is a catalog entry for a published snapshot (§8, §19).
+type Snapshot struct {
+	SnapshotID       string
+	VolumeID         string
+	ParentSnapshotID string
+	Epoch            int64
+	TargetSequence   int64
+	RootDigest       string
+	SourceHostID     string
+	State            string
+	ManifestKey      string
+	RequestID        string
+}
+
 // Operation is a reconciliation operation, idempotent by OperationID (§7, §18).
 type Operation struct {
 	OperationID  string
@@ -106,6 +122,13 @@ type Store interface {
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error)
 	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
 	UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error
+	// ResizeVolume grows size_bytes (term-guarded); shrink is rejected (§3 non-goal).
+	ResizeVolume(ctx context.Context, term int64, volumeID string, newSizeBytes int64) error
+
+	// CreateSnapshot records a published snapshot (term-guarded, §19).
+	CreateSnapshot(ctx context.Context, term int64, s Snapshot) error
+	// GetSnapshot returns a snapshot by id.
+	GetSnapshot(ctx context.Context, snapshotID string) (Snapshot, error)
 
 	// RecordOperation records an admin operation idempotently; recorded is false if
 	// the operation_id already existed (a duplicate request, §18).
