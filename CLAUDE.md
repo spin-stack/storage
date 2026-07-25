@@ -39,7 +39,17 @@ task generate:check     # fail if the committed sqlc output is stale
 task db:migrate:diff -- <name>   # author an Atlas migration from schema.sql
 task db:migrate:validate         # check migrations against atlas.sum
 task db:migrate:lint -- --latest N  # lint pending migrations for unsafe changes
+task build:qemu         # build the pinned QEMU (vhost-user-blk) into _output/
+task qemu:verify        # assert the built QEMU is pinned + has vhost-user-blk-pci
+task backend:conformance # §6.1 object-store conformance suite (blocking per backend)
 ```
+
+**Infrastructure.** QEMU 11.0.2 is built from `Dockerfile.qemu` (modelled on
+spinbox's, with `--enable-vhost-user-blk-server` and without its `CONFIG_CXL=n`
+debloat, which breaks the 11.0.2 link). The object-store backend for tests is RustFS,
+pinned by digest and started with TestContainers (`internal/testinfra`); the S3 SDK is
+used in exactly one file (`internal/simio/real/s3.go`) behind `objectstore.Store`
+(ADR-0010).
 
 ## Non-negotiable invariants (enforced, not aspirational)
 

@@ -13,6 +13,16 @@ vars:
   SIMULABLE: ./hack/analyzers/simulable/cmd/simulable
   # Project-local tool bin. Committed to .gitignore; rebuilt by `task tools`.
   TOOLS_BIN: "{{.ROOT_DIR}}/.tools/bin"
+  OUTPUT_DIR: "{{.ROOT_DIR}}/_output"
+  # Project-local by default so no task needs root; override for a shared CI cache.
+  BUILDKIT_CACHE_DIR: '{{.BUILDKIT_CACHE_DIR | default (printf "%s/.cache/buildkit" .ROOT_DIR)}}'
+  BUILDKIT_CACHE_QEMU: '{{.BUILDKIT_CACHE_DIR}}/storage-qemu'
+  # QEMU is pinned here and in CLAUDE.md; the same version runs in CI and prod.
+  QEMU_VERSION: 11.0.2
+  QEMU_JOBS: '{{.QEMU_JOBS | default 8}}'
+  # Object-store backend under test (§6.1 conformance suite). Pinned by digest so a
+  # re-tagged image cannot silently change what the suite certified.
+  RUSTFS_IMAGE: "rustfs/rustfs:latest@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
   # --- pinned tool versions (the single place each is declared) ---
   SQLC_VERSION: v1.30.0
   ATLAS_VERSION: v1.2.3
@@ -110,6 +120,60 @@ tasks:
     deps: [tools:atlas]
     cmds:
       - "{{.TOOLS_BIN}}/atlas migrate lint --env local {{.CLI_ARGS | default \"--latest 1\"}}"
+
+  # --- infrastructure (QEMU, object-store backend) ----------------------------
+
+  build:qemu:
+    desc: "Build the pinned QEMU (vhost-user-blk + storage daemon) into _output/ (§3, Phases 02/03)."
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}
+      - |
+        docker buildx build \
+          --file Dockerfile.qemu \
+          --target extract \
+          --platform linux/amd64 \
+          --cache-from type=local,src={{.BUILDKIT_CACHE_QEMU}} \
+          --cache-to type=local,dest={{.BUILDKIT_CACHE_QEMU}},mode=max,compression=zstd \
+          --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
+          --build-arg JOBS={{.QEMU_JOBS}} \
+          --output type=local,dest={{.OUTPUT_DIR}} \
+          .
+      - task: qemu:verify
+
+  qemu:verify:
+    desc: Verify the built QEMU is the pinned version and exposes the devices we depend on.
+    cmds:
+      - |
+        set -euo pipefail
+        bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
+        test -x "$bin" || { echo "missing $bin — run: task build:qemu"; exit 1; }
+        "$bin" --version | grep -q '{{.QEMU_VERSION}}' || {
+          echo "built QEMU is not the pinned {{.QEMU_VERSION}}:"; "$bin" --version; exit 1; }
+        "$bin" -device help 2>&1 | grep -q 'vhost-user-blk-pci' || {
+          echo "this QEMU has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
+        test -x {{.OUTPUT_DIR}}/bin/qemu-storage-daemon
+        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
+        echo "OK: $("$bin" --version | head -1), vhost-user-blk-pci present, storage daemon + firmware in place"
+
+  build:qemu:image:
+    desc: Build the QEMU runtime image (used by the integration lane, not extracted).
+    cmds:
+      - |
+        docker buildx build \
+          --file Dockerfile.qemu \
+          --target runtime \
+          --platform linux/amd64 \
+          --cache-from type=local,src={{.BUILDKIT_CACHE_QEMU}} \
+          --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
+          --build-arg JOBS={{.QEMU_JOBS}} \
+          --tag spin-stack/storage-qemu:{{.QEMU_VERSION}} \
+          --load \
+          .
+
+  backend:conformance:
+    desc: "§6.1/§25.4 object-store conformance suite against the pinned backend image (blocking per backend version)."
+    cmds:
+      - RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v ./integration/backend/...
 
   # --- build / test / lint ----------------------------------------------------
 

@@ -63,6 +63,20 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
    `task generate` / `generate:check`, `task db:migrate:diff -- <name>`. Tools are never
    invoked directly — versions live in `Taskfile.yml` and CI runs the same tasks.
 
+## Infrastructure now available (2026-07-25)
+- **QEMU 11.0.2** — `task build:qemu` → `_output/bin/` (qemu-system-x86_64,
+  qemu-storage-daemon, qemu-img, qemu-nbd) + firmware. `task qemu:verify` asserts the
+  version and that `vhost-user-blk-pci` exists. Unblocks the tooling half of Phases
+  02/03; QEMU's own vhost-user-blk server is there as a reference backend to test our
+  Agent's client side against.
+- **Object store** — RustFS pinned by digest, started via TestContainers
+  (`internal/testinfra`). `task backend:conformance` runs the §6.1 suite: every
+  requirement passes (conditional writes, versioning + delete markers, enforced
+  Object Lock, LIST) — see ADR-0010 for the table and the caveats.
+- **One S3 client** — `internal/simio/real.NewS3Store` is the only place the AWS SDK
+  is configured; it is proven by the shared `objectstore` contract (`storetest`)
+  against the real backend, the same contract the sim and filesystem stores satisfy.
+
 ## Next candidates (all pure-Go / DST-provable except where noted)
 - **Merge `hardening/typed-lifecycles`** (increment 13.1, ADR-0009).
 - **Phase 12** — warm standby (checkpoint hydration; `materialize.FromCheckpoint` is the

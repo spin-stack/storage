@@ -1,136 +1,32 @@
 package objectstore_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/simio/objectstore/storetest"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-func impls(t *testing.T) map[string]objectstore.Store {
-	t.Helper()
-	rs, err := real.NewObjectStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("real objectstore: %v", err)
-	}
-	return map[string]objectstore.Store{
-		"real": rs,
-		"sim":  sim.NewObjectStore(),
-	}
-}
-
-func TestPutGetHead(t *testing.T) {
-	ctx := context.Background()
-	for name, s := range impls(t) {
-		t.Run(name, func(t *testing.T) {
-			key := "wal/vol/0/1-1-abcd.wal"
-			data := []byte("encrypted-record-bytes")
-			res, err := s.Put(ctx, key, data, objectstore.PutOptions{})
+// TestContract runs the shared objectstore.Store contract (storetest) against both
+// in-process implementations. The S3-backed store runs the same contract against a
+// real backend in the integration lane (integration/backend).
+func TestContract(t *testing.T) {
+	t.Run("sim", func(t *testing.T) {
+		storetest.RunContract(t, func(*testing.T) objectstore.Store { return sim.NewObjectStore() })
+	})
+	t.Run("real-filesystem", func(t *testing.T) {
+		storetest.RunContract(t, func(t *testing.T) objectstore.Store {
+			rs, err := real.NewObjectStore(t.TempDir())
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("real objectstore: %v", err)
 			}
-			if res.ETag == "" {
-				t.Fatal("expected an ETag")
-			}
-			got, err := s.Get(ctx, key)
-			if err != nil || !bytes.Equal(got, data) {
-				t.Fatalf("get mismatch: %q err=%v", got, err)
-			}
-			info, err := s.Head(ctx, key)
-			if err != nil || info.Size != int64(len(data)) || info.ETag != res.ETag {
-				t.Fatalf("head mismatch: %+v err=%v", info, err)
-			}
+			return rs
 		})
-	}
-}
-
-func TestGetMissingIsNotFound(t *testing.T) {
-	ctx := context.Background()
-	for name, s := range impls(t) {
-		t.Run(name, func(t *testing.T) {
-			_, err := s.Get(ctx, "absent")
-			if !errors.Is(err, objectstore.ErrNotFound) {
-				t.Fatalf("want ErrNotFound, got %v", err)
-			}
-		})
-	}
-}
-
-func TestIfNoneMatchIsCreateOnly(t *testing.T) {
-	ctx := context.Background()
-	for name, s := range impls(t) {
-		t.Run(name, func(t *testing.T) {
-			key := "k"
-			opts := objectstore.PutOptions{IfNoneMatch: true}
-			if _, err := s.Put(ctx, key, []byte("v1"), opts); err != nil {
-				t.Fatalf("first create: %v", err)
-			}
-			_, err := s.Put(ctx, key, []byte("v2"), opts)
-			if !errors.Is(err, objectstore.ErrPreconditionFailed) {
-				t.Fatalf("want ErrPreconditionFailed on second create, got %v", err)
-			}
-			// Unchanged.
-			got, _ := s.Get(ctx, key)
-			if string(got) != "v1" {
-				t.Fatalf("create-only should not overwrite: got %q", got)
-			}
-		})
-	}
-}
-
-func TestIfMatchCAS(t *testing.T) {
-	ctx := context.Background()
-	for name, s := range impls(t) {
-		t.Run(name, func(t *testing.T) {
-			key := "epoch"
-			res, _ := s.Put(ctx, key, []byte("epoch-1"), objectstore.PutOptions{})
-			// Wrong ETag fails.
-			if _, err := s.Put(ctx, key, []byte("epoch-2"), objectstore.PutOptions{IfMatch: "wrong"}); !errors.Is(err, objectstore.ErrPreconditionFailed) {
-				t.Fatalf("want precondition failed on bad CAS, got %v", err)
-			}
-			// Correct ETag succeeds.
-			if _, err := s.Put(ctx, key, []byte("epoch-2"), objectstore.PutOptions{IfMatch: res.ETag}); err != nil {
-				t.Fatalf("CAS with correct ETag: %v", err)
-			}
-		})
-	}
-}
-
-func TestListByPrefixSorted(t *testing.T) {
-	ctx := context.Background()
-	for name, s := range impls(t) {
-		t.Run(name, func(t *testing.T) {
-			_, _ = s.Put(ctx, "wal/v/0/2.wal", []byte("b"), objectstore.PutOptions{})
-			_, _ = s.Put(ctx, "wal/v/0/1.wal", []byte("a"), objectstore.PutOptions{})
-			_, _ = s.Put(ctx, "other/x", []byte("x"), objectstore.PutOptions{})
-			got, err := s.List(ctx, "wal/v/0/")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(got) != 2 || got[0].Key != "wal/v/0/1.wal" || got[1].Key != "wal/v/0/2.wal" {
-				t.Fatalf("unexpected list: %+v", got)
-			}
-		})
-	}
-}
-
-func TestDelete(t *testing.T) {
-	ctx := context.Background()
-	for name, s := range impls(t) {
-		t.Run(name, func(t *testing.T) {
-			_, _ = s.Put(ctx, "k", []byte("v"), objectstore.PutOptions{})
-			if err := s.Delete(ctx, "k"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := s.Get(ctx, "k"); !errors.Is(err, objectstore.ErrNotFound) {
-				t.Fatalf("want not found after delete, got %v", err)
-			}
-		})
-	}
+	})
 }
 
 // --- sim-specific fault injection ---

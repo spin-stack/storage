@@ -39,6 +39,13 @@ invariant ID, it extends INV-08/09/10/11/16/17 to the host-move path. Phases 02/
 (need infra). `task ci` green, coverage ≥ 90%, integration green on PG 18. See
 `docs/plan/STATUS.md` for the full handoff and next steps.
 
+## Infrastructure (2026-07-25)
+`task build:qemu` builds the pinned QEMU 11.0.2 into `_output/` (vhost-user-blk +
+storage daemon); `task backend:conformance` runs the §6.1 object-store suite against
+RustFS in a container. The AWS SDK lives in exactly one file
+(`internal/simio/real/s3.go`, ADR-0010) behind `objectstore.Store`; container
+scaffolding is `internal/testinfra` (integration build tag).
+
 ## Gotchas
 - WAL headers are 104 bytes (ADR-0005), not the doc's "96".
 - Drain evacuates from the volume's durable prefix in S3, **not** from a source-taken
@@ -47,6 +54,12 @@ invariant ID, it extends INV-08/09/10/11/16/17 to the host-move path. Phases 02/
 - Tooling is pinned in `Taskfile.yml` and installed by `task tools` into
   `./.tools/bin` (sqlc, Atlas, golangci-lint). Never run those binaries by hand —
   every workflow (generate, migrations, format, lint, coverage) is a task.
+- RustFS answers `If-Match` on a missing key with **NoSuchKey**, not 412; multipart
+  ETags carry a `-N` suffix (never treat an ETag as a content hash); a LIST page caps
+  at 1000 keys, so the S3 store paginates internally (§22.1 depends on it).
+- Do not re-add spinbox's `CONFIG_CXL=n` QEMU debloat: it breaks the 11.0.2 link. The
+  QEMU build dir lives in a BuildKit cache mount — bump `QEMU_CONFIG_REV` when the
+  configure flags change, or the old configuration is silently reused.
 - Postgres `jsonb` round-trips by value, not byte-for-byte — compare parsed JSON in tests.
 - Lifecycles are typed in `internal/lifecycle` (ADR-0009): never write a bare state
   string. Stored as TEXT + CHECK (not PG enums, not int codes); binary formats keep

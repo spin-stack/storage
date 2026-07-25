@@ -19,3 +19,7 @@ cover*.out
 
 # Project-local pinned tool binaries (task tools)
 /.tools/
+
+# BuildKit cache + build output (task build:qemu)
+/.cache/
+/_output/

@@ -4,6 +4,10 @@ go 1.26
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.24.0
+	github.com/aws/aws-sdk-go-v2 v1.43.0
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.30
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.0
+	github.com/aws/smithy-go v1.27.3
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/testcontainers/testcontainers-go v0.40.0
@@ -21,6 +25,15 @@ require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
+	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.35 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.31 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.31 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.32 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.13 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.9.24 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.31 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.32 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
