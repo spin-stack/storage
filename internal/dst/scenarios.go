@@ -15,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/gc"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -93,7 +94,7 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 	term, _ := md.AcquireLeadership(ctx, "cp")
 	for _, h := range []string{srcHost, dstHost} {
 		if err := md.UpsertHost(ctx, term, metadata.Host{
-			HostID: h, State: metadata.HostActive, NVMeTotalBytes: 10 * volBytes,
+			HostID: h, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volBytes,
 		}); err != nil {
 			return err
 		}
@@ -115,8 +116,8 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 		volByID[vid] = vol
 
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
-			VolumeID: vid, SizeBytes: volBytes, BlockSize: 65536, Durability: "remote",
-			State: "ACTIVE", CurrentEpoch: 1, PrimaryHostID: srcHost,
+			VolumeID: vid, SizeBytes: volBytes, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
+			State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: srcHost,
 			DEKWrapped: []byte{1}, KEKID: "k",
 		}); err != nil {
 			return err
@@ -166,7 +167,7 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 	if err != nil {
 		return fmt.Errorf("drain: %w", err)
 	}
-	if res.Phase != controlplane.PhaseDrained || len(res.Moved) != 2 {
+	if res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 2 {
 		return fmt.Errorf("drain result = %+v", res)
 	}
 
@@ -198,7 +199,7 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 	if src.NVMeCommittedBytes != 0 || dst.NVMeCommittedBytes != 2*volBytes {
 		return fmt.Errorf("capacity accounting after drain: src=%d dst=%d", src.NVMeCommittedBytes, dst.NVMeCommittedBytes)
 	}
-	if src.State != metadata.HostDraining {
+	if src.State != lifecycle.HostDraining {
 		return fmt.Errorf("source host state = %q, want DRAINING", src.State)
 	}
 	s.Notef("drain moved 2 volumes: fenced promotion, no lost ACKed write, capacity followed")
@@ -458,7 +459,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 
 	md := metasim.New(s.Clock.Wall)
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: pvs, SizeBytes: 1 << 30, BlockSize: 65536, State: "ACTIVE", DEKWrapped: []byte{1}, KEKID: "k"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: pvs, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"})
 
 	// Parent writes + snapshot.
 	pf, _ := s.Disk.Create("wal/parent.wal")
@@ -472,7 +473,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 	if err != nil {
 		return err
 	}
-	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: m.SnapshotID, VolumeID: pvs, Epoch: 1, TargetSequence: int64(m.TargetSequence), RootDigest: m.RootDigest, State: "PUBLISHED", RequestID: "00000000-0000-7000-8000-000000000072"})
+	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: m.SnapshotID, VolumeID: pvs, Epoch: 1, TargetSequence: int64(m.TargetSequence), RootDigest: m.RootDigest, State: lifecycle.SnapshotPublished, RequestID: "00000000-0000-7000-8000-000000000072"})
 
 	parentObjsBefore, _ := s.Store.List(ctx, "wal/"+pvs+"/")
 
@@ -563,7 +564,7 @@ func scenarioRebuildMetadataFromS3(s *Sim) error {
 	epochs := epoch.NewStore(s.Store)
 
 	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
-		VolumeID: vid, SizeBytes: 1 << 30, BlockSize: 65536, Durability: "remote", KEKID: "k", DEKWrapped: []byte{1},
+		VolumeID: vid, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, KEKID: "k", DEKWrapped: []byte{1},
 	}); err != nil {
 		return err
 	}
@@ -615,7 +616,7 @@ func scenarioRecoveryAuthorityIsS3(s *Sim) error {
 	// PostgreSQL holds a WRONG informative watermark.
 	md := metasim.New(s.Clock.Wall)
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(vol), State: "ACTIVE", DurableSequence: 999, DEKWrapped: []byte{1}, KEKID: "k"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(vol), State: lifecycle.VolumeActive, DurableSequence: 999, DEKWrapped: []byte{1}, KEKID: "k"})
 
 	// Recovery derives the durable point from S3, ignoring PG's 999.
 	durable, err := recovery.DurablePoint(ctx, s.Store, vol, 1)
@@ -653,9 +654,9 @@ func scenarioFencedWriterNoLostAck(s *Sim) error {
 	md := metasim.New(s.Clock.Wall)
 	epochs := epoch.NewStore(s.Store)
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost1, State: "ACTIVE"})
-	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost2, State: "ACTIVE"})
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(volID), CurrentEpoch: 1, State: "ACTIVE", PrimaryHostID: failHost1, DEKWrapped: []byte{1}, KEKID: "k"})
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost1, State: lifecycle.HostActive})
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost2, State: lifecycle.HostActive})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(volID), CurrentEpoch: 1, State: lifecycle.VolumeActive, PrimaryHostID: failHost1, DEKWrapped: []byte{1}, KEKID: "k"})
 	if _, err := epochs.Init(ctx, format.UUIDString(volID), 1); err != nil {
 		return err
 	}
@@ -734,9 +735,9 @@ func scenarioPromotionFencingWait(s *Sim) error {
 	p := controlplane.NewPromoter(md, epochs, s.Clock, 10*time.Second, 2*time.Second)
 
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost1, State: "ACTIVE"})
-	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost2, State: "ACTIVE"})
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: promoVol, State: "ACTIVE", PrimaryHostID: promoHost1, DEKWrapped: []byte{1}, KEKID: "k"})
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost1, State: lifecycle.HostActive})
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost2, State: lifecycle.HostActive})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: promoVol, State: lifecycle.VolumeActive, PrimaryHostID: promoHost1, DEKWrapped: []byte{1}, KEKID: "k"})
 	if _, err := epochs.Init(ctx, promoVol, 0); err != nil {
 		return err
 	}

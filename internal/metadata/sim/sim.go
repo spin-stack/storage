@@ -6,10 +6,12 @@ package sim
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 )
 
@@ -69,6 +71,9 @@ func (s *Store) GetLeader(_ context.Context) (metadata.Leader, error) {
 }
 
 func (s *Store) UpsertHost(_ context.Context, term int64, h metadata.Host) error {
+	if !h.State.Valid() {
+		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, h.State)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
@@ -100,7 +105,10 @@ func (s *Store) ListHosts(_ context.Context) ([]metadata.Host, error) {
 	return hosts, nil
 }
 
-func (s *Store) SetHostState(_ context.Context, term int64, hostID, state string) error {
+func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state lifecycle.HostState) error {
+	if !state.Valid() {
+		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, state)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
@@ -109,6 +117,9 @@ func (s *Store) SetHostState(_ context.Context, term int64, hostID, state string
 	h, ok := s.hosts[hostID]
 	if !ok {
 		return metadata.ErrNotFound
+	}
+	if err := h.State.Transition(state); err != nil {
+		return err
 	}
 	h.State = state
 	s.hosts[hostID] = h
@@ -161,6 +172,15 @@ func (s *Store) GetHostLease(_ context.Context, hostID string) (metadata.HostLea
 }
 
 func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume) error {
+	if !v.State.Valid() {
+		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
+	}
+	if v.Durability == "" {
+		v.Durability = lifecycle.DurabilityRemote // the §14.8 default, as in the DB
+	}
+	if !v.Durability.Valid() {
+		return fmt.Errorf("%w: durability %q", lifecycle.ErrUnknownState, v.Durability)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
@@ -243,6 +263,9 @@ func (s *Store) ResizeVolume(_ context.Context, term int64, volumeID string, new
 }
 
 func (s *Store) CreateSnapshot(_ context.Context, term int64, snap metadata.Snapshot) error {
+	if !snap.State.Valid() {
+		return fmt.Errorf("%w: snapshot state %q", lifecycle.ErrUnknownState, snap.State)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
@@ -263,6 +286,12 @@ func (s *Store) GetSnapshot(_ context.Context, snapshotID string) (metadata.Snap
 }
 
 func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool, error) {
+	if !op.Kind.Valid() {
+		return false, fmt.Errorf("%w: operation kind %q", lifecycle.ErrUnknownState, op.Kind)
+	}
+	if !op.Phase.Valid() {
+		return false, fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.ops[op.OperationID]; exists {
@@ -273,11 +302,17 @@ func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool,
 }
 
 func (s *Store) UpdateOperation(_ context.Context, op metadata.Operation) error {
+	if !op.Phase.Valid() {
+		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.ops[op.OperationID]
 	if !ok {
 		return metadata.ErrNotFound
+	}
+	if err := cur.Phase.Transition(op.Phase); err != nil {
+		return err
 	}
 	cur.Phase, cur.CurrentState, cur.Error = op.Phase, op.CurrentState, op.Error
 	s.ops[op.OperationID] = cur

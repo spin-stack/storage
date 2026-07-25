@@ -31,9 +31,9 @@ See ADR-0006, ADR-0007. Atlas installed via `curl -sSL https://atlasbinaries.com
 `~/.local/bin/atlas`.
 
 ## Current state (2026-07-25)
-Phases 0/01/04/05/06/07/08/09/10 complete on `main` (34 commits). **Phase 11 (cross-host
-materialization + cordon/drain + capacity) is done on branch `phase-11/cross-host-drain`,
-pending the human review of the fencing diff (11.2/11.3) before the `--ff-only` merge.**
+Phases 0/01/04/05/06/07/08/09/10/**11** complete on `main` (Phase 11 = cross-host
+materialization + cordon/drain + capacity, merged `--ff-only` after review). Increment
+**13.1 (typed lifecycles, ADR-0009)** is on branch `hardening/typed-lifecycles`.
 21/22 invariants active; only INV-19 (fleet-mixed) pending — Phase 11 adds no new
 invariant ID, it extends INV-08/09/10/11/16/17 to the host-move path. Phases 02/03 planned
 (need infra). `task ci` green, coverage ≥ 90%, integration green on PG 18. See
@@ -47,6 +47,13 @@ invariant ID, it extends INV-08/09/10/11/16/17 to the host-move path. Phases 02/
 - `sqlc` is not preinstalled: `go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0`
   (lands in `~/go/bin`, not on PATH by default).
 - Postgres `jsonb` round-trips by value, not byte-for-byte — compare parsed JSON in tests.
+- Lifecycles are typed in `internal/lifecycle` (ADR-0009): never write a bare state
+  string. Stored as TEXT + CHECK (not PG enums, not int codes); binary formats keep
+  numeric enums. A new state = constant + transition table + Atlas migration, or the
+  drift test fails.
+- Atlas is not preinstalled either: `curl -sSL -o ~/.local/bin/atlas
+  https://atlasbinaries.com/atlas/atlas-linux-amd64-latest && chmod +x` (the atlasgo.sh
+  installer needs sudo).
 - Two real bugs the tests caught and fixed: `Log.Discard/WriteZeroes` not feeding the
   remote batcher; the sim network letting a closed conn Send.
 - Coverage: `-coverpkg=./...`; 90% floor excludes generated db / integration-only pg &

@@ -8,6 +8,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/epoch"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -26,10 +27,10 @@ func setup(t *testing.T) (*controlplane.Promoter, metadata.Store, *epoch.Store, 
 	epochs := epoch.NewStore(sim.NewObjectStore())
 
 	term, _ := md.AcquireLeadership(context.Background(), "cp")
-	_ = md.UpsertHost(context.Background(), term, metadata.Host{HostID: host1, State: "ACTIVE"})
-	_ = md.UpsertHost(context.Background(), term, metadata.Host{HostID: host2, State: "ACTIVE"})
+	_ = md.UpsertHost(context.Background(), term, metadata.Host{HostID: host1, State: lifecycle.HostActive})
+	_ = md.UpsertHost(context.Background(), term, metadata.Host{HostID: host2, State: lifecycle.HostActive})
 	_ = md.CreateVolume(context.Background(), term, metadata.Volume{
-		VolumeID: volID, State: "ACTIVE", PrimaryHostID: host1, DEKWrapped: []byte{1}, KEKID: "k",
+		VolumeID: volID, State: lifecycle.VolumeActive, PrimaryHostID: host1, DEKWrapped: []byte{1}, KEKID: "k",
 	})
 	if _, err := epochs.Init(context.Background(), volID, 0); err != nil {
 		t.Fatal(err)

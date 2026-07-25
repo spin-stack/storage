@@ -72,21 +72,26 @@ const updateOperationPhase = `-- name: UpdateOperationPhase :execrows
 UPDATE operations
    SET current_state = $2, phase = $3, error = $4, updated_at = now()
  WHERE operation_id = $1
+   AND phase = ANY($5::text[])
 `
 
 type UpdateOperationPhaseParams struct {
-	OperationID  uuid.UUID   `json:"operation_id"`
-	CurrentState []byte      `json:"current_state"`
-	Phase        string      `json:"phase"`
-	Error        pgtype.Text `json:"error"`
+	OperationID   uuid.UUID   `json:"operation_id"`
+	CurrentState  []byte      `json:"current_state"`
+	Phase         string      `json:"phase"`
+	Error         pgtype.Text `json:"error"`
+	AllowedPhases []string    `json:"allowed_phases"`
 }
 
+// Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
+// terminal operation cannot be resurrected even by a buggy caller.
 func (q *Queries) UpdateOperationPhase(ctx context.Context, arg UpdateOperationPhaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateOperationPhase,
 		arg.OperationID,
 		arg.CurrentState,
 		arg.Phase,
 		arg.Error,
+		arg.AllowedPhases,
 	)
 	if err != nil {
 		return 0, err

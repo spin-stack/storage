@@ -51,7 +51,7 @@ func (p Policy) maxRatio() float64 {
 
 // fits reports whether h can take sizeBytes more without breaking the policy.
 func (p Policy) fits(h metadata.Host, sizeBytes int64) bool {
-	if h.State != metadata.HostActive || h.NVMeTotalBytes <= 0 {
+	if !h.State.AcceptsPlacement() || h.NVMeTotalBytes <= 0 {
 		return false
 	}
 	limit := int64(p.maxRatio() * float64(h.NVMeTotalBytes))

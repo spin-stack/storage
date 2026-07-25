@@ -7,6 +7,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/spin-stack/storage/internal/db"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 )
 
@@ -91,9 +93,12 @@ func (s *Store) UpsertHost(ctx context.Context, term int64, h metadata.Host) err
 	if err != nil {
 		return err
 	}
+	if !h.State.Valid() {
+		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, h.State)
+	}
 	return staleIfZero(s.q.UpsertHost(ctx, db.UpsertHostParams{
 		HostID:             hostID,
-		State:              h.State,
+		State:              h.State.String(),
 		AgentVersion:       h.AgentVersion,
 		MaxFormatVersion:   h.MaxFormatVersion,
 		NvmeTotalBytes:     h.NVMeTotalBytes,
@@ -112,17 +117,23 @@ func (s *Store) GetHost(ctx context.Context, hostID string) (metadata.Host, erro
 	if err != nil {
 		return metadata.Host{}, notFound(err)
 	}
-	return hostFromRow(h), nil
+	return hostFromRow(h)
 }
 
-// hostFromRow converts a generated row to the interface type.
-func hostFromRow(h *db.Host) metadata.Host {
+// hostFromRow converts a generated row to the interface type. A row whose state is
+// outside the vocabulary is an error, not a silently propagated string (the DB CHECK
+// makes this unreachable in practice — this is the second line of defence).
+func hostFromRow(h *db.Host) (metadata.Host, error) {
+	state, err := lifecycle.ParseHostState(h.State)
+	if err != nil {
+		return metadata.Host{}, fmt.Errorf("host %s: %w", h.HostID, err)
+	}
 	return metadata.Host{
-		HostID: h.HostID.String(), State: h.State, AgentVersion: h.AgentVersion,
+		HostID: h.HostID.String(), State: state, AgentVersion: h.AgentVersion,
 		MaxFormatVersion: h.MaxFormatVersion, NVMeTotalBytes: h.NvmeTotalBytes,
 		NVMeUsedBytes: h.NvmeUsedBytes, NVMeCommittedBytes: h.NvmeCommittedBytes,
 		LastHeartbeat: fromTS(h.LastHeartbeat),
-	}
+	}, nil
 }
 
 func (s *Store) ListHosts(ctx context.Context) ([]metadata.Host, error) {
@@ -131,25 +142,42 @@ func (s *Store) ListHosts(ctx context.Context) ([]metadata.Host, error) {
 		return nil, err
 	}
 	hosts := make([]metadata.Host, 0, len(rows))
-	for _, h := range rows {
-		hosts = append(hosts, hostFromRow(h))
+	for _, row := range rows {
+		h, err := hostFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		hosts = append(hosts, h)
 	}
 	return hosts, nil
 }
 
-func (s *Store) SetHostState(ctx context.Context, term int64, hostID, state string) error {
+func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState) error {
 	id, err := uuid.Parse(hostID)
 	if err != nil {
 		return err
 	}
-	rows, err := s.q.SetHostState(ctx, db.SetHostStateParams{HostID: id, State: state, Term: term})
+	if !state.Valid() {
+		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, state)
+	}
+	rows, err := s.q.SetHostState(ctx, db.SetHostStateParams{
+		HostID: id, State: state.String(), Term: term,
+		AllowedStates: state.PredecessorNames(), // the §28.1 transition table, as a predicate
+	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
-		// 0 rows: stale term or a host that does not exist.
-		if _, gerr := s.GetHost(ctx, hostID); errors.Is(gerr, metadata.ErrNotFound) {
+		// 0 rows: missing host, an illegal transition, or a stale term.
+		h, gerr := s.GetHost(ctx, hostID)
+		switch {
+		case errors.Is(gerr, metadata.ErrNotFound):
 			return metadata.ErrNotFound
+		case gerr != nil:
+			return gerr
+		}
+		if terr := h.State.Transition(state); terr != nil {
+			return terr
 		}
 		return metadata.ErrStaleTerm
 	}
@@ -216,26 +244,41 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume)
 	}
 	durability := v.Durability
 	if durability == "" {
-		durability = "remote"
+		durability = lifecycle.DurabilityRemote
+	}
+	if !durability.Valid() {
+		return fmt.Errorf("%w: durability %q", lifecycle.ErrUnknownState, v.Durability)
+	}
+	if !v.State.Valid() {
+		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
 	return staleIfZero(s.q.CreateVolume(ctx, db.CreateVolumeParams{
-		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability,
-		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State,
+		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability.String(),
+		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
 		DekWrapped: v.DEKWrapped, KekID: v.KEKID,
 		PrimaryHostID: nullUUID(v.PrimaryHostID), ChainDepth: v.ChainDepth, Term: term,
 	}))
 }
 
-// volumeFromRow converts a generated row to the interface type.
-func volumeFromRow(v *db.Volume) metadata.Volume {
+// volumeFromRow converts a generated row to the interface type, parsing its state
+// and durability rather than trusting the column.
+func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
+	state, err := lifecycle.ParseVolumeState(v.State)
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("volume %s: %w", v.VolumeID, err)
+	}
+	durability, err := lifecycle.ParseDurability(v.Durability)
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("volume %s: %w", v.VolumeID, err)
+	}
 	return metadata.Volume{
-		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes, Durability: v.Durability,
-		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State,
+		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes, Durability: durability,
+		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: state,
 		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
 		ChainDepth: v.ChainDepth, DEKWrapped: v.DekWrapped, KEKID: v.KekID,
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence,
-	}
+	}, nil
 }
 
 func (s *Store) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
@@ -247,7 +290,7 @@ func (s *Store) GetVolume(ctx context.Context, volumeID string) (metadata.Volume
 	if err != nil {
 		return metadata.Volume{}, notFound(err)
 	}
-	return volumeFromRow(v), nil
+	return volumeFromRow(v)
 }
 
 func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadata.Volume, error) {
@@ -260,8 +303,12 @@ func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadat
 		return nil, err
 	}
 	vols := make([]metadata.Volume, 0, len(rows))
-	for _, v := range rows {
-		vols = append(vols, volumeFromRow(v))
+	for _, row := range rows {
+		v, err := volumeFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		vols = append(vols, v)
 	}
 	return vols, nil
 }
@@ -325,10 +372,13 @@ func (s *Store) CreateSnapshot(ctx context.Context, term int64, snap metadata.Sn
 	if err != nil {
 		return err
 	}
+	if !snap.State.Valid() {
+		return fmt.Errorf("%w: snapshot state %q", lifecycle.ErrUnknownState, snap.State)
+	}
 	return staleIfZero(s.q.CreateSnapshot(ctx, db.CreateSnapshotParams{
 		SnapshotID: sid, VolumeID: vid, ParentSnapshotID: nullUUID(snap.ParentSnapshotID),
 		Epoch: snap.Epoch, TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
-		SourceHostID: nullUUID(snap.SourceHostID), State: snap.State,
+		SourceHostID: nullUUID(snap.SourceHostID), State: snap.State.String(),
 		ManifestKey: text(snap.ManifestKey), RequestID: rid, Term: term,
 	}))
 }
@@ -342,11 +392,15 @@ func (s *Store) GetSnapshot(ctx context.Context, snapshotID string) (metadata.Sn
 	if err != nil {
 		return metadata.Snapshot{}, notFound(err)
 	}
+	state, err := lifecycle.ParseSnapshotState(snap.State)
+	if err != nil {
+		return metadata.Snapshot{}, fmt.Errorf("snapshot %s: %w", snap.SnapshotID, err)
+	}
 	return metadata.Snapshot{
 		SnapshotID: snap.SnapshotID.String(), VolumeID: snap.VolumeID.String(),
 		ParentSnapshotID: fromNullUUID(snap.ParentSnapshotID), Epoch: snap.Epoch,
 		TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
-		SourceHostID: fromNullUUID(snap.SourceHostID), State: snap.State,
+		SourceHostID: fromNullUUID(snap.SourceHostID), State: state,
 		ManifestKey: fromText(snap.ManifestKey), RequestID: snap.RequestID.String(),
 	}, nil
 }
@@ -356,9 +410,15 @@ func (s *Store) RecordOperation(ctx context.Context, op metadata.Operation) (boo
 	if err != nil {
 		return false, err
 	}
+	if !op.Kind.Valid() {
+		return false, fmt.Errorf("%w: operation kind %q", lifecycle.ErrUnknownState, op.Kind)
+	}
+	if !op.Phase.Valid() {
+		return false, fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
+	}
 	rows, err := s.q.RecordOperation(ctx, db.RecordOperationParams{
-		OperationID: id, Kind: op.Kind, VolumeID: nullUUID(op.VolumeID), HostID: nullUUID(op.HostID),
-		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase,
+		OperationID: id, Kind: op.Kind.String(), VolumeID: nullUUID(op.VolumeID), HostID: nullUUID(op.HostID),
+		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase.String(),
 	})
 	if err != nil {
 		return false, err
@@ -371,14 +431,23 @@ func (s *Store) UpdateOperation(ctx context.Context, op metadata.Operation) erro
 	if err != nil {
 		return err
 	}
+	if !op.Phase.Valid() {
+		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
+	}
 	rows, err := s.q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
-		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase, Error: text(op.Error),
+		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
+		AllowedPhases: op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
 	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
-		return metadata.ErrNotFound
+		// 0 rows: the operation does not exist, or the phase move is illegal.
+		cur, gerr := s.GetOperation(ctx, op.OperationID)
+		if gerr != nil {
+			return gerr
+		}
+		return cur.Phase.Transition(op.Phase)
 	}
 	return nil
 }
@@ -392,10 +461,18 @@ func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.
 	if err != nil {
 		return metadata.Operation{}, notFound(err)
 	}
+	kind, err := lifecycle.ParseOperationKind(op.Kind)
+	if err != nil {
+		return metadata.Operation{}, fmt.Errorf("operation %s: %w", op.OperationID, err)
+	}
+	phase, err := lifecycle.ParseOperationPhase(op.Phase)
+	if err != nil {
+		return metadata.Operation{}, fmt.Errorf("operation %s: %w", op.OperationID, err)
+	}
 	return metadata.Operation{
-		OperationID: op.OperationID.String(), Kind: op.Kind,
+		OperationID: op.OperationID.String(), Kind: kind,
 		VolumeID: fromNullUUID(op.VolumeID), HostID: fromNullUUID(op.HostID),
 		DesiredState: op.DesiredState, CurrentState: op.CurrentState,
-		Phase: op.Phase, Error: fromText(op.Error),
+		Phase: phase, Error: fromText(op.Error),
 	}, nil
 }

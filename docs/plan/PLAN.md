@@ -134,7 +134,7 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 | 10 | 10 | Objectization + checkpoints + GC mark-and-sweep + versioned/Object-Lock buckets | **DONE** ✓ (10.1–10.3; INV-13/14/17 active) | 08 |
 | 11 | 11 | Cross-host via full materialization + cordon/drain + capacity accounting | **DONE** ✓ (11.1–11.3; no new invariant ID — extends INV-08/09/10/11/16/17 to the host-move path; ADR-0008) | 08, 09, 10 |
 | 12 | 12 | Warm standby + WAL-object compaction + chain flattening | not expanded | 10, 11 |
-| 13 | 13 | Hardening: real-hardware fault injection + backend conformance suite + measured-time runbooks | not expanded | all |
+| 13 | 13 | Hardening: real-hardware fault injection + backend conformance suite + measured-time runbooks | **13.1 DONE** ✓ (typed lifecycles, ADR-0009); 13.2–13.4 need infra | all |
 | 14 | 14 | *(post-MVP)* lazy loading, multi-queue, io_uring, selective FUA flush, tenant QoS, S3-based lease renewal | out of scope | — |
 
 MVP "done" = Phases 01–13, evaluated against the §31 success criteria.

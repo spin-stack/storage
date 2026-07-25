@@ -4,6 +4,10 @@
 // elapsed so the old writer can no longer ACK durability on its monotonic clock
 // (§12.2). Promotion increments the epoch in PostgreSQL (term-guarded) and CASes the
 // S3 epoch object (§12.4), then grants the new lease.
+//
+// The §7 failover state names live in internal/lifecycle as lifecycle.VolumeState,
+// with the transition table that forbids reaching recovery without passing through
+// FENCING_WAIT.
 package controlplane
 
 import (
@@ -14,15 +18,6 @@ import (
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/simio/clock"
-)
-
-// Promotion state names (§7 writer-failover state machine).
-const (
-	StateActive           = "ACTIVE"
-	StatePrimarySuspected = "PRIMARY_SUSPECTED"
-	StateFencingWait      = "FENCING_WAIT"
-	StateRecoveryRequired = "RECOVERY_REQUIRED"
-	StateRecovering       = "RECOVERING"
 )
 
 // ErrFencingWaitNotElapsed means promotion was attempted before

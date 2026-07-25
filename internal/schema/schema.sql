@@ -23,9 +23,13 @@ CREATE TABLE control_plane_leader (
 -- the 7th byte of the UUID; requiring it to equal 7 rejects any non-v7 id at insert,
 -- regardless of the client. Foreign-key columns are covered transitively (they must
 -- reference a v7-checked primary key).
+-- Lifecycle vocabularies are CHECK-constrained (the third enforcement layer next to
+-- the Go types in internal/lifecycle and the transition-guarded UPDATEs): no client,
+-- script, or manual psql can persist a state that does not exist. Adding a state
+-- means editing internal/lifecycle *and* a migration — deliberately, not by accident.
 CREATE TABLE hosts (
     host_id              UUID PRIMARY KEY CHECK ((get_byte(uuid_send(host_id), 6) >> 4) = 7),
-    state                TEXT NOT NULL,   -- ACTIVE | CORDONED | DRAINING | DEAD
+    state                TEXT NOT NULL CHECK (state IN ('ACTIVE', 'CORDONED', 'DRAINING', 'DEAD')),
     agent_version        TEXT NOT NULL DEFAULT '',
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
@@ -47,10 +51,13 @@ CREATE TABLE volumes (
     volume_id          UUID PRIMARY KEY                 -- = on-disk VolumeID [16]byte
                          CHECK ((get_byte(uuid_send(volume_id), 6) >> 4) = 7),
     size_bytes         BIGINT NOT NULL,                 -- mutable: resize grow
-    durability         TEXT NOT NULL DEFAULT 'remote',  -- 'remote' | 'local' (§14.8)
+    durability         TEXT NOT NULL DEFAULT 'remote'
+                         CHECK (durability IN ('remote', 'local')),   -- §14.8
     block_size         INTEGER NOT NULL,                -- CoW segment granularity (64 KiB)
     current_epoch      BIGINT NOT NULL DEFAULT 0,
-    state              TEXT NOT NULL,
+    state              TEXT NOT NULL                                  -- §7 failover states
+                         CHECK (state IN ('ACTIVE', 'PRIMARY_SUSPECTED', 'FENCING_WAIT',
+                                          'RECOVERY_REQUIRED', 'RECOVERING', 'DETACHED')),
     primary_host_id    UUID REFERENCES hosts(host_id),
     standby_host_id    UUID REFERENCES hosts(host_id),
     active_root_id     UUID,
@@ -74,7 +81,8 @@ CREATE TABLE snapshots (
     target_sequence    BIGINT NOT NULL,
     root_digest        TEXT NOT NULL,
     source_host_id     UUID REFERENCES hosts(host_id),
-    state              TEXT NOT NULL,
+    state              TEXT NOT NULL                                  -- §19
+                         CHECK (state IN ('CREATING', 'PUBLISHED', 'FAILED', 'DELETING')),
     portable           BOOLEAN NOT NULL DEFAULT false,
     manifest_key       TEXT,
     request_id         UUID UNIQUE NOT NULL CHECK ((get_byte(uuid_send(request_id), 6) >> 4) = 7),
@@ -85,12 +93,14 @@ CREATE TABLE snapshots (
 -- operation_id is the client request_id (a UUIDv7).
 CREATE TABLE operations (
     operation_id  UUID PRIMARY KEY CHECK ((get_byte(uuid_send(operation_id), 6) >> 4) = 7),
-    kind          TEXT NOT NULL,      -- attach|detach|clone|resize|drain|recovery|flatten|gc
+    kind          TEXT NOT NULL CHECK (kind IN ('attach', 'detach', 'clone', 'resize',
+                                                'drain', 'recovery', 'flatten', 'gc')),
     volume_id     UUID REFERENCES volumes(volume_id),
     host_id       UUID REFERENCES hosts(host_id),
     desired_state JSONB NOT NULL,
     current_state JSONB NOT NULL,
-    phase         TEXT NOT NULL,
+    phase         TEXT NOT NULL CHECK (phase IN ('PENDING', 'RUNNING', 'CANCELING',
+                                                 'CANCELED', 'SUCCEEDED', 'FAILED')),
     error         TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()

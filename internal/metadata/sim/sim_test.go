@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/sim"
 )
@@ -40,7 +41,7 @@ func TestZombieCPCannotMutate(t *testing.T) {
 
 	termA, _ := s.AcquireLeadership(ctx, "cp-a")
 	// Set up a volume under cp-a.
-	if err := s.CreateVolume(ctx, termA, metadata.Volume{VolumeID: "v1", State: "ACTIVE", DEKWrapped: []byte{1}, KEKID: "k"}); err != nil {
+	if err := s.CreateVolume(ctx, termA, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -70,13 +71,13 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 		mut  func(s *sim.Store, staleTerm int64) error
 	}{
 		{"UpsertHost", func(s *sim.Store, term int64) error {
-			return s.UpsertHost(ctx, term, metadata.Host{HostID: "h"})
+			return s.UpsertHost(ctx, term, metadata.Host{HostID: "h", State: lifecycle.HostActive})
 		}},
 		{"RenewHostLease", func(s *sim.Store, term int64) error {
 			return s.RenewHostLease(ctx, term, "h", 10)
 		}},
 		{"CreateVolume", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v"})
+			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", State: lifecycle.VolumeActive})
 		}},
 		{"BumpVolumeEpoch", func(s *sim.Store, term int64) error {
 			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h")
@@ -102,7 +103,7 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 func TestOperationIdempotency(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()
-	op := metadata.Operation{OperationID: "req-1", Kind: "attach", DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: "pending"}
+	op := metadata.Operation{OperationID: "req-1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
 
 	recorded, err := s.RecordOperation(ctx, op)
 	if err != nil || !recorded {
@@ -140,15 +141,15 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 
 	term, _ := s.AcquireLeadership(ctx, "cp")
 
-	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: "ACTIVE", AgentVersion: "v1"}); err != nil {
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: lifecycle.HostActive, AgentVersion: "v1"}); err != nil {
 		t.Fatal(err)
 	}
 	h, err := s.GetHost(ctx, "h1")
-	if err != nil || h.State != "ACTIVE" || h.AgentVersion != "v1" {
+	if err != nil || h.State != lifecycle.HostActive || h.AgentVersion != "v1" {
 		t.Fatalf("GetHost: %+v err=%v", h, err)
 	}
 
-	if err := s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v1", State: "ACTIVE"}); err != nil {
+	if err := s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateWatermarks(ctx, term, "v1", 10, 5, 3); err != nil {
@@ -167,13 +168,105 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 		t.Fatalf("BumpVolumeEpoch missing: %v", err)
 	}
 
-	op := metadata.Operation{OperationID: "op1", Kind: "attach", DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: "pending"}
+	op := metadata.Operation{OperationID: "op1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
 	if _, err := s.RecordOperation(ctx, op); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetOperation(ctx, "op1")
-	if err != nil || got.Kind != "attach" {
+	if err != nil || got.Kind != lifecycle.OpAttach {
 		t.Fatalf("GetOperation: %+v err=%v", got, err)
+	}
+}
+
+// TestStoreRejectsValuesOutsideTheVocabulary: the store is the authority for what a
+// state *is*; a value from outside the lifecycle vocabulary never reaches a row.
+func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		mut  func(s *sim.Store, term int64) error
+	}{
+		{"UpsertHost with an unknown state", func(s *sim.Store, term int64) error {
+			return s.UpsertHost(ctx, term, metadata.Host{HostID: "h", State: lifecycle.HostState("NOPE")})
+		}},
+		{"UpsertHost with the zero state", func(s *sim.Store, term int64) error {
+			return s.UpsertHost(ctx, term, metadata.Host{HostID: "h"})
+		}},
+		{"SetHostState with a state from another vocabulary", func(s *sim.Store, term int64) error {
+			if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h", State: lifecycle.HostActive}); err != nil {
+				return err
+			}
+			return s.SetHostState(ctx, term, "h", lifecycle.HostState("PUBLISHED"))
+		}},
+		{"CreateVolume with the zero state", func(s *sim.Store, term int64) error {
+			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", Durability: lifecycle.DurabilityRemote})
+		}},
+		{"CreateVolume with an unknown durability", func(s *sim.Store, term int64) error {
+			return s.CreateVolume(ctx, term, metadata.Volume{
+				VolumeID: "v", State: lifecycle.VolumeActive, Durability: lifecycle.Durability("cheap"),
+			})
+		}},
+		{"CreateSnapshot with an unknown state", func(s *sim.Store, term int64) error {
+			return s.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: "s", State: lifecycle.SnapshotState("DONE")})
+		}},
+		{"RecordOperation with an unknown kind", func(s *sim.Store, term int64) error {
+			_, err := s.RecordOperation(ctx, metadata.Operation{
+				OperationID: "op", Kind: lifecycle.OperationKind("teleport"), Phase: lifecycle.OpPending,
+			})
+			return err
+		}},
+		{"RecordOperation with an unknown phase", func(s *sim.Store, term int64) error {
+			_, err := s.RecordOperation(ctx, metadata.Operation{
+				OperationID: "op", Kind: lifecycle.OpDrain, Phase: lifecycle.OperationPhase("STARTED"),
+			})
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore()
+			term, _ := s.AcquireLeadership(ctx, "cp")
+			if err := tc.mut(s, term); !errors.Is(err, lifecycle.ErrUnknownState) {
+				t.Fatalf("want ErrUnknownState, got %v", err)
+			}
+		})
+	}
+}
+
+// TestUpdateOperationEnforcesThePhaseLifecycle: a finished operation cannot be
+// resurrected, and cancellation cannot rewrite a terminal outcome (§7).
+func TestUpdateOperationEnforcesThePhaseLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	_, _ = s.AcquireLeadership(ctx, "cp")
+	op := metadata.Operation{
+		OperationID: "op-1", Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
+		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
+	}
+	if _, err := s.RecordOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+
+	op.Phase = lifecycle.OpRunning
+	if err := s.UpdateOperation(ctx, op); err != nil {
+		t.Fatalf("PENDING -> RUNNING: %v", err)
+	}
+	op.Phase = lifecycle.OpSucceeded
+	if err := s.UpdateOperation(ctx, op); err != nil {
+		t.Fatalf("RUNNING -> SUCCEEDED: %v", err)
+	}
+
+	op.Phase = lifecycle.OpRunning
+	if err := s.UpdateOperation(ctx, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
+	}
+	op.Phase = lifecycle.OpCanceling
+	if err := s.UpdateOperation(ctx, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("SUCCEEDED -> CANCELING: want ErrInvalidTransition, got %v", err)
+	}
+	got, _ := s.GetOperation(ctx, "op-1")
+	if got.Phase != lifecycle.OpSucceeded {
+		t.Fatalf("a refused transition changed the phase to %q", got.Phase)
 	}
 }
 
@@ -185,7 +278,7 @@ func TestListHostsIsSortedAndComplete(t *testing.T) {
 	term, _ := s.AcquireLeadership(ctx, "cp")
 
 	for _, id := range []string{"h-c", "h-a", "h-b"} {
-		if err := s.UpsertHost(ctx, term, metadata.Host{HostID: id, State: "ACTIVE"}); err != nil {
+		if err := s.UpsertHost(ctx, term, metadata.Host{HostID: id, State: lifecycle.HostActive}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -207,25 +300,25 @@ func TestSetHostState(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
-	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: "ACTIVE"}); err != nil {
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: lifecycle.HostActive}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.SetHostState(ctx, term, "h1", "CORDONED"); err != nil {
+	if err := s.SetHostState(ctx, term, "h1", lifecycle.HostCordoned); err != nil {
 		t.Fatal(err)
 	}
 	h, _ := s.GetHost(ctx, "h1")
-	if h.State != "CORDONED" {
+	if h.State != lifecycle.HostCordoned {
 		t.Fatalf("state = %q, want CORDONED", h.State)
 	}
 
 	// A zombie CP cannot cordon or uncordon (§7).
 	stale := term
 	_, _ = s.AcquireLeadership(ctx, "cp-b")
-	if err := s.SetHostState(ctx, stale, "h1", "ACTIVE"); !errors.Is(err, metadata.ErrStaleTerm) {
+	if err := s.SetHostState(ctx, stale, "h1", lifecycle.HostActive); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale SetHostState: want ErrStaleTerm, got %v", err)
 	}
-	if h, _ := s.GetHost(ctx, "h1"); h.State != "CORDONED" {
+	if h, _ := s.GetHost(ctx, "h1"); h.State != lifecycle.HostCordoned {
 		t.Fatalf("zombie CP changed the state to %q", h.State)
 	}
 }
@@ -236,7 +329,7 @@ func TestCommitHostCapacity(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
-	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: "ACTIVE", NVMeTotalBytes: 1000}); err != nil {
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: lifecycle.HostActive, NVMeTotalBytes: 1000}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -276,7 +369,7 @@ func TestCommitHostCapacity(t *testing.T) {
 	if err := s.CommitHostCapacity(ctx, newTerm, "absent", 1); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("missing host: want ErrNotFound, got %v", err)
 	}
-	if err := s.SetHostState(ctx, newTerm, "absent", "CORDONED"); !errors.Is(err, metadata.ErrNotFound) {
+	if err := s.SetHostState(ctx, newTerm, "absent", lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("missing host SetHostState: want ErrNotFound, got %v", err)
 	}
 }
@@ -289,10 +382,10 @@ func TestListVolumesByHost(t *testing.T) {
 	term, _ := s.AcquireLeadership(ctx, "cp")
 
 	vols := []metadata.Volume{
-		{VolumeID: "v-b", State: "ACTIVE", PrimaryHostID: "h1"},
-		{VolumeID: "v-a", State: "ACTIVE", PrimaryHostID: "h1"},
-		{VolumeID: "v-c", State: "ACTIVE", PrimaryHostID: "h2"},
-		{VolumeID: "v-d", State: "ACTIVE"}, // unattached
+		{VolumeID: "v-b", State: lifecycle.VolumeActive, PrimaryHostID: "h1"},
+		{VolumeID: "v-a", State: lifecycle.VolumeActive, PrimaryHostID: "h1"},
+		{VolumeID: "v-c", State: lifecycle.VolumeActive, PrimaryHostID: "h2"},
+		{VolumeID: "v-d", State: lifecycle.VolumeActive}, // unattached
 	}
 	for _, v := range vols {
 		if err := s.CreateVolume(ctx, term, v); err != nil {

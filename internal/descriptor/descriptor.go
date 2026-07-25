@@ -11,19 +11,20 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
 // Descriptor is the durable, self-describing metadata of a volume (§8, §22.5).
 type Descriptor struct {
-	VolumeID     string `json:"volume_id"`
-	SizeBytes    int64  `json:"size_bytes"`
-	BlockSize    int32  `json:"block_size"`
-	Durability   string `json:"durability"`
-	CurrentEpoch int64  `json:"current_epoch"` // last known; the epoch object is authoritative
-	ChainDepth   int32  `json:"chain_depth"`
-	KEKID        string `json:"kek_id"`
-	DEKWrapped   []byte `json:"dek_wrapped"`
+	VolumeID     string               `json:"volume_id"`
+	SizeBytes    int64                `json:"size_bytes"`
+	BlockSize    int32                `json:"block_size"`
+	Durability   lifecycle.Durability `json:"durability"`
+	CurrentEpoch int64                `json:"current_epoch"` // last known; the epoch object is authoritative
+	ChainDepth   int32                `json:"chain_depth"`
+	KEKID        string               `json:"kek_id"`
+	DEKWrapped   []byte               `json:"dek_wrapped"`
 }
 
 // Key is the deterministic descriptor key for a volume.

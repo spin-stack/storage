@@ -9,6 +9,9 @@ ON CONFLICT (operation_id) DO NOTHING;
 SELECT * FROM operations WHERE operation_id = $1;
 
 -- name: UpdateOperationPhase :execrows
+-- Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
+-- terminal operation cannot be resurrected even by a buggy caller.
 UPDATE operations
    SET current_state = $2, phase = $3, error = $4, updated_at = now()
- WHERE operation_id = $1;
+ WHERE operation_id = $1
+   AND phase = ANY(sqlc.arg(allowed_phases)::text[]);

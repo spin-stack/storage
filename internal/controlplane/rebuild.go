@@ -7,6 +7,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
@@ -49,10 +50,13 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			Durability:   d.Durability,
 			BlockSize:    d.BlockSize,
 			CurrentEpoch: currentEpoch,
-			State:        "REBUILT",
-			ChainDepth:   d.ChainDepth,
-			DEKWrapped:   d.DEKWrapped,
-			KEKID:        d.KEKID,
+			// A rebuilt row knows nothing about ownership: the CP re-attaches through
+			// the normal path (which fences via the epoch object), so the volume comes
+			// back DETACHED rather than in an invented state (§7, §22.5).
+			State:      lifecycle.VolumeDetached,
+			ChainDepth: d.ChainDepth,
+			DEKWrapped: d.DEKWrapped,
+			KEKID:      d.KEKID,
 		}); err != nil {
 			return rebuilt, fmt.Errorf("rebuild %s create: %w", id, err)
 		}

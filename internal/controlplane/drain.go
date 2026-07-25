@@ -8,19 +8,12 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
-)
-
-// Drain operation phases (§7 reconciliation, §28.1 visible progress).
-const (
-	PhaseDraining  = "DRAINING"
-	PhaseDrained   = "DRAINED"
-	PhaseCanceling = "CANCELING"
-	PhaseCanceled  = "CANCELED"
 )
 
 // Move records one volume evacuated from a host.
@@ -35,8 +28,10 @@ type Move struct {
 
 // DrainResult is the outcome of one Drain pass. A drain is reconciled: an
 // interrupted pass is resumed by calling Drain again with the same operation id.
+// Phase is the shared reconciliation phase (§7) — a drain has no private
+// vocabulary; what it is *doing* lives in the operation's current_state.
 type DrainResult struct {
-	Phase     string
+	Phase     lifecycle.OperationPhase
 	Moved     []Move
 	Remaining int
 }
@@ -76,15 +71,17 @@ func (d *Drainer) Cancel(ctx context.Context, operationID string) error {
 	if errors.Is(err, metadata.ErrNotFound) {
 		// Canceled before it started: record the intent so the drain sees it.
 		_, rerr := d.md.RecordOperation(ctx, metadata.Operation{
-			OperationID: operationID, Kind: "drain",
-			DesiredState: []byte(`{}`), CurrentState: []byte(`{}`), Phase: PhaseCanceling,
+			OperationID: operationID, Kind: lifecycle.OpDrain,
+			DesiredState: []byte(`{}`), CurrentState: []byte(`{}`), Phase: lifecycle.OpCanceling,
 		})
 		return rerr
 	}
 	if err != nil {
 		return err
 	}
-	op.Phase = PhaseCanceling
+	// The store refuses this on a terminal operation (lifecycle.ErrInvalidTransition):
+	// a finished drain cannot be un-finished.
+	op.Phase = lifecycle.OpCanceling
 	return d.md.UpdateOperation(ctx, op)
 }
 
@@ -99,10 +96,10 @@ func (d *Drainer) Cancel(ctx context.Context, operationID string) error {
 // its progress and the reconciler calls Drain again.
 func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID string) (DrainResult, error) {
 	// Cordon first: even if this pass aborts immediately, nothing new lands here.
-	if err := d.md.SetHostState(ctx, term, hostID, metadata.HostCordoned); err != nil {
+	if err := d.md.SetHostState(ctx, term, hostID, lifecycle.HostCordoned); err != nil {
 		return DrainResult{}, err
 	}
-	if err := d.md.SetHostState(ctx, term, hostID, metadata.HostDraining); err != nil {
+	if err := d.md.SetHostState(ctx, term, hostID, lifecycle.HostDraining); err != nil {
 		return DrainResult{}, err
 	}
 
@@ -111,47 +108,67 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 		return DrainResult{}, err
 	}
 	prog := progress{Total: len(vols)}
-	if _, err := d.md.RecordOperation(ctx, metadata.Operation{
-		OperationID: operationID, Kind: "drain", HostID: hostID,
+	recorded, err := d.md.RecordOperation(ctx, metadata.Operation{
+		OperationID: operationID, Kind: lifecycle.OpDrain, HostID: hostID,
 		DesiredState: mustJSON(map[string]string{"drain_host": hostID}),
-		CurrentState: mustJSON(prog), Phase: PhaseDraining,
-	}); err != nil {
+		CurrentState: mustJSON(prog), Phase: lifecycle.OpPending,
+	})
+	if err != nil {
 		return DrainResult{}, err
 	}
+	_ = recorded // a duplicate request resumes the recorded operation (§18)
 
-	res := DrainResult{Phase: PhaseDraining, Remaining: len(vols)}
+	res := DrainResult{Phase: lifecycle.OpRunning, Remaining: len(vols)}
+
+	// A cancellation recorded before the first pass wins here, so the operation
+	// never leaves PENDING for RUNNING just to be canceled a line later.
+	canceled, err := d.canceled(ctx, operationID)
+	if err != nil {
+		return res, err
+	}
+	if canceled {
+		res.Phase = lifecycle.OpCanceled
+		return res, d.record(ctx, operationID, lifecycle.OpCanceled, prog, "")
+	}
+	// PENDING -> RUNNING (or RUNNING/FAILED -> RUNNING on a resumed pass). An empty
+	// host still runs: cordoning it is work.
+	if err := d.record(ctx, operationID, lifecycle.OpRunning, prog, ""); err != nil {
+		return res, err
+	}
+
 	for _, v := range vols {
 		canceled, err := d.canceled(ctx, operationID)
 		if err != nil {
 			return res, err
 		}
 		if canceled {
-			res.Phase = PhaseCanceled
-			return res, d.record(ctx, operationID, PhaseCanceled, prog, "")
+			res.Phase = lifecycle.OpCanceled
+			return res, d.record(ctx, operationID, lifecycle.OpCanceled, prog, "")
 		}
 
 		prog.Current = v.VolumeID
-		if err := d.record(ctx, operationID, PhaseDraining, prog, ""); err != nil {
+		if err := d.record(ctx, operationID, lifecycle.OpRunning, prog, ""); err != nil {
 			return res, err
 		}
 		mv, err := d.move(ctx, term, v)
 		if err != nil {
-			// Retryable: keep the progress and report why this pass stopped.
-			_ = d.record(ctx, operationID, PhaseDraining, prog, err.Error())
+			// Retryable: the operation stays FAILED with its progress, and the
+			// reconciler runs it again (FAILED -> RUNNING is a legal move, §7).
+			_ = d.record(ctx, operationID, lifecycle.OpFailed, prog, err.Error())
 			return res, err
 		}
 		res.Moved = append(res.Moved, mv)
 		res.Remaining--
 		prog.Moved++
 		prog.Current = ""
-		if err := d.record(ctx, operationID, PhaseDraining, prog, ""); err != nil {
+		if err := d.record(ctx, operationID, lifecycle.OpRunning, prog, ""); err != nil {
 			return res, err
 		}
 	}
 
-	res.Phase = PhaseDrained
+	res.Phase = lifecycle.OpSucceeded
 	// The host stays DRAINING: returning it to ACTIVE is an operator decision.
-	return res, d.record(ctx, operationID, PhaseDrained, prog, "")
+	return res, d.record(ctx, operationID, lifecycle.OpSucceeded, prog, "")
 }
 
 // move evacuates one volume: place → reserve → bulk materialize → fence → final
@@ -248,10 +265,10 @@ func (d *Drainer) canceled(ctx context.Context, operationID string) (bool, error
 	if err != nil {
 		return false, err
 	}
-	return op.Phase == PhaseCanceling || op.Phase == PhaseCanceled, nil
+	return op.Phase == lifecycle.OpCanceling || op.Phase == lifecycle.OpCanceled, nil
 }
 
-func (d *Drainer) record(ctx context.Context, operationID, phase string, p progress, opErr string) error {
+func (d *Drainer) record(ctx context.Context, operationID string, phase lifecycle.OperationPhase, p progress, opErr string) error {
 	return d.md.UpdateOperation(ctx, metadata.Operation{
 		OperationID: operationID, Phase: phase, CurrentState: mustJSON(p), Error: opErr,
 	})

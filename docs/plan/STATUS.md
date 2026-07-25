@@ -3,10 +3,10 @@
 Short snapshot + resume-from-here handoff. **Read this first** when picking up the work.
 
 - **Date:** 2026-07-25
-- **Where the work is:** Phases 0–10 are on **`main`** (34 commits). **Phase 11 is on
-  branch `phase-11/cross-host-drain`** (4 commits ahead of `main`), **pending human
-  review of the fencing/durability diff** (increments 11.2 and 11.3) before the
-  `--ff-only` merge. The per-phase branches are history labels; `main` is authoritative.
+- **Where the work is:** Phases 0–11 are on **`main`** (Phase 11 merged `--ff-only`
+  after review). **Increment 13.1 (typed lifecycles) is on branch
+  `hardening/typed-lifecycles`.** The per-phase branches are history labels; `main` is
+  authoritative.
 - **Gate:** `task ci` green; `task cover` ≥ 90% production floor (90.1%);
   `task test:integration` green on Postgres 18 (Docker).
 
@@ -24,9 +24,9 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
 | 08 recovery (S3 authority) + rebuild-metadata | ✓ | INV-08, 12, 20 |
 | 09 pause-free snapshots + clone + resize | ✓ | INV-16 |
 | 10 objectization + checkpoints + GC + I/O classes | ✓ | INV-13, 14, 17 |
-| 11 cross-host + cordon/drain + capacity | ✓ (branch, review pending) | none new — extends INV-08/09/10/11/16/17 |
+| 11 cross-host + cordon/drain + capacity | ✓ (merged) | none new — extends INV-08/09/10/11/16/17 |
 | 12 warm standby + WAL compaction + flatten | not started | — |
-| 13 hardening + fleet-mixed | not started | INV-19 (only one left) |
+| 13 hardening + fleet-mixed | 13.1 typed lifecycles ✓ (branch); 13.2–13.4 need infra | INV-19 (only one left) |
 
 **Only INV-19 (fleet-mixed read-old/write-new format gating) is still pending** — Phase 13.
 
@@ -63,7 +63,7 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
    `sqlc` via `go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0` (lands in `~/go/bin`).
 
 ## Next candidates (all pure-Go / DST-provable except where noted)
-- **Merge Phase 11** after the human review of the fencing diff (11.2/11.3).
+- **Merge `hardening/typed-lifecycles`** (increment 13.1, ADR-0009).
 - **Phase 12** — warm standby (checkpoint hydration; `materialize.FromCheckpoint` is the
   building block) + WAL-object compaction + chain flatten.
 - **Phase 13** — hardening: real-HW fault injection, backend conformance suite, runbooks,
@@ -77,6 +77,10 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
   ways (forbidigo forbids v4 outside `internal/ids`; DB CHECK on the version nibble).
 - **ADR-0008:** drain moves a volume from its durable prefix in S3, fencing before the
   destination can write.
+- **ADR-0009:** lifecycles are typed (`internal/lifecycle`) and enforced three ways —
+  Go types, transition-guarded UPDATEs, and DB CHECKs. Stored as TEXT (not PG enums,
+  not int codes); binary formats keep their numeric enums. Adding a state means
+  touching the constant, the transition table, and a migration.
 - Two real bugs the tests caught: `Log.Discard/WriteZeroes` didn't feed the remote batcher
   (DISCARD never reached S3); the sim network let a **closed** conn still Send. Both fixed.
 - Coverage is measured with `-coverpkg=./...`; the 90% floor excludes generated `internal/db`,

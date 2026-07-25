@@ -27,11 +27,15 @@ SELECT * FROM hosts WHERE host_id = $1;
 SELECT * FROM hosts ORDER BY host_id;
 
 -- name: SetHostState :execrows
--- cordon / drain / mark dead (§28.1), term-guarded.
+-- cordon / drain / mark dead (§28.1), term-guarded and transition-guarded: $4 is the
+-- set of states that may legally become $2, taken from the lifecycle table. Doing it
+-- in the predicate keeps the check atomic (no read-modify-write race) and means the
+-- rule holds even for a client that skipped the Go layer.
 UPDATE hosts
    SET state = $2
  WHERE host_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3;
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND state = ANY(sqlc.arg(allowed_states)::text[]);
 
 -- name: CommitHostCapacity :execrows
 -- Reserve (positive) or release (negative) committed NVMe bytes (§28.2), term-

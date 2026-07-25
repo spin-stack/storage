@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 )
 
@@ -27,7 +28,7 @@ func Clone(ctx context.Context, md metadata.Store, term int64, parentSnapshotID,
 		Durability:    parent.Durability,
 		BlockSize:     parent.BlockSize,
 		CurrentEpoch:  1, // a fresh active child
-		State:         "ACTIVE",
+		State:         lifecycle.VolumeActive,
 		PrimaryHostID: newHostID,
 		ChainDepth:    parent.ChainDepth + 1,
 		DEKWrapped:    parent.DEKWrapped,

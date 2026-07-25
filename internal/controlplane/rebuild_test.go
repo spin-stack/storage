@@ -8,6 +8,7 @@ import (
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -21,7 +22,7 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 
 	// Two volumes exist in S3 (descriptor + epoch object), nothing in PG.
 	descs := []descriptor.Descriptor{
-		{VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, Durability: "remote", KEKID: "k1", DEKWrapped: []byte{1, 2}},
+		{VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, KEKID: "k1", DEKWrapped: []byte{1, 2}},
 		{VolumeID: host1 /*any v7 id*/, SizeBytes: 2 << 30, BlockSize: 65536, Durability: "local", KEKID: "k2", DEKWrapped: []byte{3}},
 	}
 	epochsByVol := map[string]uint64{volID: 5, host1: 0}
@@ -51,7 +52,7 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.CurrentEpoch != 5 || v.SizeBytes != 1<<30 || v.KEKID != "k1" || v.State != "REBUILT" {
+	if v.CurrentEpoch != 5 || v.SizeBytes != 1<<30 || v.KEKID != "k1" || v.State != lifecycle.VolumeDetached {
 		t.Fatalf("rebuilt volume wrong: %+v", v)
 	}
 
@@ -64,7 +65,7 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 func TestDescriptorRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store := sim.NewObjectStore()
-	d := descriptor.Descriptor{VolumeID: volID, SizeBytes: 42, BlockSize: 65536, Durability: "remote", CurrentEpoch: 3, KEKID: "k", DEKWrapped: []byte{9}}
+	d := descriptor.Descriptor{VolumeID: volID, SizeBytes: 42, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 3, KEKID: "k", DEKWrapped: []byte{9}}
 	if err := descriptor.Write(ctx, store, d); err != nil {
 		t.Fatal(err)
 	}

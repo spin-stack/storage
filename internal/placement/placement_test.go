@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/placement"
 )
@@ -11,7 +12,7 @@ import (
 const gib = int64(1) << 30
 
 // host is a compact constructor for the table below.
-func host(id, state string, total, committed int64) metadata.Host {
+func host(id string, state lifecycle.HostState, total, committed int64) metadata.Host {
 	return metadata.Host{
 		HostID: id, State: state,
 		NVMeTotalBytes: total, NVMeCommittedBytes: committed,
@@ -34,8 +35,8 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "source host wins even when emptier hosts exist",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostActive, 100*gib, 90*gib),
-				host("h-b", metadata.HostActive, 100*gib, 0),
+				host("h-a", lifecycle.HostActive, 100*gib, 90*gib),
+				host("h-b", lifecycle.HostActive, 100*gib, 0),
 			},
 			req:  placement.Request{SizeBytes: 10 * gib, SourceHostID: "h-a"},
 			want: "h-a",
@@ -43,9 +44,9 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "cordoned source falls through to a cached host",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostCordoned, 100*gib, 0),
-				host("h-b", metadata.HostActive, 100*gib, 50*gib),
-				host("h-c", metadata.HostActive, 100*gib, 0),
+				host("h-a", lifecycle.HostCordoned, 100*gib, 0),
+				host("h-b", lifecycle.HostActive, 100*gib, 50*gib),
+				host("h-c", lifecycle.HostActive, 100*gib, 0),
 			},
 			req:  placement.Request{SizeBytes: gib, SourceHostID: "h-a", CachedHostIDs: []string{"h-b"}},
 			want: "h-b",
@@ -53,8 +54,8 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "source without capacity falls through to a cached host",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostActive, 100*gib, 195*gib),
-				host("h-b", metadata.HostActive, 100*gib, 100*gib),
+				host("h-a", lifecycle.HostActive, 100*gib, 195*gib),
+				host("h-b", lifecycle.HostActive, 100*gib, 100*gib),
 			},
 			req:  placement.Request{SizeBytes: 10 * gib, SourceHostID: "h-a", CachedHostIDs: []string{"h-b"}},
 			want: "h-b",
@@ -62,9 +63,9 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "draining cached host is skipped for any active host",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostDraining, 100*gib, 0),
-				host("h-b", metadata.HostDraining, 100*gib, 0),
-				host("h-c", metadata.HostActive, 100*gib, 10*gib),
+				host("h-a", lifecycle.HostDraining, 100*gib, 0),
+				host("h-b", lifecycle.HostDraining, 100*gib, 0),
+				host("h-c", lifecycle.HostActive, 100*gib, 10*gib),
 			},
 			req:  placement.Request{SizeBytes: gib, SourceHostID: "h-a", CachedHostIDs: []string{"h-b"}},
 			want: "h-c",
@@ -72,7 +73,7 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "dead host is never chosen",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostDead, 100*gib, 0),
+				host("h-a", lifecycle.HostDead, 100*gib, 0),
 			},
 			req: placement.Request{SizeBytes: gib},
 			err: placement.ErrNoCapacity,
@@ -80,7 +81,7 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "oversubscription boundary is inclusive",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostActive, 100*gib, 190*gib),
+				host("h-a", lifecycle.HostActive, 100*gib, 190*gib),
 			},
 			req:  placement.Request{SizeBytes: 10 * gib, SourceHostID: "h-a"},
 			want: "h-a",
@@ -88,7 +89,7 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "one byte past the boundary is refused",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostActive, 100*gib, 190*gib),
+				host("h-a", lifecycle.HostActive, 100*gib, 190*gib),
 			},
 			req: placement.Request{SizeBytes: 10*gib + 1, SourceHostID: "h-a"},
 			err: placement.ErrNoCapacity,
@@ -96,7 +97,7 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "a host with no NVMe is never chosen",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostActive, 0, 0),
+				host("h-a", lifecycle.HostActive, 0, 0),
 			},
 			req: placement.Request{SizeBytes: 1},
 			err: placement.ErrNoCapacity,
@@ -104,9 +105,9 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "least-committed host wins among equals",
 			hosts: []metadata.Host{
-				host("h-a", metadata.HostActive, 100*gib, 60*gib),
-				host("h-b", metadata.HostActive, 100*gib, 20*gib),
-				host("h-c", metadata.HostActive, 100*gib, 40*gib),
+				host("h-a", lifecycle.HostActive, 100*gib, 60*gib),
+				host("h-b", lifecycle.HostActive, 100*gib, 20*gib),
+				host("h-c", lifecycle.HostActive, 100*gib, 40*gib),
 			},
 			req:  placement.Request{SizeBytes: gib},
 			want: "h-b",
@@ -114,8 +115,8 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 		{
 			name: "ties break on host id, deterministically",
 			hosts: []metadata.Host{
-				host("h-z", metadata.HostActive, 100*gib, 10*gib),
-				host("h-a", metadata.HostActive, 100*gib, 10*gib),
+				host("h-z", lifecycle.HostActive, 100*gib, 10*gib),
+				host("h-a", lifecycle.HostActive, 100*gib, 10*gib),
 			},
 			req:  placement.Request{SizeBytes: gib},
 			want: "h-a",
@@ -152,9 +153,9 @@ func TestChooseFollowsPlacementOrder(t *testing.T) {
 func TestChooseIsDeterministic(t *testing.T) {
 	policy := placement.Policy{MaxOversubscription: 2.0}
 	forward := []metadata.Host{
-		host("h-a", metadata.HostActive, 100*gib, 30*gib),
-		host("h-b", metadata.HostActive, 100*gib, 30*gib),
-		host("h-c", metadata.HostActive, 200*gib, 60*gib),
+		host("h-a", lifecycle.HostActive, 100*gib, 30*gib),
+		host("h-b", lifecycle.HostActive, 100*gib, 30*gib),
+		host("h-c", lifecycle.HostActive, 200*gib, 60*gib),
 	}
 	reversed := []metadata.Host{forward[2], forward[1], forward[0]}
 
@@ -183,9 +184,9 @@ func TestCommittedRatio(t *testing.T) {
 		h    metadata.Host
 		want float64
 	}{
-		{"half committed", host("h", metadata.HostActive, 100*gib, 50*gib), 0.5},
-		{"oversubscribed", host("h", metadata.HostActive, 100*gib, 250*gib), 2.5},
-		{"no capacity reported", host("h", metadata.HostActive, 0, 10), 0},
+		{"half committed", host("h", lifecycle.HostActive, 100*gib, 50*gib), 0.5},
+		{"oversubscribed", host("h", lifecycle.HostActive, 100*gib, 250*gib), 2.5},
+		{"no capacity reported", host("h", lifecycle.HostActive, 0, 10), 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -200,7 +201,7 @@ func TestCommittedRatio(t *testing.T) {
 // means "no oversubscription" (committed <= total), never "unbounded".
 func TestZeroPolicyRefusesOversubscription(t *testing.T) {
 	var policy placement.Policy
-	hosts := []metadata.Host{host("h-a", metadata.HostActive, 100*gib, 95*gib)}
+	hosts := []metadata.Host{host("h-a", lifecycle.HostActive, 100*gib, 95*gib)}
 
 	if _, err := policy.Choose(hosts, placement.Request{SizeBytes: 10 * gib}); !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("zero policy must not oversubscribe, got %v", err)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/epoch"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -46,12 +47,12 @@ func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 	term, _ := md.AcquireLeadership(ctx, "cp")
 
 	if err := md.UpsertHost(ctx, term, metadata.Host{
-		HostID: cloneHostA, State: metadata.HostActive, NVMeTotalBytes: 10 * volSize,
+		HostID: cloneHostA, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := md.UpsertHost(ctx, term, metadata.Host{
-		HostID: destHost, State: metadata.HostActive, NVMeTotalBytes: destTotalBytes,
+		HostID: destHost, State: lifecycle.HostActive, NVMeTotalBytes: destTotalBytes,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +72,8 @@ func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 		w.vols = append(w.vols, vol)
 
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
-			VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: "remote",
-			State: "ACTIVE", CurrentEpoch: 1, PrimaryHostID: cloneHostA,
+			VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
+			State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: cloneHostA,
 			DEKWrapped: []byte{7}, KEKID: "kek",
 		}); err != nil {
 			t.Fatal(err)
@@ -122,7 +123,7 @@ func TestDrainMovesEveryVolumeFenced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if res.Phase != controlplane.PhaseDrained || len(res.Moved) != 2 || res.Remaining != 0 {
+	if res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 2 || res.Remaining != 0 {
 		t.Fatalf("drain result = %+v", res)
 	}
 
@@ -149,13 +150,13 @@ func TestDrainMovesEveryVolumeFenced(t *testing.T) {
 
 	src, _ := w.md.GetHost(ctx, cloneHostA)
 	dst, _ := w.md.GetHost(ctx, destHost)
-	if src.State != metadata.HostDraining {
+	if src.State != lifecycle.HostDraining {
 		t.Fatalf("source state = %q, want DRAINING", src.State)
 	}
 	if src.NVMeCommittedBytes != 0 || dst.NVMeCommittedBytes != 2*volSize {
 		t.Fatalf("capacity did not follow the volumes: src=%d dst=%d", src.NVMeCommittedBytes, dst.NVMeCommittedBytes)
 	}
-	if op, _ := w.md.GetOperation(ctx, drainOpID); op.Phase != controlplane.PhaseDrained {
+	if op, _ := w.md.GetOperation(ctx, drainOpID); op.Phase != lifecycle.OpSucceeded {
 		t.Fatalf("operation phase = %q, want DRAINED", op.Phase)
 	}
 }
@@ -177,14 +178,14 @@ func TestDrainWaitsForFencing(t *testing.T) {
 		}
 	}
 	// The host is already cordoned, though: nothing new lands on it.
-	if h, _ := w.md.GetHost(ctx, cloneHostA); h.State != metadata.HostDraining {
+	if h, _ := w.md.GetHost(ctx, cloneHostA); h.State != lifecycle.HostDraining {
 		t.Fatalf("host state = %q, want DRAINING", h.State)
 	}
 
 	// Once the wait elapses the same operation completes.
 	w.pastFencingWait()
 	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
-	if err != nil || res.Phase != controlplane.PhaseDrained || len(res.Moved) != 2 {
+	if err != nil || res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 2 {
 		t.Fatalf("resumed drain: %+v err=%v", res, err)
 	}
 }
@@ -209,7 +210,7 @@ func TestDrainIsResumableAndDoesNotMoveTwice(t *testing.T) {
 
 	// Give the destination room and resume the same operation.
 	if err := w.md.UpsertHost(ctx, w.term, metadata.Host{
-		HostID: destHost, State: metadata.HostActive, NVMeTotalBytes: 10 * volSize,
+		HostID: destHost, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +245,7 @@ func TestDrainCancelStopsAtVolumeBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canceled drain should not error: %v", err)
 	}
-	if res.Phase != controlplane.PhaseCanceled || len(res.Moved) != 0 || res.Remaining != 2 {
+	if res.Phase != lifecycle.OpCanceled || len(res.Moved) != 0 || res.Remaining != 2 {
 		t.Fatalf("canceled drain result = %+v", res)
 	}
 	for _, vol := range w.vols {
@@ -253,7 +254,7 @@ func TestDrainCancelStopsAtVolumeBoundary(t *testing.T) {
 			t.Fatalf("canceled drain moved a volume: %+v", v)
 		}
 	}
-	if op, _ := w.md.GetOperation(ctx, drainOpID); op.Phase != controlplane.PhaseCanceled {
+	if op, _ := w.md.GetOperation(ctx, drainOpID); op.Phase != lifecycle.OpCanceled {
 		t.Fatalf("operation phase = %q, want CANCELED", op.Phase)
 	}
 }
@@ -274,7 +275,7 @@ func TestDrainCancelAfterPartialProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := w.md.UpsertHost(ctx, w.term, metadata.Host{
-		HostID: destHost, State: metadata.HostActive, NVMeTotalBytes: 10 * volSize,
+		HostID: destHost, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +283,7 @@ func TestDrainCancelAfterPartialProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canceled drain: %v", err)
 	}
-	if res.Phase != controlplane.PhaseCanceled || len(res.Moved) != 0 || res.Remaining != 1 {
+	if res.Phase != lifecycle.OpCanceled || len(res.Moved) != 0 || res.Remaining != 1 {
 		t.Fatalf("canceled drain result = %+v", res)
 	}
 	// The remaining volume is untouched on the source: still exactly one writer.
@@ -334,7 +335,7 @@ func TestDrainReleasesCapacityWhenMaterializationFails(t *testing.T) {
 	bad[15] = 0xaf // sorts after the two good volumes
 	badID := format.UUIDString(bad)
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
-		VolumeID: badID, SizeBytes: volSize, BlockSize: 65536, State: "ACTIVE",
+		VolumeID: badID, SizeBytes: volSize, BlockSize: 65536, State: lifecycle.VolumeActive,
 		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
 	}); err != nil {
 		t.Fatal(err)
@@ -391,7 +392,7 @@ func TestDrainRejectsMalformedVolumeID(t *testing.T) {
 	w.pastFencingWait()
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: "not-a-uuid", SizeBytes: volSize, BlockSize: 65536,
-		State: "ACTIVE", CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +410,7 @@ func TestDrainPrefersTheWarmStandby(t *testing.T) {
 
 	const standby = "00000000-0000-7000-8000-0000000000d9"
 	if err := w.md.UpsertHost(ctx, w.term, metadata.Host{
-		HostID: standby, State: metadata.HostActive, NVMeTotalBytes: 10 * volSize,
+		HostID: standby, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
 		// Deliberately more committed than destHost, so only the standby rule can win.
 		NVMeCommittedBytes: 5 * volSize,
 	}); err != nil {
@@ -445,10 +446,10 @@ func TestDrainOfEmptyHostIsDrained(t *testing.T) {
 	w.pastFencingWait()
 
 	res, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
-	if err != nil || res.Phase != controlplane.PhaseDrained || len(res.Moved) != 0 {
+	if err != nil || res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 0 {
 		t.Fatalf("empty drain: %+v err=%v", res, err)
 	}
-	if h, _ := w.md.GetHost(ctx, destHost); h.State != metadata.HostDraining {
+	if h, _ := w.md.GetHost(ctx, destHost); h.State != lifecycle.HostDraining {
 		t.Fatalf("host state = %q, want DRAINING", h.State)
 	}
 }

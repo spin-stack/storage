@@ -1,6 +1,11 @@
 package wal
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/spin-stack/storage/internal/lifecycle"
+)
 
 // ErrSelfFenced is returned when a FLUSH/FUA cannot be ACKed because the host lease
 // is no longer valid according to the Agent's monotonic clock (§12.2). The object
@@ -18,6 +23,31 @@ const (
 	// gate the FLUSH ACK (§14.8 rule 3). RPO <= max_unflushed_age, measured.
 	ModeLocal
 )
+
+// String renders the mode for traces and metrics.
+func (m DurabilityMode) String() string { return string(m.Durability()) }
+
+// Durability is the Control-Plane vocabulary for this mode (§14.8).
+func (m DurabilityMode) Durability() lifecycle.Durability {
+	if m == ModeLocal {
+		return lifecycle.DurabilityLocal
+	}
+	return lifecycle.DurabilityRemote
+}
+
+// ModeFor maps the durability the Control Plane stores (§8) to the data path's ACK
+// contract (§14.8). This is the single place the two vocabularies meet, so they
+// cannot drift: an unknown value is an error, never a silent fallback to remote.
+func ModeFor(d lifecycle.Durability) (DurabilityMode, error) {
+	switch d {
+	case lifecycle.DurabilityRemote:
+		return ModeRemote, nil
+	case lifecycle.DurabilityLocal:
+		return ModeLocal, nil
+	default:
+		return ModeRemote, fmt.Errorf("wal: %w: durability %q", lifecycle.ErrUnknownState, d)
+	}
+}
 
 // LeaseChecker reports whether the host lease is valid right now, on the monotonic
 // clock. Defined here (the consumer) so wal does not depend on the lease package;

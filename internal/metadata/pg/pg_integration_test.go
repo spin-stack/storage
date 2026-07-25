@@ -18,6 +18,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/pg"
 	"github.com/spin-stack/storage/migrations"
@@ -72,7 +73,7 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 	}
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, termA, metadata.Volume{
-		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: "ACTIVE",
+		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1, 2, 3}, KEKID: "kek-1",
 	}); err != nil {
 		t.Fatal(err)
@@ -82,7 +83,7 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 
 	hostA, hostB := ids.New().String(), ids.New().String()
 	// The promoted host must be registered before becoming primary (FK).
-	if err := store.UpsertHost(ctx, termB, metadata.Host{HostID: hostB, State: "ACTIVE"}); err != nil {
+	if err := store.UpsertHost(ctx, termB, metadata.Host{HostID: hostB, State: lifecycle.HostActive}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.BumpVolumeEpoch(ctx, termA, volID, hostA); !errors.Is(err, metadata.ErrStaleTerm) {
@@ -103,10 +104,10 @@ func TestPGOperationIdempotency(t *testing.T) {
 	store := pg.New(startPostgres(t))
 	op := metadata.Operation{
 		OperationID:  ids.New().String(),
-		Kind:         "attach",
+		Kind:         lifecycle.OpAttach,
 		DesiredState: []byte(`{"x":1}`),
 		CurrentState: []byte(`{}`),
-		Phase:        "pending",
+		Phase:        lifecycle.OpPending,
 	}
 	rec, err := store.RecordOperation(ctx, op)
 	if err != nil || !rec {
@@ -118,14 +119,14 @@ func TestPGOperationIdempotency(t *testing.T) {
 	}
 
 	// Visible progress of a long-running operation (§28.1).
-	op.Phase = "DRAINING"
+	op.Phase = lifecycle.OpRunning
 	op.CurrentState = []byte(`{"total":2,"moved":1}`)
 	op.Error = "waiting for fencing"
 	if err := store.UpdateOperation(ctx, op); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetOperation(ctx, op.OperationID)
-	if err != nil || got.Phase != "DRAINING" || got.Error != "waiting for fencing" {
+	if err != nil || got.Phase != lifecycle.OpRunning || got.Error != "waiting for fencing" {
 		t.Fatalf("operation after update: %+v err=%v", got, err)
 	}
 	// jsonb round-trips by value, not byte-for-byte.
@@ -156,7 +157,7 @@ func TestPGFleetSurface(t *testing.T) {
 	}
 	for _, id := range []string{hostA, hostB} {
 		if err := store.UpsertHost(ctx, term, metadata.Host{
-			HostID: id, State: metadata.HostActive, NVMeTotalBytes: 1000,
+			HostID: id, State: lifecycle.HostActive, NVMeTotalBytes: 1000,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -168,13 +169,13 @@ func TestPGFleetSurface(t *testing.T) {
 	}
 
 	// Cordon (§28.1).
-	if err := store.SetHostState(ctx, term, hostA, metadata.HostCordoned); err != nil {
+	if err := store.SetHostState(ctx, term, hostA, lifecycle.HostCordoned); err != nil {
 		t.Fatal(err)
 	}
-	if h, _ := store.GetHost(ctx, hostA); h.State != metadata.HostCordoned {
+	if h, _ := store.GetHost(ctx, hostA); h.State != lifecycle.HostCordoned {
 		t.Fatalf("state = %q, want CORDONED", h.State)
 	}
-	if err := store.SetHostState(ctx, term, ids.New().String(), metadata.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
+	if err := store.SetHostState(ctx, term, ids.New().String(), lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("SetHostState on a missing host: want ErrNotFound, got %v", err)
 	}
 
@@ -203,7 +204,7 @@ func TestPGFleetSurface(t *testing.T) {
 	// Volumes by host: exactly the ones whose primary is that host.
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
-		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: "ACTIVE",
+		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1}, KEKID: "k", PrimaryHostID: hostA,
 	}); err != nil {
 		t.Fatal(err)
@@ -225,9 +226,148 @@ func TestPGRejectsNonV7(t *testing.T) {
 	// A v1 UUID (version nibble 1) must be rejected by the CHECK constraint.
 	err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: "11111111-1111-1111-1111-111111111111", SizeBytes: 1, BlockSize: 65536,
-		State: "ACTIVE", DEKWrapped: []byte{1}, KEKID: "k",
+		State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
 	})
 	if err == nil {
 		t.Fatal("Postgres must reject a non-v7 volume_id (INV-22 CHECK)")
+	}
+}
+
+// TestPGAcceptsEveryDeclaredLifecycleValue is the drift test between the Go
+// vocabulary and the DB CHECK constraints: every value internal/lifecycle declares
+// must be storable. Adding a state in Go and forgetting the migration fails here.
+func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	hostID := ids.New().String()
+	if err := store.UpsertHost(ctx, term, metadata.Host{HostID: hostID, State: lifecycle.HostActive}); err != nil {
+		t.Fatal(err)
+	}
+	volID := ids.New().String()
+	if err := store.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
+		DEKWrapped: []byte{1}, KEKID: "k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapID, reqID := ids.New().String(), ids.New().String()
+	if err := store.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: snapID, VolumeID: volID, Epoch: 1, TargetSequence: 1,
+		RootDigest: "d", State: lifecycle.SnapshotCreating, RequestID: reqID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	opID := ids.New().String()
+	if _, err := store.RecordOperation(ctx, metadata.Operation{
+		OperationID: opID, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
+		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Raw SQL on purpose: this asserts the constraint, not the Go guard.
+	for _, s := range lifecycle.HostStates() {
+		if _, err := pool.Exec(ctx, `UPDATE hosts SET state=$1 WHERE host_id=$2`, s.String(), hostID); err != nil {
+			t.Fatalf("host state %q rejected by the DB: %v", s, err)
+		}
+	}
+	for _, s := range lifecycle.VolumeStates() {
+		if _, err := pool.Exec(ctx, `UPDATE volumes SET state=$1 WHERE volume_id=$2`, s.String(), volID); err != nil {
+			t.Fatalf("volume state %q rejected by the DB: %v", s, err)
+		}
+	}
+	for _, d := range lifecycle.Durabilities() {
+		if _, err := pool.Exec(ctx, `UPDATE volumes SET durability=$1 WHERE volume_id=$2`, d.String(), volID); err != nil {
+			t.Fatalf("durability %q rejected by the DB: %v", d, err)
+		}
+	}
+	for _, s := range lifecycle.SnapshotStates() {
+		if _, err := pool.Exec(ctx, `UPDATE snapshots SET state=$1 WHERE snapshot_id=$2`, s.String(), snapID); err != nil {
+			t.Fatalf("snapshot state %q rejected by the DB: %v", s, err)
+		}
+	}
+	for _, k := range lifecycle.OperationKinds() {
+		if _, err := pool.Exec(ctx, `UPDATE operations SET kind=$1 WHERE operation_id=$2`, k.String(), opID); err != nil {
+			t.Fatalf("operation kind %q rejected by the DB: %v", k, err)
+		}
+	}
+	for _, p := range lifecycle.OperationPhases() {
+		if _, err := pool.Exec(ctx, `UPDATE operations SET phase=$1 WHERE operation_id=$2`, p.String(), opID); err != nil {
+			t.Fatalf("operation phase %q rejected by the DB: %v", p, err)
+		}
+	}
+}
+
+// TestPGRejectsValuesOutsideTheVocabulary: the CHECK constraints hold even for a
+// client that never goes through the Go layer (a script, a manual psql session).
+func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	hostID := ids.New().String()
+	if err := store.UpsertHost(ctx, term, metadata.Host{HostID: hostID, State: lifecycle.HostActive}); err != nil {
+		t.Fatal(err)
+	}
+	volID := ids.New().String()
+	if err := store.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: volID, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
+		DEKWrapped: []byte{1}, KEKID: "k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		sql  string
+		arg  any
+	}{
+		{"host state", `UPDATE hosts SET state=$1 WHERE host_id='` + hostID + `'`, "ZOMBIE"},
+		{"volume state", `UPDATE volumes SET state=$1 WHERE volume_id='` + volID + `'`, "REBUILT"},
+		{"durability", `UPDATE volumes SET durability=$1 WHERE volume_id='` + volID + `'`, "eventual"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := pool.Exec(ctx, tc.sql, tc.arg); err == nil {
+				t.Fatalf("the DB accepted %q", tc.arg)
+			}
+		})
+	}
+}
+
+// TestPGOperationPhaseGuardIsAtomic: the phase transition is enforced by the UPDATE
+// predicate itself, so a terminal operation cannot be resurrected even under
+// concurrent writers.
+func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	store := pg.New(startPostgres(t))
+	_, _ = store.AcquireLeadership(ctx, "cp")
+
+	op := metadata.Operation{
+		OperationID: ids.New().String(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
+		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
+	}
+	if _, err := store.RecordOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	op.Phase = lifecycle.OpRunning
+	if err := store.UpdateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	op.Phase = lifecycle.OpSucceeded
+	if err := store.UpdateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	op.Phase = lifecycle.OpRunning
+	if err := store.UpdateOperation(ctx, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
+	}
+	got, _ := store.GetOperation(ctx, op.OperationID)
+	if got.Phase != lifecycle.OpSucceeded {
+		t.Fatalf("phase = %q after a refused transition", got.Phase)
 	}
 }

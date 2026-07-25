@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/controlplane"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -38,14 +39,14 @@ func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snap
 
 	for _, h := range []string{cloneHostA, destHost} {
 		if err := md.UpsertHost(ctx, term, metadata.Host{
-			HostID: h, State: metadata.HostActive, NVMeTotalBytes: 10 * volSize,
+			HostID: h, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
-		VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: "remote",
-		State: "ACTIVE", PrimaryHostID: cloneHostA, DEKWrapped: []byte{7}, KEKID: "kek",
+		VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
+		State: lifecycle.VolumeActive, PrimaryHostID: cloneHostA, DEKWrapped: []byte{7}, KEKID: "kek",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +67,7 @@ func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snap
 	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
 		SnapshotID: snapID, VolumeID: volID, Epoch: 1, TargetSequence: int64(m.TargetSequence),
-		RootDigest: m.RootDigest, SourceHostID: cloneHostA, State: "PUBLISHED", RequestID: reqID,
+		RootDigest: m.RootDigest, SourceHostID: cloneHostA, State: lifecycle.SnapshotPublished, RequestID: reqID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +138,7 @@ func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
 	const orphanSnap = "00000000-0000-7000-8000-0000000000b9"
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
 		SnapshotID: orphanSnap, VolumeID: "00000000-0000-7000-8000-0000000000ba",
-		Epoch: 1, TargetSequence: 1, RootDigest: "d", State: "PUBLISHED",
+		Epoch: 1, TargetSequence: 1, RootDigest: "d", State: lifecycle.SnapshotPublished,
 		RequestID: "00000000-0000-7000-8000-0000000000bb",
 	}); err != nil {
 		t.Fatal(err)
