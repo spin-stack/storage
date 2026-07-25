@@ -9,6 +9,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.38.0
 	go.opentelemetry.io/otel/trace v1.38.0
 	golang.org/x/tools v0.38.0
+	pgregory.net/rapid v1.3.0
 )
 
 require (

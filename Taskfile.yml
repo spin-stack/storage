@@ -39,9 +39,10 @@ tasks:
       - go run {{.SIMULABLE}} ./...
 
   dst:
-    desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1).
+    desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1, §25.2).
     cmds:
       - go test -race -count=1 -run 'TestMandatoryScenarios|TestDeterministicReplay|TestPlantedBug' ./internal/dst/
+      - go test -race -count=1 -run 'TestWALReplayProperty' ./internal/wal/
 
   fmt:
     desc: Format code.
