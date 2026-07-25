@@ -43,6 +43,9 @@ jobs:
       - name: Test
         run: task test
 
+      - name: Coverage (90% floor on production code)
+        run: task cover
+
       - name: DST (mandatory scenario set)
         run: task dst
 

@@ -118,6 +118,12 @@ type simConn struct {
 }
 
 func (c *simConn) Send(ctx context.Context, msg []byte) error {
+	// A closed conn errors deterministically, even if the buffer has room.
+	select {
+	case <-c.done:
+		return network.ErrClosed
+	default:
+	}
 	if c.net.isPartitioned(c.localAddr) || c.net.isPartitioned(c.remoteAddr) {
 		return network.ErrPartitioned
 	}
@@ -133,6 +139,12 @@ func (c *simConn) Send(ctx context.Context, msg []byte) error {
 }
 
 func (c *simConn) Recv(ctx context.Context) ([]byte, error) {
+	// A closed conn with no pending message errors deterministically.
+	select {
+	case <-c.done:
+		return nil, network.ErrClosed
+	default:
+	}
 	select {
 	case msg := <-c.in:
 		return msg, nil

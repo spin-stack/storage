@@ -36,3 +36,14 @@ func TestNewAtDiffersByTimeAndRandom(t *testing.T) {
 		t.Fatal("different timestamps should yield different ids")
 	}
 }
+
+func TestParse(t *testing.T) {
+	u := ids.New()
+	got, err := ids.Parse(u.String())
+	if err != nil || got != u {
+		t.Fatalf("Parse round-trip: got %v err=%v", got, err)
+	}
+	if _, err := ids.Parse("not-a-uuid"); err == nil {
+		t.Fatal("Parse should reject an invalid uuid")
+	}
+}

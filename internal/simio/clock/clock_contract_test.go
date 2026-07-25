@@ -44,6 +44,27 @@ func impls() []clockUnderTest {
 	}
 }
 
+func TestSimTimerStopAfterFire(t *testing.T) {
+	sc := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	timer := sc.NewTimer(10 * time.Millisecond)
+	sc.Advance(20 * time.Millisecond) // fires
+	<-timer.C()
+	if timer.Stop() {
+		t.Fatal("Stop after fire should report false")
+	}
+}
+
+func TestInstantArithmetic(t *testing.T) {
+	var base clock.Instant
+	later := base.Add(5 * time.Second)
+	if later.Sub(base) != 5*time.Second {
+		t.Fatalf("Add/Sub mismatch: %v", later.Sub(base))
+	}
+	if base.Add(time.Second).Sub(base.Add(3*time.Second)) != -2*time.Second {
+		t.Fatal("negative delta expected")
+	}
+}
+
 func TestNowIsMonotonic(t *testing.T) {
 	for _, ut := range impls() {
 		t.Run(ut.name, func(t *testing.T) {

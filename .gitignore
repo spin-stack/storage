@@ -13,3 +13,6 @@ coverage.*
 *.swp
 .idea/
 .vscode/
+
+# Coverage profiles
+cover*.out

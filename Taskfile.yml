@@ -52,6 +52,11 @@ tasks:
     cmds:
       - go test -tags integration -count=1 ./internal/metadata/pg/...
 
+  cover:
+    desc: Cross-package coverage report; enforces a 90% floor on production code.
+    cmds:
+      - bash hack/coverage.sh
+
   lint:
     desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).
     cmds:

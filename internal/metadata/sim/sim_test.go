@@ -114,6 +114,69 @@ func TestOperationIdempotency(t *testing.T) {
 	}
 }
 
+// TestGettersRoundTripAndNotFound exercises every read path: a value is returned
+// after it is written, and a missing key yields ErrNotFound.
+func TestGettersRoundTripAndNotFound(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+
+	// No leader yet.
+	if _, err := s.GetLeader(ctx); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("GetLeader empty: want ErrNotFound, got %v", err)
+	}
+	// Missing rows.
+	if _, err := s.GetHost(ctx, "nope"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("GetHost missing: %v", err)
+	}
+	if _, err := s.GetHostLease(ctx, "nope"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("GetHostLease missing: %v", err)
+	}
+	if _, err := s.GetVolume(ctx, "nope"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("GetVolume missing: %v", err)
+	}
+	if _, err := s.GetOperation(ctx, "nope"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("GetOperation missing: %v", err)
+	}
+
+	term, _ := s.AcquireLeadership(ctx, "cp")
+
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: "ACTIVE", AgentVersion: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.GetHost(ctx, "h1")
+	if err != nil || h.State != "ACTIVE" || h.AgentVersion != "v1" {
+		t.Fatalf("GetHost: %+v err=%v", h, err)
+	}
+
+	if err := s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v1", State: "ACTIVE"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateWatermarks(ctx, term, "v1", 10, 5, 3); err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.GetVolume(ctx, "v1")
+	if err != nil || v.LocalSequence != 10 || v.DurableSequence != 5 || v.PublishedSequence != 3 {
+		t.Fatalf("GetVolume after watermarks: %+v err=%v", v, err)
+	}
+	// UpdateWatermarks on a missing volume is ErrNotFound.
+	if err := s.UpdateWatermarks(ctx, term, "absent", 1, 1, 1); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("UpdateWatermarks missing: %v", err)
+	}
+	// BumpVolumeEpoch on a missing volume is ErrNotFound.
+	if _, err := s.BumpVolumeEpoch(ctx, term, "absent", "h1"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("BumpVolumeEpoch missing: %v", err)
+	}
+
+	op := metadata.Operation{OperationID: "op1", Kind: "attach", DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: "pending"}
+	if _, err := s.RecordOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetOperation(ctx, "op1")
+	if err != nil || got.Kind != "attach" {
+		t.Fatalf("GetOperation: %+v err=%v", got, err)
+	}
+}
+
 func TestHostLeaseRenewal(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()

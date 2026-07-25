@@ -21,6 +21,11 @@ func TestSegmentIndexAndRange(t *testing.T) {
 	if first != 0 || last != 3 {
 		t.Fatalf("range = [%d,%d], want [0,3]", first, last)
 	}
+	// A zero-length range collapses to the single segment at offset.
+	f, l := cow.SegmentRange(cow.SegmentSize, 0)
+	if f != 1 || l != 1 {
+		t.Fatalf("zero-length range = [%d,%d], want [1,1]", f, l)
+	}
 }
 
 func TestMarkLookupDiscard(t *testing.T) {

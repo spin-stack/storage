@@ -3,6 +3,7 @@ package crypto_test
 import (
 	"bytes"
 	"errors"
+	"io"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -159,5 +160,46 @@ func TestUnwrapWrongKeyIDFails(t *testing.T) {
 	// keyID is bound as AAD; unwrapping under a different id must fail.
 	if _, err := kms.UnwrapDEK(wrapped, 4); !errors.Is(err, crypto.ErrUnwrap) {
 		t.Fatalf("unwrap wrong keyID: want ErrUnwrap, got %v", err)
+	}
+}
+
+func TestKEKID(t *testing.T) {
+	var kek [crypto.DEKSize]byte
+	if got := crypto.NewDevKMS(kek, "kek-42").KEKID(); got != "kek-42" {
+		t.Fatalf("KEKID = %q, want kek-42", got)
+	}
+}
+
+// shortReader yields n bytes then EOF, to exercise randomness-failure paths.
+type shortReader struct{ n int }
+
+func (r *shortReader) Read(p []byte) (int, error) {
+	if r.n <= 0 {
+		return 0, io.EOF
+	}
+	k := min(r.n, len(p))
+	r.n -= k
+	return k, nil
+}
+
+func TestGenerateDEKShortReaderFails(t *testing.T) {
+	if _, err := crypto.GenerateDEK(&shortReader{n: 4}, 1); err == nil {
+		t.Fatal("GenerateDEK with a short reader must fail")
+	}
+}
+
+func TestWrapShortNonceReaderFails(t *testing.T) {
+	var kek [crypto.DEKSize]byte
+	kms := crypto.NewDevKMS(kek, "kek-1")
+	if _, err := kms.WrapDEK(&shortReader{n: 0}, testDEK(t, 1)); err == nil {
+		t.Fatal("WrapDEK with no wrap randomness must fail")
+	}
+}
+
+func TestUnwrapTooShortFails(t *testing.T) {
+	var kek [crypto.DEKSize]byte
+	kms := crypto.NewDevKMS(kek, "kek-1")
+	if _, err := kms.UnwrapDEK([]byte{1, 2, 3}, 1); !errors.Is(err, crypto.ErrUnwrap) {
+		t.Fatalf("unwrap short blob: want ErrUnwrap, got %v", err)
 	}
 }

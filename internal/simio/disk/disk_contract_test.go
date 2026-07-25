@@ -169,6 +169,31 @@ func TestSimShortAppendFault(t *testing.T) {
 	}
 }
 
+func TestSimTornTailTruncatesDurable(t *testing.T) {
+	d := sim.NewDisk()
+	f, _ := d.Create("wal")
+	_, _ = f.Append([]byte("committed"))
+	_ = f.Sync()
+	_, _ = f.Append([]byte("-more"))
+	_ = f.Sync()
+
+	// A torn write clips the durable tail to 9 bytes, then a crash reverts caches.
+	d.TornTail("wal", 9)
+	d.Crash()
+	if err := f.Close(); err != nil { // sim Close is a no-op but must be callable
+		t.Fatal(err)
+	}
+	sz, _ := f.Size()
+	if sz != 9 {
+		t.Fatalf("after torn tail want size 9, got %d", sz)
+	}
+	got := make([]byte, sz)
+	_, _ = f.ReadAt(got, 0)
+	if string(got) != "committed" {
+		t.Fatalf("torn tail content = %q, want committed", got)
+	}
+}
+
 func TestSimSyncLossThenCrashLosesData(t *testing.T) {
 	d := sim.NewDisk()
 	f, _ := d.Create("wal")

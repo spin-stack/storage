@@ -130,6 +130,15 @@ func TestStructuredLogHasCorrelationFields(t *testing.T) {
 	}
 }
 
+func TestMeterRecords(t *testing.T) {
+	p := newProvider(t)
+	ctr, err := p.Meter("adhoc").Int64Counter("adhoc_total")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr.Add(context.Background(), 1) // must not panic; exercises Meter()
+}
+
 // TestNestedSpansShareTrace models CP → Agent → object store: nested spans share
 // one trace, which is what makes a slow FLUSH one trace to open, not a grep.
 func TestNestedSpansShareTrace(t *testing.T) {

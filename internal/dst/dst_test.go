@@ -83,6 +83,30 @@ func TestPlantedBugPermanentDelete(t *testing.T) {
 	}
 }
 
+// TestCheckerNamesAndTrace exercises the checker metadata and the trace rendering.
+func TestCheckerNamesAndTrace(t *testing.T) {
+	names := map[string]bool{}
+	for _, c := range dst.DefaultCheckers() {
+		names[c.Name()] = true
+		// Observing an unrelated event kind must be a harmless no-op.
+		c.Observe(dst.Event{Kind: dst.EventNote, Msg: "ignored"})
+	}
+	for _, want := range []string{"monotonic-clock", "no-permanent-delete", "watermark-order", "no-plaintext-leaves-host"} {
+		if !names[want] {
+			t.Fatalf("DefaultCheckers missing %q", want)
+		}
+	}
+
+	res := dst.Run(1, func(s *dst.Sim) error {
+		s.Tick(1_000)
+		s.Notef("hello")
+		return nil
+	})
+	if res.TraceString() == "" {
+		t.Fatal("TraceString should render the recorded events")
+	}
+}
+
 // TestPassingRunHasNoError is a control: a benign scenario passes both checkers.
 func TestPassingRunHasNoError(t *testing.T) {
 	res := dst.Run(1, func(s *dst.Sim) error {

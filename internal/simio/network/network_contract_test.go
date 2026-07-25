@@ -117,6 +117,25 @@ func TestSimPartitionDropsDelivery(t *testing.T) {
 	}
 }
 
+func TestSimClosedConnErrors(t *testing.T) {
+	ctx := context.Background()
+	s := sim.NewNetwork()
+	l, _ := s.Listen("x:1")
+	defer l.Close()
+	go func() { _, _ = l.Accept(ctx) }()
+	c, err := s.Dial(ctx, "x:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	if err := c.Send(ctx, []byte("x")); !errors.Is(err, network.ErrClosed) {
+		t.Fatalf("send on closed: want ErrClosed, got %v", err)
+	}
+	if _, err := c.Recv(ctx); !errors.Is(err, network.ErrClosed) {
+		t.Fatalf("recv on closed: want ErrClosed, got %v", err)
+	}
+}
+
 func TestRecvHonorsContext(t *testing.T) {
 	s := sim.NewNetwork()
 	l, _ := s.Listen("x:1")
