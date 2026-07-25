@@ -60,6 +60,7 @@ func (e *Encryption) encodeWrite(epoch, seq, offset uint64, flags uint32, plaint
 	}
 	h := format.RecordHeader{
 		RecordType:    format.RecordWrite,
+		VolumeID:      e.VolumeID,
 		Epoch:         epoch,
 		Sequence:      seq,
 		Offset:        offset,

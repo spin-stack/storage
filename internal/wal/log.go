@@ -336,7 +336,7 @@ func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	if l.enc != nil {
 		enc, err = l.enc.encodeWrite(l.epoch, seq, offset, flags, data)
 	} else {
-		r := Record{Type: format.RecordWrite, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: uint32(len(data)), Flags: flags, Payload: data}
+		r := Record{Type: format.RecordWrite, VolumeID: l.volumeID, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: uint32(len(data)), Flags: flags, Payload: data}
 		enc, err = r.Encode()
 	}
 	if err != nil {
@@ -369,7 +369,7 @@ func (l *Log) WriteZeroes(offset uint64, length uint32) (uint64, error) {
 // converges, §14.6), and counts the reclaimed bytes.
 func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (uint64, error) {
 	seq := l.local + 1
-	enc, err := Record{Type: t, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}.Encode()
+	enc, err := Record{Type: t, VolumeID: l.volumeID, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}.Encode()
 	if err != nil {
 		return 0, err
 	}

@@ -15,6 +15,12 @@ import (
 // volume's extents and count them in this epoch's sequence space.
 var ErrForeignEpoch = errors.New("wal: the WAL file holds records from another epoch")
 
+// ErrForeignVolume means the WAL file holds records belonging to another volume. It
+// is the check that has no fallback: an encrypted volume's payloads are bound to
+// their volume by the GCM AAD, but DISCARD and WRITE_ZEROES carry no payload and a
+// plaintext volume carries no tag, so nothing else would notice.
+var ErrForeignVolume = errors.New("wal: the WAL file holds records from another volume")
+
 // resumedRecord is a record that was in the local WAL but is not yet covered by a
 // verified object: it must be handed back to the batcher when the remote path is
 // wired, or the writes since the last successful upload exist on this host only.
@@ -64,6 +70,10 @@ func Resume(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, durableIn
 	l.replayed = true
 
 	for _, rec := range recs {
+		if rec.VolumeID != volumeID {
+			return nil, fmt.Errorf("%w: sequence %d belongs to volume %s, resuming %s",
+				ErrForeignVolume, rec.Sequence, format.UUIDString(rec.VolumeID), format.UUIDString(volumeID))
+		}
 		if rec.Epoch != epoch {
 			return nil, fmt.Errorf("%w: sequence %d belongs to epoch %d, resuming %d",
 				ErrForeignEpoch, rec.Sequence, rec.Epoch, epoch)
@@ -115,6 +125,7 @@ func (l *Log) replayRecord(rec Record) error {
 func reencode(rec Record) ([]byte, error) {
 	h := format.RecordHeader{
 		RecordType:    rec.Type,
+		VolumeID:      rec.VolumeID,
 		Epoch:         rec.Epoch,
 		Sequence:      rec.Sequence,
 		Offset:        rec.Offset,
