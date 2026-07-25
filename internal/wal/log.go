@@ -50,11 +50,17 @@ type Log struct {
 
 	view   *cow.IntervalMap
 	limits Limits
+	enc    *Encryption // nil = plaintext WAL
 
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
+	discardedBytes    int64
 }
+
+// EnableEncryption binds an Encryption context so subsequent WRITEs seal their
+// payloads (§15). Must be set before the first WRITE.
+func (l *Log) EnableEncryption(e *Encryption) { l.enc = e }
 
 // NewLog creates a log backed by file, timed by clk.
 func NewLog(file disk.File, clk clock.Clock, volumeID [16]byte, epoch uint64, limits Limits) *Log {
@@ -79,44 +85,74 @@ func (l *Log) backpressure(add int) error {
 	return nil
 }
 
-func (l *Log) appendRecord(r Record, addView func()) (uint64, error) {
-	enc, err := r.Encode()
-	if err != nil {
-		return 0, err
-	}
+func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, error) {
 	if err := l.backpressure(len(enc)); err != nil {
 		return 0, err
 	}
 	if _, err := l.file.Append(enc); err != nil {
 		return 0, err
 	}
-	l.local = r.Sequence
+	l.local = seq
 	addView()
 	l.trackUnflushed(len(enc))
-	return r.Sequence, nil
+	return seq, nil
 }
 
-// Write appends a WRITE of data at offset and returns its sequence. It completes
-// on local append; it does not sync or PUT (§5.3).
+// Write appends a WRITE of data at offset and returns its sequence. It completes on
+// local append; it does not sync or PUT (§5.3). When encryption is enabled the WAL
+// bytes are ciphertext, but the read view keeps plaintext (it never leaves the host).
 func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	seq := l.local + 1
-	r := Record{Type: format.RecordWrite, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: uint32(len(data)), Flags: flags, Payload: data}
-	return l.appendRecord(r, func() { l.view.Overwrite(offset, data) })
+	var (
+		enc []byte
+		err error
+	)
+	if l.enc != nil {
+		enc, err = l.enc.encodeWrite(l.epoch, seq, offset, flags, data)
+	} else {
+		r := Record{Type: format.RecordWrite, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: uint32(len(data)), Flags: flags, Payload: data}
+		enc, err = r.Encode()
+	}
+	if err != nil {
+		return 0, err
+	}
+	// The read view holds plaintext regardless of on-disk encryption.
+	plaintext := append([]byte(nil), data...)
+	return l.appendEncoded(seq, enc, func() { l.view.Overwrite(offset, plaintext) })
 }
 
 // Discard appends a DISCARD of [offset, offset+length); the range reads as zero.
 func (l *Log) Discard(offset uint64, length uint32) (uint64, error) {
 	seq := l.local + 1
 	r := Record{Type: format.RecordDiscard, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}
-	return l.appendRecord(r, func() { l.view.Clear(offset, uint64(length)) })
+	enc, err := r.Encode()
+	if err != nil {
+		return 0, err
+	}
+	seq, err = l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
+	if err == nil {
+		l.discardedBytes += int64(length)
+	}
+	return seq, err
 }
 
 // WriteZeroes appends a WRITE_ZEROES of [offset, offset+length); reads as zero.
 func (l *Log) WriteZeroes(offset uint64, length uint32) (uint64, error) {
 	seq := l.local + 1
 	r := Record{Type: format.RecordWriteZeroes, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}
-	return l.appendRecord(r, func() { l.view.Clear(offset, uint64(length)) })
+	enc, err := r.Encode()
+	if err != nil {
+		return 0, err
+	}
+	seq, err = l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
+	if err == nil {
+		l.discardedBytes += int64(length)
+	}
+	return seq, err
 }
+
+// DiscardedBytes reports the cumulative bytes DISCARDed/zeroed (discarded_bytes_total).
+func (l *Log) DiscardedBytes() int64 { return l.discardedBytes }
 
 // Read fills buf from the read view starting at offset (zero where unwritten).
 func (l *Log) Read(offset uint64, buf []byte) { l.view.Read(offset, buf) }

@@ -3,13 +3,24 @@
 Short snapshot. Update at every increment close.
 
 - **Date:** 2026-07-25
-- **Current phase:** **Phase 01 + Phase 04 COMPLETE** (pure-Go phases). Phases 02/03
-  planned (need VM/QEMU infra). Phase 05 (crypto + DISCARD) is next.
-- **Active invariants:** INV-01, INV-02, INV-03, INV-04(bounds), INV-05, INV-18.
+- **Current phase:** **Phases 01, 04, 05 COMPLETE** (pure-Go). Phases 02/03 planned
+  (need VM/QEMU infra). **Phase 06 (remote WAL) is next.**
+- **Active invariants:** INV-01, INV-02, INV-03, INV-04(bounds), INV-05, INV-15, INV-18.
 - **Branches:** `phase-01/...` (Phases 0/01, 02/03 plans) merged-forward into
   `phase-04/wal-cow` (Phase 04). Nothing merged to `main` yet — **pending human review**,
   especially the WAL format (ADR-0005 / DEV-0001, header size 104≠96).
 - **Blockers:** none for pure-Go work; format review recommended before merge to main.
+
+## Phase 05 — COMPLETE (encryption at rest)
+
+- 5.1 `internal/crypto`: AES-256-GCM DEK.Seal/Open, nonce derived from
+  (vol,epoch,seq) — never stored/reused (§15.2); KMS + DevKMS wrap/unwrap; injected
+  randomness. Tamper fails closed; nonce-uniqueness property (rapid).
+- 5.2 encrypted WAL end-to-end: `Log.EnableEncryption` seals payloads (WAL file =
+  ciphertext, `KeyID`/`AuthTag` set, plaintext CRC per §14.1); live reads stay
+  plaintext in host memory; replay decrypts + verifies. `format.DecodeRecord` gates
+  the payload CRC on `KeyID`. DISCARD/WRITE_ZEROES accounting (`discarded_bytes_total`),
+  crypto-shred test. **INV-15 active** (checker + DST scenario).
 
 ## Phase 04 — COMPLETE (WAL/CoW correctness spine)
 

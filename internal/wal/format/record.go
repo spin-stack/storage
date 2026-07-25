@@ -35,10 +35,30 @@ func EncodeRecord(h RecordHeader, payload []byte) ([]byte, error) {
 	return append(hb, payload...), nil
 }
 
+// EncodeRecordRaw marshals h (trusting its Length, PayloadCRC32C, KeyID, and
+// AuthTag as already set) followed by payload, without recomputing anything. The
+// encrypted write path uses this: h carries the plaintext CRC and the GCM tag while
+// payload is the ciphertext (§14.1).
+func EncodeRecordRaw(h RecordHeader, payload []byte) ([]byte, error) {
+	hb, err := h.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 {
+		return hb, nil
+	}
+	return append(hb, payload...), nil
+}
+
 // DecodeRecord decodes one record from the front of b, returning the header, the
 // payload (nil for header-only records), and the total bytes consumed. It is used
 // by the replayer to stream over a WAL file; a truncated tail returns ErrShortBuf
 // so the replayer can stop cleanly at the last intact record.
+//
+// Plaintext records (KeyID == 0) have their payload CRC verified here. Encrypted
+// records (KeyID != 0) carry ciphertext whose integrity is verified by the GCM tag
+// plus the post-decrypt plaintext CRC in the crypto layer, so DecodeRecord returns
+// their ciphertext unverified.
 func DecodeRecord(b []byte) (h RecordHeader, payload []byte, n int, err error) {
 	h, err = UnmarshalRecordHeader(b)
 	if err != nil {
@@ -54,7 +74,7 @@ func DecodeRecord(b []byte) (h RecordHeader, payload []byte, n int, err error) {
 	}
 	if payloadLen > 0 {
 		payload = b[RecordHeaderSize:total]
-		if PayloadCRC(payload) != h.PayloadCRC32C {
+		if h.KeyID == 0 && PayloadCRC(payload) != h.PayloadCRC32C {
 			return RecordHeader{}, nil, 0, ErrPayloadCRC
 		}
 	}

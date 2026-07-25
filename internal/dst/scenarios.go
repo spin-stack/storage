@@ -7,11 +7,23 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 )
+
+// deterministicReader yields seed-derived bytes for DEK material under DST.
+type deterministicReader struct{ b byte }
+
+func (r *deterministicReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = r.b
+		r.b++
+	}
+	return len(p), nil
+}
 
 // MandatoryScenario is one entry in the §25.1 must-be-green-on-every-PR set. The
 // data-path arms (real WAL records, real fencing) are added by later phases; here
@@ -30,7 +42,59 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "network-partition", Run: scenarioNetworkPartition},
 		{Name: "wal-write-path-no-put", Run: scenarioWALWritePathNoPut},
 		{Name: "wal-backpressure", Run: scenarioWALBackpressure},
+		{Name: "encrypted-wal-no-plaintext-leak", Run: scenarioEncryptedWALNoPlaintextLeak},
 	}
+}
+
+// scenarioEncryptedWALNoPlaintextLeak: with per-volume encryption, the bytes that
+// will leave the host (the WAL file → later S3) contain no cleartext (§5.10,
+// INV-15), yet replay+decrypt recovers the plaintext.
+func scenarioEncryptedWALNoPlaintextLeak(s *Sim) error {
+	dek, err := crypto.GenerateDEK(&deterministicReader{b: byte(s.Rand.Intn(200) + 1)}, 1)
+	if err != nil {
+		return err
+	}
+	enc := &wal.Encryption{DEK: dek, VolumeID: [16]byte{7}}
+
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, enc.VolumeID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableEncryption(enc)
+
+	canary := []byte("CLEARTEXT-CANARY-DO-NOT-LEAK")
+	if _, err := l.Write(0, canary, 0); err != nil {
+		return err
+	}
+
+	// Inspect the bytes bound to leave the host.
+	sz, _ := f.Size()
+	raw := make([]byte, sz)
+	_, _ = f.ReadAt(raw, 0)
+	leak := bytes.Contains(raw, canary)
+	s.Emit(Event{Kind: EventLeavesHost, ClearLeak: leak, Msg: "wal object bytes"})
+	if leak {
+		return errors.New("cleartext canary present in WAL bytes")
+	}
+
+	// Recovery still works.
+	recs, err := wal.Replay(raw)
+	if err != nil {
+		return fmt.Errorf("replay: %w", err)
+	}
+	if len(recs) != 1 {
+		return fmt.Errorf("expected 1 record, got %d", len(recs))
+	}
+	pt, err := enc.Decrypt(recs[0])
+	if err != nil {
+		return fmt.Errorf("decrypt: %w", err)
+	}
+	if !bytes.Equal(pt, canary) {
+		return fmt.Errorf("decrypted plaintext mismatch: %q", pt)
+	}
+	s.Notef("encrypted WAL: 0 cleartext leak, replay+decrypt OK")
+	return nil
 }
 
 // emitWatermarks records the log's current watermarks for the ordering checker.

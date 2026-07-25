@@ -126,7 +126,7 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 | 02 | 2 | Guest layout: three devices + OverlayFS | **expanded (planning); needs VM/mount infra** | 01 |
 | 03 | 3 | vhost-user-blk raw backend + reconnection + inflight shmfd | **expanded (planning); needs QEMU 11.0.2** | 01 |
 | 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | **DONE** ✓ (4.1–4.4; INV-03/04/05/18 active; format review pending) | 01 |
-| 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | not expanded | 04 |
+| 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | **DONE** ✓ (5.1–5.2; INV-15 active) | 04 |
 | 06 | 6 | Remote WAL: on-demand batching + PUT idempotency + summary objects | not expanded | 04 (05 for ciphertext) |
 | 07 | 7 | PostgreSQL + Control Plane (verified term) + reconciliation + leases + full fencing protocol under DST | not expanded | 06 |
 | 08 | 8 | Recovery with S3 as authority + recovery-point + basic `rebuild-metadata` | not expanded | 06, 07 |

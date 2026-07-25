@@ -94,11 +94,33 @@ func (c *WatermarkOrderChecker) Observe(e Event) {
 
 func (c *WatermarkOrderChecker) Check() error { return c.violation }
 
+// NoPlaintextLeavesHostChecker enforces INV-15 (§5.10): no cleartext guest data
+// leaves the host. It watches leaves-host events for a detected cleartext leak.
+type NoPlaintextLeavesHostChecker struct {
+	violation error
+}
+
+// NewNoPlaintextLeavesHostChecker returns a fresh checker.
+func NewNoPlaintextLeavesHostChecker() *NoPlaintextLeavesHostChecker {
+	return &NoPlaintextLeavesHostChecker{}
+}
+
+func (c *NoPlaintextLeavesHostChecker) Name() string { return "no-plaintext-leaves-host" }
+
+func (c *NoPlaintextLeavesHostChecker) Observe(e Event) {
+	if e.Kind == EventLeavesHost && e.ClearLeak && c.violation == nil {
+		c.violation = fmt.Errorf("cleartext guest data left the host at step %d (violates §5.10/INV-15): %s", e.Step, e.Msg)
+	}
+}
+
+func (c *NoPlaintextLeavesHostChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
 		NewMonotonicClockChecker(),
 		NewNoPermanentDeleteChecker(),
 		NewWatermarkOrderChecker(),
+		NewNoPlaintextLeavesHostChecker(),
 	}
 }

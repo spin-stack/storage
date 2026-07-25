@@ -30,15 +30,16 @@ const simEpoch = 1_700_000_000
 type EventKind string
 
 const (
-	EventClock     EventKind = "clock"
-	EventDisk      EventKind = "disk"
-	EventObject    EventKind = "object"
-	EventNetwork   EventKind = "network"
-	EventNote      EventKind = "note"
-	EventDelete    EventKind = "delete"
-	EventFault     EventKind = "fault"
-	EventRecovery  EventKind = "recovery"
-	EventWatermark EventKind = "watermark"
+	EventClock      EventKind = "clock"
+	EventDisk       EventKind = "disk"
+	EventObject     EventKind = "object"
+	EventNetwork    EventKind = "network"
+	EventNote       EventKind = "note"
+	EventDelete     EventKind = "delete"
+	EventFault      EventKind = "fault"
+	EventRecovery   EventKind = "recovery"
+	EventWatermark  EventKind = "watermark"
+	EventLeavesHost EventKind = "leaves-host"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -56,6 +57,9 @@ type Event struct {
 	Local     uint64
 	Durable   uint64
 	Published uint64
+	// LeavesHost events (§5.10): true if cleartext guest data was detected in bytes
+	// bound for outside the host (a violation).
+	ClearLeak bool
 }
 
 // String renders an event deterministically for the trace.
@@ -67,6 +71,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d delete key=%s permanent=%t", e.Step, e.Key, e.Permanent)
 	case EventWatermark:
 		return fmt.Sprintf("%04d watermark pub=%d dur=%d loc=%d", e.Step, e.Published, e.Durable, e.Local)
+	case EventLeavesHost:
+		return fmt.Sprintf("%04d leaves-host clear_leak=%t %s", e.Step, e.ClearLeak, e.Msg)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

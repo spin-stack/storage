@@ -11,17 +11,21 @@ import (
 	"github.com/spin-stack/storage/internal/wal/format"
 )
 
-// Record is a decoded WAL record. For WRITE, Payload holds the data and Length ==
-// len(Payload). For DISCARD/WRITE_ZEROES, Payload is nil and Length is the extent
-// length (§14.1).
+// Record is a decoded WAL record. For WRITE, Payload holds the data (ciphertext if
+// KeyID != 0) and Length == len(plaintext). For DISCARD/WRITE_ZEROES, Payload is nil
+// and Length is the extent length (§14.1). KeyID/PayloadCRC/AuthTag mirror the
+// header so an encrypted record can be decrypted and verified after replay.
 type Record struct {
-	Type     format.RecordType
-	Epoch    uint64
-	Sequence uint64
-	Offset   uint64
-	Length   uint32
-	Flags    uint32
-	Payload  []byte
+	Type       format.RecordType
+	Epoch      uint64
+	Sequence   uint64
+	Offset     uint64
+	Length     uint32
+	Flags      uint32
+	KeyID      uint32
+	PayloadCRC uint32
+	AuthTag    [16]byte
+	Payload    []byte
 }
 
 // Encode serializes a single record.
@@ -75,12 +79,15 @@ func Replay(b []byte) ([]Record, error) {
 			return records, err
 		}
 		rec := Record{
-			Type:     h.RecordType,
-			Epoch:    h.Epoch,
-			Sequence: h.Sequence,
-			Offset:   h.Offset,
-			Length:   h.Length,
-			Flags:    h.Flags,
+			Type:       h.RecordType,
+			Epoch:      h.Epoch,
+			Sequence:   h.Sequence,
+			Offset:     h.Offset,
+			Length:     h.Length,
+			Flags:      h.Flags,
+			KeyID:      h.KeyID,
+			PayloadCRC: h.PayloadCRC32C,
+			AuthTag:    h.AuthTag,
 		}
 		if len(payload) > 0 {
 			rec.Payload = append([]byte(nil), payload...)
