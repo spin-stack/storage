@@ -24,10 +24,10 @@ const (
 	ObjectHeaderSize int = 104
 )
 
-// Magic tags per §14.1/§14.2.
+// Magic tags per §14.1/§14.2 (unexported: internal to the codec).
 var (
-	MagicRecord = [4]byte{'V', 'W', '0', '2'}
-	MagicObject = [4]byte{'W', 'B', '0', '2'}
+	magicRecord = [4]byte{'V', 'W', '0', '2'}
+	magicObject = [4]byte{'W', 'B', '0', '2'}
 )
 
 // RecordType classifies a WAL record.
@@ -75,7 +75,7 @@ type RecordHeader struct {
 // HeaderCRC32C over bytes [0,100).
 func (h RecordHeader) MarshalBinary() ([]byte, error) {
 	b := make([]byte, RecordHeaderSize)
-	copy(b[0:4], MagicRecord[:])
+	copy(b[0:4], magicRecord[:])
 	binary.LittleEndian.PutUint16(b[4:6], FormatVersion)
 	binary.LittleEndian.PutUint16(b[6:8], uint16(RecordHeaderSize))
 	b[8] = byte(h.RecordType)
@@ -100,7 +100,7 @@ func UnmarshalRecordHeader(b []byte) (RecordHeader, error) {
 	if len(b) < RecordHeaderSize {
 		return h, ErrShortBuf
 	}
-	if [4]byte(b[0:4]) != MagicRecord {
+	if [4]byte(b[0:4]) != magicRecord {
 		return h, ErrBadMagic
 	}
 	if binary.LittleEndian.Uint16(b[4:6]) != FormatVersion {
@@ -142,7 +142,7 @@ type ObjectHeader struct {
 // HeaderCRC32C over bytes [0,96).
 func (h ObjectHeader) MarshalBinary() ([]byte, error) {
 	b := make([]byte, ObjectHeaderSize)
-	copy(b[0:4], MagicObject[:])
+	copy(b[0:4], magicObject[:])
 	binary.LittleEndian.PutUint16(b[4:6], FormatVersion)
 	binary.LittleEndian.PutUint16(b[6:8], uint16(ObjectHeaderSize))
 	copy(b[8:24], h.VolumeID[:])
@@ -164,7 +164,7 @@ func UnmarshalObjectHeader(b []byte) (ObjectHeader, error) {
 	if len(b) < ObjectHeaderSize {
 		return h, ErrShortBuf
 	}
-	if [4]byte(b[0:4]) != MagicObject {
+	if [4]byte(b[0:4]) != magicObject {
 		return h, ErrBadMagic
 	}
 	if binary.LittleEndian.Uint16(b[4:6]) != FormatVersion {

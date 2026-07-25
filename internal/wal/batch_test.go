@@ -99,25 +99,25 @@ func TestObjectAssemblyRoundTrip(t *testing.T) {
 	b.Flush()
 	cb := b.TakePending()[0]
 
-	key, data, sha := cb.Object()
+	obj := cb.Object()
 
 	// Header parses and matches.
-	h, err := format.UnmarshalObjectHeader(data[:format.ObjectHeaderSize])
+	h, err := format.UnmarshalObjectHeader(obj.Data[:format.ObjectHeaderSize])
 	if err != nil {
 		t.Fatal(err)
 	}
 	if h.FirstSequence != 1 || h.LastSequence != 3 || h.RecordCount != 3 {
 		t.Fatalf("object header wrong: %+v", h)
 	}
-	if h.PayloadSHA256 != sha {
+	if h.PayloadSHA256 != obj.PayloadSHA {
 		t.Fatal("header SHA mismatch")
 	}
-	if h.PayloadLength != uint64(len(data)-format.ObjectHeaderSize) {
-		t.Fatalf("payload length mismatch: %d vs %d", h.PayloadLength, len(data)-format.ObjectHeaderSize)
+	if h.PayloadLength != uint64(len(obj.Data)-format.ObjectHeaderSize) {
+		t.Fatalf("payload length mismatch: %d vs %d", h.PayloadLength, len(obj.Data)-format.ObjectHeaderSize)
 	}
 
 	// Records replay from the object payload.
-	recs, err := wal.Replay(data[format.ObjectHeaderSize:])
+	recs, err := wal.Replay(obj.Data[format.ObjectHeaderSize:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestObjectAssemblyRoundTrip(t *testing.T) {
 	}
 
 	// Key is deterministic and embeds the sequence range + sha prefix.
-	if key != format.WALObjectKey([16]byte{1}, 1, 1, 3, sha) {
-		t.Fatalf("unexpected key %q", key)
+	if obj.Key != format.WALObjectKey([16]byte{1}, 1, 1, 3, obj.PayloadSHA) {
+		t.Fatalf("unexpected key %q", obj.Key)
 	}
 }

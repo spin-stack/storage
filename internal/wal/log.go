@@ -206,11 +206,11 @@ func (l *Log) Flush(ctx context.Context) error {
 		pending := l.batcher.Pending()
 		done := 0
 		for _, cb := range pending { // step 4: upload + verify (covering <= target)
-			if err := l.uploader.Upload(ctx, cb); err != nil {
+			key, err := l.uploader.Upload(ctx, cb)
+			if err != nil {
 				l.batcher.RemoveUploaded(done)
 				return err // durable NOT advanced
 			}
-			key, _, _ := cb.Object()
 			l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
 			done++
 		}

@@ -46,11 +46,17 @@ type ClosedBatch struct {
 	Reason   CloseReason
 }
 
+// WALObject is a fully assembled, ready-to-PUT WAL object (§14.2).
+type WALObject struct {
+	Key        string   // deterministic S3 key
+	Data       []byte   // ObjectHeader + concatenated records
+	PayloadSHA [32]byte // SHA-256 of the concatenated records
+}
+
 // Object assembles the on-S3 WAL object: ObjectHeader (§14.2) followed by the
-// concatenated records. It returns the deterministic key, the object bytes, and
-// the payload SHA-256.
-func (b *ClosedBatch) Object() (key string, data []byte, sha [32]byte) {
-	sha = sha256.Sum256(b.Records)
+// concatenated records.
+func (b *ClosedBatch) Object() WALObject {
+	sha := sha256.Sum256(b.Records)
 	h := format.ObjectHeader{
 		VolumeID:      b.VolumeID,
 		Epoch:         b.Epoch,
@@ -62,11 +68,14 @@ func (b *ClosedBatch) Object() (key string, data []byte, sha [32]byte) {
 		PayloadSHA256: sha,
 	}
 	hb, _ := h.MarshalBinary()
-	data = make([]byte, 0, len(hb)+len(b.Records))
+	data := make([]byte, 0, len(hb)+len(b.Records))
 	data = append(data, hb...)
 	data = append(data, b.Records...)
-	key = format.WALObjectKey(b.VolumeID, b.Epoch, b.First, b.Last, sha)
-	return key, data, sha
+	return WALObject{
+		Key:        format.WALObjectKey(b.VolumeID, b.Epoch, b.First, b.Last, sha),
+		Data:       data,
+		PayloadSHA: sha,
+	}
 }
 
 type openBatch struct {

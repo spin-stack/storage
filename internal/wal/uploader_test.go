@@ -88,15 +88,14 @@ func TestUploadIdempotentOnLostResponse(t *testing.T) {
 	b.Flush()
 	cb := b.Pending()[0]
 
-	key, _, _ := cb.Object()
-	store.InjectLostResponse(key)
+	store.InjectLostResponse(cb.Object().Key)
 
 	up := wal.NewUploader(store, 5)
-	if err := up.Upload(ctx, cb); err != nil {
+	if _, err := up.Upload(ctx, cb); err != nil {
 		t.Fatalf("upload should succeed idempotently despite lost response: %v", err)
 	}
 	// Exactly one object, and a second upload is still idempotent.
-	if err := up.Upload(ctx, cb); err != nil {
+	if _, err := up.Upload(ctx, cb); err != nil {
 		t.Fatalf("re-upload should be idempotent: %v", err)
 	}
 	if objs, _ := store.List(ctx, "wal/"); len(objs) != 1 {
@@ -115,13 +114,13 @@ func TestUploadDivergenceHardFails(t *testing.T) {
 	b.Append(1, rec(1, []byte("real payload")), false)
 	b.Flush()
 	cb := b.Pending()[0]
-	key, data, _ := cb.Object()
+	obj := cb.Object()
 
 	// Pre-place a DIFFERENT object (same key, wrong content).
-	_, _ = store.Put(ctx, key, append([]byte("junk"), data...), objectstore.PutOptions{})
+	_, _ = store.Put(ctx, obj.Key, append([]byte("junk"), obj.Data...), objectstore.PutOptions{})
 
 	up := wal.NewUploader(store, 5)
-	if err := up.Upload(ctx, cb); !errors.Is(err, wal.ErrDivergentObject) {
+	if _, err := up.Upload(ctx, cb); !errors.Is(err, wal.ErrDivergentObject) {
 		t.Fatalf("want ErrDivergentObject, got %v", err)
 	}
 }

@@ -109,14 +109,13 @@ func scenarioIdempotentBatchUpload(s *Sim) error {
 	b.Append(1, enc, false)
 	b.Flush()
 	cb := b.Pending()[0]
-	key, _, _ := cb.Object()
 
-	s.Store.InjectLostResponse(key)
+	s.Store.InjectLostResponse(cb.Object().Key)
 	up := wal.NewUploader(s.Store, 5)
-	if err := up.Upload(ctx, cb); err != nil {
+	if _, err := up.Upload(ctx, cb); err != nil {
 		return fmt.Errorf("upload should be idempotent after lost response: %w", err)
 	}
-	if err := up.Upload(ctx, cb); err != nil {
+	if _, err := up.Upload(ctx, cb); err != nil {
 		return fmt.Errorf("re-upload should be idempotent: %w", err)
 	}
 	objs, _ := s.Store.List(ctx, "wal/")

@@ -36,38 +36,36 @@ func NewUploader(store objectstore.Store, maxAttempts int) *Uploader {
 	return &Uploader{store: store, maxAttempts: maxAttempts}
 }
 
-// Upload stores the batch's WAL object idempotently. It returns nil once the object
-// is verified present with the expected content.
-func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) error {
-	key, data, _ := cb.Object()
-	expectedETag := hex.EncodeToString(sha256Sum(data))
+// Upload stores the batch's WAL object idempotently and returns its key once the
+// object is verified present with the expected content.
+func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) {
+	obj := cb.Object()
+	// The store's ETag is the SHA-256 of the whole stored object (header + records),
+	// not the payload-only SHA that keys the object.
+	objSHA := sha256.Sum256(obj.Data)
+	expectedETag := hex.EncodeToString(objSHA[:])
 
 	var lastErr error
 	for attempt := 0; attempt < u.maxAttempts; attempt++ {
-		_, err := u.store.Put(ctx, key, data, objectstore.PutOptions{IfNoneMatch: true})
+		_, err := u.store.Put(ctx, obj.Key, obj.Data, objectstore.PutOptions{IfNoneMatch: true})
 		switch {
 		case err == nil:
-			return nil
+			return obj.Key, nil
 		case errors.Is(err, objectstore.ErrPreconditionFailed):
 			// Already present: reconcile by HEAD + checksum (§14.5).
-			info, herr := u.store.Head(ctx, key)
+			info, herr := u.store.Head(ctx, obj.Key)
 			if herr != nil {
 				lastErr = herr
 				continue
 			}
-			if info.Size != int64(len(data)) || info.ETag != expectedETag {
-				return ErrDivergentObject
+			if info.Size != int64(len(obj.Data)) || info.ETag != expectedETag {
+				return "", ErrDivergentObject
 			}
-			return nil // idempotent success
+			return obj.Key, nil // idempotent success
 		default:
 			// Transient (lost response, throttle, ...): retry within budget.
 			lastErr = err
 		}
 	}
-	return fmt.Errorf("%w: %v", ErrUploadRetriesExhausted, lastErr)
-}
-
-func sha256Sum(b []byte) []byte {
-	s := sha256.Sum256(b)
-	return s[:]
+	return "", fmt.Errorf("%w: %v", ErrUploadRetriesExhausted, lastErr)
 }
