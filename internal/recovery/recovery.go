@@ -110,7 +110,12 @@ func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte
 			return nil, err
 		}
 		if len(body) < format.ObjectHeaderSize {
-			return nil, fmt.Errorf("recovery: short WAL object %s", info.Key)
+			// Too short to even hold a header: exactly as untrustworthy as a corrupt
+			// one, so it is skipped like the rest. Failing here would make a single
+			// piece of garbage under the prefix render the volume unrecoverable —
+			// and would hand anything that can write to the bucket a denial of
+			// service over recovery.
+			continue
 		}
 		h, err := format.UnmarshalObjectHeader(body[:format.ObjectHeaderSize])
 		if err != nil {

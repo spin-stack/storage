@@ -123,3 +123,69 @@ func TestOrphansPastTheDurablePrefixAreStillCollected(t *testing.T) {
 		t.Fatalf("durable prefix = %d after collecting the orphan, want 2", got)
 	}
 }
+
+// TestSweepStopsWhenTheDurablePointCannotBeEstablished: if a prefix cannot be read,
+// the GC must not proceed to mark anything under it. An unreadable prefix is a reason
+// to stop and page someone, not a licence to sweep.
+func TestSweepStopsWhenTheDurablePointCannotBeEstablished(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
+	vol := vol9()
+	writeDurableWAL(t, store, clk, vol)
+
+	// A summary that claims more than the prefix provides: recovery refuses to name a
+	// durable point at all (§22.1).
+	lie := []byte(`{"volume_id":"` + format.UUIDString(vol) + `","epoch":1,"durable_sequence":9999}`)
+	if _, err := store.Put(ctx, wal.SummaryKey(vol, 1), lie, objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := gc.Reachable(ctx, store); err == nil {
+		t.Fatal("reachability must fail when a durable point cannot be established")
+	}
+}
+
+// TestReachableCoversEveryEpochOfAVolume: a volume that was promoted has objects
+// under more than one epoch, and the older epoch's prefix is still what a recovery
+// point points back to.
+func TestReachableCoversEveryEpochOfAVolume(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
+	vol := vol9()
+	writeDurableWAL(t, store, clk, vol) // epoch 1
+
+	// Epoch 2 starts after the boundary the promotion recorded.
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/epoch2.wal")
+	l := wal.NewLog(f, clk, vol, 2, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(clk, vol, 2, 2, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
+	if _, err := l.Write(0, []byte("after the move"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	reachable, err := gc.Reachable(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(48 * time.Hour)
+	if _, err := gc.Mark(ctx, store, clk, reachable, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	for _, epoch := range []uint64{1, 2} {
+		got, err := recovery.DurablePrefix(ctx, store, vol, epoch)
+		if err != nil {
+			t.Fatalf("epoch %d: %v", epoch, err)
+		}
+		if got == 0 {
+			t.Fatalf("the sweep emptied epoch %d's durable prefix", epoch)
+		}
+	}
+}

@@ -584,14 +584,16 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The boundary must cover what was ACKed; with the object unreadable the prefix
-	// is empty, so the recovery point would understate it. Either way the pass must
-	// not silently record a boundary of zero and move on.
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
-		rp, rerr := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], 2)
-		if rerr == nil && rp.RecoveredUpTo < w.acked[firstID] {
-			t.Fatalf("wrote a recovery point at %d, below the ACKed %d", rp.RecoveredUpTo, w.acked[firstID])
-		}
+	// The boundary is immutable and every later recovery treats it as the floor, so
+	// recording one below what the volume already had durable loses that data
+	// permanently. With the object unreadable the prefix is empty, so the pass must
+	// refuse rather than write a zero.
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if !errors.Is(err, controlplane.ErrDurableRegression) {
+		t.Fatalf("want ErrDurableRegression, got %v", err)
+	}
+	if rp, rerr := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], 2); rerr == nil {
+		t.Fatalf("an epoch boundary was written anyway: %+v", rp)
 	}
 }
 
@@ -631,5 +633,68 @@ func TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan(t *testing.T) {
 	res, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
 	if err != nil || res.Phase != lifecycle.OpSucceeded || res.Remaining != 0 {
 		t.Fatalf("re-run of an empty drain: %+v err=%v", res, err)
+	}
+}
+
+// TestDrainRefusesAnEpochBoundaryBelowThePGWatermark: the other floor. PostgreSQL's
+// durable watermark is lazy and informative (§5.8), so it can only *raise* the floor
+// — but when it is present and higher than what the object store yields, the move is
+// about to lose ACKed data and must stop.
+func TestDrainRefusesAnEpochBoundaryBelowThePGWatermark(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	firstID := format.UUIDString(w.vols[0])
+
+	// The Agent had reported a much higher durable sequence than S3 can show.
+	if err := w.md.UpdateWatermarks(ctx, w.term, firstID, 500, 400, 0); err != nil {
+		t.Fatal(err)
+	}
+	w.pastFencingWait()
+
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if !errors.Is(err, controlplane.ErrDurableRegression) {
+		t.Fatalf("want ErrDurableRegression, got %v", err)
+	}
+	if rp, rerr := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], 2); rerr == nil {
+		t.Fatalf("a boundary below the reported durable point was written: %+v", rp)
+	}
+}
+
+// TestDrainAcceptsAnEmptyEpoch: a volume that was moved and never written again has
+// an epoch with no objects at all. That is not data loss — it is an empty epoch, and
+// recording a boundary of zero for it is correct.
+func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	// A third volume on the source with no WAL objects at all.
+	var empty [16]byte
+	empty[6], empty[8] = 0x70, 0x80
+	empty[15] = 0xE0
+	emptyID := format.UUIDString(empty)
+	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
+		VolumeID: emptyID, SizeBytes: volSize, BlockSize: 65536, State: lifecycle.VolumeActive,
+		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.md.CommitHostCapacity(ctx, w.term, cloneHostA, volSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := epoch.NewStore(w.store).Init(ctx, emptyID, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if err != nil {
+		t.Fatalf("an empty epoch must move cleanly: %v", err)
+	}
+	if len(res.Moved) != 3 {
+		t.Fatalf("moved %d volumes, want 3", len(res.Moved))
+	}
+	rp, err := recovery.ReadRecoveryPoint(ctx, w.store, empty, 2)
+	if err != nil || rp.RecoveredUpTo != 0 {
+		t.Fatalf("empty epoch boundary = %+v err=%v, want RecoveredUpTo 0", rp, err)
 	}
 }

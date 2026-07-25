@@ -11,12 +11,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/obs"
+	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // refHolder captures the "objects" list shared by manifests and checkpoints.
@@ -25,14 +29,25 @@ type refHolder struct {
 }
 
 // Reachable computes the set of reachable object keys: every structural object
-// (descriptors, epoch objects, manifests, checkpoints, recovery-points, summaries)
-// plus every WAL object a manifest or checkpoint references.
+// (descriptors, epoch objects, manifests, checkpoints, recovery-points, summaries),
+// every WAL object a manifest or checkpoint references, and — the root that matters
+// most — every WAL object inside a volume/epoch's **durable prefix**.
+//
+// The durable prefix is a root by definition: §5.8 makes it the authority for what a
+// volume contains, so an object within it is live whether or not anything enumerates
+// it. Without this, every ACKed write since the last checkpoint reads as an orphan —
+// and for a volume that has never checkpointed, the entire log does — so a scheduled
+// sweep would delete-marker the durable prefix under a live writer and recovery would
+// then find nothing. That is the incident INV-14 promises the GC cannot cause.
 func Reachable(ctx context.Context, store objectstore.Store) (map[string]bool, error) {
 	all, err := store.List(ctx, "")
 	if err != nil {
 		return nil, err
 	}
 	reachable := make(map[string]bool)
+	if err := addDurablePrefixes(ctx, store, all, reachable); err != nil {
+		return nil, err
+	}
 	for _, info := range all {
 		key := info.Key
 		isWALObject := strings.HasPrefix(key, "wal/") && strings.HasSuffix(key, ".wal")
@@ -120,4 +135,52 @@ func MarkWithRecorder(ctx context.Context, store objectstore.Store, clk clock.Cl
 	rec.Gauge(ctx, "orphan_objects_total", float64(len(marked)))
 	sort.Strings(marked)
 	return marked, nil
+}
+
+// addDurablePrefixes marks every WAL object that is part of some volume/epoch's
+// durable prefix. The epochs are discovered from the keyspace itself (the layout is
+// self-describing, §22.5), so this needs no Control-Plane input — which matters,
+// because a GC that depended on PostgreSQL being right about epochs would delete data
+// whenever PostgreSQL was wrong.
+func addDurablePrefixes(ctx context.Context, store objectstore.Store, all []objectstore.ObjectInfo, reachable map[string]bool) error {
+	type volEpoch struct {
+		vol   [16]byte
+		epoch uint64
+	}
+	seen := map[volEpoch]bool{}
+	for _, info := range all {
+		if !strings.HasPrefix(info.Key, "wal/") || !strings.HasSuffix(info.Key, ".wal") {
+			continue
+		}
+		parts := strings.Split(info.Key, "/")
+		if len(parts) < 4 {
+			continue
+		}
+		parsed, err := ids.Parse(parts[1])
+		if err != nil {
+			continue // not one of ours; the sweep leaves it to the reachability rules
+		}
+		epoch, err := strconv.ParseUint(parts[2], 10, 64)
+		if err != nil {
+			continue
+		}
+		seen[volEpoch{vol: [16]byte(parsed), epoch: epoch}] = true
+	}
+
+	for ve := range seen {
+		durable, err := recovery.DurablePoint(ctx, store, ve.vol, ve.epoch)
+		if err != nil {
+			// If the durable point cannot be established, nothing here may be
+			// collected: an unreadable prefix is a reason to stop, not to sweep.
+			return fmt.Errorf("gc: durable point for %s/%d: %w", format.UUIDString(ve.vol), ve.epoch, err)
+		}
+		keys, err := recovery.ObjectKeysUpTo(ctx, store, ve.vol, ve.epoch, durable)
+		if err != nil {
+			return err
+		}
+		for _, k := range keys {
+			reachable[k] = true
+		}
+	}
+	return nil
 }

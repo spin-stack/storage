@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spin-stack/storage/internal/ids"
@@ -14,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // Move records one volume evacuated from a host.
@@ -288,6 +290,9 @@ func (d *Drainer) move(ctx context.Context, term int64, source string, v metadat
 	if err != nil {
 		return Move{}, err // the volume is already the destination's; do not release
 	}
+	if err := d.guardDurableFloor(ctx, v, vol, oldEpoch, prog.UpTo); err != nil {
+		return Move{}, err
+	}
 	if err := d.writeRecoveryPoint(ctx, vol, newEpoch, oldEpoch, prog.UpTo); err != nil {
 		return Move{}, err
 	}
@@ -317,6 +322,9 @@ func (d *Drainer) finishMovedVolume(ctx context.Context, term int64, source stri
 	if err != nil {
 		return Move{}, err
 	}
+	if err := d.guardDurableFloor(ctx, v, vol, prevEpoch, prog.UpTo); err != nil {
+		return Move{}, err
+	}
 	if err := d.writeRecoveryPoint(ctx, vol, newEpoch, prevEpoch, prog.UpTo); err != nil {
 		return Move{}, err
 	}
@@ -327,6 +335,48 @@ func (d *Drainer) finishMovedVolume(ctx context.Context, term int64, source stri
 		VolumeID: v.VolumeID, FromHost: source, ToHost: v.PrimaryHostID,
 		NewEpoch: newEpoch, UpTo: prog.UpTo, Bytes: prog.Bytes,
 	}, nil
+}
+
+// ErrDurableRegression means a move was about to record an epoch boundary below what
+// the volume already had durable. The boundary is immutable and is what every later
+// recovery treats as the floor, so writing one that goes backwards does not lose data
+// slowly — it loses it permanently, at the moment of writing.
+var ErrDurableRegression = errors.New("controlplane: refusing an epoch boundary below the volume's durable point")
+
+// guardDurableFloor refuses a boundary that would move the durable point backwards.
+// The floor is whatever we can establish without trusting a single source: the
+// previous epoch's own boundary (§12.5) and PostgreSQL's informative watermark (§5.8
+// — informative, so it can only raise the floor, never lower it).
+func (d *Drainer) guardDurableFloor(ctx context.Context, v metadata.Volume, vol [16]byte, prevEpoch, upTo uint64) error {
+	floor := uint64(0)
+	if v.DurableSequence > 0 {
+		floor = uint64(v.DurableSequence)
+	}
+	if rp, err := recovery.ReadRecoveryPoint(ctx, d.store, vol, prevEpoch); err == nil && rp.RecoveredUpTo > floor {
+		floor = rp.RecoveredUpTo
+	}
+	if upTo < floor {
+		return fmt.Errorf("%w: epoch %d would record %d, but the volume was durable through %d",
+			ErrDurableRegression, prevEpoch+1, upTo, floor)
+	}
+
+	// A floor of zero proves nothing: PostgreSQL's watermark is lazy (§5.8) and the
+	// first epoch has no predecessor boundary. So ask the object store directly —
+	// "the epoch holds objects but none of them validated" is a different fact from
+	// "the epoch is empty", and only the second one may record a boundary of zero.
+	if upTo == 0 {
+		infos, err := d.store.List(ctx, fmt.Sprintf("wal/%s/%d/", format.UUIDString(vol), prevEpoch))
+		if err != nil {
+			return err
+		}
+		for _, info := range infos {
+			if strings.HasSuffix(info.Key, ".wal") {
+				return fmt.Errorf("%w: epoch %d holds objects but none is readable, so its durable point cannot be established",
+					ErrDurableRegression, prevEpoch)
+			}
+		}
+	}
+	return nil
 }
 
 // writeRecoveryPoint records the epoch boundary (§12.5). The object is create-only,
