@@ -3,39 +3,115 @@ version: "3"
 # Build/test/lint/dst orchestration for github.com/spin-stack/storage.
 # Mirrors the sibling spin-stack projects (go-task). The `ci` target is the
 # aggregate gate wired into GitHub Actions (docs/plan/PLAN.md §2).
+#
+# Reproducibility rule: every tool this project needs is pinned here and installed
+# into ./.tools/bin by `task tools`. Nothing depends on what happens to be on the
+# developer's PATH, and no task downloads an unpinned "latest". If you find yourself
+# typing `sqlc`, `atlas`, `golangci-lint`, or `gofmt` by hand, that is a missing task.
 
 vars:
   SIMULABLE: ./hack/analyzers/simulable/cmd/simulable
+  # Project-local tool bin. Committed to .gitignore; rebuilt by `task tools`.
+  TOOLS_BIN: "{{.ROOT_DIR}}/.tools/bin"
+  # --- pinned tool versions (the single place each is declared) ---
+  SQLC_VERSION: v1.30.0
+  ATLAS_VERSION: v1.2.3
+  # golangci-lint v2 also owns formatting (gofmt + goimports are configured as
+  # `formatters` in .golangci.yml), so there is exactly one formatter binary.
+  GOLANGCI_VERSION: v2.12.2
 
 tasks:
   default:
     cmds:
       - task: ci
 
+  # --- tools -----------------------------------------------------------------
+
+  tools:
+    desc: Install every pinned tool into ./.tools/bin (sqlc, atlas, golangci-lint).
+    cmds:
+      - task: tools:sqlc
+      - task: tools:atlas
+      - task: tools:golangci
+
+  tools:sqlc:
+    desc: Install the pinned sqlc (ADR-0006).
+    status:
+      - test -x {{.TOOLS_BIN}}/sqlc && {{.TOOLS_BIN}}/sqlc version | grep -q '{{.SQLC_VERSION}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/sqlc-dev/sqlc/cmd/sqlc@{{.SQLC_VERSION}}
+
+  tools:atlas:
+    desc: Install the pinned Atlas CLI (ADR-0007), downloaded by version and checksum-verified.
+    # `go install ariga.io/atlas/cmd/atlas@…` only resolves up to v0.13.1 (the CLI
+    # module stopped being tagged in the proxy), so this fetches the released binary
+    # for the pinned version — never `latest`, and never piped into a shell.
+    status:
+      - test -x {{.TOOLS_BIN}}/atlas && {{.TOOLS_BIN}}/atlas version | grep -q '{{.ATLAS_VERSION}}'
+    cmds:
+      - mkdir -p {{.TOOLS_BIN}}
+      - |
+        set -euo pipefail
+        url="https://release.ariga.io/atlas/atlas-$(go env GOOS)-$(go env GOARCH)-{{.ATLAS_VERSION}}"
+        tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+        curl -fsSL -o "$tmp/atlas" "$url"
+        curl -fsSL -o "$tmp/atlas.sha256" "$url.sha256"
+        echo "$(cat "$tmp/atlas.sha256")  $tmp/atlas" | sha256sum -c -
+        install -m 0755 "$tmp/atlas" {{.TOOLS_BIN}}/atlas
+
+  tools:golangci:
+    desc: Install the pinned golangci-lint v2.
+    status:
+      - test -x {{.TOOLS_BIN}}/golangci-lint && {{.TOOLS_BIN}}/golangci-lint version | grep -q '{{.GOLANGCI_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_VERSION}}
+
+  # --- code generation and migrations ----------------------------------------
+
   generate:
     desc: Regenerate sqlc code from schema + queries (ADR-0006).
+    deps: [tools:sqlc]
     cmds:
-      - sqlc generate
+      - "{{.TOOLS_BIN}}/sqlc generate"
+
+  generate:check:
+    desc: Fail if the committed sqlc output is stale (generate produced a diff).
+    deps: [tools:sqlc]
+    cmds:
+      - "{{.TOOLS_BIN}}/sqlc generate"
+      - git diff --exit-code -- internal/db
 
   db:migrate:diff:
     desc: "Generate an Atlas migration from schema.sql changes (ADR-0007). Usage: task db:migrate:diff -- <name>"
+    deps: [tools:atlas]
     cmds:
-      - atlas migrate diff {{.CLI_ARGS}} --env local
+      - "{{.TOOLS_BIN}}/atlas migrate diff {{.CLI_ARGS}} --env local"
 
   db:migrate:
     desc: Apply Atlas migrations to the local database.
+    deps: [tools:atlas]
     cmds:
-      - atlas migrate apply --env local
+      - "{{.TOOLS_BIN}}/atlas migrate apply --env local"
 
   db:migrate:status:
     desc: Show Atlas migration status.
+    deps: [tools:atlas]
     cmds:
-      - atlas migrate status --env local
+      - "{{.TOOLS_BIN}}/atlas migrate status --env local"
 
   db:migrate:validate:
     desc: Validate the migration directory against atlas.sum.
+    deps: [tools:atlas]
     cmds:
-      - atlas migrate validate --env local
+      - "{{.TOOLS_BIN}}/atlas migrate validate --env local"
+
+  db:migrate:lint:
+    desc: "Lint the pending migrations against the last N (default 1). Usage: task db:migrate:lint -- --latest 3"
+    deps: [tools:atlas]
+    cmds:
+      - "{{.TOOLS_BIN}}/atlas migrate lint --env local {{.CLI_ARGS | default \"--latest 1\"}}"
+
+  # --- build / test / lint ----------------------------------------------------
 
   build:
     desc: Build all packages and commands.
@@ -65,8 +141,9 @@ tasks:
 
   lint:golangci:
     desc: Run golangci-lint (incl. forbidigo/depguard belt-and-suspenders).
+    deps: [tools:golangci]
     cmds:
-      - golangci-lint run ./...
+      - "{{.TOOLS_BIN}}/golangci-lint run ./..."
 
   lint:simulable:
     desc: Run the authoritative simulable-interfaces analyzer over all packages.
@@ -80,14 +157,21 @@ tasks:
       - go test -race -count=1 -run 'TestWALReplayProperty' ./internal/wal/
 
   fmt:
-    desc: Format code.
+    desc: Format code with the pinned golangci-lint formatters (gofmt + goimports).
+    deps: [tools:golangci]
     cmds:
-      - gofmt -w .
-      - go run golang.org/x/tools/cmd/goimports@latest -w . || true
+      - "{{.TOOLS_BIN}}/golangci-lint fmt ./..."
+
+  fmt:check:
+    desc: Fail if any file is unformatted (what CI enforces, before the slower linters).
+    deps: [tools:golangci]
+    cmds:
+      - "{{.TOOLS_BIN}}/golangci-lint fmt --diff ./..."
 
   ci:
-    desc: Aggregate gate — build, lint, test, dst. Matches the standard gate.
+    desc: Aggregate gate — format, build, lint, test, dst. Matches the standard gate.
     cmds:
+      - task: fmt:check
       - task: build
       - task: lint
       - task: test

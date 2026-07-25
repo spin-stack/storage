@@ -16,3 +16,6 @@ coverage.*
 
 # Coverage profiles
 cover*.out
+
+# Project-local pinned tool binaries (task tools)
+/.tools/

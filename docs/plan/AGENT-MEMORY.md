@@ -44,16 +44,15 @@ invariant ID, it extends INV-08/09/10/11/16/17 to the host-move path. Phases 02/
 - Drain evacuates from the volume's durable prefix in S3, **not** from a source-taken
   snapshot (ADR-0008 / DEV-0002): the doc's "snapshot + restore" needs a live, cooperating
   source and the CP↔Agent RPC that Phases 02/03 will bring.
-- `sqlc` is not preinstalled: `go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0`
-  (lands in `~/go/bin`, not on PATH by default).
+- Tooling is pinned in `Taskfile.yml` and installed by `task tools` into
+  `./.tools/bin` (sqlc, Atlas, golangci-lint). Never run those binaries by hand —
+  every workflow (generate, migrations, format, lint, coverage) is a task.
 - Postgres `jsonb` round-trips by value, not byte-for-byte — compare parsed JSON in tests.
 - Lifecycles are typed in `internal/lifecycle` (ADR-0009): never write a bare state
   string. Stored as TEXT + CHECK (not PG enums, not int codes); binary formats keep
   numeric enums. A new state = constant + transition table + Atlas migration, or the
   drift test fails.
-- Atlas is not preinstalled either: `curl -sSL -o ~/.local/bin/atlas
-  https://atlasbinaries.com/atlas/atlas-linux-amd64-latest && chmod +x` (the atlasgo.sh
-  installer needs sudo).
+
 - Two real bugs the tests caught and fixed: `Log.Discard/WriteZeroes` not feeding the
   remote batcher; the sim network letting a closed conn Send.
 - Coverage: `-coverpkg=./...`; 90% floor excludes generated db / integration-only pg &

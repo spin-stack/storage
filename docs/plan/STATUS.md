@@ -58,9 +58,10 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
    failing tests/DST scenarios/checkers → Implementer makes them pass → gate green → commit.
 3. Branch per phase off `main`; **human review before merge** for data-loss zones
    (formats, fencing, durability, GC). Merge to `main` with `--ff-only` after review.
-4. Commands: `task ci`, `task cover`, `task test:integration`, `task dst`, `task generate`
-   (sqlc), `task db:migrate:diff -- <name>` (Atlas). Atlas installed via atlasgo.sh;
-   `sqlc` via `go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0` (lands in `~/go/bin`).
+4. Commands: `task tools` first (installs the pinned sqlc/Atlas/golangci-lint into
+   `./.tools/bin`), then `task ci`, `task cover`, `task test:integration`, `task dst`,
+   `task generate` / `generate:check`, `task db:migrate:diff -- <name>`. Tools are never
+   invoked directly — versions live in `Taskfile.yml` and CI runs the same tasks.
 
 ## Next candidates (all pure-Go / DST-provable except where noted)
 - **Merge `hardening/typed-lifecycles`** (increment 13.1, ADR-0009).

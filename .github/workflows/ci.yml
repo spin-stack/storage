@@ -23,17 +23,26 @@ jobs:
       - name: Set up Task
         uses: go-task/setup-task@v2
 
-      - name: Set up golangci-lint
-        uses: golangci/golangci-lint-action@v6
+      # Every other tool (sqlc, atlas, golangci-lint) is pinned in the Taskfile and
+      # installed into ./.tools/bin by `task tools` — the same command a developer
+      # runs locally, so CI and laptops cannot drift.
+      - name: Cache pinned tools
+        uses: actions/cache@v4
         with:
-          version: v2.12.2
-          install-mode: binary
-          # golangci-lint is invoked via `task lint`; only install it here.
-          args: --help
-        continue-on-error: false
+          path: .tools
+          key: tools-${{ runner.os }}-${{ hashFiles('Taskfile.yml') }}
 
-      # The standard gate (docs/plan/PLAN.md §2): build, lint (incl. the custom
-      # simulable analyzer / INV-01), test, and the DST scenario set.
+      - name: Install pinned tools
+        run: task tools
+
+      # The standard gate (docs/plan/PLAN.md §2): format, generated-code freshness,
+      # build, lint (incl. the custom simulable analyzer / INV-01), test, DST.
+      - name: Format check
+        run: task fmt:check
+
+      - name: Generated code is current (sqlc, ADR-0006)
+        run: task generate:check
+
       - name: Build
         run: task build
 

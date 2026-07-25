@@ -20,15 +20,25 @@ in `docs/plan/DEVIATIONS.md`.
 
 ## Commands
 
+**Everything goes through Taskfile targets.** Tool versions (sqlc, Atlas,
+golangci-lint) are pinned in `Taskfile.yml` and installed into `./.tools/bin` by
+`task tools`; CI runs the same tasks. Never invoke `sqlc`, `atlas`, `golangci-lint`,
+`gofmt`, or a raw `go test -coverpkg` by hand — if something is missing, add a task.
+
 ```
-task ci                 # the gate: build + lint + test(-race) + dst + coverage
+task tools              # install the pinned toolchain into ./.tools/bin
+task ci                 # the gate: fmt + build + lint + test(-race) + dst
 task test               # unit/property tests, race detector
 task test:integration   # Docker-gated TestContainers tests (-tags integration)
 task lint               # golangci-lint + the custom simulable analyzer
 task dst                # mandatory Deterministic Simulation Testing scenarios
 task cover              # cross-package coverage; fails under 90% on production code
+task fmt / fmt:check    # format (gofmt+goimports via golangci-lint v2) / verify
 task generate           # sqlc generate
+task generate:check     # fail if the committed sqlc output is stale
 task db:migrate:diff -- <name>   # author an Atlas migration from schema.sql
+task db:migrate:validate         # check migrations against atlas.sum
+task db:migrate:lint -- --latest N  # lint pending migrations for unsafe changes
 ```
 
 ## Non-negotiable invariants (enforced, not aspirational)
