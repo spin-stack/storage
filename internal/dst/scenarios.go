@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/metadata"
+	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -48,7 +52,63 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "remote-flush-ordering", Run: scenarioRemoteFlushOrdering},
 		{Name: "idempotent-batch-upload", Run: scenarioIdempotentBatchUpload},
 		{Name: "lease-fences-durable-ack", Run: scenarioLeaseFencesDurableAck},
+		{Name: "promotion-fencing-wait", Run: scenarioPromotionFencingWait},
 	}
+}
+
+// promoVol/promoHosts are v7-shaped ids used by the promotion scenario.
+const (
+	promoVol   = "00000000-0000-7000-8000-000000000020"
+	promoHost1 = "00000000-0000-7000-8000-0000000000b1"
+	promoHost2 = "00000000-0000-7000-8000-0000000000b2"
+)
+
+// scenarioPromotionFencingWait exercises INV-11 (promotion waits) and INV-10 (a
+// fenced writer cannot publish) end-to-end through the Control Plane promoter.
+func scenarioPromotionFencingWait(s *Sim) error {
+	ctx := context.Background()
+	md := metasim.New(s.Clock.Wall)
+	epochs := epoch.NewStore(s.Store)
+	p := controlplane.NewPromoter(md, epochs, s.Clock, 10*time.Second, 2*time.Second)
+
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost1, State: "ACTIVE"})
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost2, State: "ACTIVE"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: promoVol, State: "ACTIVE", PrimaryHostID: promoHost1, DEKWrapped: []byte{1}, KEKID: "k"})
+	if _, err := epochs.Init(ctx, promoVol, 0); err != nil {
+		return err
+	}
+	// The old writer W1 records the epoch object ETag it holds at epoch 0.
+	_, w1ETag, _ := epochs.Current(ctx, promoVol)
+	renewedAt := s.Clock.Wall()
+
+	// INV-11: promotion before FENCING_WAIT is refused.
+	if _, err := p.Promote(ctx, term, promoVol, renewedAt, promoHost2); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("promote-too-early: want ErrFencingWaitNotElapsed, got %v", err)
+	}
+
+	// After FENCING_WAIT (lease_ttl 10s + skew 2s), promotion succeeds.
+	s.Clock.Advance(13 * time.Second)
+	deadline := p.FencingDeadline(renewedAt)
+	newEpoch, err := p.Promote(ctx, term, promoVol, renewedAt, promoHost2)
+	if err != nil {
+		return fmt.Errorf("promote after wait: %w", err)
+	}
+	s.Emit(Event{Kind: EventPromotion, EarlyGrant: s.Clock.Wall().Before(deadline), Msg: fmt.Sprintf("epoch=%d", newEpoch)})
+	if newEpoch != 1 {
+		return fmt.Errorf("new epoch = %d, want 1", newEpoch)
+	}
+
+	// INV-10: W1 (epoch 0) is now fenced — its publish check and CAS both fail.
+	fenced := errors.Is(epochs.Verify(ctx, promoVol, 0), epoch.ErrEpochChanged)
+	_, casErr := epochs.CompareAndAdvance(ctx, promoVol, w1ETag, 99)
+	published := !fenced || casErr == nil
+	s.Emit(Event{Kind: EventStalePublsh, StalePublishOK: published})
+	if published {
+		return errors.New("a fenced writer was able to publish")
+	}
+	s.Notef("promotion respected FENCING_WAIT; old epoch fenced")
+	return nil
 }
 
 // scenarioLeaseFencesDurableAck is INV-06 (§12.2): a valid lease lets a FLUSH ACK;

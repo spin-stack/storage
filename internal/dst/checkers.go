@@ -135,6 +135,40 @@ func (c *DurableAckLeaseChecker) Observe(e Event) {
 
 func (c *DurableAckLeaseChecker) Check() error { return c.violation }
 
+// PromotionWaitChecker enforces INV-11 (§12.3): no epoch N+1 is granted before
+// FENCING_WAIT elapses.
+type PromotionWaitChecker struct{ violation error }
+
+// NewPromotionWaitChecker returns a fresh checker.
+func NewPromotionWaitChecker() *PromotionWaitChecker { return &PromotionWaitChecker{} }
+
+func (c *PromotionWaitChecker) Name() string { return "promotion-fencing-wait" }
+
+func (c *PromotionWaitChecker) Observe(e Event) {
+	if e.Kind == EventPromotion && e.EarlyGrant && c.violation == nil {
+		c.violation = fmt.Errorf("epoch granted before FENCING_WAIT elapsed at step %d (violates §12.3/INV-11)", e.Step)
+	}
+}
+
+func (c *PromotionWaitChecker) Check() error { return c.violation }
+
+// SingleWriterChecker enforces INV-10 (§12.4): a fenced/stale-epoch writer never
+// publishes.
+type SingleWriterChecker struct{ violation error }
+
+// NewSingleWriterChecker returns a fresh checker.
+func NewSingleWriterChecker() *SingleWriterChecker { return &SingleWriterChecker{} }
+
+func (c *SingleWriterChecker) Name() string { return "effective-single-writer" }
+
+func (c *SingleWriterChecker) Observe(e Event) {
+	if e.Kind == EventStalePublsh && e.StalePublishOK && c.violation == nil {
+		c.violation = fmt.Errorf("a stale-epoch writer published at step %d (violates §12.4/INV-10)", e.Step)
+	}
+}
+
+func (c *SingleWriterChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
@@ -143,5 +177,7 @@ func DefaultCheckers() []Checker {
 		NewWatermarkOrderChecker(),
 		NewNoPlaintextLeavesHostChecker(),
 		NewDurableAckLeaseChecker(),
+		NewPromotionWaitChecker(),
+		NewSingleWriterChecker(),
 	}
 }

@@ -30,17 +30,19 @@ const simEpoch = 1_700_000_000
 type EventKind string
 
 const (
-	EventClock      EventKind = "clock"
-	EventDisk       EventKind = "disk"
-	EventObject     EventKind = "object"
-	EventNetwork    EventKind = "network"
-	EventNote       EventKind = "note"
-	EventDelete     EventKind = "delete"
-	EventFault      EventKind = "fault"
-	EventRecovery   EventKind = "recovery"
-	EventWatermark  EventKind = "watermark"
-	EventLeavesHost EventKind = "leaves-host"
-	EventDurableAck EventKind = "durable-ack"
+	EventClock       EventKind = "clock"
+	EventDisk        EventKind = "disk"
+	EventObject      EventKind = "object"
+	EventNetwork     EventKind = "network"
+	EventNote        EventKind = "note"
+	EventDelete      EventKind = "delete"
+	EventFault       EventKind = "fault"
+	EventRecovery    EventKind = "recovery"
+	EventWatermark   EventKind = "watermark"
+	EventLeavesHost  EventKind = "leaves-host"
+	EventDurableAck  EventKind = "durable-ack"
+	EventPromotion   EventKind = "promotion"
+	EventStalePublsh EventKind = "stale-publish"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -64,6 +66,12 @@ type Event struct {
 	// DurableAck events (§12.2): whether the host lease was valid at the instant a
 	// FLUSH was ACKed as durable. Must always be true (INV-06).
 	LeaseValid bool
+	// Promotion events (§12.3): whether epoch N+1 was granted before FENCING_WAIT
+	// elapsed. Must always be false (INV-11).
+	EarlyGrant bool
+	// StalePublish events (§12.4): whether a fenced/stale-epoch writer managed to
+	// publish. Must always be false (INV-10).
+	StalePublishOK bool
 }
 
 // String renders an event deterministically for the trace.
@@ -79,6 +87,10 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d leaves-host clear_leak=%t %s", e.Step, e.ClearLeak, e.Msg)
 	case EventDurableAck:
 		return fmt.Sprintf("%04d durable-ack seq=%d lease_valid=%t", e.Step, e.Durable, e.LeaseValid)
+	case EventPromotion:
+		return fmt.Sprintf("%04d promotion early_grant=%t %s", e.Step, e.EarlyGrant, e.Msg)
+	case EventStalePublsh:
+		return fmt.Sprintf("%04d stale-publish succeeded=%t", e.Step, e.StalePublishOK)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:
