@@ -271,6 +271,7 @@ func TestResumeStopsAtATornTail(t *testing.T) {
 	f, _ := w.disk.Open("wal/active.wal")
 	size, _ := f.Size()
 	w.disk.TornTail("wal/active.wal", int(size)-10) // the third record is cut short
+	w.disk.Crash()                                  // the page cache is gone with the process
 
 	resumed, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, w.vol, 1, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil)

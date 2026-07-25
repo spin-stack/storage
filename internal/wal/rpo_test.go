@@ -180,6 +180,9 @@ func TestVerifiedUploadIsWhatClosesTheGap(t *testing.T) {
 	if gap <= 0 {
 		t.Fatalf("gap = %v after a failed upload; no object exists", gap)
 	}
+	if got := float64(l.RemoteGapBytes()); got != gap {
+		t.Fatalf("RemoteGapBytes() = %v but the gauge says %v", got, gap)
+	}
 
 	if err := l.Flush(ctx); err != nil { // the throttle cleared; the batch was retained
 		t.Fatal(err)

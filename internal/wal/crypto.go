@@ -75,9 +75,18 @@ func (e *Encryption) encodeWrite(epoch, seq, offset uint64, flags uint32, plaint
 // Decrypt returns the plaintext of a replayed record. Plaintext records (KeyID==0)
 // are returned as-is; encrypted records are GCM-opened and their plaintext CRC is
 // verified. Any tamper fails closed.
+//
+// A record sealed with a key version this volume does not hold is reported as such
+// rather than handed to Open, whose failure is indistinguishable from a bit flip. The
+// difference matters at recovery: "fetch DEK version 3" is actionable, while "tamper
+// detected" aborts the volume.
 func (e *Encryption) Decrypt(rec Record) ([]byte, error) {
 	if rec.KeyID == 0 {
 		return rec.Payload, nil
+	}
+	if rec.KeyID != e.DEK.KeyID {
+		return nil, fmt.Errorf("%w: sequence %d is sealed with key version %d, this volume holds %d",
+			ErrUnknownKeyID, rec.Sequence, rec.KeyID, e.DEK.KeyID)
 	}
 	pt, err := e.DEK.Open(e.VolumeID, rec.Epoch, rec.Sequence, rec.Payload, rec.AuthTag)
 	if err != nil {

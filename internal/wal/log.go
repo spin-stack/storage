@@ -51,8 +51,16 @@ type Watermarks struct {
 
 // Limits bound the local WAL (§5.7).
 type Limits struct {
+	// MaxUnflushedBytes/MaxUnflushedAge bound what fdatasync has not seen; both are
+	// cleared by Sync.
 	MaxUnflushedBytes int64
 	MaxUnflushedAge   time.Duration
+	// MaxRemoteGapBytes bounds the bytes that no verified object covers yet — the
+	// backlog a host loss destroys. It is a separate limit because fdatasync clears
+	// the two above while leaving this one untouched, so on a `local` volume (or a
+	// remote one riding out an S3 outage) nothing else stops the device from filling
+	// with writes no other machine has. 0 disables it.
+	MaxRemoteGapBytes int64
 }
 
 // Log is the append-only local WAL for one volume, with a read view over the
@@ -70,6 +78,10 @@ type Log struct {
 	durable   uint64
 	published uint64
 	replayed  bool // this log rebuilt itself from the WAL file's contents
+
+	// resumeTail holds the replayed records no verified object covers yet; they go
+	// to the batcher as soon as EnableRemote provides one.
+	resumeTail []resumedRecord
 
 	view   *cow.IntervalMap
 	limits Limits
@@ -198,6 +210,16 @@ func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
 		l.lease = lease
 	}
 	l.alignKeyID()
+	// A resumed log carries the records the crash left un-uploaded (Resume). They
+	// are the writes that exist on this host only, so the batcher gets them the
+	// moment there is one — forgetting them here would lose every write since the
+	// last successful upload, silently.
+	if b != nil {
+		for _, r := range l.resumeTail {
+			b.Append(r.seq, r.encoded, false)
+		}
+		l.resumeTail = nil
+	}
 }
 
 // NewLog creates a log backed by file, timed by clk.
@@ -230,6 +252,9 @@ func (l *Log) backpressure(add int) error {
 	}
 	if l.hasUnflushed && l.limits.MaxUnflushedAge > 0 &&
 		l.clk.Now().Sub(l.oldestUnflushedAt) > l.limits.MaxUnflushedAge {
+		return ErrBackpressure
+	}
+	if l.limits.MaxRemoteGapBytes > 0 && l.gapBytes+int64(add) > l.limits.MaxRemoteGapBytes {
 		return ErrBackpressure
 	}
 	return nil
@@ -282,6 +307,27 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	if flags&format.FlagFUA != 0 {
 		return 0, ErrFUAOnWrite
 	}
+	return l.write(offset, data, flags)
+}
+
+// WriteFUA appends a WRITE carrying the FUA flag and makes it durable before it
+// returns, under the same ACK contract as a FLUSH (§14.3.1, §14.8): in `remote` mode
+// the record is in a verified object and the lease was valid at the instant of the
+// ACK, in `local` mode it is on the host's stable media. On any failure the record
+// stays in the local WAL — as an un-ACKed FLUSH's records do — and the caller gets
+// the error instead of a completion the guest would trust.
+func (l *Log) WriteFUA(ctx context.Context, offset uint64, data []byte) (uint64, error) {
+	seq, err := l.write(offset, data, format.FlagFUA)
+	if err != nil {
+		return 0, err
+	}
+	if err := l.durableStep(ctx, seq); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	seq := l.local + 1
 	var (
 		enc []byte
