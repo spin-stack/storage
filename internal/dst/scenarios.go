@@ -18,6 +18,7 @@ import (
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/internal/snapshot"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
@@ -58,7 +59,58 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "fenced-writer-no-lost-ack", Run: scenarioFencedWriterNoLostAck},
 		{Name: "recovery-authority-is-s3", Run: scenarioRecoveryAuthorityIsS3},
 		{Name: "rebuild-metadata-from-s3", Run: scenarioRebuildMetadataFromS3},
+		{Name: "snapshot-pausefree-immutable", Run: scenarioSnapshotPauseFreeImmutable},
 	}
+}
+
+// scenarioSnapshotPauseFreeImmutable is INV-16 + §19: a snapshot captures a sequence
+// with ~0 pause and, once published, never changes even as writes continue.
+func scenarioSnapshotPauseFreeImmutable(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+
+	_, _ = l.Write(0, []byte("a"), 0)
+	_, _ = l.Write(8, []byte("b"), 0)
+
+	m, pause, err := snapshot.NewSnapshotter(s.Store, s.Clock).Create(ctx, l, vol, 1, "snap-1", "")
+	if err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	if pause != 0 {
+		return fmt.Errorf("snapshot pause = %v, want ~0", pause)
+	}
+
+	// Keep writing after the snapshot.
+	_, _ = l.Write(16, []byte("c"), 0)
+	if err := l.Flush(ctx); err != nil {
+		return err
+	}
+
+	// The published manifest is unchanged, and republishing (mutating) it fails.
+	got, err := snapshot.Read(ctx, s.Store, m.VolumeID, "snap-1")
+	if err != nil {
+		return err
+	}
+	mutated := got.TargetSequence != m.TargetSequence || len(got.Objects) != len(m.Objects)
+	changed := m
+	changed.TargetSequence = 999
+	if err := snapshot.Publish(ctx, s.Store, changed); !errors.Is(err, objectstore.ErrPreconditionFailed) {
+		mutated = true // the manifest was overwritten — INV-16 violation
+	}
+	s.Emit(Event{Kind: EventSnapshot, SnapshotMutated: mutated, Msg: fmt.Sprintf("target=%d", m.TargetSequence)})
+	if mutated {
+		return errors.New("published snapshot changed")
+	}
+	s.Notef("snapshot at seq %d: pause ~0, immutable after later writes", m.TargetSequence)
+	return nil
 }
 
 // scenarioRebuildMetadataFromS3 is INV-20 (§22.5): with PostgreSQL empty,

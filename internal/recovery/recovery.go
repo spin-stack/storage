@@ -77,6 +77,22 @@ func contiguousLast(objs []walObject) uint64 {
 	return last
 }
 
+// ObjectKeysUpTo returns the keys of the WAL objects whose last sequence is <= upTo,
+// in order. Used to build a snapshot manifest (§19) covering a captured sequence.
+func ObjectKeysUpTo(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch, upTo uint64) ([]string, error) {
+	objs, err := listObjects(ctx, store, volumeID, epoch)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for _, o := range objs {
+		if o.last <= upTo {
+			keys = append(keys, o.key)
+		}
+	}
+	return keys, nil
+}
+
 // DurablePrefix returns the durable point for a volume/epoch computed from S3 alone
 // (INV-08): the end of the longest contiguous WAL prefix.
 func DurablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {

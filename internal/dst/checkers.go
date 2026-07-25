@@ -188,6 +188,23 @@ func (c *NoLostAckedWriteChecker) Observe(e Event) {
 
 func (c *NoLostAckedWriteChecker) Check() error { return c.violation }
 
+// ImmutableSnapshotChecker enforces INV-16 (§5.2): a published snapshot never
+// changes.
+type ImmutableSnapshotChecker struct{ violation error }
+
+// NewImmutableSnapshotChecker returns a fresh checker.
+func NewImmutableSnapshotChecker() *ImmutableSnapshotChecker { return &ImmutableSnapshotChecker{} }
+
+func (c *ImmutableSnapshotChecker) Name() string { return "immutable-snapshots" }
+
+func (c *ImmutableSnapshotChecker) Observe(e Event) {
+	if e.Kind == EventSnapshot && e.SnapshotMutated && c.violation == nil {
+		c.violation = fmt.Errorf("a published snapshot changed at step %d (violates §5.2/INV-16)", e.Step)
+	}
+}
+
+func (c *ImmutableSnapshotChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
@@ -199,5 +216,6 @@ func DefaultCheckers() []Checker {
 		NewPromotionWaitChecker(),
 		NewSingleWriterChecker(),
 		NewNoLostAckedWriteChecker(),
+		NewImmutableSnapshotChecker(),
 	}
 }

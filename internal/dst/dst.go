@@ -44,6 +44,7 @@ const (
 	EventPromotion   EventKind = "promotion"
 	EventStalePublsh EventKind = "stale-publish"
 	EventFailover    EventKind = "failover"
+	EventSnapshot    EventKind = "snapshot"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -77,6 +78,9 @@ type Event struct {
 	// promoted writer's recovered prefix. Recovered must be >= AckedDurable (INV-09).
 	AckedDurable uint64
 	Recovered    uint64
+	// Snapshot events (§5.2, §19): whether a published snapshot was later observed to
+	// change (must be false, INV-16).
+	SnapshotMutated bool
 }
 
 // String renders an event deterministically for the trace.
@@ -98,6 +102,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d stale-publish succeeded=%t", e.Step, e.StalePublishOK)
 	case EventFailover:
 		return fmt.Sprintf("%04d failover acked_durable=%d recovered=%d", e.Step, e.AckedDurable, e.Recovered)
+	case EventSnapshot:
+		return fmt.Sprintf("%04d snapshot mutated=%t %s", e.Step, e.SnapshotMutated, e.Msg)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

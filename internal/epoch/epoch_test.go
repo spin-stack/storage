@@ -50,6 +50,20 @@ func TestCompareAndAdvance(t *testing.T) {
 	_ = newETag
 }
 
+func TestMissingObjectPaths(t *testing.T) {
+	ctx := context.Background()
+	s := epoch.NewStore(sim.NewObjectStore())
+	if _, _, err := s.Current(ctx, vol); err == nil {
+		t.Fatal("Current on a missing epoch object should error")
+	}
+	if err := s.Verify(ctx, vol, 1); err == nil {
+		t.Fatal("Verify on a missing epoch object should error")
+	}
+	if _, err := s.CompareAndAdvance(ctx, vol, "no-etag", 2); err == nil {
+		t.Fatal("CompareAndAdvance on a missing object should error")
+	}
+}
+
 func TestVerify(t *testing.T) {
 	ctx := context.Background()
 	s := epoch.NewStore(sim.NewObjectStore())
