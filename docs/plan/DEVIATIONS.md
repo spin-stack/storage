@@ -18,20 +18,6 @@ gate** (PLAN §2).
 
 ## Open
 
-### DEV-0003 — Recovery accepts an unvalidated WAL object as durable
-- Detected: 2026-07-25 by human review (rebaseline)
-- Doc section(s): §22.1, §14.2, §5.8
-- Divergence: `recovery.listObjects` parses an object header and trusts it — no check
-  of `PayloadSHA256`, `PayloadLength`, `RecordCount`, or that the object belongs to the
-  volume/epoch under recovery. `DurablePrefix` derives the durable point from header
-  `LastSequence` values without reading any record, so a truncated or corrupt object
-  still raises the durable point. The prefix starts at the lowest object present rather
-  than requiring sequence 1 or the previous epoch's recovery point as a floor.
-- Severity: high (durability; undermines INV-08 and INV-09)
-- Resolution: fix — validate every object against its header before it may contribute
-  to the durable point; require an explicit prefix floor; DST scenarios for a truncated
-  object at the prefix edge and a header that lies. **Status: open.**
-
 ### DEV-0004 — Fencing is fail-open, and promotion is not atomic or resumable
 - Detected: 2026-07-25 by human review (rebaseline)
 - Doc section(s): §12.2, §12.3–12.4, §14.8
@@ -41,16 +27,14 @@ gate** (PLAN §2).
   independently-failing steps with no idempotent resume.
 - Severity: high (fencing; INV-06 claimed structural but is opt-in)
 - Resolution: fix — make the lease mandatory for `remote` mode at construction time,
-  and turn promotion into a resumable staged operation. **Status: open.**
-
-### DEV-0005 — Not every Control-Plane mutation is term-guarded
-- Detected: 2026-07-25 by human review (rebaseline)
-- Doc section(s): §7
-- Divergence: `RecordOperation` and `UpdateOperationPhase` have no
-  `control_plane_leader` term predicate, so a zombie CP can write operation rows.
-- Severity: medium (control plane consistency)
-- Resolution: fix — add the predicate to both queries plus a structural test that
-  enumerates mutating queries and fails on any without one. **Status: open.**
+  and turn promotion into a resumable staged operation.
+  **Status: partially resolved 2026-07-25** by `6d5655e`: a remote FLUSH with no lease
+  checker now returns `wal.ErrNoLease` instead of ACKing, and `EnableRemote` takes the
+  lease as a parameter so every call site must answer what fences that writer. The
+  test that specified the vulnerability (`TestNoLeaseConfiguredStillAcks`: "flush
+  without a lease gate should ACK") was removed with its reason recorded in place.
+  **Still open:** promotion is three independently-failing steps with no idempotent
+  resume.
 
 ### DEV-0006 — The object store exposes permanent deletion; GC does not mark
 - Detected: 2026-07-25 by human review (rebaseline)
@@ -112,6 +96,33 @@ gate** (PLAN §2).
   exporter, before any measured-time claim. **Status: open.**
 
 ## Resolved
+
+### DEV-0005 — Not every Control-Plane mutation is term-guarded
+- Detected: 2026-07-25 by human review (rebaseline)
+- Doc section(s): §7
+- Divergence: `RecordOperation` and `UpdateOperationPhase` have no
+  `control_plane_leader` term predicate, so a zombie CP can write operation rows.
+- Severity: medium (control plane consistency)
+- Resolution: fix — add the predicate to both queries plus a structural test that
+  enumerates mutating queries and fails on any without one. **Status: open.**
+- **Resolved 2026-07-25** by `93b70aa`+`15cb1e2`: both operations queries carry the leader-term predicate, and a structural test enumerates every mutating query and fails on any without one (exemptions explicit).
+
+
+### DEV-0003 — Recovery accepts an unvalidated WAL object as durable
+- Detected: 2026-07-25 by human review (rebaseline)
+- Doc section(s): §22.1, §14.2, §5.8
+- Divergence: `recovery.listObjects` parses an object header and trusts it — no check
+  of `PayloadSHA256`, `PayloadLength`, `RecordCount`, or that the object belongs to the
+  volume/epoch under recovery. `DurablePrefix` derives the durable point from header
+  `LastSequence` values without reading any record, so a truncated or corrupt object
+  still raises the durable point. The prefix starts at the lowest object present rather
+  than requiring sequence 1 or the previous epoch's recovery point as a floor.
+- Severity: high (durability; undermines INV-08 and INV-09)
+- Resolution: fix — validate every object against its header before it may contribute
+  to the durable point; require an explicit prefix floor; DST scenarios for a truncated
+  object at the prefix edge and a header that lies. **Status: open.**
+- **Resolved 2026-07-25** by `6d5655e`: every stored object is validated against its own header (volume/epoch, payload length, SHA-256, replayed record count and first/last sequence, contiguity) before it may contribute to the durable point, and the contiguous run now starts at an explicit floor — sequence 1, or one past the epoch's recovery point (§12.5). Failing objects end the run instead of failing recovery. Tests: `internal/recovery/integrity_test.go`.
+
 
 ### DEV-0002 — Drain moves from the durable prefix, not from a snapshot
 - Detected: 2026-07-25 by implementer agent in Increment 11.3
