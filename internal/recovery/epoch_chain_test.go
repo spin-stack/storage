@@ -8,7 +8,6 @@ import (
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
-	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // A volume's sequence space is continuous across epochs: epoch N+1 starts at the
@@ -26,9 +25,8 @@ func epochWriter(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]b
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := wal.NewLog(f, clk, vol, epoch, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.SeedSequence(startSeq)
-	l.EnableRemote(wal.NewBatcher(clk, vol, epoch, startSeq, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
+	l := wal.NewLogAfter(f, clk, vol, epoch, startSeq, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(clk, vol, epoch, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	return l
 }
 
@@ -152,5 +150,95 @@ func TestRecoverRefusesABrokenChain(t *testing.T) {
 
 	if _, _, err := recovery.Recover(ctx, store, nil, vol, 2); err == nil {
 		t.Fatal("recovery must refuse an epoch whose predecessor holds data it cannot chain to")
+	}
+}
+
+// TestEpochChainReportsTheSpans: the chain is the contract other packages build on
+// (materialization fetches per span), so its shape is asserted directly.
+func TestEpochChainReportsTheSpans(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	vol := vol7()
+
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 3, 2, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	spans, err := recovery.EpochChain(ctx, store, vol, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spans) != 3 {
+		t.Fatalf("chain has %d spans, want 3", len(spans))
+	}
+	want := []recovery.EpochSpan{
+		{Epoch: 1, From: 1, Upto: 5},  // ends where epoch 2's boundary says
+		{Epoch: 2, From: 6, Upto: 9},  // ends where epoch 3's boundary says
+		{Epoch: 3, From: 10, Upto: 0}, // open: the durable point decides
+	}
+	for i, w := range want {
+		if spans[i] != w {
+			t.Fatalf("span %d = %+v, want %+v", i, spans[i], w)
+		}
+	}
+}
+
+// TestEpochChainRefusesASelfReference: a boundary pointing at itself or forward is
+// corrupt, and following it would loop or invent history.
+func TestEpochChainRefusesASelfReference(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	vol := vol7()
+
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 2, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovery.EpochChain(ctx, store, vol, 2); err == nil {
+		t.Fatal("a boundary pointing at its own epoch must be refused")
+	}
+}
+
+// TestFirstEpochNeedsNoBoundary: the common case must stay simple.
+func TestFirstEpochNeedsNoBoundary(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	vol := vol7()
+
+	spans, err := recovery.EpochChain(ctx, store, vol, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spans) != 1 || spans[0] != (recovery.EpochSpan{Epoch: 1, From: 1}) {
+		t.Fatalf("chain = %+v", spans)
+	}
+}
+
+// TestChainStopsWhenAnEarlierEpochIsUnreadable: walking back must not paper over an
+// epoch whose objects cannot be listed — the volume's history would silently start
+// later than it does.
+func TestChainStopsWhenAnEarlierEpochIsUnreadable(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := sim.NewObjectStore()
+	vol := vol7()
+
+	e1 := epochWriter(t, store, clk, vol, 1, 0)
+	if _, err := e1.Write(0, []byte("epoch-one"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := e1.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Epoch 3 claims to follow epoch 2 — which never existed — while epoch 1 holds
+	// data. Recovering epoch 3 alone would drop it.
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 3, 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovery.EpochChain(ctx, store, vol, 3); err == nil {
+		t.Fatal("a chain whose middle epoch has no boundary while an earlier one holds data must be refused")
 	}
 }

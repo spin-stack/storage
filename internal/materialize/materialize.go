@@ -96,18 +96,35 @@ func (m *Materializer) FromCheckpoint(ctx context.Context, volumeID string, epoc
 	return m.fetchAndReplay(ctx, cp.Objects)
 }
 
-// FromEpoch rebuilds the state durable in S3 for a volume's epoch: the longest
-// contiguous WAL prefix, which is the recovery authority (§5.8, §22.1). This is the
-// source a host-evacuation uses — it needs no snapshot and no cooperation from the
-// host being drained (§28.1).
+// FromEpoch rebuilds everything the volume holds as of `epoch`: the durable prefix of
+// that epoch plus every earlier epoch of its chain, each up to the boundary its
+// successor recorded (§12.5). This is the source a host-evacuation uses — it needs no
+// snapshot and no cooperation from the host being drained (§28.1).
+//
+// The chain is the point. A volume that has been promoted keeps its earlier writes in
+// earlier epochs, so fetching only `epoch` would hand the destination a volume
+// missing everything written before its last move, and report it as complete.
 func (m *Materializer) FromEpoch(ctx context.Context, volumeID [16]byte, epoch uint64) (*cow.IntervalMap, Progress, error) {
+	spans, err := recovery.EpochChain(ctx, m.store, volumeID, epoch)
+	if err != nil {
+		return nil, Progress{}, fmt.Errorf("materialize: epoch chain %s/%d: %w", format.UUIDString(volumeID), epoch, err)
+	}
 	durable, err := recovery.DurablePoint(ctx, m.store, volumeID, epoch)
 	if err != nil {
 		return nil, Progress{}, fmt.Errorf("materialize: durable point %s/%d: %w", format.UUIDString(volumeID), epoch, err)
 	}
-	keys, err := recovery.ObjectKeysUpTo(ctx, m.store, volumeID, epoch, durable)
-	if err != nil {
-		return nil, Progress{}, err
+
+	var keys []string
+	for _, span := range spans {
+		upto := durable
+		if span.Epoch != epoch {
+			upto = span.Upto
+		}
+		k, err := recovery.ObjectKeysUpTo(ctx, m.store, volumeID, span.Epoch, upto)
+		if err != nil {
+			return nil, Progress{}, err
+		}
+		keys = append(keys, k...)
 	}
 	return m.fetchAndReplay(ctx, keys)
 }

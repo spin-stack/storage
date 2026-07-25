@@ -147,3 +147,39 @@ func TestCheckpointObjectsAreContiguous(t *testing.T) {
 		t.Fatalf("checkpoint covers sequence %d across a hole", cp.DurableSequence)
 	}
 }
+
+// TestCheckpointRefusesWhenS3HoldsMoreThanThisLogAcked: the other direction. If the
+// prefix is longer than anything this writer ACKed, someone else is publishing into
+// the epoch — putting this log's name on that data is how two writers become one
+// corrupted volume.
+func TestCheckpointRefusesWhenS3HoldsMoreThanThisLogAcked(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+
+	if _, err := w.log.Write(0, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.log.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A second writer continues the same epoch's sequence space — the split-brain
+	// shape: two logs, one epoch, one prefix.
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	d := sim.NewDisk()
+	f, err := d.Create("wal/second.wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2 := wal.NewLogAfter(f, clk, w.vol, 1, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l2.EnableRemote(wal.NewBatcher(clk, w.vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(w.store, 5), leaseOK{})
+	if _, err := l2.Write(4096, []byte("someone else"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// w.log still believes durable == 1 while the prefix now reaches 2.
+	if _, err := checkpoint.NewCheckpointer(w.store).Create(ctx, w.log, w.vol, 1); err == nil {
+		t.Fatal("a checkpoint must refuse to publish a prefix this log never ACKed")
+	}
+}

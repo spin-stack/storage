@@ -160,6 +160,74 @@ func prefixFloor(ctx context.Context, store objectstore.Store, volumeID [16]byte
 	return 1
 }
 
+// ErrBrokenEpochChain means an epoch's predecessor holds data that cannot be chained
+// to it: the boundary between them is missing. Rebuilding from the newest epoch alone
+// would silently drop everything written before the promotion, so recovery stops.
+var ErrBrokenEpochChain = errors.New("recovery: epoch chain is broken")
+
+// EpochSpan is one link of a volume's history: an epoch and the sequences of it that
+// belong to the volume's state. Upto is zero for the newest epoch, whose end is the
+// durable point rather than a recorded boundary.
+type EpochSpan struct {
+	Epoch uint64
+	From  uint64
+	Upto  uint64
+}
+
+// EpochChain walks a volume's epochs back from `epoch` to its first, following the
+// recovery-point objects each promotion wrote (§12.5), and returns the spans oldest
+// first.
+//
+// A volume's sequence space is continuous across epochs, so its state is the whole
+// chain: epoch N holds everything written before the promotion that opened N+1, up to
+// exactly the boundary N+1 recorded. Scanning only the newest epoch hands back a
+// volume containing just the writes made since its last move — which is what every
+// failover, drain, or evacuation after the first one would have produced.
+func EpochChain(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) ([]EpochSpan, error) {
+	type link struct{ epoch, from uint64 }
+	var links []link // newest first
+
+	for e := epoch; ; {
+		rp, err := ReadRecoveryPoint(ctx, store, volumeID, e)
+		switch {
+		case err == nil:
+			if rp.PrevEpoch == 0 || rp.PrevEpoch >= e {
+				return nil, fmt.Errorf("%w: epoch %d records predecessor %d", ErrBrokenEpochChain, e, rp.PrevEpoch)
+			}
+			links = append(links, link{epoch: e, from: rp.RecoveredUpTo + 1})
+			e = rp.PrevEpoch
+		case errors.Is(err, objectstore.ErrNotFound):
+			// No boundary, so this must be the volume's first epoch. If an earlier
+			// one holds objects, the boundary was lost and we must not pretend the
+			// volume's history starts here.
+			for earlier := uint64(1); earlier < e; earlier++ {
+				objs, lerr := listObjects(ctx, store, volumeID, earlier)
+				if lerr != nil {
+					return nil, lerr
+				}
+				if len(objs) > 0 {
+					return nil, fmt.Errorf("%w: epoch %d has no boundary, but epoch %d holds data",
+						ErrBrokenEpochChain, e, earlier)
+				}
+			}
+			links = append(links, link{epoch: e, from: 1})
+
+			spans := make([]EpochSpan, 0, len(links))
+			for i := len(links) - 1; i >= 0; i-- { // oldest first
+				span := EpochSpan{Epoch: links[i].epoch, From: links[i].from}
+				if i > 0 {
+					// Its successor recorded where this epoch ends.
+					span.Upto = links[i-1].from - 1
+				}
+				spans = append(spans, span)
+			}
+			return spans, nil
+		default:
+			return nil, err
+		}
+	}
+}
+
 // ObjectKeysUpTo returns the keys of the WAL objects whose last sequence is <= upTo,
 // in order. Used to build a snapshot manifest (§19) covering a captured sequence.
 func ObjectKeysUpTo(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch, upTo uint64) ([]string, error) {
@@ -206,37 +274,60 @@ func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byt
 }
 
 // Recover reconstructs the read view (interval map) from S3 up to the durable point,
-// decrypting each record with enc (nil for plaintext volumes). It returns the view
-// and the durable sequence.
+// decrypting each record with enc (nil for plaintext volumes). It walks the volume's
+// whole epoch chain (§12.5) — a volume that has been promoted keeps its earlier
+// writes in earlier epochs, and replaying only the newest one would hand back a
+// volume missing everything written before its last move. It returns the view and the
+// durable sequence of the requested epoch.
 func Recover(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, epoch uint64) (*cow.IntervalMap, uint64, error) {
-	durable, err := DurablePoint(ctx, store, volumeID, epoch)
+	spans, err := EpochChain(ctx, store, volumeID, epoch)
 	if err != nil {
 		return nil, 0, err
 	}
-	objs, err := listObjects(ctx, store, volumeID, epoch)
+	durable, err := DurablePoint(ctx, store, volumeID, epoch)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	view := cow.NewIntervalMap()
-	for _, o := range objs {
-		if o.first > durable {
-			break // past the durable prefix (sorted by first)
+	for _, span := range spans {
+		upto := durable
+		if span.Epoch != epoch {
+			// An earlier epoch is covered exactly up to the boundary its successor
+			// recorded; anything past that was never adopted (§12.5).
+			upto = span.Upto
 		}
-		recs, err := wal.Replay(o.body[format.ObjectHeaderSize:])
-		if err != nil {
-			return nil, 0, fmt.Errorf("recovery: replay %s: %w", o.key, err)
-		}
-		for _, rec := range recs {
-			if rec.Sequence > durable {
-				break
-			}
-			if err := ApplyRecord(view, enc, rec); err != nil {
-				return nil, 0, err
-			}
+		if err := replayEpoch(ctx, store, enc, volumeID, span.Epoch, upto, view); err != nil {
+			return nil, 0, err
 		}
 	}
 	return view, durable, nil
+}
+
+// replayEpoch applies one epoch's validated objects up to `upto` into view.
+func replayEpoch(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, epoch, upto uint64, view *cow.IntervalMap) error {
+	objs, err := listObjects(ctx, store, volumeID, epoch)
+	if err != nil {
+		return err
+	}
+	for _, o := range objs {
+		if o.first > upto {
+			break // past what this epoch contributes (sorted by first)
+		}
+		recs, err := wal.Replay(o.body[format.ObjectHeaderSize:])
+		if err != nil {
+			return fmt.Errorf("recovery: replay %s: %w", o.key, err)
+		}
+		for _, rec := range recs {
+			if rec.Sequence > upto {
+				break
+			}
+			if err := ApplyRecord(view, enc, rec); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ApplyRecord folds one replayed record into the read view, decrypting WRITEs when

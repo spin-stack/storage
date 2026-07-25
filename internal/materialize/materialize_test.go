@@ -11,6 +11,7 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/materialize"
+	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/snapshot"
@@ -430,3 +431,45 @@ func (r *fixedReader) Read(p []byte) (int, error) {
 type leaseOK struct{}
 
 func (leaseOK) Valid() bool { return true }
+
+// TestFromEpochChainsAcrossAPromotion: the drain and warm-standby path. A volume
+// that has been promoted keeps its earlier writes in its earlier epoch; fetching only
+// the newest one would hand the destination a volume missing everything written
+// before the move — and report it as a complete rebuild.
+func TestFromEpochChainsAcrossAPromotion(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "before-move")
+	boundary := w.log.Watermarks().Durable
+
+	if err := recovery.WriteRecoveryPoint(ctx, w.store, w.vol, 2, 1, boundary); err != nil {
+		t.Fatal(err)
+	}
+	d := sim.NewDisk()
+	f, err := d.Create("wal/epoch2.wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2 := wal.NewLogAfter(f, w.clk, w.vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l2.EnableRemote(wal.NewBatcher(w.clk, w.vol, 2, 0, wal.DefaultBatchConfig()), wal.NewUploader(w.store, 5), leaseOK{})
+	if _, err := l2.Write(4096, []byte("after-move"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	view, prog, err := materialize.New(w.store, nil, nil).FromEpoch(ctx, w.vol, 2)
+	if err != nil {
+		t.Fatalf("materialize the chain: %v", err)
+	}
+	if got := readAt(view, 0, 11); got != "before-move" {
+		t.Fatalf("the pre-promotion write is missing from the materialized volume: %q", got)
+	}
+	if got := readAt(view, 4096, 10); got != "after-move" {
+		t.Fatalf("the post-promotion write is missing: %q", got)
+	}
+	if prog.UpTo != boundary+1 {
+		t.Fatalf("materialized up to %d, want %d", prog.UpTo, boundary+1)
+	}
+}

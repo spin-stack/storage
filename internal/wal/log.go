@@ -150,11 +150,22 @@ func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
 
 // NewLog creates a log backed by file, timed by clk.
 func NewLog(file disk.File, clk clock.Clock, volumeID [16]byte, epoch uint64, limits Limits) *Log {
+	return NewLogAfter(file, clk, volumeID, epoch, 0, limits)
+}
+
+// NewLogAfter creates a log whose first record continues the volume's sequence space
+// after `boundary` — what a promoted writer does in epoch N+1 (§12.5). Sequences
+// belong to the volume, not to the epoch: a log that restarted at 1 would write
+// records that collide with the previous epoch's, and recovery, which chains the
+// epochs together, would see two different records claiming the same sequence.
+func NewLogAfter(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, boundary uint64, limits Limits) *Log {
 	return &Log{
 		file:     file,
 		clk:      clk,
 		volumeID: volumeID,
 		epoch:    epoch,
+		local:    boundary,
+		durable:  boundary,
 		view:     cow.NewIntervalMap(),
 		limits:   limits,
 	}

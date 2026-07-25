@@ -289,3 +289,48 @@ func TestValidObjectsStillRecover(t *testing.T) {
 }
 
 var _ = wal.Replay // the validator must agree with the replayer
+
+// TestValidationRejectsEveryShapeOfLie exercises the remaining validate() branches
+// directly: each is the difference between "this object is what it claims" and "the
+// durable point is a guess".
+func TestValidationRejectsEveryShapeOfLie(t *testing.T) {
+	ctx := context.Background()
+	vol := vol7()
+
+	tests := []struct {
+		name string
+		mut  func(h *format.ObjectHeader, payload *[]byte)
+	}{
+		{"payload digest does not match", func(h *format.ObjectHeader, _ *[]byte) {
+			h.PayloadSHA256[0] ^= 0xFF
+		}},
+		{"record count is inflated", func(h *format.ObjectHeader, _ *[]byte) {
+			h.RecordCount += 7
+		}},
+		{"the payload is empty but the header claims records", func(h *format.ObjectHeader, p *[]byte) {
+			*p = nil
+			h.PayloadLength = 0
+			h.PayloadSHA256 = sha256.Sum256(nil)
+		}},
+		{"first sequence does not match the records", func(h *format.ObjectHeader, _ *[]byte) {
+			h.FirstSequence += 10
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := sim.NewObjectStore()
+			k1, b1 := craftObject(t, vol, 1, 1, 2, nil)
+			putObject(t, store, k1, b1)
+			k2, b2 := craftObject(t, vol, 1, 3, 4, tc.mut)
+			putObject(t, store, k2, b2)
+
+			durable, err := recovery.DurablePrefix(ctx, store, vol, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if durable != 2 {
+				t.Fatalf("durable = %d, want 2 — the lying object contributed", durable)
+			}
+		})
+	}
+}

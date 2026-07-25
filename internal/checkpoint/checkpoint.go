@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/spin-stack/storage/internal/recovery"
@@ -27,6 +28,11 @@ type Checkpoint struct {
 	RootDigest      string   `json:"root_digest"`
 	Objects         []string `json:"objects"`
 }
+
+// ErrDurablePointMismatch means the object store holds a longer durable prefix than
+// the log that is checkpointing ever ACKed — two writers in one epoch, or the wrong
+// log. Publishing under that condition would put one writer's name on another's data.
+var ErrDurablePointMismatch = errors.New("checkpoint: durable point disagrees with the log")
 
 // Key is the deterministic checkpoint key.
 func Key(volumeID string, epoch, seq uint64) string {
@@ -82,11 +88,28 @@ type Checkpointer struct {
 // NewCheckpointer returns a Checkpointer.
 func NewCheckpointer(store objectstore.Store) *Checkpointer { return &Checkpointer{store: store} }
 
-// Create publishes a checkpoint at the log's current durable sequence (already
-// verified in S3, §14.4) and then advances published_sequence — the strict §21.1
-// order. After this the caller may TruncateLocal up to the published point (INV-13).
+// Create publishes a checkpoint and then advances published_sequence — the strict
+// §21.1 order. After this the caller may TruncateLocal up to the published point,
+// which is what makes the local copy disposable (INV-13).
+//
+// The sequence it publishes is the one S3 can *prove* right now, not the log's own
+// durable watermark. The watermark was set when the Agent's PUTs returned; the prefix
+// can have fallen behind it since (a lost object, a mis-scoped lifecycle rule, a
+// corrupt upload). Publishing the higher number would authorise discarding local WAL
+// whose only remaining copy was local — and the root digest cannot catch it, because
+// it hashes key strings and cannot express a hole.
 func (c *Checkpointer) Create(ctx context.Context, log *wal.Log, volumeID [16]byte, epoch uint64) (Checkpoint, error) {
-	durable := log.Watermarks().Durable
+	claimed := log.Watermarks().Durable
+	durable, err := recovery.DurablePoint(ctx, c.store, volumeID, epoch)
+	if err != nil {
+		return Checkpoint{}, fmt.Errorf("checkpoint: cannot establish the durable point: %w", err)
+	}
+	if durable > claimed {
+		// S3 holds more than this writer ever ACKed: another writer is publishing
+		// into the same epoch, or the log is not the one that wrote these objects.
+		return Checkpoint{}, fmt.Errorf("%w: S3 proves %d but this log ACKed only %d",
+			ErrDurablePointMismatch, durable, claimed)
+	}
 	objects, err := recovery.ObjectKeysUpTo(ctx, c.store, volumeID, epoch, durable)
 	if err != nil {
 		return Checkpoint{}, err
