@@ -316,6 +316,12 @@ func (s SnapshotState) CanTransitionTo(to SnapshotState) bool { return snapshotM
 // Transition returns ErrInvalidTransition unless the move is allowed.
 func (s SnapshotState) Transition(to SnapshotState) error { return snapshotMachine.transition(s, to) }
 
+// Predecessors returns the states that may become s (including s).
+func (s SnapshotState) Predecessors() []SnapshotState { return snapshotMachine.predecessors(s) }
+
+// PredecessorNames is Predecessors as stored strings — the store's SQL guard.
+func (s SnapshotState) PredecessorNames() []string { return names(s.Predecessors()) }
+
 // --- Reconciliation operations (§7, §8) ---
 
 // OperationKind is what a reconciled operation does (§8 `operations.kind`).

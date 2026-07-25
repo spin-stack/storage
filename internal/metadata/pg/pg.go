@@ -31,15 +31,35 @@ var _ metadata.Store = (*Store)(nil)
 
 // --- id / null helpers (string boundary <-> uuid columns, ADR-0007) ---
 
-func nullUUID(s string) pgtype.UUID {
+// requireUUID parses an identifier that must be present. Empty and malformed are
+// both ErrInvalidID: a row keyed on a value the caller did not mean is a row nobody
+// finds again.
+func requireUUID(kind, s string) (uuid.UUID, error) {
 	if s == "" {
-		return pgtype.UUID{}
+		return uuid.UUID{}, fmt.Errorf("%w: empty %s id", metadata.ErrInvalidID, kind)
 	}
 	u, err := uuid.Parse(s)
 	if err != nil {
-		return pgtype.UUID{}
+		return uuid.UUID{}, fmt.Errorf("%w: %s id %q: %v", metadata.ErrInvalidID, kind, s, err)
 	}
-	return pgtype.UUID{Bytes: u, Valid: true}
+	return u, nil
+}
+
+// nullUUID parses an *optional* identifier. Empty means SQL NULL, which is
+// meaningful (no owner, no parent). Malformed is an error and never NULL: coercing
+// a truncated host id to NULL writes a volume with primary_host_id NULL, which
+// ListVolumesByHost never returns — so a drain of that host reports success without
+// evacuating it — and which promotion's resume branch can never match, so every
+// retry burns another epoch.
+func nullUUID(kind, s string) (pgtype.UUID, error) {
+	if s == "" {
+		return pgtype.UUID{}, nil
+	}
+	u, err := uuid.Parse(s)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("%w: %s id %q: %v", metadata.ErrInvalidID, kind, s, err)
+	}
+	return pgtype.UUID{Bytes: u, Valid: true}, nil
 }
 
 func fromNullUUID(u pgtype.UUID) string {
@@ -58,12 +78,51 @@ func fromText(t pgtype.Text) string {
 }
 func fromTS(t pgtype.Timestamptz) time.Time { return t.Time }
 
-// staleIfZero maps "0 rows affected" from a term-guarded write to ErrStaleTerm (§7).
-func staleIfZero(rows int64, err error) error {
+// wrote reports whether a term-guarded write landed, having first answered the only
+// question a 0-row result always has a definite answer to: was the caller still the
+// leader? Every guarded query has more than one way to affect no rows (a stale term,
+// a missing row, a refused transition, a conflict), and the term must win — a zombie
+// CP told "shrink not allowed" concludes it is still the leader.
+//
+// The re-read is on the 0-row path only, and terms are monotonic: a write that
+// affected no rows cannot have had a term that becomes current afterwards.
+func (s *Store) wrote(ctx context.Context, term, rows int64, err error) (bool, error) {
+	if err != nil {
+		return false, err
+	}
+	if rows > 0 {
+		return true, nil
+	}
+	if terr := s.currentTerm(ctx, term); terr != nil {
+		return false, terr
+	}
+	return false, nil // 0 rows for a reason the caller must diagnose
+}
+
+// currentTerm returns ErrStaleTerm unless term is the leader's term. With no leader
+// row at all — before any election — every term is stale, including 0.
+func (s *Store) currentTerm(ctx context.Context, term int64) error {
+	l, err := s.GetLeader(ctx)
+	if errors.Is(err, metadata.ErrNotFound) {
+		return metadata.ErrStaleTerm
+	}
 	if err != nil {
 		return err
 	}
-	if rows == 0 {
+	if l.Term != term {
+		return metadata.ErrStaleTerm
+	}
+	return nil
+}
+
+// staleIfZero is `wrote` for a query whose only way to affect no rows is a stale
+// term (an unconditional INSERT ... SELECT WHERE EXISTS(term match) or an upsert).
+func (s *Store) staleIfZero(ctx context.Context, term, rows int64, err error) error {
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return metadata.ErrStaleTerm
 	}
 	return nil
@@ -89,14 +148,16 @@ func (s *Store) GetLeader(ctx context.Context) (metadata.Leader, error) {
 }
 
 func (s *Store) UpsertHost(ctx context.Context, term int64, h metadata.Host) error {
-	hostID, err := uuid.Parse(h.HostID)
+	hostID, err := requireUUID("host", h.HostID)
 	if err != nil {
 		return err
 	}
 	if !h.State.Valid() {
 		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, h.State)
 	}
-	return staleIfZero(s.q.UpsertHost(ctx, db.UpsertHostParams{
+	// state and nvme_committed_bytes are written only when the row is created; the
+	// conflict path is a heartbeat and does not carry them (see hosts.sql).
+	rows, err := s.q.UpsertHost(ctx, db.UpsertHostParams{
 		HostID:             hostID,
 		State:              h.State.String(),
 		AgentVersion:       h.AgentVersion,
@@ -105,11 +166,12 @@ func (s *Store) UpsertHost(ctx context.Context, term int64, h metadata.Host) err
 		NvmeUsedBytes:      h.NVMeUsedBytes,
 		NvmeCommittedBytes: h.NVMeCommittedBytes,
 		Term:               term,
-	}))
+	})
+	return s.staleIfZero(ctx, term, rows, err)
 }
 
 func (s *Store) GetHost(ctx context.Context, hostID string) (metadata.Host, error) {
-	id, err := uuid.Parse(hostID)
+	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return metadata.Host{}, err
 	}
@@ -153,7 +215,7 @@ func (s *Store) ListHosts(ctx context.Context) ([]metadata.Host, error) {
 }
 
 func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState) error {
-	id, err := uuid.Parse(hostID)
+	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return err
 	}
@@ -164,66 +226,65 @@ func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, sta
 		HostID: id, State: state.String(), Term: term,
 		AllowedStates: state.PredecessorNames(), // the §28.1 transition table, as a predicate
 	})
-	if err != nil {
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
 		return err
 	}
-	if rows == 0 {
-		// 0 rows: missing host, an illegal transition, or a stale term.
-		h, gerr := s.GetHost(ctx, hostID)
-		switch {
-		case errors.Is(gerr, metadata.ErrNotFound):
-			return metadata.ErrNotFound
-		case gerr != nil:
-			return gerr
-		}
-		if terr := h.State.Transition(state); terr != nil {
-			return terr
-		}
-		return metadata.ErrStaleTerm
+	// Still the leader, so 0 rows means a missing host or an illegal transition.
+	h, gerr := s.GetHost(ctx, hostID)
+	if gerr != nil {
+		return gerr
 	}
-	return nil
+	if terr := h.State.Transition(state); terr != nil {
+		return terr
+	}
+	// The row looks legal now: it moved between the write and this read. The write
+	// did not land, and saying so beats reporting success.
+	return fmt.Errorf("%w: host %s changed state concurrently", lifecycle.ErrInvalidTransition, hostID)
 }
 
 func (s *Store) CommitHostCapacity(ctx context.Context, term int64, hostID string, deltaBytes int64) error {
-	id, err := uuid.Parse(hostID)
+	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return err
 	}
 	rows, err := s.q.CommitHostCapacity(ctx, db.CommitHostCapacityParams{
 		HostID: id, NvmeCommittedBytes: deltaBytes, Term: term,
 	})
-	if err != nil {
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
 		return err
 	}
-	if rows == 0 {
-		// 0 rows: missing host, an over-release (the non-negative guard), or a stale
-		// term — disambiguated so the caller gets an actionable error (§28.2).
-		h, gerr := s.GetHost(ctx, hostID)
-		switch {
-		case errors.Is(gerr, metadata.ErrNotFound):
-			return metadata.ErrNotFound
-		case gerr != nil:
-			return gerr
-		case h.NVMeCommittedBytes+deltaBytes < 0:
-			return metadata.ErrCapacityUnderflow
-		}
-		return metadata.ErrStaleTerm
+	// Still the leader, so 0 rows means a missing host or an over-release — the
+	// non-negative guard (§28.2), which is an accounting bug, never a silent clamp.
+	h, gerr := s.GetHost(ctx, hostID)
+	if gerr != nil {
+		return gerr
 	}
-	return nil
+	if h.NVMeCommittedBytes+deltaBytes < 0 {
+		return metadata.ErrCapacityUnderflow
+	}
+	return fmt.Errorf("%w: host %s capacity changed concurrently", metadata.ErrCapacityUnderflow, hostID)
 }
 
 func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {
-	id, err := uuid.Parse(hostID)
+	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return err
 	}
-	return staleIfZero(s.q.RenewHostLease(ctx, db.RenewHostLeaseParams{
+	rows, err := s.q.RenewHostLease(ctx, db.RenewHostLeaseParams{
 		HostID: id, TtlSeconds: int32(ttlSeconds), Term: term,
-	}))
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// Still the leader: the only other predicate is the host-exists one.
+	return metadata.ErrNotFound
 }
 
 func (s *Store) GetHostLease(ctx context.Context, hostID string) (metadata.HostLease, error) {
-	id, err := uuid.Parse(hostID)
+	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return metadata.HostLease{}, err
 	}
@@ -238,7 +299,15 @@ func (s *Store) GetHostLease(ctx context.Context, hostID string) (metadata.HostL
 }
 
 func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume) error {
-	id, err := uuid.Parse(v.VolumeID)
+	id, err := requireUUID("volume", v.VolumeID)
+	if err != nil {
+		return err
+	}
+	primary, err := nullUUID("primary host", v.PrimaryHostID)
+	if err != nil {
+		return err
+	}
+	standby, err := nullUUID("standby host", v.StandbyHostID)
 	if err != nil {
 		return err
 	}
@@ -252,12 +321,15 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume)
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
-	return staleIfZero(s.q.CreateVolume(ctx, db.CreateVolumeParams{
+	rows, err := s.q.CreateVolume(ctx, db.CreateVolumeParams{
 		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability.String(),
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
 		DekWrapped: v.DEKWrapped, KekID: v.KEKID,
-		PrimaryHostID: nullUUID(v.PrimaryHostID), ChainDepth: v.ChainDepth, Term: term,
-	}))
+		PrimaryHostID: primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
+		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
+		PublishedSequence: v.PublishedSequence, Term: term,
+	})
+	return s.staleIfZero(ctx, term, rows, err)
 }
 
 // volumeFromRow converts a generated row to the interface type, parsing its state
@@ -282,7 +354,7 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 }
 
 func (s *Store) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
-	id, err := uuid.Parse(volumeID)
+	id, err := requireUUID("volume", volumeID)
 	if err != nil {
 		return metadata.Volume{}, err
 	}
@@ -294,7 +366,7 @@ func (s *Store) GetVolume(ctx context.Context, volumeID string) (metadata.Volume
 }
 
 func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadata.Volume, error) {
-	id, err := uuid.Parse(hostID)
+	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return nil, err
 	}
@@ -314,77 +386,138 @@ func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadat
 }
 
 func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error) {
-	id, err := uuid.Parse(volumeID)
+	id, err := requireUUID("volume", volumeID)
+	if err != nil {
+		return 0, err
+	}
+	primary, err := nullUUID("primary host", primaryHostID)
 	if err != nil {
 		return 0, err
 	}
 	epoch, err := s.q.BumpVolumeEpoch(ctx, db.BumpVolumeEpochParams{
-		VolumeID: id, PrimaryHostID: nullUUID(primaryHostID), Term: term,
+		VolumeID: id, PrimaryHostID: primary, Term: term,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		// 0 rows: stale term or missing volume (§12.3). Treat as stale term.
-		return 0, metadata.ErrStaleTerm
+		// 0 rows: a stale term or a volume that is gone (§12.3). They are not the
+		// same instruction to the caller — one means step down, the other means stop
+		// reconciling this volume — so they are not reported as the same error.
+		if terr := s.currentTerm(ctx, term); terr != nil {
+			return 0, terr
+		}
+		return 0, metadata.ErrNotFound
 	}
 	return epoch, err
 }
 
 func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error {
-	id, err := uuid.Parse(volumeID)
+	id, err := requireUUID("volume", volumeID)
 	if err != nil {
 		return err
 	}
-	return staleIfZero(s.q.UpdateVolumeWatermarks(ctx, db.UpdateVolumeWatermarksParams{
+	if published > durable || durable > local {
+		return fmt.Errorf("%w: published=%d durable=%d local=%d",
+			metadata.ErrWatermarkOrder, published, durable, local)
+	}
+	// The query itself is monotonic (GREATEST), so a late report is ignored rather
+	// than rejected — see volumes.sql.
+	rows, err := s.q.UpdateVolumeWatermarks(ctx, db.UpdateVolumeWatermarksParams{
 		VolumeID: id, LocalSequence: local, DurableSequence: durable,
 		PublishedSequence: published, Term: term,
-	}))
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	return metadata.ErrNotFound
 }
 
 func (s *Store) ResizeVolume(ctx context.Context, term int64, volumeID string, newSizeBytes int64) error {
-	id, err := uuid.Parse(volumeID)
+	id, err := requireUUID("volume", volumeID)
 	if err != nil {
 		return err
 	}
 	rows, err := s.q.ResizeVolume(ctx, db.ResizeVolumeParams{VolumeID: id, SizeBytes: newSizeBytes, Term: term})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// Still the leader, so 0 rows means a missing volume or a rejected shrink.
+	v, gerr := s.GetVolume(ctx, volumeID)
+	if gerr != nil {
+		return gerr
+	}
+	if newSizeBytes < v.SizeBytes {
+		return metadata.ErrShrinkNotAllowed
+	}
+	return fmt.Errorf("%w: volume %s resized concurrently", metadata.ErrShrinkNotAllowed, volumeID)
+}
+
+// SetVolumeState moves a volume through the §7 ownership machine.
+func (s *Store) SetVolumeState(ctx context.Context, term int64, volumeID string, state lifecycle.VolumeState) error {
+	id, err := requireUUID("volume", volumeID)
 	if err != nil {
 		return err
 	}
-	if rows == 0 {
-		// 0 rows: stale term, missing volume, or a rejected shrink.
-		v, gerr := s.GetVolume(ctx, volumeID)
-		if gerr == nil && newSizeBytes < v.SizeBytes {
-			return metadata.ErrShrinkNotAllowed
-		}
-		return metadata.ErrStaleTerm
+	if !state.Valid() {
+		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, state)
 	}
-	return nil
+	rows, err := s.q.SetVolumeState(ctx, db.SetVolumeStateParams{
+		VolumeID: id, State: state.String(), Term: term,
+		AllowedStates: state.PredecessorNames(), // the §7 transition table, as a predicate
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	v, gerr := s.GetVolume(ctx, volumeID)
+	if gerr != nil {
+		return gerr
+	}
+	if terr := v.State.Transition(state); terr != nil {
+		return terr
+	}
+	return fmt.Errorf("%w: volume %s changed state concurrently", lifecycle.ErrInvalidTransition, volumeID)
 }
 
 func (s *Store) CreateSnapshot(ctx context.Context, term int64, snap metadata.Snapshot) error {
-	sid, err := uuid.Parse(snap.SnapshotID)
+	sid, err := requireUUID("snapshot", snap.SnapshotID)
 	if err != nil {
 		return err
 	}
-	vid, err := uuid.Parse(snap.VolumeID)
+	vid, err := requireUUID("volume", snap.VolumeID)
 	if err != nil {
 		return err
 	}
-	rid, err := uuid.Parse(snap.RequestID)
+	rid, err := requireUUID("request", snap.RequestID)
+	if err != nil {
+		return err
+	}
+	parent, err := nullUUID("parent snapshot", snap.ParentSnapshotID)
+	if err != nil {
+		return err
+	}
+	source, err := nullUUID("source host", snap.SourceHostID)
 	if err != nil {
 		return err
 	}
 	if !snap.State.Valid() {
 		return fmt.Errorf("%w: snapshot state %q", lifecycle.ErrUnknownState, snap.State)
 	}
-	return staleIfZero(s.q.CreateSnapshot(ctx, db.CreateSnapshotParams{
-		SnapshotID: sid, VolumeID: vid, ParentSnapshotID: nullUUID(snap.ParentSnapshotID),
+	rows, err := s.q.CreateSnapshot(ctx, db.CreateSnapshotParams{
+		SnapshotID: sid, VolumeID: vid, ParentSnapshotID: parent,
 		Epoch: snap.Epoch, TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
-		SourceHostID: nullUUID(snap.SourceHostID), State: snap.State.String(),
+		SourceHostID: source, State: snap.State.String(),
 		ManifestKey: text(snap.ManifestKey), RequestID: rid, Term: term,
-	}))
+	})
+	// 0 rows with a current term is the ON CONFLICT DO NOTHING path: the snapshot is
+	// already in the catalog and is immutable (INV-16), so this is a no-op, not an
+	// error. Only a stale term is.
+	_, err = s.wrote(ctx, term, rows, err)
+	return err
 }
 
 func (s *Store) GetSnapshot(ctx context.Context, snapshotID string) (metadata.Snapshot, error) {
-	id, err := uuid.Parse(snapshotID)
+	id, err := requireUUID("snapshot", snapshotID)
 	if err != nil {
 		return metadata.Snapshot{}, err
 	}
@@ -405,8 +538,43 @@ func (s *Store) GetSnapshot(ctx context.Context, snapshotID string) (metadata.Sn
 	}, nil
 }
 
+// SetSnapshotState moves a snapshot through the §19 lifecycle.
+func (s *Store) SetSnapshotState(ctx context.Context, term int64, snapshotID string, state lifecycle.SnapshotState) error {
+	id, err := requireUUID("snapshot", snapshotID)
+	if err != nil {
+		return err
+	}
+	if !state.Valid() {
+		return fmt.Errorf("%w: snapshot state %q", lifecycle.ErrUnknownState, state)
+	}
+	rows, err := s.q.SetSnapshotState(ctx, db.SetSnapshotStateParams{
+		SnapshotID: id, State: state.String(), Term: term,
+		AllowedStates: state.PredecessorNames(), // the §19 lifecycle, as a predicate
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	snap, gerr := s.GetSnapshot(ctx, snapshotID)
+	if gerr != nil {
+		return gerr
+	}
+	if terr := snap.State.Transition(state); terr != nil {
+		return terr
+	}
+	return fmt.Errorf("%w: snapshot %s changed state concurrently", lifecycle.ErrInvalidTransition, snapshotID)
+}
+
 func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Operation) (bool, error) {
-	id, err := uuid.Parse(op.OperationID)
+	id, err := requireUUID("operation", op.OperationID)
+	if err != nil {
+		return false, err
+	}
+	volID, err := nullUUID("volume", op.VolumeID)
+	if err != nil {
+		return false, err
+	}
+	hostID, err := nullUUID("host", op.HostID)
 	if err != nil {
 		return false, err
 	}
@@ -417,18 +585,19 @@ func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Ope
 		return false, fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
 	}
 	rows, err := s.q.RecordOperation(ctx, db.RecordOperationParams{
-		OperationID: id, Kind: op.Kind.String(), VolumeID: nullUUID(op.VolumeID), HostID: nullUUID(op.HostID),
+		OperationID: id, Kind: op.Kind.String(), VolumeID: volID, HostID: hostID,
 		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase.String(),
 		Term: term,
 	})
-	if err != nil {
-		return false, err
-	}
-	return rows == 1, nil
+	// This query affects 0 rows for two very different reasons: the request is a
+	// duplicate (§18 idempotency — recorded=false, no error) or the caller is not
+	// the leader (§7 — ErrStaleTerm). Reporting the second as the first is what lets
+	// a zombie CP's Cancel return success while the real drain keeps promoting.
+	return s.wrote(ctx, term, rows, err)
 }
 
 func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Operation) error {
-	id, err := uuid.Parse(op.OperationID)
+	id, err := requireUUID("operation", op.OperationID)
 	if err != nil {
 		return err
 	}
@@ -440,26 +609,24 @@ func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Ope
 		AllowedPhases: op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
 		Term:          term,                        // and the §7 term guard
 	})
-	if err != nil {
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
 		return err
 	}
-	if rows == 0 {
-		// 0 rows: the operation does not exist, the phase move is illegal, or the
-		// term is stale.
-		cur, gerr := s.GetOperation(ctx, op.OperationID)
-		if gerr != nil {
-			return gerr
-		}
-		if terr := cur.Phase.Transition(op.Phase); terr != nil {
-			return terr
-		}
-		return metadata.ErrStaleTerm
+	// Still the leader, so 0 rows means the operation is missing or the phase move
+	// is illegal — a terminal operation is never resurrected.
+	cur, gerr := s.GetOperation(ctx, op.OperationID)
+	if gerr != nil {
+		return gerr
 	}
-	return nil
+	if terr := cur.Phase.Transition(op.Phase); terr != nil {
+		return terr
+	}
+	return fmt.Errorf("%w: operation %s changed phase concurrently", lifecycle.ErrInvalidTransition, op.OperationID)
 }
 
 func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.Operation, error) {
-	id, err := uuid.Parse(operationID)
+	id, err := requireUUID("operation", operationID)
 	if err != nil {
 		return metadata.Operation{}, err
 	}

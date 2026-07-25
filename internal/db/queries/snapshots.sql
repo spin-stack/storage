@@ -8,7 +8,24 @@ INSERT INTO snapshots (
     root_digest, source_host_id, state, manifest_key, request_id
 )
 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-WHERE EXISTS (SELECT 1 FROM valid);
+WHERE EXISTS (SELECT 1 FROM valid)
+-- INV-16: a snapshot is immutable once it is in the catalog, so a duplicate record
+-- — a retried request, or two operators rebuilding at once — is a no-op rather than
+-- an overwrite or a 23505 that aborts the rebuild half-way. Untargeted, so the
+-- request_id uniqueness (§18 idempotency) is covered too. 0 rows is ambiguous
+-- between "already there" and "stale term"; the adapter disambiguates.
+ON CONFLICT DO NOTHING;
 
 -- name: GetSnapshot :one
 SELECT * FROM snapshots WHERE snapshot_id = $1;
+
+-- name: SetSnapshotState :execrows
+-- The §19 lifecycle (CREATING → PUBLISHED | FAILED → DELETING), term-guarded and
+-- transition-guarded in the predicate: $3 is the set of states that may legally
+-- become $2. Without this a snapshot whose publication crashed stays CREATING
+-- forever and the catalog side of GC never sees it.
+UPDATE snapshots
+   SET state = $2
+ WHERE snapshot_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
+   AND state = ANY(sqlc.arg(allowed_states)::text[]);
