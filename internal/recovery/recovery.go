@@ -64,6 +64,38 @@ type walObject struct {
 	body        []byte
 }
 
+// ObjectSpan is the sequence range a validated WAL object actually carries — the
+// records', not the header's claim.
+type ObjectSpan struct {
+	First, Last uint64
+}
+
+// VerifyObject is the single definition of "this stored object is what it claims"
+// (DEV-0003). It decodes the header, checks the object belongs to volumeID/epoch,
+// and validates the payload against that header; the returned span is the one the
+// records really cover.
+//
+// It exists as an exported function because the durable point is not the only place
+// that reads a WAL object out of S3: cross-host materialization replays the very same
+// objects, and a manifest or checkpoint cannot stand in for this check — the root
+// digest hashes key *strings*, so an object rewritten, torn, or restored to a wrong
+// version after publication leaves the digest matching.
+func VerifyObject(volumeID string, epoch uint64, key string, body []byte) (ObjectSpan, error) {
+	if len(body) < format.ObjectHeaderSize {
+		return ObjectSpan{}, fmt.Errorf("%w: %s is %d bytes, too short to hold a header",
+			ErrObjectIntegrity, key, len(body))
+	}
+	h, err := format.UnmarshalObjectHeader(body[:format.ObjectHeaderSize])
+	if err != nil {
+		// A torn header is exactly as untrustworthy as a torn payload.
+		return ObjectSpan{}, fmt.Errorf("%w: %s header: %v", ErrObjectIntegrity, key, err)
+	}
+	if err := validate(volumeID, epoch, key, h, body[format.ObjectHeaderSize:]); err != nil {
+		return ObjectSpan{}, err
+	}
+	return ObjectSpan{First: h.FirstSequence, Last: h.LastSequence}, nil
+}
+
 // validate checks a stored object against its own header before it is allowed to
 // contribute anything to the durable point. The header is self-describing but not
 // self-proving: it is CRC-protected, so a *torn* header is caught by the decoder,
@@ -78,9 +110,9 @@ type walObject struct {
 //  3. the payload digest matches (any corruption, including a rewritten tail);
 //  4. the records replay, and their count and their first/last sequences are exactly
 //     what the header claims (a header cannot claim sequences it does not carry).
-func validate(volumeID [16]byte, epoch uint64, key string, h format.ObjectHeader, payload []byte) error {
-	if h.VolumeID != volumeID {
-		return fmt.Errorf("%w: %s belongs to volume %s", ErrObjectIntegrity, key, format.UUIDString(h.VolumeID))
+func validate(volumeID string, epoch uint64, key string, h format.ObjectHeader, payload []byte) error {
+	if got := format.UUIDString(h.VolumeID); got != volumeID {
+		return fmt.Errorf("%w: %s belongs to volume %s, not %s", ErrObjectIntegrity, key, got, volumeID)
 	}
 	if h.Epoch != epoch {
 		return fmt.Errorf("%w: %s belongs to epoch %d, not %d", ErrObjectIntegrity, key, h.Epoch, epoch)
@@ -127,6 +159,7 @@ func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte
 	if err != nil {
 		return nil, err
 	}
+	want := format.UUIDString(volumeID)
 	var objs []walObject
 	for _, info := range infos {
 		if !strings.HasSuffix(info.Key, ".wal") {
@@ -136,23 +169,16 @@ func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte
 		if err != nil {
 			return nil, err
 		}
-		if len(body) < format.ObjectHeaderSize {
-			// Too short to even hold a header: exactly as untrustworthy as a corrupt
-			// one, so it is skipped like the rest. Failing here would make a single
-			// piece of garbage under the prefix render the volume unrecoverable —
-			// and would hand anything that can write to the bucket a denial of
-			// service over recovery.
-			continue
-		}
-		h, err := format.UnmarshalObjectHeader(body[:format.ObjectHeaderSize])
+		span, err := VerifyObject(want, epoch, info.Key, body)
 		if err != nil {
-			// A torn header is exactly as untrustworthy as a torn payload.
+			// Skipped, not fatal: an object that is not what it claims simply cannot
+			// be part of the durable prefix, and the contiguity walk stops where it is
+			// missing. Failing here would make a single piece of garbage under the
+			// prefix render the volume unrecoverable — and would hand anything that can
+			// write to the bucket a denial of service over recovery.
 			continue
 		}
-		if err := validate(volumeID, epoch, info.Key, h, body[format.ObjectHeaderSize:]); err != nil {
-			continue
-		}
-		objs = append(objs, walObject{key: info.Key, first: h.FirstSequence, last: h.LastSequence, body: body})
+		objs = append(objs, walObject{key: info.Key, first: span.First, last: span.Last, body: body})
 	}
 	sort.Slice(objs, func(i, j int) bool { return objs[i].first < objs[j].first })
 	return objs, nil
@@ -177,14 +203,30 @@ func contiguousLast(objs []walObject, floor uint64) uint64 {
 	return last
 }
 
-// prefixFloor is the first sequence this epoch's WAL must start at: 1 for a volume's
+// PrefixFloor is the first sequence this epoch's WAL must start at: 1 for a volume's
 // first epoch, or one past what the previous epoch was recovered up to, which the
-// epoch boundary records (§12.5).
-func prefixFloor(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) uint64 {
-	if rp, err := ReadRecoveryPoint(ctx, store, volumeID, epoch); err == nil {
-		return rp.RecoveredUpTo + 1
+// epoch boundary records (§12.5). volumeID is the canonical uuid string, because the
+// callers that need a floor for a manifest or a checkpoint hold it in that form.
+//
+// Only a genuinely absent boundary means floor 1. A boundary that could not be read —
+// a throttled GET (§24), a damaged object — is an error, and the distinction is the
+// whole point: the epoch's objects legitimately start above 1, so a floor of 1 makes
+// the contiguous run reach nothing and DurablePrefix answer 0 with no error. That 0
+// is a number a drain writes into the next epoch's create-only recovery point, which
+// buries every ACKed write below it permanently.
+func PrefixFloor(ctx context.Context, store objectstore.Store, volumeID string, epoch uint64) (uint64, error) {
+	body, err := store.Get(ctx, recoveryPointKeyFor(volumeID, epoch))
+	switch {
+	case errors.Is(err, objectstore.ErrNotFound):
+		return 1, nil
+	case err != nil:
+		return 0, fmt.Errorf("recovery: cannot read the epoch %d boundary of %s: %w", epoch, volumeID, err)
 	}
-	return 1
+	var rp RecoveryPoint
+	if err := json.Unmarshal(body, &rp); err != nil {
+		return 0, fmt.Errorf("recovery: the epoch %d boundary of %s is damaged: %w", epoch, volumeID, err)
+	}
+	return rp.RecoveredUpTo + 1, nil
 }
 
 // ErrBrokenEpochChain means an epoch's predecessor holds data that cannot be chained
@@ -221,7 +263,17 @@ func EpochChain(ctx context.Context, store objectstore.Store, volumeID [16]byte,
 			if rp.PrevEpoch == 0 || rp.PrevEpoch >= e {
 				return nil, fmt.Errorf("%w: epoch %d records predecessor %d", ErrBrokenEpochChain, e, rp.PrevEpoch)
 			}
-			links = append(links, link{epoch: e, from: rp.RecoveredUpTo + 1})
+			from := rp.RecoveredUpTo + 1
+			// Walking back, each older epoch must start no later than the one after
+			// it. A boundary that is higher than its successor's means the successor
+			// was recorded below a point that was already immutable: the spans would
+			// run backwards, and everything between them is under a floor nobody can
+			// raise again (§12.5).
+			if n := len(links); n > 0 && from > links[n-1].from {
+				return nil, fmt.Errorf("%w: epoch %d starts at %d, above epoch %d's start %d — the boundaries run backwards",
+					ErrBrokenEpochChain, e, from, links[n-1].epoch, links[n-1].from)
+			}
+			links = append(links, link{epoch: e, from: from})
 			e = rp.PrevEpoch
 		case errors.Is(err, objectstore.ErrNotFound):
 			// No boundary, so this must be the volume's first epoch. If an earlier
@@ -279,23 +331,62 @@ func DurablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]by
 	if err != nil {
 		return 0, err
 	}
-	return contiguousLast(objs, prefixFloor(ctx, store, volumeID, epoch)), nil
+	floor, err := PrefixFloor(ctx, store, format.UUIDString(volumeID), epoch)
+	if err != nil {
+		return 0, err
+	}
+	return contiguousLast(objs, floor), nil
+}
+
+// readSummary loads the epoch's summary for the cross-check below. It separates the
+// three cases the old code collapsed into "err == nil or nothing":
+//
+//   - the object is not there — nothing to cross-check against;
+//   - the backend could not be read — unknown, and the caller must retry rather than
+//     act on a number nobody verified;
+//   - the object is there but is not this volume/epoch's summary, or is not a summary
+//     at all — it makes no claim about us, so it is ignored. The key is overwritable,
+//     so without this one stray or mis-keyed object could veto a volume's recovery
+//     for ever.
+func readSummary(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (wal.Summary, bool, error) {
+	var s wal.Summary
+	body, err := store.Get(ctx, wal.SummaryKey(volumeID, epoch))
+	switch {
+	case errors.Is(err, objectstore.ErrNotFound):
+		return s, false, nil
+	case err != nil:
+		return s, false, fmt.Errorf("recovery: cannot read the epoch %d summary: %w", epoch, err)
+	}
+	if err := json.Unmarshal(body, &s); err != nil {
+		return s, false, nil
+	}
+	if s.VolumeID != format.UUIDString(volumeID) || s.Epoch != epoch {
+		return s, false, nil
+	}
+	return s, true, nil
 }
 
 // DurablePoint is DurablePrefix with a summary cross-check (§22.1): the summary
 // object must never claim a durable sequence beyond what the contiguous prefix
 // actually provides. In production the summary lets recovery start its LIST near the
 // end instead of scanning everything; here it is a correctness guard.
+//
+// An over-claim is real — an object that was uploaded is gone — so it is reported,
+// not smoothed over. It is reported as *SummaryOverclaim, carrying the prefix S3 can
+// still prove, so a caller can act on the discrepancy (escalate, recover the shorter
+// prefix) instead of retrying an opaque error against an epoch that will never
+// answer differently.
 func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
 	contiguous, err := DurablePrefix(ctx, store, volumeID, epoch)
 	if err != nil {
 		return 0, err
 	}
-	if sum, serr := wal.ReadSummary(ctx, store, volumeID, epoch); serr == nil {
-		if sum.DurableSequence > contiguous {
-			return 0, fmt.Errorf("recovery: summary claims durable=%d but contiguous prefix reaches only %d",
-				sum.DurableSequence, contiguous)
-		}
+	sum, ok, err := readSummary(ctx, store, volumeID, epoch)
+	if err != nil {
+		return 0, err
+	}
+	if ok && sum.DurableSequence > contiguous {
+		return 0, &SummaryOverclaim{Claimed: sum.DurableSequence, Contiguous: contiguous}
 	}
 	return contiguous, nil
 }
@@ -385,18 +476,66 @@ type RecoveryPoint struct {
 	RecoveredUpTo uint64 `json:"recovered_up_to"`
 }
 
+func recoveryPointKeyFor(volumeID string, newEpoch uint64) string {
+	return fmt.Sprintf("wal/%s/%d/recovery-point.json", volumeID, newEpoch)
+}
+
 func recoveryPointKey(volumeID [16]byte, newEpoch uint64) string {
-	return fmt.Sprintf("wal/%s/%d/recovery-point.json", format.UUIDString(volumeID), newEpoch)
+	return recoveryPointKeyFor(format.UUIDString(volumeID), newEpoch)
+}
+
+// boundaryFloor is the lowest sequence a new boundary over prevEpoch may record: the
+// highest point anything already established for that epoch. Two sources, both read
+// with strongly consistent GETs rather than a LIST:
+//
+//   - prevEpoch's own boundary, which is immutable — a new one below it would put
+//     sequences under a floor that can never be raised again;
+//   - prevEpoch's summary, which is what its writer ACKed. A LIST that has not caught
+//     up reports a shorter prefix with no error, and writing *that* number down is how
+//     a stale listing loses an ACKed FLUSH for good.
+func boundaryFloor(ctx context.Context, store objectstore.Store, volumeID [16]byte, prevEpoch uint64) (uint64, error) {
+	var floor uint64
+	switch rp, err := ReadRecoveryPoint(ctx, store, volumeID, prevEpoch); {
+	case err == nil:
+		floor = rp.RecoveredUpTo
+	case errors.Is(err, objectstore.ErrNotFound):
+		// prevEpoch is the volume's first epoch: no earlier boundary to respect.
+	default:
+		return 0, fmt.Errorf("recovery: cannot read the epoch %d boundary: %w", prevEpoch, err)
+	}
+	sum, ok, err := readSummary(ctx, store, volumeID, prevEpoch)
+	if err != nil {
+		return 0, err
+	}
+	if ok && sum.DurableSequence > floor {
+		floor = sum.DurableSequence
+	}
+	return floor, nil
 }
 
 // WriteRecoveryPoint records the epoch boundary at the start of newEpoch (§12.5):
 // which prior epoch was recovered and up to which sequence. Create-only.
+//
+// The boundary is the one number in the system nothing can walk back: the next epoch
+// will never look below it, and the object cannot be rewritten. So it is refused
+// outright if it would move backwards — below the previous epoch's own boundary, or
+// below what that epoch's writer already ACKed. Every way of computing a
+// too-low value (a stale LIST, an unreadable floor, a GC-shortened prefix) is caught
+// here, at the write, instead of being discovered as missing data long afterwards.
 func WriteRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, newEpoch, prevEpoch, recoveredUpTo uint64) error {
+	floor, err := boundaryFloor(ctx, store, volumeID, prevEpoch)
+	if err != nil {
+		return err
+	}
+	if recoveredUpTo < floor {
+		return fmt.Errorf("%w: epoch %d would record %d, below the %d already established for epoch %d",
+			ErrBoundaryRegression, newEpoch, recoveredUpTo, floor, prevEpoch)
+	}
 	body, err := json.Marshal(RecoveryPoint{PrevEpoch: prevEpoch, RecoveredUpTo: recoveredUpTo})
 	if err != nil {
 		return err
 	}
-	_, err = store.Put(ctx, recoveryPointKey(volumeID, newEpoch), body, objectstore.PutOptions{IfNoneMatch: true})
+	_, err = store.Put(ctx, recoveryPointKeyFor(format.UUIDString(volumeID), newEpoch), body, objectstore.PutOptions{IfNoneMatch: true})
 	return err
 }
 

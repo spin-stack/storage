@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
@@ -127,6 +128,38 @@ func TestEpochChainRefusesANonMonotonicChain(t *testing.T) {
 	}
 	if !errors.Is(err, recovery.ErrBrokenEpochChain) {
 		t.Fatalf("want ErrBrokenEpochChain, got %v", err)
+	}
+}
+
+// TestBoundaryWriteRefusesWhatItCannotCheck: the guard is only worth having if it
+// fails closed. A backend that cannot answer for the previous epoch leaves the floor
+// unknown, and an unknown floor may not be written over.
+func TestBoundaryWriteRefusesWhatItCannotCheck(t *testing.T) {
+	ctx := context.Background()
+	vol := vol7()
+
+	tests := []struct {
+		name  string
+		store func(*sim.ObjectStore) objectstore.Store
+	}{
+		{"the previous boundary cannot be read", func(s *sim.ObjectStore) objectstore.Store {
+			return rpFaultStore{Store: s, err: sim.ErrThrottled}
+		}},
+		{"the previous epoch's summary cannot be read", func(s *sim.ObjectStore) objectstore.Store {
+			return summaryFaultStore{Store: s}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			base := sim.NewObjectStore()
+			// prevEpoch is 1, which is the epoch both fault stores answer for.
+			if err := recovery.WriteRecoveryPoint(ctx, tc.store(base), vol, 2, 1, 5); err == nil {
+				t.Fatal("a boundary was recorded while the state it must not go below was unreadable")
+			}
+			if _, err := recovery.ReadRecoveryPoint(ctx, base, vol, 2); err == nil {
+				t.Fatal("the boundary object was written anyway")
+			}
+		})
 	}
 }
 

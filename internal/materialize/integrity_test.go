@@ -2,7 +2,9 @@ package materialize_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/checkpoint"
@@ -340,6 +342,92 @@ func TestFloorFollowsTheEpochBoundary(t *testing.T) {
 	}
 	if prog.UpTo != m.TargetSequence {
 		t.Fatalf("covered up to %d, want %d", prog.UpTo, m.TargetSequence)
+	}
+}
+
+// boundaryFaultStore cannot serve the epoch-boundary object, so the floor a
+// materialization must check against is unknown.
+type boundaryFaultStore struct {
+	objectstore.Store
+}
+
+func (s boundaryFaultStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if strings.HasSuffix(key, "recovery-point.json") {
+		return nil, sim.ErrThrottled
+	}
+	return s.Store.Get(ctx, key)
+}
+
+// TestUnknownFloorStopsTheMaterialization: with the boundary unreadable there is no
+// way to tell a complete run from one missing its head, so the destination must not
+// boot on a guess.
+func TestUnknownFloorStopsTheMaterialization(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+	m := w.snapshot(t, "snap-1")
+	cp, err := checkpoint.NewCheckpointer(w.store).Create(ctx, w.log, w.vol, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mat := materialize.New(boundaryFaultStore{Store: w.store}, nil, nil)
+	if view, _, err := mat.FromSnapshot(ctx, m.VolumeID, m.SnapshotID); err == nil || view != nil {
+		t.Fatalf("FromSnapshot proceeded with an unknown floor: view=%v err=%v", view != nil, err)
+	}
+	if view, _, err := mat.FromCheckpoint(ctx, cp.VolumeID, cp.Epoch, cp.DurableSequence); err == nil || view != nil {
+		t.Fatalf("FromCheckpoint proceeded with an unknown floor: view=%v err=%v", view != nil, err)
+	}
+}
+
+// TestSourceDescribingAnotherVolumeIsRefused: the document sitting at our key is not
+// automatically ours. A manifest or checkpoint naming a different volume is a
+// mis-keyed or restored object, and replaying what it points at would fold another
+// volume's history into this one.
+func TestSourceDescribingAnotherVolumeIsRefused(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+	full := w.snapshot(t, "snap-1")
+	ours := format.UUIDString(w.vol)
+	theirs := format.UUIDString(v7Other())
+
+	foreignManifest := snapshot.Manifest{
+		SnapshotID: "snap-foreign", VolumeID: theirs, Epoch: 1,
+		TargetSequence: full.TargetSequence, Objects: full.Objects,
+	}
+	foreignManifest.RootDigest = snapshot.Digest(foreignManifest.TargetSequence, foreignManifest.Objects)
+	putJSON(t, w.store, snapshot.ManifestKey(ours, "snap-foreign"), foreignManifest)
+
+	if _, _, err := materialize.New(w.store, nil, nil).FromSnapshot(ctx, ours, "snap-foreign"); !errors.Is(err, recovery.ErrObjectIntegrity) {
+		t.Fatalf("want ErrObjectIntegrity, got %v", err)
+	}
+
+	foreignCP := checkpoint.Checkpoint{
+		VolumeID: theirs, Epoch: 1, DurableSequence: 1, Objects: full.Objects,
+	}
+	foreignCP.RootDigest = checkpoint.Digest(foreignCP.DurableSequence, foreignCP.Objects)
+	putJSON(t, w.store, checkpoint.Key(ours, 1, 1), foreignCP)
+
+	if _, _, err := materialize.New(w.store, nil, nil).FromCheckpoint(ctx, ours, 1, 1); !errors.Is(err, recovery.ErrObjectIntegrity) {
+		t.Fatalf("want ErrObjectIntegrity, got %v", err)
+	}
+}
+
+func v7Other() [16]byte {
+	v := v7Vol()
+	v[15] = 0xEE
+	return v
+}
+
+func putJSON(t *testing.T, store *sim.ObjectStore, key string, v any) {
+	t.Helper()
+	body, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(context.Background(), key, body, objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
 	}
 }
 

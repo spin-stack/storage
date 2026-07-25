@@ -3,10 +3,13 @@ package checkpoint_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/checkpoint"
 	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
@@ -103,6 +106,46 @@ func TestCreateAdoptsAnIdenticalCheckpoint(t *testing.T) {
 	}
 	if got := w.log.Watermarks().Published; got != 2 {
 		t.Fatalf("published = %d, want 2", got)
+	}
+}
+
+// cpUnreadableStore lets the create-only PUT report "already there" while the object
+// itself cannot be read back — a throttled GET right after the precondition failure.
+type cpUnreadableStore struct {
+	objectstore.Store
+}
+
+func (s cpUnreadableStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if strings.HasPrefix(key, "checkpoints/") {
+		return nil, sim.ErrThrottled
+	}
+	return s.Store.Get(ctx, key)
+}
+
+// TestCreateDoesNotAdoptWhatItCannotRead: "something is already at this key" is not
+// enough to advance published. Adopting an unread object would unlock truncation
+// against a checkpoint nobody verified.
+func TestCreateDoesNotAdoptWhatItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	flushN(t, w, 2)
+
+	objects, err := recovery.ObjectKeysUpTo(ctx, w.store, w.vol, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoint.Publish(ctx, w.store, checkpoint.Checkpoint{
+		VolumeID: format.UUIDString(w.vol), Epoch: 1, DurableSequence: 2,
+		Objects: objects, RootDigest: checkpoint.Digest(2, objects),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := checkpoint.NewCheckpointer(cpUnreadableStore{Store: w.store}).Create(ctx, w.log, w.vol, 1); err == nil {
+		t.Fatal("Create adopted a checkpoint it could not read")
+	}
+	if got := w.log.Watermarks().Published; got != 0 {
+		t.Fatalf("published advanced to %d against an unread checkpoint", got)
 	}
 }
 
