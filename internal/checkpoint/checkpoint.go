@@ -33,7 +33,10 @@ func Key(volumeID string, epoch, seq uint64) string {
 	return fmt.Sprintf("checkpoints/%s/%d/%d.json", volumeID, epoch, seq)
 }
 
-func digest(seq uint64, objects []string) string {
+// Digest is the content digest over the covered state (sequence + object keys). A
+// consumer that rebuilds a volume from a checkpoint recomputes it to check the
+// checkpoint is self-consistent before fetching a byte (§20, §22.3).
+func Digest(seq uint64, objects []string) string {
 	buf := fmt.Appendf(nil, "seq=%d\n", seq)
 	for _, k := range objects {
 		buf = append(buf, k...)
@@ -41,6 +44,11 @@ func digest(seq uint64, objects []string) string {
 	}
 	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])
+}
+
+// DigestMatches reports whether the checkpoint's RootDigest matches its contents.
+func (c Checkpoint) DigestMatches() bool {
+	return c.RootDigest == Digest(c.DurableSequence, c.Objects)
 }
 
 // Publish writes a checkpoint create-only (a checkpoint at a sequence is immutable).
@@ -88,7 +96,7 @@ func (c *Checkpointer) Create(ctx context.Context, log *wal.Log, volumeID [16]by
 		Epoch:           epoch,
 		DurableSequence: durable,
 		Objects:         objects,
-		RootDigest:      digest(durable, objects),
+		RootDigest:      Digest(durable, objects),
 	}
 	// Publish (verified: create-only) BEFORE advancing published (§21.1).
 	if err := Publish(ctx, c.store, cp); err != nil {

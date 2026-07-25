@@ -147,7 +147,7 @@ func Recover(ctx context.Context, store objectstore.Store, enc *wal.Encryption, 
 			if rec.Sequence > durable {
 				break
 			}
-			if err := applyRecord(view, enc, rec); err != nil {
+			if err := ApplyRecord(view, enc, rec); err != nil {
 				return nil, 0, err
 			}
 		}
@@ -155,7 +155,11 @@ func Recover(ctx context.Context, store objectstore.Store, enc *wal.Encryption, 
 	return view, durable, nil
 }
 
-func applyRecord(view *cow.IntervalMap, enc *wal.Encryption, rec wal.Record) error {
+// ApplyRecord folds one replayed record into the read view, decrypting WRITEs when
+// the volume is encrypted (enc nil ⇒ plaintext). It is the single definition of
+// "replaying a WAL record onto a view", shared by recovery and by cross-host
+// materialization (§20, §22).
+func ApplyRecord(view *cow.IntervalMap, enc *wal.Encryption, rec wal.Record) error {
 	switch rec.Type {
 	case format.RecordWrite:
 		payload := rec.Payload

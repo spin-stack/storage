@@ -39,8 +39,10 @@ func ManifestKey(volumeID, snapshotID string) string {
 	return fmt.Sprintf("snapshots/%s/%s/manifest.json", volumeID, snapshotID)
 }
 
-// rootDigest is a content digest over the referenced state (target + object keys).
-func rootDigest(targetSequence uint64, objects []string) string {
+// Digest is the content digest over the referenced state (target + object keys).
+// A consumer that materializes a snapshot elsewhere recomputes it to check the
+// manifest is self-consistent before fetching a byte (§20, INV-16).
+func Digest(targetSequence uint64, objects []string) string {
 	buf := fmt.Appendf(nil, "seq=%d\n", targetSequence)
 	for _, k := range objects {
 		buf = append(buf, k...)
@@ -48,6 +50,11 @@ func rootDigest(targetSequence uint64, objects []string) string {
 	}
 	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])
+}
+
+// DigestMatches reports whether the manifest's RootDigest matches its own contents.
+func (m Manifest) DigestMatches() bool {
+	return m.RootDigest == Digest(m.TargetSequence, m.Objects)
 }
 
 // Publish writes the manifest create-only, so a published snapshot is immutable
@@ -110,7 +117,7 @@ func (s *Snapshotter) Create(ctx context.Context, log *wal.Log, volumeID [16]byt
 		TargetSequence:   target,
 		ParentSnapshotID: parentID,
 		Objects:          objects,
-		RootDigest:       rootDigest(target, objects),
+		RootDigest:       Digest(target, objects),
 	}
 	if err := Publish(ctx, s.store, m); err != nil {
 		return Manifest{}, pause, err

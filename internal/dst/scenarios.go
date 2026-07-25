@@ -15,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/gc"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/recovery"
@@ -67,7 +68,97 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "checkpoint-then-truncate", Run: scenarioCheckpointThenTruncate},
 		{Name: "gc-marks-orphans-not-live", Run: scenarioGCMarksOrphansNotLive},
 		{Name: "background-yields-to-foreground", Run: scenarioBackgroundYields},
+		{Name: "cross-host-materialization", Run: scenarioCrossHostMaterialization},
 	}
+}
+
+// scenarioCrossHostMaterialization is §20 / §22.3 cold: a destination host that
+// never had the volume rebuilds it from the object store alone. The source host is
+// partitioned away for the whole materialization — there is no host-to-host path to
+// fall back on (INV-08, §5.4) — the rebuilt state is byte-identical to the source's,
+// and the work yields to foreground I/O (INV-17). A missing referenced object is a
+// hard failure, never a half-materialized volume.
+func scenarioCrossHostMaterialization(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+	vol[15] = 0xc1
+	vols := format.UUIDString(vol)
+	const snapID = "00000000-0000-7000-8000-0000000000c2"
+
+	// Source host writes and publishes a snapshot.
+	f, err := s.Disk.Create("wal/source.wal")
+	if err != nil {
+		return err
+	}
+	src := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	src.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	if _, err := src.Write(0, []byte("cross-host"), 0); err != nil {
+		return err
+	}
+	if _, err := src.Write(4096, []byte("payload"), 0); err != nil {
+		return err
+	}
+	m, _, err := snapshot.NewSnapshotter(s.Store, s.Clock).Create(ctx, src, vol, 1, snapID, "")
+	if err != nil {
+		return err
+	}
+	acked := src.Watermarks().Durable
+	s.Emit(Event{Kind: EventWatermark, Local: src.Watermarks().Local, Durable: acked, Published: src.Watermarks().Published})
+
+	// The source host is gone for the rest of the scenario.
+	s.Net.Partition("host-source")
+	s.Notef("source host partitioned; destination materializes from S3 alone")
+
+	sched := ioclass.NewScheduler(64)
+	mat := materialize.New(s.Store, sched, nil)
+
+	// Under data-path contention the materialization yields (INV-17).
+	sched.Begin(ioclass.Foreground)
+	_, _, err = mat.FromSnapshot(ctx, vols, snapID)
+	s.Emit(Event{Kind: EventIOClass, BgGranted: err == nil, HighInFlight: sched.HighActive() > 0})
+	if !errors.Is(err, materialize.ErrThrottled) {
+		return fmt.Errorf("materialization must yield to foreground, got %v", err)
+	}
+	sched.End(ioclass.Foreground)
+
+	// Idle: it proceeds and rebuilds exactly the source's state.
+	view, prog, err := mat.FromSnapshot(ctx, vols, snapID)
+	s.Emit(Event{Kind: EventIOClass, BgGranted: err == nil, HighInFlight: sched.HighActive() > 0})
+	if err != nil {
+		return fmt.Errorf("materialize: %w", err)
+	}
+	want, _, err := recovery.Recover(ctx, s.Store, nil, vol, 1)
+	if err != nil {
+		return err
+	}
+	for _, off := range []uint64{0, 4096} {
+		got, expect := make([]byte, 16), make([]byte, 16)
+		view.Read(off, got)
+		want.Read(off, expect)
+		if !bytes.Equal(got, expect) {
+			return fmt.Errorf("materialized state differs at offset %d: %q vs %q", off, got, expect)
+		}
+	}
+	if prog.UpTo < acked {
+		return fmt.Errorf("materialized up to %d, below the ACKed-durable %d", prog.UpTo, acked)
+	}
+	s.Emit(Event{Kind: EventFailover, AckedDurable: acked, Recovered: prog.UpTo})
+
+	// A referenced object that is missing must fail hard, with no partial view.
+	if err := s.Store.Delete(ctx, m.Objects[0]); err != nil {
+		return err
+	}
+	s.Emit(Event{Kind: EventDelete, Key: m.Objects[0], Permanent: false})
+	partial, _, err := mat.FromSnapshot(ctx, vols, snapID)
+	if !errors.Is(err, materialize.ErrMissingObject) {
+		return fmt.Errorf("missing object must fail materialization, got %v", err)
+	}
+	if partial != nil {
+		return errors.New("a failed materialization returned a partial view")
+	}
+	s.Notef("cross-host materialization: S3-only, identical state, yields, no partial volume")
+	return nil
 }
 
 // scenarioBackgroundYields is INV-17 (§5.9, §11): background I/O yields whenever a
