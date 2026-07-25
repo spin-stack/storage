@@ -55,7 +55,48 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "lease-fences-durable-ack", Run: scenarioLeaseFencesDurableAck},
 		{Name: "promotion-fencing-wait", Run: scenarioPromotionFencingWait},
 		{Name: "fenced-writer-no-lost-ack", Run: scenarioFencedWriterNoLostAck},
+		{Name: "recovery-authority-is-s3", Run: scenarioRecoveryAuthorityIsS3},
 	}
+}
+
+// scenarioRecoveryAuthorityIsS3 is INV-08 (§5.8): the durable point is determined
+// from S3 alone; a wrong PostgreSQL watermark does not affect it.
+func scenarioRecoveryAuthorityIsS3(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+
+	// Write two records to S3 through a Log.
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	_, _ = l.Write(0, []byte("a"), 0)
+	_, _ = l.Write(8, []byte("b"), 0)
+	if err := l.Flush(ctx); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+
+	// PostgreSQL holds a WRONG informative watermark.
+	md := metasim.New(s.Clock.Wall)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(vol), State: "ACTIVE", DurableSequence: 999, DEKWrapped: []byte{1}, KEKID: "k"})
+
+	// Recovery derives the durable point from S3, ignoring PG's 999.
+	durable, err := recovery.DurablePoint(ctx, s.Store, vol, 1)
+	if err != nil {
+		return err
+	}
+	if durable != 2 {
+		return fmt.Errorf("durable from S3 = %d, want 2 (PG said 999)", durable)
+	}
+	if v, _ := md.GetVolume(ctx, format.UUIDString(vol)); v.DurableSequence != 999 {
+		return fmt.Errorf("expected PG to still hold the wrong watermark, got %d", v.DurableSequence)
+	}
+	s.Notef("recovery used the S3 durable point (2), not the PG watermark (999)")
+	return nil
 }
 
 // failVol/failHosts are the v7-shaped ids for the full-fencing scenario.
@@ -128,11 +169,11 @@ func scenarioFencedWriterNoLostAck(s *Sim) error {
 	}
 
 	// W2 recovers epoch 1's durable prefix from S3 and fixes the recovery point.
-	recovered, err := recovery.DurablePrefix(ctx, s.Store, format.UUIDString(volID), 1)
+	recovered, err := recovery.DurablePrefix(ctx, s.Store, volID, 1)
 	if err != nil {
 		return fmt.Errorf("recover durable prefix: %w", err)
 	}
-	if err := recovery.WriteRecoveryPoint(ctx, s.Store, format.UUIDString(volID), newEpoch, 1, recovered); err != nil {
+	if err := recovery.WriteRecoveryPoint(ctx, s.Store, volID, newEpoch, 1, recovered); err != nil {
 		return err
 	}
 

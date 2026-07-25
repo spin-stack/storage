@@ -155,32 +155,32 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 
 // Discard appends a DISCARD of [offset, offset+length); the range reads as zero.
 func (l *Log) Discard(offset uint64, length uint32) (uint64, error) {
-	seq := l.local + 1
-	r := Record{Type: format.RecordDiscard, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}
-	enc, err := r.Encode()
-	if err != nil {
-		return 0, err
-	}
-	seq, err = l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
-	if err == nil {
-		l.discardedBytes += int64(length)
-	}
-	return seq, err
+	return l.appendClear(format.RecordDiscard, offset, length)
 }
 
 // WriteZeroes appends a WRITE_ZEROES of [offset, offset+length); reads as zero.
 func (l *Log) WriteZeroes(offset uint64, length uint32) (uint64, error) {
+	return l.appendClear(format.RecordWriteZeroes, offset, length)
+}
+
+// appendClear appends a header-only DISCARD/WRITE_ZEROES record: it clears the read
+// view, feeds the remote batcher (these records must reach S3 so the working set
+// converges, §14.6), and counts the reclaimed bytes.
+func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (uint64, error) {
 	seq := l.local + 1
-	r := Record{Type: format.RecordWriteZeroes, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}
-	enc, err := r.Encode()
+	enc, err := Record{Type: t, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}.Encode()
 	if err != nil {
 		return 0, err
 	}
-	seq, err = l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
-	if err == nil {
-		l.discardedBytes += int64(length)
+	got, err := l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
+	if err != nil {
+		return 0, err
 	}
-	return seq, err
+	if l.batcher != nil {
+		l.batcher.Append(seq, enc, false)
+	}
+	l.discardedBytes += int64(length)
+	return got, nil
 }
 
 // DiscardedBytes reports the cumulative bytes DISCARDed/zeroed (discarded_bytes_total).

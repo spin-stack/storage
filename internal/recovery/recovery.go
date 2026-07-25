@@ -1,9 +1,8 @@
-// Package recovery determines the durable point of a volume from S3, which is the
-// authority for recovery (§5.8, §22.1): the durable point is the end of the longest
-// contiguous prefix of sequences under wal/<vol>/<epoch>/. It also writes the
-// recovery-point object that fixes the immutable frontier between epochs (§12.5).
-// This is the seed of Phase 08; here it is enough to prove that a promoted writer
-// recovers every write its fenced predecessor ACKed as durable (INV-09).
+// Package recovery reconstructs volume state from S3, the authority for recovery
+// (§5.8, §22.1): the durable point is the end of the longest contiguous prefix of
+// sequences under wal/<vol>/<epoch>/. Recover replays the WAL objects up to that
+// point (decrypting) to rebuild the read view; the summary object accelerates the
+// scan (§22.1), and the recovery-point object fixes the epoch frontier (§12.5).
 package recovery
 
 import (
@@ -13,64 +12,149 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
 
-// walPrefix is the object-store prefix for a volume/epoch's WAL objects.
-func walPrefix(volumeID string, epoch uint64) string {
-	return fmt.Sprintf("wal/%s/%d/", volumeID, epoch)
+func walPrefix(volumeID [16]byte, epoch uint64) string {
+	return fmt.Sprintf("wal/%s/%d/", format.UUIDString(volumeID), epoch)
 }
 
-// objRange is one WAL object's sequence span, parsed from its header.
-type objRange struct {
+// walObject is one WAL object with its parsed sequence span and raw bytes.
+type walObject struct {
 	key         string
 	first, last uint64
+	body        []byte
 }
 
-// DurablePrefix lists the WAL objects for a volume/epoch and returns the last
-// sequence of the longest contiguous prefix (starting at the lowest first
-// sequence). Objects beyond a gap are ignored — they are late/orphan PUTs (§22.1,
-// §12.5). Returns 0 if there are no WAL objects.
-func DurablePrefix(ctx context.Context, store objectstore.Store, volumeID string, epoch uint64) (uint64, error) {
+// listObjects fetches every WAL object for a volume/epoch, parses its header, and
+// returns them sorted by first sequence. summary.json / recovery-point.json are
+// skipped.
+func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) ([]walObject, error) {
 	infos, err := store.List(ctx, walPrefix(volumeID, epoch))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var ranges []objRange
+	var objs []walObject
 	for _, info := range infos {
 		if !strings.HasSuffix(info.Key, ".wal") {
-			continue // skip summary.json, recovery-point.json, ...
+			continue
 		}
 		body, err := store.Get(ctx, info.Key)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if len(body) < format.ObjectHeaderSize {
-			return 0, fmt.Errorf("recovery: short WAL object %s", info.Key)
+			return nil, fmt.Errorf("recovery: short WAL object %s", info.Key)
 		}
 		h, err := format.UnmarshalObjectHeader(body[:format.ObjectHeaderSize])
 		if err != nil {
-			return 0, fmt.Errorf("recovery: decode %s: %w", info.Key, err)
+			return nil, fmt.Errorf("recovery: decode %s: %w", info.Key, err)
 		}
-		ranges = append(ranges, objRange{key: info.Key, first: h.FirstSequence, last: h.LastSequence})
+		objs = append(objs, walObject{key: info.Key, first: h.FirstSequence, last: h.LastSequence, body: body})
 	}
-	if len(ranges) == 0 {
-		return 0, nil
-	}
-	sort.Slice(ranges, func(i, j int) bool { return ranges[i].first < ranges[j].first })
+	sort.Slice(objs, func(i, j int) bool { return objs[i].first < objs[j].first })
+	return objs, nil
+}
 
-	// Walk the contiguous run from the lowest first sequence.
-	last := ranges[0].last
-	expected := ranges[0].last + 1
-	for _, r := range ranges[1:] {
-		if r.first != expected {
-			break // gap: everything beyond is late/orphan
-		}
-		last = r.last
-		expected = r.last + 1
+// contiguousLast returns the last sequence of the longest contiguous prefix (from
+// the lowest first sequence). Objects past a gap are late/orphan (§22.1, §12.5).
+func contiguousLast(objs []walObject) uint64 {
+	if len(objs) == 0 {
+		return 0
 	}
-	return last, nil
+	last := objs[0].last
+	expected := objs[0].last + 1
+	for _, o := range objs[1:] {
+		if o.first != expected {
+			break
+		}
+		last = o.last
+		expected = o.last + 1
+	}
+	return last
+}
+
+// DurablePrefix returns the durable point for a volume/epoch computed from S3 alone
+// (INV-08): the end of the longest contiguous WAL prefix.
+func DurablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
+	objs, err := listObjects(ctx, store, volumeID, epoch)
+	if err != nil {
+		return 0, err
+	}
+	return contiguousLast(objs), nil
+}
+
+// DurablePoint is DurablePrefix with a summary cross-check (§22.1): the summary
+// object must never claim a durable sequence beyond what the contiguous prefix
+// actually provides. In production the summary lets recovery start its LIST near the
+// end instead of scanning everything; here it is a correctness guard.
+func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
+	contiguous, err := DurablePrefix(ctx, store, volumeID, epoch)
+	if err != nil {
+		return 0, err
+	}
+	if sum, serr := wal.ReadSummary(ctx, store, volumeID, epoch); serr == nil {
+		if sum.DurableSequence > contiguous {
+			return 0, fmt.Errorf("recovery: summary claims durable=%d but contiguous prefix reaches only %d",
+				sum.DurableSequence, contiguous)
+		}
+	}
+	return contiguous, nil
+}
+
+// Recover reconstructs the read view (interval map) from S3 up to the durable point,
+// decrypting each record with enc (nil for plaintext volumes). It returns the view
+// and the durable sequence.
+func Recover(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, epoch uint64) (*cow.IntervalMap, uint64, error) {
+	durable, err := DurablePoint(ctx, store, volumeID, epoch)
+	if err != nil {
+		return nil, 0, err
+	}
+	objs, err := listObjects(ctx, store, volumeID, epoch)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	view := cow.NewIntervalMap()
+	for _, o := range objs {
+		if o.first > durable {
+			break // past the durable prefix (sorted by first)
+		}
+		recs, err := wal.Replay(o.body[format.ObjectHeaderSize:])
+		if err != nil {
+			return nil, 0, fmt.Errorf("recovery: replay %s: %w", o.key, err)
+		}
+		for _, rec := range recs {
+			if rec.Sequence > durable {
+				break
+			}
+			if err := applyRecord(view, enc, rec); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+	return view, durable, nil
+}
+
+func applyRecord(view *cow.IntervalMap, enc *wal.Encryption, rec wal.Record) error {
+	switch rec.Type {
+	case format.RecordWrite:
+		payload := rec.Payload
+		if enc != nil {
+			pt, err := enc.Decrypt(rec)
+			if err != nil {
+				return fmt.Errorf("recovery: decrypt seq %d: %w", rec.Sequence, err)
+			}
+			payload = pt
+		}
+		view.Overwrite(rec.Offset, payload)
+	case format.RecordDiscard, format.RecordWriteZeroes:
+		view.Clear(rec.Offset, uint64(rec.Length))
+	}
+	return nil
 }
 
 // RecoveryPoint is the immutable epoch frontier written by a promoted writer (§12.5).
@@ -79,15 +163,13 @@ type RecoveryPoint struct {
 	RecoveredUpTo uint64 `json:"recovered_up_to"`
 }
 
-// recoveryPointKey is the key of the epoch-boundary object (§12.5).
-func recoveryPointKey(volumeID string, newEpoch uint64) string {
-	return fmt.Sprintf("wal/%s/%d/recovery-point.json", volumeID, newEpoch)
+func recoveryPointKey(volumeID [16]byte, newEpoch uint64) string {
+	return fmt.Sprintf("wal/%s/%d/recovery-point.json", format.UUIDString(volumeID), newEpoch)
 }
 
-// WriteRecoveryPoint records the boundary between epochs at the start of newEpoch:
-// which prior epoch was recovered and up to which sequence (§12.5). Create-only, so
-// a promotion writes it exactly once.
-func WriteRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID string, newEpoch, prevEpoch, recoveredUpTo uint64) error {
+// WriteRecoveryPoint records the epoch boundary at the start of newEpoch (§12.5):
+// which prior epoch was recovered and up to which sequence. Create-only.
+func WriteRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, newEpoch, prevEpoch, recoveredUpTo uint64) error {
 	body, err := json.Marshal(RecoveryPoint{PrevEpoch: prevEpoch, RecoveredUpTo: recoveredUpTo})
 	if err != nil {
 		return err
@@ -97,7 +179,7 @@ func WriteRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID s
 }
 
 // ReadRecoveryPoint loads the epoch-boundary object for newEpoch.
-func ReadRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID string, newEpoch uint64) (RecoveryPoint, error) {
+func ReadRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, newEpoch uint64) (RecoveryPoint, error) {
 	var rp RecoveryPoint
 	body, err := store.Get(ctx, recoveryPointKey(volumeID, newEpoch))
 	if err != nil {

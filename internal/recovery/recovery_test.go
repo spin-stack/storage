@@ -1,17 +1,24 @@
 package recovery_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
 
-const rvol = "00000000-0000-7000-8000-000000000030"
+func v7Vol() [16]byte {
+	var v [16]byte
+	v[6], v[8] = 0x70, 0x80 // v7 shape
+	return v
+}
 
 // putBatch uploads a WAL object covering [first,last] for the volume/epoch.
 func putBatch(t *testing.T, store *sim.ObjectStore, volID [16]byte, epoch, first, last uint64) {
@@ -28,59 +35,127 @@ func putBatch(t *testing.T, store *sim.ObjectStore, volID [16]byte, epoch, first
 	}
 }
 
-func TestDurablePrefixContiguous(t *testing.T) {
-	ctx := context.Background()
-	store := sim.NewObjectStore()
-	var volID [16]byte
-	volID[6], volID[8] = 0x70, 0x80 // v7 shape; UUIDString computed below
-
-	// Objects [1-2] and [3-4] are contiguous → durable prefix ends at 4.
-	putBatch(t, store, volID, 1, 1, 2)
-	putBatch(t, store, volID, 1, 3, 4)
-
-	vs := format.UUIDString(volID)
-	last, err := recovery.DurablePrefix(ctx, store, vs, 1)
-	if err != nil {
-		t.Fatal(err)
+func TestDurablePrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		spans  [][2]uint64 // uploaded [first,last] object spans
+		expect uint64
+	}{
+		{"contiguous", [][2]uint64{{1, 2}, {3, 4}}, 4},
+		{"stops at gap", [][2]uint64{{1, 2}, {5, 6}}, 2}, // 3-4 missing
+		{"empty", nil, 0},
+		{"single", [][2]uint64{{1, 3}}, 3},
 	}
-	if last != 4 {
-		t.Fatalf("durable prefix = %d, want 4", last)
-	}
-}
-
-func TestDurablePrefixStopsAtGap(t *testing.T) {
-	ctx := context.Background()
-	store := sim.NewObjectStore()
-	var volID [16]byte
-	volID[6], volID[8] = 0x70, 0x80
-
-	// [1-2] present, [3-4] MISSING, [5-6] present → contiguous prefix ends at 2.
-	putBatch(t, store, volID, 1, 1, 2)
-	putBatch(t, store, volID, 1, 5, 6)
-
-	last, err := recovery.DurablePrefix(ctx, store, format.UUIDString(volID), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if last != 2 {
-		t.Fatalf("durable prefix past a gap = %d, want 2", last)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := sim.NewObjectStore()
+			vol := v7Vol()
+			for _, s := range tc.spans {
+				putBatch(t, store, vol, 1, s[0], s[1])
+			}
+			last, err := recovery.DurablePrefix(context.Background(), store, vol, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if last != tc.expect {
+				t.Fatalf("durable prefix = %d, want %d", last, tc.expect)
+			}
+		})
 	}
 }
 
-func TestDurablePrefixEmpty(t *testing.T) {
-	last, err := recovery.DurablePrefix(context.Background(), sim.NewObjectStore(), rvol, 1)
-	if err != nil || last != 0 {
-		t.Fatalf("empty epoch: last=%d err=%v", last, err)
+// TestRecoverReconstructsState writes a volume through a Log and recovers its read
+// view from S3 alone.
+func TestRecoverReconstructsState(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	vol := v7Vol()
+
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/active.wal")
+	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3))
+
+	_, _ = l.Write(0, []byte("hello"), 0)
+	_, _ = l.Write(8, []byte("world"), 0)
+	_, _ = l.Discard(0, 1) // zero the first byte
+	if err := l.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	view, durable, err := recovery.Recover(ctx, store, nil, vol, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable != 3 {
+		t.Fatalf("recovered durable = %d, want 3", durable)
+	}
+	buf := make([]byte, 13)
+	view.Read(0, buf)
+	if !bytes.Equal(buf, []byte("\x00ello\x00\x00\x00world")) {
+		t.Fatalf("recovered read view mismatch: %q", buf)
+	}
+}
+
+// TestDurablePointRejectsLyingSummary is the §22.1 cross-check: a summary that
+// claims more than the contiguous prefix provides is rejected.
+func TestDurablePointRejectsLyingSummary(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	vol := v7Vol()
+
+	// Only seq 1-2 are actually durable.
+	putBatch(t, store, vol, 1, 1, 2)
+	if last, _ := recovery.DurablePoint(ctx, store, vol, 1); last != 2 {
+		t.Fatalf("honest durable point = %d, want 2", last)
+	}
+
+	// Forge a summary claiming durable=5, which the objects do not back.
+	body, _ := json.Marshal(wal.Summary{VolumeID: format.UUIDString(vol), Epoch: 1, DurableSequence: 5})
+	if _, err := store.Put(ctx, wal.SummaryKey(vol, 1), body, objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovery.DurablePoint(ctx, store, vol, 1); err == nil {
+		t.Fatal("a summary claiming more than the contiguous prefix must be rejected")
+	}
+}
+
+// TestRecoverExcludesLatePutBeyondGap is INV-12: a late PUT beyond a gap is not
+// part of the recovered prefix, and the recovery-point records the true boundary.
+func TestRecoverExcludesLatePutBeyondGap(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	vol := v7Vol()
+
+	putBatch(t, store, vol, 1, 1, 2) // durable
+	putBatch(t, store, vol, 1, 4, 4) // late/orphan PUT after a gap at 3
+
+	_, durable, err := recovery.Recover(ctx, store, nil, vol, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable != 2 {
+		t.Fatalf("recovered durable = %d, want 2 (late PUT at 4 excluded)", durable)
+	}
+	// W2 fixes the boundary; it must equal the recovered prefix, bounding the late PUT.
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, durable); err != nil {
+		t.Fatal(err)
+	}
+	rp, _ := recovery.ReadRecoveryPoint(ctx, store, vol, 2)
+	if rp.RecoveredUpTo != 2 {
+		t.Fatalf("recovery-point recovered_up_to = %d, want 2", rp.RecoveredUpTo)
 	}
 }
 
 func TestRecoveryPointRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store := sim.NewObjectStore()
-	if err := recovery.WriteRecoveryPoint(ctx, store, rvol, 2, 1, 42); err != nil {
+	vol := v7Vol()
+	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, 42); err != nil {
 		t.Fatal(err)
 	}
-	rp, err := recovery.ReadRecoveryPoint(ctx, store, rvol, 2)
+	rp, err := recovery.ReadRecoveryPoint(ctx, store, vol, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
