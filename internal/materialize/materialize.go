@@ -90,6 +90,22 @@ func (m *Materializer) FromCheckpoint(ctx context.Context, volumeID string, epoc
 	return m.fetchAndReplay(ctx, cp.Objects)
 }
 
+// FromEpoch rebuilds the state durable in S3 for a volume's epoch: the longest
+// contiguous WAL prefix, which is the recovery authority (§5.8, §22.1). This is the
+// source a host-evacuation uses — it needs no snapshot and no cooperation from the
+// host being drained (§28.1).
+func (m *Materializer) FromEpoch(ctx context.Context, volumeID [16]byte, epoch uint64) (*cow.IntervalMap, Progress, error) {
+	durable, err := recovery.DurablePoint(ctx, m.store, volumeID, epoch)
+	if err != nil {
+		return nil, Progress{}, fmt.Errorf("materialize: durable point %s/%d: %w", format.UUIDString(volumeID), epoch, err)
+	}
+	keys, err := recovery.ObjectKeysUpTo(ctx, m.store, volumeID, epoch, durable)
+	if err != nil {
+		return nil, Progress{}, err
+	}
+	return m.fetchAndReplay(ctx, keys)
+}
+
 // object is one fetched WAL object with its parsed sequence span.
 type object struct {
 	key         string

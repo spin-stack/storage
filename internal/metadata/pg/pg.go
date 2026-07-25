@@ -366,6 +366,23 @@ func (s *Store) RecordOperation(ctx context.Context, op metadata.Operation) (boo
 	return rows == 1, nil
 }
 
+func (s *Store) UpdateOperation(ctx context.Context, op metadata.Operation) error {
+	id, err := uuid.Parse(op.OperationID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
+		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase, Error: text(op.Error),
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return metadata.ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.Operation, error) {
 	id, err := uuid.Parse(operationID)
 	if err != nil {

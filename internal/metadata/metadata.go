@@ -158,4 +158,7 @@ type Store interface {
 	RecordOperation(ctx context.Context, op Operation) (recorded bool, err error)
 	// GetOperation returns a recorded operation.
 	GetOperation(ctx context.Context, operationID string) (Operation, error)
+	// UpdateOperation stores an operation's phase, current state, and error — the
+	// visible progress of a long-running reconciled operation (§7, §28.1).
+	UpdateOperation(ctx context.Context, op Operation) error
 }

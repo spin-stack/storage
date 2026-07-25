@@ -7,6 +7,7 @@ package pg_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -114,6 +115,27 @@ func TestPGOperationIdempotency(t *testing.T) {
 	rec, err = store.RecordOperation(ctx, op)
 	if err != nil || rec {
 		t.Fatalf("duplicate should report rec=false: rec=%v err=%v", rec, err)
+	}
+
+	// Visible progress of a long-running operation (§28.1).
+	op.Phase = "DRAINING"
+	op.CurrentState = []byte(`{"total":2,"moved":1}`)
+	op.Error = "waiting for fencing"
+	if err := store.UpdateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetOperation(ctx, op.OperationID)
+	if err != nil || got.Phase != "DRAINING" || got.Error != "waiting for fencing" {
+		t.Fatalf("operation after update: %+v err=%v", got, err)
+	}
+	// jsonb round-trips by value, not byte-for-byte.
+	var state map[string]int
+	if err := json.Unmarshal(got.CurrentState, &state); err != nil || state["total"] != 2 || state["moved"] != 1 {
+		t.Fatalf("current_state = %s err=%v", got.CurrentState, err)
+	}
+	op.OperationID = ids.New().String()
+	if err := store.UpdateOperation(ctx, op); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("update of a missing operation: want ErrNotFound, got %v", err)
 	}
 }
 

@@ -62,6 +62,22 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	}
 }
 
+// TestCloneWithStaleTermFails: a zombie CP cannot create the clone volume (§7).
+func TestCloneWithStaleTermFails(t *testing.T) {
+	ctx := context.Background()
+	md, term := cpStore(t)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: "ACTIVE", DEKWrapped: []byte{7}, KEKID: "kek"})
+	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: "PUBLISHED", RequestID: reqID})
+
+	stale := term
+	if _, err := md.AcquireLeadership(ctx, "cp-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlplane.Clone(ctx, md, stale, snapID, cloneVol, cloneHostA); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("want ErrStaleTerm, got %v", err)
+	}
+}
+
 func TestCloneFromMissingSnapshotFails(t *testing.T) {
 	ctx := context.Background()
 	md, term := cpStore(t)

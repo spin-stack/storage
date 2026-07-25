@@ -272,6 +272,18 @@ func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool,
 	return true, nil
 }
 
+func (s *Store) UpdateOperation(_ context.Context, op metadata.Operation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.ops[op.OperationID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	cur.Phase, cur.CurrentState, cur.Error = op.Phase, op.CurrentState, op.Error
+	s.ops[op.OperationID] = cur
+	return nil
+}
+
 func (s *Store) GetOperation(_ context.Context, operationID string) (metadata.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

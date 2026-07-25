@@ -18,6 +18,7 @@ import (
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -69,7 +70,139 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "gc-marks-orphans-not-live", Run: scenarioGCMarksOrphansNotLive},
 		{Name: "background-yields-to-foreground", Run: scenarioBackgroundYields},
 		{Name: "cross-host-materialization", Run: scenarioCrossHostMaterialization},
+		{Name: "drain-moves-volumes-fenced", Run: scenarioDrainMovesVolumesFenced},
 	}
+}
+
+// scenarioDrainMovesVolumesFenced is §28.1 drain composed with the fencing protocol:
+// evacuating a host must not grant an epoch before FENCING_WAIT (INV-11), must not
+// leave the old writer able to publish (INV-10), and the destination's materialized
+// prefix must cover everything the source ACKed as durable (INV-09).
+func scenarioDrainMovesVolumesFenced(s *Sim) error {
+	ctx := context.Background()
+	const (
+		srcHost  = "00000000-0000-7000-8000-0000000000e1"
+		dstHost  = "00000000-0000-7000-8000-0000000000e2"
+		drainOp  = "00000000-0000-7000-8000-0000000000e3"
+		leaseTTL = 10 * time.Second
+		maxSkew  = 2 * time.Second
+		volBytes = int64(1) << 30
+	)
+
+	md := metasim.New(s.Clock.Wall)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	for _, h := range []string{srcHost, dstHost} {
+		if err := md.UpsertHost(ctx, term, metadata.Host{
+			HostID: h, State: metadata.HostActive, NVMeTotalBytes: 10 * volBytes,
+		}); err != nil {
+			return err
+		}
+	}
+	if err := md.RenewHostLease(ctx, term, srcHost, int(leaseTTL/time.Second)); err != nil {
+		return err
+	}
+
+	epochs := epoch.NewStore(s.Store)
+	acked := map[string]uint64{}
+	volByID := map[string][16]byte{}
+	var vols [][16]byte
+	for i := range 2 {
+		var vol [16]byte
+		vol[6], vol[8] = 0x70, 0x80
+		vol[15] = byte(0xd0 + i)
+		vid := format.UUIDString(vol)
+		vols = append(vols, vol)
+		volByID[vid] = vol
+
+		if err := md.CreateVolume(ctx, term, metadata.Volume{
+			VolumeID: vid, SizeBytes: volBytes, BlockSize: 65536, Durability: "remote",
+			State: "ACTIVE", CurrentEpoch: 1, PrimaryHostID: srcHost,
+			DEKWrapped: []byte{1}, KEKID: "k",
+		}); err != nil {
+			return err
+		}
+		if err := md.CommitHostCapacity(ctx, term, srcHost, volBytes); err != nil {
+			return err
+		}
+		if _, err := epochs.Init(ctx, vid, 1); err != nil {
+			return err
+		}
+		f, err := s.Disk.Create("wal/" + vid + ".wal")
+		if err != nil {
+			return err
+		}
+		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+		if _, err := l.Write(0, []byte("on-source"), 0); err != nil {
+			return err
+		}
+		if err := l.Flush(ctx); err != nil {
+			return err
+		}
+		acked[vid] = l.Watermarks().Durable
+	}
+
+	drainer := controlplane.NewDrainer(md,
+		controlplane.NewPromoter(md, epochs, s.Clock, leaseTTL, maxSkew),
+		materialize.New(s.Store, nil, nil), s.Store,
+		placement.Policy{MaxOversubscription: 2.0})
+
+	// Before FENCING_WAIT the drain refuses: no epoch is granted early (INV-11).
+	_, err := drainer.Drain(ctx, term, srcHost, drainOp)
+	s.Emit(Event{Kind: EventPromotion, EarlyGrant: err == nil, Msg: "drain before fencing wait"})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("drain must wait for FENCING_WAIT, got %v", err)
+	}
+	for _, vol := range vols {
+		v, _ := md.GetVolume(ctx, format.UUIDString(vol))
+		if v.CurrentEpoch != 1 || v.PrimaryHostID != srcHost {
+			return fmt.Errorf("volume moved before the fencing wait: %+v", v)
+		}
+	}
+
+	// Wait it out, then the same operation completes.
+	s.Tick(leaseTTL + maxSkew + time.Second)
+	res, err := drainer.Drain(ctx, term, srcHost, drainOp)
+	if err != nil {
+		return fmt.Errorf("drain: %w", err)
+	}
+	if res.Phase != controlplane.PhaseDrained || len(res.Moved) != 2 {
+		return fmt.Errorf("drain result = %+v", res)
+	}
+
+	for _, mv := range res.Moved {
+		// INV-09: the destination materialized at least the source's ACKed prefix.
+		s.Emit(Event{Kind: EventFailover, AckedDurable: acked[mv.VolumeID], Recovered: mv.UpTo})
+		if mv.ToHost != dstHost {
+			return fmt.Errorf("volume %s moved to %s, want the destination host", mv.VolumeID, mv.ToHost)
+		}
+		// INV-12: the epoch boundary is recorded for the new epoch.
+		rp, err := recovery.ReadRecoveryPoint(ctx, s.Store, volByID[mv.VolumeID], mv.NewEpoch)
+		if err != nil || rp.PrevEpoch != 1 || rp.RecoveredUpTo < acked[mv.VolumeID] {
+			return fmt.Errorf("recovery point for %s: %+v err=%v", mv.VolumeID, rp, err)
+		}
+		// INV-10: the old writer is fenced — it can neither verify its old epoch nor
+		// advance the epoch object.
+		verr := epochs.Verify(ctx, mv.VolumeID, 1)
+		_, caserr := epochs.CompareAndAdvance(ctx, mv.VolumeID, "stale-etag", 99)
+		stalePublished := verr == nil || caserr == nil
+		s.Emit(Event{Kind: EventStalePublsh, StalePublishOK: stalePublished})
+		if stalePublished {
+			return fmt.Errorf("a fenced writer could still publish volume %s", mv.VolumeID)
+		}
+	}
+
+	// Capacity followed the volumes (§28.2).
+	src, _ := md.GetHost(ctx, srcHost)
+	dst, _ := md.GetHost(ctx, dstHost)
+	if src.NVMeCommittedBytes != 0 || dst.NVMeCommittedBytes != 2*volBytes {
+		return fmt.Errorf("capacity accounting after drain: src=%d dst=%d", src.NVMeCommittedBytes, dst.NVMeCommittedBytes)
+	}
+	if src.State != metadata.HostDraining {
+		return fmt.Errorf("source host state = %q, want DRAINING", src.State)
+	}
+	s.Notef("drain moved 2 volumes: fenced promotion, no lost ACKed write, capacity followed")
+	return nil
 }
 
 // scenarioCrossHostMaterialization is §20 / §22.3 cold: a destination host that

@@ -2,6 +2,7 @@ package materialize_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/materialize"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/snapshot"
 	"github.com/spin-stack/storage/internal/wal"
@@ -277,6 +279,138 @@ func TestMissingManifestIsAnError(t *testing.T) {
 	}
 	if _, _, err := materialize.New(store, nil, nil).FromCheckpoint(context.Background(), format.UUIDString(v7Vol()), 1, 7); err == nil {
 		t.Fatal("materializing from a missing checkpoint must fail")
+	}
+}
+
+// TestFromEpochRebuildsDurablePrefix is the source an evacuation uses: no snapshot,
+// no cooperation from the host being drained — just the durable prefix in S3.
+func TestFromEpochRebuildsDurablePrefix(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+	w.writeAndFlush(t, 64, "beta!")
+
+	view, prog, err := materialize.New(w.store, nil, nil).FromEpoch(ctx, w.vol, 1)
+	if err != nil {
+		t.Fatalf("from epoch: %v", err)
+	}
+	if got := readAt(view, 0, 5); got != "alpha" {
+		t.Fatalf("offset 0 = %q", got)
+	}
+	if prog.UpTo != w.log.Watermarks().Durable {
+		t.Fatalf("covered up to %d, want the durable point %d", prog.UpTo, w.log.Watermarks().Durable)
+	}
+}
+
+// TestFromEpochRefusesLyingSummary: the summary must never claim more than the
+// contiguous prefix provides (§22.1) — materialization inherits that guard.
+func TestFromEpochRefusesLyingSummary(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+
+	lie, err := json.Marshal(wal.Summary{
+		VolumeID: format.UUIDString(w.vol), Epoch: 1, DurableSequence: 999,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.Put(ctx, wal.SummaryKey(w.vol, 1), lie, objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := materialize.New(w.store, nil, nil).FromEpoch(ctx, w.vol, 1); err == nil {
+		t.Fatal("a summary claiming more than the contiguous prefix must be refused")
+	}
+}
+
+// TestRefusesUnparseableObject: a referenced key holding something that is not a WAL
+// object fails before any state is produced.
+func TestRefusesUnparseableObject(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+
+	junkKey := "wal/" + format.UUIDString(w.vol) + "/1/junk.wal"
+	if _, err := w.store.Put(ctx, junkKey, []byte("too short"), objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	m := snapshot.Manifest{
+		SnapshotID: "snap-junk", VolumeID: format.UUIDString(w.vol), Epoch: 1,
+		TargetSequence: 1, Objects: []string{junkKey},
+	}
+	m.RootDigest = snapshot.Digest(m.TargetSequence, m.Objects)
+	if err := snapshot.Publish(ctx, w.store, m); err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := materialize.New(w.store, nil, nil).FromSnapshot(ctx, m.VolumeID, m.SnapshotID)
+	if err == nil || view != nil {
+		t.Fatalf("a short/unparseable object must fail materialization, got view=%v err=%v", view, err)
+	}
+}
+
+// TestWrongDEKFailsClosed: materializing an encrypted volume with the wrong key
+// fails rather than producing garbage state (§15, INV-15 fails closed).
+func TestWrongDEKFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	dek, err := crypto.GenerateDEK(&fixedReader{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol := v7Vol()
+	w := newWorld(t, &wal.Encryption{DEK: dek, VolumeID: vol})
+	w.writeAndFlush(t, 0, "secret-payload")
+	m := w.snapshot(t, "snap-enc")
+
+	otherDEK, err := crypto.GenerateDEK(&fixedReader{b: 200}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := materialize.New(w.store, nil, &wal.Encryption{DEK: otherDEK, VolumeID: vol}).
+		FromSnapshot(ctx, m.VolumeID, m.SnapshotID)
+	if err == nil || view != nil {
+		t.Fatalf("the wrong DEK must fail closed: view=%v err=%v", view, err)
+	}
+}
+
+// TestObjectStoreErrorsSurface: a backend error (throttling, §24) is reported as
+// itself — it is not a missing object and not a partial volume.
+func TestObjectStoreErrorsSurface(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+	m := w.snapshot(t, "snap-1")
+
+	mat := materialize.New(w.store, nil, nil)
+	// One op for the manifest GET, the next one (the object GET) is throttled.
+	w.store.InjectThrottle(2)
+	view, _, err := mat.FromSnapshot(ctx, m.VolumeID, m.SnapshotID)
+	if err == nil || errors.Is(err, materialize.ErrMissingObject) || view != nil {
+		t.Fatalf("a throttled backend must surface as an error: view=%v err=%v", view, err)
+	}
+
+	// The same on the epoch path, where the failure happens during the LIST.
+	w.store.InjectThrottle(1)
+	if _, _, err := mat.FromEpoch(ctx, w.vol, 1); err == nil {
+		t.Fatal("a throttled LIST must fail the materialization")
+	}
+}
+
+// TestFromCheckpointRefusesDigestMismatch mirrors the snapshot guard on the other
+// materialization source.
+func TestFromCheckpointRefusesDigestMismatch(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t, nil)
+	w.writeAndFlush(t, 0, "alpha")
+
+	cp := checkpoint.Checkpoint{
+		VolumeID: format.UUIDString(w.vol), Epoch: 1, DurableSequence: 42,
+		Objects: []string{"wal/x"}, RootDigest: "not-the-digest",
+	}
+	if err := checkpoint.Publish(ctx, w.store, cp); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := materialize.New(w.store, nil, nil).FromCheckpoint(ctx, cp.VolumeID, 1, 42); !errors.Is(err, materialize.ErrDigestMismatch) {
+		t.Fatalf("want ErrDigestMismatch, got %v", err)
 	}
 }
 

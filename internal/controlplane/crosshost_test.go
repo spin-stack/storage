@@ -128,6 +128,44 @@ func TestCloneCrossHostReleasesCapacityOnFailure(t *testing.T) {
 	}
 }
 
+// TestCloneCrossHostFromOrphanSnapshotFails: a snapshot whose volume is gone (a
+// catalog left inconsistent by a partial rebuild) cannot be cloned.
+func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
+	ctx := context.Background()
+	md, term, store, _ := crossHostWorld(t)
+
+	const orphanSnap = "00000000-0000-7000-8000-0000000000b9"
+	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: orphanSnap, VolumeID: "00000000-0000-7000-8000-0000000000ba",
+		Epoch: 1, TargetSequence: 1, RootDigest: "d", State: "PUBLISHED",
+		RequestID: "00000000-0000-7000-8000-0000000000bb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+		term, orphanSnap, cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	if dst, _ := md.GetHost(ctx, destHost); dst.NVMeCommittedBytes != 0 {
+		t.Fatalf("committed %d bytes for an orphan snapshot", dst.NVMeCommittedBytes)
+	}
+}
+
+// TestCloneCrossHostToUnknownHostFails: the reservation is what fails first, so no
+// materialization work is started for a destination that does not exist.
+func TestCloneCrossHostToUnknownHostFails(t *testing.T) {
+	ctx := context.Background()
+	md, term, store, m := crossHostWorld(t)
+
+	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+		term, m.SnapshotID, cloneVol, "00000000-0000-7000-8000-00000000dead"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("clone volume must not exist: %v", err)
+	}
+}
+
 // TestCloneCrossHostFromMissingSnapshotFails: nothing is committed when the source
 // does not even exist.
 func TestCloneCrossHostFromMissingSnapshotFails(t *testing.T) {
