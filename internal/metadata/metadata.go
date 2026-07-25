@@ -28,6 +28,13 @@ var (
 	// ErrCapacityUnderflow means a capacity release would drive a host's committed
 	// bytes below zero — an accounting bug, never silently clamped (§28.2).
 	ErrCapacityUnderflow = errors.New("metadata: committed capacity would go negative")
+	// ErrWatermarkOrder means a watermark report violates
+	// published ≤ durable ≤ local (INV-03).
+	ErrWatermarkOrder = errors.New("metadata: watermarks out of order")
+	// ErrInvalidID means an identifier is not usable as a key — empty, or (in an
+	// implementation that constrains identifier syntax) malformed. It is never
+	// coerced to NULL or to a row nobody can find again.
+	ErrInvalidID = errors.New("metadata: invalid identifier")
 )
 
 // The lifecycle vocabularies (host/volume/snapshot/operation states, §7/§19/§28.1)
