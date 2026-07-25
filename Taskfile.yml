@@ -1,0 +1,60 @@
+version: "3"
+
+# Build/test/lint/dst orchestration for github.com/spin-stack/storage.
+# Mirrors the sibling spin-stack projects (go-task). The `ci` target is the
+# aggregate gate wired into GitHub Actions (docs/plan/PLAN.md §2).
+
+vars:
+  SIMULABLE: ./hack/analyzers/simulable/cmd/simulable
+
+tasks:
+  default:
+    cmds:
+      - task: ci
+
+  build:
+    desc: Build all packages and commands.
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run the full unit/property test suite with the race detector.
+    cmds:
+      - go test -race ./...
+
+  lint:
+    desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).
+    cmds:
+      - task: lint:golangci
+      - task: lint:simulable
+
+  lint:golangci:
+    desc: Run golangci-lint (incl. forbidigo/depguard belt-and-suspenders).
+    cmds:
+      - golangci-lint run ./...
+
+  lint:simulable:
+    desc: Run the authoritative simulable-interfaces analyzer over all packages.
+    cmds:
+      - go run {{.SIMULABLE}} ./...
+
+  dst:
+    desc: Run the mandatory Deterministic Simulation Testing scenario set.
+    cmds:
+      # Placeholder until Increment 1.3 lands the harness. Green with zero
+      # scenarios by design; becomes a real gate in Phase 01 / 1.3.
+      - 'echo "dst: no scenarios yet (harness lands in Increment 1.3)"'
+
+  fmt:
+    desc: Format code.
+    cmds:
+      - gofmt -w .
+      - go run golang.org/x/tools/cmd/goimports@latest -w . || true
+
+  ci:
+    desc: Aggregate gate — build, lint, test, dst. Matches the standard gate.
+    cmds:
+      - task: build
+      - task: lint
+      - task: test
+      - task: dst

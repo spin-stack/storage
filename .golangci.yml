@@ -1,0 +1,54 @@
+# golangci-lint v2 config for github.com/spin-stack/storage.
+#
+# The authoritative §25.1 / INV-01 check is the custom `simulable` analyzer
+# (hack/analyzers/simulable), run as its own CI/Taskfile step and covered by
+# golden tests. The forbidigo + depguard rules below are the belt-and-suspenders
+# layers described in ADR-0003: they catch the common escapes directly in
+# golangci-lint so a violation fails `task lint` even before the custom analyzer
+# runs.
+version: "2"
+
+run:
+  concurrency: 8
+  allow-parallel-runners: true
+
+linters:
+  enable:
+    - depguard
+    - forbidigo
+  settings:
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^time\.(Now|Since|Sleep|After|Tick|Until|NewTimer|NewTicker)$'
+          msg: "§25.1/INV-01: use internal/simio/clock, not the time package directly"
+        - pattern: '^net\.(Dial|DialTimeout|DialTCP|DialUDP|DialIP|DialUnix|Listen|ListenTCP|ListenUDP|ListenUnix|ListenPacket)$'
+          msg: "§25.1/INV-01: use internal/simio/net, not the net package directly"
+        - pattern: '^os\.(Open|Create|OpenFile|ReadFile|WriteFile|Remove|RemoveAll|Mkdir|MkdirAll|Rename|Truncate)$'
+          msg: "§25.1/INV-01: use internal/simio/disk, not the os package directly"
+    depguard:
+      rules:
+        outside-simio:
+          list-mode: lax
+          deny:
+            - pkg: syscall
+              desc: "§25.1/INV-01: raw syscalls only inside internal/simio/real"
+  exclusions:
+    generated: lax
+    rules:
+      # internal/simio and its real/sim implementations are the sanctioned home
+      # of the real primitives (ADR-0003).
+      - path: internal/simio
+        linters:
+          - depguard
+          - forbidigo
+      # analyzer golden fixtures deliberately contain violations.
+      - path: hack/analyzers/.*/testdata/
+        linters:
+          - depguard
+          - forbidigo
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

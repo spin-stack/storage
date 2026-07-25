@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Task
+        uses: go-task/setup-task@v2
+
+      - name: Set up golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+          install-mode: binary
+          # golangci-lint is invoked via `task lint`; only install it here.
+          args: --help
+        continue-on-error: false
+
+      # The standard gate (docs/plan/PLAN.md §2): build, lint (incl. the custom
+      # simulable analyzer / INV-01), test, and the DST scenario set.
+      - name: Build
+        run: task build
+
+      - name: Lint (golangci + simulable / INV-01)
+        run: task lint
+
+      - name: Test
+        run: task test
+
+      - name: DST (mandatory scenario set)
+        run: task dst
