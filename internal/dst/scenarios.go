@@ -79,7 +79,73 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "background-yields-to-foreground", Run: scenarioBackgroundYields},
 		{Name: "cross-host-materialization", Run: scenarioCrossHostMaterialization},
 		{Name: "drain-moves-volumes-fenced", Run: scenarioDrainMovesVolumesFenced},
+		{Name: "torn-append-leaves-nothing-behind", Run: scenarioTornAppend},
 	}
+}
+
+// scenarioTornAppend is the disk half of §25.1's "crash around append/fdatasync": a
+// partial append (ENOSPC, a torn write) must leave the log holding exactly the
+// records that were accepted. The existing crash scenario exercises the simulated
+// disk's sync semantics on raw bytes; this one drives the WAL itself, which is where
+// a rejected-but-persisted record turns into a phantom write or a silently truncated
+// replay.
+func scenarioTornAppend(s *Sim) error {
+	f, err := s.Disk.Create("wal/torn.wal")
+	if err != nil {
+		return err
+	}
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+
+	if _, err := l.Write(0, []byte("accepted"), 0); err != nil {
+		return err
+	}
+	accepted := l.Watermarks().Local
+
+	// The disk accepts a seed-dependent slice of the next record and then fails.
+	limit := s.Rand.Intn(140)
+	s.Disk.InjectShortAppend("wal/torn.wal", limit)
+	if _, err := l.Write(4096, []byte("rejected"), 0); err == nil {
+		return fmt.Errorf("a short append of %d bytes was not reported to the caller", limit)
+	}
+	s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("short append accepted %d bytes", limit)})
+
+	if got := l.Watermarks().Local; got != accepted {
+		return fmt.Errorf("local watermark moved to %d on a rejected write (was %d)", got, accepted)
+	}
+	if _, err := l.Write(8192, []byte("accepted-again"), 0); err != nil {
+		return err
+	}
+	if err := l.Sync(); err != nil {
+		return err
+	}
+
+	size, err := f.Size()
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, size)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		return err
+	}
+	recs, err := wal.Replay(buf)
+	if err != nil {
+		return fmt.Errorf("replay after a repaired tear: %w", err)
+	}
+	if len(recs) != 2 {
+		return fmt.Errorf("replay returned %d records, want the 2 accepted ones", len(recs))
+	}
+	seen := map[uint64]bool{}
+	for _, r := range recs {
+		if seen[r.Sequence] {
+			return fmt.Errorf("sequence %d replayed twice", r.Sequence)
+		}
+		seen[r.Sequence] = true
+	}
+	s.Emit(Event{Kind: EventWatermark, Local: l.Watermarks().Local, Durable: 0, Published: 0})
+	s.Notef("torn append repaired: log holds exactly the accepted records")
+	return nil
 }
 
 // scenarioDrainMovesVolumesFenced is §28.1 drain composed with the fencing protocol:

@@ -3,6 +3,7 @@ package wal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/spin-stack/storage/internal/cow"
@@ -174,7 +175,23 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	if err := l.backpressure(len(enc)); err != nil {
 		return 0, err
 	}
+	// A failed append is not necessarily an append of nothing: a partial write
+	// (ENOSPC, a torn write at a device boundary) leaves bytes that are not a record.
+	// Roll the file back to the last intact record before reporting the failure —
+	// otherwise the rejected write either replays as a record the guest was told
+	// failed (with a sequence the next accepted write reuses) or truncates the log,
+	// making replay stop at the tear and silently drop everything after it.
+	before, err := l.file.Size()
+	if err != nil {
+		return 0, err
+	}
 	if _, err := l.file.Append(enc); err != nil {
+		if terr := l.file.Truncate(before); terr != nil {
+			// The log's tail is now unknown. Refuse to serve it rather than ACK
+			// anything against a file we cannot describe.
+			l.fenced = true
+			return 0, errors.Join(err, fmt.Errorf("wal: could not roll back a partial append: %w", terr))
+		}
 		return 0, err
 	}
 	l.local = seq
