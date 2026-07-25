@@ -13,6 +13,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -67,14 +68,28 @@ type bucketVersioningAPI interface {
 	GetBucketVersioning(context.Context, *s3.GetBucketVersioningInput, ...func(*s3.Options)) (*s3.GetBucketVersioningOutput, error)
 }
 
-// requireVersioning fails unless the bucket has versioning Enabled.
-func requireVersioning(_ context.Context, _ bucketVersioningAPI, _ string) error {
+// requireVersioning fails unless the bucket has versioning Enabled. It is the
+// precondition of INV-14: on any other bucket DeleteObject destroys the object, so
+// the GC — which is allowed to be wrong precisely because a mark is reversible —
+// becomes the worst incident this system has. A bucket whose versioning tooling
+// forgot, or an operator Suspended, is indistinguishable from a correct one at every
+// other layer until the first sweep.
+func requireVersioning(ctx context.Context, api bucketVersioningAPI, bucket string) error {
+	out, err := api.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		// Cannot establish it (missing bucket, no permission, backend error) is the
+		// same answer as "not versioned": we may not place a delete marker here.
+		return fmt.Errorf("%w: %s: %w", ErrBucketNotVersioned, bucket, err)
+	}
+	if out.Status != types.BucketVersioningStatusEnabled {
+		return fmt.Errorf("%w: %s has status %q", ErrBucketNotVersioned, bucket, out.Status)
+	}
 	return nil
 }
 
-// NewS3Store builds the client from cfg. It is the only constructor that touches
-// s3.Options.
-func NewS3Store(_ context.Context, cfg S3Config) (*S3Store, error) {
+// NewS3Store builds the client from cfg and refuses a bucket the GC could not undo a
+// delete on. It is the only constructor that touches s3.Options.
+func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("simio/real: S3Config.Bucket is required")
 	}
@@ -99,7 +114,11 @@ func NewS3Store(_ context.Context, cfg S3Config) (*S3Store, error) {
 	if cfg.RequestTimeout > 0 {
 		opts.HTTPClient = awshttp.NewBuildableClient().WithTimeout(cfg.RequestTimeout)
 	}
-	return &S3Store{client: s3.New(opts), bucket: cfg.Bucket}, nil
+	store := &S3Store{client: s3.New(opts), bucket: cfg.Bucket}
+	if err := requireVersioning(ctx, store.client, cfg.Bucket); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
 // Client exposes the underlying client for the conformance suite and for the §24
@@ -120,18 +139,34 @@ func translate(err error) error {
 		return err
 	}
 	switch api.ErrorCode() {
-	case "PreconditionFailed":
+	case "PreconditionFailed", "ConditionalRequestConflict":
+		// AWS answers a *concurrent* conditional write with 409
+		// ConditionalRequestConflict rather than 412 — same race, different code.
+		// Leaving it unmapped means the promoter that lost gets an opaque error and
+		// the "I was fenced" branch of §12.4 is never taken (INV-10).
 		return fmt.Errorf("%w: %s", objectstore.ErrPreconditionFailed, api.ErrorMessage())
-	case "NoSuchKey", "NotFound", "NoSuchBucket":
+	case "NoSuchKey", "NotFound":
 		// An If-Match against a key that does not exist answers NoSuchKey on the
 		// backends we certify, not 412 — the caller reads that as "not initialised
 		// yet", which is what epoch.CompareAndAdvance needs.
 		return fmt.Errorf("%w: %s", objectstore.ErrNotFound, api.ErrorMessage())
+	case "NoSuchBucket":
+		// Deliberately *not* ErrNotFound. Recovery reads a missing key as "nothing
+		// was written yet"; a misconfigured bucket reading the same way declares an
+		// empty durable prefix for a volume whose data is intact (§22.1).
+		return fmt.Errorf("%w: %s", objectstore.ErrBucketNotFound, api.ErrorMessage())
 	}
 	var respErr *awshttp.ResponseError
-	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusPreconditionFailed {
-		return fmt.Errorf("%w: %s", objectstore.ErrPreconditionFailed, api.ErrorCode())
+	if errors.As(err, &respErr) {
+		switch respErr.HTTPStatusCode() {
+		case http.StatusPreconditionFailed, http.StatusConflict:
+			return fmt.Errorf("%w: %s", objectstore.ErrPreconditionFailed, api.ErrorCode())
+		}
 	}
+	// Everything else — SlowDown, ServiceUnavailable, RequestTimeout, InternalError,
+	// AccessDenied — stays opaque on purpose: the uploader retries anything that is
+	// not a precondition failure (§14.5), and mapping a throttle to a sentinel would
+	// stop it.
 	return err
 }
 
@@ -226,8 +261,51 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	return translate(err)
 }
 
-// Restore removes the delete marker the sweep placed, so the previous version
-// becomes current again (§21.3, INV-14).
+// Restore removes the delete marker the sweep placed, so the version underneath
+// becomes current again (§21.3). This is the operator action the whole INV-14
+// argument rests on — "a GC mistake costs a restore, not the data" — and it did not
+// exist on the production path at all.
+//
+// It refuses rather than guess in the one case that would be silently wrong: if the
+// latest version is not a delete marker, something wrote the key after the sweep
+// marked it, so the marked version is not what removing a marker would surface. An
+// operator who is told "restored" and gets different bytes rebuilds a volume from
+// content that was never what was marked.
 func (s *S3Store) Restore(ctx context.Context, key string) error {
-	return errors.New("simio/real: S3Store.Restore is not implemented")
+	var (
+		latestMarker *string
+		everMarked   bool
+		pager        = s3.NewListObjectVersionsPaginator(s.client, &s3.ListObjectVersionsInput{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(key),
+		})
+	)
+	for pager.HasMorePages() && latestMarker == nil {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return translate(err)
+		}
+		for _, dm := range page.DeleteMarkers {
+			if aws.ToString(dm.Key) != key {
+				continue // the prefix can match longer keys
+			}
+			everMarked = true
+			if aws.ToBool(dm.IsLatest) {
+				latestMarker = dm.VersionId
+				break
+			}
+		}
+	}
+	switch {
+	case latestMarker != nil:
+		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(key), VersionId: latestMarker,
+		})
+		return translate(err)
+	case everMarked:
+		// It was marked, and something has written the key since: the marked version
+		// is no longer what removing a marker would surface.
+		return fmt.Errorf("%w: %s", objectstore.ErrRestoreSuperseded, key)
+	default:
+		return fmt.Errorf("%w: %s carries no delete marker", objectstore.ErrNotFound, key)
+	}
 }
