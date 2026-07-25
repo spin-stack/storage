@@ -1,0 +1,80 @@
+package dst
+
+import (
+	"fmt"
+
+	"github.com/spin-stack/storage/internal/simio/clock"
+)
+
+// Checker observes the event stream and, at the end of a run, reports whether an
+// invariant held. Observe is called for every event in order; Check is called
+// once after the scenario completes. A checker must be able to catch a violation
+// (proven by the planted-bug test), not merely be present.
+//
+// This is the substrate every later data invariant plugs into (INV-03..INV-21):
+// each phase adds a Checker here and flips its invariant to `active`.
+type Checker interface {
+	Name() string
+	Observe(Event)
+	Check() error
+}
+
+// MonotonicClockChecker enforces INV: the monotonic clock never regresses (§12.1,
+// the basis of lease safety). It watches clock events and remembers the first
+// regression it sees.
+type MonotonicClockChecker struct {
+	last      clock.Instant
+	seen      bool
+	violation error
+}
+
+// NewMonotonicClockChecker returns a fresh checker.
+func NewMonotonicClockChecker() *MonotonicClockChecker { return &MonotonicClockChecker{} }
+
+func (c *MonotonicClockChecker) Name() string { return "monotonic-clock" }
+
+func (c *MonotonicClockChecker) Observe(e Event) {
+	if e.Kind != EventClock {
+		return
+	}
+	if c.seen && e.Mono < c.last {
+		if c.violation == nil {
+			c.violation = fmt.Errorf("monotonic clock regressed at step %d: %d -> %d", e.Step, c.last, e.Mono)
+		}
+		return
+	}
+	c.seen = true
+	c.last = e.Mono
+}
+
+func (c *MonotonicClockChecker) Check() error { return c.violation }
+
+// NoPermanentDeleteChecker enforces INV-14 (in framework form for Phase 01): the
+// GC/data path never performs a permanent (irreversible) delete. It watches
+// delete events for the Permanent flag. The sim object store only ever performs
+// reversible deletes, so this passes in real scenarios; the planted-bug test
+// feeds a Permanent delete to prove the checker catches it.
+type NoPermanentDeleteChecker struct {
+	violation error
+}
+
+// NewNoPermanentDeleteChecker returns a fresh checker.
+func NewNoPermanentDeleteChecker() *NoPermanentDeleteChecker { return &NoPermanentDeleteChecker{} }
+
+func (c *NoPermanentDeleteChecker) Name() string { return "no-permanent-delete" }
+
+func (c *NoPermanentDeleteChecker) Observe(e Event) {
+	if e.Kind == EventDelete && e.Permanent && c.violation == nil {
+		c.violation = fmt.Errorf("permanent delete of live object %q at step %d (violates §5.11/§21.3)", e.Key, e.Step)
+	}
+}
+
+func (c *NoPermanentDeleteChecker) Check() error { return c.violation }
+
+// DefaultCheckers returns the checkers active in Phase 01. Later phases append.
+func DefaultCheckers() []Checker {
+	return []Checker{
+		NewMonotonicClockChecker(),
+		NewNoPermanentDeleteChecker(),
+	}
+}

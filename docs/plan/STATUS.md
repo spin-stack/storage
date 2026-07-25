@@ -4,8 +4,21 @@ Short snapshot. Update at every increment close.
 
 - **Date:** 2026-07-24
 - **Current phase:** Phase 01 (skeleton) — **in progress**. Plan approved by human.
-- **Current increment:** **1.1 + 1.2 complete**; **1.3 next** (DST harness + checkers).
+- **Current increment:** **1.1 + 1.2 + 1.3 complete**; **1.4 next** (observability).
 - **Blockers:** none. Working on branch `phase-01/increment-1.1-skeleton-lint`.
+
+## Increment 1.3 — DONE
+
+- `internal/dst`: seeded harness (`Run(seed, scenario, checkers...)`) driving the sim
+  interfaces, deterministic event trace, and a `Checker` framework.
+- Checkers wired: `MonotonicClockChecker` (§12.1) and `NoPermanentDeleteChecker`
+  (INV-14 seed). `DefaultCheckers()` is the Phase-01 set that later phases append to.
+- Mandatory scenario set (interface-level arms): lost-PUT idempotent retry (§14.5),
+  crash-around-fdatasync (durable-prefix survives), clock-drift-beyond-skew (§12.1:
+  monotonic unaffected), network partition/heal (§12/§23).
+- **Planted-bug tests** prove the checkers actually catch violations and the failure
+  reports the reproducing seed (Adversary requirement).
+- `task dst` now runs the set for real; wired into CI. **INV-02 → active.**
 
 ## Increment 1.2 — DONE
 
@@ -56,13 +69,12 @@ Phase 01. (ADR-0001/0002/0003.)
 
 ## Next 3 steps
 
-1. **Increment 1.3** — deterministic DST harness + checker framework + fault hooks +
-   the planted-bug test. Activates **INV-02**; Adversary-reviewed.
-2. **Increment 1.4** — OTel tracing + structured logging + full §26.2 metric-name
-   registry.
-3. **Phase 01 exit gate** → reassess with the human: Track A (Phase 02: guest layout,
-   OverlayFS) and Phase 03 (vhost-user/QEMU 11.0.2) need real infrastructure not present
-   in this sandbox; Track D (S3 subsystem) is pure Go and can proceed here.
+1. **Increment 1.4** — OTel tracing + structured logging + full §26.2 metric-name
+   registry. Trace propagation + metrics-registration tests.
+2. **Phase 01 exit gate** → complete the barrier; INV-01/INV-02 active.
+3. **Reassess with the human:** Track A (Phase 02 guest layout/OverlayFS) and Phase 03
+   (vhost-user/QEMU 11.0.2) need real infrastructure absent from this sandbox; Track D
+   (S3 subsystem, §24) is pure Go and can proceed here next.
 
 ## Open questions for the human (non-blocking; defaults recorded as assumptions)
 
