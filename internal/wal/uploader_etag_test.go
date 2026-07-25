@@ -49,7 +49,7 @@ func (s *s3ETagStore) Head(ctx context.Context, key string) (objectstore.ObjectI
 	if err != nil {
 		return info, err
 	}
-	body, err := s.ObjectStore.Get(ctx, key)
+	body, err := s.Get(ctx, key)
 	if err != nil {
 		return info, err
 	}
