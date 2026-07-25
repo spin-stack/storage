@@ -153,8 +153,8 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume)
 	}
 	return staleIfZero(s.q.CreateVolume(ctx, db.CreateVolumeParams{
 		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability,
-		BlockSize: v.BlockSize, State: v.State, DekWrapped: v.DEKWrapped, KekID: v.KEKID,
-		Term: term,
+		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State,
+		DekWrapped: v.DEKWrapped, KekID: v.KEKID, Term: term,
 	}))
 }
 

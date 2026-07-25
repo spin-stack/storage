@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -96,6 +97,57 @@ func TestRecoverReconstructsState(t *testing.T) {
 	if !bytes.Equal(buf, []byte("\x00ello\x00\x00\x00world")) {
 		t.Fatalf("recovered read view mismatch: %q", buf)
 	}
+}
+
+// TestRecoverEncrypted recovers a volume whose WAL objects are ciphertext,
+// decrypting each record with the volume DEK.
+func TestRecoverEncrypted(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	vol := v7Vol()
+
+	dek, _ := crypto.GenerateDEK(&ramp{1}, 1)
+	enc := &wal.Encryption{DEK: dek, VolumeID: vol}
+
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/active.wal")
+	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableEncryption(enc)
+	l.EnableRemote(wal.NewBatcher(clk, vol, 1, dek.KeyID, wal.DefaultBatchConfig()), wal.NewUploader(store, 3))
+
+	secret := []byte("SECRET-PAYLOAD")
+	_, _ = l.Write(0, secret, 0)
+	if err := l.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// On-S3 object is ciphertext.
+	objs, _ := store.List(ctx, "wal/")
+	body, _ := store.Get(ctx, objs[0].Key)
+	if bytes.Contains(body, secret) {
+		t.Fatal("recovered object should be ciphertext")
+	}
+
+	view, _, err := recovery.Recover(ctx, store, enc, vol, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(secret))
+	view.Read(0, buf)
+	if !bytes.Equal(buf, secret) {
+		t.Fatalf("decrypted recover = %q, want %q", buf, secret)
+	}
+}
+
+type ramp struct{ b byte }
+
+func (r *ramp) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = r.b
+		r.b++
+	}
+	return len(p), nil
 }
 
 // TestDurablePointRejectsLyingSummary is the §22.1 cross-check: a summary that

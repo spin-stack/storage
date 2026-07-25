@@ -9,6 +9,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/metadata"
@@ -56,7 +57,45 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "promotion-fencing-wait", Run: scenarioPromotionFencingWait},
 		{Name: "fenced-writer-no-lost-ack", Run: scenarioFencedWriterNoLostAck},
 		{Name: "recovery-authority-is-s3", Run: scenarioRecoveryAuthorityIsS3},
+		{Name: "rebuild-metadata-from-s3", Run: scenarioRebuildMetadataFromS3},
 	}
+}
+
+// scenarioRebuildMetadataFromS3 is INV-20 (§22.5): with PostgreSQL empty,
+// rebuild-metadata reconstructs the volume from the self-describing S3 layout.
+func scenarioRebuildMetadataFromS3(s *Sim) error {
+	ctx := context.Background()
+	const vid = "00000000-0000-7000-8000-000000000050"
+	epochs := epoch.NewStore(s.Store)
+
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: vid, SizeBytes: 1 << 30, BlockSize: 65536, Durability: "remote", KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		return err
+	}
+	if _, err := epochs.Init(ctx, vid, 7); err != nil {
+		return err
+	}
+
+	md := metasim.New(s.Clock.Wall)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	if _, err := md.GetVolume(ctx, vid); err == nil {
+		return errors.New("PG should start empty")
+	}
+
+	n, err := controlplane.RebuildMetadata(ctx, s.Store, epochs, md, term)
+	if err != nil || n != 1 {
+		return fmt.Errorf("rebuild: n=%d err=%v", n, err)
+	}
+	v, err := md.GetVolume(ctx, vid)
+	if err != nil {
+		return err
+	}
+	if v.CurrentEpoch != 7 {
+		return fmt.Errorf("rebuilt epoch = %d, want 7 (from the S3 epoch object)", v.CurrentEpoch)
+	}
+	s.Notef("rebuilt PG volume from S3 (epoch 7 from the epoch object)")
+	return nil
 }
 
 // scenarioRecoveryAuthorityIsS3 is INV-08 (§5.8): the durable point is determined

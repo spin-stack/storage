@@ -1,10 +1,11 @@
 -- name: CreateVolume :execrows
--- Term-guarded create (§7).
+-- Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
+-- by rebuild-metadata (§22.5) from the authoritative S3 epoch object.
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $9
 )
-INSERT INTO volumes (volume_id, size_bytes, durability, block_size, state, dek_wrapped, kek_id)
-SELECT $1, $2, $3, $4, $5, $6, $7
+INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state, dek_wrapped, kek_id)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8
 WHERE EXISTS (SELECT 1 FROM valid);
 
 -- name: GetVolume :one

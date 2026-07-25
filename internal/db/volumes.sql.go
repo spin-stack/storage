@@ -39,31 +39,34 @@ func (q *Queries) BumpVolumeEpoch(ctx context.Context, arg BumpVolumeEpochParams
 
 const createVolume = `-- name: CreateVolume :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $9
 )
-INSERT INTO volumes (volume_id, size_bytes, durability, block_size, state, dek_wrapped, kek_id)
-SELECT $1, $2, $3, $4, $5, $6, $7
+INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state, dek_wrapped, kek_id)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8
 WHERE EXISTS (SELECT 1 FROM valid)
 `
 
 type CreateVolumeParams struct {
-	VolumeID   uuid.UUID `json:"volume_id"`
-	SizeBytes  int64     `json:"size_bytes"`
-	Durability string    `json:"durability"`
-	BlockSize  int32     `json:"block_size"`
-	State      string    `json:"state"`
-	DekWrapped []byte    `json:"dek_wrapped"`
-	KekID      string    `json:"kek_id"`
-	Term       int64     `json:"term"`
+	VolumeID     uuid.UUID `json:"volume_id"`
+	SizeBytes    int64     `json:"size_bytes"`
+	Durability   string    `json:"durability"`
+	BlockSize    int32     `json:"block_size"`
+	CurrentEpoch int64     `json:"current_epoch"`
+	State        string    `json:"state"`
+	DekWrapped   []byte    `json:"dek_wrapped"`
+	KekID        string    `json:"kek_id"`
+	Term         int64     `json:"term"`
 }
 
-// Term-guarded create (§7).
+// Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
+// by rebuild-metadata (§22.5) from the authoritative S3 epoch object.
 func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int64, error) {
 	result, err := q.db.Exec(ctx, createVolume,
 		arg.VolumeID,
 		arg.SizeBytes,
 		arg.Durability,
 		arg.BlockSize,
+		arg.CurrentEpoch,
 		arg.State,
 		arg.DekWrapped,
 		arg.KekID,
