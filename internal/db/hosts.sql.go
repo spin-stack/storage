@@ -113,6 +113,7 @@ WITH valid AS (
 INSERT INTO host_leases (host_id, granted_at, last_renewal, ttl_seconds)
 SELECT $1, now(), now(), $2
 WHERE EXISTS (SELECT 1 FROM valid)
+  AND EXISTS (SELECT 1 FROM hosts WHERE host_id = $1)
 ON CONFLICT (host_id) DO UPDATE
   SET last_renewal = now(),
       ttl_seconds = EXCLUDED.ttl_seconds
@@ -124,7 +125,10 @@ type RenewHostLeaseParams struct {
 	Term       int64     `json:"term"`
 }
 
-// Grouped per-host lease renewal (§12.6), term-guarded.
+// Grouped per-host lease renewal (§12.6), term-guarded. The host-exists predicate
+// turns "lease for an id nobody registered" into 0 rows (ErrNotFound) instead of a
+// foreign-key error: a lease is a fencing token, and granting one to an unknown
+// host invents authority over a volume nobody can find.
 func (q *Queries) RenewHostLease(ctx context.Context, arg RenewHostLeaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, renewHostLease, arg.HostID, arg.TtlSeconds, arg.Term)
 	if err != nil {
@@ -176,12 +180,10 @@ INSERT INTO hosts (
 SELECT $1, $2, $3, $4, $5, $6, $7, now()
 WHERE EXISTS (SELECT 1 FROM valid)
 ON CONFLICT (host_id) DO UPDATE
-  SET state = EXCLUDED.state,
-      agent_version = EXCLUDED.agent_version,
+  SET agent_version = EXCLUDED.agent_version,
       max_format_version = EXCLUDED.max_format_version,
       nvme_total_bytes = EXCLUDED.nvme_total_bytes,
       nvme_used_bytes = EXCLUDED.nvme_used_bytes,
-      nvme_committed_bytes = EXCLUDED.nvme_committed_bytes,
       last_heartbeat = now()
 `
 
@@ -198,6 +200,11 @@ type UpsertHostParams struct {
 
 // Term-guarded (§7): the INSERT ... SELECT produces no row when the term is stale,
 // so a zombie CP affects 0 rows.
+// The conflict path is a heartbeat: it refreshes only what the host knows about
+// itself. `state` and `nvme_committed_bytes` are the Control Plane's (SetHostState,
+// CommitHostCapacity) and are deliberately absent — a routine heartbeat carrying
+// State=ACTIVE would un-cordon a host that is being drained, and one carrying the
+// agent's idea of committed bytes would zero the ledger the drain releases against.
 func (q *Queries) UpsertHost(ctx context.Context, arg UpsertHostParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertHost,
 		arg.HostID,

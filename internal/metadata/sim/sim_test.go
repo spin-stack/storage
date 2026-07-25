@@ -406,10 +406,22 @@ func TestListVolumesByHost(t *testing.T) {
 	}
 }
 
+// TestHostLeaseRenewal: a lease is a fencing token (§12.6), so it is granted only
+// to a host that is actually registered. This test previously renewed a lease for
+// an id that was never upserted and asserted success — the sim invented a lease
+// where Postgres raises a foreign-key error, which is exactly the kind of
+// divergence the shared contract now forbids.
 func TestHostLeaseRenewal(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
+
+	if err := s.RenewHostLease(ctx, term, "host-1", 10); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("lease for an unregistered host: want ErrNotFound, got %v", err)
+	}
+	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "host-1", State: lifecycle.HostActive}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.RenewHostLease(ctx, term, "host-1", 10); err != nil {
 		t.Fatal(err)
 	}

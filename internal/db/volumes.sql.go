@@ -39,30 +39,57 @@ func (q *Queries) BumpVolumeEpoch(ctx context.Context, arg BumpVolumeEpochParams
 
 const createVolume = `-- name: CreateVolume :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $11
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $15
 )
 INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
-                     dek_wrapped, kek_id, primary_host_id, chain_depth)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                     dek_wrapped, kek_id, primary_host_id, standby_host_id, chain_depth,
+                     local_sequence, durable_sequence, published_sequence)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
 WHERE EXISTS (SELECT 1 FROM valid)
+ON CONFLICT (volume_id) DO UPDATE
+  SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
+      durability = EXCLUDED.durability,
+      block_size = EXCLUDED.block_size,
+      current_epoch = GREATEST(volumes.current_epoch, EXCLUDED.current_epoch),
+      dek_wrapped = EXCLUDED.dek_wrapped,
+      kek_id = EXCLUDED.kek_id,
+      primary_host_id = COALESCE(volumes.primary_host_id, EXCLUDED.primary_host_id),
+      standby_host_id = COALESCE(volumes.standby_host_id, EXCLUDED.standby_host_id),
+      chain_depth = EXCLUDED.chain_depth,
+      local_sequence = GREATEST(volumes.local_sequence, EXCLUDED.local_sequence),
+      durable_sequence = GREATEST(volumes.durable_sequence, EXCLUDED.durable_sequence),
+      published_sequence = GREATEST(volumes.published_sequence, EXCLUDED.published_sequence),
+      updated_at = now()
 `
 
 type CreateVolumeParams struct {
-	VolumeID      uuid.UUID   `json:"volume_id"`
-	SizeBytes     int64       `json:"size_bytes"`
-	Durability    string      `json:"durability"`
-	BlockSize     int32       `json:"block_size"`
-	CurrentEpoch  int64       `json:"current_epoch"`
-	State         string      `json:"state"`
-	DekWrapped    []byte      `json:"dek_wrapped"`
-	KekID         string      `json:"kek_id"`
-	PrimaryHostID pgtype.UUID `json:"primary_host_id"`
-	ChainDepth    int32       `json:"chain_depth"`
-	Term          int64       `json:"term"`
+	VolumeID          uuid.UUID   `json:"volume_id"`
+	SizeBytes         int64       `json:"size_bytes"`
+	Durability        string      `json:"durability"`
+	BlockSize         int32       `json:"block_size"`
+	CurrentEpoch      int64       `json:"current_epoch"`
+	State             string      `json:"state"`
+	DekWrapped        []byte      `json:"dek_wrapped"`
+	KekID             string      `json:"kek_id"`
+	PrimaryHostID     pgtype.UUID `json:"primary_host_id"`
+	StandbyHostID     pgtype.UUID `json:"standby_host_id"`
+	ChainDepth        int32       `json:"chain_depth"`
+	LocalSequence     int64       `json:"local_sequence"`
+	DurableSequence   int64       `json:"durable_sequence"`
+	PublishedSequence int64       `json:"published_sequence"`
+	Term              int64       `json:"term"`
 }
 
 // Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
 // by rebuild-metadata (§22.5) from the authoritative S3 epoch object.
+//
+// The conflict path is what makes rebuild-metadata safe to run twice, or from two
+// operators at once: both see ErrNotFound for the same volume and both INSERT, and
+// the loser must converge instead of aborting with 23505 after having written an
+// arbitrary prefix of the catalog. It converges *without regressing*: the epoch
+// (the fencing token), the size (§3 is grow-only), the watermarks and the ownership
+// columns keep the higher/existing value, and `state` is not touched at all — the
+// §7 lifecycle moves only through SetVolumeState.
 func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int64, error) {
 	result, err := q.db.Exec(ctx, createVolume,
 		arg.VolumeID,
@@ -74,7 +101,11 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.DekWrapped,
 		arg.KekID,
 		arg.PrimaryHostID,
+		arg.StandbyHostID,
 		arg.ChainDepth,
+		arg.LocalSequence,
+		arg.DurableSequence,
+		arg.PublishedSequence,
 		arg.Term,
 	)
 	if err != nil {
@@ -180,11 +211,43 @@ func (q *Queries) ResizeVolume(ctx context.Context, arg ResizeVolumeParams) (int
 	return result.RowsAffected(), nil
 }
 
+const setVolumeState = `-- name: SetVolumeState :execrows
+UPDATE volumes
+   SET state = $2, updated_at = now()
+ WHERE volume_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND state = ANY($4::text[])
+`
+
+type SetVolumeStateParams struct {
+	VolumeID      uuid.UUID `json:"volume_id"`
+	State         string    `json:"state"`
+	Term          int64     `json:"term"`
+	AllowedStates []string  `json:"allowed_states"`
+}
+
+// The §7 ownership machine, term-guarded and transition-guarded: $4 is the set of
+// states that may legally become $2, taken from the lifecycle table. In the
+// predicate rather than in Go so two Control Planes reacting to the same suspicion
+// cannot both win a read-modify-write.
+func (q *Queries) SetVolumeState(ctx context.Context, arg SetVolumeStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setVolumeState,
+		arg.VolumeID,
+		arg.State,
+		arg.Term,
+		arg.AllowedStates,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateVolumeWatermarks = `-- name: UpdateVolumeWatermarks :execrows
 UPDATE volumes
-   SET local_sequence = $2,
-       durable_sequence = $3,
-       published_sequence = $4,
+   SET local_sequence = GREATEST(local_sequence, $2),
+       durable_sequence = GREATEST(durable_sequence, $3),
+       published_sequence = GREATEST(published_sequence, $4),
        updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $5
@@ -198,7 +261,11 @@ type UpdateVolumeWatermarksParams struct {
 	Term              int64     `json:"term"`
 }
 
-// Lazy, informative watermark update (§5.8, §12.6), term-guarded.
+// Lazy, informative watermark update (§5.8, §12.6), term-guarded and monotonic.
+// GREATEST is the fencing part: promotion does not change the CP term, so an
+// epoch-N primary's report that was queued behind a retry still passes the term
+// guard after epoch N+1 has published its own. Component-wise max preserves
+// published ≤ durable ≤ local (INV-03), which the caller already validated.
 func (q *Queries) UpdateVolumeWatermarks(ctx context.Context, arg UpdateVolumeWatermarksParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateVolumeWatermarks,
 		arg.VolumeID,

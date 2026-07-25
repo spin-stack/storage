@@ -22,6 +22,7 @@ INSERT INTO snapshots (
 )
 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
 WHERE EXISTS (SELECT 1 FROM valid)
+ON CONFLICT DO NOTHING
 `
 
 type CreateSnapshotParams struct {
@@ -39,6 +40,11 @@ type CreateSnapshotParams struct {
 }
 
 // Term-guarded snapshot record (§19).
+// INV-16: a snapshot is immutable once it is in the catalog, so a duplicate record
+// — a retried request, or two operators rebuilding at once — is a no-op rather than
+// an overwrite or a 23505 that aborts the rebuild half-way. Untargeted, so the
+// request_id uniqueness (§18 idempotency) is covered too. 0 rows is ambiguous
+// between "already there" and "stale term"; the adapter disambiguates.
 func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) (int64, error) {
 	result, err := q.db.Exec(ctx, createSnapshot,
 		arg.SnapshotID,
@@ -81,4 +87,36 @@ func (q *Queries) GetSnapshot(ctx context.Context, snapshotID uuid.UUID) (*Snaps
 		&i.CreatedAt,
 	)
 	return &i, err
+}
+
+const setSnapshotState = `-- name: SetSnapshotState :execrows
+UPDATE snapshots
+   SET state = $2
+ WHERE snapshot_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND state = ANY($4::text[])
+`
+
+type SetSnapshotStateParams struct {
+	SnapshotID    uuid.UUID `json:"snapshot_id"`
+	State         string    `json:"state"`
+	Term          int64     `json:"term"`
+	AllowedStates []string  `json:"allowed_states"`
+}
+
+// The §19 lifecycle (CREATING → PUBLISHED | FAILED → DELETING), term-guarded and
+// transition-guarded in the predicate: $3 is the set of states that may legally
+// become $2. Without this a snapshot whose publication crashed stays CREATING
+// forever and the catalog side of GC never sees it.
+func (q *Queries) SetSnapshotState(ctx context.Context, arg SetSnapshotStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setSnapshotState,
+		arg.SnapshotID,
+		arg.State,
+		arg.Term,
+		arg.AllowedStates,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

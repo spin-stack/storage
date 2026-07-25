@@ -28,6 +28,13 @@ var (
 	// ErrCapacityUnderflow means a capacity release would drive a host's committed
 	// bytes below zero — an accounting bug, never silently clamped (§28.2).
 	ErrCapacityUnderflow = errors.New("metadata: committed capacity would go negative")
+	// ErrWatermarkOrder means a watermark report violates
+	// published ≤ durable ≤ local (INV-03).
+	ErrWatermarkOrder = errors.New("metadata: watermarks out of order")
+	// ErrInvalidID means an identifier is not usable as a key — empty, or (in an
+	// implementation that constrains identifier syntax) malformed. It is never
+	// coerced to NULL or to a row nobody can find again.
+	ErrInvalidID = errors.New("metadata: invalid identifier")
 )
 
 // The lifecycle vocabularies (host/volume/snapshot/operation states, §7/§19/§28.1)
@@ -105,15 +112,32 @@ type Operation struct {
 	Error        string
 }
 
-// Store is the Control Plane metadata authority. Mutations take the caller's CP
-// term and return ErrStaleTerm if it is not current.
+// Store is the Control Plane metadata authority. Every implementation answers the
+// same way; the shared contract lives in metadata/metadatatest and runs against
+// both (sim in the unit lane, pg in the integration lane). In summary:
+//
+//   - Arguments are validated first: an empty identifier is ErrInvalidID, and a
+//     value outside a lifecycle vocabulary is lifecycle.ErrUnknownState. Neither is
+//     a question about leadership.
+//   - Then the term. Every mutation validates the caller's CP term (§7); a stale
+//     term — including term 0, before any election — is ErrStaleTerm, and it wins
+//     over every other diagnosis. A zombie CP must learn that it is a zombie rather
+//     than be told its resize was a shrink.
+//   - Then existence: a mutation naming a row that is not there is ErrNotFound.
+//   - Then the domain guard: lifecycle.ErrInvalidTransition, ErrShrinkNotAllowed,
+//     ErrCapacityUnderflow, ErrWatermarkOrder.
 type Store interface {
 	// AcquireLeadership takes/renews leadership, incrementing and returning the term.
 	AcquireLeadership(ctx context.Context, holderID string) (int64, error)
 	// GetLeader returns the current leader record.
 	GetLeader(ctx context.Context) (Leader, error)
 
-	// UpsertHost registers or updates a host (term-guarded).
+	// UpsertHost registers a host or refreshes what the host itself reports:
+	// agent version, format version, NVMe totals, heartbeat. It deliberately does
+	// NOT carry the fleet state or the committed-capacity ledger — those belong to
+	// the Control Plane (SetHostState, CommitHostCapacity), and a routine heartbeat
+	// that carried them would un-cordon a draining host and zero its ledger.
+	// Term-guarded.
 	UpsertHost(ctx context.Context, term int64, h Host) error
 	// GetHost returns a host.
 	GetHost(ctx context.Context, hostID string) (Host, error)
@@ -132,7 +156,12 @@ type Store interface {
 	// GetHostLease returns a host's lease.
 	GetHostLease(ctx context.Context, hostID string) (HostLease, error)
 
-	// CreateVolume inserts a volume (term-guarded).
+	// CreateVolume inserts a volume (term-guarded). It is idempotent and never
+	// destructive: for an id that already exists it converges instead of aborting —
+	// two operators running rebuild-metadata at once must both finish — but it never
+	// lowers current_epoch, shrinks size_bytes, rewinds a watermark, blanks an
+	// owner, or rewrites the lifecycle state. Ownership and state move only through
+	// BumpVolumeEpoch and SetVolumeState.
 	CreateVolume(ctx context.Context, term int64, v Volume) error
 	// GetVolume returns a volume.
 	GetVolume(ctx context.Context, volumeID string) (Volume, error)
@@ -143,14 +172,29 @@ type Store interface {
 	// returning the new epoch (§12.3).
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error)
 	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
+	// A report violating published ≤ durable ≤ local is ErrWatermarkOrder (INV-03).
+	// A report that is merely *late* — an epoch-N primary's, delivered after epoch
+	// N+1 published its own — is not an error and is not applied: each watermark is
+	// monotonic, because promotion does not change the CP term and this number is
+	// what an operator reads during an incident.
 	UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error
 	// ResizeVolume grows size_bytes (term-guarded); shrink is rejected (§3 non-goal).
 	ResizeVolume(ctx context.Context, term int64, volumeID string, newSizeBytes int64) error
+	// SetVolumeState moves a volume through the §7 ownership machine (term-guarded).
+	// The move is guarded by the lifecycle table inside the write itself, so two
+	// Control Planes reacting to the same suspicion cannot both win.
+	SetVolumeState(ctx context.Context, term int64, volumeID string, state lifecycle.VolumeState) error
 
-	// CreateSnapshot records a published snapshot (term-guarded, §19).
+	// CreateSnapshot records a snapshot (term-guarded, §19). Like CreateVolume it is
+	// idempotent, but a snapshot is immutable (INV-16): re-recording an existing id
+	// is a no-op, never an overwrite.
 	CreateSnapshot(ctx context.Context, term int64, s Snapshot) error
 	// GetSnapshot returns a snapshot by id.
 	GetSnapshot(ctx context.Context, snapshotID string) (Snapshot, error)
+	// SetSnapshotState moves a snapshot through the §19 lifecycle (term-guarded,
+	// transition-guarded in the write). Without it a snapshot whose publication
+	// crashed stays CREATING forever and the catalog side of GC never sees it.
+	SetSnapshotState(ctx context.Context, term int64, snapshotID string, state lifecycle.SnapshotState) error
 
 	// RecordOperation records an admin operation idempotently (term-guarded, §7/§18);
 	// recorded is false if the operation_id already existed (a duplicate request).
