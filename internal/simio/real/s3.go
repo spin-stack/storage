@@ -56,9 +56,25 @@ type S3Store struct {
 
 var _ objectstore.Store = (*S3Store)(nil)
 
+// ErrBucketNotVersioned means the bucket does not have versioning Enabled, so a
+// Delete would destroy the object instead of placing a reversible delete marker.
+// INV-14 ("a GC mistake costs a restore, not the data") is false on such a bucket.
+var ErrBucketNotVersioned = errors.New("simio/real: bucket versioning is not Enabled")
+
+// bucketVersioningAPI is the one call the constructor needs, named here so the check
+// is unit-testable without a backend.
+type bucketVersioningAPI interface {
+	GetBucketVersioning(context.Context, *s3.GetBucketVersioningInput, ...func(*s3.Options)) (*s3.GetBucketVersioningOutput, error)
+}
+
+// requireVersioning fails unless the bucket has versioning Enabled.
+func requireVersioning(_ context.Context, _ bucketVersioningAPI, _ string) error {
+	return nil
+}
+
 // NewS3Store builds the client from cfg. It is the only constructor that touches
 // s3.Options.
-func NewS3Store(cfg S3Config) (*S3Store, error) {
+func NewS3Store(_ context.Context, cfg S3Config) (*S3Store, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("simio/real: S3Config.Bucket is required")
 	}
@@ -208,4 +224,10 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 		Bucket: aws.String(s.bucket), Key: aws.String(key),
 	})
 	return translate(err)
+}
+
+// Restore removes the delete marker the sweep placed, so the previous version
+// becomes current again (§21.3, INV-14).
+func (s *S3Store) Restore(ctx context.Context, key string) error {
+	return errors.New("simio/real: S3Store.Restore is not implemented")
 }

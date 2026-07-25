@@ -96,17 +96,25 @@ func TestSimEventualList(t *testing.T) {
 	}
 }
 
+// Finding 1, structural half of INV-14. "A GC mistake costs a restore, not the data"
+// is only true if every implementation the GC can be handed can actually reverse a
+// mark — including the S3-backed one, which is the store production runs against and
+// which had no Restore at all. Restore is part of objectstore.Store, so this is a
+// compile-time fact rather than a convention: a new implementation that cannot
+// reverse a mark does not build.
+var (
+	_ objectstore.Store = (*sim.ObjectStore)(nil)
+	_ objectstore.Store = (*real.ObjectStore)(nil)
+	_ objectstore.Store = (*real.S3Store)(nil)
+)
+
 // TestDeleteIsReversibleAcrossImplementations is the structural half of INV-14
 // (DEV-0006): every store must implement Delete as a reversible mark, so a GC
 // mistake costs a restore and not the data. The S3-backed store satisfies this via
 // the backend's delete markers, asserted in the integration lane.
 func TestDeleteIsReversibleAcrossImplementations(t *testing.T) {
 	ctx := context.Background()
-	type restorable interface {
-		objectstore.Store
-		Restore(context.Context, string) error
-	}
-	impls := map[string]restorable{"sim": sim.NewObjectStore()}
+	impls := map[string]objectstore.Store{"sim": sim.NewObjectStore()}
 	rs, err := real.NewObjectStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -150,6 +158,13 @@ func TestDeleteIsReversibleAcrossImplementations(t *testing.T) {
 			}
 			if body, _ := s.Get(ctx, "wal/v/1/x.wal"); string(body) != "v2" {
 				t.Fatalf("body after rewrite = %q", body)
+			}
+			// Finding 7. This test used to stop here, which blessed the one outcome an
+			// operator must never get: the un-GC runbook step returning the *rewritten*
+			// bytes as though they were the marked ones. The marked version is not what
+			// a restore would surface any more, so the restore has to say so.
+			if err := s.Restore(ctx, "wal/v/1/x.wal"); !errors.Is(err, objectstore.ErrRestoreSuperseded) {
+				t.Fatalf("restore after a rewrite = %v, want ErrRestoreSuperseded", err)
 			}
 		})
 	}

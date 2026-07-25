@@ -9,10 +9,12 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/objectstore/storetest"
 	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/internal/testinfra"
 )
 
 // TestS3StoreSatisfiesTheContract runs the *same* contract the sim and the
@@ -22,29 +24,44 @@ import (
 // not exist, and this is where that shows up.
 func TestS3StoreSatisfiesTheContract(t *testing.T) {
 	be := backendConfig(t)
-	admin := be.Client()
-	ctx := context.Background()
 
+	// Finding 1. This ran on an unversioned bucket, where DeleteObject destroys the
+	// object outright — so the contract's reversibility assertions were being proved
+	// against a bucket on which INV-14 is simply false. Production buckets are
+	// versioned (§10); the contract runs on one too, or it proves nothing.
 	var n int
 	storetest.RunContract(t, func(t *testing.T) objectstore.Store {
 		// A fresh bucket per subtest: no shared state between scenarios.
 		n++
-		bucket := fmt.Sprintf("contract-%d", n)
-		if _, err := admin.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-			t.Fatalf("create bucket: %v", err)
-		}
-		store, err := real.NewS3Store(real.S3Config{
-			Bucket:    bucket,
-			Endpoint:  be.Endpoint,
-			Region:    be.Region,
-			AccessKey: be.AccessKey,
-			SecretKey: be.SecretKey,
-		})
-		if err != nil {
-			t.Fatalf("new s3 store: %v", err)
-		}
-		return store
+		return newVersionedS3Store(t, be, fmt.Sprintf("contract-%d", n))
 	})
+}
+
+// newVersionedS3Store creates a versioned bucket and an S3Store over it.
+func newVersionedS3Store(t *testing.T, be testinfra.ObjectStoreBackend, bucket string) *real.S3Store {
+	t.Helper()
+	ctx := context.Background()
+	admin := be.Client()
+	if _, err := admin.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("create bucket %s: %v", bucket, err)
+	}
+	if _, err := admin.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket:                  aws.String(bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
+	}); err != nil {
+		t.Fatalf("enable versioning on %s: %v", bucket, err)
+	}
+	store, err := real.NewS3Store(ctx, real.S3Config{
+		Bucket:    bucket,
+		Endpoint:  be.Endpoint,
+		Region:    be.Region,
+		AccessKey: be.AccessKey,
+		SecretKey: be.SecretKey,
+	})
+	if err != nil {
+		t.Fatalf("new s3 store on %s: %v", bucket, err)
+	}
+	return store
 }
 
 // TestS3StoreListPaginates: the wrapper must hide S3's 1000-key page cap, because
@@ -53,17 +70,7 @@ func TestS3StoreSatisfiesTheContract(t *testing.T) {
 func TestS3StoreListPaginates(t *testing.T) {
 	be := backendConfig(t)
 	ctx := context.Background()
-	bucket := "contract-pagination"
-	if _, err := be.Client().CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatal(err)
-	}
-	store, err := real.NewS3Store(real.S3Config{
-		Bucket: bucket, Endpoint: be.Endpoint, Region: be.Region,
-		AccessKey: be.AccessKey, SecretKey: be.SecretKey,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newVersionedS3Store(t, be, "contract-pagination")
 
 	const objects = 1100
 	for i := range objects {
@@ -93,10 +100,8 @@ func TestS3StoreChecksumWhenRequiredAlsoWorks(t *testing.T) {
 	be := backendConfig(t)
 	ctx := context.Background()
 	bucket := "contract-checksum-required"
-	if _, err := be.Client().CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatal(err)
-	}
-	store, err := real.NewS3Store(real.S3Config{
+	makeVersionedBucket(t, ctx, be.Client(), bucket)
+	store, err := real.NewS3Store(ctx, real.S3Config{
 		Bucket: bucket, Endpoint: be.Endpoint, Region: be.Region,
 		AccessKey: be.AccessKey, SecretKey: be.SecretKey,
 		ChecksumWhenRequired: true,

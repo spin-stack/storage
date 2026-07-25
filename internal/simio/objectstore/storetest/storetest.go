@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -144,6 +146,209 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 		if got, err := s.Get(ctx, "empty"); err != nil || len(got) != 0 {
 			t.Fatalf("get of an empty object: %q err=%v", got, err)
+		}
+	})
+
+	// Finding 6. Create-only is what makes a retried WAL upload harmless (INV-21) and
+	// a published manifest immutable (INV-16); the If-Match CAS is the §12.4 epoch
+	// fence (INV-10). Both are claims about *concurrent* writers, and neither had a
+	// single concurrent test — a check-then-act implementation passes every
+	// sequential assertion above while admitting two winners, silently, with err ==
+	// nil for both. Two promoters both winning CompareAndAdvance is split brain.
+	t.Run("create-only admits exactly one concurrent writer", func(t *testing.T) {
+		s := newStore(t)
+		const writers = 16
+		var (
+			wg      sync.WaitGroup
+			mu      sync.Mutex
+			winners []string
+			losers  []error
+			start   = make(chan struct{})
+		)
+		for i := range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // release every writer at once, not as they are scheduled
+				body := fmt.Sprintf("writer-%d", i)
+				_, err := s.Put(ctx, "wal/contended.wal", []byte(body), objectstore.PutOptions{IfNoneMatch: true})
+				mu.Lock()
+				defer mu.Unlock()
+				if err == nil {
+					winners = append(winners, body)
+					return
+				}
+				losers = append(losers, err)
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if len(winners) != 1 {
+			t.Fatalf("create-only admitted %d concurrent writers, want exactly 1", len(winners))
+		}
+		for _, err := range losers {
+			if !errors.Is(err, objectstore.ErrPreconditionFailed) {
+				t.Fatalf("a loser got %v, want ErrPreconditionFailed", err)
+			}
+		}
+		got, err := s.Get(ctx, "wal/contended.wal")
+		if err != nil || string(got) != winners[0] {
+			t.Fatalf("stored body = %q err=%v, want the winner's %q", got, err, winners[0])
+		}
+	})
+
+	t.Run("If-Match admits exactly one concurrent winner", func(t *testing.T) {
+		s := newStore(t)
+		res, err := s.Put(ctx, "epoch", []byte("epoch-1"), objectstore.PutOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		const contenders = 16
+		var (
+			wg      sync.WaitGroup
+			mu      sync.Mutex
+			winners []string
+			losers  []error
+			start   = make(chan struct{})
+		)
+		for i := range contenders {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // release every contender at once
+				body := fmt.Sprintf("epoch-%d", i+2)
+				_, err := s.Put(ctx, "epoch", []byte(body), objectstore.PutOptions{IfMatch: res.ETag})
+				mu.Lock()
+				defer mu.Unlock()
+				if err == nil {
+					winners = append(winners, body)
+					return
+				}
+				losers = append(losers, err)
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if len(winners) != 1 {
+			t.Fatalf("%d concurrent CAS operations won on one ETag, want exactly 1 — that is split brain", len(winners))
+		}
+		for _, err := range losers {
+			if !errors.Is(err, objectstore.ErrPreconditionFailed) {
+				t.Fatalf("a fenced contender got %v, want ErrPreconditionFailed", err)
+			}
+		}
+		if got, _ := s.Get(ctx, "epoch"); string(got) != winners[0] {
+			t.Fatalf("stored body = %q, want the winner's %q", got, winners[0])
+		}
+	})
+
+	// Finding 3. An ETag is a CAS token and nothing else. S3 returns a quoted MD5 and
+	// a multipart object's is an MD5-of-MD5s with a `-N` suffix; both in-process
+	// stores happen to use SHA-256. Any code that compares an ETag against a content
+	// hash it computed reports a byte-perfect object as divergent on a real backend —
+	// which is the §14.5 lost-response path, i.e. the most common S3 failure there is.
+	// The contract pins only what an ETag is allowed to promise.
+	t.Run("an ETag is opaque, stable, and changes with the content", func(t *testing.T) {
+		s := newStore(t)
+		first, err := s.Put(ctx, "k", []byte("v1"), objectstore.PutOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := s.Head(ctx, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.ETag != first.ETag {
+			t.Fatalf("HEAD ETag %q != PUT ETag %q; a CAS token that is not stable is not a CAS token", info.ETag, first.ETag)
+		}
+		second, err := s.Put(ctx, "k", []byte("v2-longer"), objectstore.PutOptions{IfMatch: first.ETag})
+		if err != nil {
+			t.Fatalf("CAS with the ETag we were handed must work: %v", err)
+		}
+		if second.ETag == first.ETag {
+			t.Fatal("the ETag did not change when the content did; a stale CAS would then succeed")
+		}
+		if _, err := s.Put(ctx, "k", []byte("v3"), objectstore.PutOptions{IfMatch: first.ETag}); !errors.Is(err, objectstore.ErrPreconditionFailed) {
+			t.Fatalf("CAS on the superseded ETag: %v, want ErrPreconditionFailed", err)
+		}
+	})
+
+	// Finding 8. The GC runs on a schedule and an operator can run it by hand at the
+	// same time. Whether Delete of a key another pass already marked is an error or a
+	// no-op decides whether the second pass abandons the rest of the bucket, so the
+	// contract has to state it rather than leave each implementation to choose.
+	t.Run("delete of an already-marked key is ErrNotFound", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.Put(ctx, "k", []byte("v"), objectstore.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "k"); !errors.Is(err, objectstore.ErrNotFound) {
+			t.Fatalf("second delete: %v, want ErrNotFound", err)
+		}
+	})
+
+	// Findings 1 and 7. INV-14 says a GC mistake costs a restore, not the data. That
+	// argument only holds if Restore exists on the store the GC actually runs
+	// against, and if it either returns the marked bytes or says why it cannot.
+	t.Run("a mark is reversible", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.Put(ctx, "wal/v/1/x.wal", []byte("acked-payload"), objectstore.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "wal/v/1/x.wal"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Restore(ctx, "wal/v/1/x.wal"); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if got, err := s.Get(ctx, "wal/v/1/x.wal"); err != nil || string(got) != "acked-payload" {
+			t.Fatalf("restored body = %q err=%v", got, err)
+		}
+	})
+
+	t.Run("restore of a key that was never marked is ErrNotFound", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.Put(ctx, "k", []byte("v"), objectstore.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Restore(ctx, "k"); !errors.Is(err, objectstore.ErrNotFound) {
+			t.Fatalf("restore of a live key: %v, want ErrNotFound", err)
+		}
+		if err := s.Restore(ctx, "absent"); !errors.Is(err, objectstore.ErrNotFound) {
+			t.Fatalf("restore of a missing key: %v, want ErrNotFound", err)
+		}
+	})
+
+	// Finding 7. The un-GC runbook is "restore the version the sweep marked". If
+	// anything wrote the key again in the meantime — the Agent's idempotent retry, a
+	// rebuild, another operator — the marked version is no longer the one a restore
+	// would surface. Returning the *new* bytes there is the worst outcome available:
+	// the operator believes the data is back and the volume is reconstructed from
+	// content that was never what was marked. Refuse, distinctly.
+	t.Run("restore after the key was rewritten is refused, not silently wrong", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.Put(ctx, "wal/v/1/x.wal", []byte("the-marked-bytes"), objectstore.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "wal/v/1/x.wal"); err != nil {
+			t.Fatal(err)
+		}
+		// A writer rewrites the key; on a versioned bucket this stacks a new current
+		// version over the delete marker.
+		if _, err := s.Put(ctx, "wal/v/1/x.wal", []byte("different"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
+			t.Fatalf("create-only over a marked key must succeed: %v", err)
+		}
+		err := s.Restore(ctx, "wal/v/1/x.wal")
+		if !errors.Is(err, objectstore.ErrRestoreSuperseded) {
+			t.Fatalf("restore after a rewrite: %v, want ErrRestoreSuperseded", err)
+		}
+		if got, _ := s.Get(ctx, "wal/v/1/x.wal"); string(got) != "different" {
+			t.Fatalf("a refused restore must not change the object: %q", got)
 		}
 	})
 }
