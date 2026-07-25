@@ -13,12 +13,14 @@
 #   - internal/testinfra   integration-only container scaffolding
 #   - .../objectstore/storetest  the shared store contract: test scaffolding that
 #                          every implementation runs, imported only by tests
+#   - internal/metadata/metadatatest  the same, for metadata.Store: its pg half only
+#                          runs in the integration lane
 #   - migrations           integration-only (applied by the integration lane)
 #   - cmd/                  main() entrypoints
 #   - internal/dst         the DST test harness itself
 set -euo pipefail
 
-EXCLUDE='internal/db/|internal/metadata/pg/|internal/simio/real/s3.go|internal/simio/objectstore/storetest/|internal/testinfra/|migrations/|/cmd/|internal/dst/'
+EXCLUDE='internal/db/|internal/metadata/pg/|internal/simio/real/s3.go|internal/simio/objectstore/storetest/|internal/metadata/metadatatest/|internal/testinfra/|migrations/|/cmd/|internal/dst/'
 
 # -count=1: never reuse a cached test result here. A cached entry can carry coverage
 # blocks from an older compilation of a file, so the profile ends up describing two
