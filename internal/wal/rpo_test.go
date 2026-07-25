@@ -8,6 +8,7 @@ import (
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
+	"github.com/spin-stack/storage/internal/wal/format"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -118,8 +119,11 @@ func TestDurableGapBytesCountsWhatS3DoesNotHave(t *testing.T) {
 	if !ok {
 		t.Fatal("wal_durable_gap_bytes was never recorded")
 	}
-	if gap <= 0 {
-		t.Fatalf("wal_durable_gap_bytes = %v after 4 ACKed FLUSHed records that no S3 object covers", gap)
+	// Exactly the four records: the gauge is a byte count an operator sizes a
+	// recovery window with, not a boolean.
+	want := float64(4 * (format.RecordHeaderSize + len("guest-data")))
+	if gap != want {
+		t.Fatalf("wal_durable_gap_bytes = %v after 4 ACKed FLUSHes that no S3 object covers, want %v", gap, want)
 	}
 }
 
