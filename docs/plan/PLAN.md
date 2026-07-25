@@ -123,8 +123,8 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 | Phase | Roadmap § | Title | State | Depends on |
 |---|---|---|---|---|
 | **01** | 1 | Skeleton + simulable interfaces + minimal DST harness + tracing/logging | **DONE** ✓ (1.1–1.4; INV-01/02 active) | — |
-| 02 | 2 | Guest layout: three devices + OverlayFS | not expanded | 01 |
-| 03 | 3 | vhost-user-blk raw backend + reconnection + inflight shmfd | not expanded | 01 |
+| 02 | 2 | Guest layout: three devices + OverlayFS | **expanded (planning); needs VM/mount infra** | 01 |
+| 03 | 3 | vhost-user-blk raw backend + reconnection + inflight shmfd | **expanded (planning); needs QEMU 11.0.2** | 01 |
 | 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | **expanded; format review pending** | 01 |
 | 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | not expanded | 04 |
 | 06 | 6 | Remote WAL: on-demand batching + PUT idempotency + summary objects | not expanded | 04 (05 for ciphertext) |
