@@ -62,7 +62,10 @@ func NewPromoter(md metadata.Store, epochs *epoch.Store, clk clock.Clock, leaseT
 }
 
 // FencingDeadline is the earliest wall instant at which a primary whose lease was
-// last renewed at renewedAt may be superseded (§12.3 step 3).
+// last renewed at renewedAt may be superseded (§12.3 step 3), for this CP's
+// configured lease TTL. Promote may wait past it — it also honours the lease row it
+// reads for the host being fenced, including a TTL longer than this one — so this is
+// a lower bound on the wait, never a promise that the promotion will proceed.
 func (p *Promoter) FencingDeadline(renewedAt time.Time) time.Time {
 	return renewedAt.Add(p.leaseTTL + p.maxClockSkew)
 }
