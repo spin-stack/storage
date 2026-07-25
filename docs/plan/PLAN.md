@@ -122,7 +122,7 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 
 | Phase | Roadmap § | Title | State | Depends on |
 |---|---|---|---|---|
-| **01** | 1 | Skeleton + simulable interfaces + minimal DST harness + tracing/logging | **in progress** (1.1 ✓, 1.2 next) | — |
+| **01** | 1 | Skeleton + simulable interfaces + minimal DST harness + tracing/logging | **DONE** ✓ (1.1–1.4; INV-01/02 active) | — |
 | 02 | 2 | Guest layout: three devices + OverlayFS | not expanded | 01 |
 | 03 | 3 | vhost-user-blk raw backend + reconnection + inflight shmfd | not expanded | 01 |
 | 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | not expanded | 01 |

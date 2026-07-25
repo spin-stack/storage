@@ -3,9 +3,28 @@
 Short snapshot. Update at every increment close.
 
 - **Date:** 2026-07-24
-- **Current phase:** Phase 01 (skeleton) — **in progress**. Plan approved by human.
-- **Current increment:** **1.1 + 1.2 + 1.3 complete**; **1.4 next** (observability).
-- **Blockers:** none. Working on branch `phase-01/increment-1.1-skeleton-lint`.
+- **Current phase:** **Phase 01 COMPLETE** (skeleton barrier). Plan approved by human.
+- **Increments:** 1.1, 1.2, 1.3, 1.4 all done. **INV-01 + INV-02 active.**
+- **Blockers:** none. Branch `phase-01/increment-1.1-skeleton-lint`. Phase 01 exit gate
+  green; awaiting human steer on what to build next (see "Next 3 steps").
+
+## Increment 1.4 — DONE
+
+- `internal/obs`: OTel tracing + W3C context propagation across the `simio.network`
+  boundary (`InjectContext`/`ExtractContext`), structured JSON logging keyed on
+  request_id/operation_id/volume_id/host_id + trace_id/span_id, and the full §26.2
+  metric taxonomy as a declarative `Catalog()` built into live OTel instruments.
+- Tests: trace propagates across a CP→Agent boundary; nested CP→Agent→objectstore
+  spans share a trace; structured log carries all correlation fields; metrics catalog
+  well-formed (no dupes, load-bearing names present) and every entry registered.
+
+## Phase 01 exit gate — GREEN
+
+- Module builds; `task ci` = build + lint(golangci + simulable) + test(-race) + dst.
+- INV-01 (simulable lint) + INV-02 (deterministic replay) active and green.
+- Four `simio` interfaces (real + sim) contract-tested; DST harness + checker
+  framework + planted-bug proof; OTel + logging + §26.2 registry.
+- No `time.Now()`/socket/disk/S3 escape anywhere (lint proves it).
 
 ## Increment 1.3 — DONE
 
@@ -67,14 +86,22 @@ Go 1.26 · module `github.com/spin-stack/storage` in `spin-stack/storage/` · Ta
 golangci-lint (+ custom `simulable` analyzer) · GitHub Actions · parallel tracks after
 Phase 01. (ADR-0001/0002/0003.)
 
-## Next 3 steps
+## Next 3 steps (needs human steer)
 
-1. **Increment 1.4** — OTel tracing + structured logging + full §26.2 metric-name
-   registry. Trace propagation + metrics-registration tests.
-2. **Phase 01 exit gate** → complete the barrier; INV-01/INV-02 active.
-3. **Reassess with the human:** Track A (Phase 02 guest layout/OverlayFS) and Phase 03
-   (vhost-user/QEMU 11.0.2) need real infrastructure absent from this sandbox; Track D
-   (S3 subsystem, §24) is pure Go and can proceed here next.
+Phase 01 barrier is done, so parallel tracks (ADR-0002) are unlocked. Options:
+
+1. **Track A — Phase 02** (guest layout: three devices + OverlayFS) and **Phase 03**
+   (vhost-user-blk + QEMU 11.0.2 inflight shmfd): highest-value data path, but need
+   real infrastructure (mounts, QEMU) **not present in this sandbox** — best done where
+   that infra exists; RISK-10 (inflight-shmfd) is *Unverified* until then.
+2. **Track A — Phase 04** (CoW 64 KiB + local WAL, real extents, format v2 w/ crypto
+   fields + WAL property tests §25.2): **pure Go, fully buildable here**, and the
+   correctness spine (activates INV-03/04/05/18). Strong candidate to continue now.
+3. **Track D — S3 client subsystem** (§24: hedged GETs, retry budget, circuit breaker
+   over the `objectstore` interface): pure Go, buildable here, feeds Phase 06/08/11.
+
+Recommendation: continue with **Phase 04** here (pure Go, unblocks 05/06), and schedule
+Phases 02/03 for an environment with QEMU/mounts.
 
 ## Open questions for the human (non-blocking; defaults recorded as assumptions)
 
