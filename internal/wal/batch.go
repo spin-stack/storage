@@ -155,6 +155,16 @@ func (b *Batcher) TakePending() []*ClosedBatch {
 	return p
 }
 
+// RemoveUploaded drops the first n closed batches (those successfully uploaded),
+// retaining the rest for a later retry.
+func (b *Batcher) RemoveUploaded(n int) {
+	if n >= len(b.pending) {
+		b.pending = nil
+		return
+	}
+	b.pending = b.pending[n:]
+}
+
 // OpenBytes reports the current open batch size (0 if none).
 func (b *Batcher) OpenBytes() int {
 	if b.cur == nil {

@@ -12,6 +12,7 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
+	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // deterministicReader yields seed-derived bytes for DEK material under DST.
@@ -43,7 +44,87 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "wal-write-path-no-put", Run: scenarioWALWritePathNoPut},
 		{Name: "wal-backpressure", Run: scenarioWALBackpressure},
 		{Name: "encrypted-wal-no-plaintext-leak", Run: scenarioEncryptedWALNoPlaintextLeak},
+		{Name: "remote-flush-ordering", Run: scenarioRemoteFlushOrdering},
+		{Name: "idempotent-batch-upload", Run: scenarioIdempotentBatchUpload},
 	}
+}
+
+func remoteLog(s *Sim, vol [16]byte) (*wal.Log, error) {
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return nil, err
+	}
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(
+		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 5),
+	)
+	return l, nil
+}
+
+// scenarioRemoteFlushOrdering is INV-07 (§14.4): durable_sequence advances only
+// after the covering objects are verified in S3. A failing upload must leave
+// durable where it was.
+func scenarioRemoteFlushOrdering(s *Sim) error {
+	ctx := context.Background()
+	l, err := remoteLog(s, [16]byte{5})
+	if err != nil {
+		return err
+	}
+	if _, err := l.Write(0, []byte("durable-me"), 0); err != nil {
+		return err
+	}
+
+	s.Store.InjectThrottle(5) // exhaust the uploader budget, then clear
+	if err := l.Flush(ctx); err == nil {
+		return errors.New("flush should fail while uploads fail")
+	}
+	emitWatermarks(s, l)
+	if l.Watermarks().Durable != 0 {
+		return fmt.Errorf("durable advanced to %d despite upload failure (INV-07)", l.Watermarks().Durable)
+	}
+	if objs, _ := s.Store.List(ctx, "wal/"); len(objs) != 0 {
+		return fmt.Errorf("no object should be durable, got %d", len(objs))
+	}
+
+	// Retry succeeds; durable now advances.
+	if err := l.Flush(ctx); err != nil {
+		return fmt.Errorf("retry flush: %w", err)
+	}
+	emitWatermarks(s, l)
+	if l.Watermarks().Durable != 1 {
+		return fmt.Errorf("durable should be 1 after verified upload, got %d", l.Watermarks().Durable)
+	}
+	s.Emit(Event{Kind: EventObject, Msg: "batch verified in S3"})
+	return nil
+}
+
+// scenarioIdempotentBatchUpload is INV-21 (§14.5): a PUT that persisted but lost
+// its response reconciles on retry, and re-uploads never duplicate.
+func scenarioIdempotentBatchUpload(s *Sim) error {
+	ctx := context.Background()
+	vol := [16]byte{6}
+	b := wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig())
+	enc, _ := wal.Record{Type: format.RecordWrite, Epoch: 1, Sequence: 1, Payload: []byte("batch-bytes")}.Encode()
+	b.Append(1, enc, false)
+	b.Flush()
+	cb := b.Pending()[0]
+	key, _, _ := cb.Object()
+
+	s.Store.InjectLostResponse(key)
+	up := wal.NewUploader(s.Store, 5)
+	if err := up.Upload(ctx, cb); err != nil {
+		return fmt.Errorf("upload should be idempotent after lost response: %w", err)
+	}
+	if err := up.Upload(ctx, cb); err != nil {
+		return fmt.Errorf("re-upload should be idempotent: %w", err)
+	}
+	objs, _ := s.Store.List(ctx, "wal/")
+	if len(objs) != 1 {
+		return fmt.Errorf("expected exactly 1 object after idempotent retries, got %d", len(objs))
+	}
+	s.Notef("idempotent upload: 1 object after lost response + re-upload")
+	return nil
 }
 
 // scenarioEncryptedWALNoPlaintextLeak: with per-volume encryption, the bytes that

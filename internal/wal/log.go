@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -52,6 +53,9 @@ type Log struct {
 	limits Limits
 	enc    *Encryption // nil = plaintext WAL
 
+	batcher  *Batcher  // nil = local-only (no remote WAL)
+	uploader *Uploader // nil = local-only
+
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
@@ -61,6 +65,13 @@ type Log struct {
 // EnableEncryption binds an Encryption context so subsequent WRITEs seal their
 // payloads (§15). Must be set before the first WRITE.
 func (l *Log) EnableEncryption(e *Encryption) { l.enc = e }
+
+// EnableRemote wires the on-demand batcher and idempotent uploader so FLUSH/FUA
+// make records durable in S3 (§14.3–14.5). Must be set before the first WRITE.
+func (l *Log) EnableRemote(b *Batcher, u *Uploader) {
+	l.batcher = b
+	l.uploader = u
+}
 
 // NewLog creates a log backed by file, timed by clk.
 func NewLog(file disk.File, clk clock.Clock, volumeID [16]byte, epoch uint64, limits Limits) *Log {
@@ -118,7 +129,14 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	}
 	// The read view holds plaintext regardless of on-disk encryption.
 	plaintext := append([]byte(nil), data...)
-	return l.appendEncoded(seq, enc, func() { l.view.Overwrite(offset, plaintext) })
+	got, err := l.appendEncoded(seq, enc, func() { l.view.Overwrite(offset, plaintext) })
+	if err != nil {
+		return 0, err
+	}
+	if l.batcher != nil {
+		l.batcher.Append(seq, enc, flags&format.FlagFUA != 0)
+	}
+	return got, nil
 }
 
 // Discard appends a DISCARD of [offset, offset+length); the range reads as zero.
@@ -159,7 +177,7 @@ func (l *Log) Read(offset uint64, buf []byte) { l.view.Read(offset, buf) }
 
 // Sync makes prior appends durable locally (fdatasync) and clears the unflushed
 // accounting. It does not advance the durable watermark — that requires remote
-// durability (Phase 06).
+// durability via Flush.
 func (l *Log) Sync() error {
 	if err := l.file.Sync(); err != nil {
 		return err
@@ -167,6 +185,41 @@ func (l *Log) Sync() error {
 	l.unflushedBytes = 0
 	l.hasUnflushed = false
 	return nil
+}
+
+// Flush makes every record up to the current local sequence durable in S3 and
+// advances durable_sequence (§14.4). Order: capture target, close the batch,
+// fdatasync, upload+verify all covering objects, advance durable, ack. durable is
+// advanced ONLY after the objects are verified (INV-07). If an upload fails, the
+// un-uploaded batches are retained for the next Flush and durable is not advanced.
+// The lease-verify step (§14.4 step 5) lands in Phase 07.
+func (l *Log) Flush(ctx context.Context) error {
+	target := l.local
+	if l.batcher != nil {
+		l.batcher.Flush() // step 2: close current batch
+	}
+	if err := l.file.Sync(); err != nil { // step 3: fdatasync local
+		return err
+	}
+	if l.batcher != nil && l.uploader != nil {
+		pending := l.batcher.Pending()
+		done := 0
+		for _, cb := range pending { // step 4: upload + verify (covering <= target)
+			if err := l.uploader.Upload(ctx, cb); err != nil {
+				l.batcher.RemoveUploaded(done)
+				return err // durable NOT advanced
+			}
+			done++
+		}
+		l.batcher.RemoveUploaded(done)
+	}
+	// step 5: lease verify — Phase 07.
+	if err := l.AdvanceDurable(target); err != nil { // step 6
+		return err
+	}
+	l.unflushedBytes = 0
+	l.hasUnflushed = false
+	return nil // step 7: ack
 }
 
 func (l *Log) trackUnflushed(n int) {
