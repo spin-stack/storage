@@ -10,6 +10,7 @@ import (
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/internal/wal"
 )
 
 // MandatoryScenario is one entry in the §25.1 must-be-green-on-every-PR set. The
@@ -27,7 +28,86 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "crash-around-fdatasync", Run: scenarioCrashAroundFdatasync},
 		{Name: "clock-drift-beyond-skew", Run: scenarioClockDriftBeyondSkew},
 		{Name: "network-partition", Run: scenarioNetworkPartition},
+		{Name: "wal-write-path-no-put", Run: scenarioWALWritePathNoPut},
+		{Name: "wal-backpressure", Run: scenarioWALBackpressure},
 	}
+}
+
+// emitWatermarks records the log's current watermarks for the ordering checker.
+func emitWatermarks(s *Sim, l *wal.Log) {
+	w := l.Watermarks()
+	s.Emit(Event{Kind: EventWatermark, Local: w.Local, Durable: w.Durable, Published: w.Published})
+}
+
+// scenarioWALWritePathNoPut: normal WRITEs go to the local WAL and are readable
+// back, they issue no object-store PUT (§5.3, INV-18), and the watermarks stay
+// ordered (§5.6, INV-03).
+func scenarioWALWritePathNoPut(s *Sim) error {
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20, MaxUnflushedAge: 30 * time.Second})
+
+	n := 3 + s.Rand.Intn(6)
+	written := map[uint64][]byte{}
+	for i := 0; i < n; i++ {
+		off := uint64(s.Rand.Intn(16)) * 8
+		payload := []byte(fmt.Sprintf("rec%02d", i))
+		if _, err := l.Write(off, payload, 0); err != nil {
+			return fmt.Errorf("write %d: %w", i, err)
+		}
+		written[off] = payload
+		emitWatermarks(s, l)
+	}
+
+	// Read-back matches the last write at each offset.
+	for off, want := range written {
+		buf := make([]byte, len(want))
+		l.Read(off, buf)
+		if !bytes.Equal(buf, want) {
+			return fmt.Errorf("read-back at %d: got %q want %q", off, buf, want)
+		}
+	}
+
+	// INV-18: no PUT happened on the write path.
+	objs, err := s.Store.List(context.Background(), "")
+	if err != nil {
+		return err
+	}
+	if len(objs) != 0 {
+		return fmt.Errorf("write path issued %d PUTs; a normal WRITE must not PUT (§5.3)", len(objs))
+	}
+	s.Notef("wrote %d records, 0 PUTs", n)
+	return nil
+}
+
+// scenarioWALBackpressure: exceeding the unflushed byte limit yields an explicit
+// error (§5.7, INV-04), and after Sync writes resume.
+func scenarioWALBackpressure(s *Sim) error {
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	// Room for one record (104-byte header + small payload) but not two.
+	l := wal.NewLog(f, s.Clock, [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 200})
+
+	if _, err := l.Write(0, make([]byte, 32), 0); err != nil {
+		return fmt.Errorf("first write should fit: %w", err)
+	}
+	if _, err := l.Write(64, make([]byte, 64), 0); !errors.Is(err, wal.ErrBackpressure) {
+		return fmt.Errorf("expected backpressure, got %v", err)
+	}
+	s.Emit(Event{Kind: EventFault, Msg: "backpressure asserted"})
+
+	if err := l.Sync(); err != nil {
+		return err
+	}
+	if _, err := l.Write(64, make([]byte, 64), 0); err != nil {
+		return fmt.Errorf("write after sync should resume: %w", err)
+	}
+	emitWatermarks(s, l)
+	return nil
 }
 
 // scenarioLostPutIdempotent: a PUT persists but its response is lost (§14.5). The

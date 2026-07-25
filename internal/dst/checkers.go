@@ -71,10 +71,34 @@ func (c *NoPermanentDeleteChecker) Observe(e Event) {
 
 func (c *NoPermanentDeleteChecker) Check() error { return c.violation }
 
-// DefaultCheckers returns the checkers active in Phase 01. Later phases append.
+// WatermarkOrderChecker enforces INV-03 (§5.6): published <= durable <= local at
+// every observation. It watches watermark events.
+type WatermarkOrderChecker struct {
+	violation error
+}
+
+// NewWatermarkOrderChecker returns a fresh checker.
+func NewWatermarkOrderChecker() *WatermarkOrderChecker { return &WatermarkOrderChecker{} }
+
+func (c *WatermarkOrderChecker) Name() string { return "watermark-order" }
+
+func (c *WatermarkOrderChecker) Observe(e Event) {
+	if e.Kind != EventWatermark || c.violation != nil {
+		return
+	}
+	if e.Published > e.Durable || e.Durable > e.Local {
+		c.violation = fmt.Errorf("watermark ordering violated at step %d: published=%d durable=%d local=%d",
+			e.Step, e.Published, e.Durable, e.Local)
+	}
+}
+
+func (c *WatermarkOrderChecker) Check() error { return c.violation }
+
+// DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
 		NewMonotonicClockChecker(),
 		NewNoPermanentDeleteChecker(),
+		NewWatermarkOrderChecker(),
 	}
 }

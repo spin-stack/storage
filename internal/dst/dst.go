@@ -30,14 +30,15 @@ const simEpoch = 1_700_000_000
 type EventKind string
 
 const (
-	EventClock    EventKind = "clock"
-	EventDisk     EventKind = "disk"
-	EventObject   EventKind = "object"
-	EventNetwork  EventKind = "network"
-	EventNote     EventKind = "note"
-	EventDelete   EventKind = "delete"
-	EventFault    EventKind = "fault"
-	EventRecovery EventKind = "recovery"
+	EventClock     EventKind = "clock"
+	EventDisk      EventKind = "disk"
+	EventObject    EventKind = "object"
+	EventNetwork   EventKind = "network"
+	EventNote      EventKind = "note"
+	EventDelete    EventKind = "delete"
+	EventFault     EventKind = "fault"
+	EventRecovery  EventKind = "recovery"
+	EventWatermark EventKind = "watermark"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -51,6 +52,10 @@ type Event struct {
 	// Object/Delete events:
 	Key       string
 	Permanent bool // Delete: whether it was a permanent (irreversible) delete
+	// Watermark events (§5.6):
+	Local     uint64
+	Durable   uint64
+	Published uint64
 }
 
 // String renders an event deterministically for the trace.
@@ -60,6 +65,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d clock mono=%d %s", e.Step, e.Mono, e.Msg)
 	case EventDelete:
 		return fmt.Sprintf("%04d delete key=%s permanent=%t", e.Step, e.Key, e.Permanent)
+	case EventWatermark:
+		return fmt.Sprintf("%04d watermark pub=%d dur=%d loc=%d", e.Step, e.Published, e.Durable, e.Local)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:
