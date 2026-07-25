@@ -261,6 +261,58 @@ func TestPromoteRefusesAHostThatCannotTakeTheVolume(t *testing.T) {
 	}
 }
 
+// unreadableLeases is a metadata store whose lease read is down — a PgBouncer
+// hiccup, a failover, a timeout. "I could not read it" must not collapse into
+// "there is none".
+type unreadableLeases struct {
+	metadata.Store
+	err error
+}
+
+func (s unreadableLeases) GetHostLease(context.Context, string) (metadata.HostLease, error) {
+	return metadata.HostLease{}, s.err
+}
+
+func TestPromoteRefusesWhenTheSourceLeaseCannotBeRead(t *testing.T) {
+	ctx := context.Background()
+	w := newFenceWorld(t)
+	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	renewedAt := w.clk.Wall()
+	w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+
+	down := errors.New("metadata unavailable")
+	p := controlplane.NewPromoter(unreadableLeases{Store: w.md, err: down}, w.epochs, w.clk, fenceTTL, fenceSkew)
+	if _, err := p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); !errors.Is(err, down) {
+		t.Fatalf("promote with an unreadable lease: err = %v, want the read error", err)
+	}
+	w.unchanged(t, 1, fenceHostA)
+}
+
+// TestPromoteOfAVolumeWithNoPrimaryNeedsNoWait: nothing is serving it, so there is
+// nobody to fence. This is the state a rebuilt volume record is in.
+func TestPromoteOfAVolumeWithNoPrimaryNeedsNoWait(t *testing.T) {
+	ctx := context.Background()
+	w := newFenceWorld(t)
+	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, fenceVol, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, etag, err := w.epochs.Current(ctx, fenceVol); err != nil {
+		t.Fatal(err)
+	} else if _, err := w.epochs.CompareAndAdvance(ctx, fenceVol, etag, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := w.p.Promote(ctx, w.term, fenceVol, time.Time{}, fenceHostB)
+	if err != nil {
+		t.Fatalf("promoting a volume nobody serves: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("new epoch = %d, want 3", got)
+	}
+}
+
 // TestPromoteFinishesAResumeOntoAHostThatWasCordonedMeanwhile: a cordon stops new
 // placement, it does not stop a host serving what it already holds. A promotion that
 // already moved the volume there must still be completable, or a crash plus a cordon

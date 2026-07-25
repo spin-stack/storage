@@ -18,7 +18,17 @@ type hookedStore struct {
 	objectstore.Store
 	afterGet  func()
 	afterHead func(n int)
+	beforePut func()
 	heads     int
+}
+
+func (s *hookedStore) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	if s.beforePut != nil {
+		hook := s.beforePut
+		s.beforePut = nil
+		hook()
+	}
+	return s.Store.Put(ctx, key, data, opts)
 }
 
 func (s *hookedStore) Get(ctx context.Context, key string) ([]byte, error) {
@@ -134,6 +144,109 @@ func TestTwoPromotersCannotBothGrantTheSameEpoch(t *testing.T) {
 		t.Fatal("both promoters granted epoch 4: the second CAS overwrote the epoch the first one had already handed out")
 	}
 
+	ep, _, err := winner.Current(ctx, vol)
+	if err != nil || ep != 4 {
+		t.Fatalf("epoch object = %d err=%v, want the winner's 4", ep, err)
+	}
+}
+
+// failingStore fails one operation of the read Current makes, so every leg of the
+// stable read is known to surface its error instead of returning a pair built from a
+// half-failed read.
+type failingStore struct {
+	objectstore.Store
+	failGet bool
+	headsOK int
+	corrupt bool
+	heads   int
+}
+
+var errBackend = errors.New("backend unavailable")
+
+func (s *failingStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if s.failGet {
+		return nil, errBackend
+	}
+	if s.corrupt {
+		return []byte("{not json"), nil
+	}
+	return s.Store.Get(ctx, key)
+}
+
+func (s *failingStore) Head(ctx context.Context, key string) (objectstore.ObjectInfo, error) {
+	s.heads++
+	if s.heads > s.headsOK {
+		return objectstore.ObjectInfo{}, errBackend
+	}
+	return s.Store.Head(ctx, key)
+}
+
+func TestCurrentReportsAFailedRead(t *testing.T) {
+	tests := []struct {
+		name  string
+		store func(backing objectstore.Store) *failingStore
+		want  error
+	}{
+		{"the first metadata read fails", func(b objectstore.Store) *failingStore {
+			return &failingStore{Store: b, headsOK: 0}
+		}, errBackend},
+		{"the body read fails", func(b objectstore.Store) *failingStore {
+			return &failingStore{Store: b, headsOK: 1, failGet: true}
+		}, errBackend},
+		{"the confirming metadata read fails", func(b objectstore.Store) *failingStore {
+			return &failingStore{Store: b, headsOK: 1}
+		}, errBackend},
+		{"the body is not a valid epoch record", func(b objectstore.Store) *failingStore {
+			return &failingStore{Store: b, headsOK: 2, corrupt: true}
+		}, nil}, // a decode error, reported as such
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			backing := sim.NewObjectStore()
+			if _, err := epoch.NewStore(backing).Init(ctx, vol, 2); err != nil {
+				t.Fatal(err)
+			}
+			s := epoch.NewStore(tc.store(backing))
+			ep, etag, err := s.Current(ctx, vol)
+			if err == nil {
+				t.Fatalf("Current returned epoch %d / %q on a failed read", ep, etag)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			// A failed read must never be reported as a usable pair.
+			if ep != 0 || etag != "" {
+				t.Fatalf("Current returned (%d, %q) alongside %v", ep, etag, err)
+			}
+		})
+	}
+}
+
+// TestCompareAndAdvanceStillLosesARaceAfterItsPreCheck: the forward-only check reads
+// the object first, but the read is not what makes the advance safe — the If-Match
+// is. A promoter that advances the object in the window between the two must still
+// win, and ours must come back as a CAS conflict rather than overwriting it.
+func TestCompareAndAdvanceStillLosesARaceAfterItsPreCheck(t *testing.T) {
+	ctx := context.Background()
+	backing := sim.NewObjectStore()
+	h := &hookedStore{Store: backing}
+	loser := epoch.NewStore(h)
+	winner := epoch.NewStore(backing)
+
+	etag, err := winner.Init(ctx, vol, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.beforePut = func() {
+		if _, err := winner.CompareAndAdvance(ctx, vol, etag, 4); err != nil {
+			t.Errorf("winner advance: %v", err)
+		}
+	}
+
+	if _, err := loser.CompareAndAdvance(ctx, vol, etag, 4); !errors.Is(err, epoch.ErrCASConflict) {
+		t.Fatalf("racing advance: err = %v, want ErrCASConflict", err)
+	}
 	ep, _, err := winner.Current(ctx, vol)
 	if err != nil || ep != 4 {
 		t.Fatalf("epoch object = %d err=%v, want the winner's 4", ep, err)
