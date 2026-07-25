@@ -3,11 +3,13 @@
 Short snapshot. Update at every increment close.
 
 - **Date:** 2026-07-25
-- **Current phase:** **Phases 01, 04, 05, 06 COMPLETE** (pure-Go), merged to `main`
-  through Phase 05; Phase 06 on branch `phase-06/remote-wal`. Phases 02/03 planned.
-  **Phase 07 (Control Plane + leases + fencing) is next.**
-- **Active invariants:** INV-01, INV-02, INV-03, INV-04, INV-05, INV-07(ordering),
-  INV-15, INV-18, INV-21(PUT). **9 active.**
+- **Current phase:** **Phases 01, 04, 05, 06, 07 COMPLETE.** On `main` through Phase 06;
+  **Phase 07 on branch `phase-07/control-plane-fencing`** (fencing = review zone,
+  awaiting human review before merge). Phases 02/03 planned (need infra).
+- **Active invariants (14):** INV-01, 02, 03, 04, 05, **06**, 07, **09**, **10**, **11**,
+  15, 18, 21, 22. The fencing set (06/09/10/11) is complete.
+- **Next:** Phase 08 (recovery + rebuild-metadata) — `recovery.DurablePrefix` +
+  recovery-point already seed it; or Phase 09 (snapshots/clone/resize).
 - **Branches:** `phase-01/...` (Phases 0/01, 02/03 plans) merged-forward into
   `phase-04/wal-cow` (Phase 04). Nothing merged to `main` yet — **pending human review**,
   especially the WAL format (ADR-0005 / DEV-0001, header size 104≠96).
