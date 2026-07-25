@@ -160,3 +160,46 @@ func TestPromoteRefusesWhenSomeoneElseAdvancedFurther(t *testing.T) {
 		t.Fatal("promotion must refuse when the epoch object is ahead of what it would grant")
 	}
 }
+
+// TestPromoteRefusesAnUnexpectedEpochGap: PostgreSQL more than one epoch ahead of the
+// object is not a resume, it is corruption or a lost write. Guessing which epoch to
+// finish would be inventing a fence.
+func TestPromoteRefusesAnUnexpectedEpochGap(t *testing.T) {
+	ctx := context.Background()
+	w := newPromoWorld(t)
+
+	for range 3 {
+		if _, err := w.md.BumpVolumeEpoch(ctx, w.term, promoVolume, promoNew); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.p.Promote(ctx, w.term, promoVolume, time.Time{}, promoNew); err == nil {
+		t.Fatal("a multi-epoch gap between PostgreSQL and the object must not be resumed silently")
+	}
+}
+
+// TestPromoteRefusesBeforeTheFencingWait keeps the §12.3 order visible in the
+// idempotent version: none of the resume logic runs before the wait elapses.
+func TestPromoteRefusesBeforeTheFencingWait(t *testing.T) {
+	ctx := context.Background()
+	w := newPromoWorld(t)
+
+	// A lease renewed "now" on the CP clock: the deadline is in the future.
+	if _, err := w.p.Promote(ctx, w.term, promoVolume, w.clk.Wall(), promoNew); err == nil {
+		t.Fatal("promotion must refuse before FENCING_WAIT")
+	}
+	v, _ := w.md.GetVolume(ctx, promoVolume)
+	if v.CurrentEpoch != 1 {
+		t.Fatalf("epoch moved to %d before the fencing wait", v.CurrentEpoch)
+	}
+}
+
+// TestPromoteOfAMissingVolumeFails: the resume decision needs the row; without it
+// there is nothing to be idempotent about.
+func TestPromoteOfAMissingVolumeFails(t *testing.T) {
+	ctx := context.Background()
+	w := newPromoWorld(t)
+	if _, err := w.p.Promote(ctx, w.term, "00000000-0000-7000-8000-0000000000ff", time.Time{}, promoNew); err == nil {
+		t.Fatal("promoting a volume that does not exist must fail")
+	}
+}

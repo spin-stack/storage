@@ -462,11 +462,17 @@ func TestDrainOfEmptyHostIsDrained(t *testing.T) {
 func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 	ctx := context.Background()
 	w := newDrainWorld(t, 10*volSize)
-	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
 
-	// Simulate the crash: promote the first volume by hand, leaving the recovery
-	// point unwritten and the source's capacity still committed.
+	// A first pass records the operation and its plan, then stops on the fencing
+	// wait — the operation now exists with both volumes committed to the move.
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: want ErrFencingWaitNotElapsed, got %v", err)
+	}
+	w.pastFencingWait()
+
+	// Now the crash: the next pass promoted the first volume and died before writing
+	// the epoch boundary and releasing the source's capacity.
 	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
 		t.Fatal(err)
 	}
@@ -516,5 +522,114 @@ func TestDrainReleasesSourceCapacityExactlyOnce(t *testing.T) {
 	if src.NVMeCommittedBytes != 3*volSize {
 		t.Fatalf("source committed = %d, want %d — capacity was released more than once",
 			src.NVMeCommittedBytes, 3*volSize)
+	}
+}
+
+// TestDrainResumeUsesTheRecordedPlan: the plan is what the operation committed to,
+// so a volume that lands on the source *after* the drain started is not swept into
+// it — the operator asked to evacuate a set, not to chase a moving target.
+func TestDrainResumeUsesTheRecordedPlan(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: %v", err)
+	}
+	// A third volume appears on the host after the plan was recorded.
+	var late [16]byte
+	late[6], late[8] = 0x70, 0x80
+	late[15] = 0xbe
+	lateID := format.UUIDString(late)
+	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
+		VolumeID: lateID, SizeBytes: volSize, BlockSize: 65536, State: lifecycle.VolumeActive,
+		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	w.pastFencingWait()
+	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != 2 {
+		t.Fatalf("moved %d volumes, want the 2 in the recorded plan", len(res.Moved))
+	}
+	if v, _ := w.md.GetVolume(ctx, lateID); v.PrimaryHostID != cloneHostA {
+		t.Fatal("a volume that arrived after the plan was recorded must not be moved by it")
+	}
+}
+
+// TestDrainRefusesToFinishAVolumeWhoseDataIsGone: finishing a promoted volume still
+// has to derive the epoch boundary from S3. If the previous epoch's objects are
+// unreadable, the boundary would be a guess — the pass fails instead.
+func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	firstID := format.UUIDString(w.vols[0])
+
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: %v", err)
+	}
+	w.pastFencingWait()
+	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the epoch's only object so the durable point cannot be established.
+	objs, _ := w.store.List(ctx, "wal/"+firstID+"/1/")
+	if len(objs) == 0 {
+		t.Fatal("expected a WAL object for the source epoch")
+	}
+	if _, err := w.store.Put(ctx, objs[0].Key, []byte("garbage"), objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The boundary must cover what was ACKed; with the object unreadable the prefix
+	// is empty, so the recovery point would understate it. Either way the pass must
+	// not silently record a boundary of zero and move on.
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
+		rp, rerr := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], 2)
+		if rerr == nil && rp.RecoveredUpTo < w.acked[firstID] {
+			t.Fatalf("wrote a recovery point at %d, below the ACKed %d", rp.RecoveredUpTo, w.acked[firstID])
+		}
+	}
+}
+
+// TestCancelAFinishedDrainIsRefused: cancellation is a request about work in flight.
+// Once the operation succeeded there is nothing to cancel, and letting it flip back
+// would misreport what happened to the fleet.
+func TestCancelAFinishedDrainIsRefused(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.drainer.Cancel(ctx, w.term, drainOpID); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("cancelling a finished drain: want ErrInvalidTransition, got %v", err)
+	}
+	if op, _ := w.md.GetOperation(ctx, drainOpID); op.Phase != lifecycle.OpSucceeded {
+		t.Fatalf("phase = %q after a refused cancel", op.Phase)
+	}
+}
+
+// TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan: the operation still exists, so a
+// later pass has something to be idempotent about.
+func TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	if _, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID); err != nil {
+		t.Fatal(err)
+	}
+	op, err := w.md.GetOperation(ctx, drainOpID)
+	if err != nil || op.Phase != lifecycle.OpSucceeded {
+		t.Fatalf("operation = %+v err=%v", op, err)
+	}
+	// And re-running it is a no-op rather than an illegal transition.
+	res, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
+	if err != nil || res.Phase != lifecycle.OpSucceeded || res.Remaining != 0 {
+		t.Fatalf("re-run of an empty drain: %+v err=%v", res, err)
 	}
 }

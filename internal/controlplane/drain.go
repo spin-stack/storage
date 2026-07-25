@@ -36,11 +36,33 @@ type DrainResult struct {
 	Remaining int
 }
 
-// progress is the operation's current_state (§28.1: progress must be visible).
+// plan is the operation's desired_state: the volumes this drain committed to move,
+// captured once when the operation is recorded. Every later pass walks this list
+// rather than asking who owns what right now — a volume that was already promoted is
+// no longer listed under the source, and driving from the live listing is exactly how
+// a half-finished move used to disappear (DEV-0008).
+type plan struct {
+	Host    string   `json:"drain_host"`
+	Volumes []string `json:"volumes"`
+}
+
+// progress is the operation's current_state (§28.1: progress must be visible). Moved
+// holds the volume ids that are completely done — the epoch boundary written and the
+// source's capacity released — so a resumed pass can tell "finished" from "promoted
+// but not finished", and never releases capacity twice.
 type progress struct {
-	Total   int    `json:"total"`
-	Moved   int    `json:"moved"`
-	Current string `json:"current_volume,omitempty"`
+	Total   int      `json:"total"`
+	Moved   []string `json:"moved"`
+	Current string   `json:"current_volume,omitempty"`
+}
+
+func (p progress) done(volumeID string) bool {
+	for _, id := range p.Moved {
+		if id == volumeID {
+			return true
+		}
+	}
+	return false
 }
 
 // Drainer evacuates every volume off a host (§28.1). It is the composition of the
@@ -103,22 +125,45 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 		return DrainResult{}, err
 	}
 
+	// The plan is captured once. On a resumed pass we read back what this operation
+	// committed to move, so a volume that was promoted before the crash is still on
+	// the list and gets finished (DEV-0008).
 	vols, err := d.md.ListVolumesByHost(ctx, hostID)
 	if err != nil {
 		return DrainResult{}, err
 	}
-	prog := progress{Total: len(vols)}
+	p := plan{Host: hostID}
+	for _, v := range vols {
+		p.Volumes = append(p.Volumes, v.VolumeID)
+	}
+	prog := progress{Total: len(p.Volumes)}
 	recorded, err := d.md.RecordOperation(ctx, term, metadata.Operation{
 		OperationID: operationID, Kind: lifecycle.OpDrain, HostID: hostID,
-		DesiredState: mustJSON(map[string]string{"drain_host": hostID}),
-		CurrentState: mustJSON(prog), Phase: lifecycle.OpPending,
+		DesiredState: mustJSON(p), CurrentState: mustJSON(prog), Phase: lifecycle.OpPending,
 	})
 	if err != nil {
 		return DrainResult{}, err
 	}
-	_ = recorded // a duplicate request resumes the recorded operation (§18)
+	if !recorded {
+		// A resumed (or duplicated) request: the recorded plan and progress win.
+		op, err := d.md.GetOperation(ctx, operationID)
+		if err != nil {
+			return DrainResult{}, err
+		}
+		if err := json.Unmarshal(op.DesiredState, &p); err != nil {
+			return DrainResult{}, fmt.Errorf("drain: decode plan: %w", err)
+		}
+		if err := json.Unmarshal(op.CurrentState, &prog); err != nil {
+			return DrainResult{}, fmt.Errorf("drain: decode progress: %w", err)
+		}
+		if op.Phase == lifecycle.OpSucceeded {
+			// Already finished: re-running must not touch a thing, least of all
+			// release capacity a second time.
+			return DrainResult{Phase: lifecycle.OpSucceeded, Remaining: 0}, nil
+		}
+	}
 
-	res := DrainResult{Phase: lifecycle.OpRunning, Remaining: len(vols)}
+	res := DrainResult{Phase: lifecycle.OpRunning, Remaining: len(p.Volumes) - len(prog.Moved)}
 
 	// A cancellation recorded before the first pass wins here, so the operation
 	// never leaves PENDING for RUNNING just to be canceled a line later.
@@ -136,7 +181,10 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 		return res, err
 	}
 
-	for _, v := range vols {
+	for _, volumeID := range p.Volumes {
+		if prog.done(volumeID) {
+			continue // finished by an earlier pass
+		}
 		canceled, err := d.canceled(ctx, operationID)
 		if err != nil {
 			return res, err
@@ -146,11 +194,15 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 			return res, d.record(ctx, term, operationID, lifecycle.OpCanceled, prog, "")
 		}
 
-		prog.Current = v.VolumeID
+		prog.Current = volumeID
 		if err := d.record(ctx, term, operationID, lifecycle.OpRunning, prog, ""); err != nil {
 			return res, err
 		}
-		mv, err := d.move(ctx, term, v)
+		v, err := d.md.GetVolume(ctx, volumeID)
+		if err != nil {
+			return res, err
+		}
+		mv, err := d.move(ctx, term, hostID, v)
 		if err != nil {
 			// Retryable: the operation stays FAILED with its progress, and the
 			// reconciler runs it again (FAILED -> RUNNING is a legal move, §7).
@@ -159,7 +211,7 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 		}
 		res.Moved = append(res.Moved, mv)
 		res.Remaining--
-		prog.Moved++
+		prog.Moved = append(prog.Moved, volumeID)
 		prog.Current = ""
 		if err := d.record(ctx, term, operationID, lifecycle.OpRunning, prog, ""); err != nil {
 			return res, err
@@ -171,9 +223,17 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 	return res, d.record(ctx, term, operationID, lifecycle.OpSucceeded, prog, "")
 }
 
-// move evacuates one volume: place → reserve → bulk materialize → fence → final
-// materialize → recovery point → release the source's reservation.
-func (d *Drainer) move(ctx context.Context, term int64, v metadata.Volume) (Move, error) {
+// move evacuates one volume from source: place → reserve → bulk materialize → fence
+// → final materialize → recovery point → release the source's reservation.
+//
+// It is re-entrant at every one of those boundaries. If the volume is already off the
+// source, the promotion half happened in an earlier pass and only the tail is
+// completed: the epoch boundary (create-only, so a repeat is a no-op) and the source's
+// capacity release, which the caller records as done exactly once.
+func (d *Drainer) move(ctx context.Context, term int64, source string, v metadata.Volume) (Move, error) {
+	if v.PrimaryHostID != source {
+		return d.finishMovedVolume(ctx, term, source, v)
+	}
 	parsed, err := ids.Parse(v.VolumeID)
 	if err != nil {
 		return Move{}, fmt.Errorf("drain: volume id %q: %w", v.VolumeID, err)
@@ -236,6 +296,35 @@ func (d *Drainer) move(ctx context.Context, term int64, v metadata.Volume) (Move
 	}
 	return Move{
 		VolumeID: v.VolumeID, FromHost: v.PrimaryHostID, ToHost: dest,
+		NewEpoch: newEpoch, UpTo: prog.UpTo, Bytes: prog.Bytes,
+	}, nil
+}
+
+// finishMovedVolume completes a move whose promotion already landed: the epoch
+// boundary and the source's capacity. Both are safe to attempt again — the boundary
+// object is create-only and matched against what we would have written, and the
+// release is recorded by the caller as part of `moved`.
+func (d *Drainer) finishMovedVolume(ctx context.Context, term int64, source string, v metadata.Volume) (Move, error) {
+	parsed, err := ids.Parse(v.VolumeID)
+	if err != nil {
+		return Move{}, fmt.Errorf("drain: volume id %q: %w", v.VolumeID, err)
+	}
+	vol := [16]byte(parsed)
+	newEpoch := uint64(v.CurrentEpoch)
+	prevEpoch := newEpoch - 1
+
+	_, prog, err := d.mat.FromEpoch(ctx, vol, prevEpoch)
+	if err != nil {
+		return Move{}, err
+	}
+	if err := d.writeRecoveryPoint(ctx, vol, newEpoch, prevEpoch, prog.UpTo); err != nil {
+		return Move{}, err
+	}
+	if err := d.md.CommitHostCapacity(ctx, term, source, -v.SizeBytes); err != nil {
+		return Move{}, err
+	}
+	return Move{
+		VolumeID: v.VolumeID, FromHost: source, ToHost: v.PrimaryHostID,
 		NewEpoch: newEpoch, UpTo: prog.UpTo, Bytes: prog.Bytes,
 	}, nil
 }

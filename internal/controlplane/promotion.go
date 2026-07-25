@@ -13,6 +13,7 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/spin-stack/storage/internal/epoch"
@@ -24,6 +25,11 @@ import (
 // last_renewal + lease_ttl + max_clock_skew (§12.3 step 3). The reconciler retries
 // after the wait; it must never be bypassed.
 var ErrFencingWaitNotElapsed = errors.New("controlplane: fencing wait not elapsed")
+
+// ErrEpochConflict means the epoch object is ahead of what this promotion would
+// grant: another Control Plane already promoted this volume further. Finishing our
+// own steps would fence the writer that won, so we stop instead (§12.4).
+var ErrEpochConflict = errors.New("controlplane: epoch object is ahead of this promotion")
 
 // Promoter runs the promotion protocol.
 type Promoter struct {
@@ -50,6 +56,21 @@ func (p *Promoter) FencingDeadline(renewedAt time.Time) time.Time {
 // CP wall clock; then it bumps the epoch in PG (term-guarded, §12.3 step 4), CASes
 // the S3 epoch object (§12.4), and grants the new lease (step 5). Returns the new
 // epoch.
+// Promote is a *resumable* three-step write: the epoch in PostgreSQL, the epoch
+// object in S3, and the lease. Any of them can be the last thing that happens before
+// a crash, and the reconciler will call this again, so the target epoch is derived
+// from the state that is already out there instead of being blindly incremented
+// (DEV-0004):
+//
+//	pg == s3, primary is already newHost -> the promotion completed; return it
+//	pg == s3                             -> nothing done yet; grant pg+1
+//	pg == s3 + 1                         -> PG bumped, the CAS never landed; finish it
+//	s3 >  pg                             -> another CP promoted further; refuse
+//
+// Every step is then idempotent: the PG bump only runs when PG is behind, the CAS is
+// skipped when the object already carries the target, and the lease grant is an
+// upsert. Two runs of the same promotion therefore grant one epoch — a second one
+// would fence the writer the first one just installed.
 func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, oldLeaseRenewedAt time.Time, newHost string) (uint64, error) {
 	// Step 3: FENCING_WAIT. Adding max_clock_skew covers a CP wall clock running up
 	// to that far ahead of true time; a CP behind simply waits longer (§12.1).
@@ -57,26 +78,50 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 		return 0, ErrFencingWaitNotElapsed
 	}
 
-	// Read the epoch object's current ETag for the CAS.
-	_, etag, err := p.epochs.Current(ctx, volumeID)
+	v, err := p.md.GetVolume(ctx, volumeID)
 	if err != nil {
 		return 0, err
 	}
-
-	// Step 4a: increment the epoch in PostgreSQL (term-guarded).
-	newEpoch, err := p.md.BumpVolumeEpoch(ctx, term, volumeID, newHost)
+	stored, etag, err := p.epochs.Current(ctx, volumeID)
 	if err != nil {
 		return 0, err
 	}
+	pgEpoch := uint64(v.CurrentEpoch)
 
-	// Step 4b: CAS the S3 epoch object to N+1 (§12.4). A concurrent advance loses.
-	if _, err := p.epochs.CompareAndAdvance(ctx, volumeID, etag, uint64(newEpoch)); err != nil {
-		return 0, err
+	var target uint64
+	switch {
+	case stored > pgEpoch:
+		return 0, fmt.Errorf("%w: object at %d, PostgreSQL at %d", ErrEpochConflict, stored, pgEpoch)
+	case pgEpoch == stored && v.PrimaryHostID == newHost && pgEpoch > 0:
+		// Already promoted to this host: finish any tail step and report the epoch.
+		target = pgEpoch
+	case pgEpoch == stored:
+		target = pgEpoch + 1
+		newEpoch, err := p.md.BumpVolumeEpoch(ctx, term, volumeID, newHost) // step 4a
+		if err != nil {
+			return 0, err
+		}
+		if uint64(newEpoch) != target {
+			return 0, fmt.Errorf("%w: PostgreSQL granted %d, expected %d", ErrEpochConflict, newEpoch, target)
+		}
+	case pgEpoch == stored+1:
+		// Resume: PostgreSQL was bumped, the CAS never landed.
+		target = pgEpoch
+	default:
+		return 0, fmt.Errorf("%w: object at %d, PostgreSQL at %d", ErrEpochConflict, stored, pgEpoch)
 	}
 
-	// Step 5: grant the lease to the new host.
+	// Step 4b: CAS the S3 epoch object to the target (§12.4), unless it is already
+	// there from a previous attempt.
+	if stored != target {
+		if _, err := p.epochs.CompareAndAdvance(ctx, volumeID, etag, target); err != nil {
+			return 0, err
+		}
+	}
+
+	// Step 5: grant the lease to the new host (an upsert: safe to repeat).
 	if err := p.md.RenewHostLease(ctx, term, newHost, int(p.leaseTTL/time.Second)); err != nil {
 		return 0, err
 	}
-	return uint64(newEpoch), nil
+	return target, nil
 }
