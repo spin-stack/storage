@@ -7,6 +7,9 @@
 > (`DECISIONS/`), and any observed doc↔code divergence is logged in `DEVIATIONS.md`.
 
 - **Status file:** `STATUS.md` (current increment, blockers, next 3 steps).
+- **Rebaseline (2026-07-25):** `REBASELINE.md` replaces the single "DONE" flag with a
+  maturity model (*model* / *integrated* / *production-verified*) and lists the
+  correctness gaps that pause new features. Read it before trusting any state below.
 - **Invariants:** `INVARIANTS.md` (extracted from §4/§5/§12/§14/§21/§27).
 - **Phase detail:** `PHASE-0N.md` (only Phase 1 is expanded in Phase 0; the rest are
   expanded just-in-time by the Planner before the phase starts).
@@ -122,18 +125,18 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 
 | Phase | Roadmap § | Title | State | Depends on |
 |---|---|---|---|---|
-| **01** | 1 | Skeleton + simulable interfaces + minimal DST harness + tracing/logging | **DONE** ✓ (1.1–1.4; INV-01/02 active) | — |
+| **01** | 1 | Skeleton + simulable interfaces + minimal DST harness + tracing/logging | **model** (obs registers metrics but nothing records them — DEV-0010) | — |
 | 02 | 2 | Guest layout: three devices + OverlayFS | **expanded (planning); needs VM/mount infra** | 01 |
 | 03 | 3 | vhost-user-blk raw backend + reconnection + inflight shmfd | **expanded (planning); needs QEMU 11.0.2** | 01 |
-| 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | **DONE** ✓ (4.1–4.4; INV-03/04/05/18 active; format review pending) | 01 |
-| 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | **DONE** ✓ (5.1–5.2; INV-15 active) | 04 |
-| 06 | 6 | Remote WAL: on-demand batching + PUT idempotency + summary objects | **DONE** ✓ (6.1–6.3; INV-07/21 active, INV-04 full) | 04 (05 for ciphertext) |
-| 07 | 7 | PostgreSQL + Control Plane (verified term) + reconciliation + leases + full fencing protocol under DST | **DONE** ✓ (7.1–7.4; INV-06/09/10/11 active) | 06 |
-| 08 | 8 | Recovery with S3 as authority + recovery-point + basic `rebuild-metadata` | **DONE** ✓ (8.1–8.2; INV-08/12/20 active) | 06, 07 |
-| 09 | 9 | Pause-free snapshots + same-host clones + online resize (grow) | **DONE** ✓ (9.1–9.2; INV-16 active) | 08 |
-| 10 | 10 | Objectization + checkpoints + GC mark-and-sweep + versioned/Object-Lock buckets | **DONE** ✓ (10.1–10.3; INV-13/14/17 active) | 08 |
-| 11 | 11 | Cross-host via full materialization + cordon/drain + capacity accounting | **DONE** ✓ (11.1–11.3; no new invariant ID — extends INV-08/09/10/11/16/17 to the host-move path; ADR-0008) | 08, 09, 10 |
-| 12 | 12 | Warm standby + WAL-object compaction + chain flattening | not expanded | 10, 11 |
+| 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | **model** (4.1–4.4; format review still pending) | 01 |
+| 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | **model** (5.1–5.2) | 04 |
+| 06 | 6 | Remote WAL: on-demand batching + PUT idempotency + summary objects | **model** (6.1–6.3) | 04 (05 for ciphertext) |
+| 07 | 7 | PostgreSQL + Control Plane (verified term) + reconciliation + leases + full fencing protocol under DST | **model, with gaps** (7.1–7.4; fail-open lease + non-atomic promotion DEV-0004; operations not term-guarded DEV-0005) | 06 |
+| 08 | 8 | Recovery with S3 as authority + recovery-point + basic `rebuild-metadata` | **model, with gaps** (8.1–8.2; unvalidated objects raise the durable point DEV-0003; rebuild is volumes-only DEV-0009) | 06, 07 |
+| 09 | 9 | Pause-free snapshots + same-host clones + online resize (grow) | **partial model** (9.1–9.2; synchronous sealing, no chain link — DEV-0007) | 08 |
+| 10 | 10 | Objectization + checkpoints + GC mark-and-sweep + versioned/Object-Lock buckets | **partial model** (10.1–10.3; no segment objects, GC computes but does not mark — DEV-0006/0007) | 08 |
+| 11 | 11 | Cross-host via full materialization + cordon/drain + capacity accounting | **partial model** (11.1–11.3; materialized view discarded, drain not idempotent after promotion — DEV-0007/0008; ADR-0008) | 08, 09, 10 |
+| 12 | 12 | Warm standby + WAL-object compaction + chain flattening | **paused** by the rebaseline | 10, 11 |
 | 13 | 13 | Hardening: real-hardware fault injection + backend conformance suite + measured-time runbooks | **13.1 DONE** ✓ (typed lifecycles, ADR-0009); 13.2–13.4 need infra | all |
 | 14 | 14 | *(post-MVP)* lazy loading, multi-queue, io_uring, selective FUA flush, tenant QoS, S3-based lease renewal | out of scope | — |
 

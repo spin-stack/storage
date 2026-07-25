@@ -44,7 +44,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
   chrony monitored, alert at 500 ms; hosts over `max_clock_skew` ineligible for
   promotion; DST injects drift beyond the bound and asserts the only effect is waiting
   longer, never losing writes (INV-11).
-- Status: open (mitigation lands with Phase 07).
+- Status: open (Phase 07 shipped the model; the mitigation is not complete — fencing is fail-open and promotion is not atomic, DEV-0004).
 
 ### RISK-04 — Cold cross-host materialization RTO
 - Source: §29.4
@@ -62,7 +62,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Mitigation: blocking backend conformance suite per version (§6.1); specified graceful
   degradation to lease-only if CAS is absent (§12.4); minimum on-prem durability
   requirement removes the single-node case (§6.1).
-- Status: open (suite lands Phase 13; sim exercises the surface from Phase 01).
+- Status: mitigated for the certified dev backend (the §6.1 suite runs via `task backend:conformance`, ADR-0010); open for the production multi-node backends.
 
 ### RISK-06 — PostgreSQL as a single point of control
 - Source: §29.6
@@ -71,7 +71,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Mitigation: VMs keep serving non-durable I/O; reconciliation makes catch-up trivial;
   PITR + `rebuild-metadata` cover blip-to-total-loss; verified CP term removes
   split-brain (INV-10, §7).
-- Status: open (rebuild-metadata basic in Phase 08).
+- Status: open (rebuild-metadata reconstructs volume rows only — DEV-0009).
 
 ### RISK-07 — Added complexity (implementation surface) of v5
 - Source: §29.7 (honest self-assessment)
@@ -89,7 +89,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Mitigation: strict ordering + DST/fault injection at each step + never truncate above
   a verified `published_sequence` + GC-cannot-permanently-delete as the final net
   (INV-13, INV-14).
-- Status: open (lands Phase 10, human-review zone).
+- Status: open (Phase 10 shipped a GC that computes candidate keys but does not mark, and the store still exposes permanent deletion — DEV-0006).
 
 ## Planning / execution risks (from this plan)
 

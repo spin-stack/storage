@@ -30,7 +30,18 @@ embedded via the `migrations` package). Driver pgx/v5. `metadata.Store` has two 
 See ADR-0006, ADR-0007. Atlas installed via `curl -sSL https://atlasbinaries.com/...` to
 `~/.local/bin/atlas`.
 
-## Current state (2026-07-25)
+## Current state (2026-07-25, REBASELINED)
+**Read `docs/plan/REBASELINE.md` first.** A human review found the status docs
+overstated: what exists is a set of well-tested library *models* plus a DST harness —
+no `cmd/`, no `api/`, no Agent, no vhost-user path, nothing that serves a VM. Phase
+states are now *model* / *integrated* / *production-verified*; nothing is integrated.
+Eight deviations are open (DEV-0003…DEV-0010): unvalidated objects can raise the
+durable point, fencing is fail-open, operations are not term-guarded, the store can
+delete permanently and the GC does not mark, drain is not idempotent after promotion,
+rebuild-metadata covers volumes only, and no metric is ever recorded. Features are
+paused until the first four are fixed.
+
+## Previous (pre-rebaseline) note
 Phases 0/01/04/05/06/07/08/09/10/**11** complete on `main` (Phase 11 = cross-host
 materialization + cordon/drain + capacity, merged `--ff-only` after review). Increment
 **13.1 (typed lifecycles, ADR-0009)** is on branch `hardening/typed-lifecycles`.
