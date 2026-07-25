@@ -201,6 +201,26 @@ func TestResumeRefusesRecordsFromAnotherEpoch(t *testing.T) {
 	}
 }
 
+// TestResumeRefusesAnotherVolumesRecords: the same fail-closed check as the epoch
+// one, on the identity that has no other guard. A WAL file that ends up under the
+// wrong volume's directory (a restored backup, a reused directory, a path bug)
+// replays into that volume's read view and continues its sequence space.
+func TestResumeRefusesAnotherVolumesRecords(t *testing.T) {
+	w := newResumeWorld(t, nil) // volume {21}
+	if _, err := w.log.Write(0, []byte("volume-21's data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.log.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	other := [16]byte{99}
+	if _, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, other, 1, 0,
+		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil); !errors.Is(err, wal.ErrForeignVolume) {
+		t.Fatalf("resuming volume %x over volume %x's WAL must fail closed, got %v", other, w.vol, err)
+	}
+}
+
 // TestResumeUploadsOnlyTheTailS3NeverGot: the records between the durable point and
 // the end of the WAL exist only on this host. A resume that forgets them loses every
 // write since the last successful upload; a resume that re-uploads the whole file

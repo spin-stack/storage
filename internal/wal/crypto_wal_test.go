@@ -324,6 +324,54 @@ func TestRecordsCarryTheLogsEpoch(t *testing.T) {
 	}
 }
 
+// TestRecordsCarryTheLogsVolumeID: the record header has a VolumeID field (§14.1)
+// and the write path leaves it zero, so the local WAL has no volume binding at all.
+// A file replayed against the wrong volume — a path bug, a restored backup, a reused
+// volume directory, two volumes' records concatenated — applies to another guest's
+// extents with nothing to detect it. Encryption's AAD catches it for sealed payloads
+// only, which is not the layer INV-05/INV-08 are claimed at, and DISCARD records
+// carry no payload at all.
+func TestRecordsCarryTheLogsVolumeID(t *testing.T) {
+	vol := [16]byte{0xA1, 0xB2, 0xC3}
+	d := sim.NewDisk()
+	f, _ := d.Create("wal/active.wal")
+	l := wal.NewLog(f, sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	if _, err := l.Write(0, []byte("w"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Discard(64, 8); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.WriteZeroes(128, 8); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := wal.Replay(readAll(t, f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range recs {
+		if r.VolumeID != vol {
+			t.Fatalf("record %d (%v) carries volume %x, the log belongs to %x", i, r.Type, r.VolumeID, vol)
+		}
+	}
+}
+
+// TestEncryptedRecordsCarryTheVolumeID: the encrypted path builds its header
+// separately, so it needs its own assertion.
+func TestEncryptedRecordsCarryTheVolumeID(t *testing.T) {
+	l, f, _ := encryptedLog(t)
+	if _, err := l.Write(0, []byte("sealed"), 0); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := wal.Replay(readAll(t, f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recs[0].VolumeID != ([16]byte{9, 9, 9}) {
+		t.Fatalf("encrypted record carries volume %x, want %x", recs[0].VolumeID, [16]byte{9, 9, 9})
+	}
+}
+
 func TestDiscardAccounting(t *testing.T) {
 	d := sim.NewDisk()
 	f, _ := d.Create("wal/active.wal")
