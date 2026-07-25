@@ -115,6 +115,26 @@ func (c *NoPlaintextLeavesHostChecker) Observe(e Event) {
 
 func (c *NoPlaintextLeavesHostChecker) Check() error { return c.violation }
 
+// DurableAckLeaseChecker enforces INV-06 (§12.2): no FLUSH/FUA is ACKed as durable
+// while the host lease is invalid. It watches durable-ack events for an ACK that
+// escaped with an invalid lease.
+type DurableAckLeaseChecker struct {
+	violation error
+}
+
+// NewDurableAckLeaseChecker returns a fresh checker.
+func NewDurableAckLeaseChecker() *DurableAckLeaseChecker { return &DurableAckLeaseChecker{} }
+
+func (c *DurableAckLeaseChecker) Name() string { return "durable-ack-requires-lease" }
+
+func (c *DurableAckLeaseChecker) Observe(e Event) {
+	if e.Kind == EventDurableAck && !e.LeaseValid && c.violation == nil {
+		c.violation = fmt.Errorf("durable ACK of seq %d with an invalid lease at step %d (violates §12.2/INV-06)", e.Durable, e.Step)
+	}
+}
+
+func (c *DurableAckLeaseChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
@@ -122,5 +142,6 @@ func DefaultCheckers() []Checker {
 		NewNoPermanentDeleteChecker(),
 		NewWatermarkOrderChecker(),
 		NewNoPlaintextLeavesHostChecker(),
+		NewDurableAckLeaseChecker(),
 	}
 }

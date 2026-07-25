@@ -40,6 +40,7 @@ const (
 	EventRecovery   EventKind = "recovery"
 	EventWatermark  EventKind = "watermark"
 	EventLeavesHost EventKind = "leaves-host"
+	EventDurableAck EventKind = "durable-ack"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -60,6 +61,9 @@ type Event struct {
 	// LeavesHost events (§5.10): true if cleartext guest data was detected in bytes
 	// bound for outside the host (a violation).
 	ClearLeak bool
+	// DurableAck events (§12.2): whether the host lease was valid at the instant a
+	// FLUSH was ACKed as durable. Must always be true (INV-06).
+	LeaseValid bool
 }
 
 // String renders an event deterministically for the trace.
@@ -73,6 +77,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d watermark pub=%d dur=%d loc=%d", e.Step, e.Published, e.Durable, e.Local)
 	case EventLeavesHost:
 		return fmt.Sprintf("%04d leaves-host clear_leak=%t %s", e.Step, e.ClearLeak, e.Msg)
+	case EventDurableAck:
+		return fmt.Sprintf("%04d durable-ack seq=%d lease_valid=%t", e.Step, e.Durable, e.LeaseValid)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

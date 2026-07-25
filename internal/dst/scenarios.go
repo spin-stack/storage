@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -46,7 +47,63 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "encrypted-wal-no-plaintext-leak", Run: scenarioEncryptedWALNoPlaintextLeak},
 		{Name: "remote-flush-ordering", Run: scenarioRemoteFlushOrdering},
 		{Name: "idempotent-batch-upload", Run: scenarioIdempotentBatchUpload},
+		{Name: "lease-fences-durable-ack", Run: scenarioLeaseFencesDurableAck},
 	}
+}
+
+// scenarioLeaseFencesDurableAck is INV-06 (§12.2): a valid lease lets a FLUSH ACK;
+// once the lease expires, a FLUSH whose object still lands in S3 is NOT ACKed —
+// durable does not advance and the log self-fences.
+func scenarioLeaseFencesDurableAck(s *Sim) error {
+	ctx := context.Background()
+	vol := [16]byte{8}
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	lm := lease.NewManager(s.Clock, 10*time.Second)
+	lm.Grant()
+
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(
+		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 5),
+	)
+	l.SetLease(lm)
+
+	// (1) With a valid lease, the FLUSH ACKs.
+	if _, err := l.Write(0, []byte("acked"), 0); err != nil {
+		return err
+	}
+	if err := l.Flush(ctx); err != nil {
+		return fmt.Errorf("flush with valid lease: %w", err)
+	}
+	s.Emit(Event{Kind: EventDurableAck, Durable: l.Watermarks().Durable, LeaseValid: lm.Valid()})
+	ackedDurable := l.Watermarks().Durable
+
+	// (2) Lease expires; a further write + FLUSH must self-fence without ACKing,
+	// even though the object reaches S3.
+	if _, err := l.Write(8, []byte("not-acked"), 0); err != nil {
+		return err
+	}
+	s.Clock.Advance(11 * time.Second) // no renewal
+	err = l.Flush(ctx)
+	if !errors.Is(err, wal.ErrSelfFenced) {
+		return fmt.Errorf("expired-lease flush: want ErrSelfFenced, got %v", err)
+	}
+	// No durable-ack event is emitted here — there was no ACK. The checker verifies
+	// no ACK ever escaped with an invalid lease.
+	if l.Watermarks().Durable != ackedDurable {
+		return fmt.Errorf("durable advanced past the last ACK despite an invalid lease (INV-06)")
+	}
+	if !l.Fenced() {
+		return errors.New("log should have self-fenced")
+	}
+	if objs, _ := s.Store.List(ctx, "wal/"); len(objs) != 2 {
+		return fmt.Errorf("both objects should be in S3 (PUT succeeded), got %d", len(objs))
+	}
+	s.Notef("lease expiry self-fenced the ACK; object in S3 but not confirmed")
+	return nil
 }
 
 func remoteLog(s *Sim, vol [16]byte) (*wal.Log, error) {

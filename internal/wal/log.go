@@ -56,12 +56,25 @@ type Log struct {
 	batcher  *Batcher  // nil = local-only (no remote WAL)
 	uploader *Uploader // nil = local-only
 
+	mode   DurabilityMode // remote (default) | local (§14.8)
+	lease  LeaseChecker   // nil = no lease gate (dev/local without a CP)
+	fenced bool           // set once a FLUSH finds the lease invalid (§16 SELF_FENCED)
+
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
 	discardedBytes    int64
 	uploaded          []SummaryObject // durable objects, for the summary (§22.1)
 }
+
+// SetDurabilityMode selects the FLUSH/FUA ACK contract (§14.8). Default is remote.
+func (l *Log) SetDurabilityMode(m DurabilityMode) { l.mode = m }
+
+// SetLease wires the host lease checker used by the durable-ACK rule (§12.2).
+func (l *Log) SetLease(c LeaseChecker) { l.lease = c }
+
+// Fenced reports whether the log has self-fenced (a FLUSH found the lease invalid).
+func (l *Log) Fenced() bool { return l.fenced }
 
 // EnableEncryption binds an Encryption context so subsequent WRITEs seal their
 // payloads (§15). Must be set before the first WRITE.
@@ -183,18 +196,27 @@ func (l *Log) Sync() error {
 	if err := l.file.Sync(); err != nil {
 		return err
 	}
-	l.unflushedBytes = 0
-	l.hasUnflushed = false
+	l.clearUnflushed()
 	return nil
 }
 
-// Flush makes every record up to the current local sequence durable in S3 and
-// advances durable_sequence (§14.4). Order: capture target, close the batch,
-// fdatasync, upload+verify all covering objects, advance durable, ack. durable is
-// advanced ONLY after the objects are verified (INV-07). If an upload fails, the
-// un-uploaded batches are retained for the next Flush and durable is not advanced.
-// The lease-verify step (§14.4 step 5) lands in Phase 07.
+// Flush makes a FLUSH/FUA durable and ACKs it, following §14.4. Order: capture
+// target, close the batch, fdatasync, then per durability mode (§14.8):
+//
+//   - remote (default): upload + verify every covering object, VERIFY the lease is
+//     still valid on the monotonic clock, then advance durable_sequence and ACK.
+//     durable advances ONLY after S3 verification (INV-07); and the ACK happens ONLY
+//     while the lease is valid (§12.2, INV-06) — a PUT that landed in S3 after the
+//     lease expired is NOT confirmed, and the log self-fences.
+//   - local: ACK after the local fdatasync; the lease does not gate the FLUSH ACK
+//     and S3 is asynchronous (§14.8 rule 3).
+//
+// A failed upload retains the un-uploaded batches for the next Flush and does not
+// advance durable.
 func (l *Log) Flush(ctx context.Context) error {
+	if l.fenced {
+		return ErrSelfFenced
+	}
 	target := l.local
 	if l.batcher != nil {
 		l.batcher.Flush() // step 2: close current batch
@@ -202,6 +224,13 @@ func (l *Log) Flush(ctx context.Context) error {
 	if err := l.file.Sync(); err != nil { // step 3: fdatasync local
 		return err
 	}
+
+	if l.mode == ModeLocal {
+		// §14.8: ACK on local durability; no lease gate, no synchronous S3.
+		l.clearUnflushed()
+		return nil
+	}
+
 	if l.batcher != nil && l.uploader != nil {
 		pending := l.batcher.Pending()
 		done := 0
@@ -216,13 +245,23 @@ func (l *Log) Flush(ctx context.Context) error {
 		}
 		l.batcher.RemoveUploaded(done)
 	}
-	// step 5: lease verify — Phase 07.
+
+	// step 5: verify the lease on the monotonic clock (§12.2, INV-06). If it is not
+	// valid, do NOT advance durable and do NOT ACK — self-fence.
+	if l.lease != nil && !l.lease.Valid() {
+		l.fenced = true
+		return ErrSelfFenced
+	}
 	if err := l.AdvanceDurable(target); err != nil { // step 6
 		return err
 	}
+	l.clearUnflushed()
+	return nil // step 7: ack
+}
+
+func (l *Log) clearUnflushed() {
 	l.unflushedBytes = 0
 	l.hasUnflushed = false
-	return nil // step 7: ack
 }
 
 func (l *Log) trackUnflushed(n int) {
