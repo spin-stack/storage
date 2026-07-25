@@ -19,6 +19,11 @@ backend throttles mid-sweep, or a clock moves backwards.
 | The GC did not treat the durable prefix as a root: a sweep delete-markered every ACKed WAL object no checkpoint enumerates, moving the durable point to zero | `8dd3de3` |
 | A drain could record an immutable epoch boundary of 0 below what the volume had durable, losing it permanently | `8dd3de3` |
 | Nine of eleven DST checkers had never been shown to catch anything | `b54e66e` |
+| Recovery and materialization never chained across epochs: a volume promoted twice rebuilt with only its newest epoch's writes, reported as complete | `a0d59a6` |
+| `checkpoint.Create` published the log's durable watermark instead of what S3 proves, authorising local truncation over data that existed nowhere else | `a0d59a6` |
+| Every log started at sequence 1, so a promoted writer would have written records colliding with the previous epoch's | `a0d59a6` |
+
+**All seven criticals are now closed.** What remains below is high and lower.
 
 ## Open
 
