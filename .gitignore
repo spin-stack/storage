@@ -6,7 +6,7 @@
 # Go
 *.test
 *.out
-coverage.*
+
 
 # Editor / OS
 .DS_Store
