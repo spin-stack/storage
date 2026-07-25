@@ -35,8 +35,12 @@ func (q *Queries) GetOperation(ctx context.Context, operationID uuid.UUID) (*Ope
 }
 
 const recordOperation = `-- name: RecordOperation :execrows
+WITH valid AS (
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
+)
 INSERT INTO operations (operation_id, kind, volume_id, host_id, desired_state, current_state, phase)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+SELECT $1, $2, $3, $4, $5, $6, $7
+WHERE EXISTS (SELECT 1 FROM valid)
 ON CONFLICT (operation_id) DO NOTHING
 `
 
@@ -48,10 +52,12 @@ type RecordOperationParams struct {
 	DesiredState []byte      `json:"desired_state"`
 	CurrentState []byte      `json:"current_state"`
 	Phase        string      `json:"phase"`
+	Term         int64       `json:"term"`
 }
 
-// Admin idempotency by request_id (§18). Returns 1 if newly recorded, 0 if the
-// operation_id already existed (a duplicate request).
+// Admin idempotency by request_id (§18) + term guard (§7): the INSERT ... SELECT
+// produces no row for a stale term, so a zombie CP cannot record work. Returns 1 if
+// newly recorded, 0 if the operation_id already existed or the term is stale.
 func (q *Queries) RecordOperation(ctx context.Context, arg RecordOperationParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordOperation,
 		arg.OperationID,
@@ -61,6 +67,7 @@ func (q *Queries) RecordOperation(ctx context.Context, arg RecordOperationParams
 		arg.DesiredState,
 		arg.CurrentState,
 		arg.Phase,
+		arg.Term,
 	)
 	if err != nil {
 		return 0, err
@@ -72,7 +79,8 @@ const updateOperationPhase = `-- name: UpdateOperationPhase :execrows
 UPDATE operations
    SET current_state = $2, phase = $3, error = $4, updated_at = now()
  WHERE operation_id = $1
-   AND phase = ANY($5::text[])
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $5
+   AND phase = ANY($6::text[])
 `
 
 type UpdateOperationPhaseParams struct {
@@ -80,6 +88,7 @@ type UpdateOperationPhaseParams struct {
 	CurrentState  []byte      `json:"current_state"`
 	Phase         string      `json:"phase"`
 	Error         pgtype.Text `json:"error"`
+	Term          int64       `json:"term"`
 	AllowedPhases []string    `json:"allowed_phases"`
 }
 
@@ -91,6 +100,7 @@ func (q *Queries) UpdateOperationPhase(ctx context.Context, arg UpdateOperationP
 		arg.CurrentState,
 		arg.Phase,
 		arg.Error,
+		arg.Term,
 		arg.AllowedPhases,
 	)
 	if err != nil {

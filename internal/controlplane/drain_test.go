@@ -238,7 +238,7 @@ func TestDrainCancelStopsAtVolumeBoundary(t *testing.T) {
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
-	if err := w.drainer.Cancel(ctx, drainOpID); err != nil {
+	if err := w.drainer.Cancel(ctx, w.term, drainOpID); err != nil {
 		t.Fatal(err)
 	}
 	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
@@ -271,7 +271,7 @@ func TestDrainCancelAfterPartialProgress(t *testing.T) {
 	}
 
 	// Cancel the in-flight operation, then give the fleet room again.
-	if err := w.drainer.Cancel(ctx, drainOpID); err != nil {
+	if err := w.drainer.Cancel(ctx, w.term, drainOpID); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.md.UpsertHost(ctx, w.term, metadata.Host{

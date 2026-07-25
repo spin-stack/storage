@@ -89,7 +89,9 @@ tasks:
     deps: [tools:sqlc]
     cmds:
       - "{{.TOOLS_BIN}}/sqlc generate"
-      - git diff --exit-code -- internal/db
+      # Only the generated files: hand-written tests living in internal/db must not
+      # make this fail (it is about staleness, not about uncommitted work).
+      - git diff --exit-code -- 'internal/db/*.go' ':!internal/db/*_test.go'
 
   db:migrate:diff:
     desc: "Generate an Atlas migration from schema.sql changes (ADR-0007). Usage: task db:migrate:diff -- <name>"

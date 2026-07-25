@@ -285,7 +285,7 @@ func (s *Store) GetSnapshot(_ context.Context, snapshotID string) (metadata.Snap
 	return snap, nil
 }
 
-func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool, error) {
+func (s *Store) RecordOperation(_ context.Context, term int64, op metadata.Operation) (bool, error) {
 	if !op.Kind.Valid() {
 		return false, fmt.Errorf("%w: operation kind %q", lifecycle.ErrUnknownState, op.Kind)
 	}
@@ -294,6 +294,9 @@ func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return false, err
+	}
 	if _, exists := s.ops[op.OperationID]; exists {
 		return false, nil // duplicate request (§18)
 	}
@@ -301,12 +304,15 @@ func (s *Store) RecordOperation(_ context.Context, op metadata.Operation) (bool,
 	return true, nil
 }
 
-func (s *Store) UpdateOperation(_ context.Context, op metadata.Operation) error {
+func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Operation) error {
 	if !op.Phase.Valid() {
 		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
 	cur, ok := s.ops[op.OperationID]
 	if !ok {
 		return metadata.ErrNotFound

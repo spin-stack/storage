@@ -103,13 +103,14 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 func TestOperationIdempotency(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()
+	term, _ := s.AcquireLeadership(ctx, "cp")
 	op := metadata.Operation{OperationID: "req-1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
 
-	recorded, err := s.RecordOperation(ctx, op)
+	recorded, err := s.RecordOperation(ctx, term, op)
 	if err != nil || !recorded {
 		t.Fatalf("first record: recorded=%v err=%v", recorded, err)
 	}
-	recorded, err = s.RecordOperation(ctx, op)
+	recorded, err = s.RecordOperation(ctx, term, op)
 	if err != nil || recorded {
 		t.Fatalf("duplicate record should report recorded=false, got %v err=%v", recorded, err)
 	}
@@ -169,7 +170,7 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 	}
 
 	op := metadata.Operation{OperationID: "op1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
-	if _, err := s.RecordOperation(ctx, op); err != nil {
+	if _, err := s.RecordOperation(ctx, term, op); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetOperation(ctx, "op1")
@@ -210,13 +211,13 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: "s", State: lifecycle.SnapshotState("DONE")})
 		}},
 		{"RecordOperation with an unknown kind", func(s *sim.Store, term int64) error {
-			_, err := s.RecordOperation(ctx, metadata.Operation{
+			_, err := s.RecordOperation(ctx, term, metadata.Operation{
 				OperationID: "op", Kind: lifecycle.OperationKind("teleport"), Phase: lifecycle.OpPending,
 			})
 			return err
 		}},
 		{"RecordOperation with an unknown phase", func(s *sim.Store, term int64) error {
-			_, err := s.RecordOperation(ctx, metadata.Operation{
+			_, err := s.RecordOperation(ctx, term, metadata.Operation{
 				OperationID: "op", Kind: lifecycle.OpDrain, Phase: lifecycle.OperationPhase("STARTED"),
 			})
 			return err
@@ -238,30 +239,30 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 func TestUpdateOperationEnforcesThePhaseLifecycle(t *testing.T) {
 	ctx := context.Background()
 	s := newStore()
-	_, _ = s.AcquireLeadership(ctx, "cp")
+	term, _ := s.AcquireLeadership(ctx, "cp")
 	op := metadata.Operation{
 		OperationID: "op-1", Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
 		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
 	}
-	if _, err := s.RecordOperation(ctx, op); err != nil {
+	if _, err := s.RecordOperation(ctx, term, op); err != nil {
 		t.Fatal(err)
 	}
 
 	op.Phase = lifecycle.OpRunning
-	if err := s.UpdateOperation(ctx, op); err != nil {
+	if err := s.UpdateOperation(ctx, term, op); err != nil {
 		t.Fatalf("PENDING -> RUNNING: %v", err)
 	}
 	op.Phase = lifecycle.OpSucceeded
-	if err := s.UpdateOperation(ctx, op); err != nil {
+	if err := s.UpdateOperation(ctx, term, op); err != nil {
 		t.Fatalf("RUNNING -> SUCCEEDED: %v", err)
 	}
 
 	op.Phase = lifecycle.OpRunning
-	if err := s.UpdateOperation(ctx, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := s.UpdateOperation(ctx, term, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
 	}
 	op.Phase = lifecycle.OpCanceling
-	if err := s.UpdateOperation(ctx, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := s.UpdateOperation(ctx, term, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("SUCCEEDED -> CANCELING: want ErrInvalidTransition, got %v", err)
 	}
 	got, _ := s.GetOperation(ctx, "op-1")

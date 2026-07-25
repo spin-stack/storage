@@ -405,7 +405,7 @@ func (s *Store) GetSnapshot(ctx context.Context, snapshotID string) (metadata.Sn
 	}, nil
 }
 
-func (s *Store) RecordOperation(ctx context.Context, op metadata.Operation) (bool, error) {
+func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Operation) (bool, error) {
 	id, err := uuid.Parse(op.OperationID)
 	if err != nil {
 		return false, err
@@ -419,6 +419,7 @@ func (s *Store) RecordOperation(ctx context.Context, op metadata.Operation) (boo
 	rows, err := s.q.RecordOperation(ctx, db.RecordOperationParams{
 		OperationID: id, Kind: op.Kind.String(), VolumeID: nullUUID(op.VolumeID), HostID: nullUUID(op.HostID),
 		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase.String(),
+		Term: term,
 	})
 	if err != nil {
 		return false, err
@@ -426,7 +427,7 @@ func (s *Store) RecordOperation(ctx context.Context, op metadata.Operation) (boo
 	return rows == 1, nil
 }
 
-func (s *Store) UpdateOperation(ctx context.Context, op metadata.Operation) error {
+func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Operation) error {
 	id, err := uuid.Parse(op.OperationID)
 	if err != nil {
 		return err
@@ -437,17 +438,22 @@ func (s *Store) UpdateOperation(ctx context.Context, op metadata.Operation) erro
 	rows, err := s.q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
 		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
 		AllowedPhases: op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
+		Term:          term,                        // and the §7 term guard
 	})
 	if err != nil {
 		return err
 	}
 	if rows == 0 {
-		// 0 rows: the operation does not exist, or the phase move is illegal.
+		// 0 rows: the operation does not exist, the phase move is illegal, or the
+		// term is stale.
 		cur, gerr := s.GetOperation(ctx, op.OperationID)
 		if gerr != nil {
 			return gerr
 		}
-		return cur.Phase.Transition(op.Phase)
+		if terr := cur.Phase.Transition(op.Phase); terr != nil {
+			return terr
+		}
+		return metadata.ErrStaleTerm
 	}
 	return nil
 }

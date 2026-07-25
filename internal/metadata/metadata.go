@@ -152,14 +152,14 @@ type Store interface {
 	// GetSnapshot returns a snapshot by id.
 	GetSnapshot(ctx context.Context, snapshotID string) (Snapshot, error)
 
-	// RecordOperation records an admin operation idempotently; recorded is false if
-	// the operation_id already existed (a duplicate request, §18).
-	RecordOperation(ctx context.Context, op Operation) (recorded bool, err error)
+	// RecordOperation records an admin operation idempotently (term-guarded, §7/§18);
+	// recorded is false if the operation_id already existed (a duplicate request).
+	RecordOperation(ctx context.Context, term int64, op Operation) (recorded bool, err error)
 	// GetOperation returns a recorded operation.
 	GetOperation(ctx context.Context, operationID string) (Operation, error)
 	// UpdateOperation stores an operation's phase, current state, and error — the
-	// visible progress of a long-running reconciled operation (§7, §28.1). The phase
-	// move is guarded by the lifecycle table, so a terminal operation is never
-	// resurrected (lifecycle.ErrInvalidTransition).
-	UpdateOperation(ctx context.Context, op Operation) error
+	// visible progress of a long-running reconciled operation (§7, §28.1). It is
+	// term-guarded, and the phase move is guarded by the lifecycle table, so a
+	// terminal operation is never resurrected (lifecycle.ErrInvalidTransition).
+	UpdateOperation(ctx context.Context, term int64, op Operation) error
 }

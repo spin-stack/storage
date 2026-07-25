@@ -103,6 +103,10 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 func TestPGOperationIdempotency(t *testing.T) {
 	ctx := context.Background()
 	store := pg.New(startPostgres(t))
+	term, err := store.AcquireLeadership(ctx, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
 	op := metadata.Operation{
 		OperationID:  ids.New().String(),
 		Kind:         lifecycle.OpAttach,
@@ -110,11 +114,11 @@ func TestPGOperationIdempotency(t *testing.T) {
 		CurrentState: []byte(`{}`),
 		Phase:        lifecycle.OpPending,
 	}
-	rec, err := store.RecordOperation(ctx, op)
+	rec, err := store.RecordOperation(ctx, term, op)
 	if err != nil || !rec {
 		t.Fatalf("first record: rec=%v err=%v", rec, err)
 	}
-	rec, err = store.RecordOperation(ctx, op)
+	rec, err = store.RecordOperation(ctx, term, op)
 	if err != nil || rec {
 		t.Fatalf("duplicate should report rec=false: rec=%v err=%v", rec, err)
 	}
@@ -123,7 +127,7 @@ func TestPGOperationIdempotency(t *testing.T) {
 	op.Phase = lifecycle.OpRunning
 	op.CurrentState = []byte(`{"total":2,"moved":1}`)
 	op.Error = "waiting for fencing"
-	if err := store.UpdateOperation(ctx, op); err != nil {
+	if err := store.UpdateOperation(ctx, term, op); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetOperation(ctx, op.OperationID)
@@ -136,7 +140,7 @@ func TestPGOperationIdempotency(t *testing.T) {
 		t.Fatalf("current_state = %s err=%v", got.CurrentState, err)
 	}
 	op.OperationID = ids.New().String()
-	if err := store.UpdateOperation(ctx, op); !errors.Is(err, metadata.ErrNotFound) {
+	if err := store.UpdateOperation(ctx, term, op); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("update of a missing operation: want ErrNotFound, got %v", err)
 	}
 }
@@ -262,7 +266,7 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	opID := ids.New().String()
-	if _, err := store.RecordOperation(ctx, metadata.Operation{
+	if _, err := store.RecordOperation(ctx, term, metadata.Operation{
 		OperationID: opID, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
 		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
 	}); err != nil {
@@ -346,25 +350,25 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	store := pg.New(startPostgres(t))
-	_, _ = store.AcquireLeadership(ctx, "cp")
+	term, _ := store.AcquireLeadership(ctx, "cp")
 
 	op := metadata.Operation{
 		OperationID: ids.New().String(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
 		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
 	}
-	if _, err := store.RecordOperation(ctx, op); err != nil {
+	if _, err := store.RecordOperation(ctx, term, op); err != nil {
 		t.Fatal(err)
 	}
 	op.Phase = lifecycle.OpRunning
-	if err := store.UpdateOperation(ctx, op); err != nil {
+	if err := store.UpdateOperation(ctx, term, op); err != nil {
 		t.Fatal(err)
 	}
 	op.Phase = lifecycle.OpSucceeded
-	if err := store.UpdateOperation(ctx, op); err != nil {
+	if err := store.UpdateOperation(ctx, term, op); err != nil {
 		t.Fatal(err)
 	}
 	op.Phase = lifecycle.OpRunning
-	if err := store.UpdateOperation(ctx, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := store.UpdateOperation(ctx, term, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
 	}
 	got, _ := store.GetOperation(ctx, op.OperationID)

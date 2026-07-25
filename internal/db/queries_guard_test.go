@@ -1,12 +1,17 @@
 package db_test
 
 import (
-	"os"
-	"path/filepath"
+	"embed"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+// The .sql sources are embedded rather than read from disk: the test needs no file
+// I/O at all, which keeps it inside INV-01 without an exemption.
+//
+//go:embed queries/*.sql
+var querySources embed.FS
 
 // TestEveryMutatingQueryIsTermGuarded is DEV-0005. §7 says every Control-Plane write
 // validates the leader term, so a zombie CP affects 0 rows — but that was a
@@ -23,8 +28,7 @@ func TestEveryMutatingQueryIsTermGuarded(t *testing.T) {
 		"AcquireLeadership": "the query that elects the leader and writes the new term",
 	}
 
-	dir := filepath.Join("queries")
-	entries, err := os.ReadDir(dir)
+	entries, err := querySources.ReadDir("queries")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +40,7 @@ func TestEveryMutatingQueryIsTermGuarded(t *testing.T) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
-		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		body, err := querySources.ReadFile("queries/" + e.Name())
 		if err != nil {
 			t.Fatal(err)
 		}
