@@ -128,7 +128,7 @@ Phase 14 (post-MVP) is out of MVP scope and listed for completeness only.
 | 04 | 4 | CoW (64 KiB segments) + local WAL (real extents) + format v2 (crypto fields reserved) + WAL property tests | **DONE** ✓ (4.1–4.4; INV-03/04/05/18 active; format review pending) | 01 |
 | 05 | 5 | Per-volume encryption (DEK/KEK, dev KMS) + DISCARD/WRITE_ZEROES | **DONE** ✓ (5.1–5.2; INV-15 active) | 04 |
 | 06 | 6 | Remote WAL: on-demand batching + PUT idempotency + summary objects | **DONE** ✓ (6.1–6.3; INV-07/21 active, INV-04 full) | 04 (05 for ciphertext) |
-| 07 | 7 | PostgreSQL + Control Plane (verified term) + reconciliation + leases + full fencing protocol under DST | **expanded; fencing review pending** ⚠️ | 06 |
+| 07 | 7 | PostgreSQL + Control Plane (verified term) + reconciliation + leases + full fencing protocol under DST | **DONE** ✓ (7.1–7.4; INV-06/09/10/11 active) | 06 |
 | 08 | 8 | Recovery with S3 as authority + recovery-point + basic `rebuild-metadata` | not expanded | 06, 07 |
 | 09 | 9 | Pause-free snapshots + same-host clones + online resize (grow) | not expanded | 08 |
 | 10 | 10 | Objectization + checkpoints + GC mark-and-sweep + versioned/Object-Lock buckets | not expanded | 08 |

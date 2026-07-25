@@ -13,6 +13,7 @@ import (
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/network"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -53,7 +54,94 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "idempotent-batch-upload", Run: scenarioIdempotentBatchUpload},
 		{Name: "lease-fences-durable-ack", Run: scenarioLeaseFencesDurableAck},
 		{Name: "promotion-fencing-wait", Run: scenarioPromotionFencingWait},
+		{Name: "fenced-writer-no-lost-ack", Run: scenarioFencedWriterNoLostAck},
 	}
+}
+
+// failVol/failHosts are the v7-shaped ids for the full-fencing scenario.
+const (
+	failVolStr = "00000000-0000-7000-8000-000000000040"
+	failHost1  = "00000000-0000-7000-8000-0000000000c1"
+	failHost2  = "00000000-0000-7000-8000-0000000000c2"
+)
+
+// scenarioFencedWriterNoLostAck is INV-09 — the headline of v5. W1 (epoch 1) ACKs
+// some FLUSHes; it is then partitioned from the CP (S3 intact), so past its lease it
+// cannot ACK (INV-06); the CP waits FENCING_WAIT and promotes W2 (INV-10/11); W2
+// recovers the durable prefix from S3 and it covers everything W1 ACKed. W1's late
+// PUT (which landed in S3 but was never ACKed) is a harmless superset.
+func scenarioFencedWriterNoLostAck(s *Sim) error {
+	ctx := context.Background()
+	var volID [16]byte
+	volID[6], volID[8] = 0x70, 0x80 // v7 shape; UUIDString(volID) is a valid v7 id
+
+	// Control Plane state.
+	md := metasim.New(s.Clock.Wall)
+	epochs := epoch.NewStore(s.Store)
+	term, _ := md.AcquireLeadership(ctx, "cp")
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost1, State: "ACTIVE"})
+	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost2, State: "ACTIVE"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(volID), CurrentEpoch: 1, State: "ACTIVE", PrimaryHostID: failHost1, DEKWrapped: []byte{1}, KEKID: "k"})
+	if _, err := epochs.Init(ctx, format.UUIDString(volID), 1); err != nil {
+		return err
+	}
+
+	// W1: remote leased log at epoch 1.
+	lm := lease.NewManager(s.Clock, 10*time.Second)
+	lm.Grant()
+	f, err := s.Disk.Create("wal/active.wal")
+	if err != nil {
+		return err
+	}
+	w1 := wal.NewLog(f, s.Clock, volID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	w1.EnableRemote(
+		wal.NewBatcher(s.Clock, volID, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 5),
+	)
+	w1.SetLease(lm)
+
+	// W1 ACKs seq 1..2 with a valid lease.
+	_, _ = w1.Write(0, []byte("one"), 0)
+	_, _ = w1.Write(8, []byte("two"), 0)
+	if err := w1.Flush(ctx); err != nil {
+		return fmt.Errorf("w1 flush (valid lease): %w", err)
+	}
+	ackedDurable := w1.Watermarks().Durable // = 2
+
+	// Partition: heartbeats stop; the lease expires. W1's next FLUSH's object lands
+	// in S3 (S3 is reachable) but W1 self-fences and does NOT ACK it.
+	_, _ = w1.Write(16, []byte("three"), 0)
+	s.Clock.Advance(11 * time.Second) // lease expires, no renewal
+	if err := w1.Flush(ctx); !errors.Is(err, wal.ErrSelfFenced) {
+		return fmt.Errorf("w1 partitioned flush: want ErrSelfFenced, got %v", err)
+	}
+	if w1.Watermarks().Durable != ackedDurable {
+		return errors.New("w1 durable advanced past its ACK despite an invalid lease (INV-06)")
+	}
+
+	// CP promotes W2 after FENCING_WAIT (its lease was renewed at t0 = start).
+	s.Clock.Advance(2 * time.Second) // ensure past last_renewal + ttl + skew
+	newEpoch, err := controlplane.NewPromoter(md, epochs, s.Clock, 10*time.Second, 2*time.Second).
+		Promote(ctx, term, format.UUIDString(volID), s.Clock.Wall().Add(-13*time.Second), failHost2)
+	if err != nil {
+		return fmt.Errorf("promote W2: %w", err)
+	}
+
+	// W2 recovers epoch 1's durable prefix from S3 and fixes the recovery point.
+	recovered, err := recovery.DurablePrefix(ctx, s.Store, format.UUIDString(volID), 1)
+	if err != nil {
+		return fmt.Errorf("recover durable prefix: %w", err)
+	}
+	if err := recovery.WriteRecoveryPoint(ctx, s.Store, format.UUIDString(volID), newEpoch, 1, recovered); err != nil {
+		return err
+	}
+
+	s.Emit(Event{Kind: EventFailover, AckedDurable: ackedDurable, Recovered: recovered})
+	if recovered < ackedDurable {
+		return fmt.Errorf("recovered %d < acked %d — a durable ACK was lost (INV-09)", recovered, ackedDurable)
+	}
+	s.Notef("failover: W1 acked=%d, W2 recovered=%d (>= acked); no ACKed write lost", ackedDurable, recovered)
+	return nil
 }
 
 // promoVol/promoHosts are v7-shaped ids used by the promotion scenario.

@@ -43,6 +43,7 @@ const (
 	EventDurableAck  EventKind = "durable-ack"
 	EventPromotion   EventKind = "promotion"
 	EventStalePublsh EventKind = "stale-publish"
+	EventFailover    EventKind = "failover"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -72,6 +73,10 @@ type Event struct {
 	// StalePublish events (§12.4): whether a fenced/stale-epoch writer managed to
 	// publish. Must always be false (INV-10).
 	StalePublishOK bool
+	// Failover events (§12): the fenced writer's ACKed-durable sequence and the
+	// promoted writer's recovered prefix. Recovered must be >= AckedDurable (INV-09).
+	AckedDurable uint64
+	Recovered    uint64
 }
 
 // String renders an event deterministically for the trace.
@@ -91,6 +96,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d promotion early_grant=%t %s", e.Step, e.EarlyGrant, e.Msg)
 	case EventStalePublsh:
 		return fmt.Sprintf("%04d stale-publish succeeded=%t", e.Step, e.StalePublishOK)
+	case EventFailover:
+		return fmt.Sprintf("%04d failover acked_durable=%d recovered=%d", e.Step, e.AckedDurable, e.Recovered)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

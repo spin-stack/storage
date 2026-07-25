@@ -169,6 +169,25 @@ func (c *SingleWriterChecker) Observe(e Event) {
 
 func (c *SingleWriterChecker) Check() error { return c.violation }
 
+// NoLostAckedWriteChecker enforces INV-09 (§12): across a partition + failover, the
+// promoted writer's recovered prefix must cover everything the fenced writer ACKed
+// as durable.
+type NoLostAckedWriteChecker struct{ violation error }
+
+// NewNoLostAckedWriteChecker returns a fresh checker.
+func NewNoLostAckedWriteChecker() *NoLostAckedWriteChecker { return &NoLostAckedWriteChecker{} }
+
+func (c *NoLostAckedWriteChecker) Name() string { return "no-lost-acked-write" }
+
+func (c *NoLostAckedWriteChecker) Observe(e Event) {
+	if e.Kind == EventFailover && e.Recovered < e.AckedDurable && c.violation == nil {
+		c.violation = fmt.Errorf("recovered prefix %d < ACKed-durable %d at step %d (violates §12/INV-09)",
+			e.Recovered, e.AckedDurable, e.Step)
+	}
+}
+
+func (c *NoLostAckedWriteChecker) Check() error { return c.violation }
+
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	return []Checker{
@@ -179,5 +198,6 @@ func DefaultCheckers() []Checker {
 		NewDurableAckLeaseChecker(),
 		NewPromotionWaitChecker(),
 		NewSingleWriterChecker(),
+		NewNoLostAckedWriteChecker(),
 	}
 }
