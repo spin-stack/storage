@@ -222,6 +222,24 @@ func TestStoreInternalsAreNotObjects(t *testing.T) {
 	}
 }
 
+// TestAKeyCannotCollideWithTheStoresBookkeeping: the sidecars are addressed by
+// suffix, so a key ending in one would make an object indistinguishable from a
+// delete marker — silently hiding, or resurrecting, the object it sits next to.
+func TestAKeyCannotCollideWithTheStoresBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newFSStore(t)
+	for _, key := range []string{"wal/v/1/x.wal.deleted", "wal/v/1/x.wal.superseded", "wal/v/1/x.wal.tmp"} {
+		t.Run(key, func(t *testing.T) {
+			if _, err := s.Put(ctx, key, []byte("v"), objectstore.PutOptions{}); err == nil {
+				t.Fatal("a key that collides with the store's bookkeeping must be refused")
+			}
+			if _, err := s.Get(ctx, key); !errors.Is(err, objectstore.ErrNotFound) {
+				t.Fatalf("the refused key must not exist: %v", err)
+			}
+		})
+	}
+}
+
 // describe renders what a torn read actually looked like, which is the whole point
 // of the failure message.
 func describe(b []byte) string {
