@@ -12,6 +12,11 @@ tasks:
     cmds:
       - task: ci
 
+  generate:
+    desc: Regenerate sqlc code from schema + queries (ADR-0006).
+    cmds:
+      - sqlc generate
+
   build:
     desc: Build all packages and commands.
     cmds:
@@ -21,6 +26,11 @@ tasks:
     desc: Run the full unit/property test suite with the race detector.
     cmds:
       - go test -race ./...
+
+  test:integration:
+    desc: Run Docker-gated integration tests (TestContainers Postgres, ADR-0006).
+    cmds:
+      - go test -tags integration -count=1 ./internal/metadata/pg/...
 
   lint:
     desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).

@@ -45,3 +45,7 @@ jobs:
 
       - name: DST (mandatory scenario set)
         run: task dst
+
+      # TestContainers Postgres integration (ADR-0006); ubuntu runners have Docker.
+      - name: Integration (TestContainers Postgres)
+        run: task test:integration

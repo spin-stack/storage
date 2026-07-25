@@ -5,10 +5,13 @@
 > that closes the stale-writer window. Human review of THIS spec is required before the
 > Harness agent writes tests. Implements §5.1, §7, §8, §12, §14.4-step-5, §18, §23.
 >
-> **Simulability:** PostgreSQL is reached through a `metadata` interface (like `simio`):
-> a real (PG/pgx) implementation and a deterministic in-memory sim so DST can drive
-> leases/epochs/promotions under partitions and clock drift. Real PG is verified by
-> integration tests later; the *protocol* is proven in sim.
+> **Simulability + SQL (ADR-0006):** PostgreSQL is reached through a `metadata.Store`
+> interface with two implementations — `metadata/sim` (in-memory, **deterministic**, for
+> DST under partitions/clock drift) and `metadata/pg` (a thin adapter over **sqlc**-
+> generated queries on pgx/v5, verified by **TestContainers**). The fencing *protocol* is
+> proven in sim; the real PG path is exercised by TestContainers where Docker exists.
+> Layout mirrors `spin`: `internal/schema/schema.sql`, `internal/db/queries/*.sql`,
+> `sqlc.yaml`, generated `internal/db`.
 
 **Phase objective:** a single-active Control Plane whose every write transaction is
 guarded by a verified `term`; per-host leases renewed in one grouped heartbeat; the
@@ -27,13 +30,16 @@ idempotency).
 ---
 
 ## Increment 7.1 — Metadata interface + schema + verified-term CP  ⚠️ review
-**Objective:** the `metadata` store interface (real PG + sim) with the §8 tables
-(`volumes`, `hosts`, `host_leases`, `snapshots`, `operations`, `control_plane_leader`);
-CP leadership via `term` (take-leadership increments term; **every** write carries
-`WHERE term = $mine`; a stale/zombie CP affects 0 rows, detects it, and self-terminates,
-§7).
-**Tests first:** two CPs contend — the one with the stale term makes 0-row writes and
-steps down; committed state is never double-applied.
+**Objective:** the `metadata.Store` interface with the §8 tables (`volumes`, `hosts`,
+`host_leases`, `snapshots`, `operations`, `control_plane_leader`) as
+`internal/schema/schema.sql`; sqlc queries (`internal/db/queries/*.sql`) generated to
+`internal/db`; a `metadata/sim` (in-memory, deterministic) and a `metadata/pg` (sqlc
+adapter). CP leadership via `term` (take-leadership increments term; **every** write
+carries `WHERE term = $mine`; a stale/zombie CP affects 0 rows, detects it, and
+self-terminates, §7).
+**Tests first:** sim contract — two CPs contend, the stale-term one makes 0-row writes
+and steps down; op idempotency by request_id. `metadata/pg` verified by a TestContainers
+integration test (Docker-gated).
 **Gate:** standard + human review. Activates the CP-term half of INV-10.
 
 ## Increment 7.2 — Lease manager + grouped heartbeat + durable-ACK rule  ⚠️ review
