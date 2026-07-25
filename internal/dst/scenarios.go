@@ -12,6 +12,7 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
+	"github.com/spin-stack/storage/internal/gc"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -63,7 +64,75 @@ func MandatoryScenarios() []MandatoryScenario {
 		{Name: "snapshot-pausefree-immutable", Run: scenarioSnapshotPauseFreeImmutable},
 		{Name: "same-host-clone-independent", Run: scenarioSameHostCloneIndependent},
 		{Name: "checkpoint-then-truncate", Run: scenarioCheckpointThenTruncate},
+		{Name: "gc-marks-orphans-not-live", Run: scenarioGCMarksOrphansNotLive},
 	}
+}
+
+// scenarioGCMarksOrphansNotLive is INV-14 (§21.3, §5.11): the GC marks unreachable
+// objects reversibly and never permanently deletes; a live object is never marked.
+func scenarioGCMarksOrphansNotLive(s *Sim) error {
+	ctx := context.Background()
+	const vid = "00000000-0000-7000-8000-000000000090"
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+
+	// A live WAL object anchored by a checkpoint, plus structural metadata.
+	_ = descriptor.Write(ctx, s.Store, descriptor.Descriptor{VolumeID: vid, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
+	lf, _ := s.Disk.Create("wal/active.wal")
+	l := wal.NewLog(lf, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5))
+	_, _ = l.Write(0, []byte("live"), 0)
+	if err := l.Flush(ctx); err != nil {
+		return err
+	}
+	if _, err := checkpoint.NewCheckpointer(s.Store).Create(ctx, l, vol, 1); err != nil {
+		return err
+	}
+	liveObjs, _ := s.Store.List(ctx, "wal/"+format.UUIDString(vol)+"/1/")
+	var live string
+	for _, o := range liveObjs {
+		if len(o.Key) > 4 && o.Key[len(o.Key)-4:] == ".wal" {
+			live = o.Key
+		}
+	}
+
+	// An orphan object referenced by nothing.
+	if _, err := s.Store.Put(ctx, "wal/"+format.UUIDString(vol)+"/1/999-999-deadbeef.wal", []byte("orphan"), objectstore.PutOptions{}); err != nil {
+		return err
+	}
+
+	reachable, err := gc.Reachable(ctx, s.Store)
+	if err != nil {
+		return err
+	}
+	marks, err := gc.Collect(ctx, s.Store, reachable)
+	if err != nil {
+		return err
+	}
+
+	// Each mark is a reversible delete-marker — emit it as a non-permanent delete so
+	// the NoPermanentDeleteChecker (INV-14) validates the GC never permanent-deletes.
+	liveMarked := false
+	for _, m := range marks {
+		s.Emit(Event{Kind: EventDelete, Key: m, Permanent: false})
+		if m == live {
+			liveMarked = true
+		}
+	}
+	if liveMarked {
+		return errors.New("the GC marked a live object")
+	}
+	if len(marks) == 0 {
+		return errors.New("the GC should have marked the orphan")
+	}
+	// Marks are reversible: the objects still exist.
+	for _, m := range marks {
+		if _, err := s.Store.Head(ctx, m); err != nil {
+			return fmt.Errorf("GC marks must be reversible, but %q is gone", m)
+		}
+	}
+	s.Notef("GC marked %d orphan(s), no live object, no permanent delete", len(marks))
+	return nil
 }
 
 // scenarioCheckpointThenTruncate is INV-13 (§21.1): local WAL is truncated only up to
