@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
@@ -126,13 +127,77 @@ func TestUploadDivergenceHardFails(t *testing.T) {
 	}
 }
 
+// TestUploadRefusesASecondObjectForTheSameSpan is INV-21 / §14.5 — "same range,
+// different hash ⇒ hard fail". The rule is unreachable through the key, because the
+// key *embeds* the content hash: two objects claiming sequences 1..N with different
+// content get different keys, so both pass the create-only PUT, both pass recovery's
+// integrity check, and Recover applies both. The volume's content is then decided by
+// SHA-prefix sort order, with no diagnostic anywhere. The span, not the key, is what
+// must be unique.
+func TestUploadRefusesASecondObjectForTheSameSpan(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	vol := [16]byte{14}
+
+	batch := func(payload string) *wal.ClosedBatch {
+		b := wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig())
+		b.Append(1, rec(1, []byte(payload)), false)
+		b.Append(2, rec(2, []byte(payload)), false)
+		b.Flush()
+		return b.Pending()[0]
+	}
+	first, second := batch("the records W1 wrote"), batch("what W2 put in 1..2")
+	if first.Object().Key == second.Object().Key {
+		t.Fatal("test setup: the two batches must differ in content")
+	}
+
+	up := wal.NewUploader(store, 5)
+	if _, err := up.Upload(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := up.Upload(ctx, second); !errors.Is(err, wal.ErrDivergentObject) {
+		t.Fatalf("a second object claiming sequences 1..2 with different content must hard-fail, got %v", err)
+	}
+	if objs, _ := store.List(ctx, "wal/"); len(objs) != 1 {
+		t.Fatalf("two objects now claim the same span; recovery picks one by sort order (%d objects)", len(objs))
+	}
+}
+
+// TestUploadStopsOnACancelledContext: the retry loop is the one place that keeps
+// issuing requests after the caller is gone. On a cancelled context it must return at
+// the first check instead of spending its whole budget against a backend that is
+// already being torn down.
+func TestUploadStopsOnACancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	b := wal.NewBatcher(clk, [16]byte{15}, 1, 0, wal.DefaultBatchConfig())
+	b.Append(1, rec(1, []byte("payload")), false)
+	b.Flush()
+
+	store.InjectThrottle(10) // every attempt would be a retryable failure
+	if _, err := wal.NewUploader(store, 5).Upload(ctx, b.Pending()[0]); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled upload must report the cancellation, got %v", err)
+	}
+}
+
 func TestEncryptedRemoteObjectsAreCiphertext(t *testing.T) {
 	// End-to-end: encrypted + remote — the uploaded object contains no cleartext.
 	ctx := context.Background()
 	store := sim.NewObjectStore()
 	l := remoteLog(t, store)
-	l.EnableEncryption(&wal.Encryption{VolumeID: [16]byte{2}}) // zero DEK is fine for the canary check
-	_ = format.FormatVersion                                   // keep format import used
+	// A versioned DEK: KeyID 0 is the on-disk marker for "plaintext record", so a
+	// zero-KeyID DEK produces objects that no recovery can read (see
+	// TestUnversionedDEKIsRefusedAtWriteTime). The canary check is the same.
+	dek, err := crypto.GenerateDEK(&ramp{b: 11}, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.EnableEncryption(&wal.Encryption{DEK: dek, VolumeID: [16]byte{2}})
+	_ = format.FormatVersion // keep format import used
 
 	canary := []byte("PLAINTEXT-SHOULD-NOT-APPEAR")
 	_, _ = l.Write(0, canary, 0)
