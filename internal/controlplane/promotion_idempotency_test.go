@@ -56,6 +56,12 @@ func newPromoWorld(t *testing.T) *promoWorld {
 	if _, err := epochs.Init(ctx, promoVolume, 1); err != nil {
 		t.Fatal(err)
 	}
+	// The source holds a lease stamped now. The promoter reads it itself — a caller
+	// that passes the zero instant is saying "I know nothing about the source", which
+	// is not the same as "its lease expired long ago".
+	if err := md.RenewHostLease(ctx, term, promoOld, 10); err != nil {
+		t.Fatal(err)
+	}
 	clk.Advance(30 * time.Second) // past FENCING_WAIT
 	return &promoWorld{
 		md: md, term: term, epochs: epochs, clk: clk,
