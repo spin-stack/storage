@@ -27,6 +27,19 @@ var ErrWatermarkOrder = errors.New("wal: watermark ordering violation")
 // verified checkpoint.
 var ErrTruncateAboveDurable = errors.New("wal: truncate above verified published point")
 
+// ErrDirtyLog is returned by the first append to a log built over a WAL file that
+// already holds records. Such a log did not replay them, so it does not know where
+// the sequence space ends: it would re-issue sequences that are already on disk and
+// (for an encrypted volume) already used as GCM nonces for this (volume, epoch).
+var ErrDirtyLog = errors.New("wal: the WAL file already holds records this log did not replay")
+
+// ErrFUAOnWrite is returned when a WRITE carries FlagFUA. A FUA write carries the
+// FLUSH ACK contract (§14.3.1, §14.8) — fdatasync, verified PUT, valid lease — and
+// Write implements none of it. Accepting the flag and appending anyway is worse than
+// refusing it: it reads as "FUA is implemented" while the guest's write lives in the
+// host page cache.
+var ErrFUAOnWrite = errors.New("wal: Write does not implement the FUA durability contract")
+
 // Watermarks are the three sequence watermarks (§5.6). In Phase 04 only Local
 // advances (durable/published need remote durability, Phase 06+); the ordering
 // invariant is enforced here regardless.
@@ -38,8 +51,16 @@ type Watermarks struct {
 
 // Limits bound the local WAL (§5.7).
 type Limits struct {
+	// MaxUnflushedBytes/MaxUnflushedAge bound what fdatasync has not seen; both are
+	// cleared by Sync.
 	MaxUnflushedBytes int64
 	MaxUnflushedAge   time.Duration
+	// MaxRemoteGapBytes bounds the bytes that no verified object covers yet — the
+	// backlog a host loss destroys. It is a separate limit because fdatasync clears
+	// the two above while leaving this one untouched, so on a `local` volume (or a
+	// remote one riding out an S3 outage) nothing else stops the device from filling
+	// with writes no other machine has. 0 disables it.
+	MaxRemoteGapBytes int64
 }
 
 // Log is the append-only local WAL for one volume, with a read view over the
@@ -52,9 +73,15 @@ type Log struct {
 	volumeID [16]byte
 	epoch    uint64
 
+	start     uint64 // the sequence this log continues from (§12.5 boundary)
 	local     uint64
 	durable   uint64
 	published uint64
+	replayed  bool // this log rebuilt itself from the WAL file's contents
+
+	// resumeTail holds the replayed records no verified object covers yet; they go
+	// to the batcher as soon as EnableRemote provides one.
+	resumeTail []resumedRecord
 
 	view   *cow.IntervalMap
 	limits Limits
@@ -70,9 +97,17 @@ type Log struct {
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
-	discardedBytes    int64
-	truncatedUpTo     uint64          // local WAL discarded up to this sequence (§14.7)
-	uploaded          []SummaryObject // durable objects, for the summary (§22.1)
+
+	// Remote-durability backlog: the bytes appended that no verified S3 object
+	// covers yet. Deliberately separate from the unflushed accounting above, which
+	// fdatasync clears: fdatasync is host durability, and the host is exactly what
+	// this backlog would be lost with (§14.8 RPO).
+	gapBytes       int64
+	oldestGapAt    clock.Instant
+	hasGap         bool
+	discardedBytes int64
+	truncatedUpTo  uint64          // local WAL discarded up to this sequence (§14.7)
+	uploaded       []SummaryObject // durable objects, for the summary (§22.1)
 
 	rec      *obs.Recorder // nil = telemetry not wired (no-op)
 	volLabel string
@@ -121,18 +156,46 @@ func (l *Log) recordWatermarks(ctx context.Context) {
 	l.rec.Gauge(ctx, "wal_durable_sequence", float64(l.durable), vol)
 	l.rec.Gauge(ctx, "wal_published_sequence", float64(l.published), vol)
 	l.rec.Gauge(ctx, "wal_unflushed_bytes", float64(l.unflushedBytes), vol)
-	l.rec.Gauge(ctx, "wal_durable_gap_bytes", float64(l.unflushedBytes), vol)
+	// The gap is what S3 cannot reproduce, not what fdatasync has not seen. A
+	// `local` volume ACKs on fdatasync, so its unflushed count is 0 while its RPO
+	// exposure is the whole backlog — reporting the former as the latter is the
+	// operator's only RPO signal telling them the opposite of the truth.
+	l.rec.Gauge(ctx, "wal_durable_gap_bytes", float64(l.gapBytes), vol)
+	l.rec.Gauge(ctx, "wal_durable_gap_seconds", l.gapAge().Seconds(), vol)
 }
 
-// SetLease wires the host lease checker used by the durable-ACK rule (§12.2).
-func (l *Log) SetLease(c LeaseChecker) { l.lease = c }
+// gapAge is how long the oldest un-remote-durable record has been waiting: the
+// effective RPO in seconds (§14.8, §26.2).
+func (l *Log) gapAge() time.Duration {
+	if !l.hasGap {
+		return 0
+	}
+	return l.clk.Now().Sub(l.oldestGapAt)
+}
+
+// RemoteGapBytes reports the bytes appended that no verified object covers yet.
+func (l *Log) RemoteGapBytes() int64 { return l.gapBytes }
 
 // Fenced reports whether the log has self-fenced (a FLUSH found the lease invalid).
 func (l *Log) Fenced() bool { return l.fenced }
 
 // EnableEncryption binds an Encryption context so subsequent WRITEs seal their
 // payloads (§15). Must be set before the first WRITE.
-func (l *Log) EnableEncryption(e *Encryption) { l.enc = e }
+func (l *Log) EnableEncryption(e *Encryption) {
+	l.enc = e
+	l.alignKeyID()
+}
+
+// alignKeyID makes the DEK the single source of truth for the KeyID an assembled
+// object announces (§15.1). The Batcher is constructed independently of the
+// Encryption context — every call site in the tree passes 0 — and an object header
+// naming a key version that did not seal its records points a recovering host at the
+// wrong DEK. The two cannot disagree if only one of them is authoritative.
+func (l *Log) alignKeyID() {
+	if l.enc != nil && l.batcher != nil {
+		l.batcher.keyID = l.enc.DEK.KeyID
+	}
+}
 
 // EnableRemote wires the on-demand batcher and idempotent uploader so FLUSH/FUA
 // make records durable in S3 (§14.3–14.5). Must be set before the first WRITE.
@@ -145,6 +208,17 @@ func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
 	l.uploader = u
 	if lease != nil {
 		l.lease = lease
+	}
+	l.alignKeyID()
+	// A resumed log carries the records the crash left un-uploaded (Resume). They
+	// are the writes that exist on this host only, so the batcher gets them the
+	// moment there is one — forgetting them here would lose every write since the
+	// last successful upload, silently.
+	if b != nil {
+		for _, r := range l.resumeTail {
+			b.Append(r.seq, r.encoded, false)
+		}
+		l.resumeTail = nil
 	}
 }
 
@@ -164,6 +238,7 @@ func NewLogAfter(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, boun
 		clk:      clk,
 		volumeID: volumeID,
 		epoch:    epoch,
+		start:    boundary,
 		local:    boundary,
 		durable:  boundary,
 		view:     cow.NewIntervalMap(),
@@ -177,6 +252,9 @@ func (l *Log) backpressure(add int) error {
 	}
 	if l.hasUnflushed && l.limits.MaxUnflushedAge > 0 &&
 		l.clk.Now().Sub(l.oldestUnflushedAt) > l.limits.MaxUnflushedAge {
+		return ErrBackpressure
+	}
+	if l.limits.MaxRemoteGapBytes > 0 && l.gapBytes+int64(add) > l.limits.MaxRemoteGapBytes {
 		return ErrBackpressure
 	}
 	return nil
@@ -196,6 +274,16 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	if err != nil {
 		return 0, err
 	}
+	// Nothing has been appended through this log yet, but the file is not empty:
+	// this log was built over a WAL whose records it never read (an agent restart
+	// re-attaching at the same epoch, §16). Its sequence counter starts at the
+	// boundary it was handed, so the next append would re-issue sequences that are
+	// already on disk — duplicate sequences in the same (volume, epoch), reused GCM
+	// nonces (§15.2), and two objects claiming one span (INV-21). Fail at the first
+	// append rather than produce them.
+	if !l.replayed && l.local == l.start && before > 0 {
+		return 0, fmt.Errorf("%w: %d bytes at sequence %d", ErrDirtyLog, before, l.start)
+	}
 	if _, err := l.file.Append(enc); err != nil {
 		if terr := l.file.Truncate(before); terr != nil {
 			// The log's tail is now unknown. Refuse to serve it rather than ACK
@@ -208,6 +296,7 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	l.local = seq
 	addView()
 	l.trackUnflushed(len(enc))
+	l.trackGap(len(enc))
 	return seq, nil
 }
 
@@ -215,6 +304,30 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 // local append; it does not sync or PUT (§5.3). When encryption is enabled the WAL
 // bytes are ciphertext, but the read view keeps plaintext (it never leaves the host).
 func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
+	if flags&format.FlagFUA != 0 {
+		return 0, ErrFUAOnWrite
+	}
+	return l.write(offset, data, flags)
+}
+
+// WriteFUA appends a WRITE carrying the FUA flag and makes it durable before it
+// returns, under the same ACK contract as a FLUSH (§14.3.1, §14.8): in `remote` mode
+// the record is in a verified object and the lease was valid at the instant of the
+// ACK, in `local` mode it is on the host's stable media. On any failure the record
+// stays in the local WAL — as an un-ACKed FLUSH's records do — and the caller gets
+// the error instead of a completion the guest would trust.
+func (l *Log) WriteFUA(ctx context.Context, offset uint64, data []byte) (uint64, error) {
+	seq, err := l.write(offset, data, format.FlagFUA)
+	if err != nil {
+		return 0, err
+	}
+	if err := l.durableStep(ctx, seq); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	seq := l.local + 1
 	var (
 		enc []byte
@@ -223,7 +336,7 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	if l.enc != nil {
 		enc, err = l.enc.encodeWrite(l.epoch, seq, offset, flags, data)
 	} else {
-		r := Record{Type: format.RecordWrite, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: uint32(len(data)), Flags: flags, Payload: data}
+		r := Record{Type: format.RecordWrite, VolumeID: l.volumeID, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: uint32(len(data)), Flags: flags, Payload: data}
 		enc, err = r.Encode()
 	}
 	if err != nil {
@@ -256,7 +369,7 @@ func (l *Log) WriteZeroes(offset uint64, length uint32) (uint64, error) {
 // converges, §14.6), and counts the reclaimed bytes.
 func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (uint64, error) {
 	seq := l.local + 1
-	enc, err := Record{Type: t, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}.Encode()
+	enc, err := Record{Type: t, VolumeID: l.volumeID, Epoch: l.epoch, Sequence: seq, Offset: offset, Length: length}.Encode()
 	if err != nil {
 		return 0, err
 	}
@@ -302,10 +415,16 @@ func (l *Log) Sync() error {
 // A failed upload retains the un-uploaded batches for the next Flush and does not
 // advance durable.
 func (l *Log) Flush(ctx context.Context) error {
+	return l.durableStep(ctx, l.local)
+}
+
+// durableStep is the §14.4 sequence shared by FLUSH and FUA — they carry the same
+// ACK contract, so they must not have two implementations of it. target is the
+// sequence the ACK would confirm, captured before the batch is closed.
+func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	if l.fenced {
 		return ErrSelfFenced
 	}
-	target := l.local
 	if l.batcher != nil {
 		l.batcher.Flush() // step 2: close current batch
 	}
@@ -314,39 +433,47 @@ func (l *Log) Flush(ctx context.Context) error {
 	}
 
 	if l.mode == ModeLocal {
-		// §14.8: ACK on local durability; no lease gate, no synchronous S3.
+		// §14.8: ACK on local durability; no lease gate, no synchronous S3. The
+		// remote gap is untouched on purpose — it is exactly what this ACK does not
+		// cover, and it is the RPO an operator reads.
 		l.clearUnflushed()
+		l.recordWatermarks(ctx)
 		return nil
 	}
 
-	if l.batcher != nil && l.uploader != nil {
-		pending := l.batcher.Pending()
-		done := 0
-		for _, cb := range pending { // step 4: upload + verify (covering <= target)
-			key, err := l.uploader.Upload(ctx, cb)
-			if err != nil {
-				l.batcher.RemoveUploaded(done)
-				return err // durable NOT advanced
-			}
-			l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
-			done++
-		}
-		l.batcher.RemoveUploaded(done)
+	// Remote durability with nothing able to PUT is not "nothing to upload": it is a
+	// durability claim with no backing. Refuse it here rather than let step 6 move
+	// durable_sequence past what S3 can produce (INV-07).
+	if l.batcher == nil || l.uploader == nil {
+		return ErrNoUploader
 	}
+
+	pending := l.batcher.Pending()
+	done := 0
+	for _, cb := range pending { // step 4: upload + verify (covering <= target)
+		key, err := l.uploader.Upload(ctx, cb)
+		if err != nil {
+			l.batcher.RemoveUploaded(done)
+			l.recordWatermarks(ctx) // a growing gap is what an operator needs here
+			return err              // durable NOT advanced
+		}
+		l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
+		l.closeGap(int64(len(cb.Records)))
+		done++
+	}
+	l.batcher.RemoveUploaded(done)
 
 	// step 5: verify the lease on the monotonic clock (§12.2, INV-06). If it is not
 	// valid, do NOT advance durable and do NOT ACK — self-fence. In remote mode the
 	// check is mandatory: no lease checker means nothing is fencing this writer, so
 	// the ACK is refused rather than granted by default.
-	if l.mode == ModeRemote {
-		if l.lease == nil {
-			return ErrNoLease
-		}
-		if !l.lease.Valid() {
-			l.fenced = true
-			l.rec.Count(ctx, "self_fenced_total", 1, obs.String("volume", l.volLabel))
-			return ErrSelfFenced
-		}
+	if l.lease == nil {
+		return ErrNoLease
+	}
+	if !l.lease.Valid() {
+		l.fenced = true
+		l.rec.Count(ctx, "self_fenced_total", 1, obs.String("volume", l.volLabel))
+		return ErrSelfFenced
 	}
 	if err := l.AdvanceDurable(target); err != nil { // step 6
 		return err
@@ -367,6 +494,25 @@ func (l *Log) trackUnflushed(n int) {
 		l.hasUnflushed = true
 	}
 	l.unflushedBytes += int64(n)
+}
+
+// trackGap records bytes that no object covers yet.
+func (l *Log) trackGap(n int) {
+	if !l.hasGap {
+		l.oldestGapAt = l.clk.Now()
+		l.hasGap = true
+	}
+	l.gapBytes += int64(n)
+}
+
+// closeGap discounts the bytes of an object that is now verified in the store. Only
+// a verified PUT closes the gap — not fdatasync, not an ACK.
+func (l *Log) closeGap(n int64) {
+	l.gapBytes -= n
+	if l.gapBytes <= 0 {
+		l.gapBytes = 0
+		l.hasGap = false
+	}
 }
 
 // Watermarks returns the current watermarks.

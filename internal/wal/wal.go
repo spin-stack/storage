@@ -16,7 +16,12 @@ import (
 // and Length is the extent length (§14.1). KeyID/PayloadCRC/AuthTag mirror the
 // header so an encrypted record can be decrypted and verified after replay.
 type Record struct {
-	Type       format.RecordType
+	Type format.RecordType
+	// VolumeID binds the record to the volume that wrote it (§14.1). It is the only
+	// identity a replayed record carries on its own: without it a WAL file replayed
+	// under the wrong volume applies to another guest's extents, and nothing in the
+	// header contradicts it.
+	VolumeID   [16]byte
 	Epoch      uint64
 	Sequence   uint64
 	Offset     uint64
@@ -32,6 +37,7 @@ type Record struct {
 func (r Record) Encode() ([]byte, error) {
 	h := format.RecordHeader{
 		RecordType: r.Type,
+		VolumeID:   r.VolumeID,
 		Epoch:      r.Epoch,
 		Sequence:   r.Sequence,
 		Offset:     r.Offset,
@@ -80,6 +86,7 @@ func Replay(b []byte) ([]Record, error) {
 		}
 		rec := Record{
 			Type:       h.RecordType,
+			VolumeID:   h.VolumeID,
 			Epoch:      h.Epoch,
 			Sequence:   h.Sequence,
 			Offset:     h.Offset,
