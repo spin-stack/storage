@@ -17,6 +17,26 @@ tasks:
     cmds:
       - sqlc generate
 
+  db:migrate:diff:
+    desc: "Generate an Atlas migration from schema.sql changes (ADR-0007). Usage: task db:migrate:diff -- <name>"
+    cmds:
+      - atlas migrate diff {{.CLI_ARGS}} --env local
+
+  db:migrate:
+    desc: Apply Atlas migrations to the local database.
+    cmds:
+      - atlas migrate apply --env local
+
+  db:migrate:status:
+    desc: Show Atlas migration status.
+    cmds:
+      - atlas migrate status --env local
+
+  db:migrate:validate:
+    desc: Validate the migration directory against atlas.sum.
+    cmds:
+      - atlas migrate validate --env local
+
   build:
     desc: Build all packages and commands.
     cmds:

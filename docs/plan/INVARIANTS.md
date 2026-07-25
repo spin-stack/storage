@@ -32,6 +32,8 @@ property a **checker** verifies inside the DST harness. An invariant is born
 | **INV-20** | pending | **PG is reconstructible from S3.** The full PostgreSQL state can be rebuilt from the self-describing S3 layout (`rebuild-metadata`). | Checker: wipe simulated PG, run `rebuild-metadata` from the object store, assert reconstructed catalog matches ground truth for the covered fields. | Phase 08 (basic) | §5.8 corollary, §22.5 |
 | **INV-21** | **active (PUT)** | **Idempotent duplicated requests.** Duplicate data PUTs (deterministic key + `If-None-Match:*` + HEAD/checksum) and duplicate admin ops (`request_id`) produce no double effect; same range + different hash ⇒ hard fail. | `scenarioIdempotentBatchUpload` + `TestUpload*`: lost-response then retry yields exactly one object; a divergent object at the key hard-fails (`ErrDivergentObject`). Admin-op idempotency lands Phase 07. **Active since 6.2.** | Phase 06 (6.2) ✓ / admin Phase 07 | §14.5, §18 |
 
+| **INV-22** | **active** | **All UUIDs are v7.** Every identifier is a UUIDv7 (time-ordered), in code and in Postgres. | Two layers (ADR-0007): (1) code — golangci `forbidigo` forbids `uuid.New`/`NewString`/`NewRandom` outside `internal/ids`, whose `ids.New()` returns v7; (2) DB — every uuid identity column has a `CHECK ((get_byte(uuid_send(col),6)>>4)=7)` that rejects non-v7 (proven by `TestPGRejectsNonV7`). **Active since 7.1.** | Phase 07 (7.1) ✓ | ADR-0007 |
+
 ## Notes on activation
 
 - **Phase 01 activates the *framework*, not the data invariants.** It makes INV-01

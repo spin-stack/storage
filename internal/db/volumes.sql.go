@@ -8,6 +8,7 @@ package db
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -22,8 +23,8 @@ RETURNING current_epoch
 `
 
 type BumpVolumeEpochParams struct {
-	VolumeID      string      `json:"volume_id"`
-	PrimaryHostID pgtype.Text `json:"primary_host_id"`
+	VolumeID      uuid.UUID   `json:"volume_id"`
+	PrimaryHostID pgtype.UUID `json:"primary_host_id"`
 	Term          int64       `json:"term"`
 }
 
@@ -46,14 +47,14 @@ WHERE EXISTS (SELECT 1 FROM valid)
 `
 
 type CreateVolumeParams struct {
-	VolumeID   string `json:"volume_id"`
-	SizeBytes  int64  `json:"size_bytes"`
-	Durability string `json:"durability"`
-	BlockSize  int32  `json:"block_size"`
-	State      string `json:"state"`
-	DekWrapped []byte `json:"dek_wrapped"`
-	KekID      string `json:"kek_id"`
-	Term       int64  `json:"term"`
+	VolumeID   uuid.UUID `json:"volume_id"`
+	SizeBytes  int64     `json:"size_bytes"`
+	Durability string    `json:"durability"`
+	BlockSize  int32     `json:"block_size"`
+	State      string    `json:"state"`
+	DekWrapped []byte    `json:"dek_wrapped"`
+	KekID      string    `json:"kek_id"`
+	Term       int64     `json:"term"`
 }
 
 // Term-guarded create (§7).
@@ -78,7 +79,7 @@ const getVolume = `-- name: GetVolume :one
 SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
-func (q *Queries) GetVolume(ctx context.Context, volumeID string) (*Volume, error) {
+func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
 	row := q.db.QueryRow(ctx, getVolume, volumeID)
 	var i Volume
 	err := row.Scan(
@@ -115,11 +116,11 @@ UPDATE volumes
 `
 
 type UpdateVolumeWatermarksParams struct {
-	VolumeID          string `json:"volume_id"`
-	LocalSequence     int64  `json:"local_sequence"`
-	DurableSequence   int64  `json:"durable_sequence"`
-	PublishedSequence int64  `json:"published_sequence"`
-	Term              int64  `json:"term"`
+	VolumeID          uuid.UUID `json:"volume_id"`
+	LocalSequence     int64     `json:"local_sequence"`
+	DurableSequence   int64     `json:"durable_sequence"`
+	PublishedSequence int64     `json:"published_sequence"`
+	Term              int64     `json:"term"`
 }
 
 // Lazy, informative watermark update (§5.8, §12.6), term-guarded.

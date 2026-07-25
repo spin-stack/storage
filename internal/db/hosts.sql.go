@@ -7,13 +7,15 @@ package db
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const getHost = `-- name: GetHost :one
 SELECT host_id, state, agent_version, max_format_version, nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat FROM hosts WHERE host_id = $1
 `
 
-func (q *Queries) GetHost(ctx context.Context, hostID string) (*Host, error) {
+func (q *Queries) GetHost(ctx context.Context, hostID uuid.UUID) (*Host, error) {
 	row := q.db.QueryRow(ctx, getHost, hostID)
 	var i Host
 	err := row.Scan(
@@ -33,7 +35,7 @@ const getHostLease = `-- name: GetHostLease :one
 SELECT host_id, granted_at, last_renewal, ttl_seconds FROM host_leases WHERE host_id = $1
 `
 
-func (q *Queries) GetHostLease(ctx context.Context, hostID string) (*HostLease, error) {
+func (q *Queries) GetHostLease(ctx context.Context, hostID uuid.UUID) (*HostLease, error) {
 	row := q.db.QueryRow(ctx, getHostLease, hostID)
 	var i HostLease
 	err := row.Scan(
@@ -58,9 +60,9 @@ ON CONFLICT (host_id) DO UPDATE
 `
 
 type RenewHostLeaseParams struct {
-	HostID     string `json:"host_id"`
-	TtlSeconds int32  `json:"ttl_seconds"`
-	Term       int64  `json:"term"`
+	HostID     uuid.UUID `json:"host_id"`
+	TtlSeconds int32     `json:"ttl_seconds"`
+	Term       int64     `json:"term"`
 }
 
 // Grouped per-host lease renewal (§12.6), term-guarded.
@@ -93,14 +95,14 @@ ON CONFLICT (host_id) DO UPDATE
 `
 
 type UpsertHostParams struct {
-	HostID             string `json:"host_id"`
-	State              string `json:"state"`
-	AgentVersion       string `json:"agent_version"`
-	MaxFormatVersion   int32  `json:"max_format_version"`
-	NvmeTotalBytes     int64  `json:"nvme_total_bytes"`
-	NvmeUsedBytes      int64  `json:"nvme_used_bytes"`
-	NvmeCommittedBytes int64  `json:"nvme_committed_bytes"`
-	Term               int64  `json:"term"`
+	HostID             uuid.UUID `json:"host_id"`
+	State              string    `json:"state"`
+	AgentVersion       string    `json:"agent_version"`
+	MaxFormatVersion   int32     `json:"max_format_version"`
+	NvmeTotalBytes     int64     `json:"nvme_total_bytes"`
+	NvmeUsedBytes      int64     `json:"nvme_used_bytes"`
+	NvmeCommittedBytes int64     `json:"nvme_committed_bytes"`
+	Term               int64     `json:"term"`
 }
 
 // Term-guarded (§7): the INSERT ... SELECT produces no row when the term is stale,

@@ -43,8 +43,8 @@ ON CONFLICT (operation_id) DO NOTHING
 type RecordOperationParams struct {
 	OperationID  uuid.UUID   `json:"operation_id"`
 	Kind         string      `json:"kind"`
-	VolumeID     pgtype.Text `json:"volume_id"`
-	HostID       pgtype.Text `json:"host_id"`
+	VolumeID     pgtype.UUID `json:"volume_id"`
+	HostID       pgtype.UUID `json:"host_id"`
 	DesiredState []byte      `json:"desired_state"`
 	CurrentState []byte      `json:"current_state"`
 	Phase        string      `json:"phase"`

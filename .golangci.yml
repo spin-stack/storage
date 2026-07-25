@@ -26,6 +26,8 @@ linters:
           msg: "§25.1/INV-01: use internal/simio/net, not the net package directly"
         - pattern: '^os\.(Open|Create|OpenFile|ReadFile|WriteFile|Remove|RemoveAll|Mkdir|MkdirAll|Rename|Truncate)$'
           msg: "§25.1/INV-01: use internal/simio/disk, not the os package directly"
+        - pattern: '^uuid\.(New|NewString|NewRandom)$'
+          msg: "INV-22/ADR-0007: all ids are UUIDv7 — use internal/ids.New, not the v4 generators"
     depguard:
       rules:
         outside-simio:
@@ -51,6 +53,10 @@ linters:
       - linters:
           - errcheck
         text: "Error return value of.*(Close|Remove|Sync)` is not checked"
+      # internal/ids is the sanctioned home of UUID generation (INV-22).
+      - path: internal/ids
+        linters:
+          - forbidigo
 
 formatters:
   enable:

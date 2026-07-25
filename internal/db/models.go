@@ -17,7 +17,7 @@ type ControlPlaneLeader struct {
 }
 
 type Host struct {
-	HostID             string             `json:"host_id"`
+	HostID             uuid.UUID          `json:"host_id"`
 	State              string             `json:"state"`
 	AgentVersion       string             `json:"agent_version"`
 	MaxFormatVersion   int32              `json:"max_format_version"`
@@ -28,7 +28,7 @@ type Host struct {
 }
 
 type HostLease struct {
-	HostID      string             `json:"host_id"`
+	HostID      uuid.UUID          `json:"host_id"`
 	GrantedAt   pgtype.Timestamptz `json:"granted_at"`
 	LastRenewal pgtype.Timestamptz `json:"last_renewal"`
 	TtlSeconds  int32              `json:"ttl_seconds"`
@@ -37,8 +37,8 @@ type HostLease struct {
 type Operation struct {
 	OperationID  uuid.UUID          `json:"operation_id"`
 	Kind         string             `json:"kind"`
-	VolumeID     pgtype.Text        `json:"volume_id"`
-	HostID       pgtype.Text        `json:"host_id"`
+	VolumeID     pgtype.UUID        `json:"volume_id"`
+	HostID       pgtype.UUID        `json:"host_id"`
 	DesiredState []byte             `json:"desired_state"`
 	CurrentState []byte             `json:"current_state"`
 	Phase        string             `json:"phase"`
@@ -48,13 +48,13 @@ type Operation struct {
 }
 
 type Snapshot struct {
-	SnapshotID       string             `json:"snapshot_id"`
-	VolumeID         string             `json:"volume_id"`
-	ParentSnapshotID pgtype.Text        `json:"parent_snapshot_id"`
+	SnapshotID       uuid.UUID          `json:"snapshot_id"`
+	VolumeID         uuid.UUID          `json:"volume_id"`
+	ParentSnapshotID pgtype.UUID        `json:"parent_snapshot_id"`
 	Epoch            int64              `json:"epoch"`
 	TargetSequence   int64              `json:"target_sequence"`
 	RootDigest       string             `json:"root_digest"`
-	SourceHostID     pgtype.Text        `json:"source_host_id"`
+	SourceHostID     pgtype.UUID        `json:"source_host_id"`
 	State            string             `json:"state"`
 	Portable         bool               `json:"portable"`
 	ManifestKey      pgtype.Text        `json:"manifest_key"`
@@ -63,16 +63,16 @@ type Snapshot struct {
 }
 
 type Volume struct {
-	VolumeID          string             `json:"volume_id"`
+	VolumeID          uuid.UUID          `json:"volume_id"`
 	SizeBytes         int64              `json:"size_bytes"`
 	Durability        string             `json:"durability"`
 	BlockSize         int32              `json:"block_size"`
 	CurrentEpoch      int64              `json:"current_epoch"`
 	State             string             `json:"state"`
-	PrimaryHostID     pgtype.Text        `json:"primary_host_id"`
-	StandbyHostID     pgtype.Text        `json:"standby_host_id"`
-	ActiveRootID      pgtype.Text        `json:"active_root_id"`
-	PublishedRootID   pgtype.Text        `json:"published_root_id"`
+	PrimaryHostID     pgtype.UUID        `json:"primary_host_id"`
+	StandbyHostID     pgtype.UUID        `json:"standby_host_id"`
+	ActiveRootID      pgtype.UUID        `json:"active_root_id"`
+	PublishedRootID   pgtype.UUID        `json:"published_root_id"`
 	ChainDepth        int32              `json:"chain_depth"`
 	DekWrapped        []byte             `json:"dek_wrapped"`
 	KekID             string             `json:"kek_id"`
