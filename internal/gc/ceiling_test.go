@@ -114,6 +114,37 @@ func TestASupersededEpochsSnapshotSurvivesASweep(t *testing.T) {
 	}
 }
 
+// TestSweepStopsWhenAnEpochBoundaryCannotBeRead: whether an epoch has been closed
+// decides whether its objects are roots, and the answer comes from a GET at a
+// deterministic key. A backend that will not answer it (§24 throttling, a damaged
+// object) leaves the sweep unable to tell a superseded epoch from an open one, and
+// that is a reason to stop — the same discipline as an unreadable anchor.
+func TestSweepStopsWhenAnEpochBoundaryCannotBeRead(t *testing.T) {
+	ctx := context.Background()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	store := newStore(clk)
+	vol := vol9()
+	writeDurableWAL(t, store, clk, vol)
+	closeEpoch(t, store, vol, 2)
+	clk.Advance(48 * time.Hour)
+
+	// Every read of the boundary object fails, however many times the sweep asks.
+	store.InjectThrottleKey("wal/"+format.UUIDString(vol)+"/2/recovery-point.json", 100)
+
+	if _, err := gc.Reachable(ctx, store); err == nil {
+		t.Fatal("a boundary the sweep cannot read must abort it, not leave it guessing")
+	}
+	objects, err := recovery.ObjectKeysUpTo(ctx, store, vol, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range objects {
+		if _, err := store.Get(ctx, key); err != nil {
+			t.Fatalf("the aborted sweep marked %s: %v", key, err)
+		}
+	}
+}
+
 // TestASupersededEpochsLatePutIsNoLongerCollected is the cost of the rule above, pinned
 // deliberately: an object a fenced writer landed past the boundary is real bytes the
 // sweep can no longer tell apart from a snapshot's object under a lagging listing, so
