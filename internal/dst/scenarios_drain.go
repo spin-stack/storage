@@ -29,6 +29,7 @@ func drainScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "drain-crash-at-every-boundary", Run: scenarioDrainCrashAtEveryBoundary},
 		{Name: "drain-source-cannot-ack-afterwards", Run: scenarioDrainSourceCannotAck},
+		{Name: "stale-lease-read-does-not-shorten-the-fence", Run: scenarioStaleLeaseReadDoesNotShortenTheFence},
 	}
 }
 
@@ -53,6 +54,10 @@ type faultMD struct {
 	metadata.Store
 	onUpdate func(op metadata.Operation, done bool)
 	onLease  func(hostID string)
+	// staleLease, when non-zero, is the last_renewal every lease read reports: a
+	// replica lagging far enough that any deadline derived from the timestamp
+	// elapsed long ago (ADR-0015).
+	staleLease time.Time
 }
 
 func (s *faultMD) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
@@ -70,7 +75,11 @@ func (s *faultMD) GetHostLease(ctx context.Context, hostID string) (metadata.Hos
 	if s.onLease != nil {
 		s.onLease(hostID)
 	}
-	return s.Store.GetHostLease(ctx, hostID)
+	l, err := s.Store.GetHostLease(ctx, hostID)
+	if err == nil && !s.staleLease.IsZero() {
+		l.LastRenewal = s.staleLease
+	}
+	return l, err
 }
 
 // faultStore wraps the object store so the epoch-boundary PUT can be crashed at,
@@ -533,5 +542,87 @@ func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 		return fmt.Errorf("a self-fenced log must stay fenced, got %v", err)
 	}
 	s.Notef("drained source self-fenced: no ACK after the promotion, boundary bounds its last one")
+	return nil
+}
+
+// scenarioStaleLeaseReadDoesNotShortenTheFence is ADR-0015 in the harness. Every read
+// of the source's lease is served by a replica lagging by more than
+// lease_ttl + max_clock_skew, so the timestamp the row carries says the wait was over
+// before the promotion was even contemplated. Both clocks agree — the Control Plane's
+// and the store's — so the §12.1 offset check sees nothing wrong. It is the *data*
+// that is old, and a wait derived from it is no wait at all.
+//
+// The source here is a real Agent counting its own lease down on the monotonic clock,
+// exactly as §12.2 requires, and it never hears about any of this. So the claim is
+// decidable: while that Agent's lease is valid the epoch must not be granted, however
+// old the row looks.
+//
+// PromotionWaitChecker is driven from the same two facts (the Agent's own answer and
+// whether the grant landed), so reverting the dwell to a comparison against
+// last_renewal makes the checker fail, not just the assertions.
+func scenarioStaleLeaseReadDoesNotShortenTheFence(s *Sim) error {
+	ctx := context.Background()
+	agent := lease.NewManager(s.Clock, drainLeaseTTL)
+	agent.Grant()
+	w, err := newDrainWorld(s, 0x2f, agent)
+	if err != nil {
+		return err
+	}
+	// The replica is an hour behind: last_renewal predates the simulation.
+	w.md.staleLease = s.Clock.Wall().Add(-time.Hour)
+
+	// First pass. Whatever the row says, this Control Plane has observed nothing yet.
+	_, err = w.pass()
+	s.Emit(Event{
+		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
+		Msg: "first look at an hour-stale lease row",
+	})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("an hour-stale lease read let the drain promote at once: %v", err)
+	}
+	// The observation is durable, recorded with the §7 state (ADR-0015).
+	v, err := w.md.GetVolume(ctx, w.volID)
+	if err != nil {
+		return err
+	}
+	if v.State != lifecycle.VolumeFencingWait {
+		return fmt.Errorf("volume state is %q, want FENCING_WAIT", v.State)
+	}
+	if v.FencingStartedAt.IsZero() {
+		return fmt.Errorf("the promoter waited without recording when it started")
+	}
+
+	// One second short of the dwell the Agent's lease is still valid, so the grant
+	// would be exactly the loss INV-11 exists to prevent.
+	s.Tick(drainLeaseTTL + drainMaxSkew - time.Second)
+	_, err = w.pass()
+	s.Emit(Event{
+		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
+		Msg: "one second short of the dwell",
+	})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("the dwell was cut short by the stale row: %v", err)
+	}
+	if !agent.Valid() {
+		return fmt.Errorf("the Agent's lease expired early; this step no longer tests anything")
+	}
+
+	// Past it, and only there.
+	s.Tick(2 * time.Second)
+	if agent.Valid() {
+		return fmt.Errorf("the promotion is about to run against an Agent whose lease is still valid")
+	}
+	if _, err := w.pass(); err != nil {
+		return fmt.Errorf("the dwell elapsed and the drain still refused: %w", err)
+	}
+	v, err = w.md.GetVolume(ctx, w.volID)
+	if err != nil {
+		return err
+	}
+	if v.PrimaryHostID != w.dst || v.CurrentEpoch != 2 {
+		return fmt.Errorf("the volume did not move: %+v", v)
+	}
+	s.Emit(Event{Kind: EventPromotion, EarlyGrant: agent.Valid(), Msg: "granted after a full monotonic dwell"})
+	s.Notef("an hour-stale lease read cost the fence nothing: the dwell ran on the promoter's own clock")
 	return nil
 }

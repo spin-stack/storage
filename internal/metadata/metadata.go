@@ -181,6 +181,15 @@ type Volume struct {
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64
+	// FencingStartedAt is the instant the Control Plane observed the lease of the
+	// writer it is fencing, stamped by the store's own clock when the volume entered
+	// FENCING_WAIT (§7, ADR-0015). It is the durable half of the promotion dwell: a
+	// Control Plane that restarts mid-fence has no memory of having observed
+	// anything, and without this would have to start the wait again.
+	//
+	// Zero means "no fence is running, or nobody recorded one", which a promoter
+	// answers by starting a full dwell now. Fail slow, never short.
+	FencingStartedAt time.Time
 }
 
 // Snapshot is a catalog entry for a published snapshot (§8, §19).
