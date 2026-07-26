@@ -76,6 +76,12 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	if host.NVMeTotalBytes != 1<<40 || host.NVMeUsedBytes != 512<<30 {
 		t.Fatalf("device numbers did not cross the wire: %+v", host)
 	}
+	// vol-mine's 1 MiB gap is the whole fleet's view of what is not on S3 yet: the
+	// Agent sums it per device, and this is where that sum lands. vol-stolen
+	// contributes nothing, which is right — it reports a closed gap.
+	if host.RemoteBacklogBytes != 1<<20 {
+		t.Fatalf("the aggregate remote backlog did not cross the wire: %+v", host)
+	}
 	if host.AgentVersion != testVersion || host.MaxFormatVersion != 3 {
 		t.Fatalf("identity did not cross the wire: %+v", host)
 	}
