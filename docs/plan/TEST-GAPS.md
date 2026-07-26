@@ -22,8 +22,16 @@ backend throttles mid-sweep, or a clock moves backwards.
 | Recovery and materialization never chained across epochs: a volume promoted twice rebuilt with only its newest epoch's writes, reported as complete | `a0d59a6` |
 | `checkpoint.Create` published the log's durable watermark instead of what S3 proves, authorising local truncation over data that existed nowhere else | `a0d59a6` |
 | Every log started at sequence 1, so a promoted writer would have written records colliding with the previous epoch's | `a0d59a6` |
+| A KeyID-0 DEK sealed ciphertext but marked the object plaintext: the FLUSH ACKed, the object was unreadable at recovery, and Decrypt aborted a whole Recover on a key version it merely did not hold | `4ce470e`, `bd0b0fd` |
+| `wal_durable_gap_bytes` measured what was un-fdatasynced instead of what no verified S3 object covers, so the RPO gauge read 0 while the backlog grew unbounded; nothing bounded that backlog | `4ce470e`, `bd0b0fd`, `58ccf6b` |
+| A reopened WAL restarted at sequence 1 and served an empty view — duplicate sequences, re-issued object spans, and reused AES-GCM nonces for the same (volume, epoch, sequence). `ErrDirtyLog` stops the silent path; `wal.Resume` continues at last_local+1 and re-queues only the tail S3 never took | `4ce470e`, `bd0b0fd` |
+| A WRITE carrying FlagFUA completed with no fdatasync, no PUT and no lease check. `Write` refuses the flag; `WriteFUA` runs a FLUSH's durability step | `4ce470e`, `bd0b0fd` |
+| A remote-mode FLUSH with a lease but no uploader ACKed and advanced durable over an empty bucket; the vestigial `SetLease` is gone, so `EnableRemote` is the only way into remote mode | `4ce470e` |
+| WAL records never carried their VolumeID: a file replayed under the wrong volume applied to the wrong guest's extents with nothing to contradict it (the recovery-side check remains open below) | `15f7117` |
 
-**All seven criticals are now closed.** What remains below is high and lower.
+**All seven criticals are now closed**, and wave 1 of `TEST-GAPS-PLAN.md` (packages
+A–E) closed the entries above plus those still being reconciled below. What remains
+is high and lower.
 
 ## Open
 
@@ -33,13 +41,8 @@ and where the test belongs.
 
 ### CRITICAL
 
-- **checkpoint.Create trusts the log's local durable watermark instead of the S3 prefix, then unlocks local truncation over data S3 does not have** _(recovery-materialize)_
-  - failure mode: S3's contiguous prefix falls behind the log's durable watermark (a GC mark on the un-checkpointed tail, a mis-scoped lifecycle rule, a corrupt object, an ACKed PUT whose object was later lost). The next checkpoint publishes the higher sequence with a gapped object list — the RootDigest matches because it is a hash of key strings and cannot express a hole — then advances published, which authorises TruncateLocal over sequences whose only remaining copy was local. INV-13's "never truncate above a verified published point" is enforced against a number nobody verified. The published checkpoint is also create-only and immutable, so it is permanently unusable for rebuild.
-  - missing test: In internal/checkpoint/checkpoint_test.go: flush 3 objects, delete-mark (or corrupt) the middle one, call Create, and assert (a) it refuses or clamps DurableSequence to recovery.DurablePoint, (b) published is not advanced past the S3 prefix, (c) TruncateLocal at the log's durable is still refused with ErrTruncateAboveDurable. Plus an assertion that any published checkpoint's Objects list is contiguous from the epoch floor to DurableSequence.
-
-- **Recovery and materialization never chain across epochs: a volume that has ever been promoted rebuilds with only its newest epoch's writes** _(recovery-materialize)_
-  - failure mode: Every failover, drain, or host evacuation after the first one materializes a volume containing only the writes made since the last promotion, and reports it as a complete rebuild (Progress.UpTo equals that epoch's durable point). Nothing errors, so an operator has no signal. A volume moved twice loses everything written before the second move.
-  - missing test: A recovery test and a materialize test at epoch >= 2 that write bytes in epoch 1, cross the boundary via a recovery point, write more in epoch 2, and assert the pre-promotion bytes are present in the recovered/materialized view — or an explicit, tested refusal to materialize an epoch whose predecessor is not covered by a checkpoint/snapshot the caller also fetched. Plus a drain test that moves the same volume twice and asserts the second move's Bytes/UpTo cover the first epoch's ACKed data.
+None open. The two entries that stood here were closed by `a0d59a6` and are
+recorded in the table above.
 
 
 ### HIGH
@@ -148,28 +151,9 @@ and where the test belongs.
   - failure mode: One bad pass — from the empty-epoch bug, the swallowed floor error, a stale LIST, or a GC-shortened prefix — writes an immutable boundary lower than an earlier one, or one whose PrevEpoch does not chain. The floor for the newest epoch then either sits below data that was already superseded or (a floor of 0/1 against objects that start higher) declares nothing durable at all, permanently, with no in-band repair because the object is create-only. This is the one guard that would have caught gaps 3, 5, 9 and 12 at the boundary write instead of after it.
   - missing test: A chained recovery test over epochs 1→2→3 asserting recovered_up_to is non-decreasing and PrevEpoch links (N+1's prev == N), plus a drain test that refuses to write a boundary below recovery_point(prevEpoch).RecoveredUpTo — and a DST invariant checker for boundary monotonicity with a planted-bug proof.
 
-- **KeyID semantics on the write path are unvalidated: a KeyID-0 DEK ACKs a FLUSH whose object recovery can never read** _(wal-durability)_
-  - failure mode: A volume configured with a DEK whose KeyID is 0 (or an Encryption enabled after NewBatcher was given a different keyID) ACKs FLUSH as remotely durable while every uploaded object fails recovery.validate — an ACKed write that S3 provably cannot produce, with no error at write time, no error at ACK time, and a durable point stuck at 0. Separately, Decrypt attempts Open for any non-zero KeyID it does not hold, so a mixed-KeyID epoch aborts the entire Recover instead of reporting which key is missing.
-  - missing test: In internal/wal/crypto_wal_test.go: (a) a round-trip that writes through an encrypted Log, uploads, and asserts recovery.DurablePrefix/Recover return the written data — run for KeyID 0 and non-zero; (b) assert EnableEncryption with DEK.KeyID==0 (or a batcher keyID that disagrees with the DEK) is refused at configuration time; (c) assert Decrypt rejects a record whose KeyID it does not hold instead of calling Open.
-
-- **INV-04's backpressure accounting is cleared by events that make nothing durable, and wal_durable_gap_bytes reports 0 (or nothing) exactly where the doc calls it critical** _(wal-durability)_
-  - failure mode: On a `local` volume (or a `remote` volume during an S3 outage where anything calls Sync), the un-remote-durable backlog grows without bound while the RPO gauge reads 0 or is never published, so §5.7's 'explicit error rather than silently filling NVMe' never fires and the operator's only RPO signal is a lie. Host loss then loses far more than max_unflushed_age of ACKed FLUSHes. (The absence of the async uploader itself is DEV-0007; the metric definition and the unbacked accounting reset are not.)
-  - missing test: A test asserting wal_durable_gap_bytes equals the bytes not yet in a verified S3 object (not the unsynced bytes) after N local-mode flushes with the store unreachable, that the gauges are recorded in local mode at all, and that Sync() does not clear the remote-durability accounting; plus a bound on Batcher.pending bytes with an explicit error.
-
 - **A fenced writer's late PUT raises the old epoch's durable prefix past the recovery point** _(wal-durability)_
   - failure mode: W1's in-flight PUT (slow S3, SDK retry) completes after W2 wrote recovery-point{recovered_up_to: D}. materialize.FromEpoch(vol, oldEpoch) — the drain/warm-standby source per ADR-0008 — calls DurablePoint, which does not consult the next epoch's boundary, so it rebuilds a state containing a record the live epoch-N+1 volume never had. Two divergent materializations of the same volume from the same bucket; and a drain resumed through finishMovedVolume recomputes prog.UpTo, finds it disagrees with the existing create-only recovery point, and hard-errors that volume permanently.
   - missing test: A DST scenario that lands W1's fenced PUT *after* W2's recovery point and asserts either that DurablePrefix(epoch N) is clamped to the successor's recovered_up_to, or that materialize.FromEpoch refuses/clamps when a later epoch's recovery point exists; plus a unit case in internal/recovery for the same ordering.
-
-- **Reopening a WAL restarts sequences at 1 and serves an empty read view** _(wal-durability)_
-  - failure mode: The documented ATTACHING→ACTIVE path (§16: 'validar epoch + obtener lease', not 'increment epoch') lets an agent restart re-attach at the same epoch. The rebuilt Log serves zeros for data that is in the WAL and in S3, re-issues sequences 1..N under the same (volume, epoch) — which is the trigger for the GCM nonce reuse and for duplicate/overlapping object spans — and every durability claim for that epoch is then built on duplicated sequence numbers.
-  - missing test: A DST scenario 'crash mid-workload, reopen the log, resume' asserting the resumed log's first sequence is last_local+1, its read view equals the pre-crash view, and no S3 object span is reissued; failing that, a unit test that NewLog over a non-empty file is refused.
-
-- **AES-GCM nonce reuse when the sequence restarts inside the same (volume, epoch)** _(wal-durability)_
-  - failure mode: A Log rebuilt for the same volume at an unchanged epoch (agent restart, re-attach that validates rather than bumps the epoch) re-issues sequences 1,2,3… under the same DEK and epoch. Two WAL objects in the bucket then carry ciphertexts whose XOR is the plaintexts' XOR — guest data recoverable without the key (INV-15), and forgeable records that pass DEK.Open and the plaintext CRC.
-  - missing test: Not a crypto test — a WAL-level test that a Log which resumes over a non-empty WAL for an unchanged epoch either refuses to start or resumes at last_seq+1, i.e. the same resume test the reopen finding needs; plus a DST checker that no (volume, epoch, sequence) is ever sealed twice across a run.
-
-
-### MEDIUM
 
 - **A duplicate drain request re-cordons a host that was returned to ACTIVE (the DEAD arm is by design)** _(drain-placement-dst)_
   - failure mode: A retried or replayed drain request for a finished operation silently removes a repaired, ACTIVE host from placement again — capacity disappears from the fleet while the call reports SUCCEEDED and reports no error anywhere for an operator to see.
@@ -275,25 +259,14 @@ and where the test belongs.
   - failure mode: A promotion or drain runs while LIST is behind (a lagging S3-compatible backend, a LIST racing an in-flight upload). recovery.DurablePrefix returns a value below what the fenced writer ACKed, with no error, and drain writes that number into the create-only recovery point for the next epoch — those ACKed FLUSHes end up below the new floor permanently, an ACKed write lost purely because a listing was stale.
   - missing test: Either (a) tighten the Store contract doc to require strongly consistent LIST and let integration/backend/conformance_test.go TestListSeesAFreshPut be its enforcement, or (b) recovery/drain tests plus a DST scenario with SetEventualList(true) asserting the durable point never regresses below a previously observed value and that the boundary write refuses to lower it. Option (b) is the same guard the recovery-point monotonicity gap needs.
 
-- **'Same range, different hash ⇒ hard fail' (INV-21 / §14.5) is unreachable because the key embeds the content hash** _(wal-durability)_
-  - failure mode: Two objects claiming the same sequence span with different content both pass create-only PUT, both pass recovery.validate, and Recover applies both — the recovered volume content is decided by SHA-prefix sort order, with no diagnostic anywhere. Reachable when a restarted/re-batching writer regroups records (see the reopen finding) or when fencing has already failed and two writers share an epoch — exactly the case INV-21 exists to catch.
-  - missing test: In internal/wal/uploader_test.go: upload two ClosedBatches with identical [First,Last] and different Records through the real key builder and assert the second is refused. In internal/recovery/integrity_test.go: assert DurablePrefix/Recover refuse a span covered by two distinct validated objects rather than silently picking one.
+- **'Same range, different hash ⇒ hard fail' (INV-21 / §14.5) is unreachable at recovery because the key embeds the content hash** _(wal-durability)_
+  - failure mode: Two objects claiming the same sequence span with different content both pass create-only PUT, both pass recovery.validate, and Recover applies both — the recovered volume content is decided by SHA-prefix sort order, with no diagnostic anywhere. Reachable when a restarted/re-batching writer regroups records or when fencing has already failed and two writers share an epoch — exactly the case INV-21 exists to catch.
+  - **write half closed** by `4ce470e`: the uploader now checks the sequence span (a prefix LIST of the key minus its hash suffix), not the key, so one writer cannot publish two versions of a span.
+  - missing test: the recovery half — in internal/recovery/integrity_test.go, assert DurablePrefix/Recover refuse a span covered by two distinct validated objects rather than silently picking one, which is the case a *second* writer produces and the uploader cannot see.
 
 - **Overlapping sequence spans silently under-report the durable point** _(wal-durability)_
   - failure mode: Overlapping objects (producible after a restart/re-batch, not by a single correct Batcher) make the durable point stop early. W2 then writes recovery-point{recovered_up_to: 3}, epoch N+1's floor becomes 4, and sequences 4-5 — inside an ACKed FLUSH — are never replayed by anyone again, while the drain's materializer refuses the same volume outright.
   - missing test: Cases in TestDurablePrefix for {1-3},{2-5} and {1-3},{1-5} asserting the durable point still reaches 5 via record-level contiguity, or that recovery fails loudly instead of returning 3; and a matching assertion that materialize.FromEpoch and DurablePrefix agree on that layout.
-
-- **A FUA WRITE completes without fdatasync, without a PUT and without a lease check** _(wal-durability)_
-  - failure mode: A caller that hands a virtio FUA write to Log.Write gets a completed write whose bytes are only in the host page cache, with no fdatasync, no verified PUT and no lease validation — the flag is accepted and half-handled, which reads as 'FUA is implemented'. Host loss then loses a write the guest believes is on stable media. Severity is capped today only because the component that would ACK to a guest does not exist (DEV-0007) and Write's doc comment claims no-sync semantics for normal writes — so the real defect is an undecided contract with a flag silently swallowed.
-  - missing test: In internal/wal/durability_test.go, the three assertions that already exist for Flush, applied to a FUA write: it must be in a verified S3 object by the time Write returns, return ErrSelfFenced when the lease expired, and return ErrNoLease in remote mode with no lease checker — or, if translation is the agent's job, a test that Log.Write rejects FlagFUA outright.
-
-- **Remote-mode FLUSH ACKs and advances durable with nothing in S3 when the log has a lease but no uploader** _(wal-durability)_
-  - failure mode: A Log built with NewLog + SetLease (remote is the default mode) ACKs a FLUSH as remotely durable with zero bytes in the object store and advances durable_sequence past anything S3 can produce — the same fail-open shape DEV-0004 removed, re-entered through the vestigial setter. Severity is medium rather than high because no production caller exists and the setter is dead code; the fix is deleting it so EnableRemote is structurally the only way into remote mode.
-  - missing test: In internal/wal/durability_test.go next to TestRemoteModeWithoutALeaseFailsClosed: a remote-mode log with a lease but no uploader must fail closed; and an assertion in the happy path that a successful Flush left at least one object in the store covering target.
-
-- **WAL records never carry their VolumeID, so a record can be replayed under the wrong volume undetected** _(wal-durability)_
-  - failure mode: The local WAL file has no volume binding whatsoever: a file replayed against the wrong volume (path bug, restored backup, reused volume directory), or records of two volumes concatenated, apply to the wrong guest's extents with no error. Inside an object the record-level epoch is likewise unchecked against the object header. Encrypted volumes are saved only by the GCM AAD, which is not the layer INV-05/INV-08 are claimed at.
-  - missing test: A field assertion in internal/wal (or format) that a record written through Log.Write/Discard/WriteZeroes carries the log's volume id and epoch; and a validate() extension in internal/recovery rejecting any record whose VolumeID/Epoch disagrees with the object header, with a planted violation to prove the checker catches it.
 
 - **A full disk is not modelled anywhere; the WAL has no ENOSPC policy** _(wal-durability)_
   - failure mode: The device fills because S3 has been unreachable and nothing was truncated. The first ENOSPC arrives as a partial append (the silent-truncation failure above); after that every WRITE returns a raw I/O error while the volume reports itself un-fenced, durable_sequence is stale, and no metric or state says 'out of space'. Recovery from a WAL whose tail was cut by ENOSPC is untested.
@@ -326,6 +299,7 @@ and where the test belongs.
   - failure mode: Once agents report watermarks: an epoch-N primary's report is queued behind a retry and delivered after epoch N+1's writer has published its own. Promotion does not change the CP term, so the stale report passes the term guard and lowers durable_sequence — during an incident that is the number an operator uses to decide whether to accept data loss.
   - missing test: Contract test asserting UpdateWatermarks rejects (or ignores) a decrease and rejects published > durable > local in both implementations, plus a fencing test where an epoch-N report arrives after epoch N+1 has published.
 
-- **Uploader retries with no backoff and no context check** _(wal-durability)_
-  - failure mode: Under coordinated backend throttling a FLUSH exhausts its budget faster than the backend's recovery window and returns ErrUploadRetriesExhausted where a short backoff would have succeeded; on a cancelled context the loop still issues maxAttempts requests instead of returning at the first ctx.Err().
-  - missing test: An uploader test with an injected clock asserting a sleep drawn from the simulated clock between attempts on a throttle (per INV-01), and a test that a cancelled context aborts the retry loop at the first iteration.
+- **Uploader retries with no backoff** _(wal-durability)_
+  - failure mode: Under coordinated backend throttling a FLUSH exhausts its budget faster than the backend's recovery window and returns ErrUploadRetriesExhausted where a short backoff would have succeeded.
+  - **context half closed** by `4ce470e`: the retry loop returns ctx.Err() at the first check instead of issuing maxAttempts requests on a cancelled context.
+  - missing test: An uploader test with an injected clock asserting a sleep drawn from the simulated clock between attempts on a throttle (per INV-01).
