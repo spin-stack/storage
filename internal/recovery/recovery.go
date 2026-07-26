@@ -3,6 +3,26 @@
 // sequences under wal/<vol>/<epoch>/. Recover replays the WAL objects up to that
 // point (decrypting) to rebuild the read view; the summary object accelerates the
 // scan (§22.1), and the recovery-point object fixes the epoch frontier (§12.5).
+//
+// # What this package needs from the object store
+//
+// The durable point is derived from a LIST, and a LIST that has not caught up answers
+// with a *smaller* prefix and no error — the one failure shape that is
+// indistinguishable from the truth. So:
+//
+//   - LIST must be strongly consistent (read-after-write for a new key). That is the
+//     backend's obligation, not something this package can check: nothing here can
+//     tell "the listing is behind" from "the object is gone". A candidate backend is
+//     held to it by integration/backend/conformance_test.go's TestListSeesAFreshPut,
+//     which is blocking per backend (§6.1).
+//   - Everything the walk cannot afford to guess is read with a GET instead: the
+//     epoch's floor (PrefixFloor), its ceiling (EpochCeiling) and the previous
+//     epoch's summary (boundaryFloor). A GET failure is an error, never a default —
+//     a defaulted floor of 1 or an assumed absent ceiling each produce a number a
+//     promotion writes into a create-only object.
+//   - The number a stale listing could still bury is refused at the write:
+//     WriteRecoveryPoint will not record a boundary below what the previous epoch's
+//     own boundary or its summary already establishes.
 package recovery
 
 import (
