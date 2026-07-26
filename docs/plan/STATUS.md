@@ -4,10 +4,12 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
 work, then `REBASELINE.md` — a human review on 2026-07-25 found this file claiming
 more than the repository does, and the maturity model below is the correction.
 
-- **Date:** 2026-07-25 (rebaselined)
+- **Date:** 2026-07-26 (waves 1–3 of the test-gap backlog merged; the design decisions
+  that were blocking the spine are taken)
 - **Where the work is:** everything is on **`main`**, pushed to `origin`
   (`/home/aledbf/spin-storage.git`, a bare repo — the old bundle remote is gone).
-- **Gate on `main`:** `task ci` green; `task cover` 90.2% (>= 90 floor);
+- **Gate on `main`:** `task ci:full` green — that is now the merge gate and it includes
+  the Docker lanes (`task ci` stays the fast local loop). `task cover` 91.9% (>= 90);
   `task test:integration` green on Postgres 18; `task backend:conformance` green
   against the pinned RustFS; `task build:qemu` + `task qemu:verify` green.
 
@@ -72,19 +74,65 @@ Three of the seven criticals were one root cause (the GC), which is the shape to
 expect: the suite covered the happy path thoroughly and the operational worst case
 barely at all.
 
-## What to do next
+## What happened since the rebaseline
 
-Seven of the eight deviations are closed (DEV-0003/0004/0005/0006/0008/0009/0010).
-**DEV-0007 is the one left**, and it cannot be closed by fixing a function:
+Three waves of parallel increments closed 65 of the 78 audit findings (`TEST-GAPS.md`
+records each with the commit that closed it, and the seven that remain with what they
+are waiting on). The ones worth carrying in your head, because they were real data-loss
+paths and not tidying:
 
-1. **The spine** — `api/`, `cmd/volume-agent`, `cmd/control-plane`, `cmd/volctl`, then
-   Phases 02/03 (guest layout, vhost-user) against the QEMU build that now exists.
-   Only then can any phase move from *model* to *integrated*.
-2. **Reopen 09/10/11 as integration work**: snapshot lifecycle in the background,
-   objectization with real segment objects, chain links persisted, a materialized
-   volume that lands on the destination's disk, resize end to end.
-3. Then Phase 12, and the rest of Phase 13 (real-hardware fault injection, backend
-   conformance per version, runbooks with measured times, INV-19).
+- a reopened WAL restarted at sequence 1 — duplicate sequences and reused GCM nonces;
+- the publishers never consulted the epoch object at all, so a fenced host could
+  publish a checkpoint into another host's epoch and advance `published`;
+- `AdvancePublished` accepted a value below its own past, so one stale listing walked
+  the published point backwards under WAL that had already been discarded;
+- a drain finished volumes it never moved, writing create-only boundaries for them;
+- `BumpVolumeEpoch` was a blind increment, so n promoters each got an epoch;
+- the GC's epoch ceiling licensed destroying a superseded epoch's objects that a
+  pre-promotion manifest still named (ADR-0012).
+
+**Every design decision that was blocking the spine is now taken:** ADR-0011 (term
+claimed in S3), 0012 + amendment (GC anchors; Phase 12 is born with a by-key index),
+0013 (device pressure, Proposed), 0014 (soft per-lineage quota, content-addressed
+snapshots, squash), 0015 (fencing wait is a monotonic dwell), 0016 (fencing
+granularity), 0017 (capacity is derived, not a ledger), 0018 (the spine: Agent first,
+Connect RPC in `api/`, Agent pulls).
+
+## What to do next — three tracks, in this order
+
+**DEV-0007 is the only open deviation**, and everything below either builds it or
+clears its path. The tracks are split so no two share a hot file.
+
+### Track A — Control Plane: land the decided fixes (one increment, one owner)
+ADR-0015 (dwell + durable `FENCING_WAIT`), ADR-0016 stage 1 (revocation window bounded
+to one promotion), ADR-0017 (derived capacity, deleting the ledger). They all touch
+`promotion.go`/`drain.go`/`schema.sql`/`db/queries`, so they are one increment, not
+three. Finishing it closes three of the seven open findings.
+
+### Track B — the spine (ADR-0018), Agent first
+1. `api/`: protobuf + Connect (`connectrpc/connect-go`), `buf` in the pinned toolchain,
+   `generate`/`generate:check` twins like sqlc's.
+2. `cmd/volume-agent`: pull reconciliation + heartbeat. The heartbeat is what finally
+   writes `nvme_used_bytes`, which is the input every ADR-0013 threshold needs.
+3. The data path: vhost-user-blk against the published QEMU image, one volume on one
+   host, `guest write → WAL → FLUSH → verified object → checkpoint → TruncateLocal`.
+4. The integration lane for it, using the image the QEMU workflow publishes rather than
+   building QEMU per push.
+
+**That slice is the definition of done for "integrated"** — the first time any phase
+stops being a model.
+
+### Track C — WAL segmentation (ADR-0013 §4, and the reclaim gap)
+`TruncateLocal` frees bytes only when the checkpoint reached the end of the log, so on
+an active volume it reclaims nothing. Segmenting the WAL is the fix and it is an
+on-disk format change: **the format spec gets a human review before the code**, per
+CLAUDE.md. Owns `internal/wal`, so it runs alongside A and B1/B2 without collision.
+
+### After those
+Quota/lineage accounting (ADR-0014, CP-side: `lineages`, `charged_bytes`), then Phase 12
+— segments, the by-key index all three of ADR-0012/0014 need, and squash — then the
+rest of Phase 13 (real-hardware fault injection, runbooks with measured times, INV-19,
+which becomes binding as soon as two Agents can differ).
 
 ## How to resume
 1. Read `REBASELINE.md`, then `PLAN.md` (phase map), `INVARIANTS.md`, `CLAUDE.md`.
