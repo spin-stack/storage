@@ -747,6 +747,89 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 	}
 }
 
+// TestDrainRevokesTheSourceLeaseBeforeItPromotes: evacuating a *healthy* host. The
+// drain refuses to promote a source whose lease is still live — correctly, that is
+// INV-11 — but nothing takes the lease away, so on a host that is up and being
+// renewed the wait is measured against an instant that keeps moving and the drain
+// waits forever. Revoking is the Control Plane withdrawing its own record of the
+// source as a writer; it belongs in the fencing step, before the wait.
+//
+// It must not shorten the wait by a single tick. The Agent counts its copy of the
+// lease down on a monotonic clock (§12.2) and never learns the row is gone, so a
+// promotion granted early would run against a writer that can still ACK — the
+// failure INV-11 exists to prevent.
+func TestDrainRevokesTheSourceLeaseBeforeItPromotes(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize) // the source's lease was renewed "now"
+
+	// The source is healthy: this pass runs while its lease is live.
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("a live lease must hold the promotion back: %v", err)
+	}
+	if _, err := w.base.GetHostLease(ctx, cloneHostA); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("the drain waited on the source's lease but never revoked it: %v", err)
+	}
+
+	// Still inside last_renewal + lease_ttl + max_clock_skew: the revocation is not
+	// an excuse to promote early.
+	w.clk.Advance(leaseTTL)
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("revoking the lease shortened the fencing wait: %v", err)
+	}
+	for _, vol := range w.vols {
+		if v, _ := w.md.GetVolume(ctx, format.UUIDString(vol)); v.CurrentEpoch != 1 {
+			t.Fatalf("a volume was promoted inside the fencing wait: %+v", v)
+		}
+	}
+
+	// Past the full wait the healthy host is evacuated — the instant it is measured
+	// from survives the revocation.
+	w.clk.Advance(maxSkew + time.Second)
+	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if err != nil {
+		t.Fatalf("a healthy host must be evacuable: %v", err)
+	}
+	if res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 2 {
+		t.Fatalf("drain result = %+v", res)
+	}
+}
+
+// TestDrainDoesNotRevokeTheDestinationsLease is the guard rail on the step above.
+// The revocation happens while the source is still the volume's primary; a pass that
+// resumes *after* its own promotion landed would, if it revoked by primary host id,
+// take away the lease promotion had just granted to the destination — fencing the
+// new writer with nobody to replace it.
+//
+// The crash is the one that leaves the drain in that state: the promotion landed and
+// the progress write that records it did not.
+func TestDrainDoesNotRevokeTheDestinationsLease(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+	firstID := format.UUIDString(w.vols[0])
+
+	w.hooks.beforeUpdate = func(op metadata.Operation) error {
+		if strings.Contains(string(op.CurrentState), `"PROMOTED"`) {
+			return errProgressLost
+		}
+		return nil
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
+		t.Fatalf("setup: want errProgressLost, got %v", err)
+	}
+	w.hooks.beforeUpdate = nil
+	if v, _ := w.md.GetVolume(ctx, firstID); v.PrimaryHostID != destHost || v.CurrentEpoch != 2 {
+		t.Fatalf("setup: the promotion should have landed: %+v", v)
+	}
+
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := w.base.GetHostLease(ctx, destHost); err != nil {
+		t.Fatalf("the resumed pass revoked the lease of the host it had just promoted: %v", err)
+	}
+}
+
 // TestCancelAFinishedDrainIsRefused: cancellation is a request about work in flight.
 // Once the operation succeeded there is nothing to cancel, and letting it flip back
 // would misreport what happened to the fleet.

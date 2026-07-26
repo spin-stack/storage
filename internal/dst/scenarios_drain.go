@@ -426,21 +426,72 @@ func (w *drainWorld) assertMovedExactlyOnce(ctx context.Context) error {
 // an invalid lease" because the emitted LeaseValid is the Agent's real monotonic
 // answer. With the assertions below removed as well, NoLostAckedWriteChecker sees the
 // same thing from the other side: an ACKed sequence outside the recorded boundary.
+// It runs against two shapes of source. The first has already gone quiet, which is
+// the shape every earlier drain scenario assumed. The second is a *healthy* host:
+// its lease is live at the instant the evacuation starts, which is what evacuating a
+// working host actually looks like, and it is where the order of the fencing step
+// decides whether any of this holds. The Control Plane has to withdraw its own
+// record of the source as a writer before it waits — otherwise the wait is measured
+// against an instant that keeps moving — and withdrawing it must not advance the
+// promotion by a single tick, because the Agent's copy of the lease is counted down
+// on a monotonic clock that never hears about the row.
 func scenarioDrainSourceCannotAck(s *Sim) error {
+	for _, tc := range []struct {
+		name    string
+		tag     byte
+		healthy bool
+	}{
+		{"a source that has already gone quiet", 0x0f, false},
+		{"a healthy source, fenced by the drain itself", 0x1f, true},
+	} {
+		if err := drainSourceCannotAck(s, tc.tag, tc.healthy); err != nil {
+			return fmt.Errorf("%s: %w", tc.name, err)
+		}
+	}
+	return nil
+}
+
+func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 	ctx := context.Background()
 	// The source Agent's own lease, granted now and never renewed again.
 	agent := lease.NewManager(s.Clock, drainLeaseTTL)
 	agent.Grant()
-	w, err := newDrainWorld(s, 0x0f, agent)
+	w, err := newDrainWorld(s, tag, agent)
 	if err != nil {
 		return err
 	}
 	s.Emit(Event{Kind: EventDurableAck, Durable: w.acked, LeaseValid: agent.Valid()})
 
-	// The Control Plane waits the fence out and evacuates the host.
-	s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
-	if _, err := w.pass(); err != nil {
-		return fmt.Errorf("drain: %w", err)
+	if healthy {
+		// The evacuation starts while the source still holds a live lease. The pass
+		// must refuse to promote, and must leave the Control Plane's record of that
+		// lease gone, so nothing on this side re-arms it behind the fence.
+		if _, err := w.pass(); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return fmt.Errorf("a live source lease must hold the promotion back, got %v", err)
+		}
+		if _, err := w.md.GetHostLease(ctx, w.src); !errors.Is(err, metadata.ErrNotFound) {
+			return fmt.Errorf("the drain waited on the source's lease but never revoked it: %v", err)
+		}
+		// Revoking is not a shortcut through the wait: at lease_ttl the Agent's own
+		// copy is still valid, and so is the fence.
+		s.Tick(drainLeaseTTL)
+		if _, err := w.pass(); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return fmt.Errorf("revoking the lease shortened the fencing wait, got %v", err)
+		}
+		if !agent.Valid() {
+			return fmt.Errorf("the Agent's lease expired before the wait it is meant to cover")
+		}
+		s.Emit(Event{Kind: EventFault, Msg: "drain revoked the lease of a healthy source"})
+		s.Tick(drainMaxSkew + time.Second)
+		if _, err := w.pass(); err != nil {
+			return fmt.Errorf("drain of a healthy source: %w", err)
+		}
+	} else {
+		// The Control Plane waits the fence out and evacuates the host.
+		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+		if _, err := w.pass(); err != nil {
+			return fmt.Errorf("drain: %w", err)
+		}
 	}
 	if v, err := w.md.GetVolume(ctx, w.volID); err != nil || v.PrimaryHostID != w.dst {
 		return fmt.Errorf("the volume did not move: %+v err=%v", v, err)
