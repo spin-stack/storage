@@ -55,7 +55,7 @@ linters:
       # offers no other spelling of it. Narrow on purpose: only depguard, only
       # cmd/, and the authoritative simulable analyzer still runs over cmd/, so a
       # real read/write/fsync smuggled into a main is still a failure.
-      - path: ^cmd/
+      - path: (^|/)cmd/
         linters:
           - depguard
       # analyzer golden fixtures deliberately contain violations.
@@ -76,3 +76,12 @@ formatters:
   enable:
     - gofmt
     - goimports
+  exclusions:
+    # Generated code is formatted by its generator, not by us. The linters honour
+    # `exclusions.generated`, but formatters take their own list, so without this the
+    # gate reports protoc-gen-go's import grouping as our formatting error — and the
+    # only way to "fix" it is to hand-edit a file whose header says DO NOT EDIT.
+    generated: lax
+    paths:
+      - api/gen
+      - internal/db
