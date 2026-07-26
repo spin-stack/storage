@@ -118,7 +118,10 @@ tasks:
       - "{{.TOOLS_BIN}}/atlas migrate validate --env local"
 
   db:migrate:lint:
-    desc: "Lint the pending migrations against the last N (default 1). Usage: task db:migrate:lint -- --latest 3"
+    # Requires `atlas login`: Atlas gates `migrate lint` behind Atlas Pro since v0.38,
+    # so this fails with an authentication notice rather than a migration problem
+    # (DEV-0011). It is deliberately not part of `task ci`.
+    desc: "Lint the pending migrations against the last N (default 1) — needs `atlas login`. Usage: task db:migrate:lint -- --latest 3"
     deps: [tools:atlas]
     cmds:
       - "{{.TOOLS_BIN}}/atlas migrate lint --env local {{.CLI_ARGS | default \"--latest 1\"}}"
