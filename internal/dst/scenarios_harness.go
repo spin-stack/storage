@@ -52,11 +52,10 @@ const enospcRecord = 200
 //     way rather than silently succeeding, and a WAL that still replays to exactly the
 //     records the guest was told were accepted.
 //
-// Known hole (reported, not asserted here): after arm 2 the log is not `Fenced()` and
-// exposes no "out of space" state at all — `wal` has no ENOSPC policy, so a caller
-// cannot distinguish a full device from a transient I/O error. Asserting a degraded
-// state would need an API `internal/wal` does not have; this scenario pins down
-// everything that *is* observable so the missing piece is the only gap left.
+// Both arms also pin the state the log reports about its device (`Degraded()`), which
+// is what tells an operator which remedy applies. It is orthogonal to `Fenced()` on
+// purpose and the scenario asserts that too: a full disk is local and recoverable, and
+// handing the volume to another host over it would turn it into a failover.
 func scenarioDiskFillsWithS3Down(s *Sim) error {
 	if err := enospcBackpressureFirst(s); err != nil {
 		return err
@@ -112,6 +111,11 @@ func enospcBackpressureFirst(s *Sim) error {
 			if w := l.Watermarks(); w.Durable != 0 {
 				return fmt.Errorf("durable advanced to %d with nothing in S3", w.Durable)
 			}
+			// Backpressure is not a full device, and reporting it as one would send
+			// an operator to grow a disk that has room.
+			if d := l.Degraded(); d != wal.DegradedNone {
+				return fmt.Errorf("the log reports %s while the device still has room", d)
+			}
 			return nil
 		case errors.Is(err, sim.ErrNoSpace):
 			return fmt.Errorf("the device filled at record %d before the WAL applied backpressure (§5.7)", i)
@@ -147,6 +151,9 @@ func enospcTailReplaysClean(s *Sim) error {
 		_, err := l.Write(uint64(i)*4096, make([]byte, enospcRecord), 0)
 		if err == nil {
 			accepted++
+			if d := l.Degraded(); d != wal.DegradedNone {
+				return fmt.Errorf("the log reports %s after an accepted WRITE", d)
+			}
 			continue
 		}
 		full = err
@@ -163,6 +170,12 @@ func enospcTailReplaysClean(s *Sim) error {
 	}
 	s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("device full after %d records", accepted)})
 
+	// The condition is named, not just returned: "no space" and "the backend hiccuped"
+	// have different remedies and the caller has to be able to tell them apart.
+	if d := l.Degraded(); d != wal.DegradedOutOfSpace {
+		return fmt.Errorf("after ENOSPC the log reports %s, want %s", d, wal.DegradedOutOfSpace)
+	}
+
 	// The rejected WRITE left no phantom sequence behind.
 	if got := l.Watermarks().Local; got != uint64(accepted) {
 		return fmt.Errorf("local watermark = %d after a rejected WRITE, want %d", got, accepted)
@@ -174,6 +187,9 @@ func enospcTailReplaysClean(s *Sim) error {
 	for i := range 3 {
 		if _, err := l.Write(uint64(1<<20)+uint64(i), make([]byte, enospcRecord), 0); !errors.Is(err, sim.ErrNoSpace) {
 			return fmt.Errorf("WRITE %d on a full device returned %v, want ENOSPC", i, err)
+		}
+		if d := l.Degraded(); d != wal.DegradedOutOfSpace {
+			return fmt.Errorf("the device state cleared to %s while the device was still full", d)
 		}
 	}
 	if l.Fenced() {
@@ -218,7 +234,12 @@ func enospcTailReplaysClean(s *Sim) error {
 	if seq != uint64(accepted+1) {
 		return fmt.Errorf("the WRITE after ENOSPC took sequence %d, want %d", seq, accepted+1)
 	}
-	s.Notef("device filled after %d records: backpressure first, no phantom record, clean replay", accepted)
+	// Only an append the device actually took clears the state — nothing probes it.
+	if d := l.Degraded(); d != wal.DegradedNone {
+		return fmt.Errorf("the log still reports %s after a WRITE the device accepted", d)
+	}
+	s.Notef("device filled after %d records: backpressure first, no phantom record, clean replay, state %s->%s->%s",
+		accepted, wal.DegradedNone, wal.DegradedOutOfSpace, l.Degraded())
 	return nil
 }
 
