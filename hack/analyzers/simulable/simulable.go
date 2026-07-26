@@ -53,13 +53,27 @@ var forbidden = map[string]map[string]bool{
 	},
 }
 
-// exemptPathFragment marks packages allowed to touch the real primitives: the
-// simio interface package and its real implementations both live under this path.
-const exemptPathFragment = "internal/simio"
+// exemptPathFragments marks the packages allowed to touch the real primitives.
+//
+//   - internal/simio is the sanctioned home of every simulable interface and of
+//     its real implementations (ADR-0003).
+//   - internal/vhost/hostio is the one documented exception (ADR-0020):
+//     vhost-user is a SOCK_STREAM Unix socket whose messages carry file
+//     descriptors and whose central act is mapping the front-end's address space
+//     into this process. simio models none of that, and a simulation of it would
+//     be a fiction. The exception is this leaf package only — internal/vhost
+//     itself is *not* exempt, and that narrowness is what keeps the protocol,
+//     the ring and the request handling simulable.
+var exemptPathFragments = []string{
+	"internal/simio",
+	"internal/vhost/hostio",
+}
 
 func run(pass *analysis.Pass) (any, error) {
-	if strings.Contains(pass.Pkg.Path(), exemptPathFragment) {
-		return nil, nil
+	for _, frag := range exemptPathFragments {
+		if strings.Contains(pass.Pkg.Path(), frag) {
+			return nil, nil
+		}
 	}
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
