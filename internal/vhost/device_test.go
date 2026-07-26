@@ -35,7 +35,7 @@ func TestHandshakeReachesReady(t *testing.T) {
 	dev, raw := newTestDevice(t, g, 1<<20)
 
 	var seen []Request
-	dev.onRequest = func(r Request) { seen = append(seen, r) }
+	dev.onRequest = func(m Message) { seen = append(seen, m.Request) }
 
 	replies := map[Request]*Message{}
 	for _, m := range g.handshakeMessages() {

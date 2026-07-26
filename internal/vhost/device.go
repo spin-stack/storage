@@ -23,12 +23,16 @@ type Config struct {
 	// BlockSize is the logical block size advertised in the virtio-blk config.
 	// Zero means SectorSize.
 	BlockSize uint32
-	// OnRequest, if set, is called with every vhost-user request as it is
+	// OnRequest, if set, is called with every vhost-user message as it is
 	// handled. It exists so a test — including the QEMU integration lane, which
-	// cannot observe the socket any other way — can assert *which* handshake
-	// the front-end actually performed, rather than assert that it did not
-	// crash.
-	OnRequest func(Request)
+	// cannot observe the socket any other way — can assert *which* handshake the
+	// front-end actually performed and *what* it said, rather than assert that it
+	// did not crash.
+	//
+	// The message is the one the device is about to dispatch: the hook may read
+	// it, but the descriptors in Files belong to the device and must not be
+	// retained or closed.
+	OnRequest func(Message)
 	// OnError, if set, is called with every request this backend completed as
 	// an I/O error. A device that fails every READ and a device that serves
 	// them are indistinguishable from the outside until the guest gives up.
@@ -46,7 +50,7 @@ type Device struct {
 	queueSize uint16
 	serial    string
 	blockSize uint32
-	onRequest func(Request)
+	onRequest func(Message)
 	onError   func(uint32, error)
 
 	mu       sync.Mutex
@@ -166,7 +170,7 @@ func (d *Device) reset() {
 // out of a ring or a memory map we cannot describe.
 func (d *Device) Handle(ctx context.Context, m Message) (*Message, error) {
 	if d.onRequest != nil {
-		d.onRequest(m.Request)
+		d.onRequest(m)
 	}
 	if v := m.Version(); v != flagVersion1 {
 		m.CloseFiles()
