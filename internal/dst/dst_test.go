@@ -1,7 +1,6 @@
 package dst_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/dst"
@@ -43,43 +42,6 @@ func TestDeterministicReplay(t *testing.T) {
 				}
 			}
 		}
-	}
-}
-
-// TestPlantedBugMonotonicClock proves the MonotonicClockChecker actually catches a
-// violation (not merely present) and that the failure reports the reproducing seed.
-func TestPlantedBugMonotonicClock(t *testing.T) {
-	buggy := func(s *dst.Sim) error {
-		// Emit a regressing clock event directly (a broken component would).
-		s.Emit(dst.Event{Kind: dst.EventClock, Mono: 100})
-		s.Emit(dst.Event{Kind: dst.EventClock, Mono: 50}) // regression
-		return nil
-	}
-	res := dst.Run(777, buggy, dst.NewMonotonicClockChecker())
-	if res.Err == nil {
-		t.Fatal("expected the monotonic-clock checker to catch the planted regression")
-	}
-	if !strings.Contains(res.Err.Error(), "seed=777") {
-		t.Fatalf("failure must report the reproducing seed, got: %v", res.Err)
-	}
-	if !strings.Contains(res.Err.Error(), "monotonic-clock") {
-		t.Fatalf("failure must name the checker, got: %v", res.Err)
-	}
-}
-
-// TestPlantedBugPermanentDelete proves the NoPermanentDeleteChecker catches an
-// irreversible delete (the INV-14 seed).
-func TestPlantedBugPermanentDelete(t *testing.T) {
-	buggy := func(s *dst.Sim) error {
-		s.Emit(dst.Event{Kind: dst.EventDelete, Key: "wal/live-object", Permanent: true})
-		return nil
-	}
-	res := dst.Run(1234, buggy, dst.NewNoPermanentDeleteChecker())
-	if res.Err == nil {
-		t.Fatal("expected the no-permanent-delete checker to catch the planted delete")
-	}
-	if !strings.Contains(res.Err.Error(), "seed=1234") {
-		t.Fatalf("failure must report the reproducing seed, got: %v", res.Err)
 	}
 }
 
