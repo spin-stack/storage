@@ -341,6 +341,35 @@ tasks:
     desc: Run Docker-gated integration tests (TestContainers Postgres, ADR-0006).
     cmds:
       - go test -tags integration -count=1 ./internal/metadata/pg/...
+      - task: test:integration:qemu
+
+  test:integration:qemu:
+    desc: >-
+      Boot a real QEMU {{.QEMU_VERSION}} guest against the vhost-user-blk backend
+      (Phase 03, increment 3.1; the [Verify] step of RISK-10). Skips with a
+      pointer to `task build:qemu` if the pinned QEMU has not been built.
+    deps: [qemu:verify]
+    cmds:
+      # -count=1 because the result depends on a binary outside the module: a
+      # cached PASS would survive a QEMU rebuild, which is the one thing this
+      # lane exists to notice.
+      - go test -tags integration -count=1 -timeout 15m ./integration/vhost/...
+
+  vhost:bootsector:
+    desc: >-
+      Reassemble integration/vhost/testdata/bootsector.bin from its .S source.
+      Needs binutils (as + ld); the .bin is committed so the integration lane
+      does not.
+    cmds:
+      - |
+        set -euo pipefail
+        dir={{.ROOT_DIR}}/integration/vhost/testdata
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        as --32 -o "$tmp/boot.o" "$dir/bootsector.S"
+        ld -m elf_i386 -Ttext 0x7c00 --oformat binary -o "$tmp/boot.bin" "$tmp/boot.o"
+        test "$(stat -c%s "$tmp/boot.bin")" = 512 || { echo "boot sector is not 512 bytes"; exit 1; }
+        mv "$tmp/boot.bin" "$dir/bootsector.bin"
+        echo "rebuilt $dir/bootsector.bin"
 
   cover:
     desc: Cross-package coverage report; enforces a 90% floor on production code.

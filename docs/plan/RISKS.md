@@ -109,4 +109,52 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
   `VHOST_USER_PROTOCOL_F_INFLIGHT_SHMFD` behavior against QEMU docs and by execution
   before relying on it; SPDK vhost as the reference model. Marked **Unverified:** until
   Phase 03 executes it.
-- Status: open.
+- Status: **open** — the handshake half is verified (below); inflight-shmfd is not, and
+  is not touched until Increment 3.3.
+
+#### Verified by execution, 2026-07-26 (increment 3.1)
+
+Executed: `task test:integration:qemu` — the real pinned binary
+(`_output/bin/qemu-system-x86_64`, `QEMU emulator version 11.0.2`, `vhost-user-blk-pci`
+present) connecting to a `vhost.Server` over a Unix socket, booting a guest from a
+512-byte MBR (`integration/vhost/testdata/bootsector.S`) served by
+`hostio.RawFile`. No KVM on this machine (`/dev/kvm` is not readable by the running
+user), so `accel=kvm:tcg` fell back to TCG; the backend cannot tell the difference.
+Guest memory is `memory-backend-memfd,share=on`, which vhost-user requires.
+
+What it proved:
+
+- **The full handshake completes and the device goes live.** The observed sequence was
+  `GET_FEATURES, GET_PROTOCOL_FEATURES, SET_PROTOCOL_FEATURES, SET_OWNER, GET_FEATURES,
+  SET_VRING_CALL, SET_VRING_ERR, GET_CONFIG, SET_FEATURES, SET_VRING_CALL, SET_FEATURES,
+  SET_MEM_TABLE, SET_VRING_NUM, SET_VRING_BASE, SET_VRING_ADDR, SET_VRING_KICK,
+  SET_VRING_ENABLE, SET_VRING_ENABLE, GET_VRING_BASE`.
+- **READ and WRITE work end to end.** SeaBIOS read LBA 0 through the virtqueue to find
+  the boot signature; the boot sector then read LBA 1 and wrote it to LBA 64 via INT 13h
+  (AH=42h/43h), and the bytes are asserted on the backend side. A planted bug that makes
+  `RawFile.ReadAt` return zeros turns the lane red.
+- **FLUSH is *not* covered by this lane.** SeaBIOS's INT 13h has no flush verb, so no
+  real guest here issues one. FLUSH is covered by the unit tests against the simulated
+  front-end and by `hostio.RawFile`'s own tests. Proving it from a real guest needs a
+  Linux kernel: `-kernel` direct boot is not available because the firmware blobs
+  `task build:qemu` extracts do not include `linuxboot_dma.bin`, and this sandbox has no
+  readable kernel image. **Open gap, not a verified property.**
+
+Measurements worth keeping, all of them things the specification did not say:
+
+- QEMU 11.0.2 asks for **57 bytes** of configuration space in `GET_CONFIG` at offset 0 —
+  not the 60 of `struct virtio_blk_config`. The backend fills 60 and zero-fills up to the
+  protocol's 256-byte maximum, which is what makes this a non-event.
+- `SET_VRING_NUM` is **128**, matching QEMU's `vhost-user-blk` `queue-size` default and
+  the depth §30.3 fixes. The lane asserts this so a default change surfaces as a named
+  failure rather than a connection that dies mid-handshake.
+- QEMU sends **`SET_VRING_ERR`**, which the simulated front-end did not, and never sends
+  `GET_QUEUE_NUM`, which the simulated front-end did.
+- **QEMU 11.0.2's `vhost-user-blk` reconnects on its own** after a backend protocol
+  error — `Reconnecting after error: vhost_backend_init failed: Protocol error` — with no
+  `reconnect=` on the chardev. Increment 3.2 builds on this rather than adding it.
+
+Still unverified, and the reason this risk stays open: `GET_INFLIGHT_FD` /
+`SET_INFLIGHT_FD`. The backend does not advertise `INFLIGHT_SHMFD`, QEMU therefore never
+sends them (asserted in the lane), and nothing here says anything about how QEMU behaves
+when it does. That is Increment 3.3, and it is the durability-review zone.

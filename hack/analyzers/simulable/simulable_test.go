@@ -27,3 +27,19 @@ func TestCompliant(t *testing.T) {
 func TestExempt(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/internal/simio")
 }
+
+// TestExemptVHostHostIO asserts the second and only other exemption (ADR-0020):
+// internal/vhost/hostio may open the Unix socket and mmap the front-end's memory
+// that vhost-user is made of, because simio models neither.
+func TestExemptVHostHostIO(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/internal/vhost/hostio")
+}
+
+// TestVHostItselfIsNotExempt is the narrowness proof. An exemption that leaked
+// to the parent package would make the whole vhost-user backend — protocol,
+// virtqueue, request handling — unsimulable without anything failing, which is
+// precisely the retrofit INV-01 says is impossible. Every call in the fixture
+// must still be flagged.
+func TestVHostItselfIsNotExempt(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "notexempt/internal/vhost")
+}

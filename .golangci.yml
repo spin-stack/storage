@@ -58,6 +58,20 @@ linters:
       - path: (^|/)cmd/
         linters:
           - depguard
+      # internal/vhost/hostio is the one INV-01 exception outside internal/simio
+      # (ADR-0020). vhost-user is a SOCK_STREAM Unix socket whose messages carry
+      # file descriptors over SCM_RIGHTS, and its central act is mapping the
+      # front-end's address space into this process; simio/network carries
+      # length-delimited messages between named endpoints and has no notion of
+      # either, so there is nothing here to simulate that is not the mapping
+      # itself. Deliberately the leaf package and not internal/vhost: the
+      # protocol, the virtqueue and the virtio-blk request handling next door are
+      # pure and stay that way, and the simulable analyzer enforces the same
+      # boundary with its own fixture proving the parent is still checked.
+      - path: internal/vhost/hostio
+        linters:
+          - depguard
+          - forbidigo
       # analyzer golden fixtures deliberately contain violations.
       - path: hack/analyzers/.*/testdata/
         linters:
