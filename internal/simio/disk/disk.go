@@ -9,6 +9,18 @@ import "errors"
 // ErrNotExist is returned when opening or renaming a missing file.
 var ErrNotExist = errors.New("simio/disk: file does not exist")
 
+// ErrNoSpace means the device backing the file has no room left: the real disk's
+// ENOSPC and the simulator's injected equivalent, wrapped so callers can tell them
+// apart from any other I/O failure with errors.Is.
+//
+// It lives here because the WAL has to distinguish "the device is full" — a sticky
+// condition with its own remedy (truncate after a checkpoint, grow the device, restore
+// the object store so the remote gap can close) — from a transient error, and it may
+// import neither syscall (denied outside simio) nor the simulator. Without a sentinel
+// on this interface the only portable test is the error's message, which is a string
+// comparison in the durability path.
+var ErrNoSpace = errors.New("simio/disk: no space left on device")
+
 // Disk is a flat-ish namespace of append-only files (names may contain "/").
 type Disk interface {
 	// Create returns a new empty file, truncating any existing one.

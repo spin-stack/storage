@@ -3,11 +3,13 @@ package wal_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/obs"
+	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -274,5 +276,32 @@ func TestNilClassifierRestoresTheDefault(t *testing.T) {
 	fillTheDevice(t, l)
 	if got := l.Degraded(); got != wal.DegradedOutOfSpace {
 		t.Fatalf("after SetOutOfSpace(nil) the log reports %q, want %q", got, wal.DegradedOutOfSpace)
+	}
+}
+
+// TestDefaultOutOfSpaceRecognisesBothDisks: the classifier is what turns a full device
+// into a state an operator can act on, so it has to hold for the disk production runs
+// on and the one every proof runs on. Identity, not wording — a message match was the
+// weakest line in this package until disk.ErrNoSpace existed.
+func TestDefaultOutOfSpaceRecognisesBothDisks(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil is not a full device", err: nil, want: false},
+		{name: "the shared sentinel", err: disk.ErrNoSpace, want: true},
+		{name: "the simulator's injected ENOSPC", err: sim.ErrNoSpace, want: true},
+		{name: "wrapped by a caller", err: fmt.Errorf("append: %w", sim.ErrNoSpace), want: true},
+		{name: "the operating system's error unwrapped", err: errors.New("write /wal: no space left on device"), want: true},
+		{name: "an unrelated I/O error", err: errors.New("input/output error"), want: false},
+		{name: "a torn write is not a full device", err: sim.ErrShortWrite, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wal.DefaultOutOfSpace(tc.err); got != tc.want {
+				t.Fatalf("DefaultOutOfSpace(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

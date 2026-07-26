@@ -2,9 +2,11 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/spin-stack/storage/internal/obs"
+	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
 // Degradation is why the local WAL device cannot be written to. It is a vocabulary
@@ -38,28 +40,35 @@ func (d Degradation) String() string {
 
 // OutOfSpaceFunc classifies a disk error as "the device has no room left".
 //
-// It is injected for the same reason the clock and the disk are (§25.1, INV-01):
-// `internal/simio/disk` — the interface the WAL depends on — declares no typed
-// no-space sentinel, so there is nothing the WAL can compare against that holds for
-// both implementations. The real disk returns an *os.PathError wrapping
-// syscall.ENOSPC, and `syscall` is denied outside internal/simio; the simulated disk
-// returns sim.ErrNoSpace, and production code must not import the simulator. Until
-// `disk` grows a shared sentinel (a simio-owned change), classification is a policy
-// the caller can supply and DefaultOutOfSpace is the portable fallback.
+// It stays injectable even though disk.ErrNoSpace now makes the default portable: a
+// deployment whose filesystem reports exhaustion its own way (a quota, a thin-provisioned
+// volume returning EIO) can supply the rule without a change here. The default is
+// correct for both disks in this tree.
 type OutOfSpaceFunc func(error) bool
 
 // noSpaceMessage is the wording both worlds share: syscall.ENOSPC.Error() is exactly
 // this string, and sim.ErrNoSpace embeds it verbatim for that reason.
 const noSpaceMessage = "no space left on device"
 
-// DefaultOutOfSpace reports whether err is the device saying it is full. It matches
-// on the message rather than on identity, which is a compromise and is stated as one:
-// the alternative is a WAL that can never recognise a full device on either the real
-// or the simulated disk. It is used only to *label* a failure that has already been
-// reported to the caller — a false negative loses a diagnostic, never a write, and a
-// false positive raises a gauge, never an ACK.
+// DefaultOutOfSpace reports whether err is the device saying it is full. It compares
+// by identity against disk.ErrNoSpace, which both the real disk (wrapping
+// syscall.ENOSPC) and the simulator wrap, and keeps a message match as a fallback for
+// a disk that returns the operating system's error unwrapped. It is used only to
+// *label* a failure that has already been reported to the caller — a false negative
+// loses a diagnostic, never a write, and a false positive raises a gauge, never an
+// ACK.
 func DefaultOutOfSpace(err error) bool {
-	return err != nil && strings.Contains(err.Error(), noSpaceMessage)
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, disk.ErrNoSpace) {
+		return true
+	}
+	// A disk implementation that predates the sentinel, or one that returns the
+	// operating system's error unwrapped. Kept as a fallback rather than as the rule:
+	// it costs nothing, and dropping it would silently stop recognising a full device
+	// on any such disk instead of failing loudly.
+	return strings.Contains(err.Error(), noSpaceMessage)
 }
 
 // SetOutOfSpace replaces the classifier that decides whether a failed append means

@@ -1,11 +1,14 @@
 package real
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
@@ -105,9 +108,22 @@ type realFile struct {
 
 func (r *realFile) Append(p []byte) (int, error) {
 	if _, err := r.f.Seek(0, io.SeekEnd); err != nil {
-		return 0, err
+		return 0, noSpace(err)
 	}
-	return r.f.Write(p)
+	n, err := r.f.Write(p)
+	return n, noSpace(err)
+}
+
+// noSpace wraps ENOSPC in disk.ErrNoSpace so a caller can recognise a full device by
+// identity. The WAL has to tell "the device is full" — sticky, with its own remedy —
+// from a transient failure, and it may not import syscall (§25.1 denies it outside
+// this package). The original error is preserved in the chain, so an errors.As for
+// *os.PathError still works.
+func noSpace(err error) error {
+	if err == nil || !errors.Is(err, syscall.ENOSPC) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", disk.ErrNoSpace, err)
 }
 
 func (r *realFile) ReadAt(p []byte, off int64) (int, error) { return r.f.ReadAt(p, off) }

@@ -2,6 +2,7 @@ package sim
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -18,7 +19,7 @@ var ErrShortWrite = errors.New("simio/sim: injected short write")
 // other fault here it is *not* one-shot — a full device stays full until space is
 // reclaimed — because the failure mode worth testing is what the caller does after
 // the first failure, not the first failure itself.
-var ErrNoSpace = errors.New("simio/sim: injected ENOSPC (no space left on device)")
+var ErrNoSpace = fmt.Errorf("simio/sim: injected ENOSPC: %w", disk.ErrNoSpace)
 
 // Disk is a deterministic in-memory disk with an explicit crash model: content
 // written but not Synced lives only in the per-file cache and is discarded by
