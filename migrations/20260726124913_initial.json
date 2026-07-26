@@ -1,0 +1,92 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-07-26T09:49:13-03:00",
+  "source_fingerprint": {
+    "hash": "965b1131737c955e24c7f827c55bd78e4cb49a75adfd04229e0ba297376f5085"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS control_plane_leader (\n    singleton boolean DEFAULT true,\n    term bigint NOT NULL,\n    holder_id text NOT NULL,\n    renewed_at timestamptz NOT NULL,\n    CONSTRAINT control_plane_leader_pkey PRIMARY KEY (singleton),\n    CONSTRAINT control_plane_leader_singleton_check CHECK (singleton)\n);",
+          "type": "table",
+          "operation": "create",
+          "path": "public.control_plane_leader"
+        },
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS hosts (\n    host_id uuid,\n    state text NOT NULL,\n    agent_version text DEFAULT '' NOT NULL,\n    max_format_version integer DEFAULT 2 NOT NULL,\n    nvme_total_bytes bigint DEFAULT 0 NOT NULL,\n    nvme_used_bytes bigint DEFAULT 0 NOT NULL,\n    last_heartbeat timestamptz NOT NULL,\n    renewals_blocked_until timestamptz,\n    CONSTRAINT hosts_pkey PRIMARY KEY (host_id),\n    CONSTRAINT hosts_host_id_check CHECK ((get_byte(uuid_send(host_id), 6) >> 4) = 7),\n    CONSTRAINT hosts_state_check CHECK (state IN ('ACTIVE'::text, 'CORDONED'::text, 'DRAINING'::text, 'DEAD'::text))\n);",
+          "type": "table",
+          "operation": "create",
+          "path": "public.hosts"
+        },
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS host_leases (\n    host_id uuid,\n    granted_at timestamptz NOT NULL,\n    last_renewal timestamptz NOT NULL,\n    ttl_seconds integer DEFAULT 10 NOT NULL,\n    CONSTRAINT host_leases_pkey PRIMARY KEY (host_id),\n    CONSTRAINT host_leases_host_id_fkey FOREIGN KEY (host_id) REFERENCES hosts (host_id)\n);",
+          "type": "table",
+          "operation": "create",
+          "path": "public.host_leases"
+        },
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS volumes (\n    volume_id uuid,\n    size_bytes bigint NOT NULL,\n    durability text DEFAULT 'remote' NOT NULL,\n    block_size integer NOT NULL,\n    current_epoch bigint DEFAULT 0 NOT NULL,\n    state text NOT NULL,\n    primary_host_id uuid,\n    standby_host_id uuid,\n    active_root_id uuid,\n    published_root_id uuid,\n    chain_depth integer DEFAULT 0 NOT NULL,\n    dek_wrapped bytea NOT NULL,\n    kek_id text NOT NULL,\n    local_sequence bigint DEFAULT 0 NOT NULL,\n    durable_sequence bigint DEFAULT 0 NOT NULL,\n    published_sequence bigint DEFAULT 0 NOT NULL,\n    fencing_started_at timestamptz,\n    created_at timestamptz DEFAULT now() NOT NULL,\n    updated_at timestamptz DEFAULT now() NOT NULL,\n    CONSTRAINT volumes_pkey PRIMARY KEY (volume_id),\n    CONSTRAINT volumes_primary_host_id_fkey FOREIGN KEY (primary_host_id) REFERENCES hosts (host_id),\n    CONSTRAINT volumes_standby_host_id_fkey FOREIGN KEY (standby_host_id) REFERENCES hosts (host_id),\n    CONSTRAINT volumes_durability_check CHECK (durability IN ('remote'::text, 'local'::text)),\n    CONSTRAINT volumes_state_check CHECK (state IN ('ACTIVE'::text, 'PRIMARY_SUSPECTED'::text, 'FENCING_WAIT'::text, 'RECOVERY_REQUIRED'::text, 'RECOVERING'::text, 'DETACHED'::text)),\n    CONSTRAINT volumes_volume_id_check CHECK ((get_byte(uuid_send(volume_id), 6) >> 4) = 7)\n);",
+          "type": "table",
+          "operation": "create",
+          "path": "public.volumes"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS volumes_primary_host_id_volume_id_idx ON volumes (primary_host_id, volume_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.volumes.volumes_primary_host_id_volume_id_idx"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS volumes_standby_host_id_idx ON volumes (standby_host_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.volumes.volumes_standby_host_id_idx"
+        },
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS operations (\n    operation_id uuid,\n    kind text NOT NULL,\n    volume_id uuid,\n    host_id uuid,\n    desired_state jsonb NOT NULL,\n    current_state jsonb NOT NULL,\n    phase text NOT NULL,\n    error text,\n    created_at timestamptz DEFAULT now() NOT NULL,\n    updated_at timestamptz DEFAULT now() NOT NULL,\n    CONSTRAINT operations_pkey PRIMARY KEY (operation_id),\n    CONSTRAINT operations_host_id_fkey FOREIGN KEY (host_id) REFERENCES hosts (host_id),\n    CONSTRAINT operations_volume_id_fkey FOREIGN KEY (volume_id) REFERENCES volumes (volume_id),\n    CONSTRAINT operations_kind_check CHECK (kind IN ('attach'::text, 'detach'::text, 'clone'::text, 'resize'::text, 'drain'::text, 'recovery'::text, 'flatten'::text, 'gc'::text)),\n    CONSTRAINT operations_operation_id_check CHECK ((get_byte(uuid_send(operation_id), 6) >> 4) = 7),\n    CONSTRAINT operations_phase_check CHECK (phase IN ('PENDING'::text, 'RUNNING'::text, 'CANCELING'::text, 'CANCELED'::text, 'SUCCEEDED'::text, 'FAILED'::text))\n);",
+          "type": "table",
+          "operation": "create",
+          "path": "public.operations"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS operations_host_id_operation_id_idx ON operations (host_id, operation_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.operations.operations_host_id_operation_id_idx"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS operations_volume_id_idx ON operations (volume_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.operations.operations_volume_id_idx"
+        },
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS snapshots (\n    snapshot_id uuid,\n    volume_id uuid NOT NULL,\n    parent_snapshot_id uuid,\n    epoch bigint NOT NULL,\n    target_sequence bigint NOT NULL,\n    root_digest text NOT NULL,\n    source_host_id uuid,\n    state text NOT NULL,\n    portable boolean DEFAULT false NOT NULL,\n    manifest_key text,\n    request_id uuid NOT NULL,\n    created_at timestamptz DEFAULT now() NOT NULL,\n    CONSTRAINT snapshots_pkey PRIMARY KEY (snapshot_id),\n    CONSTRAINT snapshots_request_id_key UNIQUE (request_id),\n    CONSTRAINT snapshots_parent_snapshot_id_fkey FOREIGN KEY (parent_snapshot_id) REFERENCES snapshots (snapshot_id),\n    CONSTRAINT snapshots_source_host_id_fkey FOREIGN KEY (source_host_id) REFERENCES hosts (host_id),\n    CONSTRAINT snapshots_volume_id_fkey FOREIGN KEY (volume_id) REFERENCES volumes (volume_id),\n    CONSTRAINT snapshots_request_id_check CHECK ((get_byte(uuid_send(request_id), 6) >> 4) = 7),\n    CONSTRAINT snapshots_snapshot_id_check CHECK ((get_byte(uuid_send(snapshot_id), 6) >> 4) = 7),\n    CONSTRAINT snapshots_state_check CHECK (state IN ('CREATING'::text, 'PUBLISHED'::text, 'FAILED'::text, 'DELETING'::text))\n);",
+          "type": "table",
+          "operation": "create",
+          "path": "public.snapshots"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.snapshots.snapshots_parent_snapshot_id_idx"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS snapshots_source_host_id_idx ON snapshots (source_host_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.snapshots.snapshots_source_host_id_idx"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS snapshots_volume_id_idx ON snapshots (volume_id);",
+          "type": "table.index",
+          "operation": "create",
+          "path": "public.snapshots.snapshots_volume_id_idx"
+        }
+      ]
+    }
+  ]
+}
