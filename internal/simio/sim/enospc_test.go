@@ -140,3 +140,39 @@ func TestENOSPCLeavesAcceptedBytesDurable(t *testing.T) {
 		t.Fatalf("post-crash content = %q, want the synced bytes", got)
 	}
 }
+
+// Growing a file with Truncate allocates just as an append does, so it must hit the
+// same wall — otherwise a caller could grow its way out of ENOSPC.
+func TestENOSPCRefusesATruncateThatGrows(t *testing.T) {
+	d := sim.NewDisk()
+	f, _ := d.Create("wal")
+	d.InjectENOSPC("wal", 8)
+
+	if err := f.Truncate(8); err != nil {
+		t.Fatalf("growing to exactly the device size must succeed: %v", err)
+	}
+	if err := f.Truncate(9); !errors.Is(err, sim.ErrNoSpace) {
+		t.Fatalf("growing past the device = %v, want ErrNoSpace", err)
+	}
+	if size, _ := f.Size(); size != 8 {
+		t.Fatalf("a refused Truncate changed the size to %d", size)
+	}
+}
+
+// A cap can also arrive *below* what the file already holds — a quota lowered under a
+// running volume. The bytes already written stay readable; nothing more fits.
+func TestENOSPCCapBelowCurrentSize(t *testing.T) {
+	d := sim.NewDisk()
+	f, _ := d.Create("wal")
+	if _, err := f.Append(make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	d.InjectENOSPC("wal", 10)
+
+	if n, err := f.Append([]byte{1}); n != 0 || !errors.Is(err, sim.ErrNoSpace) {
+		t.Fatalf("append under a lowered cap = (%d, %v), want (0, ErrNoSpace)", n, err)
+	}
+	if size, _ := f.Size(); size != 100 {
+		t.Fatalf("the bytes already written must stay: size = %d", size)
+	}
+}

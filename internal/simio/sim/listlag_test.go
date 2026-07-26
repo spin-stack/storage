@@ -99,3 +99,16 @@ func TestListLagDoesNotResurrectAMarkedObject(t *testing.T) {
 		t.Fatalf("a marked object became listable once its write caught up: %v", objs)
 	}
 }
+
+// A negative lag is a caller mistake, not a request for a listing from the future.
+func TestSetListLagRejectsANegativeLag(t *testing.T) {
+	ctx := context.Background()
+	s := sim.NewObjectStore()
+	s.SetListLag(-5)
+	if _, err := s.Put(ctx, "wal/k", []byte("v"), objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if objs, _ := s.List(ctx, "wal/"); len(objs) != 1 {
+		t.Fatalf("a negative lag must mean strongly consistent, got %d objects", len(objs))
+	}
+}
