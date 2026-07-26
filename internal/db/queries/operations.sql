@@ -13,12 +13,24 @@ ON CONFLICT (operation_id) DO NOTHING;
 -- name: GetOperation :one
 SELECT * FROM operations WHERE operation_id = $1;
 
--- name: ListOperationsByHost :many
--- Every operation recorded against a host, so a reconciler can ask what is already
--- happening to it before starting something else (§7, §28.1). Deterministic order:
--- the answer must not depend on row order (INV-02), and the composite index
--- operations (host_id, operation_id) satisfies both the filter and the sort.
-SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id;
+-- name: ListLiveOperationsByHost :many
+-- The operations still happening on a host, so a reconciler can ask what is already
+-- under way before starting something else (§7, §28.1). Deterministic order: the
+-- answer must not depend on row order (INV-02).
+--
+-- The phase predicate is written out rather than passed as a parameter because it is
+-- what makes operations_live_by_host_idx usable: the planner has to see that the
+-- query's condition implies the index's, and a parameter it cannot see is a
+-- condition it cannot match. `operations` is append-only history — nothing deletes a
+-- finished operation — so without the partial index this walks everything the host
+-- has ever done, on every drain pass.
+--
+-- It is the terminal set spelled out, which lifecycle.OperationPhase.Terminal() also
+-- defines; TestPGLivePhaseSetsAgreeWithTheLifecycle refuses to let the two drift.
+SELECT * FROM operations
+ WHERE host_id = $1
+   AND phase NOT IN ('SUCCEEDED', 'CANCELED')
+ ORDER BY operation_id;
 
 -- name: UpdateOperationPhase :execrows
 -- Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
@@ -39,21 +51,11 @@ UPDATE operations
  WHERE operations.operation_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
    AND operations.phase = ANY(sqlc.arg(allowed_phases)::text[])
-   -- The derived value is hosts.sql's GetHost expression; see the comment there.
+   -- The derived value is the host_committed_bytes view; schema.sql says why it is
+   -- a view and what it sums. A bound naming a host nobody registered admits
+   -- nothing: no row in the view, a NULL comparison, no write.
    AND (sqlc.narg(bound_host)::uuid IS NULL
        OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = sqlc.narg(bound_host)::uuid)
-           AND (
-               COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
-               WHERE v.primary_host_id = sqlc.narg(bound_host)::uuid), 0)
-               + COALESCE((SELECT SUM(rv.size_bytes)
-               FROM operations plans
-               CROSS JOIN LATERAL jsonb_array_elements(
-               CASE WHEN jsonb_typeof(plans.current_state -> 'volumes') = 'array'
-               THEN plans.current_state -> 'volumes'
-               ELSE '[]'::jsonb END) AS e
-               JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
-               WHERE plans.phase NOT IN ('SUCCEEDED', 'CANCELED')
-               AND e ->> 'to_host' = (sqlc.narg(bound_host)::uuid)::text
-               AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
-               AND rv.primary_host_id IS DISTINCT FROM sqlc.narg(bound_host)::uuid), 0))::BIGINT
+           AND (SELECT c.committed_bytes FROM host_committed_bytes c
+                 WHERE c.host_id = sqlc.narg(bound_host)::uuid)
                + sqlc.arg(bound_add_bytes)::bigint <= sqlc.arg(bound_limit)::bigint));

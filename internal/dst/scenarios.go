@@ -784,10 +784,20 @@ func scenarioRecoveryAuthorityIsS3(s *Sim) error {
 		return fmt.Errorf("flush: %w", err)
 	}
 
-	// PostgreSQL holds a WRONG informative watermark.
+	// PostgreSQL holds a WRONG informative watermark. Wrong, not disordered: the
+	// claim under test is that recovery ignores what PG says about durability, and
+	// local_sequence has to lead durable_sequence for the row to satisfy INV-03 —
+	// a volume whose local WAL had reached 999 and whose durable point PG believes
+	// is 999 too. A triple no writer could ever have produced would prove nothing
+	// about a writer.
 	md := metasim.New(s.Clock.Wall)
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(vol), State: lifecycle.VolumeActive, DurableSequence: 999, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: format.UUIDString(vol), State: lifecycle.VolumeActive,
+		LocalSequence: 999, DurableSequence: 999, DEKWrapped: []byte{1}, KEKID: "k",
+	}, nil); err != nil {
+		return fmt.Errorf("seed the wrong watermark: %w", err)
+	}
 
 	// Recovery derives the durable point from S3, ignoring PG's 999.
 	durable, err := recovery.DurablePoint(ctx, s.Store, vol, 1)

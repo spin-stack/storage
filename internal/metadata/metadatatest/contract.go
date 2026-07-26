@@ -79,7 +79,8 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
 		{"CapacityIsDerivedAndTheBoundIsAPredicateOfTheWrite", capacity},
-		{"OperationsAreListableByHost", operationsByHost},
+		{"LiveOperationsAreListableByHost", liveOperationsByHost},
+		{"AHostHoldsOnlyOneLiveDrain", oneLiveDrainPerHost},
 		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
 	for _, tc := range cases {
@@ -598,6 +599,38 @@ func watermarks(t *testing.T, s metadata.Store) {
 		v, _ := s.GetVolume(ctx, w.vol)
 		if v.LocalSequence != 400 || v.DurableSequence != 300 || v.PublishedSequence != 200 {
 			t.Fatalf("forward report did not land: %+v", v)
+		}
+	})
+
+	// The reporting path has always refused disorder; the *creating* path did not,
+	// so INV-03 could be violated at birth by rebuild-metadata or by a test fixture
+	// and no later report would ever repair it (each watermark only moves forward).
+	// Postgres now refuses such a row outright; this is the same refusal one layer
+	// up, so both stores answer with the same sentinel instead of one of them
+	// answering with a constraint violation.
+	t.Run("a create with out-of-order watermarks is rejected", func(t *testing.T) {
+		tests := []struct {
+			name                      string
+			local, durable, published int64
+		}{
+			{"durable above local", 10, 20, 5},
+			{"published above durable", 30, 9, 20},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				vol := id()
+				err := s.CreateVolume(ctx, w.term, metadata.Volume{
+					VolumeID: vol, SizeBytes: 1 << 20, BlockSize: 65536,
+					State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
+					LocalSequence: tc.local, DurableSequence: tc.durable, PublishedSequence: tc.published,
+				}, nil)
+				if !errors.Is(err, metadata.ErrWatermarkOrder) {
+					t.Fatalf("want ErrWatermarkOrder, got %v", err)
+				}
+				if _, err := s.GetVolume(ctx, vol); !errors.Is(err, metadata.ErrNotFound) {
+					t.Fatalf("the refused volume was created anyway: %v", err)
+				}
+			})
 		}
 	})
 }
@@ -1125,15 +1158,20 @@ func plan(volumeID, toHost, stage string) []byte {
 		volumeID, stage, toHost)
 }
 
-// operationsByHost: an operation id is the only handle GetOperation offers, and the
-// question a reconciler has to answer before it starts work on a host — "is anything
-// already happening here?" — arrives with a *different* id every time. The listing is
-// what a second drain of one host is refused by, so its filter has to be exact: an
+// liveOperationsByHost: an operation id is the only handle GetOperation offers, and
+// the question a reconciler has to answer before it starts work on a host — "is
+// anything already happening here?" — arrives with a *different* id every time. The
+// listing is what answers it, so its filter has to be exact in both directions: an
 // operation belonging to another host, or to no host at all, must never be counted
-// as work in progress here.
-func operationsByHost(t *testing.T, s metadata.Store) {
+// as work in progress here, and neither must one that has finished.
+//
+// Terminal operations are excluded by the listing itself rather than by the caller.
+// The set of operations a host has ever had only grows — nothing deletes them — so a
+// listing that returned all of them would make the check that runs before every
+// drain pass get slower for the rest of the cluster's life.
+func liveOperationsByHost(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
-	w := newWorld(t, s) // records one drain operation for w.host
+	w := newWorld(t, s) // records one live drain operation for w.host
 
 	other := id()
 	if err := s.UpsertHost(ctx, w.term, metadata.Host{
@@ -1141,42 +1179,59 @@ func operationsByHost(t *testing.T, s metadata.Store) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// A second operation on the same host, one on another host, and one recorded
-	// with no host at all (a cancellation that arrived before the drain started).
-	mine := id()
+	// A second live operation on the same host, one on another host, one recorded
+	// with no host at all (a cancellation that arrived before the drain started),
+	// and one that has finished. Only the first is work in progress here.
+	//
+	// The second one is an attach rather than a drain because a host may hold only
+	// one live drain (that is the rule the drain exclusion used to enforce in Go);
+	// what this case is about is the host filter, not the kind.
+	mine, done := id(), id()
 	for _, op := range []metadata.Operation{
-		{OperationID: mine, Kind: lifecycle.OpDrain, HostID: w.host, Phase: lifecycle.OpRunning},
+		{OperationID: mine, Kind: lifecycle.OpAttach, HostID: w.host, Phase: lifecycle.OpRunning},
 		{OperationID: id(), Kind: lifecycle.OpDrain, HostID: other, Phase: lifecycle.OpPending},
 		{OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpCanceling},
+		{OperationID: done, Kind: lifecycle.OpAttach, HostID: w.host, Phase: lifecycle.OpPending},
 	} {
 		op.DesiredState, op.CurrentState = []byte(`{}`), []byte(`{}`)
 		if _, err := s.RecordOperation(ctx, w.term, op); err != nil {
 			t.Fatal(err)
 		}
 	}
+	for _, phase := range []lifecycle.OperationPhase{lifecycle.OpRunning, lifecycle.OpSucceeded} {
+		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: done, Kind: lifecycle.OpAttach, HostID: w.host, Phase: phase,
+			DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	ops, err := s.ListOperationsByHost(ctx, w.host)
+	ops, err := s.ListLiveOperationsByHost(ctx, w.host)
 	if err != nil {
-		t.Fatalf("ListOperationsByHost: %v", err)
+		t.Fatalf("ListLiveOperationsByHost: %v", err)
 	}
 	got := make([]string, 0, len(ops))
 	for _, op := range ops {
 		if op.HostID != w.host {
 			t.Fatalf("operation %s belongs to host %q", op.OperationID, op.HostID)
 		}
+		if op.Phase.Terminal() {
+			t.Fatalf("operation %s is %s and is not live work", op.OperationID, op.Phase)
+		}
 		got = append(got, op.OperationID)
 	}
 	want := []string{w.op, mine}
 	sort.Strings(want) // the listing is ordered by operation id (INV-02)
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("operations for the host = %v, want %v", got, want)
+		t.Fatalf("live operations for the host = %v, want %v", got, want)
 	}
-	if ops[0].Kind != lifecycle.OpDrain || ops[0].Phase == "" {
+	if ops[0].Kind == "" || ops[0].Phase == "" {
 		t.Fatalf("the listing must round-trip kind and phase: %+v", ops[0])
 	}
 
 	t.Run("a host with no operations lists none", func(t *testing.T) {
-		ops, err := s.ListOperationsByHost(ctx, id())
+		ops, err := s.ListLiveOperationsByHost(ctx, id())
 		if err != nil || len(ops) != 0 {
 			t.Fatalf("unknown host: %d operations, err=%v", len(ops), err)
 		}
@@ -1185,8 +1240,78 @@ func operationsByHost(t *testing.T, s metadata.Store) {
 	t.Run("an empty host id is rejected", func(t *testing.T) {
 		// Not "every operation nobody attached to a host": that set is exactly the
 		// one a caller of this must never be handed.
-		if _, err := s.ListOperationsByHost(ctx, ""); !errors.Is(err, metadata.ErrInvalidID) {
+		if _, err := s.ListLiveOperationsByHost(ctx, ""); !errors.Is(err, metadata.ErrInvalidID) {
 			t.Fatalf("empty host id: want ErrInvalidID, got %v", err)
+		}
+	})
+}
+
+// oneLiveDrainPerHost: two evacuations of one host are not two halves of the same
+// work. Each captures its own plan and promotes the same volumes, and whichever
+// loses a race is left holding a destination reservation nobody will release —
+// releasing it is the losing operation's own next step, and that step now fails for
+// ever (§28.2, ADR-0017). The volumes are safe either way, since the promotion
+// protocol serializes them; the accounting is not, and a host placement believes is
+// full is a host that stays empty.
+//
+// The Control Plane checks this before it writes, but a check followed by a write is
+// not exclusion: two goroutines inside one leader can both pass it. So the store
+// itself refuses the second one, with a sentinel the caller can act on rather than
+// an integrity error it can only log.
+func oneLiveDrainPerHost(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s) // records one live drain for w.host
+
+	second := metadata.Operation{
+		OperationID: id(), Kind: lifecycle.OpDrain, HostID: w.host, Phase: lifecycle.OpPending,
+		DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+	}
+	if _, err := s.RecordOperation(ctx, w.term, second); !errors.Is(err, metadata.ErrDrainInProgress) {
+		t.Fatalf("a second live drain: want ErrDrainInProgress, got %v", err)
+	}
+	if _, err := s.GetOperation(ctx, second.OperationID); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("the refused drain was recorded anyway: %v", err)
+	}
+
+	// The rule is about live *drains* of *this* host, and nothing wider.
+	other := id()
+	if err := s.UpsertHost(ctx, w.term, metadata.Host{
+		HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	allowed := []struct {
+		name string
+		op   metadata.Operation
+	}{
+		{"another kind on the same host", metadata.Operation{
+			OperationID: id(), Kind: lifecycle.OpAttach, HostID: w.host, Phase: lifecycle.OpPending}},
+		{"a drain of another host", metadata.Operation{
+			OperationID: id(), Kind: lifecycle.OpDrain, HostID: other, Phase: lifecycle.OpPending}},
+		{"a drain attached to no host", metadata.Operation{
+			OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending}},
+	}
+	for _, tc := range allowed {
+		t.Run(tc.name, func(t *testing.T) {
+			op := tc.op
+			op.DesiredState, op.CurrentState = []byte(`{}`), []byte(`{}`)
+			if _, err := s.RecordOperation(ctx, w.term, op); err != nil {
+				t.Fatalf("must be allowed: %v", err)
+			}
+		})
+	}
+
+	t.Run("the host is drainable again once the owning operation finishes", func(t *testing.T) {
+		for _, phase := range []lifecycle.OperationPhase{lifecycle.OpRunning, lifecycle.OpSucceeded} {
+			if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+				OperationID: w.op, Kind: lifecycle.OpDrain, HostID: w.host, Phase: phase,
+				DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+			}, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.RecordOperation(ctx, w.term, second); err != nil {
+			t.Fatalf("a finished drain must not block the next one: %v", err)
 		}
 	})
 }

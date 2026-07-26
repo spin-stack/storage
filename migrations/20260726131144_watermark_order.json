@@ -1,0 +1,26 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-07-26T10:11:44-03:00",
+  "source_fingerprint": {
+    "hash": "2eda18c72f48ac202d60c0c04d97bc7ae3f01232be1de51bc2fdecd641999ee2"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE volumes\nADD CONSTRAINT volumes_watermarks_ordered CHECK (published_sequence <= durable_sequence AND durable_sequence <= local_sequence) NOT VALID;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.volumes.volumes_watermarks_ordered"
+        },
+        {
+          "sql": "ALTER TABLE volumes VALIDATE CONSTRAINT volumes_watermarks_ordered;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.volumes.volumes_watermarks_ordered"
+        }
+      ]
+    }
+  ]
+}

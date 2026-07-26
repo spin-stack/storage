@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -60,12 +61,41 @@ var (
 	// waits is the durable ACK, for at most one lease_ttl + max_clock_skew per volume
 	// moved. A caller that reads this should retry, not conclude the host is gone.
 	ErrRenewalsBlocked = errors.New("metadata: host lease renewals are blocked by a revocation window")
+	// ErrDrainInProgress means the host already has a live drain operation and this
+	// one was not recorded (§28.1). Two evacuations of one host each capture their
+	// own plan and promote the same volumes; whichever loses a race is left holding
+	// a destination reservation nobody will release, because releasing it is the
+	// losing operation's own next step and that step now fails for ever (§28.2).
+	//
+	// The Control Plane refuses this before it writes, and that check is where the
+	// useful message comes from — it names the operation that owns the host. This
+	// sentinel is the store closing the window the check leaves: a read followed by
+	// a write is not exclusion, and two goroutines inside one leader can both pass
+	// it. A caller that sees it should reconcile the drain that already exists, not
+	// retry its own.
+	ErrDrainInProgress = errors.New("metadata: the host already has a live drain operation")
 	// ErrHostNotServing means the operation needs a host the fleet still considers a
 	// writer, and this one is DEAD (§28.1). Marking a host dead is the Control Plane
 	// asserting that its writer is gone; handing it a fresh lease afterwards
 	// contradicts that assertion.
 	ErrHostNotServing = errors.New("metadata: host is not serving")
 )
+
+// CheckWatermarkOrder returns ErrWatermarkOrder unless published ≤ durable ≤ local
+// (INV-03, §5.6). It is the Go half of the CHECK constraint the volumes table
+// carries: every store validates the triple before writing it, so the two
+// implementations refuse the same input with the same sentinel instead of one of
+// them surfacing an integrity error the caller cannot classify.
+//
+// Only the writes that *set* the triple need it. The ones that advance it take a
+// component-wise maximum, and the max of two ordered triples is ordered.
+func CheckWatermarkOrder(local, durable, published int64) error {
+	if published > durable || durable > local {
+		return fmt.Errorf("%w: published=%d durable=%d local=%d",
+			ErrWatermarkOrder, published, durable, local)
+	}
+	return nil
+}
 
 // The lifecycle vocabularies (host/volume/snapshot/operation states, §7/§19/§28.1)
 // live in internal/lifecycle: they are typed, so a state from the wrong vocabulary
@@ -371,15 +401,26 @@ type Store interface {
 
 	// RecordOperation records an admin operation idempotently (term-guarded, §7/§18);
 	// recorded is false if the operation_id already existed (a duplicate request).
+	//
+	// A drain of a host that already has a live one is ErrDrainInProgress and is not
+	// recorded (§28.1): two evacuations of one host strand a reservation nobody will
+	// release. The refusal is the store's, so a Control Plane that checked first and
+	// then wrote — which is not exclusion — cannot end up with two.
 	RecordOperation(ctx context.Context, term int64, op Operation) (recorded bool, err error)
 	// GetOperation returns a recorded operation.
 	GetOperation(ctx context.Context, operationID string) (Operation, error)
-	// ListOperationsByHost returns every operation recorded against hostID, ordered
-	// by operation id (deterministic, INV-02). It is how a reconciler asks what is
-	// already happening to a host before starting something else: an operation id is
-	// the only handle GetOperation offers, and a second drain arrives with a new one
-	// (§7, §28.1).
-	ListOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
+	// ListLiveOperationsByHost returns the operations still under way on hostID —
+	// every phase but the terminal ones — ordered by operation id (deterministic,
+	// INV-02). It is how a reconciler asks what is already happening to a host
+	// before starting something else: an operation id is the only handle
+	// GetOperation offers, and a second drain arrives with a new one (§7, §28.1).
+	//
+	// Finished operations are excluded by the store, not by the caller. Nothing
+	// deletes them, so the set of operations a host has ever had only grows, and a
+	// listing that carried the history would make the question that runs before
+	// every drain pass more expensive for the rest of the cluster's life. A caller
+	// that wants a specific past operation has its id and GetOperation.
+	ListLiveOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
 	// UpdateOperation stores an operation's phase, current state, and error — the
 	// visible progress of a long-running reconciled operation (§7, §28.1). It is
 	// term-guarded, and the phase move is guarded by the lifecycle table, so a

@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/spin-stack/storage/internal/db"
@@ -158,6 +159,33 @@ func (s *Store) boundRefused(ctx context.Context, b *metadata.CapacityBound) err
 			metadata.ErrCapacityExceeded, b.HostID, after, b.Limit)
 	}
 	return nil
+}
+
+// oneLiveDrainPerHostIndex is the unique partial index that makes "one live drain
+// per host" a property of the database rather than of whoever remembered to check
+// (§28.1, schema.sql). Its name is matched rather than the SQLSTATE alone: 23505 on
+// this table also means a duplicate operation_id, which is idempotency and not an
+// error at all.
+const oneLiveDrainPerHostIndex = "operations_one_live_drain_per_host_idx"
+
+// uniqueViolation is SQLSTATE 23505, spelled out rather than pulled in as a
+// dependency for one constant.
+const uniqueViolation = "23505"
+
+// drainInProgress turns that index's violation into a sentinel the caller can act
+// on. Without it the loser of the race is handed a driver error carrying an index
+// name, which no caller can branch on and every caller would log as "unknown".
+//
+// Only the insert path needs it: a row joins the live set when it is created or by
+// leaving the terminal set, and no phase transition leaves it (SUCCEEDED and
+// CANCELED have no successors), so an update cannot create a second live drain.
+func drainInProgress(err error, hostID string) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != uniqueViolation ||
+		pgErr.ConstraintName != oneLiveDrainPerHostIndex {
+		return nil
+	}
+	return fmt.Errorf("%w: host %s", metadata.ErrDrainInProgress, hostID)
 }
 
 func notFound(err error) error {
@@ -414,6 +442,11 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
+	// INV-03 before the insert, so a disordered triple is ErrWatermarkOrder rather
+	// than the volumes_watermarks_ordered constraint arriving as an opaque 23514.
+	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
+		return err
+	}
 	boundHost, addBytes, limit, err := boundParams(bound)
 	if err != nil {
 		return err
@@ -527,9 +560,8 @@ func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID strin
 	if err != nil {
 		return err
 	}
-	if published > durable || durable > local {
-		return fmt.Errorf("%w: published=%d durable=%d local=%d",
-			metadata.ErrWatermarkOrder, published, durable, local)
+	if err := metadata.CheckWatermarkOrder(local, durable, published); err != nil {
+		return err
 	}
 	// The query itself is monotonic (GREATEST), so a late report is ignored rather
 	// than rejected — see volumes.sql.
@@ -702,6 +734,9 @@ func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Ope
 		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase.String(),
 		Term: term,
 	})
+	if derr := drainInProgress(err, op.HostID); derr != nil {
+		return false, derr
+	}
 	// This query affects 0 rows for two very different reasons: the request is a
 	// duplicate (§18 idempotency — recorded=false, no error) or the caller is not
 	// the leader (§7 — ErrStaleTerm). Reporting the second as the first is what lets
@@ -761,12 +796,12 @@ func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.
 	return operationFromRow(op)
 }
 
-func (s *Store) ListOperationsByHost(ctx context.Context, hostID string) ([]metadata.Operation, error) {
+func (s *Store) ListLiveOperationsByHost(ctx context.Context, hostID string) ([]metadata.Operation, error) {
 	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.q.ListOperationsByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
+	rows, err := s.q.ListLiveOperationsByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
 	if err != nil {
 		return nil, err
 	}

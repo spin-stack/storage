@@ -393,16 +393,19 @@ func (d *Drainer) operation(ctx context.Context, hostID, operationID string) (pl
 // will resume it; an operator who really wants a different operation id cancels the
 // first one. A drain never blocks itself, so its own later passes are unaffected.
 //
-// This is a read followed by a write rather than a database constraint. The
-// alternative — a unique partial index over live drain operations per host — would
-// make it atomic, but it puts "live" in a migration instead of in the lifecycle
-// table, and it surfaces as a constraint violation through an INSERT whose ON
-// CONFLICT clause already belongs to operation_id, which the caller cannot tell from
-// any other integrity error. The Control Plane is single-active and every write here
-// is term-guarded, so the window this leaves is two goroutines inside one leader,
-// not two leaders; if that ever becomes real, the index is the answer.
+// This is a read followed by a write, which is not exclusion: two goroutines inside
+// one leader can both pass it. The store closes that window — a unique partial index
+// over the live drains of a host, surfaced as metadata.ErrDrainInProgress — so this
+// check is no longer what makes the rule true. It stays because it is what makes the
+// refusal *useful*: it names the operation that owns the host and the phase it is
+// in, which is the difference between an operator reconciling the drain that already
+// exists and an operator retrying a new id for ever.
+//
+// The two definitions of "live" are kept honest by a test that evaluates the index
+// predicate against every value of the lifecycle vocabulary
+// (TestPGLivePhaseSetsAgreeWithTheLifecycle).
 func (d *Drainer) exclusive(ctx context.Context, hostID, operationID string) error {
-	ops, err := d.md.ListOperationsByHost(ctx, hostID)
+	ops, err := d.md.ListLiveOperationsByHost(ctx, hostID)
 	if err != nil {
 		return err
 	}

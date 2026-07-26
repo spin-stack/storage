@@ -14,3 +14,18 @@ sql:
         overrides:
           - db_type: "uuid"
             go_type: "github.com/google/uuid.UUID"
+          # The uuidv7 domain (INV-22 as a type, internal/schema/schema.sql). sqlc
+          # does not follow a domain to its base type, so without these every
+          # identity column is generated as interface{} — the invariant would cost
+          # the Go side its types. Two entries because sqlc picks the override by
+          # nullability as well as by name: the second is what keeps the nullable
+          # active_root_id / published_root_id as pgtype.UUID.
+          #
+          # With them, the generated output is byte-for-byte what plain `uuid`
+          # produced, which is the whole bargain: the rule moves into the database
+          # and nothing above it changes.
+          - db_type: "uuidv7"
+            go_type: "github.com/google/uuid.UUID"
+          - db_type: "uuidv7"
+            nullable: true
+            go_type: "github.com/jackc/pgx/v5/pgtype.UUID"

@@ -324,6 +324,11 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, b
 	if !v.Durability.Valid() {
 		return fmt.Errorf("%w: durability %q", lifecycle.ErrUnknownState, v.Durability)
 	}
+	// INV-03 at birth: a row created out of order can never be repaired, because
+	// every later report only moves each watermark forward.
+	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
@@ -413,9 +418,8 @@ func (s *Store) UpdateWatermarks(_ context.Context, term int64, volumeID string,
 	if err := requireID("volume", volumeID); err != nil {
 		return err
 	}
-	if published > durable || durable > local {
-		return fmt.Errorf("%w: published=%d durable=%d local=%d",
-			metadata.ErrWatermarkOrder, published, durable, local)
+	if err := metadata.CheckWatermarkOrder(local, durable, published); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -569,6 +573,17 @@ func (s *Store) RecordOperation(_ context.Context, term int64, op metadata.Opera
 	if _, exists := s.ops[op.OperationID]; exists {
 		return false, nil // duplicate request (§18)
 	}
+	// One live drain per host (§28.1). In Postgres this is a unique partial index;
+	// here it is the same rule stated in Go, because a property proven against this
+	// store is only a proof about production if both refuse the same writes.
+	if op.Kind == lifecycle.OpDrain && op.HostID != "" && !op.Phase.Terminal() {
+		for _, cur := range s.ops {
+			if cur.Kind == lifecycle.OpDrain && cur.HostID == op.HostID && !cur.Phase.Terminal() {
+				return false, fmt.Errorf("%w: host %s is already being drained by operation %s",
+					metadata.ErrDrainInProgress, op.HostID, cur.OperationID)
+			}
+		}
+	}
 	s.ops[op.OperationID] = op
 	return true, nil
 }
@@ -602,7 +617,7 @@ func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Opera
 	return nil
 }
 
-func (s *Store) ListOperationsByHost(_ context.Context, hostID string) ([]metadata.Operation, error) {
+func (s *Store) ListLiveOperationsByHost(_ context.Context, hostID string) ([]metadata.Operation, error) {
 	// An empty id would match every operation recorded with no host at all, which is
 	// the opposite of what any caller of this means (in Postgres host_id is NULL for
 	// those, and NULL matches nothing).
@@ -613,7 +628,9 @@ func (s *Store) ListOperationsByHost(_ context.Context, hostID string) ([]metada
 	defer s.mu.Unlock()
 	var ops []metadata.Operation
 	for _, op := range s.ops {
-		if op.HostID == hostID {
+		// Live only, as in Postgres: a finished operation is history, and the
+		// question this answers is what is happening now (§28.1).
+		if op.HostID == hostID && !op.Phase.Terminal() {
 			ops = append(ops, op)
 		}
 	}
