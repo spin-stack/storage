@@ -4,6 +4,11 @@
 // sequence and publishing an immutable manifest — happens in the background. Once
 // PUBLISHED a snapshot never changes (§5.2, INV-16): the manifest is create-only and
 // the WAL objects it references are append-only.
+//
+// Publishing is also exclusive: a manifest names the WAL objects of one epoch, and that
+// epoch belongs to the host it was *granted* to, not to every host that happens to hold
+// the same epoch number (§12.4). Create gates on that with recovery.VerifyPublisher, so
+// a Snapshotter has to say which host it speaks for — see HeldBy.
 package snapshot
 
 import (
@@ -81,25 +86,62 @@ func Read(ctx context.Context, store objectstore.Store, volumeID, snapshotID str
 	return m, nil
 }
 
-// Snapshotter creates snapshots against an object store.
+// Snapshotter creates snapshots against an object store, on behalf of one host.
 type Snapshotter struct {
 	store objectstore.Store
 	clk   clock.Clock
+	// hostID is the host this snapshotter publishes for, checked against the epoch's
+	// holder. Empty means "would not say", which cannot be reconciled with any grant
+	// and is refused for every epoch that has one.
+	hostID string
 }
 
-// NewSnapshotter returns a Snapshotter.
+// NewSnapshotter returns a Snapshotter that does not name the host it publishes for.
+// It can only snapshot an epoch nobody was granted, or a volume with no epoch object at
+// all (§12.4, §22.5) — see recovery.VerifyPublisher. Anything that snapshots a live
+// volume knows which host it is: use HeldBy.
 func NewSnapshotter(store objectstore.Store, clk clock.Clock) *Snapshotter {
 	return &Snapshotter{store: store, clk: clk}
+}
+
+// HeldBy returns a Snapshotter that publishes as hostID, which the epoch object must
+// name as the holder of the epoch being snapshotted. The receiver is left alone, so a
+// single Snapshotter can be scoped per volume without sharing mutable state.
+func (s *Snapshotter) HeldBy(hostID string) *Snapshotter {
+	scoped := *s
+	scoped.hostID = hostID
+	return &scoped
 }
 
 // Create takes a crash-consistent snapshot of log's volume at its current sequence.
 // It returns the published manifest and the guest-perceived pause (the O(1) capture),
 // which must be ≈ 0. Writes with sequence > TargetSequence are not in the snapshot.
+//
+// The epoch is verified once, before the publish, and deliberately not again after it.
+// That is the difference from checkpoint.Create, where the second read is load-bearing:
+// there the publish is followed by AdvancePublished, the step that authorises discarding
+// the last local copy of the data (INV-13, §21.1), so a writer fenced mid-flight still
+// has something left to refuse. Here Publish is the last thing Create does, and what it
+// writes is create-only and immutable (INV-16). A second read could observe a fence and
+// report it, but it could not unwrite the manifest or take back its status as a GC root
+// (§21.3, ADR-0012) — it would only turn a completed publication into an error, which is
+// worse than the truthful "this manifest exists". The gate has to be the pre-check.
+//
+// A snapshot never moves published and never authorises a truncation, which is why it
+// read as the harmless publication and was left out of the wave-3 sweep. The damage is
+// of a different shape: a host the epoch was never granted to publishes an immutable
+// manifest naming another host's WAL objects, pinning its own view of that epoch
+// forever, and every clone taken from it rebuilds a state the live volume never had.
 func (s *Snapshotter) Create(ctx context.Context, log *wal.Log, volumeID [16]byte, epoch uint64, snapshotID, parentID string) (Manifest, time.Duration, error) {
 	// The pause: capture the sequence atomically. No I/O, no clock advance.
 	pauseStart := s.clk.Now()
 	target := log.Watermarks().Local
 	pause := s.clk.Now().Sub(pauseStart)
+
+	vid := format.UUIDString(volumeID)
+	if err := recovery.VerifyPublisher(ctx, s.store, vid, epoch, s.hostID); err != nil {
+		return Manifest{}, pause, fmt.Errorf("snapshot: %s may not snapshot epoch %d: %w", vid, epoch, err)
+	}
 
 	// Sealing (background class): make the captured prefix durable, then build the
 	// manifest from the objects covering it.
@@ -112,7 +154,7 @@ func (s *Snapshotter) Create(ctx context.Context, log *wal.Log, volumeID [16]byt
 	}
 	m := Manifest{
 		SnapshotID:       snapshotID,
-		VolumeID:         format.UUIDString(volumeID),
+		VolumeID:         vid,
 		Epoch:            epoch,
 		TargetSequence:   target,
 		ParentSnapshotID: parentID,

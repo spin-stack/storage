@@ -5,10 +5,12 @@ package dst
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/spin-stack/storage/internal/descriptor"
+	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/gc"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/snapshot"
@@ -19,6 +21,7 @@ import (
 func gcScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "gc-keeps-a-superseded-epochs-snapshot", Run: scenarioGCKeepsSupersededEpochSnapshot},
+		{Name: "snapshot-publisher-must-hold-the-epoch", Run: scenarioSnapshotPublisherMustHoldTheEpoch},
 	}
 }
 
@@ -127,5 +130,102 @@ func scenarioGCKeepsSupersededEpochSnapshot(s *Sim) error {
 		return fmt.Errorf("the published manifest no longer matches its own contents: %+v", read)
 	}
 	s.Notef("a superseded epoch's published snapshot survived a sweep whose listing was behind")
+	return nil
+}
+
+// Hosts for the snapshot-holdership scenario. Both believe they are at epoch 1; the
+// object store granted it to exactly one of them.
+const (
+	snapHostHoldsEpoch1 = "00000000-0000-7000-8000-0000000000c8" // named by the epoch object
+	snapHostNamedInPG   = "00000000-0000-7000-8000-0000000000c9" // named by a stale volumes row
+)
+
+// scenarioSnapshotPublisherMustHoldTheEpoch runs the split a number-only fence cannot
+// see against the snapshot publisher: PostgreSQL and the epoch object name two
+// different hosts at the *same* epoch, because the two records of a promotion are
+// written by two steps of §12.3 and a promoter can die between them (§12.4).
+//
+// A snapshot looks like the safe publication — it never advances published and never
+// authorises a truncation — which is exactly why it was left out of wave 3. What it
+// does instead is worse to undo. The manifest is create-only and immutable (INV-16) and
+// it is a GC root (§21.3, ADR-0012): a fenced host that publishes one pins its own view
+// of another host's epoch permanently, names WAL objects it does not own, and hands
+// every clone taken from it a state the live volume never had. Nothing downstream can
+// tell that manifest from the real holder's.
+//
+// The scenario asserts both directions, because a gate that refuses everybody is not a
+// gate: the fenced host is refused and leaves nothing behind, and the host the epoch was
+// granted to publishes the very same snapshot from the very same log.
+func scenarioSnapshotPublisherMustHoldTheEpoch(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+	vol[15] = 0xc7
+	vid := format.UUIDString(vol)
+
+	es := epoch.NewStore(s.Store)
+	etag, err := es.Init(ctx, vid, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := es.Grant(ctx, vid, etag, 1, snapHostHoldsEpoch1); err != nil {
+		return fmt.Errorf("granting epoch 1: %w", err)
+	}
+
+	f, err := s.Disk.Create("wal/snapshot-holder.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 5), alwaysValidLease{})
+	for i := range 2 {
+		if _, err := l.Write(uint64(i)*4096, []byte("acked under epoch 1"), 0); err != nil {
+			return err
+		}
+		if err := l.Flush(ctx); err != nil {
+			return fmt.Errorf("flush %d: %w", i, err)
+		}
+	}
+
+	// The host a stale PostgreSQL row names snapshots the very same log at the very
+	// same epoch. Only the publisher's identity differs from the call below it, and
+	// only that may decide the outcome.
+	snapper := snapshot.NewSnapshotter(s.Store, s.Clock)
+	const fencedSnapID = "00000000-0000-7000-8000-0000000000ca"
+	_, _, err = snapper.HeldBy(snapHostNamedInPG).Create(ctx, l, vol, 1, fencedSnapID, "")
+	if !errors.Is(err, epoch.ErrNotHolder) {
+		return fmt.Errorf("a host the epoch was never granted to published a snapshot into it: %v", err)
+	}
+	s.Emit(Event{Kind: EventSnapshot, Msg: "fenced host refused a manifest in epoch 1"})
+	left, err := s.Store.List(ctx, "snapshots/")
+	if err != nil {
+		return err
+	}
+	if len(left) != 0 {
+		return fmt.Errorf("a refused snapshot left %d manifest(s) behind: %v — a manifest is "+
+			"immutable (INV-16) and a GC root (§21.3), so there is no taking it back", len(left), left)
+	}
+
+	// The epoch's holder publishes its own snapshot from the same log.
+	const heldSnapID = "00000000-0000-7000-8000-0000000000cb"
+	m, _, err := snapper.HeldBy(snapHostHoldsEpoch1).Create(ctx, l, vol, 1, heldSnapID, "")
+	if err != nil {
+		return fmt.Errorf("the epoch's holder could not publish its own snapshot: %w", err)
+	}
+	if len(m.Objects) == 0 || m.TargetSequence < 2 {
+		return fmt.Errorf("the holder's snapshot does not anchor the ACKed objects: %+v", m)
+	}
+	read, err := snapshot.Read(ctx, s.Store, vid, heldSnapID)
+	if err != nil {
+		return err
+	}
+	if !read.DigestMatches() {
+		return fmt.Errorf("the published manifest does not match its own contents: %+v", read)
+	}
+	if _, err := snapshot.Read(ctx, s.Store, vid, fencedSnapID); err == nil {
+		return fmt.Errorf("the fenced host's manifest %s is readable: it was published after all", fencedSnapID)
+	}
+	s.Notef("only the host epoch 1 was granted to could publish a manifest into it")
 	return nil
 }
