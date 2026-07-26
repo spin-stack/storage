@@ -46,6 +46,7 @@ var (
 	errStaleWriterPublished    = errors.New("planted: a fenced writer verified its own epoch")
 	errPromotedOverLiveLease   = errors.New("planted: an epoch was granted while the fenced writer's lease was still valid")
 	errTruncatedAbovePublished = errors.New("planted: local WAL was reclaimed above the verified published point")
+	errPublishedAheadOfDurable = errors.New("planted: a record no object store holds was reclaimed as published")
 )
 
 // plantedBug runs sc and requires checker to reject it, naming itself and printing the
@@ -219,6 +220,93 @@ func TestPlantedBugWatermarkOrder(t *testing.T) {
 		s.Emit(Event{Kind: EventWatermark, Published: 9, Durable: 3, Local: 5})
 		return nil
 	})
+}
+
+// publishedAheadOfDurable is INV-03 where it costs something. A log holds three
+// records and has ACKed two of them: local=3, durable=2, published=0. Advancing
+// published to 3 claims that a verified checkpoint covers a record the object store
+// has never seen — and INV-13, still strict, then *correctly* allows the local copy of
+// that record to be reclaimed, because published is exactly what INV-13 trusts. The
+// record exists nowhere afterwards.
+//
+// The move is the real one a checkpointer makes (Log.AdvancePublished, §21.1 step 2)
+// and the trio is the log's own. relax substitutes the ordering policy behind that one
+// move and leaves the other two rules strict, so what the checker sees is one rule
+// missing rather than a Log with no rules at all.
+func publishedAheadOfDurable(relax bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		var vol [16]byte
+		vol[6], vol[8] = 0x70, 0x80
+		vol[15] = 0xd2
+
+		f, err := s.Disk.Create("wal/active.wal")
+		if err != nil {
+			return err
+		}
+		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l.EnableRemote(
+			wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+			wal.NewUploader(s.Store, 5),
+			alwaysValidLease{},
+		)
+		for i, payload := range []string{"acked", "acked-too", "never-uploaded"} {
+			if _, err := l.Write(uint64(i)*8, []byte(payload), 0); err != nil {
+				return err
+			}
+			if i == 1 {
+				if err := l.Flush(ctx); err != nil {
+					return fmt.Errorf("flush: %w", err)
+				}
+			}
+		}
+		emitWatermarks(s, l)
+		w := l.Watermarks()
+		if w.Local != 3 || w.Durable != 2 {
+			return fmt.Errorf("setup: local=%d durable=%d, want 3 and 2", w.Local, w.Durable)
+		}
+
+		if relax {
+			s.Emit(Event{Kind: EventFault, Msg: "the published watermark stopped being checked against durable"})
+		}
+		// What a checkpoint's second step does, for a checkpoint that covers a record
+		// S3 does not hold.
+		switch err := l.AdvancePublished(w.Local); {
+		case relax && err != nil:
+			return fmt.Errorf("the relaxed policy still refused the move: %w", err)
+		case !relax && !errors.Is(err, wal.ErrWatermarkOrder):
+			return fmt.Errorf("publishing above durable: want ErrWatermarkOrder, got %v", err)
+		}
+		emitWatermarks(s, l)
+		if !relax {
+			return nil
+		}
+
+		// INV-13 is untouched and does its job against a number that is now a lie: the
+		// only copy of record 3 is reclaimed.
+		if err := l.TruncateLocal(l.Watermarks().Published); err != nil {
+			return fmt.Errorf("truncate to the published point: %w", err)
+		}
+		size, err := f.Size()
+		if err != nil {
+			return err
+		}
+		if size != 0 {
+			return fmt.Errorf("the WAL still holds %d bytes; the plant did not reach the file", size)
+		}
+		return errPublishedAheadOfDurable
+	}
+}
+
+// INV-03: published <= durable <= local at every observation.
+//
+// FAILS: the ordering rules are three comparisons over numbers held in memory and the
+// Log applies them itself, so the trio it reports is ordered by construction whatever
+// the disk and the object store do. Driving the real move only produces the error the
+// Log is supposed to return.
+func TestPlantedBugPublishedAheadOfDurable(t *testing.T) {
+	requirePasses(t, 20, NewWatermarkOrderChecker(), publishedAheadOfDurable(false))
+	plantedBug(t, 20, NewWatermarkOrderChecker(), "watermark-order", publishedAheadOfDurable(true))
 }
 
 // Ids for the fencing-wait plant, kept apart from the mandatory scenario's so the two
