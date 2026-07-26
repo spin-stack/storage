@@ -13,6 +13,24 @@
 - **Addresses:** TEST-GAPS finding "A GC sweep cannot see an anchor its listing has
   not caught up to".
 
+## Amendment, 2026-07-26 (accepted)
+
+The deferred half of this ADR asked when to revisit. The answer is not a date: **Phase
+12 is born with a per-volume index readable by deterministic key**, rather than
+retrofitting one afterwards.
+
+Two decisions converge on the same object. This ADR wants it so the sweep can find an
+anchor without depending on a listing; ADR-0014 wants it so squash can know each
+segment's live fraction. Designing it twice — or bolting it onto a published on-S3
+format — is the kind of change this project treats as a human-review zone, so the
+segment format Phase 12 introduces carries it from the start.
+
+What that does *not* change: strongly consistent LIST stays a precondition of
+`recovery`, `descriptor.ListVolumeIDs` and `rebuild-metadata` (§3 below), and the
+reproduction that decided against a snapshot index for the *current* format still
+stands — a hole in the listing below a durable point loses ACKed data with no anchor
+involved at all.
+
 ## Context
 
 Reachability is computed from a LIST of the bucket. §21.1 publishes a snapshot's WAL

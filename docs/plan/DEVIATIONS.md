@@ -45,7 +45,11 @@ gate** (PLAN §2).
 - Severity: medium (feature completeness; the invariants they claim are narrower than
   documented)
 - Resolution: reopen the affected phases as integration work once the Agent/API spine
-  exists (REBASELINE.md, step 5–6). **Status: open.**
+  exists (REBASELINE.md, step 5–6). The spine's shape is now decided — **ADR-0018**:
+  Agent first, Connect RPC (`connectrpc/connect-go`) with the schema in `api/`, the
+  Agent pulls and the Control Plane never pushes, and "done" is one volume on one host
+  under a real QEMU guest over vhost-user-blk running write → FLUSH → verified object →
+  checkpoint → truncate. **Status: open (decided, not built).**
 
 ## Resolved
 

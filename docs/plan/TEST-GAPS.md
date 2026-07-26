@@ -106,19 +106,19 @@ full device. Each names what it is waiting on.
     `last_renewal` old enough that the wait looks over, and an epoch is granted over a
     live writer. The clock-offset check added in wave 2 cannot see it: both clocks
     agree, it is the *data* that is old.
-  - waiting on: a decision between reading leases from the primary explicitly (a
-    deployment guarantee the adapter would have to state and enforce) and a monotonic
-    dwell measured from when *this* promoter first observed the lease. The second is
-    the one that does not depend on how the database is deployed.
+  - **decided (ADR-0015, Accepted):** the wait becomes a monotonic dwell since the
+    promoter observed the lease, recorded durably with the §7 FENCING_WAIT state.
+    Waiting on implementation, not on a decision.
 
 - **A heartbeat will re-arm the lease a drain revokes** _(fencing-promotion, new)_
   - `RenewHostLease` deliberately accepts CORDONED and DRAINING, because both still
     serve what they hold. Nothing renews leases outside promotion today, so the drain's
     revoke works — but once the Agent heartbeat exists (DEV-0007), a source that keeps
     heartbeating re-arms the lease the drain just revoked and the wait never elapses.
-  - waiting on: an ADR in the lease/fencing zone. Either the CP refuses renewals for a
-    host it is draining (which flips a wave-2 contract test that exists on purpose), or
-    a host state means "fenced" distinctly from "cordoned".
+  - **decided (ADR-0016, Accepted):** a revocation window bounded to one volume's
+    promotion now; the ACK gate moves to per-volume epoch holdership once the Agent
+    exists. The granularity mismatch — a per-host lease fencing a per-volume move — is
+    the defect; stage 1 is deliberately throwaway.
 
 - **A GC sweep cannot see an anchor its listing has not caught up to** _(gc-objectstore)_
   - Narrowed, not closed, by ADR-0012: the epoch ceiling no longer licenses destruction,
@@ -126,9 +126,9 @@ full device. Each names what it is waiting on.
     marks ACKed data with no manifest involved at all — showed no index would have
     helped. Strongly consistent LIST stays a precondition, certified per backend by
     `TestListSeesAFreshPut` (§6.1, blocking).
-  - revisit when: compaction/objectization (Phase 12) makes a manifest the *sole* anchor
-    of the WAL objects a segment replaced. That is the point where there is a format
-    worth indexing.
+  - **decided (ADR-0012 amendment, Accepted):** Phase 12's segment format is born with a
+    per-volume index readable by deterministic key, rather than retrofitting one. The
+    same object ADR-0014's squash needs, designed once.
 
 ### Needs an increment owning files no package owned (3)
 
@@ -148,8 +148,9 @@ full device. Each names what it is waiting on.
     dies before its reservation and a stranger's change nets to exactly one volume size,
     the resumed compare-and-set fails, the re-read shows `before + delta`, and the pass
     concludes its own delta landed.
-  - waiting on: a reservation row keyed by `(operation_id, volume_id)` — a schema
-    decision, deliberately not taken by an implementer.
+  - **decided (ADR-0017, Accepted):** the ledger goes away. Committed bytes are derived
+    from the volumes a host holds plus the in-flight plans targeting it, so there is no
+    delta to apply twice and the crash tests become uninteresting by construction.
 
 - **Watermarks are not epoch-qualified at the store** _(metadata-cp)_
   - The monotonic floor covers the regression the original finding named, but a fenced
