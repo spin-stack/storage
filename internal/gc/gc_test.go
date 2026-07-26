@@ -99,3 +99,36 @@ func TestGCMarksAreReversible(t *testing.T) {
 		t.Fatalf("a marked object must still be retrievable, got %v", err)
 	}
 }
+
+// TestGCNeverMarksATermClaim: the Control Plane's term claims (ADR-0011) are the only
+// record of which terms have been issued, and they have to outlive the database they
+// were issued from. A sweep that collected them would restore the exact failure the
+// claim exists to prevent — a restored database re-issuing a term a live leader still
+// holds — with the added twist that it would look like a routine cost-control pass.
+func TestGCNeverMarksATermClaim(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+
+	claim := "control-plane/terms/00000000000000000042"
+	if _, err := store.Put(ctx, claim, []byte(`{"term":42,"holder_id":"cp-a"}`), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Old enough that the grace period protects nothing.
+	clk.Advance(72 * time.Hour)
+
+	reachable, err := gc.Reachable(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reachable[claim] {
+		t.Fatalf("the term claim %s is not a GC root", claim)
+	}
+	marked, err := gc.Mark(ctx, store, clk, reachable, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(marked, claim) {
+		t.Fatalf("the sweep marked a term claim: %v", marked)
+	}
+}
