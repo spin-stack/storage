@@ -4,8 +4,9 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
 work, then `REBASELINE.md` — a human review on 2026-07-25 found this file claiming
 more than the repository does, and the maturity model below is the correction.
 
-- **Date:** 2026-07-26 (waves 1–3 of the test-gap backlog merged; the design decisions
-  that were blocking the spine are taken)
+- **Date:** 2026-07-26 (wave 4 merged: the spine exists — `api/` over Connect, an Agent
+  that pulls — and the three decided Control-Plane fixes landed. 76 of the 78 audit
+  findings are closed; the two left wait on formats, not on effort.)
 - **Where the work is:** everything is on **`main`**, pushed to `origin`
   (`/home/aledbf/spin-storage.git`, a bare repo — the old bundle remote is gone).
 - **Gate on `main`:** `task ci:full` green — that is now the merge gate and it includes
@@ -103,21 +104,28 @@ Connect RPC in `api/`, Agent pulls).
 **DEV-0007 is the only open deviation**, and everything below either builds it or
 clears its path. The tracks are split so no two share a hot file.
 
-### Track A — Control Plane: land the decided fixes (one increment, one owner)
-ADR-0015 (dwell + durable `FENCING_WAIT`), ADR-0016 stage 1 (revocation window bounded
-to one promotion), ADR-0017 (derived capacity, deleting the ledger). They all touch
-`promotion.go`/`drain.go`/`schema.sql`/`db/queries`, so they are one increment, not
-three. Finishing it closes three of the seven open findings.
+### ~~Track A — Control Plane~~ **done** (wave 4)
+ADR-0015/0016/0017 landed. Two consequences to carry forward: a drain now costs one
+dwell **per volume** (ADR-0016's own bound; stage 2 removes it), and stage 1 needs the
+reconciler to poll faster than the revocation window or the drain retries without
+converging — it corrupts nothing, it just does not finish.
 
 ### Track B — the spine (ADR-0018), Agent first
-1. `api/`: protobuf + Connect (`connectrpc/connect-go`), `buf` in the pinned toolchain,
-   `generate`/`generate:check` twins like sqlc's.
-2. `cmd/volume-agent`: pull reconciliation + heartbeat. The heartbeat is what finally
-   writes `nvme_used_bytes`, which is the input every ADR-0013 threshold needs.
-3. The data path: vhost-user-blk against the published QEMU image, one volume on one
-   host, `guest write → WAL → FLUSH → verified object → checkpoint → TruncateLocal`.
-4. The integration lane for it, using the image the QEMU workflow publishes rather than
-   building QEMU per push.
+1. ~~`api/` + toolchain~~ **done**: protobuf served over Connect, `buf` pinned,
+   `generate:proto:check` in the gate.
+2. ~~`cmd/volume-agent` skeleton~~ **done**: pull reconciliation, heartbeat carrying
+   device total/used/backlog, epoch-qualified watermark reports, a lease armed only by
+   a successful heartbeat and anchored to the instant the request left.
+3. **Next — the data path**: vhost-user-blk against the published QEMU image, one
+   volume on one host, `guest write → WAL → FLUSH → verified object → checkpoint →
+   TruncateLocal`. Three small gaps block it and should land first:
+   - `internal/simio/disk` has no statfs, so the Agent estimates device usage instead of
+     reading it (`Usage() (Usage, error)`, `unix.Statfs` in real, budget in sim);
+   - `metadata.Host` has no field for the aggregate remote backlog, so `cpserver`
+     receives the number and drops it;
+   - `DesiredVolume` carries no key material, so the Agent cannot open a volume — and
+     the right shape is a separate key-fetch RPC, not keys in every state answer.
+4. The integration lane, using the image the QEMU workflow publishes.
 
 **That slice is the definition of done for "integrated"** — the first time any phase
 stops being a model.

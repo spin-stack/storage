@@ -49,7 +49,10 @@ gate** (PLAN §2).
   Agent first, Connect RPC (`connectrpc/connect-go`) with the schema in `api/`, the
   Agent pulls and the Control Plane never pushes, and "done" is one volume on one host
   under a real QEMU guest over vhost-user-blk running write → FLUSH → verified object →
-  checkpoint → truncate. **Status: open (decided, not built).**
+  checkpoint → truncate. **Status: open — partially built.** `api/` (Connect),
+  `internal/agent`, `internal/cpserver`, `cmd/volume-agent` and `cmd/control-plane`
+  exist and are exercised end to end over real HTTP; what is missing is the data path
+  (vhost-user-blk, a `wal.Log`-backed volume source) and the QEMU integration lane.
 
 ## Resolved
 

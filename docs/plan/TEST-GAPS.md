@@ -11,7 +11,7 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files, then wave 3 (G1–G5). **Six entries are
+own worktree over a disjoint set of files, then wave 3 (G1–G5). **Two entries are
 still open**, and every one of them is listed below with what it is waiting on.
 Findings that turned out to be already covered are recorded as such rather than
 counted as work; two of the open entries are new, found by the harness while proving
@@ -93,33 +93,20 @@ that a checker could catch a real bug.
 | The WAL classified a full device by matching an error message, because the disk interface declared no sentinel | `58f398b` |
 | `internal/snapshot` published a create-only manifest without consulting the epoch object, so a fenced host could snapshot into an epoch granted to somebody else — the last ungated publisher | `5e88ebc` |
 
+## Closed — wave 4 (the decided ADRs)
+
+| Finding | Commit |
+|---|---|
+| A lease read served by a lagging replica made the fencing wait look elapsed, granting an epoch over a live writer (ADR-0015: the wait is a monotonic dwell, seeded from a durable record) | `725bc69` |
+| Nothing stopped a heartbeat re-arming the lease a drain had just revoked, so a healthy host could not be evacuated (ADR-0016 stage 1: a revocation window bounded to one promotion) | `f54221d` |
+| Capacity was an incremental ledger that a crash could apply twice, and no guard could tell a stranger's equal-and-opposite change from its own (ADR-0017: committed bytes are derived from state, the column is gone) | `a42fed4` |
+| Watermarks were not epoch-qualified at the store, so a fenced epoch-N writer's late report was accepted — there was no caller that knew its own epoch until the Agent reported one (`ReportVolumeState`, enforced in `cpserver`) | `28cb8c5` |
+
 ## Open
 
-Six entries. Three are new: two found by the harness while proving that a checker
-could catch a real bug, and one found while answering how a node protects itself from a
-full device. Each names what it is waiting on.
+Two entries, each named with what it is waiting on.
 
-### Needs a decision (3)
-
-- **A lagging replica read makes the fencing wait elapse early** _(fencing-promotion, new)_
-  - `Promote` takes the `host_leases` row as the whole authority for FENCING_WAIT. A
-    read served by a replica behind by more than `lease_ttl + max_clock_skew` reports a
-    `last_renewal` old enough that the wait looks over, and an epoch is granted over a
-    live writer. The clock-offset check added in wave 2 cannot see it: both clocks
-    agree, it is the *data* that is old.
-  - **decided (ADR-0015, Accepted):** the wait becomes a monotonic dwell since the
-    promoter observed the lease, recorded durably with the §7 FENCING_WAIT state.
-    Waiting on implementation, not on a decision.
-
-- **A heartbeat will re-arm the lease a drain revokes** _(fencing-promotion, new)_
-  - `RenewHostLease` deliberately accepts CORDONED and DRAINING, because both still
-    serve what they hold. Nothing renews leases outside promotion today, so the drain's
-    revoke works — but once the Agent heartbeat exists (DEV-0007), a source that keeps
-    heartbeating re-arms the lease the drain just revoked and the wait never elapses.
-  - **decided (ADR-0016, Accepted):** a revocation window bounded to one volume's
-    promotion now; the ACK gate moves to per-volume epoch holdership once the Agent
-    exists. The granularity mismatch — a per-host lease fencing a per-volume move — is
-    the defect; stage 1 is deliberately throwaway.
+### Waiting on a format that Phase 12 will introduce (1)
 
 - **A GC sweep cannot see an anchor its listing has not caught up to** _(gc-objectstore)_
   - Narrowed, not closed, by ADR-0012: the epoch ceiling no longer licenses destruction,
@@ -131,7 +118,7 @@ full device. Each names what it is waiting on.
     per-volume index readable by deterministic key, rather than retrofitting one. The
     same object ADR-0014's squash needs, designed once.
 
-### Needs an increment owning files no package owned (3)
+### Waiting on the WAL segment format review (1)
 
 - **`TruncateLocal` reclaims nothing on an active volume** _(wal-durability, new)_
   - It records `truncatedUpTo` and calls `file.Truncate(0)` only when `upTo >= local`,
@@ -144,24 +131,9 @@ full device. Each names what it is waiting on.
     unlinks whole segments, which is an on-disk format change and needs the format
     review before the code.
 
-- **Capacity accounting has no idempotency key** _(drain-placement-dst)_
-  - The expected-value predicate closes the read→write window, not a crash: if the drain
-    dies before its reservation and a stranger's change nets to exactly one volume size,
-    the resumed compare-and-set fails, the re-read shows `before + delta`, and the pass
-    concludes its own delta landed.
-  - **decided (ADR-0017, Accepted):** the ledger goes away. Committed bytes are derived
-    from the volumes a host holds plus the in-flight plans targeting it, so there is no
-    delta to apply twice and the crash tests become uninteresting by construction.
-
-- **Watermarks are not epoch-qualified at the store** _(metadata-cp)_
-  - The monotonic floor covers the regression the original finding named, but a fenced
-    epoch-N writer reporting a *higher* durable sequence than epoch N+1 published would
-    still be accepted. It needs a caller that knows its epoch, and there is none yet.
-  - waiting on: DEV-0007 (the Agent spine).
-
 ### Known-weaker coverage, deliberately (0)
 
-None. The snapshot publisher was the last entry here and is closed below.
+None left. The snapshot publisher was the last one, closed in wave 4.
 
 ## Interpretations that deserve a second look
 
