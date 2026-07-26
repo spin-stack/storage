@@ -12,6 +12,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -703,6 +705,136 @@ func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
 
 	assertIndexed(t, pool, "operations_host_id_operation_id_idx", "operations",
 		`EXPLAIN SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id`, hotHost)
+}
+
+// TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet is the plan assertion the
+// host_committed_bytes view has to earn. The derivation used to be inlined in four
+// queries; as a view it is written once, and the risk that trade brings is that a
+// reader asking about *one* host silently pays for all of them — a view whose
+// aggregate is computed before the filter is applied is exactly that shape, and the
+// drain reads this on every pass, for every host it considers.
+//
+// So the assertion is not "an index is used" (this derivation has never used one:
+// both sums scan, and did before the view too — see the sibling index tests for the
+// queries that do). It is that the filtered read costs a fraction of the fleet-wide
+// one. If the filter stops being pushed into the derivation, the two converge and
+// this fails.
+func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
+	ctx := t.Context()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	// A fleet of a couple of hundred hosts, one of them holding volumes and one
+	// in-flight plan aimed at it — the §28.2 numbers the drain reads.
+	hot := ids.New().String()
+	fleet := []string{hot}
+	for range fleetHosts - 1 {
+		fleet = append(fleet, ids.New().String())
+	}
+	for _, h := range fleet {
+		if err := store.UpsertHost(ctx, term, metadata.Host{
+			HostID: h, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 50,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var inFlight string
+	for i := range fleetVolumes {
+		id := ids.New().String()
+		host := fleet[i%len(fleet)]
+		if err := store.CreateVolume(ctx, term, metadata.Volume{
+			VolumeID: id, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
+			PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k",
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			inFlight = id // a volume on somebody else, being moved to hot
+		}
+	}
+	plan := `{"volumes":[{"volume_id":"` + inFlight + `","to_host":"` + hot + `","stage":"MOVING"}]}`
+	for i := range fleetOperations {
+		op := metadata.Operation{
+			OperationID: ids.New().String(), Kind: lifecycle.OpDrain, HostID: fleet[i%len(fleet)],
+			Phase: lifecycle.OpSucceeded, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+		}
+		if i == 0 {
+			op.Phase, op.CurrentState = lifecycle.OpRunning, []byte(plan)
+		}
+		if _, err := store.RecordOperation(ctx, term, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `ANALYZE hosts; ANALYZE volumes; ANALYZE operations`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The number is right before anything is said about how it was computed.
+	h, err := store.GetHost(ctx, hot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := int64(fleetVolumes/len(fleet)) << 30
+	if h.NVMeCommittedBytes < own+(1<<30) {
+		t.Fatalf("committed = %d, want at least its own volumes plus the one in flight", h.NVMeCommittedBytes)
+	}
+
+	one := explainBuffers(t, pool,
+		`EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+		 SELECT committed_bytes FROM host_committed_bytes WHERE host_id = $1`, hot)
+	all := explainBuffers(t, pool,
+		`EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+		 SELECT committed_bytes FROM host_committed_bytes ORDER BY host_id`)
+	if one == 0 || all == 0 {
+		t.Fatalf("no buffer counts in the plans (one=%d all=%d): the assertion is empty", one, all)
+	}
+	// A tenth is a wide margin on a fleet of fleetHosts: if the filter reaches the
+	// derivation the ratio is about 1/fleetHosts, and if it does not it is 1.
+	if one*10 >= all {
+		t.Fatalf("asking about one host costs %d buffers and asking about all %d costs %d:\n"+
+			"the view derives the whole fleet before the filter is applied", one, fleetHosts, all)
+	}
+}
+
+// Fleet shape for the plan tests: hundreds of hosts (§28.2 says the fleet is that
+// size), thousands of volumes and operations, so the planner sees a table worth
+// making a decision about rather than one small enough that every plan is equal.
+const (
+	fleetHosts      = 200
+	fleetVolumes    = 2000
+	fleetOperations = 2000
+)
+
+// explainBuffers runs an EXPLAIN (ANALYZE, BUFFERS) and returns the total buffers
+// the plan touched — the whole plan's cost in the one unit that does not depend on
+// how busy the machine running the test is.
+func explainBuffers(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	total := 0
+	re := regexp.MustCompile(`shared hit=(\d+)(?: read=(\d+))?`)
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		// Only the top node's counters are cumulative; nested ones are included in
+		// it, so the first match is the whole plan and the rest are its parts.
+		if m := re.FindStringSubmatch(line); m != nil && total == 0 {
+			hit, _ := strconv.Atoi(m[1])
+			read, _ := strconv.Atoi(m[2])
+			total = hit + read
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return total
 }
 
 // assertIndexed fails unless the planner reaches for index on table for query.
