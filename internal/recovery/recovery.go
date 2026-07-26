@@ -35,6 +35,13 @@ var ErrObjectIntegrity = errors.New("recovery: WAL object failed integrity valid
 // ever, so a boundary that goes down is unrecoverable data loss (§12.5).
 var ErrBoundaryRegression = errors.New("recovery: epoch boundary would move backwards")
 
+// ErrAmbiguousSequence means two validated WAL objects carry different records for a
+// sequence they both cover. INV-21 (§14.5) calls for a hard failure on "same range,
+// different hash", and this is the only place it can be enforced: the object key
+// embeds the payload digest, so divergent objects land on different keys and both
+// create-only PUTs succeed. Which one wins would otherwise be decided by sort order.
+var ErrAmbiguousSequence = errors.New("recovery: two objects carry different records for the same sequence")
+
 // ErrSummaryOverclaims means the summary object names a durable sequence the
 // contiguous prefix cannot reach: an object it counted is gone. The summary is an
 // accelerator, not an authority (§22.1), so this is reported with the prefix S3 can
