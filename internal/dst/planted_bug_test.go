@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -617,13 +618,19 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
 	const wantBehavioural = 13
 	got := 0
-	for _, kind := range plantedProofs {
-		if kind == proofBehavioural {
+	var literal []string
+	for name, kind := range plantedProofs {
+		switch kind {
+		case proofBehavioural:
 			got++
+		case proofLiteral:
+			literal = append(literal, name)
 		}
 	}
 	if got != wantBehavioural {
-		t.Fatalf("%d checkers have a behavioural planted-bug proof, expected %d: "+
-			"raise the constant when converting one, never lower it", got, wantBehavioural)
+		sort.Strings(literal)
+		t.Fatalf("%d checkers have a behavioural planted-bug proof, expected %d "+
+			"(literal: %v): raise the constant when converting one, never lower it",
+			got, wantBehavioural, literal)
 	}
 }
