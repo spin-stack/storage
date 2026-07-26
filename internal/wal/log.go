@@ -99,6 +99,10 @@ type Log struct {
 	degraded   Degradation
 	outOfSpace OutOfSpaceFunc
 
+	// order decides the watermark and truncation rules (INV-03, INV-13). Nil is
+	// strict; see OrderPolicy for why the rules sit behind an interface.
+	order OrderPolicy
+
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
@@ -126,8 +130,8 @@ func (l *Log) TruncatedUpTo() uint64 { return l.truncatedUpTo }
 // verified checkpoint must never be discarded. When the whole log is objectized it
 // resets the local file.
 func (l *Log) TruncateLocal(upTo uint64) error {
-	if upTo > l.published {
-		return ErrTruncateAboveDurable
+	if err := l.orderPolicy().AllowTruncate(upTo, l.Watermarks()); err != nil {
+		return err
 	}
 	l.truncatedUpTo = upTo
 	if upTo >= l.local {
@@ -253,6 +257,7 @@ func NewLogAfter(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, boun
 		limits:     limits,
 		degraded:   DegradedNone,
 		outOfSpace: DefaultOutOfSpace,
+		order:      StrictOrder{},
 	}
 }
 
@@ -543,8 +548,8 @@ func (l *Log) ViewBytes() int { return l.view.Bytes() }
 
 // AdvanceDurable advances the durable watermark, enforcing durable <= local (§5.6).
 func (l *Log) AdvanceDurable(seq uint64) error {
-	if seq > l.local || seq < l.published {
-		return ErrWatermarkOrder
+	if err := l.orderPolicy().AllowDurable(seq, l.Watermarks()); err != nil {
+		return err
 	}
 	l.durable = seq
 	return nil
@@ -552,8 +557,8 @@ func (l *Log) AdvanceDurable(seq uint64) error {
 
 // AdvancePublished advances the published watermark, enforcing published <= durable.
 func (l *Log) AdvancePublished(seq uint64) error {
-	if seq > l.durable {
-		return ErrWatermarkOrder
+	if err := l.orderPolicy().AllowPublished(seq, l.Watermarks()); err != nil {
+		return err
 	}
 	l.published = seq
 	return nil
