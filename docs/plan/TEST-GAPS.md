@@ -11,7 +11,7 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files, then wave 3 (G1–G5). **Six entries are
+own worktree over a disjoint set of files, then wave 3 (G1–G5). **Seven entries are
 still open**, and every one of them is listed below with what it is waiting on.
 Findings that turned out to be already covered are recorded as such rather than
 counted as work; two of the open entries are new, found by the harness while proving
@@ -94,8 +94,9 @@ that a checker could catch a real bug.
 
 ## Open
 
-Six entries, and two of them are new — found by the harness while proving that a
-checker could catch a real bug. Each names what it is waiting on.
+Seven entries. Three are new: two found by the harness while proving that a checker
+could catch a real bug, and one found while answering how a node protects itself from a
+full device. Each names what it is waiting on.
 
 ### Needs a decision (3)
 
@@ -129,7 +130,18 @@ checker could catch a real bug. Each names what it is waiting on.
     of the WAL objects a segment replaced. That is the point where there is a format
     worth indexing.
 
-### Needs an increment owning files no package owned (2)
+### Needs an increment owning files no package owned (3)
+
+- **`TruncateLocal` reclaims nothing on an active volume** _(wal-durability, new)_
+  - It records `truncatedUpTo` and calls `file.Truncate(0)` only when `upTo >= local`,
+    so the space below a published checkpoint is freed only when the checkpoint reached
+    the end of the log — which on a volume under continuous write never happens. The
+    WAL is a file that grows and is emptied when the volume goes idle. Every other
+    defence against a full device is downstream of this one, and none of them helps
+    while the reclaim path is a no-op.
+  - waiting on: ADR-0013 (Proposed). The fix is to segment the WAL so truncation
+    unlinks whole segments, which is an on-disk format change and needs the format
+    review before the code.
 
 - **Capacity accounting has no idempotency key** _(drain-placement-dst)_
   - The expected-value predicate closes the read→write window, not a crash: if the drain
