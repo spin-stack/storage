@@ -236,6 +236,68 @@ func TestPGRejectsNonV7(t *testing.T) {
 	}
 }
 
+// TestPGWatermarkOrderIsAConstraint proves INV-03 is structural, not merely a rule
+// the queries and the Go caller happen to follow: the row itself cannot be written
+// out of order. It matters because published/durable/local is the number an operator
+// reads during an incident to decide whether to accept data loss (§5.6), and a
+// disordered triple is not a wrong number — it is three numbers that cannot all be
+// true, from which no decision can be taken at all.
+//
+// Raw SQL on purpose: this asserts the constraint, not the Go guard above it.
+func TestPGWatermarkOrderIsAConstraint(t *testing.T) {
+	ctx := t.Context()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	volID := ids.New().String()
+	if err := store.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
+		DEKWrapped: []byte{1}, KEKID: "k",
+		LocalSequence: 100, DurableSequence: 90, PublishedSequence: 80,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both ends of the predicate, each broken on its own.
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{"published above durable", `UPDATE volumes SET published_sequence = 95 WHERE volume_id = $1`},
+		{"durable above local", `UPDATE volumes SET durable_sequence = 101 WHERE volume_id = $1`},
+		{"local below both", `UPDATE volumes SET local_sequence = 70 WHERE volume_id = $1`},
+		{"inserted out of order", `INSERT INTO volumes (volume_id, size_bytes, block_size, state,
+			dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence)
+			VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k', 1, 2, 3)`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			arg := volID
+			if strings.HasPrefix(tc.sql, "INSERT") {
+				arg = ids.New().String()
+			}
+			if _, err := pool.Exec(ctx, tc.sql, arg); err == nil {
+				t.Fatal("the database accepted watermarks out of order (INV-03)")
+			}
+		})
+	}
+
+	// The row is untouched, and a move that keeps the order is still allowed.
+	v, err := store.GetVolume(ctx, volID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.LocalSequence != 100 || v.DurableSequence != 90 || v.PublishedSequence != 80 {
+		t.Fatalf("a refused write still mutated the row: %+v", v)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE volumes SET local_sequence = 200, durable_sequence = 200, published_sequence = 200
+		  WHERE volume_id = $1`, volID); err != nil {
+		t.Fatalf("an ordered write must still be accepted: %v", err)
+	}
+}
+
 // TestPGAcceptsEveryDeclaredLifecycleValue is the drift test between the Go
 // vocabulary and the DB CHECK constraints: every value internal/lifecycle declares
 // must be storable. Adding a state in Go and forgetting the migration fails here.

@@ -600,6 +600,38 @@ func watermarks(t *testing.T, s metadata.Store) {
 			t.Fatalf("forward report did not land: %+v", v)
 		}
 	})
+
+	// The reporting path has always refused disorder; the *creating* path did not,
+	// so INV-03 could be violated at birth by rebuild-metadata or by a test fixture
+	// and no later report would ever repair it (each watermark only moves forward).
+	// Postgres now refuses such a row outright; this is the same refusal one layer
+	// up, so both stores answer with the same sentinel instead of one of them
+	// answering with a constraint violation.
+	t.Run("a create with out-of-order watermarks is rejected", func(t *testing.T) {
+		tests := []struct {
+			name                      string
+			local, durable, published int64
+		}{
+			{"durable above local", 10, 20, 5},
+			{"published above durable", 30, 9, 20},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				vol := id()
+				err := s.CreateVolume(ctx, w.term, metadata.Volume{
+					VolumeID: vol, SizeBytes: 1 << 20, BlockSize: 65536,
+					State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
+					LocalSequence: tc.local, DurableSequence: tc.durable, PublishedSequence: tc.published,
+				}, nil)
+				if !errors.Is(err, metadata.ErrWatermarkOrder) {
+					t.Fatalf("want ErrWatermarkOrder, got %v", err)
+				}
+				if _, err := s.GetVolume(ctx, vol); !errors.Is(err, metadata.ErrNotFound) {
+					t.Fatalf("the refused volume was created anyway: %v", err)
+				}
+			})
+		}
+	})
 }
 
 // upsertHost: a host is cordoned and being drained; its next routine heartbeat
