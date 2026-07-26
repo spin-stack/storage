@@ -19,6 +19,11 @@ var (
 	ErrDivergentObject = errors.New("wal: divergent object at key (same range, different content)")
 	// ErrUploadRetriesExhausted means the retry budget ran out on transient errors.
 	ErrUploadRetriesExhausted = errors.New("wal: upload retries exhausted")
+	// ErrOverlappingSpan means this uploader already published an object covering
+	// part — but not all — of this batch's sequence range in the same (volume,
+	// epoch). Two objects claiming one sequence is INV-21, and unlike the foreign
+	// writer case it is decidable here without asking the backend anything.
+	ErrOverlappingSpan = errors.New("wal: batch overlaps a sequence span this uploader already published")
 )
 
 // Backoff is the wait between upload attempts. It is exponential from Base, doubling
@@ -68,6 +73,35 @@ type Uploader struct {
 	// single throttling window (see UploaderOption); nil clk means no waiting.
 	clk     clock.Clock
 	backoff Backoff
+
+	// claimed is every sequence span this uploader has published, per (volume,
+	// epoch). See selfOverlap: it is the half of INV-21 the write path can decide on
+	// its own. It grows by one entry per WAL object, in step with Log.uploaded, and
+	// is bounded by the same thing — a log that has published enough objects for
+	// this to matter has long since been checkpointed and rebuilt.
+	claimed map[spanKey][]span
+}
+
+// spanKey scopes a claimed span to the sequence space it belongs to. Sequences belong
+// to a volume (§12.5), and an epoch boundary is what makes the successor's records
+// different records, so two volumes — or two epochs — both writing 1..3 do not
+// overlap. One uploader may serve several of each.
+type spanKey struct {
+	volume [16]byte
+	epoch  uint64
+}
+
+// span is an inclusive sequence range [first, last].
+type span struct{ first, last uint64 }
+
+// overlaps reports whether two spans share a sequence without being the same span. An
+// identical span is not an overlap: it is the idempotent re-upload of a batch whose
+// PUT response was lost, which §14.5 requires to succeed.
+func (s span) overlaps(o span) bool {
+	if s == o {
+		return false
+	}
+	return s.first <= o.last && o.first <= s.last
 }
 
 // UploaderOption configures an Uploader at construction.
@@ -114,6 +148,9 @@ func (u *Uploader) wait(ctx context.Context, attempt int) error {
 // Upload stores the batch's WAL object idempotently and returns its key once the
 // object is verified present with the expected content.
 func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) {
+	if err := u.selfOverlap(cb); err != nil {
+		return "", err
+	}
 	obj := cb.Object()
 
 	var lastErr error
@@ -140,6 +177,7 @@ func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) 
 		_, err := u.store.Put(ctx, obj.Key, obj.Data, objectstore.PutOptions{IfNoneMatch: true})
 		switch {
 		case err == nil:
+			u.claim(cb)
 			return obj.Key, nil
 		case errors.Is(err, objectstore.ErrPreconditionFailed):
 			// Already present: reconcile against what is stored (§14.5). The ETag
@@ -165,6 +203,7 @@ func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) 
 			if !bytes.Equal(stored, obj.Data) {
 				return "", ErrDivergentObject
 			}
+			u.claim(cb)
 			return obj.Key, nil // idempotent success
 		default:
 			// Transient (lost response, throttle, ...): retry within budget.
@@ -172,6 +211,42 @@ func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) 
 		}
 	}
 	return "", fmt.Errorf("%w: %v", ErrUploadRetriesExhausted, lastErr)
+}
+
+// selfOverlap closes the half of INV-21 the write path can decide: a batch whose
+// sequence range partially overlaps one this uploader already published. It needs no
+// I/O, so it is not blinded by a lagging listing, and it costs a slice scan per
+// upload against a slice with one entry per object already written.
+//
+// It is the failure the write path can actually see: a batcher accounting bug, or a
+// Resume that re-queued records an object already covers. What it does NOT decide is
+// an overlap produced by *another* writer in the same (volume, epoch) — see
+// spanClaimed for that argument.
+func (u *Uploader) selfOverlap(cb *ClosedBatch) error {
+	this := span{first: cb.First, last: cb.Last}
+	for _, other := range u.claimed[spanKey{volume: cb.VolumeID, epoch: cb.Epoch}] {
+		if other.overlaps(this) {
+			return fmt.Errorf("%w: %d-%d overlaps the published %d-%d (violates INV-21)",
+				ErrOverlappingSpan, this.first, this.last, other.first, other.last)
+		}
+	}
+	return nil
+}
+
+// claim records a span as published. Only a verified upload claims one: a failed PUT
+// must stay retryable, and its span must stay available to the retry.
+func (u *Uploader) claim(cb *ClosedBatch) {
+	if u.claimed == nil {
+		u.claimed = map[spanKey][]span{}
+	}
+	k := spanKey{volume: cb.VolumeID, epoch: cb.Epoch}
+	this := span{first: cb.First, last: cb.Last}
+	for _, other := range u.claimed[k] {
+		if other == this {
+			return // an idempotent re-upload of the same batch
+		}
+	}
+	u.claimed[k] = append(u.claimed[k], this)
 }
 
 // spanClaimed enforces INV-21 / §14.5 ("same range, different hash ⇒ hard fail")
@@ -185,6 +260,20 @@ func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) 
 // It costs one prefix LIST per attempt, which returns at most a handful of keys. The
 // alternative is a bucket in which two writers' versions of sequences 1..N coexist
 // silently, which is the exact scenario the invariant exists to catch.
+//
+// It decides *identical* spans only, and that is a decision, not an oversight. A
+// partial overlap from a foreign writer ({1-3} against this batch's {2-5}) lands on an
+// unrelated key prefix, and finding it would mean listing the whole epoch and parsing
+// every key's range on every upload. That check would still be wrong twice over: LIST
+// is eventually consistent (§6.1), so it answers "nothing there" precisely in the
+// window a fenced predecessor's object was just written — the case it exists for — and
+// treating any listed overlap as fatal would permanently wedge a writer that restarted
+// and harmlessly re-batched records it had already published, which
+// recovery.VerifyAgreement deliberately allows when the shared records are
+// byte-identical. Two writers in one (volume, epoch) is a fencing failure (§12.2,
+// INV-06) and is caught where the answer must be right: recovery reads a complete
+// listing and fails with ErrAmbiguousSequence. selfOverlap covers what this uploader
+// can know without asking anyone.
 func (u *Uploader) spanClaimed(ctx context.Context, key string) error {
 	dash := strings.LastIndex(key, "-")
 	if dash < 0 {
