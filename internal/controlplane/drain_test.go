@@ -233,6 +233,37 @@ func (w *drainWorld) killAfterTheRelease(t *testing.T, volumeID string) {
 	}
 }
 
+// killAfterThePromotion fails the progress write that records the promotion. The
+// epoch is already granted and the volume is already the destination's; nothing has
+// said so yet. That is the window a ledger cannot survive — the source is still
+// charged for a volume it no longer holds — and the one ADR-0017 removes.
+func (w *drainWorld) killAfterThePromotion(t *testing.T) {
+	t.Helper()
+	w.hooks.beforeUpdate = func(op metadata.Operation) error {
+		if strings.Contains(string(op.CurrentState), `"PROMOTED"`) {
+			return errProgressLost
+		}
+		return nil
+	}
+}
+
+// killAtTheProgressWrite fails the write that records a finished move.
+func (w *drainWorld) killAtTheProgressWrite(t *testing.T) {
+	t.Helper()
+	w.hooks.beforeUpdate = func(op metadata.Operation) error {
+		if strings.Contains(string(op.CurrentState), `"DONE"`) {
+			return errProgressLost
+		}
+		return nil
+	}
+}
+
+// clearFaults disarms every hook, so the next pass runs clean.
+func (w *drainWorld) clearFaults() {
+	w.hooks.beforeUpdate = nil
+	w.faults.fail = nil
+}
+
 // addHost registers an extra ACTIVE host with room for ten volumes.
 func (w *drainWorld) addHost(t *testing.T, hostID string) {
 	t.Helper()
