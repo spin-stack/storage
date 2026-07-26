@@ -172,6 +172,11 @@ func TestRebuildRepairsAVolumeRowLeftBehindByS3(t *testing.T) {
 		t.Fatalf("the row is still at epoch %d while S3 is at 5, and the rebuild reported %+v — "+
 			"the volume is unattachable and nothing says so", v.CurrentEpoch, res)
 	}
+	// A count of rows *created* says nothing about a row that was repaired, and an
+	// operator reading Volumes:0 would move on.
+	if !slices.Contains(res.Repaired, staleVol) {
+		t.Fatalf("the rebuild corrected the row but reported %+v", res)
+	}
 	// The row must not be *rewritten* wholesale: state and ownership are the §7
 	// machine's, not S3's.
 	if v.State != lifecycle.VolumeActive || v.PrimaryHostID != staleHost {
@@ -266,4 +271,106 @@ func (h *rebuildHookStore) Get(ctx context.Context, key string) ([]byte, error) 
 		}
 	}
 	return h.ObjectStore.Get(ctx, key)
+}
+
+// TestRebuildNamesARowThatIsAheadOfS3: the other direction of the same disagreement.
+// The row claims an epoch the object store never recorded — PostgreSQL bumped and
+// the CAS never landed, or a descriptor was restored from an older backup. Rewinding
+// a fencing token is not the rebuild's call (§12.4), so it must converge everything
+// it can and say plainly that this one is not reconciled, rather than report a clean
+// run over a volume nobody can promote.
+func TestRebuildNamesARowThatIsAheadOfS3(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	epochs := epoch.NewStore(store)
+
+	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
+		VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 2, KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := epochs.Init(ctx, staleVol, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	md := metasim.New(clk.Wall)
+	term, err := md.AcquireLeadership(ctx, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 7,
+		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := controlplane.RebuildMetadata(ctx, store, epochs, md, term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(res.Conflicting, staleVol) {
+		t.Fatalf("a row ahead of the epoch object was reported as a clean rebuild: %+v", res)
+	}
+	if slices.Contains(res.Repaired, staleVol) {
+		t.Fatalf("the rebuild claimed to have repaired a row it cannot repair: %+v", res)
+	}
+	v, err := md.GetVolume(ctx, staleVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.CurrentEpoch != 7 {
+		t.Fatalf("the rebuild rewound the fencing token to %d", v.CurrentEpoch)
+	}
+}
+
+// TestRebuildGrowsARowThatShrankUnderAPITR: the same failure in the size column. A
+// restore that predates a resize leaves the row smaller than the volume actually is,
+// and the guest addresses blocks past the end of it.
+func TestRebuildGrowsARowThatShrankUnderAPITR(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	epochs := epoch.NewStore(store)
+
+	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
+		VolumeID: staleVol, SizeBytes: 16 << 30, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := epochs.Init(ctx, staleVol, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	md := metasim.New(clk.Wall)
+	term, err := md.AcquireLeadership(ctx, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: staleVol, SizeBytes: 4 << 30, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1,
+		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := controlplane.RebuildMetadata(ctx, store, epochs, md, term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(res.Repaired, staleVol) {
+		t.Fatalf("a row smaller than the volume was reported as a clean rebuild: %+v", res)
+	}
+	v, err := md.GetVolume(ctx, staleVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.SizeBytes != 16<<30 {
+		t.Fatalf("size = %d, want the descriptor's %d", v.SizeBytes, int64(16<<30))
+	}
 }
