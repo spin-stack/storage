@@ -1,0 +1,181 @@
+syntax = "proto3";
+
+// Package spin.storage.v1 is the RPC surface between a Volume Agent and the
+// Control Plane (ADR-0018). It is deliberately small: the Agent *pulls*, so
+// every call below is one the Agent makes, and there is no way for the Control
+// Plane to reach into a host. A partitioned Agent simply stops learning, its
+// lease lapses, and §12 fencing does the rest.
+package spin.storage.v1;
+
+option go_package = "github.com/spin-stack/storage/api/gen/spin/storage/v1;storagev1";
+
+// ControlPlaneService is what a Volume Agent talks to. Three calls, one loop:
+// say what this host is (Heartbeat), ask what it should be serving
+// (GetDesiredState), say what it observed (ReportVolumeState).
+//
+// Attach/detach are deliberately absent: a volume's lifecycle is driven by the
+// desired state the Agent reconciles against, not by commands, and the data path
+// that would honour an attach does not exist yet (ADR-0018 §2).
+service ControlPlaneService {
+  // Heartbeat reports the host's identity, its capabilities, and the state of
+  // its local device, and renews the host lease (§12.6). It is the call that
+  // finally writes host.nvme_used_bytes — the input every ADR-0013 threshold
+  // needs and that nothing has ever produced.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // GetDesiredState returns the volumes this host should be serving. The Agent
+  // reconciles towards it; a volume that disappears from the answer is a volume
+  // the Agent must stop serving.
+  rpc GetDesiredState(GetDesiredStateRequest) returns (GetDesiredStateResponse);
+
+  // ReportVolumeState reports epoch-qualified watermarks. The epoch is the point:
+  // a report from a fenced writer names an epoch the volume has moved past, and
+  // is refused rather than applied (INV-03, §12.3).
+  rpc ReportVolumeState(ReportVolumeStateRequest) returns (ReportVolumeStateResponse);
+}
+
+// HostState mirrors internal/lifecycle.HostState (§28.1). The Agent needs it to
+// know it has been cordoned: only ACTIVE takes new volumes, and a CORDONED or
+// DRAINING host keeps serving (and keeps its lease) while it is evacuated.
+enum HostState {
+  HOST_STATE_UNSPECIFIED = 0;
+  HOST_STATE_ACTIVE = 1;
+  HOST_STATE_CORDONED = 2;
+  HOST_STATE_DRAINING = 3;
+  HOST_STATE_DEAD = 4;
+}
+
+// VolumeState mirrors internal/lifecycle.VolumeState — the Control Plane's view
+// of writer ownership (§7).
+enum VolumeState {
+  VOLUME_STATE_UNSPECIFIED = 0;
+  VOLUME_STATE_ACTIVE = 1;
+  VOLUME_STATE_PRIMARY_SUSPECTED = 2;
+  VOLUME_STATE_FENCING_WAIT = 3;
+  VOLUME_STATE_RECOVERY_REQUIRED = 4;
+  VOLUME_STATE_RECOVERING = 5;
+  VOLUME_STATE_DETACHED = 6;
+}
+
+// Durability mirrors internal/lifecycle.Durability — the per-volume FLUSH/FUA
+// ACK contract (§14.8).
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_REMOTE = 1;
+  DURABILITY_LOCAL = 2;
+}
+
+// DeviceStatus is what the Agent observes about the NVMe device it owns
+// (ADR-0013). All three numbers are needed and none is derivable from the
+// others: total and used give the pressure thresholds, and the remote backlog is
+// the part of `used` that no amount of local truncation can reclaim, because it
+// is bytes no verified object covers yet (INV-13).
+message DeviceStatus {
+  // total_bytes is the capacity of the device backing the WAL and checkpoints.
+  int64 total_bytes = 1;
+  // used_bytes is what this Agent is occupying on it right now.
+  int64 used_bytes = 2;
+  // remote_backlog_bytes is the sum, over every volume on this host, of the
+  // bytes that are not yet covered by a verified object. Per-volume
+  // backpressure (wal.Limits.MaxRemoteGapBytes) never sums to a device budget
+  // on its own — this is the number that does (ADR-0013 §1).
+  int64 remote_backlog_bytes = 3;
+}
+
+message HeartbeatRequest {
+  // host_id is the fleet identity of this host.
+  string host_id = 1;
+  // agent_version is the build the Agent is running (fleet-mixed, §13.4).
+  string agent_version = 2;
+  // max_format_version is the highest on-disk/on-S3 format this Agent can read
+  // and write. The Control Plane never places a volume on a host that cannot
+  // read its format.
+  int32 max_format_version = 3;
+  // device is the local device budget picture (ADR-0013).
+  DeviceStatus device = 4;
+}
+
+message HeartbeatResponse {
+  // lease_ttl_seconds is the TTL the host lease was renewed with. The Agent
+  // anchors it to the instant the *request left*, never to the answer's arrival
+  // (§12.2), which is what keeps its validity window a subset of the Control
+  // Plane's.
+  int32 lease_ttl_seconds = 1;
+  // state is the fleet state the Control Plane holds for this host (§28.1).
+  HostState state = 2;
+  // term is the Control Plane term that served this heartbeat. It is
+  // informative — the Agent does not guard on it — and exists so an operator
+  // reading an Agent's logs during an incident can see which leader answered.
+  int64 term = 3;
+}
+
+message GetDesiredStateRequest {
+  string host_id = 1;
+}
+
+// DesiredVolume is one volume this host should be serving.
+message DesiredVolume {
+  string volume_id = 1;
+  int64 size_bytes = 2;
+  int32 block_size = 3;
+  // epoch is the volume's current epoch (§12.3). Everything the Agent later
+  // reports about this volume is qualified by it.
+  int64 epoch = 4;
+  VolumeState state = 5;
+  Durability durability = 6;
+}
+
+message GetDesiredStateResponse {
+  // volumes is ordered by volume id, deterministically (INV-02).
+  repeated DesiredVolume volumes = 1;
+}
+
+// VolumeReport is one volume's watermarks as the Agent observes them, qualified
+// by the epoch under which they were produced.
+message VolumeReport {
+  string volume_id = 1;
+  // epoch is the epoch this Agent believes it holds the volume under. A report
+  // whose epoch is not the volume's current one is refused: it comes from a
+  // writer that has been fenced.
+  int64 epoch = 2;
+  // Watermarks are informative (§5.8) and must satisfy
+  // published <= durable <= local (INV-03).
+  int64 local_sequence = 3;
+  int64 durable_sequence = 4;
+  int64 published_sequence = 5;
+  // remote_gap_bytes is this volume's share of the device's remote backlog.
+  int64 remote_gap_bytes = 6;
+}
+
+message ReportVolumeStateRequest {
+  string host_id = 1;
+  repeated VolumeReport volumes = 2;
+}
+
+// ReportOutcome says what happened to one report. A refusal is information the
+// Agent acts on — STALE_EPOCH or NOT_PRIMARY means this host is no longer the
+// writer and must stop behaving like one.
+enum ReportOutcome {
+  REPORT_OUTCOME_UNSPECIFIED = 0;
+  // ACCEPTED: the watermarks were applied (or were already at least as high —
+  // each watermark is monotonic, so a late report is not an error).
+  REPORT_OUTCOME_ACCEPTED = 1;
+  // STALE_EPOCH: the volume has moved past the epoch the report names.
+  REPORT_OUTCOME_STALE_EPOCH = 2;
+  // NOT_PRIMARY: this host is not the volume's primary.
+  REPORT_OUTCOME_NOT_PRIMARY = 3;
+  // UNKNOWN_VOLUME: the Control Plane has no such volume.
+  REPORT_OUTCOME_UNKNOWN_VOLUME = 4;
+  // OUT_OF_ORDER: the report violates published <= durable <= local (INV-03).
+  REPORT_OUTCOME_OUT_OF_ORDER = 5;
+}
+
+message VolumeReportResult {
+  string volume_id = 1;
+  ReportOutcome outcome = 2;
+}
+
+message ReportVolumeStateResponse {
+  // results is one entry per reported volume, in the order they were reported.
+  repeated VolumeReportResult results = 1;
+}
