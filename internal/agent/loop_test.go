@@ -362,8 +362,9 @@ func TestRunHoldsItsCadence(t *testing.T) {
 		h.awaitBeat(t, 1)
 	}
 	h.waitSleeping(t)
+	// Cancelling is enough to end the sleep: the loop's clock is the injected one,
+	// and Sleep honours the context.
 	cancel()
-	h.clk.Advance(testInterval)
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want context.Canceled", err)
 	}
@@ -411,7 +412,6 @@ func TestRunBacksOffAfterAFailureAndRecovers(t *testing.T) {
 
 	h.waitSleeping(t)
 	cancel()
-	h.clk.Advance(testInterval)
 	<-done
 
 	instants := h.cp.instants()
