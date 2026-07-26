@@ -52,6 +52,26 @@ func (c *Clock) SetSkew(d time.Duration) {
 	c.skew = d
 }
 
+// InjectMonotonicRegression steps monotonic time *backwards* by d. Nothing legitimate
+// does this: it models the clock source itself breaking — a VM resumed from a
+// snapshot, a live migration, a hypervisor serving a bad CLOCK_MONOTONIC — which is a
+// fault the design has no defence against and every lease in the system trusts (§12.1).
+//
+// It exists so a checker can be proven to catch it. A lease that had correctly expired
+// reports itself valid again after a regression, un-fencing a writer the Control Plane
+// has already replaced; without an injector that outcome cannot be produced from a
+// scenario, and the monotonic-clock checker can only be proven against a fabricated
+// event. Timers are left where they are: a deadline already passed does not un-fire.
+func (c *Clock) InjectMonotonicRegression(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if step := clock.Instant(d); step > c.mono {
+		c.mono = 0
+	} else {
+		c.mono -= step
+	}
+}
+
 // Advance moves monotonic time forward by d and fires every timer whose deadline
 // is now due, in deterministic (deadline, insertion) order.
 func (c *Clock) Advance(d time.Duration) {

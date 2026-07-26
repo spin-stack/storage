@@ -13,15 +13,24 @@ import (
 // ErrShortWrite is returned by an injected partial/torn append.
 var ErrShortWrite = errors.New("simio/sim: injected short write")
 
+// ErrNoSpace models ENOSPC: the device backing the file has no room left. It is the
+// simulated counterpart of syscall.ENOSPC from a real Append/Truncate. Unlike every
+// other fault here it is *not* one-shot — a full device stays full until space is
+// reclaimed — because the failure mode worth testing is what the caller does after
+// the first failure, not the first failure itself.
+var ErrNoSpace = errors.New("simio/sim: injected ENOSPC (no space left on device)")
+
 // Disk is a deterministic in-memory disk with an explicit crash model: content
 // written but not Synced lives only in the per-file cache and is discarded by
-// Crash. It also injects partial appends and lost syncs (§25.3).
+// Crash. It also injects partial appends, lost syncs, and full devices (§25.3).
 type Disk struct {
 	mu    sync.Mutex
 	files map[string]*content
 	// one-shot fault injection keyed by file name
 	shortAppend map[string]int
 	syncLoss    map[string]bool
+	// capacity is a standing (not one-shot) per-file device size in bytes.
+	capacity map[string]int64
 }
 
 type content struct {
@@ -35,7 +44,45 @@ func NewDisk() *Disk {
 		files:       map[string]*content{},
 		shortAppend: map[string]int{},
 		syncLoss:    map[string]bool{},
+		capacity:    map[string]int64{},
 	}
+}
+
+// InjectENOSPC caps the device backing name at capacity bytes. Appends are accepted
+// while they fit; the one that crosses the cap writes only what fits and returns
+// ErrNoSpace (the partial append a real ENOSPC delivers), and every append after it
+// writes nothing and returns ErrNoSpace. Growing the file with Truncate is refused
+// the same way. Space is reclaimed by truncating the file down or by ClearENOSPC.
+//
+// Allocation is charged at append time, so Sync of bytes the device already took
+// always succeeds. A filesystem that defers allocation can instead fail at fsync;
+// that variant is not modelled.
+func (d *Disk) InjectENOSPC(name string, capacity int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.capacity[name] = capacity
+}
+
+// ClearENOSPC removes the device cap on name (the operator grew the device, or a
+// checkpoint authorised a truncation that freed it).
+func (d *Disk) ClearENOSPC(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.capacity, name)
+}
+
+// freeSpace reports the bytes name's device can still take, and whether it is
+// capped at all. Callers hold d.mu.
+func (d *Disk) freeSpace(name string, used int64) (int64, bool) {
+	capacity, capped := d.capacity[name]
+	if !capped {
+		return 0, false
+	}
+	free := capacity - used
+	if free < 0 {
+		free = 0
+	}
+	return free, true
 }
 
 // InjectShortAppend makes the next Append to name write only n bytes then fail.
@@ -145,6 +192,10 @@ func (f *simFile) Append(p []byte) (int, error) {
 		c.cache = append(c.cache, p[:n]...)
 		return n, ErrShortWrite
 	}
+	if free, capped := f.d.freeSpace(f.name, int64(len(c.cache))); capped && int64(len(p)) > free {
+		c.cache = append(c.cache, p[:free]...)
+		return int(free), ErrNoSpace
+	}
 	c.cache = append(c.cache, p...)
 	return len(p), nil
 }
@@ -171,7 +222,11 @@ func (f *simFile) Truncate(size int64) error {
 	case size <= int64(len(c.cache)):
 		c.cache = c.cache[:size]
 	default:
-		c.cache = append(c.cache, make([]byte, size-int64(len(c.cache)))...)
+		grow := size - int64(len(c.cache))
+		if free, capped := f.d.freeSpace(f.name, int64(len(c.cache))); capped && grow > free {
+			return ErrNoSpace
+		}
+		c.cache = append(c.cache, make([]byte, grow)...)
 	}
 	return nil
 }
