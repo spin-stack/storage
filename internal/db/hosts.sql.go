@@ -11,8 +11,32 @@ import (
 	"github.com/google/uuid"
 )
 
+const blockHostRenewals = `-- name: BlockHostRenewals :execrows
+UPDATE hosts
+   SET renewals_blocked_until = now() + make_interval(secs => $2)
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+`
+
+type BlockHostRenewalsParams struct {
+	HostID uuid.UUID `json:"host_id"`
+	Secs   float64   `json:"secs"`
+	Term   int64     `json:"term"`
+}
+
+// Open (or re-arm) the ADR-0016 revocation window on a host for the next $2 seconds,
+// term-guarded. Re-arming is what a resumed pass does: the promotion it belongs to is
+// still running, so the window follows it rather than expiring under it.
+func (q *Queries) BlockHostRenewals(ctx context.Context, arg BlockHostRenewalsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, blockHostRenewals, arg.HostID, arg.Secs, arg.Term)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getHost = `-- name: GetHost :one
-SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, (
+SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, h.renewals_blocked_until, (
        COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
        WHERE v.primary_host_id = h.host_id), 0)
        + COALESCE((SELECT SUM(rv.size_bytes)
@@ -75,6 +99,7 @@ func (q *Queries) GetHost(ctx context.Context, hostID uuid.UUID) (*GetHostRow, e
 		&i.Host.NvmeTotalBytes,
 		&i.Host.NvmeUsedBytes,
 		&i.Host.LastHeartbeat,
+		&i.Host.RenewalsBlockedUntil,
 		&i.CommittedBytes,
 	)
 	return &i, err
@@ -108,7 +133,7 @@ func (q *Queries) HostExists(ctx context.Context, hostID uuid.UUID) (bool, error
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, (
+SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, h.renewals_blocked_until, (
        COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
        WHERE v.primary_host_id = h.host_id), 0)
        + COALESCE((SELECT SUM(rv.size_bytes)
@@ -150,6 +175,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]*ListHostsRow, error) {
 			&i.Host.NvmeTotalBytes,
 			&i.Host.NvmeUsedBytes,
 			&i.Host.LastHeartbeat,
+			&i.Host.RenewalsBlockedUntil,
 			&i.CommittedBytes,
 		); err != nil {
 			return nil, err
@@ -171,7 +197,8 @@ SELECT $1, now(), now(), $2
 WHERE EXISTS (SELECT 1 FROM valid)
   AND EXISTS (SELECT 1 FROM hosts
                WHERE host_id = $1
-                 AND state = ANY($4::text[]))
+                 AND state = ANY($4::text[])
+                 AND (renewals_blocked_until IS NULL OR renewals_blocked_until <= now()))
 ON CONFLICT (host_id) DO UPDATE
   SET last_renewal = now(),
       ttl_seconds = EXCLUDED.ttl_seconds
@@ -195,6 +222,11 @@ type RenewHostLeaseParams struct {
 // re-arm the lease of a host that has just been fenced. CORDONED and DRAINING are
 // deliberately still allowed: both are still serving the volumes they hold, and
 // refusing their renewals would stop their ACKs in the middle of an evacuation.
+// The third predicate is the ADR-0016 revocation window: while it is open the
+// Control Plane has revoked this host's lease to fence one of its volumes, and a
+// renewal would put back exactly what the fence took away. It is bounded by its own
+// deadline, so a Control Plane that dies mid-promotion cannot leave a host unable to
+// renew for ever.
 func (q *Queries) RenewHostLease(ctx context.Context, arg RenewHostLeaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, renewHostLease,
 		arg.HostID,
@@ -260,6 +292,29 @@ func (q *Queries) SetHostState(ctx context.Context, arg SetHostStateParams) (int
 		arg.Term,
 		arg.AllowedStates,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const unblockHostRenewals = `-- name: UnblockHostRenewals :execrows
+UPDATE hosts
+   SET renewals_blocked_until = NULL
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $2
+`
+
+type UnblockHostRenewalsParams struct {
+	HostID uuid.UUID `json:"host_id"`
+	Term   int64     `json:"term"`
+}
+
+// Close the window (term-guarded). Idempotent: a host with no window is the state the
+// caller asked for, which matters because this runs on every exit path of a promotion
+// including the ones that never opened one.
+func (q *Queries) UnblockHostRenewals(ctx context.Context, arg UnblockHostRenewalsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, unblockHostRenewals, arg.HostID, arg.Term)
 	if err != nil {
 		return 0, err
 	}

@@ -113,6 +113,11 @@ UPDATE hosts
 -- re-arm the lease of a host that has just been fenced. CORDONED and DRAINING are
 -- deliberately still allowed: both are still serving the volumes they hold, and
 -- refusing their renewals would stop their ACKs in the middle of an evacuation.
+-- The third predicate is the ADR-0016 revocation window: while it is open the
+-- Control Plane has revoked this host's lease to fence one of its volumes, and a
+-- renewal would put back exactly what the fence took away. It is bounded by its own
+-- deadline, so a Control Plane that dies mid-promotion cannot leave a host unable to
+-- renew for ever.
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $3
 )
@@ -121,7 +126,8 @@ SELECT $1, now(), now(), $2
 WHERE EXISTS (SELECT 1 FROM valid)
   AND EXISTS (SELECT 1 FROM hosts
                WHERE host_id = $1
-                 AND state = ANY(sqlc.arg(serving_states)::text[]))
+                 AND state = ANY(sqlc.arg(serving_states)::text[])
+                 AND (renewals_blocked_until IS NULL OR renewals_blocked_until <= now()))
 ON CONFLICT (host_id) DO UPDATE
   SET last_renewal = now(),
       ttl_seconds = EXCLUDED.ttl_seconds;
@@ -143,3 +149,21 @@ SELECT EXISTS (SELECT 1 FROM hosts WHERE host_id = $1);
 
 -- name: GetHostLease :one
 SELECT * FROM host_leases WHERE host_id = $1;
+
+-- name: BlockHostRenewals :execrows
+-- Open (or re-arm) the ADR-0016 revocation window on a host for the next $2 seconds,
+-- term-guarded. Re-arming is what a resumed pass does: the promotion it belongs to is
+-- still running, so the window follows it rather than expiring under it.
+UPDATE hosts
+   SET renewals_blocked_until = now() + make_interval(secs => $2)
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3;
+
+-- name: UnblockHostRenewals :execrows
+-- Close the window (term-guarded). Idempotent: a host with no window is the state the
+-- caller asked for, which matters because this runs on every exit path of a promotion
+-- including the ones that never opened one.
+UPDATE hosts
+   SET renewals_blocked_until = NULL
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $2;

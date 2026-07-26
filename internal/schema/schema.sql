@@ -36,8 +36,25 @@ CREATE TABLE hosts (
     nvme_used_bytes      BIGINT NOT NULL DEFAULT 0,
     -- There is deliberately no nvme_committed_bytes column (ADR-0017). Committed
     -- capacity is derived from the rows that already say who holds what; see the
-    -- host_committed_bytes view at the bottom of this file.
-    last_heartbeat       TIMESTAMPTZ NOT NULL
+    -- note at the bottom of this file.
+    last_heartbeat       TIMESTAMPTZ NOT NULL,
+    -- The end of the bounded revocation window (§12.6, ADR-0016 stage 1): until this
+    -- instant, by this database's clock, the host's lease renewals are refused.
+    --
+    -- The drain revokes the source's lease to fence it, and the source's next
+    -- heartbeat would otherwise re-arm it — moving the instant the fencing wait is
+    -- measured from, so a healthy host could never be evacuated. Refusing renewals
+    -- for any DRAINING host fixes that and costs too much: the lease is per host and
+    -- the evacuation is per volume, so it stops the durable ACKs of every volume the
+    -- host still holds, including the ones nobody is moving. This column is the same
+    -- mechanism with the blast radius cut to one promotion.
+    --
+    -- It is a deadline rather than a flag on purpose. The Control Plane closes the
+    -- window on every exit path of the promotion, but a Control Plane that dies
+    -- mid-promotion runs no closing write at all, and a host that can never renew
+    -- again is worse than the bug this fixes. The deadline is the backstop: at most
+    -- one lease_ttl + max_clock_skew per volume moved, whatever happens to the CP.
+    renewals_blocked_until TIMESTAMPTZ
 );
 
 -- Lease POR HOST (§12.6): one grouped renewal per host, not per volume. Each volume

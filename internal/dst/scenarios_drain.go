@@ -72,7 +72,7 @@ type faultMD struct {
 
 func (s *faultMD) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {
 	if s.wholeDrainWindow {
-		h, err := s.Store.GetHost(ctx, hostID)
+		h, err := s.GetHost(ctx, hostID)
 		if err != nil {
 			return err
 		}
@@ -763,18 +763,26 @@ func revocationWindow(plantWholeDrain bool) Scenario {
 		}
 		s.Emit(Event{Kind: EventNote, Msg: "the window closed on its own; the source is serving again"})
 
-		// And the drain still converges, because the next pass re-opens it. A source
-		// that heartbeats between every pass — which is what a healthy host does — must
-		// not be able to wedge its own evacuation.
-		for range 8 {
-			if rerr := renew(); rerr != nil && !errors.Is(rerr, metadata.ErrRenewalsBlocked) {
+		// And the drain still converges once the reconciler is running at its normal
+		// cadence — inside the window it arms, where a real one polls in seconds. The
+		// source heartbeats before every pass, which is what a healthy host does, and
+		// must not be able to wedge its own evacuation.
+		blocked := 0
+		for range 12 {
+			switch rerr := renew(); {
+			case errors.Is(rerr, metadata.ErrRenewalsBlocked):
+				blocked++
+			case rerr != nil:
 				return fmt.Errorf("unexpected renewal error: %w", rerr)
 			}
 			_, err = w.pass()
 			if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
 				break
 			}
-			s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+			s.Tick((drainLeaseTTL + drainMaxSkew) / 2)
+		}
+		if blocked == 0 {
+			return fmt.Errorf("no heartbeat was ever refused, so nothing stopped the source re-arming its lease")
 		}
 		if err != nil {
 			return fmt.Errorf("a heartbeating source wedged its own evacuation: %w", err)

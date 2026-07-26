@@ -47,6 +47,10 @@ func TestADrainIsNotWedgedByTheSourcesHeartbeat(t *testing.T) {
 		err      error
 		refusals int
 	)
+	// The reconciler comes back inside the window it armed — half a dwell, where a
+	// real one polls in seconds. That is a requirement of stage 1 and it is stated as
+	// one in fenceAndPromote: a pass that arrives after the window has lapsed finds
+	// the source renewed and starts the dwell again.
 	for range 24 {
 		// The Agent heartbeats before every Control-Plane pass.
 		if herr := w.heartbeat(t, cloneHostA); herr != nil {
@@ -56,7 +60,7 @@ func TestADrainIsNotWedgedByTheSourcesHeartbeat(t *testing.T) {
 		if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
 			break
 		}
-		w.pastFencingWait()
+		w.clk.Advance((leaseTTL + maxSkew) / 2)
 	}
 	if err != nil {
 		t.Fatalf("a heartbeating source wedged the drain: %v", err)
@@ -183,39 +187,49 @@ func TestTheRevocationWindowIsBoundedToOnePromotion(t *testing.T) {
 	}
 }
 
-// TestTheRevocationWindowExpiresOnItsOwn: the Control Plane dies with the window
-// open. Nothing will run the closing write, so the window has to close itself —
-// bounded by one lease_ttl + max_clock_skew, the length of the promotion it exists
-// for. Without that, a crashed drain leaves the host unable to ACK for volumes nobody
-// was moving, permanently, and the only cure is an operator noticing.
+// TestTheRevocationWindowExpiresOnItsOwn: the closing write never lands. Here the
+// Control Plane loses the election between opening the window and closing it, so
+// every term-guarded write it attempts afterwards affects 0 rows — including the one
+// that would give the host its renewals back. A process that simply dies is the same
+// situation with less warning.
+//
+// Nothing will reopen the window, so it has to close itself, bounded by the promotion
+// it was opened for. Without that, a host that lost its drain mid-promotion cannot
+// ACK a FLUSH for any of its volumes, permanently, and the only cure is an operator
+// noticing.
 func TestTheRevocationWindowExpiresOnItsOwn(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
-	// A pass that opens the window and then dies before anything closes it. A panic,
-	// not an error: a returned error lets the drain run its own tidy-up, which is
-	// exactly the code a crash does not get to run.
+	var lost bool
 	w.hooks.afterLease = func(hostID string) {
-		if hostID == cloneHostA {
-			panic(errProgressLost)
+		if lost || hostID != cloneHostA {
+			return
+		}
+		lost = true
+		if _, err := w.base.AcquireLeadership(ctx, "cp-2"); err != nil {
+			t.Errorf("new leader: %v", err)
 		}
 	}
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Fatal("the pass was supposed to die with the window open")
-			}
-		}()
-		_, _ = w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
-	}()
-	w.hooks.afterLease = nil
-
-	if err := w.heartbeat(t, cloneHostA); !errors.Is(err, metadata.ErrRenewalsBlocked) {
-		t.Fatalf("the window was not open when the pass died: %v", err)
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("want ErrStaleTerm once leadership moved, got %v", err)
 	}
-	// One dwell later it is gone, with nobody having closed it.
+	w.hooks.afterLease = nil
+	// The new leader inherits the fleet; only it can write now.
+	newTerm, err := w.base.AcquireLeadership(ctx, "cp-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renew := func() error {
+		return w.base.RenewHostLease(ctx, newTerm, cloneHostA, int(leaseTTL/time.Second))
+	}
+
+	if err := renew(); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+		t.Fatalf("the window was not open when the drain lost the election: %v", err)
+	}
+	// One promotion later it is gone, with nobody having closed it.
 	w.pastFencingWait()
-	if err := w.heartbeat(t, cloneHostA); err != nil {
+	if err := renew(); err != nil {
 		t.Fatalf("a window nobody closed outlived the promotion it was opened for: %v", err)
 	}
 }

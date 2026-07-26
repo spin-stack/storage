@@ -547,18 +547,65 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 }
 
 // fenceAndPromote fences the source and grants the volume's next epoch to the
-// destination (§12.3–12.5). The revocation is skipped once the volume is already on
-// the destination — this operation's own promotion, being resumed — because the
-// lease it would take away then is the one promotion granted to the *new* writer.
+// destination (§12.3–12.5), inside a bounded revocation window (ADR-0016 stage 1).
+//
+// The window is what makes the revocation stick. Taking the lease away is what lets a
+// *healthy* host be evacuated — the promoter refuses a source whose lease is live, so
+// on a host that is up and heartbeating the deadline keeps moving forward — but the
+// host's next heartbeat puts back exactly what was taken, and the drain waits for
+// ever. Refusing renewals for any DRAINING host would fix that at a price wave 2
+// rejected: the lease is per host and the evacuation is per volume, so it would stop
+// the durable ACKs of every volume the host still holds, for the whole drain. This is
+// the same refusal, scoped to one volume's promotion.
+//
+// It is closed on every exit path but one, and the exception is named: a fencing wait
+// that has not elapsed is the promotion *in progress*, not a failure, and handing the
+// lease back at that point restarts the dwell the window exists to protect. That path
+// is covered instead by the window's own deadline, which every pass re-arms — so a
+// Control Plane that dies mid-promotion costs the host one dwell of blocked renewals,
+// not for ever.
+//
+// The consequence, in the runbook's words: **draining a healthy host briefly
+// interrupts durable ACKs for its other volumes** — at most one lease_ttl +
+// max_clock_skew per volume moved. A guest sees a FLUSH take longer, not a write
+// fail: the WAL keeps accepting writes; it is the durable ACK that waits. It also
+// means the reconciler has to come back inside the window it armed; a pass that
+// arrives after it has lapsed finds the source renewed, and the dwell starts again.
+// Stage 2 of ADR-0016 — the ACK gate becoming epoch holdership for *that volume* —
+// is what removes both costs.
+//
+// Nothing is opened, and nothing revoked, once the volume is already on the
+// destination: that is this operation's own promotion being resumed, and the lease
+// that would be blocked is the one promotion granted to the *new* writer.
 func (d *Drainer) fenceAndPromote(ctx context.Context, term int64, operationID string,
 	v metadata.Volume, vp *volumeProgress, prog *progress,
 ) (uint64, error) {
-	if v.PrimaryHostID != vp.ToHost {
-		if err := d.fenceSource(ctx, term, operationID, v.PrimaryHostID, prog); err != nil {
-			return 0, err
-		}
+	source := v.PrimaryHostID
+	if source == "" || source == vp.ToHost {
+		return d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
 	}
-	return d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
+
+	if err := d.md.BlockHostRenewals(ctx, term, source, d.promoter.FencingDwell()); err != nil {
+		return 0, err
+	}
+	fencing := false
+	defer func() {
+		if fencing {
+			return
+		}
+		// Every other way out of this function — the promotion landed, the
+		// destination died, the lease could not be revoked, a panic — gives the host
+		// its renewals back. A cancelled context must not stop that: the window is
+		// the one thing whose absence is worse than the operation failing.
+		_ = d.md.UnblockHostRenewals(context.WithoutCancel(ctx), term, source)
+	}()
+
+	if err := d.fenceSource(ctx, term, operationID, source, prog); err != nil {
+		return 0, err
+	}
+	newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
+	fencing = errors.Is(err, ErrFencingWaitNotElapsed)
+	return newEpoch, err
 }
 
 // fenceSource is the Control Plane withdrawing its own record of hostID as a writer:

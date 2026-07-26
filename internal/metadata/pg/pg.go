@@ -236,7 +236,7 @@ func hostFromRow(h *db.Host, committed int64) (metadata.Host, error) {
 		HostID: h.HostID.String(), State: state, AgentVersion: h.AgentVersion,
 		MaxFormatVersion: h.MaxFormatVersion, NVMeTotalBytes: h.NvmeTotalBytes,
 		NVMeUsedBytes: h.NvmeUsedBytes, NVMeCommittedBytes: committed,
-		LastHeartbeat: fromTS(h.LastHeartbeat),
+		LastHeartbeat: fromTS(h.LastHeartbeat), RenewalsBlockedUntil: fromTS(h.RenewalsBlockedUntil),
 	}, nil
 }
 
@@ -298,8 +298,9 @@ func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, t
 	if err != nil || ok {
 		return err
 	}
-	// Still the leader, so the row was filtered by the host predicate: either there
-	// is no such host, or it is one the fleet no longer counts as a writer.
+	// Still the leader, so the row was filtered by the host predicate: there is no
+	// such host, it is one the fleet no longer counts as a writer, or a revocation
+	// window is open on it (ADR-0016).
 	h, gerr := s.GetHost(ctx, hostID)
 	if gerr != nil {
 		return gerr
@@ -307,9 +308,49 @@ func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, t
 	if !h.State.Serving() {
 		return fmt.Errorf("%w: host %s is %s", metadata.ErrHostNotServing, hostID, h.State)
 	}
+	now, nerr := s.Now(ctx)
+	if nerr != nil {
+		return nerr
+	}
+	if !h.RenewalsBlockedUntil.IsZero() && now.Before(h.RenewalsBlockedUntil) {
+		return fmt.Errorf("%w: host %s until %s", metadata.ErrRenewalsBlocked, hostID, h.RenewalsBlockedUntil)
+	}
 	// The host looks eligible now: it changed state between the write and this read.
 	// The write did not land, and saying so beats reporting success.
 	return fmt.Errorf("%w: host %s changed state concurrently", metadata.ErrHostNotServing, hostID)
+}
+
+// BlockHostRenewals opens (or re-arms) the ADR-0016 revocation window on a host.
+func (s *Store) BlockHostRenewals(ctx context.Context, term int64, hostID string, d time.Duration) error {
+	id, err := requireUUID("host", hostID)
+	if err != nil {
+		return err
+	}
+	if d <= 0 {
+		return s.UnblockHostRenewals(ctx, term, hostID)
+	}
+	rows, err := s.q.BlockHostRenewals(ctx, db.BlockHostRenewalsParams{
+		HostID: id, Secs: d.Seconds(), Term: term,
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	return metadata.ErrNotFound
+}
+
+// UnblockHostRenewals closes it. Idempotent: no window is the state asked for.
+func (s *Store) UnblockHostRenewals(ctx context.Context, term int64, hostID string) error {
+	id, err := requireUUID("host", hostID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.UnblockHostRenewals(ctx, db.UnblockHostRenewalsParams{HostID: id, Term: term})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	return metadata.ErrNotFound
 }
 
 // RevokeHostLease drops a host's lease. Idempotent: no lease is the state asked for.

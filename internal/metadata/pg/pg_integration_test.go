@@ -205,6 +205,15 @@ func TestPGFleetSurface(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
+	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 1<<30 {
+		t.Fatalf("committed = %d, want %d (the volume it now holds)", h.NVMeCommittedBytes, int64(1)<<30)
+	}
+	if err := store.CreateVolume(ctx, staleTerm, metadata.Volume{
+		VolumeID: ids.New().String(), SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
+		DEKWrapped: []byte{1}, KEKID: "k",
+	}, nil); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("stale-term create: want ErrStaleTerm, got %v", err)
+	}
 	vols, err := store.ListVolumesByHost(ctx, hostA)
 	if err != nil || len(vols) != 1 || vols[0].VolumeID != volID {
 		t.Fatalf("ListVolumesByHost(hostA) = %+v err=%v", vols, err)

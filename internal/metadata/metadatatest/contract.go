@@ -231,6 +231,12 @@ func everyMutation() []mutation {
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.RenewHostLease(ctx, term, w.host, 10)
 		}},
+		{"BlockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.BlockHostRenewals(ctx, term, w.host, time.Minute)
+		}},
+		{"UnblockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.UnblockHostRenewals(ctx, term, w.host)
+		}},
 		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return revokeHostLease(ctx, s, term, w.host)
 		}},
@@ -327,6 +333,12 @@ func missingRows(t *testing.T, s metadata.Store) {
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
+		}},
+		{"BlockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.BlockHostRenewals(ctx, term, ghostHost, time.Minute)
+		}},
+		{"UnblockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.UnblockHostRenewals(ctx, term, ghostHost)
 		}},
 		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return revokeHostLease(ctx, s, term, ghostHost)
@@ -861,8 +873,8 @@ func hostLeases(t *testing.T, s metadata.Store) {
 
 	t.Run("a cordoned or draining host still renews", func(t *testing.T) {
 		// A cordon stops new placement and a drain evacuates, but both hosts are
-		// still serving the volumes they hold: taking their lease away would stop
-		// their ACKs mid-evacuation.
+		// still serving the volumes they hold: taking their lease away for the whole
+		// evacuation would stop the ACKs of volumes nobody is moving (ADR-0016).
 		for _, state := range []lifecycle.HostState{lifecycle.HostCordoned, lifecycle.HostDraining} {
 			if err := s.SetHostState(ctx, w.term, w.host, state); err != nil {
 				t.Fatal(err)
@@ -870,6 +882,76 @@ func hostLeases(t *testing.T, s metadata.Store) {
 			if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
 				t.Fatalf("renewing the lease of a %s host: %v", state, err)
 			}
+		}
+	})
+
+	// ADR-0016 stage 1: the bounded version of that refusal. The Control Plane
+	// revokes a lease to fence one volume, and the host's next heartbeat would put it
+	// straight back; the window is how long that heartbeat is refused for.
+	t.Run("a revocation window refuses renewals while it is open", func(t *testing.T) {
+		if err := s.BlockHostRenewals(ctx, w.term, w.host, time.Minute); err != nil {
+			t.Fatalf("BlockHostRenewals: %v", err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+			t.Fatalf("renewing inside the window: want ErrRenewalsBlocked, got %v", err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.RenewalsBlockedUntil.IsZero() {
+			t.Fatal("the window is not visible on the host row")
+		}
+	})
+
+	t.Run("closing it lets the host renew again", func(t *testing.T) {
+		if err := s.UnblockHostRenewals(ctx, w.term, w.host); err != nil {
+			t.Fatalf("UnblockHostRenewals: %v", err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+			t.Fatalf("renewing after the window closed: %v", err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !h.RenewalsBlockedUntil.IsZero() {
+			t.Fatalf("the window is still recorded as open: %v", h.RenewalsBlockedUntil)
+		}
+	})
+
+	t.Run("closing a window that is not open is a no-op", func(t *testing.T) {
+		if err := s.UnblockHostRenewals(ctx, w.term, w.host); err != nil {
+			t.Fatalf("a second close must converge, not fail: %v", err)
+		}
+	})
+
+	t.Run("a window that has expired stops refusing", func(t *testing.T) {
+		// The Control Plane that opened it may not survive to close it, so the
+		// deadline is the backstop: a host whose drain died must serve again.
+		if err := s.BlockHostRenewals(ctx, w.term, w.host, -time.Minute); err != nil {
+			t.Fatalf("BlockHostRenewals: %v", err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+			t.Fatalf("an expired window still refuses renewals: %v", err)
+		}
+	})
+
+	t.Run("a heartbeat cannot close a window the Control Plane opened", func(t *testing.T) {
+		if err := s.BlockHostRenewals(ctx, w.term, w.host, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		// UpsertHost is the Agent reporting on itself; the window is the CP's.
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{
+			HostID: w.host, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+			t.Fatalf("a heartbeat closed the window fencing one of its volumes: %v", err)
+		}
+		if err := s.UnblockHostRenewals(ctx, w.term, w.host); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
@@ -1161,6 +1243,12 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, "", 10)
+		}},
+		{"BlockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.BlockHostRenewals(ctx, term, "", time.Minute)
+		}},
+		{"UnblockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.UnblockHostRenewals(ctx, term, "")
 		}},
 		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return revokeHostLease(ctx, s, term, "")

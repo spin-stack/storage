@@ -99,6 +99,10 @@ type Host struct {
 	// exist.
 	NVMeCommittedBytes int64
 	LastHeartbeat      time.Time
+	// RenewalsBlockedUntil is the end of the bounded revocation window (ADR-0016
+	// stage 1): until this instant, on the store's clock, RenewHostLease refuses.
+	// Zero means the host renews normally.
+	RenewalsBlockedUntil time.Time
 }
 
 // HostLease is the per-host lease (§12.6).
@@ -278,8 +282,28 @@ type Store interface {
 	// gone — the same assertion promotion accepts as a reason to skip the fencing
 	// wait — so a routine heartbeat must not be able to re-arm it. A CORDONED or
 	// DRAINING host still renews: both are still serving the volumes they hold, and
-	// stopping their ACKs mid-evacuation is the failure this would cause.
+	// stopping their ACKs for the whole evacuation is the failure that would cause.
+	//
+	// It is also refused, with ErrRenewalsBlocked, while a revocation window is open
+	// on the host (ADR-0016 stage 1) — the bounded version of that same refusal, for
+	// the length of one volume's promotion.
 	RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error
+	// BlockHostRenewals opens (or re-arms) the revocation window on hostID for d
+	// (term-guarded, §12.6/ADR-0016). While it is open the host's renewals are
+	// ErrRenewalsBlocked, so the lease the Control Plane revoked to fence one of its
+	// volumes cannot be put back by the host's next heartbeat.
+	//
+	// The window carries its own deadline rather than being a flag, because the
+	// Control Plane that opened it may not survive to close it: a host that can never
+	// renew again is worse than the bug the window fixes. d is therefore the length
+	// of one promotion — one lease_ttl + max_clock_skew — and a pass that is still
+	// running re-arms it rather than relying on the first call.
+	BlockHostRenewals(ctx context.Context, term int64, hostID string, d time.Duration) error
+	// UnblockHostRenewals closes the window (term-guarded). It is idempotent: a host
+	// with no window is the state the caller asked for, which matters because this
+	// runs on every exit path of a promotion, including the ones that never opened
+	// one.
+	UnblockHostRenewals(ctx context.Context, term int64, hostID string) error
 	// RevokeHostLease drops a host's lease (term-guarded), so nothing keeps its
 	// Agent-side lease alive once the Control Plane has fenced it. It is idempotent:
 	// revoking a lease that is not there is the state the caller asked for. An
