@@ -43,6 +43,7 @@ func Catalog() []MetricDesc {
 		{"wal_local_sequence", KindGauge, "Local sequence watermark (informative)", []string{"volume"}},
 		{"wal_durable_sequence", KindGauge, "Durable sequence watermark (informative)", []string{"volume"}},
 		{"wal_published_sequence", KindGauge, "Published sequence watermark (informative)", []string{"volume"}},
+		{"wal_out_of_space", KindGauge, "1 while the WAL device is refusing appends for want of space (§5.7)", []string{"volume"}},
 
 		// --- WAL remote (§26.2) ---
 		{"wal_batch_size_bytes", KindHistogram, "Closed WAL batch size", []string{"volume"}},

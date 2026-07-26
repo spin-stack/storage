@@ -11,8 +11,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/spin-stack/storage/internal/checkpoint"
+	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
@@ -36,6 +39,7 @@ func recoveryScenarios() []MandatoryScenario {
 		{Name: "boundary-chain-is-monotonic", Run: scenarioBoundaryChainMonotonic},
 		{Name: "durable-point-under-a-lagging-list", Run: scenarioDurablePointUnderLaggingList},
 		{Name: "divergent-objects-are-refused", Run: scenarioDivergentObjectsRefused},
+		{Name: "publishers-must-hold-the-epoch", Run: scenarioPublishersMustHoldTheEpoch},
 	}
 }
 
@@ -161,6 +165,134 @@ func (c *DurablePointMonotonicChecker) Observe(e Event) {
 }
 
 func (c *DurablePointMonotonicChecker) Check() error { return c.violation }
+
+// The three hosts of scenarioPublishersMustHoldTheEpoch: the one the object store
+// granted epoch 1 to, the one a promoter's half-finished work left named in
+// PostgreSQL at that same epoch, and the destination epoch 2 is granted to.
+const (
+	hostHoldsEpoch1 = "00000000-0000-7000-8000-0000000000d1"
+	hostNamedInPG   = "00000000-0000-7000-8000-0000000000d2"
+	hostHoldsEpoch2 = "00000000-0000-7000-8000-0000000000d3"
+)
+
+// grantEpochTo advances the volume's epoch object to ep, naming its holder (§12.3
+// step 4b).
+func grantEpochTo(ctx context.Context, es *epoch.Store, volumeID string, ep uint64, holder string) error {
+	_, etag, err := es.Current(ctx, volumeID)
+	if err != nil {
+		return err
+	}
+	_, err = es.Grant(ctx, volumeID, etag, ep, holder)
+	return err
+}
+
+// scenarioPublishersMustHoldTheEpoch is the split a number-only fence cannot see, run
+// end to end: PostgreSQL and the epoch object name two different hosts at the *same*
+// epoch, because the two records of a promotion are written by two steps of §12.3 and
+// a promoter can die between them.
+//
+// Both hosts are right about the number. One of them was granted the epoch. The
+// scenario asserts the three places that difference has to be decided:
+//
+//   - a checkpoint (a publication into checkpoints/<vol>/<epoch>/ that also authorises
+//     truncating the local WAL, INV-13) is refused for the host that was not granted
+//     the epoch, and its published watermark does not move;
+//   - the epoch boundary (create-only, immutable, §12.5) is refused for it too, and
+//     nothing is left in the bucket — the epoch's real holder must not inherit a floor
+//     it did not choose;
+//   - materialization is *not* refused. ADR-0008's drain has the destination rebuild
+//     the durable prefix of the epoch the source still holds, before the fence, so a
+//     holder check on the read path would make evacuating a dead host impossible.
+func scenarioPublishersMustHoldTheEpoch(s *Sim) error {
+	ctx := context.Background()
+	vol := recVol()
+	vid := format.UUIDString(vol)
+	es := epoch.NewStore(s.Store)
+
+	if _, err := es.Init(ctx, vid, 0); err != nil {
+		return err
+	}
+	if err := grantEpochTo(ctx, es, vid, 1, hostHoldsEpoch1); err != nil {
+		return fmt.Errorf("granting epoch 1: %w", err)
+	}
+
+	l, err := recLog(s, vol, 1, 0)
+	if err != nil {
+		return err
+	}
+	for i := range 2 {
+		if _, err := l.Write(uint64(i)*4096, []byte("acked"), 0); err != nil {
+			return err
+		}
+		if err := l.Flush(ctx); err != nil {
+			return fmt.Errorf("flush %d: %w", i, err)
+		}
+	}
+	acked := l.Watermarks().Durable
+
+	// The host PostgreSQL names checkpoints the very same log, at the very same epoch.
+	// Only the publisher's identity differs from the call below it, and only that may
+	// decide the outcome.
+	cps := checkpoint.NewCheckpointer(s.Store)
+	if _, err := cps.HeldBy(hostNamedInPG).Create(ctx, l, vol, 1); !errors.Is(err, epoch.ErrNotHolder) {
+		return fmt.Errorf("a host the epoch was never granted to published a checkpoint into it: %v", err)
+	}
+	if p := l.Watermarks().Published; p != 0 {
+		return fmt.Errorf("a refused checkpoint advanced published to %d, authorising truncation of "+
+			"local WAL this host does not own (INV-13)", p)
+	}
+	if err := l.TruncateLocal(acked); !errors.Is(err, wal.ErrTruncateAboveDurable) {
+		return fmt.Errorf("truncation must stay refused after a refused checkpoint, got %v", err)
+	}
+
+	// The holder publishes the identical checkpoint, and only now is the local copy
+	// disposable.
+	if _, err := cps.HeldBy(hostHoldsEpoch1).Create(ctx, l, vol, 1); err != nil {
+		return fmt.Errorf("the epoch's holder could not publish its own checkpoint: %w", err)
+	}
+	if p := l.Watermarks().Published; p != acked {
+		return fmt.Errorf("published = %d after the holder's checkpoint, want %d", p, acked)
+	}
+	if err := l.TruncateLocal(acked); err != nil {
+		return fmt.Errorf("truncation to the published point: %w", err)
+	}
+
+	// ADR-0008 step 1: the destination rebuilds epoch 1 while hostHoldsEpoch1 still
+	// holds it. This must succeed — it is the whole reason a drain works against a
+	// host that is dead or refusing to cooperate.
+	_, prog, err := materialize.New(s.Store, nil, nil).FromEpoch(ctx, vol, 1)
+	if err != nil {
+		return fmt.Errorf("the destination cannot rebuild an epoch another host holds (ADR-0008): %w", err)
+	}
+	if prog.UpTo != acked {
+		return fmt.Errorf("the bulk pass covered %d, the epoch is durable through %d", prog.UpTo, acked)
+	}
+
+	// ADR-0008 step 2: the fence. Epoch 2 goes to the destination.
+	if err := grantEpochTo(ctx, es, vid, 2, hostHoldsEpoch2); err != nil {
+		return fmt.Errorf("granting epoch 2: %w", err)
+	}
+
+	// The boundary is create-only and immutable, so the wrong author is not a mistake
+	// anyone can repair: it must be refused, and it must leave nothing behind.
+	rp := recovery.RecoveryPoint{PrevEpoch: 1, RecoveredUpTo: acked}
+	if err := rp.WriteAs(ctx, s.Store, vol, 2, hostNamedInPG); !errors.Is(err, epoch.ErrNotHolder) {
+		return fmt.Errorf("a host epoch 2 was never granted to recorded its immutable boundary: %v", err)
+	}
+	if _, err := recovery.ReadRecoveryPoint(ctx, s.Store, vol, 2); !errors.Is(err, objectstore.ErrNotFound) {
+		return errors.New("the refused boundary object was written anyway — it can never be rewritten")
+	}
+	if err := rp.WriteAs(ctx, s.Store, vol, 2, hostHoldsEpoch2); err != nil {
+		return fmt.Errorf("the holder of epoch 2 could not record its own boundary: %w", err)
+	}
+	if err := observeBoundary(s, vol, 2); err != nil {
+		return err
+	}
+
+	s.Notef("two hosts at epoch 1, one grant: the holder published and truncated, the other was "+
+		"refused at the checkpoint and at the boundary, and the drain still read %d", prog.UpTo)
+	return nil
+}
 
 // recVol is the v7-shaped volume id this area's scenarios use.
 func recVol() [16]byte {
