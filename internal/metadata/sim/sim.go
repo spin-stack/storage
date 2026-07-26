@@ -573,6 +573,17 @@ func (s *Store) RecordOperation(_ context.Context, term int64, op metadata.Opera
 	if _, exists := s.ops[op.OperationID]; exists {
 		return false, nil // duplicate request (§18)
 	}
+	// One live drain per host (§28.1). In Postgres this is a unique partial index;
+	// here it is the same rule stated in Go, because a property proven against this
+	// store is only a proof about production if both refuse the same writes.
+	if op.Kind == lifecycle.OpDrain && op.HostID != "" && !op.Phase.Terminal() {
+		for _, cur := range s.ops {
+			if cur.Kind == lifecycle.OpDrain && cur.HostID == op.HostID && !cur.Phase.Terminal() {
+				return false, fmt.Errorf("%w: host %s is already being drained by operation %s",
+					metadata.ErrDrainInProgress, op.HostID, cur.OperationID)
+			}
+		}
+	}
 	s.ops[op.OperationID] = op
 	return true, nil
 }
@@ -617,7 +628,9 @@ func (s *Store) ListLiveOperationsByHost(_ context.Context, hostID string) ([]me
 	defer s.mu.Unlock()
 	var ops []metadata.Operation
 	for _, op := range s.ops {
-		if op.HostID == hostID {
+		// Live only, as in Postgres: a finished operation is history, and the
+		// question this answers is what is happening now (§28.1).
+		if op.HostID == hostID && !op.Phase.Terminal() {
 			ops = append(ops, op)
 		}
 	}

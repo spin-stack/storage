@@ -401,14 +401,25 @@ type Store interface {
 
 	// RecordOperation records an admin operation idempotently (term-guarded, §7/§18);
 	// recorded is false if the operation_id already existed (a duplicate request).
+	//
+	// A drain of a host that already has a live one is ErrDrainInProgress and is not
+	// recorded (§28.1): two evacuations of one host strand a reservation nobody will
+	// release. The refusal is the store's, so a Control Plane that checked first and
+	// then wrote — which is not exclusion — cannot end up with two.
 	RecordOperation(ctx context.Context, term int64, op Operation) (recorded bool, err error)
 	// GetOperation returns a recorded operation.
 	GetOperation(ctx context.Context, operationID string) (Operation, error)
-	// ListLiveOperationsByHost returns every operation recorded against hostID, ordered
-	// by operation id (deterministic, INV-02). It is how a reconciler asks what is
-	// already happening to a host before starting something else: an operation id is
-	// the only handle GetOperation offers, and a second drain arrives with a new one
-	// (§7, §28.1).
+	// ListLiveOperationsByHost returns the operations still under way on hostID —
+	// every phase but the terminal ones — ordered by operation id (deterministic,
+	// INV-02). It is how a reconciler asks what is already happening to a host
+	// before starting something else: an operation id is the only handle
+	// GetOperation offers, and a second drain arrives with a new one (§7, §28.1).
+	//
+	// Finished operations are excluded by the store, not by the caller. Nothing
+	// deletes them, so the set of operations a host has ever had only grows, and a
+	// listing that carried the history would make the question that runs before
+	// every drain pass more expensive for the rest of the cluster's life. A caller
+	// that wants a specific past operation has its id and GetOperation.
 	ListLiveOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
 	// UpdateOperation stores an operation's phase, current state, and error — the
 	// visible progress of a long-running reconciled operation (§7, §28.1). It is

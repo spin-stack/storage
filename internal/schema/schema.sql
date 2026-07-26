@@ -178,14 +178,16 @@ CREATE TABLE operations (
 --    future FK arrives without one.
 -- 2. A query with a filter + ORDER BY gets a composite index in that order, so the
 --    planner can skip the sort. Today that is ListVolumesByHost, the loop a drain
---    iterates, and ListOperationsByHost, the lookup that stops a second drain of a
---    host that already has one (§28.1).
+--    iterates, and ListLiveOperationsByHost, the lookup that stops a second drain of
+--    a host that already has one (§28.1). Where the query also has a fixed
+--    predicate, the index carries it: see the live-operation indexes below.
 --
 -- Deliberately NOT added yet (no query uses them; each has a named trigger so the
 -- index lands with its query rather than on speculation):
 --   * operations (phase) WHERE phase NOT IN ('SUCCEEDED','CANCELED') — a partial
---     index for "find work to reconcile". Needed when the reconciler loop lands
---     (§7); without it that scan grows with completed-operation history.
+--     index for "find work to reconcile", fleet-wide rather than per host. Needed
+--     when the reconciler loop lands (§7); the per-host one below does not serve it,
+--     since a scan for work everywhere has no host to lead with.
 --   * hosts (last_heartbeat) / host_leases (last_renewal) — expiry sweeps (§12.3).
 --     The fleet is hundreds of rows; a sequential scan is cheaper than the index
 --     until it is not.
@@ -198,10 +200,53 @@ CREATE TABLE operations (
 -- as the FK index for primary_host_id.
 CREATE INDEX volumes_primary_host_id_volume_id_idx ON volumes (primary_host_id, volume_id);
 
--- ListOperationsByHost: WHERE host_id = $1 ORDER BY operation_id (§28.1, the drain's
--- exclusion check). Composite for the same reason as the volumes one above, and it
--- doubles as the FK index for host_id.
+-- The FK index for operations.host_id (rule 1). It is not the index the drain reads
+-- by: a parent DELETE has to find every child row, including the finished ones, so
+-- this one cannot be partial — and precisely because it cannot, it is the wrong
+-- index for a query that only ever wants the live ones.
 CREATE INDEX operations_host_id_operation_id_idx ON operations (host_id, operation_id);
+
+-- The live-operation predicate, twice.
+--
+-- `phase NOT IN ('SUCCEEDED', 'CANCELED')` is lifecycle.OperationPhase.Terminal()
+-- written in SQL, and that duplication is the real cost of these two indexes: the
+-- authority for the vocabulary is internal/lifecycle, and this is a second copy of
+-- one of its rules. It is stated as the *complement* of the terminal set rather than
+-- as a list of live phases because that set is the one the lifecycle defines and the
+-- one that does not grow when a phase is added — a new live phase is covered by
+-- these indexes on the day it is declared, without a schema change.
+--
+-- The duplication is only acceptable because a test refuses to let it drift:
+-- TestPGLivePhaseSetsAgreeWithTheLifecycle evaluates these predicates in PostgreSQL
+-- once per value of the vocabulary and compares each answer with lifecycle's own. If
+-- that test is ever deleted, delete these indexes with it.
+
+-- ListLiveOperationsByHost: WHERE host_id = $1 AND phase NOT IN (…) ORDER BY
+-- operation_id (§28.1, the drain's exclusion check). Partial because `operations` is
+-- append-only history — nothing deletes a finished operation — so an index over all
+-- of them makes the check that runs before every drain pass slower for the rest of
+-- the cluster's life. Composite so the index satisfies the filter and the sort.
+CREATE INDEX operations_live_by_host_idx ON operations (host_id, operation_id)
+    WHERE phase NOT IN ('SUCCEEDED', 'CANCELED');
+
+-- One live drain per host (§28.1). Two evacuations of one host each capture their
+-- own plan and promote the same volumes; whichever loses a race is left holding a
+-- destination reservation nobody will release, because releasing it is the losing
+-- operation's own next step and that step now fails for ever (§28.2). Wave 3 closed
+-- the harm in Go with a read followed by a write, which is not exclusion: two
+-- goroutines inside one leader can both pass the read. This closes it.
+--
+-- A unique partial index rather than EXCLUDE USING gist (host_id WITH =): the
+-- constraint form needs the btree_gist extension and buys nothing here, since
+-- equality is all this excludes on. host_id is nullable and NULLs are distinct, so
+-- an operation attached to no host is unaffected — which is right, since nothing can
+-- be draining a host nobody named.
+--
+-- Only an INSERT can violate it. A row enters the live set at creation or by leaving
+-- the terminal set, and no phase transition leaves it (SUCCEEDED and CANCELED have
+-- no successors), so the phase update path cannot create a second live drain.
+CREATE UNIQUE INDEX operations_one_live_drain_per_host_idx ON operations (host_id)
+    WHERE kind = 'drain' AND phase NOT IN ('SUCCEEDED', 'CANCELED');
 
 -- FK indexes (rule 1).
 CREATE INDEX volumes_standby_host_id_idx ON volumes (standby_host_id);

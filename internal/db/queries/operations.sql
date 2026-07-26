@@ -14,11 +14,23 @@ ON CONFLICT (operation_id) DO NOTHING;
 SELECT * FROM operations WHERE operation_id = $1;
 
 -- name: ListLiveOperationsByHost :many
--- Every operation recorded against a host, so a reconciler can ask what is already
--- happening to it before starting something else (§7, §28.1). Deterministic order:
--- the answer must not depend on row order (INV-02), and the composite index
--- operations (host_id, operation_id) satisfies both the filter and the sort.
-SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id;
+-- The operations still happening on a host, so a reconciler can ask what is already
+-- under way before starting something else (§7, §28.1). Deterministic order: the
+-- answer must not depend on row order (INV-02).
+--
+-- The phase predicate is written out rather than passed as a parameter because it is
+-- what makes operations_live_by_host_idx usable: the planner has to see that the
+-- query's condition implies the index's, and a parameter it cannot see is a
+-- condition it cannot match. `operations` is append-only history — nothing deletes a
+-- finished operation — so without the partial index this walks everything the host
+-- has ever done, on every drain pass.
+--
+-- It is the terminal set spelled out, which lifecycle.OperationPhase.Terminal() also
+-- defines; TestPGLivePhaseSetsAgreeWithTheLifecycle refuses to let the two drift.
+SELECT * FROM operations
+ WHERE host_id = $1
+   AND phase NOT IN ('SUCCEEDED', 'CANCELED')
+ ORDER BY operation_id;
 
 -- name: UpdateOperationPhase :execrows
 -- Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a

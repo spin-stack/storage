@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/spin-stack/storage/internal/db"
@@ -158,6 +159,33 @@ func (s *Store) boundRefused(ctx context.Context, b *metadata.CapacityBound) err
 			metadata.ErrCapacityExceeded, b.HostID, after, b.Limit)
 	}
 	return nil
+}
+
+// oneLiveDrainPerHostIndex is the unique partial index that makes "one live drain
+// per host" a property of the database rather than of whoever remembered to check
+// (§28.1, schema.sql). Its name is matched rather than the SQLSTATE alone: 23505 on
+// this table also means a duplicate operation_id, which is idempotency and not an
+// error at all.
+const oneLiveDrainPerHostIndex = "operations_one_live_drain_per_host_idx"
+
+// uniqueViolation is SQLSTATE 23505, spelled out rather than pulled in as a
+// dependency for one constant.
+const uniqueViolation = "23505"
+
+// drainInProgress turns that index's violation into a sentinel the caller can act
+// on. Without it the loser of the race is handed a driver error carrying an index
+// name, which no caller can branch on and every caller would log as "unknown".
+//
+// Only the insert path needs it: a row joins the live set when it is created or by
+// leaving the terminal set, and no phase transition leaves it (SUCCEEDED and
+// CANCELED have no successors), so an update cannot create a second live drain.
+func drainInProgress(err error, hostID string) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != uniqueViolation ||
+		pgErr.ConstraintName != oneLiveDrainPerHostIndex {
+		return nil
+	}
+	return fmt.Errorf("%w: host %s", metadata.ErrDrainInProgress, hostID)
 }
 
 func notFound(err error) error {
@@ -706,6 +734,9 @@ func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Ope
 		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase.String(),
 		Term: term,
 	})
+	if derr := drainInProgress(err, op.HostID); derr != nil {
+		return false, derr
+	}
 	// This query affects 0 rows for two very different reasons: the request is a
 	// duplicate (§18 idempotency — recorded=false, no error) or the caller is not
 	// the leader (§7 — ErrStaleTerm). Reporting the second as the first is what lets
