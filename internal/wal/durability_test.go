@@ -378,3 +378,58 @@ func TestLocalModeWithoutALeaseStillAcks(t *testing.T) {
 	// fdatasync and S3 catches up asynchronously (§14.8), which is what the RPO
 	// metric measures.
 }
+
+// TestPublishedNeverWalksBackwards: the published point is the floor INV-13 enforces
+// truncation against, and TruncateLocal has already discarded the records below it —
+// they exist in a verified checkpoint and nowhere else on this host. Letting it move
+// *down* therefore does not merely lose a number: it re-opens a range that has been
+// reclaimed, so the next check compares a live truncation floor against a smaller
+// published point and the WAL can be told to serve records whose bytes are gone.
+//
+// The reachable path is a stale listing (§24, and the DST harness models it): a
+// checkpoint recomputes the published point from what S3 lists, and a listing that is
+// momentarily behind proves less than the previous one did. The ordering rule guarded
+// against durable and against nothing else, so the lower value was accepted with no
+// error anywhere.
+func TestPublishedNeverWalksBackwards(t *testing.T) {
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	lm := lease.NewManager(clk, 10*time.Second)
+	lm.Grant()
+	l := remoteLeasedLog(t, store, clk, lm)
+	for range 3 {
+		if _, err := l.Write(0, []byte("x"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.AdvancePublished(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.TruncateLocal(3); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		seq  uint64
+		want error
+	}{
+		{name: "a stale listing proves less than the last one", seq: 0, want: wal.ErrWatermarkOrder},
+		{name: "one object short of the published point", seq: 2, want: wal.ErrWatermarkOrder},
+		{name: "the same point again is idempotent, not a regression", seq: 3, want: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := l.AdvancePublished(tc.seq)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("AdvancePublished(%d) = %v, want %v", tc.seq, err, tc.want)
+			}
+			if got := l.Watermarks().Published; got < 3 {
+				t.Fatalf("published fell to %d under WAL already reclaimed to 3", got)
+			}
+		})
+	}
+}
