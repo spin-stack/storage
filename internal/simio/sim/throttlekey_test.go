@@ -1,7 +1,6 @@
 package sim_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -15,7 +14,7 @@ import (
 // step of the promotion protocol: the moment the production code adds a HEAD, the
 // fault lands somewhere else and the scenario passes for the wrong reason.
 func TestInjectThrottleKeyOnlyHitsThatKey(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	if _, err := s.Put(ctx, "other", []byte("v"), objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
@@ -48,7 +47,7 @@ func TestInjectThrottleKeyOnlyHitsThatKey(t *testing.T) {
 // A throttled operation is a refusal, not a partial effect: the create-only PUT that
 // follows must still see the key as absent.
 func TestThrottledPutLeavesNoObject(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	s.InjectThrottleKey("k", 1)
 

@@ -1,7 +1,6 @@
 package controlplane_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -32,7 +31,7 @@ var clonePolicy = placement.Policy{MaxOversubscription: 2.0}
 // and a metadata store with a source and a destination host.
 func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snapshot.Manifest) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	md := metasim.New(clk.Wall)
@@ -83,7 +82,7 @@ func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snap
 // TestCloneCrossHostMaterializesOnDestination: the clone lands on a host that never
 // had the data, rebuilt from S3 alone, with the destination's capacity committed.
 func TestCloneCrossHostMaterializesOnDestination(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term, store, m := crossHostWorld(t)
 
 	res, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
@@ -115,7 +114,7 @@ func TestCloneCrossHostMaterializesOnDestination(t *testing.T) {
 // TestCloneCrossHostReleasesCapacityOnFailure: a failed materialization must not
 // leak a reservation, or the fleet slowly loses placeable capacity (§28.2).
 func TestCloneCrossHostReleasesCapacityOnFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term, store, m := crossHostWorld(t)
 
 	// The snapshot references an object that is no longer there.
@@ -138,7 +137,7 @@ func TestCloneCrossHostReleasesCapacityOnFailure(t *testing.T) {
 // TestCloneCrossHostFromOrphanSnapshotFails: a snapshot whose volume is gone (a
 // catalog left inconsistent by a partial rebuild) cannot be cloned.
 func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term, store, _ := crossHostWorld(t)
 
 	const orphanSnap = "00000000-0000-7000-8000-0000000000b9"
@@ -161,7 +160,7 @@ func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
 // TestCloneCrossHostToUnknownHostFails: the destination is read before anything is
 // reserved, so no materialization work is started for a host that does not exist.
 func TestCloneCrossHostToUnknownHostFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term, store, m := crossHostWorld(t)
 
 	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
@@ -176,7 +175,7 @@ func TestCloneCrossHostToUnknownHostFails(t *testing.T) {
 // TestCloneCrossHostFromMissingSnapshotFails: nothing is committed when the source
 // does not even exist.
 func TestCloneCrossHostFromMissingSnapshotFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term, store, _ := crossHostWorld(t)
 
 	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),

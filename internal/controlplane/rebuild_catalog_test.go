@@ -1,7 +1,6 @@
 package controlplane_test
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -29,7 +28,7 @@ const (
 )
 
 func TestRebuildRestoresTheSnapshotCatalog(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)
@@ -89,7 +88,7 @@ func TestRebuildRestoresTheSnapshotCatalog(t *testing.T) {
 // TestRebuildIsIdempotent: rebuild-metadata is run by an operator under pressure,
 // possibly twice. It must converge, not duplicate or fail.
 func TestRebuildIsIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)
@@ -124,7 +123,7 @@ func TestRebuildIsIdempotent(t *testing.T) {
 // turns a partial rebuild into a surprise. Hosts and in-flight operations are not in
 // S3 at all, and the caller has to know that.
 func TestRebuildReportsWhatItCouldNotReconstruct(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	md := metasim.New(clk.Wall)
@@ -153,7 +152,7 @@ func TestRebuildReportsWhatItCouldNotReconstruct(t *testing.T) {
 // digest is corrupt (INV-16 says a published one never changes). Writing a catalog
 // row for it would give that corruption authority over restores.
 func TestRebuildRefusesACorruptManifest(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)
@@ -185,7 +184,7 @@ func TestRebuildRefusesACorruptManifest(t *testing.T) {
 // independently — a PITR restore can bring volumes back while the catalog is still
 // short, and the rebuild has to fill that in rather than skipping the volume.
 func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)
@@ -232,7 +231,7 @@ func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
 // aborting; this pins that from the rebuild's side, which is the only place the
 // consequence is visible.
 func TestTwoConcurrentRebuildsBothComplete(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)

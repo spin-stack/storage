@@ -1,7 +1,6 @@
 package snapshot_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -31,7 +30,7 @@ func remoteLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]byt
 // TestSnapshotIsPauseFreeAndCapturesSequence: the capture does not advance the clock
 // (pause ≈ 0) and the manifest's target is the captured sequence.
 func TestSnapshotIsPauseFreeAndCapturesSequence(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
@@ -57,7 +56,7 @@ func TestSnapshotIsPauseFreeAndCapturesSequence(t *testing.T) {
 
 // TestSnapshotExcludesLaterWrites: writes after the capture are not in the snapshot.
 func TestSnapshotExcludesLaterWrites(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
@@ -89,14 +88,14 @@ func TestSnapshotExcludesLaterWrites(t *testing.T) {
 }
 
 func TestReadMissingManifest(t *testing.T) {
-	if _, err := snapshot.Read(context.Background(), sim.NewObjectStore(), "vol", "nope"); err == nil {
+	if _, err := snapshot.Read(t.Context(), sim.NewObjectStore(), "vol", "nope"); err == nil {
 		t.Fatal("reading a missing manifest should error")
 	}
 }
 
 // TestSnapshotManifestIsImmutable is INV-16: republishing a manifest fails.
 func TestSnapshotManifestIsImmutable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	m := snapshot.Manifest{SnapshotID: "s1", VolumeID: format.UUIDString(v7Vol()), Epoch: 1, TargetSequence: 5}
 	if err := snapshot.Publish(ctx, store, m); err != nil {

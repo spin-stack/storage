@@ -85,7 +85,7 @@ func TestLostResponseReconcilesOnABackendWithS3ETags(t *testing.T) {
 			name = "multipart etag"
 		}
 		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			store := &s3ETagStore{ObjectStore: sim.NewObjectStore(), multipart: multipart}
 			cb := batchFor(t, "batch-bytes")
 
@@ -104,7 +104,7 @@ func TestLostResponseReconcilesOnABackendWithS3ETags(t *testing.T) {
 // TestDivergentObjectIsStillDetected is the other half: reconciling must not become
 // "assume it is fine". A different body at the same key is a hard failure (§14.5).
 func TestDivergentObjectIsStillDetected(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := &s3ETagStore{ObjectStore: sim.NewObjectStore()}
 	cb := batchFor(t, "batch-bytes")
 

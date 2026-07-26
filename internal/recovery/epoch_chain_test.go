@@ -1,7 +1,6 @@
 package recovery_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -33,7 +32,7 @@ func epochWriter(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]b
 // TestRecoverChainsAcrossEpochs: the writes from before a promotion must be in the
 // rebuilt view.
 func TestRecoverChainsAcrossEpochs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	vol := vol7()
@@ -82,7 +81,7 @@ func TestRecoverChainsAcrossEpochs(t *testing.T) {
 // TestRecoverChainsAcrossThreeEpochs: a volume moved twice (rolling maintenance) must
 // still hold everything.
 func TestRecoverChainsAcrossThreeEpochs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	vol := vol7()
@@ -124,7 +123,7 @@ func TestRecoverChainsAcrossThreeEpochs(t *testing.T) {
 // predecessor is missing while the predecessor holds data, recovery must not quietly
 // return the newest epoch alone — that is the silent-loss shape.
 func TestRecoverRefusesABrokenChain(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	vol := vol7()
@@ -156,7 +155,7 @@ func TestRecoverRefusesABrokenChain(t *testing.T) {
 // TestEpochChainReportsTheSpans: the chain is the contract other packages build on
 // (materialization fetches per span), so its shape is asserted directly.
 func TestEpochChainReportsTheSpans(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -189,7 +188,7 @@ func TestEpochChainReportsTheSpans(t *testing.T) {
 // TestEpochChainRefusesASelfReference: a boundary pointing at itself or forward is
 // corrupt, and following it would loop or invent history.
 func TestEpochChainRefusesASelfReference(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -203,7 +202,7 @@ func TestEpochChainRefusesASelfReference(t *testing.T) {
 
 // TestFirstEpochNeedsNoBoundary: the common case must stay simple.
 func TestFirstEpochNeedsNoBoundary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -220,7 +219,7 @@ func TestFirstEpochNeedsNoBoundary(t *testing.T) {
 // epoch whose objects cannot be listed — the volume's history would silently start
 // later than it does.
 func TestChainStopsWhenAnEarlierEpochIsUnreadable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	vol := vol7()

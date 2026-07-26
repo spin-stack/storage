@@ -2,7 +2,6 @@ package real_test
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -44,7 +43,7 @@ func newFSStore(t *testing.T) (*real.ObjectStore, string) {
 // TestPutIsNeverPartiallyVisible: whatever a reader gets, it is a complete object
 // somebody wrote — never a prefix of one, never zero bytes of a non-empty one.
 func TestPutIsNeverPartiallyVisible(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s, _ := newFSStore(t)
 	const key = "wal/v/1/1-1-a.wal"
 
@@ -116,7 +115,7 @@ func TestPutIsNeverPartiallyVisible(t *testing.T) {
 // being written again, a reader may see nothing or the new object. The bytes the
 // operator retired must never be served.
 func TestARewriteOverAMarkedObjectNeverResurrectsTheOldBytes(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	const key = "wal/v/1/2-2-b.wal"
 	retired := bytes.Repeat([]byte("retired-by-the-operator"), 4096)
 	replacement := bytes.Repeat([]byte("the-new-object"), 4096)
@@ -173,7 +172,7 @@ func TestARewriteOverAMarkedObjectNeverResurrectsTheOldBytes(t *testing.T) {
 // object (delete markers, temp files, locks) must never surface as a key. A stray
 // key is an orphan to the GC and a corrupt WAL object to recovery.
 func TestStoreInternalsAreNotObjects(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s, dir := newFSStore(t)
 	keys := []string{"wal/v/1/1-1-a.wal", "wal/v/1/2-2-b.wal", "volumes/v/descriptor.json"}
 	for _, k := range keys {
@@ -226,7 +225,7 @@ func TestStoreInternalsAreNotObjects(t *testing.T) {
 // suffix, so a key ending in one would make an object indistinguishable from a
 // delete marker — silently hiding, or resurrecting, the object it sits next to.
 func TestAKeyCannotCollideWithTheStoresBookkeeping(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s, _ := newFSStore(t)
 	for _, key := range []string{"wal/v/1/x.wal.deleted", "wal/v/1/x.wal.superseded", "wal/v/1/x.wal.tmp"} {
 		t.Run(key, func(t *testing.T) {

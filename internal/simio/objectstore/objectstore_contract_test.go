@@ -1,7 +1,6 @@
 package objectstore_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -35,7 +34,7 @@ func TestContract(t *testing.T) {
 // but its response is lost; the idempotent retry with If-None-Match sees the
 // object already there (412), HEADs it, and the checksums match => success.
 func TestSimLostResponseIsIdempotentOnRetry(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	key := "wal/v/0/1-1-hash.wal"
 	data := []byte("the-batch-bytes")
@@ -61,7 +60,7 @@ func TestSimLostResponseIsIdempotentOnRetry(t *testing.T) {
 }
 
 func TestSimThrottle(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	s.InjectThrottle(2)
 	if _, err := s.Put(ctx, "k", []byte("v"), objectstore.PutOptions{}); !errors.Is(err, sim.ErrThrottled) {
@@ -77,7 +76,7 @@ func TestSimThrottle(t *testing.T) {
 }
 
 func TestSimEventualList(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	s.SetEventualList(true)
 	_, _ = s.Put(ctx, "wal/1", []byte("a"), objectstore.PutOptions{})
@@ -113,7 +112,7 @@ var (
 // mistake costs a restore and not the data. The S3-backed store satisfies this via
 // the backend's delete markers, asserted in the integration lane.
 func TestDeleteIsReversibleAcrossImplementations(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	impls := map[string]objectstore.Store{"sim": sim.NewObjectStore()}
 	rs, err := real.NewObjectStore(t.TempDir())
 	if err != nil {

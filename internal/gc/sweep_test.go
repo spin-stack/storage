@@ -1,7 +1,6 @@
 package gc_test
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -24,7 +23,7 @@ const grace = time.Hour
 // it lists again — and the newly anchored, live objects are marked. Correct code on
 // both sides of the race, data loss anyway.
 func TestAManifestPublishedDuringTheSweepIsHonoured(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, anchoredWAL, otherWAL)
@@ -67,7 +66,7 @@ func TestAManifestPublishedDuringTheSweepIsHonoured(t *testing.T) {
 // Combined with a GC host whose clock runs ahead of the backend's, the window
 // collapses entirely: every object of the in-flight publication looks ancient.
 func TestAPublicationOutlastingGraceUnderClockSkewIsHonoured(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	storeClk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	gcClk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC().Add(4 * grace)) // GC host runs ahead
 	store := newStore(storeClk)
@@ -100,7 +99,7 @@ func TestAPublicationOutlastingGraceUnderClockSkewIsHonoured(t *testing.T) {
 // protected forever, and the bucket grows without bound with no signal at all. The
 // sweep must say so rather than quietly do nothing.
 func TestSweepRefusesWhenTheStoreClockIsAheadOfTheGCClock(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	base := time.Unix(1_700_000_000, 0).UTC()
 
 	tests := []struct {
@@ -153,7 +152,7 @@ func TestSweepRefusesWhenTheStoreClockIsAheadOfTheGCClock(t *testing.T) {
 // already marked. That is an ErrNotFound from Delete, which killed the pass at the
 // first collision and left the rest of the bucket unswept, with an opaque error.
 func TestTwoOverlappingSweepsBothComplete(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	inner := newStore(clk)
 	orphans := []string{"wal/av/1/1-1-a.wal", "wal/av/1/2-2-b.wal", "wal/av/1/3-3-c.wal", "wal/av/1/4-4-d.wal"}
@@ -200,7 +199,7 @@ func TestTwoOverlappingSweepsBothComplete(t *testing.T) {
 // TestASweepResumesAfterAFailureAtEveryPosition: whatever object the backend refuses
 // on, the next pass must pick up exactly the remainder — no gap, no double count.
 func TestASweepResumesAfterAFailureAtEveryPosition(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	orphans := []string{"wal/av/1/1-1-a.wal", "wal/av/1/2-2-b.wal", "wal/av/1/3-3-c.wal", "wal/av/1/4-4-d.wal"}
 
 	for k := 1; k <= len(orphans); k++ {
@@ -249,7 +248,7 @@ func TestASweepResumesAfterAFailureAtEveryPosition(t *testing.T) {
 // looking at the previous pass's number — and a stuck GC is exactly the condition the
 // gauge exists to show (§26.2, DEV-0010).
 func TestOrphanGaugeIsRecordedEvenWhenTheSweepFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, err := obs.NewTestProvider("gc-test")
 	if err != nil {
 		t.Fatal(err)

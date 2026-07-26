@@ -1,7 +1,6 @@
 package wal_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -16,7 +15,7 @@ import (
 // volume's RPO, and the self-fencing counter — are recorded by the path that owns
 // them, not merely declared.
 func TestFlushRecordsTheWatermarkMetrics(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, err := obs.NewTestProvider("wal-telemetry")
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +56,7 @@ func TestFlushRecordsTheWatermarkMetrics(t *testing.T) {
 }
 
 func TestSelfFencingIsCounted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, err := obs.NewTestProvider("wal-telemetry")
 	if err != nil {
 		t.Fatal(err)

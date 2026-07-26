@@ -65,7 +65,7 @@ func TestRealDiskErrorPaths(t *testing.T) {
 }
 
 func TestRealObjectStoreErrorPaths(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s, err := real.NewObjectStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +101,7 @@ func TestRealClockTimerStop(t *testing.T) {
 
 func TestRealClockSleepContext(t *testing.T) {
 	c := real.NewClock()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	if err := c.Sleep(ctx, time.Hour); err == nil {
 		t.Fatal("Sleep should return the context error when cancelled")

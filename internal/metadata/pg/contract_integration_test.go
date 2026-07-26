@@ -22,7 +22,7 @@ import (
 // One container is started for the whole contract and the tables are truncated
 // between cases: the contract is about behaviour, not about container startup.
 func TestPGStoreContract(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	metadatatest.RunContract(t, func(t *testing.T) metadata.Store {
 		if _, err := pool.Exec(ctx,
@@ -40,7 +40,7 @@ func TestPGStoreContract(t *testing.T) {
 // success without evacuating it, and promotion's resume branch (v.PrimaryHostID ==
 // newHost) can never match, so every retry burns another epoch.
 func TestPGMalformedIDsAreRejected(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	term, err := store.AcquireLeadership(ctx, "cp")
@@ -137,7 +137,7 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 // UPDATE predicate, not in a read-modify-write in Go, or two Control Planes racing
 // to react to the same suspicion can both win.
 func TestPGVolumeStateGuardIsAtomic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	// Asserted rather than called directly so the gap "the Store stores the §7
@@ -189,7 +189,7 @@ func TestPGVolumeStateGuardIsAtomic(t *testing.T) {
 // Go lets a publication that lands between the read and the write be overwritten by
 // a concurrent cleanup pass marking the snapshot FAILED.
 func TestPGSnapshotStateGuardIsAtomic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	setter, ok := any(store).(interface {

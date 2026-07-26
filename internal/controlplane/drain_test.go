@@ -116,7 +116,7 @@ type drainWorld struct {
 // a source lease last renewed at T0.
 func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	base := metasim.New(clk.Wall)
@@ -202,7 +202,7 @@ func (w *drainWorld) book(hostID string, delta int64) error {
 // committed reports a host's committed NVMe bytes.
 func (w *drainWorld) committed(t *testing.T, hostID string) int64 {
 	t.Helper()
-	h, err := w.base.GetHost(context.Background(), hostID)
+	h, err := w.base.GetHost(t.Context(), hostID)
 	if err != nil {
 		t.Fatalf("host %s: %v", hostID, err)
 	}
@@ -214,7 +214,7 @@ func (w *drainWorld) committed(t *testing.T, hostID string) int64 {
 // written by the wrong party is not a mistake that can be corrected later.
 func (w *drainWorld) noBoundary(t *testing.T, vol [16]byte, epoch uint64) {
 	t.Helper()
-	if rp, err := recovery.ReadRecoveryPoint(context.Background(), w.store, vol, epoch); err == nil {
+	if rp, err := recovery.ReadRecoveryPoint(t.Context(), w.store, vol, epoch); err == nil {
 		t.Fatalf("an epoch boundary was written for epoch %d: %+v", epoch, rp)
 	}
 }
@@ -236,7 +236,7 @@ func (w *drainWorld) killAfterTheRelease(t *testing.T, volumeID string) {
 // addHost registers an extra ACTIVE host with room for ten volumes.
 func (w *drainWorld) addHost(t *testing.T, hostID string) {
 	t.Helper()
-	if err := w.base.UpsertHost(context.Background(), w.term, metadata.Host{
+	if err := w.base.UpsertHost(t.Context(), w.term, metadata.Host{
 		HostID: hostID, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
 	}); err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func (w *drainWorld) pastFencingWait() { w.clk.Advance(leaseTTL + maxSkew + time
 // materialized prefix covers what the source ACKed (INV-09), an epoch-boundary
 // recovery point is written (INV-12), and capacity follows the volume (§28.2).
 func TestDrainMovesEveryVolumeFenced(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -300,7 +300,7 @@ func TestDrainMovesEveryVolumeFenced(t *testing.T) {
 // TestDrainWaitsForFencing: before FENCING_WAIT elapses no volume moves and no
 // epoch is granted (INV-11). The reconciler simply retries later.
 func TestDrainWaitsForFencing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
 	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
@@ -330,7 +330,7 @@ func TestDrainWaitsForFencing(t *testing.T) {
 // destination runs out of capacity) resumes on the same operation id and finishes
 // the rest, without moving an already-moved volume again (§7 reconciliation, §18).
 func TestDrainIsResumableAndDoesNotMoveTwice(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// The destination has room for exactly one volume under the 2.0 policy.
 	w := newDrainWorld(t, volSize/2)
 	w.pastFencingWait()
@@ -370,7 +370,7 @@ func TestDrainIsResumableAndDoesNotMoveTwice(t *testing.T) {
 // TestDrainCancelStopsAtVolumeBoundary: cancellation is honored between volumes —
 // never between promote and detach — so every volume still has exactly one writer.
 func TestDrainCancelStopsAtVolumeBoundary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -398,7 +398,7 @@ func TestDrainCancelStopsAtVolumeBoundary(t *testing.T) {
 // TestDrainCancelAfterPartialProgress: cancelling a drain that is already under way
 // stops it at the next volume boundary, leaving the already-moved volumes intact.
 func TestDrainCancelAfterPartialProgress(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// Room for one volume only, so the first pass stops after moving one.
 	w := newDrainWorld(t, volSize/2)
 	w.pastFencingWait()
@@ -433,7 +433,7 @@ func TestDrainCancelAfterPartialProgress(t *testing.T) {
 // promotion and the boundary write finds an identical recovery point and proceeds
 // (§18); a boundary that says something else is a hard error.
 func TestDrainToleratesItsOwnRecoveryPoint(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	first := w.vols[0]
@@ -461,7 +461,7 @@ func TestDrainToleratesItsOwnRecoveryPoint(t *testing.T) {
 // TestDrainReleasesCapacityWhenMaterializationFails: a move that cannot rebuild the
 // volume on the destination gives the reservation back (§28.2).
 func TestDrainReleasesCapacityWhenMaterializationFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -497,7 +497,7 @@ func TestDrainReleasesCapacityWhenMaterializationFails(t *testing.T) {
 // part of the move; if the books say the source never held those bytes, the drain
 // reports it instead of writing a negative (§28.2).
 func TestDrainSurfacesBrokenCapacityAccounting(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -513,7 +513,7 @@ func TestDrainSurfacesBrokenCapacityAccounting(t *testing.T) {
 // TestDrainOfUnknownHostFails: a drain of a host that is not registered cannot even
 // cordon it, and fails before touching any volume.
 func TestDrainOfUnknownHostFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	if _, err := w.drainer.Drain(ctx, w.term, "00000000-0000-7000-8000-00000000dead", drainOpID); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
@@ -523,7 +523,7 @@ func TestDrainOfUnknownHostFails(t *testing.T) {
 // TestDrainRejectsMalformedVolumeID: the volume id is the same 16-byte id the WAL
 // keyspace uses; a row that is not a UUID stops the move instead of guessing.
 func TestDrainRejectsMalformedVolumeID(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
@@ -540,7 +540,7 @@ func TestDrainRejectsMalformedVolumeID(t *testing.T) {
 // TestDrainPrefersTheWarmStandby is §20 step 2 / §22.3: when a volume has a warm
 // standby, the evacuation lands there — it is already hydrated, so the move is short.
 func TestDrainPrefersTheWarmStandby(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -577,7 +577,7 @@ func TestDrainPrefersTheWarmStandby(t *testing.T) {
 // TestDrainOfEmptyHostIsDrained: draining a host with no volumes is a no-op that
 // still cordons it — the operation is idempotent, not an error.
 func TestDrainOfEmptyHostIsDrained(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -602,7 +602,7 @@ func TestDrainOfEmptyHostIsDrained(t *testing.T) {
 // (TestDrainRefusesToFinishAVolumeAnotherActorPromoted), so it can no longer stand in
 // for this one.
 func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	firstID := format.UUIDString(w.vols[0])
 
@@ -651,7 +651,7 @@ func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 // release capacity twice (which the non-negative guard would turn into a hard error
 // on a host that legitimately holds other volumes).
 func TestDrainReleasesSourceCapacityExactlyOnce(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -676,7 +676,7 @@ func TestDrainReleasesSourceCapacityExactlyOnce(t *testing.T) {
 // so a volume that lands on the source *after* the drain started is not swept into
 // it — the operator asked to evacuate a set, not to chase a moving target.
 func TestDrainResumeUsesTheRecordedPlan(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
@@ -711,7 +711,7 @@ func TestDrainResumeUsesTheRecordedPlan(t *testing.T) {
 // has to derive the epoch boundary from S3. If the previous epoch's objects are
 // unreadable, the boundary would be a guess — the pass fails instead.
 func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	firstID := format.UUIDString(w.vols[0])
 
@@ -759,7 +759,7 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 // promotion granted early would run against a writer that can still ACK — the
 // failure INV-11 exists to prevent.
 func TestDrainRevokesTheSourceLeaseBeforeItPromotes(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize) // the source's lease was renewed "now"
 
 	// The source is healthy: this pass runs while its lease is live.
@@ -803,7 +803,7 @@ func TestDrainRevokesTheSourceLeaseBeforeItPromotes(t *testing.T) {
 // The crash is the one that leaves the drain in that state: the promotion landed and
 // the progress write that records it did not.
 func TestDrainDoesNotRevokeTheDestinationsLease(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
@@ -834,7 +834,7 @@ func TestDrainDoesNotRevokeTheDestinationsLease(t *testing.T) {
 // Once the operation succeeded there is nothing to cancel, and letting it flip back
 // would misreport what happened to the fleet.
 func TestCancelAFinishedDrainIsRefused(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
@@ -851,7 +851,7 @@ func TestCancelAFinishedDrainIsRefused(t *testing.T) {
 // TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan: the operation still exists, so a
 // later pass has something to be idempotent about.
 func TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -874,7 +874,7 @@ func TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan(t *testing.T) {
 // — but when it is present and higher than what the object store yields, the move is
 // about to lose ACKed data and must stop.
 func TestDrainRefusesAnEpochBoundaryBelowThePGWatermark(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	firstID := format.UUIDString(w.vols[0])
 
@@ -897,7 +897,7 @@ func TestDrainRefusesAnEpochBoundaryBelowThePGWatermark(t *testing.T) {
 // an epoch with no objects at all. That is not data loss — it is an empty epoch, and
 // recording a boundary of zero for it is correct.
 func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -940,7 +940,7 @@ func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
 // every later pass (the host stays DRAINING and the remaining volumes are never
 // evacuated), and with slack it silently eats another volume's reservation.
 func TestDrainReleasesCapacityOnceWhenTheProgressWriteFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
@@ -974,7 +974,7 @@ func TestDrainReleasesCapacityOnceWhenTheProgressWriteFails(t *testing.T) {
 // window between a completed move and the record of it must not make the resumed
 // pass release that volume's capacity again.
 func TestDrainCancelBetweenTheMoveAndTheProgressWrite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
@@ -1018,7 +1018,7 @@ func TestDrainCancelBetweenTheMoveAndTheProgressWrite(t *testing.T) {
 // understates the previous epoch collapses the live epoch's contiguous prefix to zero
 // — nor release capacity for a move it did not make.
 func TestDrainRefusesToFinishAVolumeAnotherActorPromoted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	firstID := format.UUIDString(w.vols[0])
 
@@ -1066,7 +1066,7 @@ func TestDrainRefusesToFinishAVolumeAnotherActorPromoted(t *testing.T) {
 // The exclusion is over *live* work: once the owning operation is finished, the same
 // host may be drained again.
 func TestASecondDrainOfTheSameHostIsRefused(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
 	// The first operation records its plan and stops on the fencing wait.
@@ -1116,7 +1116,7 @@ func TestASecondDrainOfTheSameHostIsRefused(t *testing.T) {
 // assertions stay: they are about the fleet's accounting, not about which of the two
 // mechanisms enforces it.
 func TestTwoDrainsOfTheSameHostReleaseCapacityOnce(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	// Reservations on the source that belong to volumes no drain is moving.
 	if err := w.book(cloneHostA, 3*volSize); err != nil {
@@ -1152,7 +1152,7 @@ func TestTwoDrainsOfTheSameHostReleaseCapacityOnce(t *testing.T) {
 // Inferring prev = current-1 records a permanent boundary of zero for an epoch that
 // holds ACKed data, which recovery then reads as "durable through nothing".
 func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
@@ -1186,7 +1186,7 @@ func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
 // never held, create-only boundary keys burned on the volumes' live epoch, and
 // SUCCEEDED reported over fabricated moves.
 func TestDrainRefusesAnOperationIdRecordedForAnotherHost(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
 	// The operation is recorded for the source host and stops on the fencing wait.
@@ -1220,7 +1220,7 @@ func TestDrainRefusesAnOperationIdRecordedForAnotherHost(t *testing.T) {
 // returned to ACTIVE would otherwise leave placement again, silently, while the call
 // reports success. (The DEAD arm is by design: a dead host is still evacuated.)
 func TestDuplicateDrainDoesNotReCordonARepairedHost(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
@@ -1244,7 +1244,7 @@ func TestDuplicateDrainDoesNotReCordonARepairedHost(t *testing.T) {
 // volume's primary to a dead host, commit its capacity there and release the
 // source's — a volume stranded with no writer.
 func TestDrainAbortsWhenTheDestinationDiesBeforeThePromotion(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -1278,7 +1278,7 @@ func TestDrainAbortsWhenTheDestinationDiesBeforeThePromotion(t *testing.T) {
 // TestDrainWithAStaleTermMutatesNothing: a zombie Control Plane must learn it is a
 // zombie before it cordons a host or reserves anything (§7).
 func TestDrainWithAStaleTermMutatesNothing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -1305,7 +1305,7 @@ func TestDrainWithAStaleTermMutatesNothing(t *testing.T) {
 // so the drain must say so. A phantom reservation nobody reconciles makes placement
 // under-use, and eventually refuse, a host that is actually empty (§28.2).
 func TestDrainSurfacesAReservationItCouldNotRelease(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -1338,7 +1338,7 @@ func TestDrainSurfacesAReservationItCouldNotRelease(t *testing.T) {
 // FLUSHes into the old epoch while the destination writes the new one, and
 // everything ACKed above the recorded boundary is discarded at recovery.
 func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// Room for exactly one volume, so the first pass stops after moving one.
 	w := newDrainWorld(t, volSize/2)
 	w.pastFencingWait()
@@ -1378,7 +1378,7 @@ func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
 // past MaxOversubscription × NVMeTotalBytes with neither caller having made a
 // mistake, and the volumes that follow are placed against a ledger that already lies.
 func TestDrainRefusesADestinationAnotherPlacementFilled(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// The destination holds one volume-worth of NVMe; under the 2.0 policy its
 	// declared ceiling is 2*volSize.
 	w := newDrainWorld(t, volSize)
@@ -1419,7 +1419,7 @@ func TestDrainRefusesADestinationAnotherPlacementFilled(t *testing.T) {
 // result is indistinguishable from a correct one while the other operation's
 // reservation has silently been consumed.
 func TestDrainRefusesAReleaseWhoseLedgerMovedUnderTheRead(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
@@ -1467,7 +1467,7 @@ func TestDrainRefusesAReleaseWhoseLedgerMovedUnderTheRead(t *testing.T) {
 // meantime that proof is gone, and the drain says so rather than guessing — releasing
 // again would consume a reservation belonging to a volume nobody is moving.
 func TestDrainRefusesToGuessWhenTheCapacityLedgerMoved(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
@@ -1505,7 +1505,7 @@ func TestDrainRefusesToGuessWhenTheCapacityLedgerMoved(t *testing.T) {
 // object is immutable, so a later read could refuse nothing — and reverting the drain
 // to the anonymous recovery.WriteRecoveryPoint makes this test fail.
 func TestDrainWritesTheBoundaryAsTheEpochHolder(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	firstID := format.UUIDString(w.vols[0])
 

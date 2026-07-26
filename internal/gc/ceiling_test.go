@@ -1,7 +1,6 @@
 package gc_test
 
 import (
-	"context"
 	"slices"
 	"testing"
 	"time"
@@ -32,7 +31,7 @@ import (
 // closeEpoch records the promotion boundary that supersedes epoch 1 at `upTo`.
 func closeEpoch(t *testing.T, store *sim.ObjectStore, vol [16]byte, upTo uint64) {
 	t.Helper()
-	if err := recovery.WriteRecoveryPoint(context.Background(), store, vol, 2, 1, upTo); err != nil {
+	if err := recovery.WriteRecoveryPoint(t.Context(), store, vol, 2, 1, upTo); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -40,7 +39,7 @@ func closeEpoch(t *testing.T, store *sim.ObjectStore, vol [16]byte, upTo uint64)
 // publishSnapshot publishes a manifest anchoring every object of epoch 1 up to target.
 func publishSnapshot(t *testing.T, store *sim.ObjectStore, vol [16]byte, target uint64) []string {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	objects, err := recovery.ObjectKeysUpTo(ctx, store, vol, 1, target)
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +75,7 @@ func TestASupersededEpochsSnapshotSurvivesASweep(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 			store := newStore(clk)
 			vol := vol9()
@@ -120,7 +119,7 @@ func TestASupersededEpochsSnapshotSurvivesASweep(t *testing.T) {
 // object) leaves the sweep unable to tell a superseded epoch from an open one, and
 // that is a reason to stop — the same discipline as an unreadable anchor.
 func TestSweepStopsWhenAnEpochBoundaryCannotBeRead(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	vol := vol9()
@@ -152,7 +151,7 @@ func TestSweepStopsWhenAnEpochBoundaryCannotBeRead(t *testing.T) {
 // INV-14's own trade. Collecting them is an operator action on a named epoch, never an
 // inference the sweep makes for itself.
 func TestASupersededEpochsLatePutIsNoLongerCollected(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	vol := vol9()

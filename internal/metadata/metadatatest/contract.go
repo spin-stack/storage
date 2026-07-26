@@ -196,7 +196,7 @@ type world struct {
 
 func newWorld(t *testing.T, s metadata.Store) world {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	term, err := s.AcquireLeadership(ctx, "cp-a")
 	if err != nil {
 		t.Fatalf("AcquireLeadership: %v", err)
@@ -302,7 +302,7 @@ func everyMutation() []mutation {
 // never acquired leadership — or that read a zeroed config field — passes; treating
 // it as valid lets an unelected process bump epochs and release capacity.
 func termZero(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	// No AcquireLeadership: there is no leader at all.
 	w := world{host: id(), vol: id(), snap: id(), op: id()}
 	for _, m := range everyMutation() {
@@ -317,7 +317,7 @@ func termZero(t *testing.T, s metadata.Store) {
 // staleTerm: the §7 property over the whole mutating surface, with every row
 // present so ErrNotFound cannot stand in for the answer.
 func staleTerm(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	stale := w.term
 	if _, err := s.AcquireLeadership(ctx, "cp-b"); err != nil {
@@ -336,7 +336,7 @@ func staleTerm(t *testing.T, s metadata.Store) {
 // reconciler that reads ErrStaleTerm here steps down and re-acquires leadership
 // forever over a volume that was simply deleted.
 func missingRows(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	ghostHost, ghostVol, ghostSnap, ghostOp := id(), id(), id(), id()
 
@@ -406,7 +406,7 @@ func missingRows(t *testing.T, s metadata.Store) {
 // reason, the term is the answer. Otherwise the zombie is told "shrink not allowed"
 // or "no such volume" and concludes it is still the leader.
 func staleTermWins(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	if err := s.ResizeVolume(ctx, w.term, w.vol, 1<<31); err != nil {
 		t.Fatal(err)
@@ -454,7 +454,7 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 // production run that does not have it — scenarioRecoveryAuthorityIsS3 seeds a
 // deliberately wrong durable_sequence exactly this way.
 func volumeRoundTrip(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	standby := id()
 	if err := s.UpsertHost(ctx, w.term, metadata.Host{HostID: standby, State: lifecycle.HostActive}); err != nil {
@@ -491,7 +491,7 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 // rewrite the lifecycle state — each of those hands the fleet to the wrong writer or
 // hides data that is durable in S3.
 func volumeRecreate(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	vol := id()
 	if err := s.CreateVolume(ctx, w.term, metadata.Volume{
@@ -534,7 +534,7 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 // — the concurrent-rebuild case again — is a no-op, not an overwrite and not an
 // abort that leaves the catalog half-built.
 func snapshotRecreate(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	snapID, reqID := id(), id()
 	first := metadata.Snapshot{
@@ -568,7 +568,7 @@ func snapshotRecreate(t *testing.T, s metadata.Store) {
 // that can refuse to move durable_sequence backwards, and that number is what an
 // operator uses during an incident to decide whether to accept data loss.
 func watermarks(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	if err := s.UpdateWatermarks(ctx, w.term, w.vol, 100, 90, 80); err != nil {
 		t.Fatal(err)
@@ -623,7 +623,7 @@ func watermarks(t *testing.T, s metadata.Store) {
 // heartbeat wins, AcceptsPlacement() starts handing the host new volumes while its
 // own are being evacuated, and the drain's later release underflows.
 func upsertHost(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	if err := s.CommitHostCapacity(ctx, w.term, w.host, metadata.CapacityChange{DeltaBytes: 700, Limit: 1 << 40}); err != nil {
 		t.Fatal(err)
@@ -660,7 +660,7 @@ func upsertHost(t *testing.T, s metadata.Store) {
 // An operator cancelling a drain through a CP that lost the election otherwise gets
 // success while the real drain keeps promoting volumes.
 func recordOperation(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	op := metadata.Operation{
 		OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
@@ -697,7 +697,7 @@ func recordOperation(t *testing.T, s metadata.Store) {
 // Store. A volume mid-promotion persisted as ACTIVE leaves a restarted or second CP
 // with no durable signal that it is being fenced, so it can start a competing attach.
 func volumeLifecycle(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 
 	// §7's path to a new writer: ACTIVE -> PRIMARY_SUSPECTED -> FENCING_WAIT ->
@@ -730,7 +730,7 @@ func volumeLifecycle(t *testing.T, s metadata.Store) {
 // and then DELETING, or it stays CREATING forever, the catalog side of GC never sees
 // it, and its objects are never collected.
 func snapshotLifecycle(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s) // w.snap is CREATING
 
 	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotFailed); err != nil {
@@ -774,7 +774,7 @@ func snapshotLifecycle(t *testing.T, s metadata.Store) {
 // This case replaces an earlier one that asserted the opposite — n bumps produce n
 // distinct epochs — which pinned the blind increment as if it were the contract.
 func concurrentBumps(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 	const n = 8
 
@@ -843,7 +843,7 @@ func concurrentBumps(t *testing.T, s metadata.Store) {
 // itself: it re-arms the writer it just fenced while the new primary is materialising
 // the epoch, and both ACK.
 func hostLeases(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 
 	if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
@@ -914,7 +914,7 @@ func hostLeases(t *testing.T, s metadata.Store) {
 // the next one starts from, so a write that lands when it should not is visible in
 // the case after it as well as in its own.
 func capacity(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s) // one ACTIVE host, 1 TiB of NVMe, nothing committed
 	const (
 		gib   = int64(1) << 30
@@ -1020,7 +1020,7 @@ func capacity(t *testing.T, s metadata.Store) {
 // operation belonging to another host, or to no host at all, must never be counted
 // as work in progress here.
 func operationsByHost(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s) // records one drain operation for w.host
 
 	other := id()
@@ -1085,7 +1085,7 @@ func operationsByHost(t *testing.T, s metadata.Store) {
 // correction, a VM restored from a snapshot, a bad RTC — so the promoter has to be
 // able to ask the store what time it thinks it is.
 func authorityClock(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 
 	before, err := now(ctx, s)
@@ -1119,7 +1119,7 @@ func authorityClock(t *testing.T, s metadata.Store) {
 // meaningfully empty, so it is rejected rather than written — a row keyed on the
 // empty string is invisible to every lookup that follows.
 func emptyIDs(t *testing.T, s metadata.Store) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, s)
 
 	tests := []mutation{

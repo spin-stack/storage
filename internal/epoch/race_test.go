@@ -73,7 +73,7 @@ func TestCurrentIsAStableRead(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			backing := sim.NewObjectStore()
 			h := &hookedStore{Store: backing}
 			s := epoch.NewStore(h)
@@ -119,7 +119,7 @@ func TestCurrentIsAStableRead(t *testing.T) {
 // could, two writers would number objects into wal/<vol>/4/ independently and the
 // contiguous prefix would belong to neither (INV-08/INV-10).
 func TestTwoPromotersCannotBothGrantTheSameEpoch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	backing := sim.NewObjectStore()
 	h := &hookedStore{Store: backing}
 	loser := epoch.NewStore(h)
@@ -202,7 +202,7 @@ func TestCurrentReportsAFailedRead(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			backing := sim.NewObjectStore()
 			if _, err := epoch.NewStore(backing).Init(ctx, vol, 2); err != nil {
 				t.Fatal(err)
@@ -228,7 +228,7 @@ func TestCurrentReportsAFailedRead(t *testing.T) {
 // is. A promoter that advances the object in the window between the two must still
 // win, and ours must come back as a CAS conflict rather than overwriting it.
 func TestCompareAndAdvanceStillLosesARaceAfterItsPreCheck(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	backing := sim.NewObjectStore()
 	h := &hookedStore{Store: backing}
 	loser := epoch.NewStore(h)
@@ -272,7 +272,7 @@ func TestCompareAndAdvanceRefusesToGoBackwards(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			s := epoch.NewStore(sim.NewObjectStore())
 			etag, err := s.Init(ctx, vol, 5)
 			if err != nil {

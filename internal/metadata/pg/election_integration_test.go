@@ -3,7 +3,6 @@
 package pg_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/controlplane"
@@ -23,7 +22,7 @@ import (
 // it, which no assertion here depends on. Said plainly so nobody reads this as proof
 // that a full restore was exercised.
 func TestATermIsNeverIssuedTwiceAcrossADatabaseRestore(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	if _, err := pool.Exec(ctx, `TRUNCATE operations, snapshots, volumes, host_leases, hosts, control_plane_leader`); err != nil {
 		t.Fatalf("reset: %v", err)

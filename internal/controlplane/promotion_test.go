@@ -1,7 +1,6 @@
 package controlplane_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -26,13 +25,13 @@ func setup(t *testing.T) (*controlplane.Promoter, metadata.Store, *epoch.Store, 
 	md := metasim.New(clk.Wall)
 	epochs := epoch.NewStore(sim.NewObjectStore())
 
-	term, _ := md.AcquireLeadership(context.Background(), "cp")
-	_ = md.UpsertHost(context.Background(), term, metadata.Host{HostID: host1, State: lifecycle.HostActive})
-	_ = md.UpsertHost(context.Background(), term, metadata.Host{HostID: host2, State: lifecycle.HostActive})
-	_ = md.CreateVolume(context.Background(), term, metadata.Volume{
+	term, _ := md.AcquireLeadership(t.Context(), "cp")
+	_ = md.UpsertHost(t.Context(), term, metadata.Host{HostID: host1, State: lifecycle.HostActive})
+	_ = md.UpsertHost(t.Context(), term, metadata.Host{HostID: host2, State: lifecycle.HostActive})
+	_ = md.CreateVolume(t.Context(), term, metadata.Volume{
 		VolumeID: volID, State: lifecycle.VolumeActive, PrimaryHostID: host1, DEKWrapped: []byte{1}, KEKID: "k",
 	})
-	if _, err := epochs.Init(context.Background(), volID, 0); err != nil {
+	if _, err := epochs.Init(t.Context(), volID, 0); err != nil {
 		t.Fatal(err)
 	}
 	p := controlplane.NewPromoter(md, epochs, clk, 10*time.Second, 2*time.Second)
@@ -42,7 +41,7 @@ func setup(t *testing.T) (*controlplane.Promoter, metadata.Store, *epoch.Store, 
 // TestFencingWaitEnforced is INV-11: promotion is refused until
 // last_renewal + lease_ttl + max_clock_skew has elapsed.
 func TestFencingWaitEnforced(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, md, epochs, clk, term := setup(t)
 	renewedAt := clk.Wall() // old primary's last lease renewal
 
@@ -77,7 +76,7 @@ func TestFencingWaitEnforced(t *testing.T) {
 // TestDriftOnlyLengthensTheWait is INV-11 / §12.1: a CP wall clock behind true time
 // only makes the wait longer; it never grants early.
 func TestDriftOnlyLengthensTheWait(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, _, _, clk, term := setup(t)
 	renewedAt := clk.Wall()
 
@@ -97,7 +96,7 @@ func TestDriftOnlyLengthensTheWait(t *testing.T) {
 // writer's epoch is fenced — its publish fails the epoch check and CAS, and a
 // stale-term mutation affects 0 rows.
 func TestStaleWriterCannotPublishAfterPromotion(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, md, epochs, clk, term := setup(t)
 	renewedAt := clk.Wall()
 

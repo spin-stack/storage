@@ -1,7 +1,6 @@
 package recovery_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -24,7 +23,7 @@ import (
 
 // TestBoundaryMustNotRegress: epoch 3's boundary may not be lower than epoch 2's.
 func TestBoundaryMustNotRegress(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -54,7 +53,7 @@ func TestBoundaryMustNotRegress(t *testing.T) {
 // caught up reports a shorter prefix, with no error. Writing *that* number as the
 // next epoch's floor is how a stale listing loses an ACKed FLUSH permanently.
 func TestBoundaryMustNotDropBelowWhatThePreviousWriterAcked(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	store.SetEventualList(true)
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
@@ -109,7 +108,7 @@ func TestBoundaryMustNotDropBelowWhatThePreviousWriterAcked(t *testing.T) {
 // epoch 2's). Recovery must still refuse to build a volume out of it rather than
 // hand back spans whose ranges run backwards.
 func TestEpochChainRefusesANonMonotonicChain(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -135,7 +134,7 @@ func TestEpochChainRefusesANonMonotonicChain(t *testing.T) {
 // fails closed. A backend that cannot answer for the previous epoch leaves the floor
 // unknown, and an unknown floor may not be written over.
 func TestBoundaryWriteRefusesWhatItCannotCheck(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	vol := vol7()
 
 	tests := []struct {
@@ -167,7 +166,7 @@ func TestBoundaryWriteRefusesWhatItCannotCheck(t *testing.T) {
 // asserts the two properties the chain rests on: each boundary links to the epoch
 // before it, and the recovered points never go down.
 func TestChainedBoundariesAreMonotonicAndLinked(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := vol7()

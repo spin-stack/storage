@@ -1,7 +1,6 @@
 package checkpoint_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -30,7 +29,7 @@ func remoteLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]byt
 // TestCheckpointThenTruncate: a checkpoint advances published; only then can local
 // WAL be truncated up to that point (§21.1). Recovery from S3 is unaffected.
 func TestCheckpointThenTruncate(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
@@ -72,7 +71,7 @@ func TestCheckpointThenTruncate(t *testing.T) {
 // TestNeverTruncateAboveDurable is INV-13: even after a checkpoint, truncating
 // beyond the published point is refused.
 func TestNeverTruncateAboveDurable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
@@ -95,13 +94,13 @@ func TestNeverTruncateAboveDurable(t *testing.T) {
 }
 
 func TestReadMissingCheckpoint(t *testing.T) {
-	if _, err := checkpoint.Read(context.Background(), sim.NewObjectStore(), "v", 1, 5); err == nil {
+	if _, err := checkpoint.Read(t.Context(), sim.NewObjectStore(), "v", 1, 5); err == nil {
 		t.Fatal("reading a missing checkpoint should error")
 	}
 }
 
 func TestCheckpointImmutable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	cp := checkpoint.Checkpoint{VolumeID: "v", Epoch: 1, DurableSequence: 5}
 	if err := checkpoint.Publish(ctx, store, cp); err != nil {

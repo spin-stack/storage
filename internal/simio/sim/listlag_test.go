@@ -1,7 +1,6 @@
 package sim_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -15,7 +14,7 @@ import (
 // scenario needs in order to explore *when* the catch-up lands relative to the
 // promotion, the boundary write, or the GC's second listing.
 func TestSetListLagMakesAKeyVisibleAfterNOperations(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name string
@@ -65,7 +64,7 @@ func TestSetListLagMakesAKeyVisibleAfterNOperations(t *testing.T) {
 // Settle is the escape hatch every scenario needs at the end: whatever the lag, the
 // listing eventually reflects reality.
 func TestSettleCatchesUpAnyLag(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	s.SetListLag(100)
 	if _, err := s.Put(ctx, "wal/k", []byte("v"), objectstore.PutOptions{}); err != nil {
@@ -83,7 +82,7 @@ func TestSettleCatchesUpAnyLag(t *testing.T) {
 // The lag must not resurrect a delete marker: an object marked while it was still
 // invisible to List stays out of the listing forever, not "until it catches up".
 func TestListLagDoesNotResurrectAMarkedObject(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	s.SetListLag(2)
 	if _, err := s.Put(ctx, "wal/k", []byte("v"), objectstore.PutOptions{}); err != nil {
@@ -102,7 +101,7 @@ func TestListLagDoesNotResurrectAMarkedObject(t *testing.T) {
 
 // A negative lag is a caller mistake, not a request for a listing from the future.
 func TestSetListLagRejectsANegativeLag(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	s.SetListLag(-5)
 	if _, err := s.Put(ctx, "wal/k", []byte("v"), objectstore.PutOptions{}); err != nil {

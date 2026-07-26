@@ -1,7 +1,6 @@
 package wal_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -32,7 +31,7 @@ import (
 //     one moment the answer has to be right, and fails with ErrAmbiguousSequence.
 
 func TestUploaderRefusesASpanOverlappingOneItPublished(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	published := oneBatch(1, 3)
 
 	tests := []struct {
@@ -94,7 +93,7 @@ func TestUploaderRefusesASpanOverlappingOneItPublished(t *testing.T) {
 // are not an overlap, and neither are two epochs — the epoch boundary is what makes
 // the second one's records different records (§12.5).
 func TestOverlapIsScopedToOneVolumeAndEpoch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	u := wal.NewUploader(sim.NewObjectStore(), 3)
 	if _, err := u.Upload(ctx, oneBatch(1, 3)); err != nil {
 		t.Fatal(err)
@@ -125,7 +124,7 @@ func TestOverlapIsScopedToOneVolumeAndEpoch(t *testing.T) {
 // re-batch is harmless, which is the trade-off recovery.VerifyAgreement already
 // resolves the other way.
 func TestAForeignWritersPartialOverlapIsNotCaughtOnTheWritePath(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 
 	fenced := wal.NewUploader(store, 3)

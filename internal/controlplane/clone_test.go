@@ -1,7 +1,6 @@
 package controlplane_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -25,12 +24,12 @@ func cpStore(t *testing.T) (metadata.Store, int64) {
 	t.Helper()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	md := metasim.New(clk.Wall)
-	term, _ := md.AcquireLeadership(context.Background(), "cp")
+	term, _ := md.AcquireLeadership(t.Context(), "cp")
 	return md, term
 }
 
 func TestCloneIsIndependentOfParent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term := cpStore(t)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
@@ -65,7 +64,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 
 // TestCloneWithStaleTermFails: a zombie CP cannot create the clone volume (§7).
 func TestCloneWithStaleTermFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term := cpStore(t)
 	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"})
 	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID})
@@ -80,7 +79,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 }
 
 func TestCloneFromMissingSnapshotFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term := cpStore(t)
 	if _, err := controlplane.Clone(ctx, md, term, "no-such-snap", cloneVol, cloneHostA); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("clone from a missing snapshot: want ErrNotFound, got %v", err)
@@ -88,7 +87,7 @@ func TestCloneFromMissingSnapshotFails(t *testing.T) {
 }
 
 func TestResizeGrowsOnly(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term := cpStore(t)
 	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 100, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"})
 
@@ -105,7 +104,7 @@ func TestResizeGrowsOnly(t *testing.T) {
 }
 
 func TestSnapshotCatalogRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, term := cpStore(t)
 	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"})
 	snap := metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 2, TargetSequence: 7, RootDigest: "d", State: lifecycle.SnapshotPublished, ManifestKey: "snapshots/x", RequestID: reqID}

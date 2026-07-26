@@ -1,7 +1,6 @@
 package sim_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -17,7 +16,7 @@ import (
 // against fabricated events.
 
 func TestInjectPermanentDeleteRemovesTheBytes(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	if _, err := s.Put(ctx, "k", []byte("v"), objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
@@ -48,7 +47,7 @@ func TestInjectPermanentDeleteRemovesTheBytes(t *testing.T) {
 }
 
 func TestInjectIgnorePreconditionsMakesCreateOnlyAnOverwrite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	if _, err := s.Put(ctx, "k", []byte("first"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
@@ -71,7 +70,7 @@ func TestInjectIgnorePreconditionsMakesCreateOnlyAnOverwrite(t *testing.T) {
 }
 
 func TestInjectStaleReadServesThePreviousVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	if _, err := s.Put(ctx, "k", []byte("v1"), objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)

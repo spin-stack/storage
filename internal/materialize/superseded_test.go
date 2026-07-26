@@ -1,7 +1,6 @@
 package materialize_test
 
 import (
-	"context"
 	"crypto/sha256"
 	"errors"
 	"testing"
@@ -69,7 +68,7 @@ func craft(t *testing.T, vol [16]byte, epoch, first, last uint64, content string
 
 func put(t *testing.T, store *sim.ObjectStore, key string, body []byte) {
 	t.Helper()
-	if _, err := store.Put(context.Background(), key, body, objectstore.PutOptions{}); err != nil {
+	if _, err := store.Put(t.Context(), key, body, objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -77,7 +76,7 @@ func put(t *testing.T, store *sim.ObjectStore, key string, body []byte) {
 // TestFromEpochStopsAtTheSuccessorsBoundary: the drain's final pass over the old epoch
 // must land on exactly the number the boundary already records.
 func TestFromEpochStopsAtTheSuccessorsBoundary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 
@@ -113,7 +112,7 @@ func TestFromEpochStopsAtTheSuccessorsBoundary(t *testing.T) {
 // TestFromEpochAndDurablePrefixAgreeOnOverlappingObjects: one bucket, two readers.
 // They must not disagree about whether it is recoverable.
 func TestFromEpochAndDurablePrefixAgreeOnOverlappingObjects(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 
@@ -142,7 +141,7 @@ func TestFromEpochAndDurablePrefixAgreeOnOverlappingObjects(t *testing.T) {
 // TestFromEpochRefusesDivergentObjects is INV-21 on the materialization path: the
 // destination must never boot a volume whose content was decided by sort order.
 func TestFromEpochRefusesDivergentObjects(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 
@@ -161,7 +160,7 @@ func TestFromEpochRefusesDivergentObjects(t *testing.T) {
 // see this — it hashes key strings, and the two objects have different keys precisely
 // because their contents differ.
 func TestFromSnapshotRefusesDivergentObjects(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 
@@ -189,7 +188,7 @@ func TestFromSnapshotRefusesDivergentObjects(t *testing.T) {
 // TestFromSnapshotAcceptsAgreeingOverlap is the control on the manifest path: a
 // duplicate that carries the same records is not a gap and not a divergence.
 func TestFromSnapshotAcceptsAgreeingOverlap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 

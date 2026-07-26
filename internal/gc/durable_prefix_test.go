@@ -1,7 +1,6 @@
 package gc_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -45,7 +44,7 @@ func writeDurableWAL(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [
 		if _, err := l.Write(uint64(i)*4096, []byte("acked-write"), 0); err != nil {
 			t.Fatal(err)
 		}
-		if err := l.Flush(context.Background()); err != nil {
+		if err := l.Flush(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -54,7 +53,7 @@ func writeDurableWAL(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [
 // TestDurablePrefixIsAGCRoot: the objects that make up the durable point must survive
 // a sweep even when nothing enumerates them.
 func TestDurablePrefixIsAGCRoot(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	vol := vol9()
@@ -89,7 +88,7 @@ func TestDurablePrefixIsAGCRoot(t *testing.T) {
 // turn the GC off. An object beyond a gap is not durable and is exactly what §22.1
 // says will be GC'd as an orphan.
 func TestOrphansPastTheDurablePrefixAreStillCollected(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	vol := vol9()
@@ -128,7 +127,7 @@ func TestOrphansPastTheDurablePrefixAreStillCollected(t *testing.T) {
 // the GC must not proceed to mark anything under it. An unreadable prefix is a reason
 // to stop and page someone, not a licence to sweep.
 func TestSweepStopsWhenTheDurablePointCannotBeEstablished(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	vol := vol9()
@@ -150,7 +149,7 @@ func TestSweepStopsWhenTheDurablePointCannotBeEstablished(t *testing.T) {
 // under more than one epoch, and the older epoch's prefix is still what a recovery
 // point points back to.
 func TestReachableCoversEveryEpochOfAVolume(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	vol := vol9()

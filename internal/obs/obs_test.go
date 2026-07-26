@@ -2,7 +2,6 @@ package obs_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"log/slog"
 	"testing"
@@ -16,7 +15,7 @@ func newProvider(t *testing.T) *obs.Provider {
 	if err != nil {
 		t.Fatalf("provider: %v", err)
 	}
-	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	t.Cleanup(func() { _ = p.Shutdown(t.Context()) })
 	return p
 }
 
@@ -75,7 +74,7 @@ func TestTracePropagationAcrossBoundary(t *testing.T) {
 	p := newProvider(t)
 
 	// CP side: start a root span with a request_id.
-	cpCtx := obs.WithRequestID(context.Background(), "req-123")
+	cpCtx := obs.WithRequestID(t.Context(), "req-123")
 	cpCtx, cpSpan := p.Tracer.Start(cpCtx, "cp.Attach")
 	wantTrace := cpSpan.SpanContext().TraceID()
 
@@ -83,7 +82,7 @@ func TestTracePropagationAcrossBoundary(t *testing.T) {
 	cpSpan.End()
 
 	// Agent side: fresh context, extract, start child span.
-	agentCtx := p.Tracer.ExtractContext(context.Background(), header)
+	agentCtx := p.Tracer.ExtractContext(t.Context(), header)
 	_, agentSpan := p.Tracer.Start(agentCtx, "agent.attach")
 	gotTrace := agentSpan.SpanContext().TraceID()
 	agentSpan.End()
@@ -105,7 +104,7 @@ func TestTracePropagationAcrossBoundary(t *testing.T) {
 func TestStructuredLogHasCorrelationFields(t *testing.T) {
 	p := newProvider(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	ctx = obs.WithRequestID(ctx, "req-1")
 	ctx = obs.WithOperationID(ctx, "op-1")
 	ctx = obs.WithVolumeID(ctx, "vol-1")
@@ -136,14 +135,14 @@ func TestMeterRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr.Add(context.Background(), 1) // must not panic; exercises Meter()
+	ctr.Add(t.Context(), 1) // must not panic; exercises Meter()
 }
 
 // TestNestedSpansShareTrace models CP → Agent → object store: nested spans share
 // one trace, which is what makes a slow FLUSH one trace to open, not a grep.
 func TestNestedSpansShareTrace(t *testing.T) {
 	p := newProvider(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	ctx, root := p.Tracer.Start(ctx, "cp")
 	ctx, mid := p.Tracer.Start(ctx, "agent")
 	_, leaf := p.Tracer.Start(ctx, "objectstore.put")

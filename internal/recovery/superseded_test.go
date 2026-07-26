@@ -44,7 +44,7 @@ func (s ceilingFaultStore) Get(ctx context.Context, key string) ([]byte, error) 
 // 4, epoch 2's boundary recorded at 4, and only then W1's fenced PUT of 5..6.
 func supersededWorld(t *testing.T) (*sim.ObjectStore, [16]byte) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -66,7 +66,7 @@ func supersededWorld(t *testing.T) (*sim.ObjectStore, [16]byte) {
 
 // TestLateFencedPutCannotRaiseASupersededEpoch is the finding itself.
 func TestLateFencedPutCannotRaiseASupersededEpoch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store, vol := supersededWorld(t)
 
 	got, err := recovery.DurablePrefix(ctx, store, vol, 1)
@@ -86,7 +86,7 @@ func TestLateFencedPutCannotRaiseASupersededEpoch(t *testing.T) {
 // its own must produce exactly the state epoch 2 started from. Anything else is two
 // divergent volumes out of one bucket.
 func TestRecoveringASupersededEpochMatchesWhatItsSuccessorAdopted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store, vol := supersededWorld(t)
 
 	view, durable, err := recovery.Recover(ctx, store, nil, vol, 1)
@@ -110,7 +110,7 @@ func TestRecoveringASupersededEpochMatchesWhatItsSuccessorAdopted(t *testing.T) 
 // floor, so an unreadable one is an error rather than "no ceiling". Answering 6 here
 // is what a resumed drain writes down and then contradicts for ever.
 func TestASupersededEpochsCeilingIsNotGuessed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	base, vol := supersededWorld(t)
 
 	store := ceilingFaultStore{Store: base, suffix: "/2/recovery-point.json"}
@@ -123,7 +123,7 @@ func TestASupersededEpochsCeilingIsNotGuessed(t *testing.T) {
 // TestAnOpenEpochHasNoCeiling is the control: the newest epoch is still being written
 // to, so its prefix must be free to grow.
 func TestAnOpenEpochHasNoCeiling(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -140,7 +140,7 @@ func TestAnOpenEpochHasNoCeiling(t *testing.T) {
 // only speaks for epoch N when it says so. One that records a different predecessor
 // makes no claim about us and must not be read as one.
 func TestASuccessorThatDidNotAdoptThisEpochIsNotItsCeiling(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 

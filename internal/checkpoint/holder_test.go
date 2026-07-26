@@ -60,7 +60,7 @@ func heldBy(t *testing.T, c *checkpoint.Checkpointer, hostID string) *checkpoint
 // created or rebuilt (§22.5).
 func grantEpoch(t *testing.T, store objectstore.Store, volumeID string, ep uint64, holder string) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	es := epoch.NewStore(store)
 	etag, err := es.Init(ctx, volumeID, ep-1)
 	if err != nil {
@@ -80,7 +80,7 @@ func checkpointWorldAt(t *testing.T) *checkpointWorld {
 		if _, err := w.log.Write(uint64(i)*4096, []byte("payload"), 0); err != nil {
 			t.Fatal(err)
 		}
-		if err := w.log.Flush(context.Background()); err != nil {
+		if err := w.log.Flush(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -93,7 +93,7 @@ func checkpointWorldAt(t *testing.T) *checkpointWorld {
 // checkpoints/<vol>/1/ anyway, because the only question ever asked is the number.
 // It then advances published, which is what authorises discarding the local WAL.
 func TestAnUnnamedPublisherCannotPublishIntoAHeldEpoch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := checkpointWorldAt(t)
 	grantEpoch(t, w.store, format.UUIDString(v7Vol()), 1, hostGranted)
 
@@ -155,7 +155,7 @@ func TestOnlyTheEpochHolderMayPublishACheckpoint(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			w := checkpointWorldAt(t)
 			tc.arrange(t, w.store)
 
@@ -216,7 +216,7 @@ func (s *fenceOnPublish) Put(ctx context.Context, key string, data []byte, opts 
 // — but the step that follows it can still be refused, and that step is the one that
 // loses data: advancing published is what lets local WAL be discarded (INV-13).
 func TestTheEpochIsRecheckedBeforeTruncationIsAuthorised(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	vid := format.UUIDString(v7Vol())
 
 	store := sim.NewObjectStore()

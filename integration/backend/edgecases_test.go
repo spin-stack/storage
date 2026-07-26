@@ -8,7 +8,6 @@ package backend_test
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -352,7 +351,7 @@ func TestSDKChecksumModesBothWork(t *testing.T) {
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			client := be.ClientWith(func(o *s3.Options) {
 				o.RequestChecksumCalculation = tc.mode
 			})

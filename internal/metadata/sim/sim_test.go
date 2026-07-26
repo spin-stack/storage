@@ -1,7 +1,6 @@
 package sim_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -17,7 +16,7 @@ func newStore() *sim.Store {
 }
 
 func TestLeadershipTermIncrements(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	t1, err := s.AcquireLeadership(ctx, "cp-a")
 	if err != nil || t1 != 1 {
@@ -36,7 +35,7 @@ func TestLeadershipTermIncrements(t *testing.T) {
 // TestZombieCPCannotMutate is the §7 property: a CP holding a stale term makes
 // 0-row writes (ErrStaleTerm), so it cannot corrupt state.
 func TestZombieCPCannotMutate(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 
 	termA, _ := s.AcquireLeadership(ctx, "cp-a")
@@ -65,7 +64,7 @@ func TestZombieCPCannotMutate(t *testing.T) {
 }
 
 func TestStaleTermRejectedAcrossMutations(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	tests := []struct {
 		name string
 		mut  func(s *sim.Store, staleTerm int64) error
@@ -101,7 +100,7 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 
 // TestOperationIdempotency is §18: a duplicated admin request records once.
 func TestOperationIdempotency(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 	op := metadata.Operation{OperationID: "req-1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
@@ -119,7 +118,7 @@ func TestOperationIdempotency(t *testing.T) {
 // TestGettersRoundTripAndNotFound exercises every read path: a value is returned
 // after it is written, and a missing key yields ErrNotFound.
 func TestGettersRoundTripAndNotFound(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 
 	// No leader yet.
@@ -182,7 +181,7 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 // TestStoreRejectsValuesOutsideTheVocabulary: the store is the authority for what a
 // state *is*; a value from outside the lifecycle vocabulary never reaches a row.
 func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	tests := []struct {
 		name string
 		mut  func(s *sim.Store, term int64) error
@@ -237,7 +236,7 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 // TestUpdateOperationEnforcesThePhaseLifecycle: a finished operation cannot be
 // resurrected, and cancellation cannot rewrite a terminal outcome (§7).
 func TestUpdateOperationEnforcesThePhaseLifecycle(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 	op := metadata.Operation{
@@ -274,7 +273,7 @@ func TestUpdateOperationEnforcesThePhaseLifecycle(t *testing.T) {
 // TestListHostsIsSortedAndComplete: the fleet surface used by placement must be
 // deterministic (INV-02), so ListHosts returns every host ordered by id.
 func TestListHostsIsSortedAndComplete(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 
@@ -298,7 +297,7 @@ func TestListHostsIsSortedAndComplete(t *testing.T) {
 
 // TestSetHostState is cordon/drain (§28.1): a term-guarded state transition.
 func TestSetHostState(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: lifecycle.HostActive}); err != nil {
@@ -327,7 +326,7 @@ func TestSetHostState(t *testing.T) {
 // TestCommitHostCapacity is the §28.2 accounting: reservations add, releases
 // subtract, and committed bytes can never go negative.
 func TestCommitHostCapacity(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: lifecycle.HostActive, NVMeTotalBytes: 1000}); err != nil {
@@ -378,7 +377,7 @@ func TestCommitHostCapacity(t *testing.T) {
 // TestListVolumesByHost is what drain iterates over (§28.1): exactly the volumes
 // whose primary is that host, in a deterministic order.
 func TestListVolumesByHost(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 
@@ -412,7 +411,7 @@ func TestListVolumesByHost(t *testing.T) {
 // where Postgres raises a foreign-key error, which is exactly the kind of
 // divergence the shared contract now forbids.
 func TestHostLeaseRenewal(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
 

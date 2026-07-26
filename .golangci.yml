@@ -16,7 +16,11 @@ linters:
   enable:
     - depguard
     - forbidigo
+    - usetesting
   settings:
+    usetesting:
+      context-background: true
+      context-todo: true
     forbidigo:
       analyze-types: true
       forbid:

@@ -27,7 +27,7 @@ func networks() map[string]struct {
 }
 
 func TestSendRecvBothDirections(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	for name, tc := range networks() {
 		t.Run(name, func(t *testing.T) {
 			l, err := tc.net.Listen(tc.addr)
@@ -81,7 +81,7 @@ func TestSendRecvBothDirections(t *testing.T) {
 
 func TestDialNoListener(t *testing.T) {
 	// sim reports a typed error; real returns a dial error. Assert both fail.
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewNetwork()
 	if _, err := s.Dial(ctx, "absent"); !errors.Is(err, network.ErrNoListener) {
 		t.Fatalf("sim want ErrNoListener, got %v", err)
@@ -89,7 +89,7 @@ func TestDialNoListener(t *testing.T) {
 }
 
 func TestSimPartitionDropsDelivery(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewNetwork()
 	l, _ := s.Listen("agent:1")
 	defer l.Close()
@@ -118,7 +118,7 @@ func TestSimPartitionDropsDelivery(t *testing.T) {
 }
 
 func TestSimClosedConnErrors(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewNetwork()
 	l, _ := s.Listen("x:1")
 	defer l.Close()
@@ -140,10 +140,10 @@ func TestRecvHonorsContext(t *testing.T) {
 	s := sim.NewNetwork()
 	l, _ := s.Listen("x:1")
 	defer l.Close()
-	go func() { _, _ = l.Accept(context.Background()) }()
-	client, _ := s.Dial(context.Background(), "x:1")
+	go func() { _, _ = l.Accept(t.Context()) }()
+	client, _ := s.Dial(t.Context(), "x:1")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 	_, err := client.Recv(ctx)
 	if err == nil {

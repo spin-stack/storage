@@ -1,7 +1,6 @@
 package wal_test
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -121,7 +120,7 @@ func TestOutOfSpaceDoesNotFenceAndFencingIsNotOutOfSpace(t *testing.T) {
 	}
 
 	// The mirror image: a self-fenced log on a healthy device is fenced, not degraded.
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
 	f, _ := d.Create("wal/fenced.wal")
@@ -188,7 +187,7 @@ func TestBackpressureIsNotOutOfSpace(t *testing.T) {
 // TestOutOfSpaceIsRecordedAsAGauge: the finding asks for "a metric that says it".
 // The value matters, not the name — a gauge wired backwards is worse than none.
 func TestOutOfSpaceIsRecordedAsAGauge(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	p, err := obs.NewTestProvider("wal-degraded")
 	if err != nil {
 		t.Fatal(err)

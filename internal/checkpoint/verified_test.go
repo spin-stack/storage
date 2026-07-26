@@ -1,7 +1,6 @@
 package checkpoint_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -39,7 +38,7 @@ func newWorld(t *testing.T) *checkpointWorld {
 // TestCheckpointDoesNotPublishBeyondWhatS3Holds is the property: published never
 // exceeds the durable point S3 can prove.
 func TestCheckpointDoesNotPublishBeyondWhatS3Holds(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 
 	// Three flushed objects, so the log's durable watermark is 3.
@@ -90,7 +89,7 @@ func TestCheckpointDoesNotPublishBeyondWhatS3Holds(t *testing.T) {
 // TestTruncateStillRefusedAfterAnUnverifiableCheckpoint: the consequence that matters.
 // INV-13 must keep the local copy of anything S3 cannot prove.
 func TestTruncateStillRefusedAfterAnUnverifiableCheckpoint(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 
 	for i := range 3 {
@@ -119,7 +118,7 @@ func TestTruncateStillRefusedAfterAnUnverifiableCheckpoint(t *testing.T) {
 // hole in it, and the root digest cannot express one — so the list itself must be
 // checked when it is built.
 func TestCheckpointObjectsAreContiguous(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 
 	for i := range 3 {
@@ -153,7 +152,7 @@ func TestCheckpointObjectsAreContiguous(t *testing.T) {
 // the epoch — putting this log's name on that data is how two writers become one
 // corrupted volume.
 func TestCheckpointRefusesWhenS3HoldsMoreThanThisLogAcked(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 
 	if _, err := w.log.Write(0, []byte("payload"), 0); err != nil {

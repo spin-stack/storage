@@ -121,7 +121,7 @@ func TestSleepReturns(t *testing.T) {
 	for _, ut := range impls() {
 		t.Run(ut.name, func(t *testing.T) {
 			done := make(chan error, 1)
-			go func() { done <- ut.clk.Sleep(context.Background(), 15*time.Millisecond) }()
+			go func() { done <- ut.clk.Sleep(t.Context(), 15*time.Millisecond) }()
 			ut.waitBlocked()
 			ut.advance(20 * time.Millisecond)
 			select {
@@ -139,7 +139,7 @@ func TestSleepReturns(t *testing.T) {
 func TestSleepHonorsContext(t *testing.T) {
 	for _, ut := range impls() {
 		t.Run(ut.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)
 			go func() { done <- ut.clk.Sleep(ctx, time.Hour) }()
 			cancel()

@@ -2,7 +2,6 @@ package recovery_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -31,7 +30,7 @@ func putBatch(t *testing.T, store *sim.ObjectStore, volID [16]byte, epoch, first
 		b.Append(seq, enc, false)
 	}
 	b.Flush()
-	if _, err := wal.NewUploader(store, 3).Upload(context.Background(), b.Pending()[0]); err != nil {
+	if _, err := wal.NewUploader(store, 3).Upload(t.Context(), b.Pending()[0]); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -54,7 +53,7 @@ func TestDurablePrefix(t *testing.T) {
 			for _, s := range tc.spans {
 				putBatch(t, store, vol, 1, s[0], s[1])
 			}
-			last, err := recovery.DurablePrefix(context.Background(), store, vol, 1)
+			last, err := recovery.DurablePrefix(t.Context(), store, vol, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,7 +67,7 @@ func TestDurablePrefix(t *testing.T) {
 // TestRecoverReconstructsState writes a volume through a Log and recovers its read
 // view from S3 alone.
 func TestRecoverReconstructsState(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
@@ -102,7 +101,7 @@ func TestRecoverReconstructsState(t *testing.T) {
 // TestRecoverEncrypted recovers a volume whose WAL objects are ciphertext,
 // decrypting each record with the volume DEK.
 func TestRecoverEncrypted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
@@ -153,7 +152,7 @@ func (r *ramp) Read(p []byte) (int, error) {
 // TestDurablePointRejectsLyingSummary is the §22.1 cross-check: a summary that
 // claims more than the contiguous prefix provides is rejected.
 func TestDurablePointRejectsLyingSummary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 
@@ -176,7 +175,7 @@ func TestDurablePointRejectsLyingSummary(t *testing.T) {
 // TestRecoverExcludesLatePutBeyondGap is INV-12: a late PUT beyond a gap is not
 // part of the recovered prefix, and the recovery-point records the true boundary.
 func TestRecoverExcludesLatePutBeyondGap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 
@@ -201,7 +200,7 @@ func TestRecoverExcludesLatePutBeyondGap(t *testing.T) {
 }
 
 func TestRecoveryPointRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := v7Vol()
 	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, 42); err != nil {

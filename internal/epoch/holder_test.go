@@ -57,7 +57,7 @@ const (
 // granted epoch 4 — because PostgreSQL says it is the primary at epoch 4, or because
 // its own promotion returned before the CAS was re-read — is fenced by the object.
 func TestOnlyTheGrantedHolderMayPublish(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 	etag, err := s.Init(ctx, vol, 3)
 	if err != nil {
@@ -92,7 +92,7 @@ func TestOnlyTheGrantedHolderMayPublish(t *testing.T) {
 // host cannot publish into an epoch it was never granted just because the number
 // happens to match.
 func TestAnUnheldEpochHasNoPublisher(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 	if _, err := s.Init(ctx, vol, 1); err != nil {
 		t.Fatal(err)
@@ -112,7 +112,7 @@ func TestAnUnheldEpochHasNoPublisher(t *testing.T) {
 // promoter A's read spans. A either detects the unstable read or loses the CAS, and
 // whichever way it goes, exactly one of the two hosts may publish afterwards.
 func TestTwoPromotersLeaveExactlyOnePublisher(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	backing := sim.NewObjectStore()
 	h := &hookedStore{Store: backing}
 	loser := epoch.NewStore(h)
@@ -151,7 +151,7 @@ func TestTwoPromotersLeaveExactlyOnePublisher(t *testing.T) {
 // forward-only rule — re-granting the epoch a fenced writer already used would put
 // two writers in one wal/<vol>/<epoch>/ namespace no matter who is named.
 func TestGrantIsStillForwardOnly(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 	etag, err := s.Init(ctx, vol, 5)
 	if err != nil {

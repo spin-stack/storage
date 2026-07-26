@@ -1,7 +1,6 @@
 package materialize_test
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -57,14 +56,14 @@ func (w *world) writeAndFlush(t *testing.T, offset uint64, payload string) {
 	if _, err := w.log.Write(offset, []byte(payload), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.log.Flush(context.Background()); err != nil {
+	if err := w.log.Flush(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func (w *world) snapshot(t *testing.T, id string) snapshot.Manifest {
 	t.Helper()
-	m, _, err := snapshot.NewSnapshotter(w.store, w.clk).Create(context.Background(), w.log, w.vol, 1, id, "")
+	m, _, err := snapshot.NewSnapshotter(w.store, w.clk).Create(t.Context(), w.log, w.vol, 1, id, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +81,7 @@ func readAt(m interface{ Read(uint64, []byte) }, offset uint64, n int) string {
 // nothing but a Store — and the result is the source's state at the captured
 // sequence.
 func TestFromSnapshotRebuildsExactState(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	w.writeAndFlush(t, 64, "beta!")
@@ -110,7 +109,7 @@ func TestFromSnapshotRebuildsExactState(t *testing.T) {
 // TestFromSnapshotDecryptsWithVolumeDEK: an encrypted volume materializes to the
 // same plaintext on the destination (§15, INV-15 — the bytes in S3 stay sealed).
 func TestFromSnapshotDecryptsWithVolumeDEK(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dek, err := crypto.GenerateDEK(&fixedReader{}, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -133,7 +132,7 @@ func TestFromSnapshotDecryptsWithVolumeDEK(t *testing.T) {
 // TestFromSnapshotRefusesMissingObject: a referenced object that is gone must be a
 // hard failure, never a silently partial volume (§5.8 authority, §29.4).
 func TestFromSnapshotRefusesMissingObject(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	w.writeAndFlush(t, 64, "beta!")
@@ -154,7 +153,7 @@ func TestFromSnapshotRefusesMissingObject(t *testing.T) {
 // TestFromSnapshotRefusesSequenceGap: a manifest whose objects do not form a
 // contiguous run is refused — the destination never boots on a hole (§22.1).
 func TestFromSnapshotRefusesSequenceGap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "one")
 	w.writeAndFlush(t, 64, "two")
@@ -190,7 +189,7 @@ func TestFromSnapshotRefusesSequenceGap(t *testing.T) {
 // before a single byte is fetched (INV-16 — a published snapshot never changes, so
 // a mismatch means tampering or corruption).
 func TestFromSnapshotRefusesDigestMismatch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	full := w.snapshot(t, "snap-1")
@@ -209,7 +208,7 @@ func TestFromSnapshotRefusesDigestMismatch(t *testing.T) {
 // TestFromCheckpointRebuildsLiveVolume: the other materialization source — the
 // latest verified checkpoint of a live volume (§21.1, §22.3).
 func TestFromCheckpointRebuildsLiveVolume(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	w.writeAndFlush(t, 64, "beta!")
@@ -234,7 +233,7 @@ func TestFromCheckpointRebuildsLiveVolume(t *testing.T) {
 // while a foreground/flush op is in flight the fetch is refused outright (the
 // reconciler retries), and it proceeds once the data path is idle.
 func TestMaterializationYieldsToForeground(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	m := w.snapshot(t, "snap-1")
@@ -256,7 +255,7 @@ func TestMaterializationYieldsToForeground(t *testing.T) {
 // TestMaterializationRespectsBackgroundBudget: over-budget is a yield, not an
 // unbounded background burst (§5.9).
 func TestMaterializationRespectsBackgroundBudget(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "one")
 	w.writeAndFlush(t, 64, "two")
@@ -275,10 +274,10 @@ func TestMaterializationRespectsBackgroundBudget(t *testing.T) {
 // empty volume.
 func TestMissingManifestIsAnError(t *testing.T) {
 	store := sim.NewObjectStore()
-	if _, _, err := materialize.New(store, nil, nil).FromSnapshot(context.Background(), format.UUIDString(v7Vol()), "absent"); err == nil {
+	if _, _, err := materialize.New(store, nil, nil).FromSnapshot(t.Context(), format.UUIDString(v7Vol()), "absent"); err == nil {
 		t.Fatal("materializing from a missing manifest must fail")
 	}
-	if _, _, err := materialize.New(store, nil, nil).FromCheckpoint(context.Background(), format.UUIDString(v7Vol()), 1, 7); err == nil {
+	if _, _, err := materialize.New(store, nil, nil).FromCheckpoint(t.Context(), format.UUIDString(v7Vol()), 1, 7); err == nil {
 		t.Fatal("materializing from a missing checkpoint must fail")
 	}
 }
@@ -286,7 +285,7 @@ func TestMissingManifestIsAnError(t *testing.T) {
 // TestFromEpochRebuildsDurablePrefix is the source an evacuation uses: no snapshot,
 // no cooperation from the host being drained — just the durable prefix in S3.
 func TestFromEpochRebuildsDurablePrefix(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	w.writeAndFlush(t, 64, "beta!")
@@ -306,7 +305,7 @@ func TestFromEpochRebuildsDurablePrefix(t *testing.T) {
 // TestFromEpochRefusesLyingSummary: the summary must never claim more than the
 // contiguous prefix provides (§22.1) — materialization inherits that guard.
 func TestFromEpochRefusesLyingSummary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 
@@ -327,7 +326,7 @@ func TestFromEpochRefusesLyingSummary(t *testing.T) {
 // TestRefusesUnparseableObject: a referenced key holding something that is not a WAL
 // object fails before any state is produced.
 func TestRefusesUnparseableObject(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 
@@ -352,7 +351,7 @@ func TestRefusesUnparseableObject(t *testing.T) {
 // TestWrongDEKFailsClosed: materializing an encrypted volume with the wrong key
 // fails rather than producing garbage state (§15, INV-15 fails closed).
 func TestWrongDEKFailsClosed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dek, err := crypto.GenerateDEK(&fixedReader{}, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -376,7 +375,7 @@ func TestWrongDEKFailsClosed(t *testing.T) {
 // TestObjectStoreErrorsSurface: a backend error (throttling, §24) is reported as
 // itself — it is not a missing object and not a partial volume.
 func TestObjectStoreErrorsSurface(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	m := w.snapshot(t, "snap-1")
@@ -399,7 +398,7 @@ func TestObjectStoreErrorsSurface(t *testing.T) {
 // TestFromCheckpointRefusesDigestMismatch mirrors the snapshot guard on the other
 // materialization source.
 func TestFromCheckpointRefusesDigestMismatch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 
@@ -437,7 +436,7 @@ func (leaseOK) Valid() bool { return true }
 // the newest one would hand the destination a volume missing everything written
 // before the move — and report it as a complete rebuild.
 func TestFromEpochChainsAcrossAPromotion(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "before-move")
 	boundary := w.log.Watermarks().Durable

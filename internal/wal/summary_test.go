@@ -1,7 +1,6 @@
 package wal_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -10,7 +9,7 @@ import (
 )
 
 func TestSummaryReflectsDurableObjects(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	l := remoteLog(t, store)
 
@@ -50,7 +49,7 @@ func TestSummaryReflectsDurableObjects(t *testing.T) {
 }
 
 func TestSummaryOverwritesLatest(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	l := remoteLog(t, store)
 

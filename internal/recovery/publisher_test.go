@@ -47,14 +47,14 @@ func writeBoundaryAs(t *testing.T, rp recovery.RecoveryPoint, store objectstore.
 			"including the host a crashed promoter left named in PostgreSQL while the object " +
 			"store granted the epoch to somebody else — and the object cannot be rewritten")
 	}
-	return a.WriteAs(context.Background(), store, vol, newEpoch, hostID)
+	return a.WriteAs(t.Context(), store, vol, newEpoch, hostID)
 }
 
 // grantEpoch puts the epoch object at `ep` for the volume, granted to holder. An empty
 // holder is the epoch Init writes for a volume nobody has been granted yet (§22.5).
 func grantEpoch(t *testing.T, store objectstore.Store, vol [16]byte, ep uint64, holder string) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	es := epoch.NewStore(store)
 	vid := format.UUIDString(vol)
 	etag, err := es.Init(ctx, vid, ep-1)
@@ -125,7 +125,7 @@ func TestOnlyTheEpochHolderMayRecordItsBoundary(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			store := sim.NewObjectStore()
 			vol := vol7()
 			tc.arrange(t, store, vol)
@@ -158,7 +158,7 @@ func TestOnlyTheEpochHolderMayRecordItsBoundary(t *testing.T) {
 // not replace the ones that were already there. A holder writing a boundary below what
 // its predecessor already established is still refused (§12.5, INV-12).
 func TestTheBoundaryGuardsStillApplyToItsHolder(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 

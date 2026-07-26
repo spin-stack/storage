@@ -7,7 +7,6 @@ package storetest
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -22,7 +21,7 @@ type NewStore func(t *testing.T) objectstore.Store
 // RunContract runs the full contract against the implementation newStore builds.
 func RunContract(t *testing.T, newStore NewStore) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("put/get/head round trip", func(t *testing.T) {
 		s := newStore(t)

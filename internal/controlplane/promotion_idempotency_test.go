@@ -35,7 +35,7 @@ const (
 
 func newPromoWorld(t *testing.T) *promoWorld {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := sim.NewObjectStore()
 	md := metasim.New(clk.Wall)
@@ -73,7 +73,7 @@ func newPromoWorld(t *testing.T) *promoWorld {
 // TestPromoteIsIdempotent: the reconciler running the same promotion twice must not
 // grant two epochs. A second epoch would fence the writer that was just promoted.
 func TestPromoteIsIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 
 	first, err := w.p.Promote(ctx, w.term, promoVolume, time.Time{}, promoNew)
@@ -101,7 +101,7 @@ func TestPromoteIsIdempotent(t *testing.T) {
 // the process died before the S3 CAS. The retry must finish that epoch, not start
 // another one.
 func TestPromoteResumesAfterCrashBetweenPGAndS3(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 
 	// Simulate the first half having happened.
@@ -131,7 +131,7 @@ func TestPromoteResumesAfterCrashBetweenPGAndS3(t *testing.T) {
 // the lease was never granted, so the promoted host cannot ACK. The retry must grant
 // it rather than refuse because "the epoch is already there".
 func TestPromoteResumesAfterCrashBeforeTheLease(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 
 	bumped, _ := w.md.BumpVolumeEpoch(ctx, w.term, promoVolume, promoNew, 1)
@@ -155,7 +155,7 @@ func TestPromoteResumesAfterCrashBeforeTheLease(t *testing.T) {
 // what this promotion is completing, another Control Plane won. Finishing our steps
 // would fence the winner.
 func TestPromoteRefusesWhenSomeoneElseAdvancedFurther(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 
 	// Another CP promoted twice while we were away.
@@ -172,7 +172,7 @@ func TestPromoteRefusesWhenSomeoneElseAdvancedFurther(t *testing.T) {
 // object is not a resume, it is corruption or a lost write. Guessing which epoch to
 // finish would be inventing a fence.
 func TestPromoteRefusesAnUnexpectedEpochGap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 
 	for expected := range int64(3) {
@@ -188,7 +188,7 @@ func TestPromoteRefusesAnUnexpectedEpochGap(t *testing.T) {
 // TestPromoteRefusesBeforeTheFencingWait keeps the §12.3 order visible in the
 // idempotent version: none of the resume logic runs before the wait elapses.
 func TestPromoteRefusesBeforeTheFencingWait(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 
 	// A lease renewed "now" on the CP clock: the deadline is in the future.
@@ -204,7 +204,7 @@ func TestPromoteRefusesBeforeTheFencingWait(t *testing.T) {
 // TestPromoteOfAMissingVolumeFails: the resume decision needs the row; without it
 // there is nothing to be idempotent about.
 func TestPromoteOfAMissingVolumeFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 	if _, err := w.p.Promote(ctx, w.term, "00000000-0000-7000-8000-0000000000ff", time.Time{}, promoNew); err == nil {
 		t.Fatal("promoting a volume that does not exist must fail")
@@ -218,7 +218,7 @@ func TestPromoteOfAMissingVolumeFails(t *testing.T) {
 // into the epoch object while PostgreSQL records theirs, and both would believe they
 // hold the same epoch — the two records of one promotion disagreeing about the owner.
 func TestPromoteRefusesToFinishSomebodyElsesPromotion(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newPromoWorld(t)
 	third := "00000000-0000-7000-8000-0000000000c4"
 	if err := w.md.UpsertHost(ctx, w.term, metadata.Host{HostID: third, State: lifecycle.HostActive}); err != nil {
@@ -257,7 +257,7 @@ func TestPromoteRefusesToFinishSomebodyElsesPromotion(t *testing.T) {
 // naming whoever ran last; an epoch object that does not name its holder lets a
 // second host pass the publish check at the same number.
 func TestConcurrentPromotionsLeaveExactlyOneWriter(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	md := metasim.New(clk.Wall)
 	term, err := md.AcquireLeadership(ctx, "cp")

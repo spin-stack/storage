@@ -50,7 +50,7 @@ func (w *fenceWorld) advance(d time.Duration) {
 // each test states what the CP knows about the source.
 func newFenceWorld(t *testing.T) *fenceWorld {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	dbClk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	md := metasim.New(dbClk.Wall)
@@ -83,7 +83,7 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 
 func (w *fenceWorld) state(t *testing.T) lifecycle.VolumeState {
 	t.Helper()
-	v, err := w.md.GetVolume(context.Background(), fenceVol)
+	v, err := w.md.GetVolume(t.Context(), fenceVol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func (w *fenceWorld) state(t *testing.T) lifecycle.VolumeState {
 
 func (w *fenceWorld) unchanged(t *testing.T, wantEpoch int64, wantPrimary string) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	v, err := w.md.GetVolume(ctx, fenceVol)
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func (w *fenceWorld) unchanged(t *testing.T, wantEpoch int64, wantPrimary string
 // Treating "I know nothing" as "renewed at the epoch" makes FENCING_WAIT zero — two
 // writers, at the moment the CP's view of the fleet is least trustworthy.
 func TestPromoteRefusesWhenTheSourceLeaseRecordIsMissing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	w.advance(time.Hour) // however long the CP has been up, it never observed the lease
 
@@ -128,7 +128,7 @@ func TestPromoteRefusesWhenTheSourceLeaseRecordIsMissing(t *testing.T) {
 // the fleet has recorded the host as DEAD the CP is asserting the writer is gone, and
 // a volume must not be strandable by a missing lease row.
 func TestPromoteOfAnObservedDeadSourceProceedsWithoutALeaseRow(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	if err := w.md.SetHostState(ctx, w.term, fenceHostA, lifecycle.HostDead); err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ func TestPromoteOfAnObservedDeadSourceProceedsWithoutALeaseRow(t *testing.T) {
 // take the most conservative view — including the lease it can read itself for the
 // host that is actually primary — never the caller's word alone.
 func TestPromoteMeasuresTheWaitAgainstTheFencedHostsOwnLease(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 
 	stale := w.clk.Wall() // what the caller observed at T0
@@ -176,7 +176,7 @@ func TestPromoteMeasuresTheWaitAgainstTheFencedHostsOwnLease(t *testing.T) {
 // which starts recovering and ACKing. The second must not then fence hostB with a
 // zero wait just because the instant it carries belongs to hostA.
 func TestPromoteRefusesWhenTheVolumeMovedOnSinceTheCommandWasIssued(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 
 	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
@@ -205,7 +205,7 @@ func TestPromoteRefusesWhenTheVolumeMovedOnSinceTheCommandWasIssued(t *testing.T
 // one the *Agent* is counting down, which is what the lease row records. A CP
 // configured with a shorter TTL than the lease it granted must not shorten the wait.
 func TestPromoteHonoursALeaseTTLLongerThanTheConfiguredOne(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 
 	const granted = 60 * time.Second
@@ -239,24 +239,24 @@ func TestPromoteRefusesAHostThatCannotTakeTheVolume(t *testing.T) {
 	}{
 		{"unknown host", "00000000-0000-7000-8000-0000000000ee", nil},
 		{"dead host", fenceHostB, func(t *testing.T, w *fenceWorld) {
-			if err := w.md.SetHostState(context.Background(), w.term, fenceHostB, lifecycle.HostDead); err != nil {
+			if err := w.md.SetHostState(t.Context(), w.term, fenceHostB, lifecycle.HostDead); err != nil {
 				t.Fatal(err)
 			}
 		}},
 		{"cordoned host", fenceHostB, func(t *testing.T, w *fenceWorld) {
-			if err := w.md.SetHostState(context.Background(), w.term, fenceHostB, lifecycle.HostCordoned); err != nil {
+			if err := w.md.SetHostState(t.Context(), w.term, fenceHostB, lifecycle.HostCordoned); err != nil {
 				t.Fatal(err)
 			}
 		}},
 		{"draining host", fenceHostB, func(t *testing.T, w *fenceWorld) {
-			if err := w.md.SetHostState(context.Background(), w.term, fenceHostB, lifecycle.HostDraining); err != nil {
+			if err := w.md.SetHostState(t.Context(), w.term, fenceHostB, lifecycle.HostDraining); err != nil {
 				t.Fatal(err)
 			}
 		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			w := newFenceWorld(t)
 			if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
 				t.Fatal(err)
@@ -293,7 +293,7 @@ func (s unreadableLeases) GetHostLease(context.Context, string) (metadata.HostLe
 }
 
 func TestPromoteRefusesWhenTheSourceLeaseCannotBeRead(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
 		t.Fatal(err)
@@ -312,7 +312,7 @@ func TestPromoteRefusesWhenTheSourceLeaseCannotBeRead(t *testing.T) {
 // TestPromoteOfAVolumeWithNoPrimaryNeedsNoWait: nothing is serving it, so there is
 // nobody to fence. This is the state a rebuilt volume record is in.
 func TestPromoteOfAVolumeWithNoPrimaryNeedsNoWait(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, fenceVol, "", 1); err != nil {
 		t.Fatal(err)
@@ -337,7 +337,7 @@ func TestPromoteOfAVolumeWithNoPrimaryNeedsNoWait(t *testing.T) {
 // already moved the volume there must still be completable, or a crash plus a cordon
 // strands the volume with no lease.
 func TestPromoteFinishesAResumeOntoAHostThatWasCordonedMeanwhile(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
 		t.Fatal(err)
@@ -370,7 +370,7 @@ func TestPromoteFinishesAResumeOntoAHostThatWasCordonedMeanwhile(t *testing.T) {
 // after the epoch is granted, because §7 never lets a fenced volume go straight back
 // to serving.
 func TestPromoteRecordsTheFencingWaitDurably(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
 		t.Fatal(err)
@@ -404,7 +404,7 @@ func TestPromoteRecordsTheFencingWaitDurably(t *testing.T) {
 // fence and no guest to serve. Promoting one would grant an epoch and a lease for a
 // volume the Control Plane has already released.
 func TestPromoteRefusesADetachedVolume(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newFenceWorld(t)
 	if err := w.md.SetVolumeState(ctx, w.term, fenceVol, lifecycle.VolumeDetached); err != nil {
 		t.Fatal(err)
@@ -446,7 +446,7 @@ func TestAControlPlaneClockAheadOfTheDatabaseDoesNotGrantEarly(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			w := newFenceWorld(t)
 			if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
 				t.Fatal(err)

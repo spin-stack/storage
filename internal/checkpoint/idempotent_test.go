@@ -29,7 +29,7 @@ import (
 // flushN writes and flushes n records, so the log's durable watermark is n.
 func flushN(t *testing.T, w *checkpointWorld, n int) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	for i := range n {
 		if _, err := w.log.Write(uint64(i)*4096, []byte("payload"), 0); err != nil {
 			t.Fatal(err)
@@ -43,7 +43,7 @@ func flushN(t *testing.T, w *checkpointWorld, n int) {
 // TestCreateRetriesThroughALostPublishResponse: the PUT persisted, the ACK did not.
 // Retrying is the only thing the caller can do, and it has to work.
 func TestCreateRetriesThroughALostPublishResponse(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 	flushN(t, w, 2)
 
@@ -78,7 +78,7 @@ func TestCreateRetriesThroughALostPublishResponse(t *testing.T) {
 // died between the PUT and AdvancePublished; on restart the checkpoint it would
 // write is byte-for-byte the one already there.
 func TestCreateAdoptsAnIdenticalCheckpoint(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 	flushN(t, w, 2)
 
@@ -126,7 +126,7 @@ func (s cpUnreadableStore) Get(ctx context.Context, key string) ([]byte, error) 
 // enough to advance published. Adopting an unread object would unlock truncation
 // against a checkpoint nobody verified.
 func TestCreateDoesNotAdoptWhatItCannotRead(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 	flushN(t, w, 2)
 
@@ -154,7 +154,7 @@ func TestCreateDoesNotAdoptWhatItCannotRead(t *testing.T) {
 // must be distinguishable from an ordinary precondition failure — and it must never
 // unlock truncation.
 func TestCreateReportsAForeignCheckpointAsAConflict(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t)
 	flushN(t, w, 2)
 

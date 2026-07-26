@@ -1,7 +1,6 @@
 package wal_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -31,7 +30,7 @@ func remoteLeasedLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, lm *l
 // TestFlushAcksWhileLeaseValid: the happy path — a valid lease lets the FLUSH
 // advance durable and ACK.
 func TestFlushAcksWhileLeaseValid(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
@@ -65,7 +64,7 @@ func TestFlushAcksWhileLeaseValid(t *testing.T) {
 // produce — the same fail-open shape DEV-0004 removed, through a different door. A
 // missing uploader is not "nothing to upload"; it is an unbacked durability claim.
 func TestRemoteFlushWithALeaseButNoUploaderFailsClosed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
@@ -99,7 +98,7 @@ func TestRemoteFlushWithALeaseButNoUploaderFailsClosed(t *testing.T) {
 // Either contract is defensible; silently swallowing the flag is not. So: a FUA
 // write either fails, or by the time it returns the record is in a verified object.
 func TestFUAWriteIsDurableOrRefused(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
@@ -146,7 +145,7 @@ func TestFUAWriteSelfFencesWhenTheLeaseExpired(t *testing.T) {
 // because the lease is invalid at the instant of ACK, the write is NOT confirmed —
 // durable does not advance and the log self-fences.
 func TestFlushSelfFencesWhenLeaseExpired(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
@@ -180,7 +179,7 @@ func TestFlushSelfFencesWhenLeaseExpired(t *testing.T) {
 // TestLocalModeIgnoresLeaseForFlush is §14.8 rule 3 / §23: a `local` volume ACKs a
 // FLUSH after local fdatasync even with an expired lease (PG-down does not stop it).
 func TestLocalModeIgnoresLeaseForFlush(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
@@ -211,7 +210,7 @@ func TestLocalModeIgnoresLeaseForFlush(t *testing.T) {
 // record is in S3 is a write the guest believes is on stable media and a host loss
 // destroys.
 func TestWriteFUAIsInAVerifiedObjectBeforeItReturns(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
@@ -238,7 +237,7 @@ func TestWriteFUAIsInAVerifiedObjectBeforeItReturns(t *testing.T) {
 // gates the FLUSH ACK — the object may be in S3, but a host that no longer owns the
 // volume must not confirm the write.
 func TestWriteFUASelfFencesWhenTheLeaseExpired(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
@@ -261,7 +260,7 @@ func TestWriteFUASelfFencesWhenTheLeaseExpired(t *testing.T) {
 // TestWriteFUAWithoutALeaseFailsClosed: DEV-0004 for the FUA path — a remote volume
 // with nothing fencing it must not ACK.
 func TestWriteFUAWithoutALeaseFailsClosed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
@@ -281,7 +280,7 @@ func TestWriteFUAWithoutALeaseFailsClosed(t *testing.T) {
 // TestLocalModeWriteFUAAcksOnFdatasync: §14.8 rule 3 applies to FUA as well — a
 // `local` volume ACKs on the local sync, and S3 catches up asynchronously.
 func TestLocalModeWriteFUAAcksOnFdatasync(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
 	f, _ := d.Create("wal/local.wal")
@@ -330,7 +329,7 @@ func TestModeForRejectsUnknown(t *testing.T) {
 // was opt-in — a remote-durability log built without a lease checker ACKed FLUSH with
 // no lease at all. A missing fence must fail closed, not open.
 func TestRemoteModeWithoutALeaseFailsClosed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
@@ -354,7 +353,7 @@ func TestRemoteModeWithoutALeaseFailsClosed(t *testing.T) {
 // TestLocalModeWithoutALeaseStillAcks is the other half of §14.8 rule 3: in local
 // mode the lease does not gate the FLUSH ACK, so no lease is required.
 func TestLocalModeWithoutALeaseStillAcks(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
@@ -402,7 +401,7 @@ func TestPublishedNeverWalksBackwards(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := l.Flush(context.Background()); err != nil {
+	if err := l.Flush(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.AdvancePublished(3); err != nil {

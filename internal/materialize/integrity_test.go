@@ -34,7 +34,7 @@ import (
 // its digest check.
 func rewriteObject(t *testing.T, store *sim.ObjectStore, key string, mut func(h *format.ObjectHeader, payload *[]byte)) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	body, err := store.Get(ctx, key)
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +101,7 @@ var damage = []struct {
 func TestFromSnapshotRefusesADamagedObject(t *testing.T) {
 	for _, tc := range damage {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			w := newWorld(t, nil)
 			w.writeAndFlush(t, 0, "alpha")
 			w.writeAndFlush(t, 64, "beta!")
@@ -128,7 +128,7 @@ func TestFromSnapshotRefusesADamagedObject(t *testing.T) {
 func TestFromCheckpointRefusesADamagedObject(t *testing.T) {
 	for _, tc := range damage {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			w := newWorld(t, nil)
 			w.writeAndFlush(t, 0, "alpha")
 			w.writeAndFlush(t, 64, "beta!")
@@ -159,7 +159,7 @@ func TestFromCheckpointRefusesADamagedObject(t *testing.T) {
 // the full span, so the destination boots missing an ACKed write while Progress says
 // it covered everything.
 func TestTruncatedObjectIsNotReportedAsFullCoverage(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	w.writeAndFlush(t, 64, "beta!")
@@ -181,7 +181,7 @@ func TestTruncatedObjectIsNotReportedAsFullCoverage(t *testing.T) {
 // on, so a body belonging to another volume stored at this volume's key is replayed
 // straight into the view unless the header is checked.
 func TestCrossVolumeBodyIsNeverReplayed(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	w.writeAndFlush(t, 64, "beta!")
@@ -229,7 +229,7 @@ func TestCrossVolumeBodyIsNeverReplayed(t *testing.T) {
 // volume with a hole at the front. Every object it names can be perfectly valid and
 // perfectly contiguous with the next; what is missing is the run's *start*.
 func TestFromSnapshotRequiresThePrefixFloor(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "first")
 	w.writeAndFlush(t, 64, "secnd")
@@ -268,7 +268,7 @@ func TestFromSnapshotRequiresThePrefixFloor(t *testing.T) {
 // TestFromCheckpointRequiresThePrefixFloor: the same on the checkpoint source, which
 // is what a live move and a standby hydration replay.
 func TestFromCheckpointRequiresThePrefixFloor(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "first")
 	w.writeAndFlush(t, 64, "secnd")
@@ -304,7 +304,7 @@ func TestFromCheckpointRequiresThePrefixFloor(t *testing.T) {
 // come from the boundary, not from a constant. Without this the fix for the previous
 // test would simply break every promoted volume.
 func TestFloorFollowsTheEpochBoundary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "before-move")
 	boundary := w.log.Watermarks().Durable
@@ -362,7 +362,7 @@ func (s boundaryFaultStore) Get(ctx context.Context, key string) ([]byte, error)
 // way to tell a complete run from one missing its head, so the destination must not
 // boot on a guess.
 func TestUnknownFloorStopsTheMaterialization(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	m := w.snapshot(t, "snap-1")
@@ -385,7 +385,7 @@ func TestUnknownFloorStopsTheMaterialization(t *testing.T) {
 // mis-keyed or restored object, and replaying what it points at would fold another
 // volume's history into this one.
 func TestSourceDescribingAnotherVolumeIsRefused(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "alpha")
 	full := w.snapshot(t, "snap-1")
@@ -426,7 +426,7 @@ func putJSON(t *testing.T, store *sim.ObjectStore, key string, v any) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Put(context.Background(), key, body, objectstore.PutOptions{}); err != nil {
+	if _, err := store.Put(t.Context(), key, body, objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -436,7 +436,7 @@ func putJSON(t *testing.T, store *sim.ObjectStore, key string, v any) {
 // actually reach it. A manifest whose objects stop short is a volume that boots
 // missing its most recent ACKed writes.
 func TestProgressMustReachTheClaimedSequence(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newWorld(t, nil)
 	w.writeAndFlush(t, 0, "first")
 	w.writeAndFlush(t, 64, "secnd")

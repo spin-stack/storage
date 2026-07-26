@@ -2,7 +2,6 @@ package wal_test
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -227,7 +226,7 @@ func TestResumeRefusesAnotherVolumesRecords(t *testing.T) {
 // re-issues spans S3 already has, which is the divergent-object case of INV-21. Only
 // the tail moves.
 func TestResumeUploadsOnlyTheTailS3NeverGot(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	w := newResumeWorld(t, nil)
 	if _, err := w.log.Write(0, []byte("durable-one"), 0); err != nil {
 		t.Fatal(err)
@@ -309,7 +308,7 @@ func TestResumeStopsAtATornTail(t *testing.T) {
 // that only this host holds. The guest must get an explicit error rather than the
 // host silently filling NVMe with writes no other machine has.
 func TestRemoteGapBackpressureIsExplicit(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
 	f, _ := d.Create("wal/local.wal")

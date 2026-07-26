@@ -57,7 +57,10 @@ func RustFS(t *testing.T, image string) ObjectStoreBackend {
 	if image == "" {
 		image = DefaultRustFSImage
 	}
-	ctx := context.Background()
+	// Not t.Context(): the container is terminated from t.Cleanup, which runs
+	// *after* the test context is cancelled. A cancelled context there leaks the
+	// container for the rest of the run.
+	ctx := context.Background() //nolint:usetesting // see above
 
 	const (
 		accessKey = "rustfsadmin"

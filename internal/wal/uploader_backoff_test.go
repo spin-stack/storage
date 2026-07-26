@@ -106,7 +106,7 @@ func TestUploadRidesOutAThrottleThatOutlastsTheRoundTrips(t *testing.T) {
 		clk := newStepClock()
 		store := &throttledUntil{ObjectStore: sim.NewObjectStore(), clk: clk, until: clock.Instant(500 * time.Millisecond)}
 		u := wal.NewUploader(store, budget)
-		if _, err := u.Upload(context.Background(), oneBatch(1, 1)); !errors.Is(err, wal.ErrUploadRetriesExhausted) {
+		if _, err := u.Upload(t.Context(), oneBatch(1, 1)); !errors.Is(err, wal.ErrUploadRetriesExhausted) {
 			t.Fatalf("upload = %v, want ErrUploadRetriesExhausted", err)
 		}
 		if len(clk.slept) != 0 {
@@ -118,7 +118,7 @@ func TestUploadRidesOutAThrottleThatOutlastsTheRoundTrips(t *testing.T) {
 		clk := newStepClock()
 		store := &throttledUntil{ObjectStore: sim.NewObjectStore(), clk: clk, until: clock.Instant(500 * time.Millisecond)}
 		u := wal.NewUploader(store, budget, wal.WithBackoff(clk, wal.Backoff{Base: 100 * time.Millisecond, Max: time.Second}))
-		key, err := u.Upload(context.Background(), oneBatch(1, 1))
+		key, err := u.Upload(t.Context(), oneBatch(1, 1))
 		if err != nil {
 			t.Fatalf("upload with a backoff: %v", err)
 		}
@@ -185,7 +185,7 @@ func TestBackoffDelaySchedule(t *testing.T) {
 // is the new place a cancelled FLUSH could otherwise sit for the whole schedule.
 func TestUploadBackoffStopsOnContextCancellation(t *testing.T) {
 	clk := newStepClock()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	clk.onSleep = func() error { cancel(); return nil }
 
 	store := &throttledUntil{ObjectStore: sim.NewObjectStore(), clk: clk, until: clock.Instant(time.Hour)}
@@ -205,7 +205,7 @@ func TestUploadDoesNotWaitAfterTheLastAttempt(t *testing.T) {
 	clk := newStepClock()
 	store := &throttledUntil{ObjectStore: sim.NewObjectStore(), clk: clk, until: clock.Instant(time.Hour)}
 	u := wal.NewUploader(store, 3, wal.WithBackoff(clk, wal.Backoff{Base: time.Second, Max: time.Minute}))
-	if _, err := u.Upload(context.Background(), oneBatch(1, 1)); !errors.Is(err, wal.ErrUploadRetriesExhausted) {
+	if _, err := u.Upload(t.Context(), oneBatch(1, 1)); !errors.Is(err, wal.ErrUploadRetriesExhausted) {
 		t.Fatalf("upload = %v, want ErrUploadRetriesExhausted", err)
 	}
 	if len(clk.slept) != 2 { // three attempts, two gaps
@@ -216,7 +216,7 @@ func TestUploadDoesNotWaitAfterTheLastAttempt(t *testing.T) {
 // TestUploadDoesNotWaitOnAHardFailure: a divergent object is not going to become
 // non-divergent, so the schedule must not be spent on it.
 func TestUploadDoesNotWaitOnAHardFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := newStepClock()
 	store := sim.NewObjectStore()
 	u := wal.NewUploader(store, 5, wal.WithBackoff(clk, wal.Backoff{Base: time.Second, Max: time.Minute}))

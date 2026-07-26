@@ -27,7 +27,10 @@ import (
 
 func startPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	ctx := context.Background()
+	// Not t.Context(): the container is terminated from t.Cleanup, which runs
+	// *after* the test context is cancelled. A cancelled context there leaks the
+	// container for the rest of the run.
+	ctx := context.Background() //nolint:usetesting // see above
 	container, err := tcpostgres.Run(ctx, "postgres:18-alpine",
 		tcpostgres.WithDatabase("cp"),
 		tcpostgres.WithUsername("cp"),
@@ -65,7 +68,7 @@ func startPostgres(t *testing.T) *pgxpool.Pool {
 }
 
 func TestPGZombieCPCannotMutate(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := pg.New(startPostgres(t))
 
 	termA, err := store.AcquireLeadership(ctx, "cp-a")
@@ -101,7 +104,7 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 }
 
 func TestPGOperationIdempotency(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := pg.New(startPostgres(t))
 	term, err := store.AcquireLeadership(ctx, "cp")
 	if err != nil {
@@ -149,7 +152,7 @@ func TestPGOperationIdempotency(t *testing.T) {
 // Postgres: cordon, capacity reservation/release with the non-negative guard, and
 // the two listings a drain iterates over.
 func TestPGFleetSurface(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := pg.New(startPostgres(t))
 	term, err := store.AcquireLeadership(ctx, "cp")
 	if err != nil {
@@ -227,7 +230,7 @@ func TestPGFleetSurface(t *testing.T) {
 
 // TestPGRejectsNonV7 proves the DB-layer INV-22 enforcement: a v4 id is refused.
 func TestPGRejectsNonV7(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := pg.New(startPostgres(t))
 	term, _ := store.AcquireLeadership(ctx, "cp")
 	// A v1 UUID (version nibble 1) must be rejected by the CHECK constraint.
@@ -244,7 +247,7 @@ func TestPGRejectsNonV7(t *testing.T) {
 // vocabulary and the DB CHECK constraints: every value internal/lifecycle declares
 // must be storable. Adding a state in Go and forgetting the migration fails here.
 func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	term, _ := store.AcquireLeadership(ctx, "cp")
@@ -311,7 +314,7 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 // TestPGRejectsValuesOutsideTheVocabulary: the CHECK constraints hold even for a
 // client that never goes through the Go layer (a script, a manual psql session).
 func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	term, _ := store.AcquireLeadership(ctx, "cp")
@@ -350,7 +353,7 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 // predicate itself, so a terminal operation cannot be resurrected even under
 // concurrent writers.
 func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := pg.New(startPostgres(t))
 	term, _ := store.AcquireLeadership(ctx, "cp")
 
@@ -385,7 +388,7 @@ func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
 // host being decommissioned, a volume removed — sequentially scans the child table
 // while holding locks. This fails the moment a FK is added without its index.
 func TestPGEveryForeignKeyHasAnIndex(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 
 	const q = `
@@ -426,7 +429,7 @@ SELECT c.conrelid::regclass::text AS child_table, a.attname AS column_name, c.co
 // with a realistic row count the planner uses it for the drain's iteration query
 // (§28.1) instead of scanning every volume in the fleet.
 func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	term, _ := store.AcquireLeadership(ctx, "cp")
@@ -463,7 +466,7 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 // only grows: completed operations are history and nothing deletes them, so a
 // sequential scan here gets slower for the rest of the cluster's life.
 func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
 	term, _ := store.AcquireLeadership(ctx, "cp")
@@ -497,7 +500,7 @@ func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
 // assertIndexed fails unless the planner reaches for index on table for query.
 func assertIndexed(t *testing.T, pool *pgxpool.Pool, index, table, query string, args ...any) {
 	t.Helper()
-	rows, err := pool.Query(context.Background(), query, args...)
+	rows, err := pool.Query(t.Context(), query, args...)
 	if err != nil {
 		t.Fatal(err)
 	}

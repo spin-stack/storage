@@ -42,7 +42,7 @@ func makeVersionedBucket(t *testing.T, ctx context.Context, c *s3.Client, name s
 
 func TestNewS3StoreRefusesABucketWithoutVersioning(t *testing.T) {
 	be := backendConfig(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	c := be.Client()
 
 	tests := []struct {
@@ -92,7 +92,7 @@ func TestNewS3StoreRefusesABucketWithoutVersioning(t *testing.T) {
 // marker over a retained version, and Restore must bring exactly those bytes back.
 // This is the runbook step INV-14 promises, executed against a real backend.
 func TestS3StoreDeleteIsAVersionedDeleteMarker(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	be := backendConfig(t)
 	store := newVersionedS3Store(t, be, "gc-restore")
 	const key = "wal/v/1/1-1-acked.wal"
@@ -136,7 +136,7 @@ func TestS3StoreDeleteIsAVersionedDeleteMarker(t *testing.T) {
 // PUTs *through S3Store* — not through a raw client — so the mapping is what is under
 // test, not the backend.
 func TestConditionalWritesThroughS3StoreMapEveryLoser(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	be := backendConfig(t)
 	store := newVersionedS3Store(t, be, "conditional-through-store")
 
@@ -188,15 +188,18 @@ func TestConditionalWritesThroughS3StoreMapEveryLoser(t *testing.T) {
 // uploader against the real backend so "idempotent retry" is a fact about the thing
 // production uses, not about the simulator.
 func TestWALUploaderIsIdempotentAgainstARealBackend(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	be := backendConfig(t)
 	store := newVersionedS3Store(t, be, "wal-uploader")
 
-	var vol [16]byte
-	vol[6], vol[8] = 0x70, 0x80
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
-	batch := func(payload []byte, records int) *wal.ClosedBatch {
+	// A volume per case. The two cases both number their records from 1, and one
+	// uploader may not publish two spans that overlap inside a single (volume, epoch)
+	// — a real writer never restarts its sequence space there, and the uploader now
+	// refuses it (INV-21). Sharing one volume here would have been the fixture
+	// asserting something no writer does.
+	batch := func(vol [16]byte, payload []byte, records int) *wal.ClosedBatch {
 		t.Helper()
 		b := wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig())
 		for seq := 1; seq <= records; seq++ {
@@ -214,17 +217,21 @@ func TestWALUploaderIsIdempotentAgainstARealBackend(t *testing.T) {
 
 	tests := []struct {
 		name    string
+		tag     byte
 		payload []byte
 		records int
 	}{
-		{"a small batch", []byte("a short encrypted record"), 4},
+		{"a small batch", 0x01, []byte("a short encrypted record"), 4},
 		// Above the SDK's 5 MiB multipart threshold, where the ETag stops even
 		// pretending to be a content hash.
-		{"a batch past the multipart threshold", bytes.Repeat([]byte("payload-"), 1<<19), 2},
+		{"a batch past the multipart threshold", 0x02, bytes.Repeat([]byte("payload-"), 1<<19), 2},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cb := batch(tc.payload, tc.records)
+			var vol [16]byte
+			vol[6], vol[8] = 0x70, 0x80
+			vol[15] = tc.tag
+			cb := batch(vol, tc.payload, tc.records)
 			key, err := up.Upload(ctx, cb)
 			if err != nil {
 				t.Fatalf("first upload: %v", err)
@@ -244,7 +251,7 @@ func TestWALUploaderIsIdempotentAgainstARealBackend(t *testing.T) {
 			if _, err := store.Put(ctx, key+".divergent", []byte("not the batch"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
 				t.Fatal(err)
 			}
-			other := batch(append([]byte("different-"), tc.payload...), tc.records)
+			other := batch(vol, append([]byte("different-"), tc.payload...), tc.records)
 			if _, err := store.Put(ctx, other.Object().Key, []byte("someone else's bytes"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
 				t.Fatal(err)
 			}

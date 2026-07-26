@@ -1,7 +1,6 @@
 package gc_test
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -29,7 +28,7 @@ func newStore(clk *sim.Clock) *sim.ObjectStore {
 func seed(t *testing.T, s *sim.ObjectStore, keys ...string) {
 	t.Helper()
 	for _, k := range keys {
-		if _, err := s.Put(context.Background(), k, []byte(k), objectstore.PutOptions{}); err != nil {
+		if _, err := s.Put(t.Context(), k, []byte(k), objectstore.PutOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -38,7 +37,7 @@ func seed(t *testing.T, s *sim.ObjectStore, keys ...string) {
 // TestMarkIsReversible: a marked object is still readable by anyone who asks for the
 // marked version — that is what makes a GC mistake recoverable (§21.3).
 func TestMarkIsReversible(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "wal/v/1/1-1-a.wal", "volumes/v/descriptor.json")
@@ -67,7 +66,7 @@ func TestMarkIsReversible(t *testing.T) {
 // TestMarkNeverTouchesAReachableObject is the property that makes the GC safe to run
 // at all: reachability decides, and a live object is never marked.
 func TestMarkNeverTouchesAReachableObject(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "wal/v/1/live.wal", "wal/v/1/orphan.wal")
@@ -87,7 +86,7 @@ func TestMarkNeverTouchesAReachableObject(t *testing.T) {
 // manifest that is still being published (§21.1 order). The grace period is what
 // keeps the GC from racing a publication.
 func TestGracePeriodProtectsFreshObjects(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "wal/v/1/fresh.wal")
@@ -117,7 +116,7 @@ func TestGracePeriodProtectsFreshObjects(t *testing.T) {
 // TestMarkIsIdempotent: the GC runs on a schedule; marking what is already marked
 // must not error or double-count.
 func TestMarkIsIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "wal/v/1/orphan.wal")
@@ -138,7 +137,7 @@ func TestMarkIsIdempotent(t *testing.T) {
 // TestStoreHasNoPermanentDelete is the structural half of INV-14: the interface must
 // not offer a way to destroy data, so no amount of GC bugs can.
 func TestStoreHasNoPermanentDelete(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	seed(t, store, "k")
 
@@ -162,7 +161,7 @@ func TestStoreHasNoPermanentDelete(t *testing.T) {
 // error rather than claiming the whole sweep succeeded — an operator reading
 // gc_marked_bytes_total needs that number to be true.
 func TestMarkStopsAtTheFirstFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "a.wal", "b.wal")
@@ -177,7 +176,7 @@ func TestMarkStopsAtTheFirstFailure(t *testing.T) {
 // object referenced by a published manifest is live even though nothing else points
 // at it.
 func TestReachableAnchorsWALObjectsFromManifests(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, "wal/v/1/anchored.wal", "wal/v/1/orphan.wal")

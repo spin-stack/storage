@@ -1,7 +1,6 @@
 package epoch_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -13,7 +12,7 @@ import (
 const vol = "00000000-0000-7000-8000-000000000001"
 
 func TestInitCurrentAndCreateOnly(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 
 	etag, err := s.Init(ctx, vol, 3)
@@ -31,7 +30,7 @@ func TestInitCurrentAndCreateOnly(t *testing.T) {
 }
 
 func TestCompareAndAdvance(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 	etag, _ := s.Init(ctx, vol, 1)
 
@@ -51,7 +50,7 @@ func TestCompareAndAdvance(t *testing.T) {
 }
 
 func TestMissingObjectPaths(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 	if _, _, err := s.Current(ctx, vol); err == nil {
 		t.Fatal("Current on a missing epoch object should error")
@@ -65,7 +64,7 @@ func TestMissingObjectPaths(t *testing.T) {
 }
 
 func TestVerify(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := epoch.NewStore(sim.NewObjectStore())
 	etag, _ := s.Init(ctx, vol, 5)
 

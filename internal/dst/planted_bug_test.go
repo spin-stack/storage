@@ -131,7 +131,7 @@ func TestPlantedBugStaleWriterPublished(t *testing.T) {
 	const vid = "00000000-0000-7000-8000-0000000000a7"
 	sc := func(staleAfterPromotion bool) Scenario {
 		return func(s *Sim) error {
-			ctx := context.Background()
+			ctx := t.Context()
 			epochs := epoch.NewStore(s.Store)
 			if _, err := epochs.Init(ctx, vid, 1); err != nil {
 				return err

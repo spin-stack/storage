@@ -62,7 +62,7 @@ func newElectorWorld(t *testing.T) (*metasim.Store, *sim.ObjectStore) {
 // A term nobody can see is a term nobody can be stopped from re-issuing: the claim
 // has to exist, be create-only, and name its holder before the term is returned.
 func TestElectorClaimsTheTermBeforeReturningIt(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, store := newElectorWorld(t)
 	e := controlplane.NewElector(md, store)
 
@@ -96,7 +96,7 @@ func TestElectorClaimsTheTermBeforeReturningIt(t *testing.T) {
 // leader's term, so an election hands out a term that is already in use. The elector
 // must never return it — it climbs until it finds one nobody has claimed.
 func TestARewoundDatabaseCannotReissueALiveTerm(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	// Terms 1 and 2 were issued and used. The restore rewinds the row, so the next
 	// three elections hand out 1, 2 and 3 again.
@@ -131,7 +131,7 @@ func TestARewoundDatabaseCannotReissueALiveTerm(t *testing.T) {
 // term here would be the fail-open shape the whole ADR exists to remove — the claim
 // is the only record that outlives the database.
 func TestElectorFailsClosedWhenTheClaimCannotBeWritten(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	md, base := newElectorWorld(t)
 	boom := errors.New("object store unreachable")
 	e := controlplane.NewElector(md, &failingPuts{Store: base, err: boom})
@@ -148,7 +148,7 @@ func TestElectorFailsClosedWhenTheClaimCannotBeWritten(t *testing.T) {
 // A store that refuses every claim must not loop forever: an operator needs an error,
 // not a process that never becomes leader and never says why.
 func TestElectorGivesUpRatherThanSpinning(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	var terms []int64
 	for i := int64(1); i <= 4096; i++ {
@@ -182,7 +182,7 @@ func TestTermClaimKeysSortNumerically(t *testing.T) {
 // HighestClaimedTerm is the diagnostic the ADR promises an operator: the bucket's
 // view of leadership, which is the one that survives the restore.
 func TestHighestClaimedTermReadsTheBucketNotTheDatabase(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	e := controlplane.NewElector(&scriptedTerms{terms: []int64{1, 2, 3}}, store)
 
@@ -206,7 +206,7 @@ func TestHighestClaimedTermReadsTheBucketNotTheDatabase(t *testing.T) {
 // An unreadable claim is not a zero: reporting 0 would tell an operator comparing the
 // bucket against the database that nothing was ever issued.
 func TestHighestClaimedTermRefusesAnUnreadableClaim(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	if _, err := store.Put(ctx, controlplane.TermClaimKey(7), []byte("not json"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
 		t.Fatal(err)

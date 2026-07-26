@@ -29,7 +29,7 @@ import (
 // backendUnderTest starts the pinned backend and returns a client for it.
 func backendUnderTest(t *testing.T) (*s3.Client, context.Context) {
 	t.Helper()
-	return backendConfig(t).Client(), context.Background()
+	return backendConfig(t).Client(), t.Context()
 }
 
 // backendConfig starts the pinned backend and returns its connection details, for

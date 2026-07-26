@@ -1,7 +1,6 @@
 package gc_test
 
 import (
-	"context"
 	"slices"
 	"testing"
 	"time"
@@ -26,7 +25,7 @@ func putWAL(t *testing.T, store *sim.ObjectStore, v [16]byte, epoch, first, last
 		b.Append(seq, enc, false)
 	}
 	b.Flush()
-	key, err := wal.NewUploader(store, 3).Upload(context.Background(), b.Pending()[0])
+	key, err := wal.NewUploader(store, 3).Upload(t.Context(), b.Pending()[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +35,7 @@ func putWAL(t *testing.T, store *sim.ObjectStore, v [16]byte, epoch, first, last
 // TestGCMarksOrphansNotLive is INV-14: an orphan (unreferenced) WAL object is
 // marked; live objects (referenced by a checkpoint) and structural objects are not.
 func TestGCMarksOrphansNotLive(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	var v [16]byte
 	v[6], v[8] = 0x70, 0x80
@@ -85,7 +84,7 @@ func TestGCMarksOrphansNotLive(t *testing.T) {
 // TestGCHasNoPermanentDeleteCapability: the marks are reversible — a marked object is
 // still present (the lifecycle sweeps later, not the GC).
 func TestGCMarksAreReversible(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	_, _ = store.Put(ctx, "wal/x/1/9-9-h.wal", []byte("orphan"), objectstore.PutOptions{})
 
@@ -106,7 +105,7 @@ func TestGCMarksAreReversible(t *testing.T) {
 // claim exists to prevent — a restored database re-issuing a term a live leader still
 // holds — with the added twist that it would look like a routine cost-control pass.
 func TestGCNeverMarksATermClaim(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 

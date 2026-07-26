@@ -1,7 +1,6 @@
 package recovery_test
 
 import (
-	"context"
 	"crypto/sha256"
 	"testing"
 
@@ -67,7 +66,7 @@ func craftObject(t *testing.T, volumeID [16]byte, epoch, first, last uint64, mut
 
 func putObject(t *testing.T, store *sim.ObjectStore, key string, body []byte) {
 	t.Helper()
-	if _, err := store.Put(context.Background(), key, body, objectstore.PutOptions{}); err != nil {
+	if _, err := store.Put(t.Context(), key, body, objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -76,7 +75,7 @@ func putObject(t *testing.T, store *sim.ObjectStore, key string, body []byte) {
 // short still carries a header claiming its full range. Trusting that header
 // overstates durability — exactly the failure INV-08 must exclude.
 func TestTruncatedObjectDoesNotRaiseTheDurablePoint(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -99,7 +98,7 @@ func TestTruncatedObjectDoesNotRaiseTheDurablePoint(t *testing.T) {
 // while the header claims a longer sequence span than the records it holds. The
 // durable point must follow the records, not the claim.
 func TestHeaderLyingAboutItsRangeIsRejected(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -124,7 +123,7 @@ func TestHeaderLyingAboutItsRangeIsRejected(t *testing.T) {
 // TestObjectFromAnotherVolumeOrEpochIsIgnored: a stray object under the prefix (a
 // mis-keyed upload, a bug, a restored bucket) must not contribute.
 func TestObjectFromAnotherVolumeOrEpochIsIgnored(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 	other := vol
@@ -154,7 +153,7 @@ func TestObjectFromAnotherVolumeOrEpochIsIgnored(t *testing.T) {
 // floor, a bucket whose first objects are missing (a partial restore, an aborted GC)
 // reads as a healthy prefix starting at whatever survived.
 func TestPrefixRequiresItsFloor(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -174,7 +173,7 @@ func TestPrefixRequiresItsFloor(t *testing.T) {
 // TestPrefixFloorComesFromTheRecoveryPoint: in epoch N+1 the WAL legitimately starts
 // after the previous epoch's recovered point (§12.5), so that is the floor.
 func TestPrefixFloorComesFromTheRecoveryPoint(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -211,7 +210,7 @@ func TestPrefixFloorComesFromTheRecoveryPoint(t *testing.T) {
 // TestRecoverStopsAtTheValidatedPrefix: Recover must apply exactly the records the
 // durable point covers, so a corrupt tail cannot leak into the rebuilt view.
 func TestRecoverStopsAtTheValidatedPrefix(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -240,7 +239,7 @@ func TestRecoverStopsAtTheValidatedPrefix(t *testing.T) {
 // TestWALObjectKeyIsNotTrusted: validation is on the object's own bytes, not on the
 // sequence numbers someone encoded in the key.
 func TestWALObjectKeyIsNotTrusted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -262,7 +261,7 @@ func TestWALObjectKeyIsNotTrusted(t *testing.T) {
 // TestValidObjectsStillRecover is the control: nothing above may be achieved by
 // making the validator reject everything.
 func TestValidObjectsStillRecover(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -294,7 +293,7 @@ var _ = wal.Replay // the validator must agree with the replayer
 // directly: each is the difference between "this object is what it claims" and "the
 // durable point is a guess".
 func TestValidationRejectsEveryShapeOfLie(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	vol := vol7()
 
 	tests := []struct {

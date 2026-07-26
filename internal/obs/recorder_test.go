@@ -1,7 +1,6 @@
 package obs_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/obs"
@@ -15,7 +14,7 @@ import (
 
 func TestNilRecorderIsSafe(t *testing.T) {
 	var r *obs.Recorder // never assigned
-	ctx := context.Background()
+	ctx := t.Context()
 	// None of these may panic: a data path is not allowed to fail because telemetry
 	// was not wired.
 	r.Count(ctx, "gc_marked_bytes_total", 10)
@@ -29,8 +28,8 @@ func TestRecorderWritesToTheRegisteredInstruments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Shutdown(context.Background()) }()
-	ctx := context.Background()
+	defer func() { _ = p.Shutdown(t.Context()) }()
+	ctx := t.Context()
 
 	r := obs.NewRecorder(p.Metrics)
 	r.Count(ctx, "gc_marked_bytes_total", 42)
@@ -55,8 +54,8 @@ func TestRecorderIgnoresUnknownNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = p.Shutdown(context.Background()) }()
-	ctx := context.Background()
+	defer func() { _ = p.Shutdown(t.Context()) }()
+	ctx := t.Context()
 
 	r := obs.NewRecorder(p.Metrics)
 	r.Count(ctx, "wal_typo_total", 1)

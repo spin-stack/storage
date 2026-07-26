@@ -48,7 +48,7 @@ func TestRequireVersioning(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := tc.stub
-			err := requireVersioning(context.Background(), &stub, "volumes")
+			err := requireVersioning(t.Context(), &stub, "volumes")
 			switch {
 			case tc.want == nil && err != nil:
 				t.Fatalf("a versioned bucket must be accepted: %v", err)
@@ -66,7 +66,7 @@ func TestRequireVersioning(t *testing.T) {
 // constructor. A method a caller may forget to call is not a structural guarantee,
 // and INV-14 is claimed as structural.
 func TestNewS3StoreRefusesAnUnversionedBucket(t *testing.T) {
-	if _, err := NewS3Store(context.Background(), S3Config{}); err == nil {
+	if _, err := NewS3Store(t.Context(), S3Config{}); err == nil {
 		t.Fatal("a store with no bucket must not be constructible")
 	}
 }

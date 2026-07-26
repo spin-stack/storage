@@ -2,7 +2,6 @@ package wal_test
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -174,7 +173,7 @@ func TestUnversionedDEKIsRefusedAtWriteTime(t *testing.T) {
 // can disagree — and then the object announces a key version that did not seal it.
 // The DEK is the only source of truth for that field.
 func TestEncryptedObjectHeaderCarriesTheDEKKeyID(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dek, err := crypto.GenerateDEK(&ramp{b: 3}, 7)
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +211,7 @@ func TestEncryptedObjectHeaderCarriesTheDEKKeyID(t *testing.T) {
 // TestEncryptedWriteSurvivesTheS3RoundTrip is the positive control for the two above:
 // with a versioned DEK the ACKed FLUSH is genuinely reproducible from the bucket.
 func TestEncryptedWriteSurvivesTheS3RoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dek, err := crypto.GenerateDEK(&ramp{b: 5}, 7)
 	if err != nil {
 		t.Fatal(err)

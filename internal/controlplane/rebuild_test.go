@@ -19,7 +19,7 @@ import (
 // TestRebuildMetadataFromS3 is INV-20: with PostgreSQL wiped, rebuild-metadata
 // reconstructs the volumes from the self-describing S3 layout.
 func TestRebuildMetadataFromS3(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	epochs := epoch.NewStore(store)
 
@@ -66,7 +66,7 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 }
 
 func TestDescriptorRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	d := descriptor.Descriptor{VolumeID: volID, SizeBytes: 42, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 3, KEKID: "k", DEKWrapped: []byte{9}}
 	if err := descriptor.Write(ctx, store, d); err != nil {
@@ -116,7 +116,7 @@ const (
 // epoch 2, S3 says 5, a promotion is impossible, the operator runs the rebuild, and
 // the promotion must work afterwards.
 func TestRebuildRepairsAVolumeRowLeftBehindByS3(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)
@@ -194,7 +194,7 @@ func TestRebuildRepairsAVolumeRowLeftBehindByS3(t *testing.T) {
 // loop fails with ErrStaleTerm. The re-run under the new term has to finish the job
 // rather than trip over what the first run already wrote.
 func TestRebuildResumesAfterALeadershipChangeMidLoop(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	inner := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(inner)
@@ -280,7 +280,7 @@ func (h *rebuildHookStore) Get(ctx context.Context, key string) ([]byte, error) 
 // it can and say plainly that this one is not reconciled, rather than report a clean
 // run over a volume nobody can promote.
 func TestRebuildNamesARowThatIsAheadOfS3(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)
@@ -331,7 +331,7 @@ func TestRebuildNamesARowThatIsAheadOfS3(t *testing.T) {
 // restore that predates a resize leaves the row smaller than the volume actually is,
 // and the guest addresses blocks past the end of it.
 func TestRebuildGrowsARowThatShrankUnderAPITR(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	epochs := epoch.NewStore(store)

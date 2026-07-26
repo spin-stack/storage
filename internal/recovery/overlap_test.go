@@ -1,7 +1,6 @@
 package recovery_test
 
 import (
-	"context"
 	"crypto/sha256"
 	"errors"
 	"testing"
@@ -85,7 +84,7 @@ func TestOverlappingObjectsDoNotUnderReportTheDurablePoint(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			store := sim.NewObjectStore()
 			vol := vol7()
 			for _, s := range tc.spans {
@@ -119,7 +118,7 @@ func TestDivergentObjectsForOneSequenceAreAHardFailure(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			store := sim.NewObjectStore()
 			vol := vol7()
 
@@ -150,7 +149,7 @@ func TestDivergentObjectsForOneSequenceAreAHardFailure(t *testing.T) {
 // re-sent object that carries the same records is a duplicate, not a divergence, and
 // the epoch stays recoverable.
 func TestAgreeingObjectsAreNotAConflict(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -181,7 +180,7 @@ func TestAgreeingObjectsAreNotAConflict(t *testing.T) {
 // because it sits past a gap. An object below the durable point can be re-uploaded
 // later and close the gap, and by then the choice would already have been made.
 func TestDivergenceIsReportedEvenAboveAGap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 

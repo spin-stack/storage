@@ -66,7 +66,7 @@ func goodCheckpoint(objects ...string) checkpoint.Checkpoint {
 // TestReachableRefusesAnUnreadableAnchor: every way an anchor can be unreadable must
 // stop the sweep, and the objects it protected must survive.
 func TestReachableRefusesAnUnreadableAnchor(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	manifestKey := snapshot.ManifestKey(anchorVol, "s1")
 	cpKey := checkpoint.Key(anchorVol, 1, 1)
 
@@ -124,7 +124,7 @@ func TestReachableRefusesAnUnreadableAnchor(t *testing.T) {
 // so eager that it refuses a real anchor, including a snapshot that legitimately
 // references nothing.
 func TestReachableAcceptsAWellFormedAnchor(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	tests := []struct {
 		name string
 		key  string
@@ -177,7 +177,7 @@ func TestReachableAcceptsAWellFormedAnchor(t *testing.T) {
 // operator can retire an anchor in the microseconds between the sweep's LIST and its
 // GET. Reading that as "anchors nothing" would mark the objects it protected.
 func TestAnchorThatDisappearsBetweenListAndGetAbortsTheSweep(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	inner := newStore(clk)
 	seed(t, inner, anchoredWAL)
@@ -215,7 +215,7 @@ func TestAnchorThatDisappearsBetweenListAndGetAbortsTheSweep(t *testing.T) {
 // TestChildManifestKeepsItsParentsObjectsReachable: with the whole lineage present,
 // both generations survive a sweep.
 func TestChildManifestKeepsItsParentsObjectsReachable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, anchoredWAL, otherWAL)
@@ -246,7 +246,7 @@ func TestChildManifestKeepsItsParentsObjectsReachable(t *testing.T) {
 // child's lineage is dangling and the sweep can no longer know what the parent
 // anchored. Abort — do not mark the parent's objects.
 func TestRetiringAParentManifestDoesNotWidenTheMarkSet(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	store := newStore(clk)
 	seed(t, store, anchoredWAL, otherWAL)

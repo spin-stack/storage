@@ -1,7 +1,6 @@
 package wal_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -37,7 +36,7 @@ func newMetricSink(t *testing.T) *metricSink {
 func (s *metricSink) gauge(t *testing.T, name string) (float64, bool) {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := s.reader.Collect(context.Background(), &rm); err != nil {
+	if err := s.reader.Collect(t.Context(), &rm); err != nil {
 		t.Fatal(err)
 	}
 	for _, scope := range rm.ScopeMetrics {
@@ -77,7 +76,7 @@ func localModeLog(t *testing.T, sink *metricSink) (*wal.Log, *sim.Clock) {
 // returns before any gauge is published, so the volume with the real RPO exposure is
 // the one that reports nothing.
 func TestLocalModeFlushPublishesTheRPOGauges(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sink := newMetricSink(t)
 	l, _ := localModeLog(t, sink)
 
@@ -102,7 +101,7 @@ func TestLocalModeFlushPublishesTheRPOGauges(t *testing.T) {
 // local-mode FLUSH (and a bare Sync) resets — so the backlog that a host loss would
 // destroy grows without bound while the gauge reads 0.
 func TestDurableGapBytesCountsWhatS3DoesNotHave(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sink := newMetricSink(t)
 	l, _ := localModeLog(t, sink)
 
@@ -131,7 +130,7 @@ func TestDurableGapBytesCountsWhatS3DoesNotHave(t *testing.T) {
 // the host, which is precisely the durability a host loss destroys. Clearing the
 // remote-gap accounting there reports RPO 0 for data no other machine has.
 func TestSyncDoesNotClearTheRemoteDurabilityAccounting(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sink := newMetricSink(t)
 	l, _ := localModeLog(t, sink)
 
@@ -156,7 +155,7 @@ func TestSyncDoesNotClearTheRemoteDurabilityAccounting(t *testing.T) {
 // TestVerifiedUploadIsWhatClosesTheGap: the other direction — the gap must fall only
 // when an object is verified in the store, and reach 0 when everything is covered.
 func TestVerifiedUploadIsWhatClosesTheGap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sink := newMetricSink(t)
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())

@@ -27,7 +27,7 @@ func putSummary(t *testing.T, store *sim.ObjectStore, key string, s wal.Summary)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Put(context.Background(), key, body, objectstore.PutOptions{}); err != nil {
+	if _, err := store.Put(t.Context(), key, body, objectstore.PutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -37,7 +37,7 @@ func putSummary(t *testing.T, store *sim.ObjectStore, key string, s wal.Summary)
 // but it has to be reportable *as that*, with the prefix S3 can still prove, so an
 // operator or a drain can act on it instead of retrying an opaque error for ever.
 func TestOverclaimingSummaryIsDistinguishableAndTheHonestPrefixSurvives(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -75,7 +75,7 @@ func TestOverclaimingSummaryIsDistinguishableAndTheHonestPrefixSurvives(t *testi
 // its fields were never checked against the volume being recovered, so one stray
 // object could brick a volume's recovery until a human deleted it.
 func TestSummaryFromAnotherVolumeOrEpochIsIgnored(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	vol := vol7()
 	other := vol
 	other[15] = 0xEE
@@ -114,7 +114,7 @@ func TestSummaryFromAnotherVolumeOrEpochIsIgnored(t *testing.T) {
 // skip into a silent under-report. The objects are the authority; a stale summary
 // that names fewer of them must not shrink what S3 can prove.
 func TestSummaryClaimingLessDoesNotLowerTheDurablePoint(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 
@@ -141,7 +141,7 @@ func TestSummaryClaimingLessDoesNotLowerTheDurablePoint(t *testing.T) {
 // boundary object — one is "nothing to cross-check against", the other is "we could
 // not look".
 func TestUnreadableSummaryIsNotSilentlyNoSummary(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	base := sim.NewObjectStore()
 	vol := vol7()
 

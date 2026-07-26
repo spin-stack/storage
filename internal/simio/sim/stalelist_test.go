@@ -1,7 +1,6 @@
 package sim_test
 
 import (
-	"context"
 	"math/rand"
 	"testing"
 
@@ -13,7 +12,7 @@ import (
 func put(t *testing.T, s *sim.ObjectStore, keys ...string) {
 	t.Helper()
 	for _, k := range keys {
-		if _, err := s.Put(context.Background(), k, []byte("v"), objectstore.PutOptions{}); err != nil {
+		if _, err := s.Put(t.Context(), k, []byte("v"), objectstore.PutOptions{}); err != nil {
 			t.Fatalf("put %s: %v", k, err)
 		}
 	}
@@ -21,7 +20,7 @@ func put(t *testing.T, s *sim.ObjectStore, keys ...string) {
 
 func listed(t *testing.T, s *sim.ObjectStore, prefix string) []string {
 	t.Helper()
-	objs, err := s.List(context.Background(), prefix)
+	objs, err := s.List(t.Context(), prefix)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -93,7 +92,7 @@ func TestInjectStaleListingLosesTheNewestNotTheLast(t *testing.T) {
 		t.Fatal("a stale listing must still answer with the older keys, got nothing")
 	}
 	// GET stays strongly consistent: the asymmetry recovery depends on (§6.1).
-	if _, err := s.Get(context.Background(), "wal/a"); err != nil {
+	if _, err := s.Get(t.Context(), "wal/a"); err != nil {
 		t.Fatalf("GET must be unaffected by a lagging listing: %v", err)
 	}
 }
@@ -142,7 +141,7 @@ func TestInjectStaleListingSkipsEmptyListings(t *testing.T) {
 // A stale listing hides keys; it never resurrects a marked one. The two mechanisms are
 // independent and INV-14's marker outranks them both.
 func TestInjectStaleListingDoesNotResurrectAMarkedObject(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s := sim.NewObjectStore()
 	put(t, s, "wal/1", "wal/2")
 	if err := s.Delete(ctx, "wal/2"); err != nil {

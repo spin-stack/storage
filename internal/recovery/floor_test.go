@@ -47,7 +47,7 @@ func (s rpFaultStore) Get(ctx context.Context, key string) ([]byte, error) {
 // TestUnreadableBoundaryIsAnErrorNotAFloorOfOne: with the boundary unreadable the
 // durable point is unknown. Reporting a number — any number — is the failure.
 func TestUnreadableBoundaryIsAnErrorNotAFloorOfOne(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	vol := vol7()
 
 	// Epoch 2 legitimately starts at 8: the promotion recorded a boundary at 7.
@@ -92,7 +92,7 @@ func TestUnreadableBoundaryIsAnErrorNotAFloorOfOne(t *testing.T) {
 // a genuinely absent recovery-point object is the ordinary case for a volume's first
 // epoch, and it means floor 1 — not an error.
 func TestMissingBoundaryStillMeansTheFirstEpoch(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	vol := vol7()
 

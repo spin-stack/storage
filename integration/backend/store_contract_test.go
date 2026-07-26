@@ -3,7 +3,6 @@
 package backend_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -40,7 +39,7 @@ func TestS3StoreSatisfiesTheContract(t *testing.T) {
 // newVersionedS3Store creates a versioned bucket and an S3Store over it.
 func newVersionedS3Store(t *testing.T, be testinfra.ObjectStoreBackend, bucket string) *real.S3Store {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	admin := be.Client()
 	if _, err := admin.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatalf("create bucket %s: %v", bucket, err)
@@ -69,7 +68,7 @@ func newVersionedS3Store(t *testing.T, be testinfra.ObjectStoreBackend, bucket s
 // that returned one page would silently shorten the contiguous prefix.
 func TestS3StoreListPaginates(t *testing.T) {
 	be := backendConfig(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newVersionedS3Store(t, be, "contract-pagination")
 
 	const objects = 1100
@@ -98,7 +97,7 @@ func TestS3StoreListPaginates(t *testing.T) {
 // by flipping one field, with no other code change.
 func TestS3StoreChecksumWhenRequiredAlsoWorks(t *testing.T) {
 	be := backendConfig(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	bucket := "contract-checksum-required"
 	makeVersionedBucket(t, ctx, be.Client(), bucket)
 	store, err := real.NewS3Store(ctx, real.S3Config{

@@ -1,7 +1,6 @@
 package materialize_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/checkpoint"
@@ -34,7 +33,7 @@ const holderElsewhere = "00000000-0000-7000-8000-0000000000c1"
 // the one doing the materializing.
 func grantEpochTo(t *testing.T, store objectstore.Store, vol [16]byte, ep uint64, holder string) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	es := epoch.NewStore(store)
 	vid := format.UUIDString(vol)
 	etag, err := es.Init(ctx, vid, ep-1)
@@ -59,14 +58,14 @@ func TestMaterializationDoesNotRequireHoldingTheEpoch(t *testing.T) {
 			name: "FromEpoch — the drain's bulk pass (ADR-0008 step 1)",
 			run: func(t *testing.T, w *world) (uint64, error) {
 				grantEpochTo(t, w.store, w.vol, 1, holderElsewhere)
-				_, prog, err := materialize.New(w.store, nil, nil).FromEpoch(context.Background(), w.vol, 1)
+				_, prog, err := materialize.New(w.store, nil, nil).FromEpoch(t.Context(), w.vol, 1)
 				return prog.UpTo, err
 			},
 		},
 		{
 			name: "FromCheckpoint — warm-standby hydration (§21.1, §22.3)",
 			run: func(t *testing.T, w *world) (uint64, error) {
-				ctx := context.Background()
+				ctx := t.Context()
 				cp, err := checkpoint.NewCheckpointer(w.store).Create(ctx, w.log, w.vol, 1)
 				if err != nil {
 					t.Fatalf("publishing the source checkpoint: %v", err)
@@ -83,7 +82,7 @@ func TestMaterializationDoesNotRequireHoldingTheEpoch(t *testing.T) {
 				m := w.snapshot(t, "snap-holder")
 				grantEpochTo(t, w.store, w.vol, 1, holderElsewhere)
 				_, prog, err := materialize.New(w.store, nil, nil).
-					FromSnapshot(context.Background(), m.VolumeID, m.SnapshotID)
+					FromSnapshot(t.Context(), m.VolumeID, m.SnapshotID)
 				return prog.UpTo, err
 			},
 		},

@@ -29,7 +29,7 @@ func remoteLog(t *testing.T, store *sim.ObjectStore) *wal.Log {
 }
 
 func TestFlushUploadsAndAdvancesDurable(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	l := remoteLog(t, store)
 
@@ -53,7 +53,7 @@ func TestFlushUploadsAndAdvancesDurable(t *testing.T) {
 // TestFlushDoesNotAdvanceDurableOnUploadFailure is INV-07: durable_sequence must
 // not move past what is verified in S3.
 func TestFlushDoesNotAdvanceDurableOnUploadFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	l := remoteLog(t, store)
 	_, _ = l.Write(0, []byte("data"), 0)
@@ -81,7 +81,7 @@ func TestFlushDoesNotAdvanceDurableOnUploadFailure(t *testing.T) {
 // TestUploadIdempotentOnLostResponse is INV-21: a PUT that persisted but lost its
 // response reconciles on retry via 412 + HEAD.
 func TestUploadIdempotentOnLostResponse(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := [16]byte{3}
@@ -108,7 +108,7 @@ func TestUploadIdempotentOnLostResponse(t *testing.T) {
 // TestUploadDivergenceHardFails: a different object already at the key is a hard
 // fail (§14.5).
 func TestUploadDivergenceHardFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := [16]byte{4}
@@ -135,7 +135,7 @@ func TestUploadDivergenceHardFails(t *testing.T) {
 // SHA-prefix sort order, with no diagnostic anywhere. The span, not the key, is what
 // must be unique.
 func TestUploadRefusesASecondObjectForTheSameSpan(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := [16]byte{14}
@@ -169,7 +169,7 @@ func TestUploadRefusesASecondObjectForTheSameSpan(t *testing.T) {
 // the first check instead of spending its whole budget against a backend that is
 // already being torn down.
 func TestUploadStopsOnACancelledContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	store := sim.NewObjectStore()
@@ -186,7 +186,7 @@ func TestUploadStopsOnACancelledContext(t *testing.T) {
 
 func TestEncryptedRemoteObjectsAreCiphertext(t *testing.T) {
 	// End-to-end: encrypted + remote — the uploaded object contains no cleartext.
-	ctx := context.Background()
+	ctx := t.Context()
 	store := sim.NewObjectStore()
 	l := remoteLog(t, store)
 	// A versioned DEK: KeyID 0 is the on-disk marker for "plaintext record", so a
