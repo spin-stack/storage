@@ -96,6 +96,14 @@ func TestHeartbeatWritesTheDevicePicture(t *testing.T) {
 	if h.NVMeTotalBytes != 1<<40 || h.NVMeUsedBytes != 700<<30 {
 		t.Fatalf("device numbers not stored: %+v", h)
 	}
+	// The backlog is the one number of the three that no other reader can recompute:
+	// it is the part of `used` that no verified object covers yet (INV-13), so no
+	// amount of local truncation reclaims it, and per-volume MaxRemoteGapBytes never
+	// sums to it. Dropping it left the fleet unable to tell a host that is merely
+	// full from one whose object store has stopped answering.
+	if h.RemoteBacklogBytes != 4<<30 {
+		t.Fatalf("remote backlog not stored: %+v", h)
+	}
 	if h.AgentVersion != "0.1.0" || h.MaxFormatVersion != 2 {
 		t.Fatalf("identity not stored: %+v", h)
 	}

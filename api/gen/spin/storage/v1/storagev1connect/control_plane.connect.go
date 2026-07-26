@@ -47,6 +47,9 @@ const (
 	// ControlPlaneServiceReportVolumeStateProcedure is the fully-qualified name of the
 	// ControlPlaneService's ReportVolumeState RPC.
 	ControlPlaneServiceReportVolumeStateProcedure = "/spin.storage.v1.ControlPlaneService/ReportVolumeState"
+	// ControlPlaneServiceGetVolumeKeysProcedure is the fully-qualified name of the
+	// ControlPlaneService's GetVolumeKeys RPC.
+	ControlPlaneServiceGetVolumeKeysProcedure = "/spin.storage.v1.ControlPlaneService/GetVolumeKeys"
 )
 
 // ControlPlaneServiceClient is a client for the spin.storage.v1.ControlPlaneService service.
@@ -64,6 +67,29 @@ type ControlPlaneServiceClient interface {
 	// a report from a fenced writer names an epoch the volume has moved past, and
 	// is refused rather than applied (INV-03, §12.3).
 	ReportVolumeState(context.Context, *connect.Request[v1.ReportVolumeStateRequest]) (*connect.Response[v1.ReportVolumeStateResponse], error)
+	// GetVolumeKeys returns the wrapped DEK of one volume, and the id of the KEK
+	// that wraps it (§15.1). Without it the desired state is an instruction the
+	// Agent cannot carry out: every payload on this path is sealed with the
+	// volume's DEK before it reaches the WAL or an S3 object.
+	//
+	// It is a call of its own rather than fields on DesiredVolume, for three
+	// reasons that all point the same way:
+	//
+	//   - Exposure. Key material is the one thing on this surface whose leak is
+	//     not repaired by re-reading the truth from S3. A separate call is
+	//     authorised per request against the volume's current primary, so a host
+	//     that has been fenced, or that never held the volume, is refused. Bundled
+	//     into a list answer there is no such granularity: the only unit available
+	//     to check is the whole list.
+	//   - Frequency. The desired state is polled by every host every few seconds,
+	//     for every volume it holds. Bundled, a wrapped DEK would cross the wire
+	//     thousands of times a day per volume, in exactly the message an operator
+	//     is most likely to dump while debugging an incident.
+	//   - Cacheability. The two have opposite lifetimes. Desired state is expected
+	//     to change and is re-read for that reason; key material does not change
+	//     while the volume is this host's, so it is fetched once and held, and
+	//     dropped when the volume leaves the desired state.
+	GetVolumeKeys(context.Context, *connect.Request[v1.GetVolumeKeysRequest]) (*connect.Response[v1.GetVolumeKeysResponse], error)
 }
 
 // NewControlPlaneServiceClient constructs a client for the spin.storage.v1.ControlPlaneService
@@ -95,6 +121,12 @@ func NewControlPlaneServiceClient(httpClient connect.HTTPClient, baseURL string,
 			connect.WithSchema(controlPlaneServiceMethods.ByName("ReportVolumeState")),
 			connect.WithClientOptions(opts...),
 		),
+		getVolumeKeys: connect.NewClient[v1.GetVolumeKeysRequest, v1.GetVolumeKeysResponse](
+			httpClient,
+			baseURL+ControlPlaneServiceGetVolumeKeysProcedure,
+			connect.WithSchema(controlPlaneServiceMethods.ByName("GetVolumeKeys")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -103,6 +135,7 @@ type controlPlaneServiceClient struct {
 	heartbeat         *connect.Client[v1.HeartbeatRequest, v1.HeartbeatResponse]
 	getDesiredState   *connect.Client[v1.GetDesiredStateRequest, v1.GetDesiredStateResponse]
 	reportVolumeState *connect.Client[v1.ReportVolumeStateRequest, v1.ReportVolumeStateResponse]
+	getVolumeKeys     *connect.Client[v1.GetVolumeKeysRequest, v1.GetVolumeKeysResponse]
 }
 
 // Heartbeat calls spin.storage.v1.ControlPlaneService.Heartbeat.
@@ -118,6 +151,11 @@ func (c *controlPlaneServiceClient) GetDesiredState(ctx context.Context, req *co
 // ReportVolumeState calls spin.storage.v1.ControlPlaneService.ReportVolumeState.
 func (c *controlPlaneServiceClient) ReportVolumeState(ctx context.Context, req *connect.Request[v1.ReportVolumeStateRequest]) (*connect.Response[v1.ReportVolumeStateResponse], error) {
 	return c.reportVolumeState.CallUnary(ctx, req)
+}
+
+// GetVolumeKeys calls spin.storage.v1.ControlPlaneService.GetVolumeKeys.
+func (c *controlPlaneServiceClient) GetVolumeKeys(ctx context.Context, req *connect.Request[v1.GetVolumeKeysRequest]) (*connect.Response[v1.GetVolumeKeysResponse], error) {
+	return c.getVolumeKeys.CallUnary(ctx, req)
 }
 
 // ControlPlaneServiceHandler is an implementation of the spin.storage.v1.ControlPlaneService
@@ -136,6 +174,29 @@ type ControlPlaneServiceHandler interface {
 	// a report from a fenced writer names an epoch the volume has moved past, and
 	// is refused rather than applied (INV-03, §12.3).
 	ReportVolumeState(context.Context, *connect.Request[v1.ReportVolumeStateRequest]) (*connect.Response[v1.ReportVolumeStateResponse], error)
+	// GetVolumeKeys returns the wrapped DEK of one volume, and the id of the KEK
+	// that wraps it (§15.1). Without it the desired state is an instruction the
+	// Agent cannot carry out: every payload on this path is sealed with the
+	// volume's DEK before it reaches the WAL or an S3 object.
+	//
+	// It is a call of its own rather than fields on DesiredVolume, for three
+	// reasons that all point the same way:
+	//
+	//   - Exposure. Key material is the one thing on this surface whose leak is
+	//     not repaired by re-reading the truth from S3. A separate call is
+	//     authorised per request against the volume's current primary, so a host
+	//     that has been fenced, or that never held the volume, is refused. Bundled
+	//     into a list answer there is no such granularity: the only unit available
+	//     to check is the whole list.
+	//   - Frequency. The desired state is polled by every host every few seconds,
+	//     for every volume it holds. Bundled, a wrapped DEK would cross the wire
+	//     thousands of times a day per volume, in exactly the message an operator
+	//     is most likely to dump while debugging an incident.
+	//   - Cacheability. The two have opposite lifetimes. Desired state is expected
+	//     to change and is re-read for that reason; key material does not change
+	//     while the volume is this host's, so it is fetched once and held, and
+	//     dropped when the volume leaves the desired state.
+	GetVolumeKeys(context.Context, *connect.Request[v1.GetVolumeKeysRequest]) (*connect.Response[v1.GetVolumeKeysResponse], error)
 }
 
 // NewControlPlaneServiceHandler builds an HTTP handler from the service implementation. It returns
@@ -163,6 +224,12 @@ func NewControlPlaneServiceHandler(svc ControlPlaneServiceHandler, opts ...conne
 		connect.WithSchema(controlPlaneServiceMethods.ByName("ReportVolumeState")),
 		connect.WithHandlerOptions(opts...),
 	)
+	controlPlaneServiceGetVolumeKeysHandler := connect.NewUnaryHandler(
+		ControlPlaneServiceGetVolumeKeysProcedure,
+		svc.GetVolumeKeys,
+		connect.WithSchema(controlPlaneServiceMethods.ByName("GetVolumeKeys")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/spin.storage.v1.ControlPlaneService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case ControlPlaneServiceHeartbeatProcedure:
@@ -171,6 +238,8 @@ func NewControlPlaneServiceHandler(svc ControlPlaneServiceHandler, opts ...conne
 			controlPlaneServiceGetDesiredStateHandler.ServeHTTP(w, r)
 		case ControlPlaneServiceReportVolumeStateProcedure:
 			controlPlaneServiceReportVolumeStateHandler.ServeHTTP(w, r)
+		case ControlPlaneServiceGetVolumeKeysProcedure:
+			controlPlaneServiceGetVolumeKeysHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -190,4 +259,8 @@ func (UnimplementedControlPlaneServiceHandler) GetDesiredState(context.Context, 
 
 func (UnimplementedControlPlaneServiceHandler) ReportVolumeState(context.Context, *connect.Request[v1.ReportVolumeStateRequest]) (*connect.Response[v1.ReportVolumeStateResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("spin.storage.v1.ControlPlaneService.ReportVolumeState is not implemented"))
+}
+
+func (UnimplementedControlPlaneServiceHandler) GetVolumeKeys(context.Context, *connect.Request[v1.GetVolumeKeysRequest]) (*connect.Response[v1.GetVolumeKeysResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("spin.storage.v1.ControlPlaneService.GetVolumeKeys is not implemented"))
 }

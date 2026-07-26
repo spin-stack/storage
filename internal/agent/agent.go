@@ -21,18 +21,16 @@ import (
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
-// DeviceUsage is the byte accounting of the local NVMe device (ADR-0013). Total is
-// the device's capacity; Used is what this Agent occupies on it.
-type DeviceUsage struct {
-	TotalBytes int64
-	UsedBytes  int64
-}
-
-// Device reports the local device's usage. It is an interface because the honest
-// implementation is a statfs, which lives behind internal/simio — see DiskUsage for
-// what this increment can measure without one.
+// Device reports the local NVMe device's usage (ADR-0013). It is an interface, and
+// it carries a context the disk's own statfs does not need, because the device an
+// Agent owns will not always be a filesystem under its feet: a future one is a block
+// device queried over a socket, and a caller that cannot cancel that is a caller
+// whose heartbeat can hang.
+//
+// It reports disk.Usage unchanged rather than a shape of its own. The Agent used to
+// have one, and the translation was where the honest numbers were lost.
 type Device interface {
-	Usage(ctx context.Context) (DeviceUsage, error)
+	Usage(ctx context.Context) (disk.Usage, error)
 }
 
 // VolumeStatus is what the Agent knows about one volume it is serving. The epoch is
@@ -49,6 +47,17 @@ type VolumeStatus struct {
 	// bytes no verified object covers yet, which no local truncation can reclaim
 	// (INV-13).
 	RemoteGapBytes int64
+}
+
+// VolumeKeys is what a host needs to seal and open one volume's payloads (§15.1).
+// The DEK arrives wrapped and stays wrapped here: unwrapping is the KMS's, with a
+// KEK this Agent already holds and the Control Plane never sees.
+type VolumeKeys struct {
+	VolumeID string
+	// DEKWrapped is the volume's data-encryption key sealed under the KEK.
+	DEKWrapped []byte
+	// KEKID names the key that wraps it, for a host holding more than one.
+	KEKID string
 }
 
 // VolumeSource is the set of volumes this host is serving right now. The data path
@@ -94,59 +103,31 @@ func (s *VolumeSet) Volumes(context.Context) ([]VolumeStatus, error) {
 	return out, nil
 }
 
-// DiskUsage measures the Agent's own footprint by summing the files under its data
-// prefix, and takes the device's capacity from configuration.
+// DiskUsage is the Device backed by the disk this Agent writes its WAL and
+// checkpoints to: it asks the device itself (a statfs in production), rather than
+// estimating from the files it happens to know about.
 //
-// It is deliberately not a statfs. internal/simio/disk has no notion of a device's
-// free space, and adding one is a change to an interface this increment does not
-// own (see the increment's report): what a statfs would add is the space *other*
-// tenants of the filesystem occupy. Until then the number reported is the one the
-// Agent is responsible for and the one ADR-0013's thresholds act on.
+// The difference is what the Agent cannot reclaim. A sum of our own files says
+// nothing about the space another tenant of the same filesystem occupies, and no
+// checkpoint of ours will ever free it — so a threshold evaluated on the sum fires
+// after the device is already full, which is the one moment it needed to have fired
+// earlier (ADR-0013 §3).
 type DiskUsage struct {
-	disk       disk.Disk
-	prefix     string
-	totalBytes int64
+	disk disk.Disk
 }
 
-// NewDiskUsage returns a Device that sums the files under prefix on d and reports
-// totalBytes as the device's capacity.
-func NewDiskUsage(d disk.Disk, prefix string, totalBytes int64) *DiskUsage {
-	return &DiskUsage{disk: d, prefix: prefix, totalBytes: totalBytes}
-}
+// NewDiskUsage returns a Device reporting the device behind d.
+func NewDiskUsage(d disk.Disk) *DiskUsage { return &DiskUsage{disk: d} }
 
-// Usage sums the sizes of every file under the prefix.
-func (u *DiskUsage) Usage(context.Context) (DeviceUsage, error) {
-	names, err := u.disk.List(u.prefix)
+// Usage reports the device. A failure is returned, never smoothed into a zero: an
+// unreadable device that looks empty is the worst answer available here, because
+// every ADR-0013 threshold would read it as headroom.
+func (u *DiskUsage) Usage(context.Context) (disk.Usage, error) {
+	usage, err := u.disk.Usage()
 	if err != nil {
-		return DeviceUsage{}, fmt.Errorf("agent: listing %q: %w", u.prefix, err)
+		return disk.Usage{}, fmt.Errorf("agent: measuring the data disk: %w", err)
 	}
-	var used int64
-	for _, name := range names {
-		size, err := u.fileSize(name)
-		if err != nil {
-			// A file that vanished between the listing and the open is not an error:
-			// a truncation or a GC ran, and the next cycle will see the new picture.
-			if errors.Is(err, disk.ErrNotExist) {
-				continue
-			}
-			return DeviceUsage{}, err
-		}
-		used += size
-	}
-	return DeviceUsage{TotalBytes: u.totalBytes, UsedBytes: used}, nil
-}
-
-func (u *DiskUsage) fileSize(name string) (int64, error) {
-	f, err := u.disk.Open(name)
-	if err != nil {
-		return 0, fmt.Errorf("agent: opening %q: %w", name, err)
-	}
-	defer f.Close()
-	size, err := f.Size()
-	if err != nil {
-		return 0, fmt.Errorf("agent: sizing %q: %w", name, err)
-	}
-	return size, nil
+	return usage, nil
 }
 
 // Config is the Agent's configuration. Every field is required: an Agent that
@@ -169,8 +150,10 @@ type Config struct {
 	// Control Plane's answer wins when it differs — a shorter one must shorten the
 	// Agent's window (§12.2).
 	LeaseTTL time.Duration
-	// DeviceTotalBytes is the capacity of the NVMe device this Agent owns.
-	DeviceTotalBytes int64
+	// The device's capacity is deliberately absent. It used to be configured here,
+	// and configuration is the wrong authority for it: the number ADR-0013 divides
+	// by has to be the device's own answer, not the one an operator typed on a host
+	// whose disk was later replaced. It comes from Device.Usage.
 }
 
 // Validate reports what is missing or contradictory.
@@ -194,8 +177,6 @@ func (c Config) Validate() error {
 		// A lease that expires within one heartbeat interval is a lease that lapses
 		// during normal operation, which would fence a perfectly healthy host.
 		return errors.New("agent: lease TTL must exceed the heartbeat interval")
-	case c.DeviceTotalBytes <= 0:
-		return errors.New("agent: device total bytes must be positive")
 	}
 	return nil
 }

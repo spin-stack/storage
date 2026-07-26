@@ -46,7 +46,6 @@ func run() error {
 		hostID       = flag.String("host-id", "", "fleet identity of this host (required)")
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
 		dataDir      = flag.String("data-dir", "", "directory holding this Agent's WAL and checkpoints (required)")
-		deviceBytes  = flag.Int64("device-total-bytes", 0, "capacity of the NVMe device backing --data-dir (required)")
 		interval     = flag.Duration("heartbeat-interval", 5*time.Second, "reconciliation cadence")
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
@@ -70,7 +69,6 @@ func run() error {
 		HeartbeatInterval: *interval,
 		RetryBackoff:      *retryBackoff,
 		LeaseTTL:          *leaseTTL,
-		DeviceTotalBytes:  *deviceBytes,
 	}
 
 	disk, err := real.NewDisk(*dataDir)
@@ -82,9 +80,11 @@ func run() error {
 		Clock: real.NewClock(),
 		ControlPlane: storagev1connect.NewControlPlaneServiceClient(
 			&http.Client{Timeout: *httpTimeout}, *cpURL),
-		// The volume prefix mirrors what the WAL will write under; until the data
-		// path exists this measures an empty tree, and reports it honestly.
-		Device:  agent.NewDiskUsage(disk, "volumes/", *deviceBytes),
+		// The device is measured, not declared: NewDiskUsage statfs's the
+		// filesystem holding --data-dir, so the capacity ADR-0013's thresholds
+		// divide by is the disk's own answer and includes what other tenants of
+		// that filesystem occupy.
+		Device:  agent.NewDiskUsage(disk),
 		Volumes: agent.NewVolumeSet(),
 		// No Recorder: obs has no production exporter yet (the OTLP wiring is a
 		// deploy concern nobody has landed), and a nil Recorder is a working no-op.

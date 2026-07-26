@@ -1,0 +1,20 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-07-26T10:58:44-03:00",
+  "source_fingerprint": {
+    "hash": "efdb22f38f7eb78e8daa8562a3d4e948a3028d990cc959f540a486f8c67fc92d"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE hosts ADD COLUMN nvme_remote_backlog_bytes bigint DEFAULT 0 NOT NULL;",
+          "type": "table.column",
+          "operation": "create",
+          "path": "public.hosts.nvme_remote_backlog_bytes"
+        }
+      ]
+    }
+  ]
+}

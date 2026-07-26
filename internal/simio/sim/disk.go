@@ -21,6 +21,12 @@ var ErrShortWrite = errors.New("simio/sim: injected short write")
 // the first failure, not the first failure itself.
 var ErrNoSpace = fmt.Errorf("simio/sim: injected ENOSPC: %w", disk.ErrNoSpace)
 
+// ErrNoDeviceBudget is returned by Usage on a disk that was never given a device
+// size. Inventing one would be worse than refusing: a zero total makes every
+// ADR-0013 threshold derived from it read as "empty device", silently, in exactly
+// the scenarios written to exercise pressure.
+var ErrNoDeviceBudget = errors.New("simio/sim: this disk has no device budget: call SetDeviceBudget")
+
 // Disk is a deterministic in-memory disk with an explicit crash model: content
 // written but not Synced lives only in the per-file cache and is discarded by
 // Crash. It also injects partial appends, lost syncs, and full devices (§25.3).
@@ -32,6 +38,8 @@ type Disk struct {
 	syncLoss    map[string]bool
 	// capacity is a standing (not one-shot) per-file device size in bytes.
 	capacity map[string]int64
+	// budget is the size of the whole simulated device, or 0 for "never declared".
+	budget int64
 }
 
 type content struct {
@@ -72,18 +80,69 @@ func (d *Disk) ClearENOSPC(name string) {
 	delete(d.capacity, name)
 }
 
-// freeSpace reports the bytes name's device can still take, and whether it is
-// capped at all. Callers hold d.mu.
+// SetDeviceBudget declares how big this simulated device is: the total Usage
+// reports, and the ceiling every file on it is charged against together. It is the
+// simulated counterpart of the real disk's statfs, and the knob ADR-0013's device
+// budget, reserve and thresholds are exercised through — a scenario sets the size of
+// the NVMe it wants to fill, then fills it.
+//
+// It is deliberately not the same thing as InjectENOSPC, which caps one file: N
+// volumes each comfortably inside their own cap can still exhaust the device between
+// them, and that unsummed backlog is the failure ADR-0013 §1 exists for. Both
+// ceilings bind; the tighter one wins.
+//
+// Zero (the default) leaves the device unsized: appends are unbounded and Usage
+// refuses to answer.
+func (d *Disk) SetDeviceBudget(bytes int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.budget = bytes
+}
+
+// Usage reports the simulated device: the declared budget, and what the files on it
+// actually occupy. The used figure is derived from the files rather than tracked
+// alongside them, so it cannot drift from the disk it describes; it costs one pass
+// over the file table, which is a simulator's price to pay for not having a second
+// source of truth.
+func (d *Disk) Usage() (disk.Usage, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.budget <= 0 {
+		return disk.Usage{}, ErrNoDeviceBudget
+	}
+	used := d.usedLocked()
+	avail := d.budget - used
+	if avail < 0 {
+		avail = 0
+	}
+	return disk.Usage{TotalBytes: d.budget, UsedBytes: used, AvailBytes: avail}, nil
+}
+
+// usedLocked sums the visible size of every file. Callers hold d.mu.
+func (d *Disk) usedLocked() int64 {
+	var used int64
+	for _, c := range d.files {
+		used += int64(len(c.cache))
+	}
+	return used
+}
+
+// freeSpace reports the bytes an append to name may still take, and whether
+// anything caps it at all. Two ceilings apply — the per-file cap of InjectENOSPC and
+// the whole-device budget — and the tighter one wins, because a real writer meets
+// whichever it reaches first. Callers hold d.mu.
 func (d *Disk) freeSpace(name string, used int64) (int64, bool) {
-	capacity, capped := d.capacity[name]
-	if !capped {
-		return 0, false
+	free, capped := int64(0), false
+	if capacity, ok := d.capacity[name]; ok {
+		free, capped = max(capacity-used, 0), true
 	}
-	free := capacity - used
-	if free < 0 {
-		free = 0
+	if d.budget > 0 {
+		deviceFree := max(d.budget-d.usedLocked(), 0)
+		if !capped || deviceFree < free {
+			free, capped = deviceFree, true
+		}
 	}
-	return free, true
+	return free, capped
 }
 
 // InjectShortAppend makes the next Append to name write only n bytes then fail.

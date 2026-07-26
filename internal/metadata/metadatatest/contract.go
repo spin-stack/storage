@@ -658,7 +658,7 @@ func upsertHost(t *testing.T, s metadata.Store) {
 	if err := s.UpsertHost(ctx, w.term, metadata.Host{
 		HostID: w.host, State: lifecycle.HostActive, AgentVersion: "v2",
 		MaxFormatVersion: 3, NVMeTotalBytes: 1 << 41, NVMeUsedBytes: 123,
-		NVMeCommittedBytes: 999,
+		RemoteBacklogBytes: 456, NVMeCommittedBytes: 999,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -673,6 +673,11 @@ func upsertHost(t *testing.T, s metadata.Store) {
 		t.Fatalf("a heartbeat changed the committed capacity: committed = %d, want %d", h.NVMeCommittedBytes, held)
 	case h.AgentVersion != "v2" || h.MaxFormatVersion != 3 || h.NVMeTotalBytes != 1<<41 || h.NVMeUsedBytes != 123:
 		t.Fatalf("a heartbeat did not update the fields it owns: %+v", h)
+	case h.RemoteBacklogBytes != 456:
+		// The remote backlog is reported by the host, so it is one of the fields a
+		// heartbeat owns — unlike committed capacity above, which is derived from
+		// the rows that say who holds what and is the Control Plane's (ADR-0017).
+		t.Fatalf("a heartbeat did not update the remote backlog: %+v", h)
 	}
 }
 

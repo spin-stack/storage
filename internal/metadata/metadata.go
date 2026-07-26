@@ -116,6 +116,18 @@ type Host struct {
 	MaxFormatVersion int32
 	NVMeTotalBytes   int64
 	NVMeUsedBytes    int64
+	// RemoteBacklogBytes is the share of NVMeUsedBytes that no verified object
+	// covers yet, summed over every volume the host holds (ADR-0013 §1). Like the
+	// two fields above it, the host reports it and a heartbeat writes it.
+	//
+	// It is stored rather than derived — the opposite call from NVMeCommittedBytes
+	// below — because nothing else here can produce it: the distance between what a
+	// host has written and what S3 has acknowledged is measured in bytes on that
+	// host, while the catalog holds watermarks in sequence numbers. It is also the
+	// number that tells a busy host from a host whose object store has stopped
+	// answering: only the second one keeps growing, because no local truncation may
+	// reclaim records that exist nowhere else (INV-13).
+	RemoteBacklogBytes int64
 	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by
 	// the store on every read, and never stored anywhere (ADR-0017):
 	//
@@ -292,8 +304,9 @@ type Store interface {
 	Now(ctx context.Context) (time.Time, error)
 
 	// UpsertHost registers a host or refreshes what the host itself reports:
-	// agent version, format version, NVMe totals, heartbeat. It deliberately does
-	// NOT carry the fleet state — that belongs to the Control Plane (SetHostState),
+	// agent version, format version, NVMe totals, remote backlog, heartbeat. It
+	// deliberately does NOT carry the fleet state — that belongs to the Control
+	// Plane (SetHostState),
 	// and a routine heartbeat that carried it would un-cordon a draining host.
 	// Committed capacity is not carried either, and could not be: it is derived
 	// from the volumes and plans that name the host (ADR-0017). Term-guarded.
