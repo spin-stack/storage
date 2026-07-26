@@ -28,6 +28,17 @@ var (
 	// ErrCapacityUnderflow means a capacity release would drive a host's committed
 	// bytes below zero — an accounting bug, never silently clamped (§28.2).
 	ErrCapacityUnderflow = errors.New("metadata: committed capacity would go negative")
+	// ErrCapacityExceeded means a reservation would take a host past the placement
+	// bound it was offered (§28.2). It is the opposite incident to
+	// ErrCapacityUnderflow — bytes that were never released against bytes that were
+	// never available — and callers branch differently on the two: an over-commit
+	// re-places the volume somewhere else, an underflow is an accounting bug that
+	// must stop the operation and be looked at.
+	ErrCapacityExceeded = errors.New("metadata: committed capacity would exceed the placement bound")
+	// ErrCapacityConflict means the ledger was not at the value the change was
+	// conditional on: somebody else wrote the same books between the caller's read
+	// and its write. Nothing was applied.
+	ErrCapacityConflict = errors.New("metadata: committed capacity is not the expected value")
 	// ErrWatermarkOrder means a watermark report violates
 	// published ≤ durable ≤ local (INV-03).
 	ErrWatermarkOrder = errors.New("metadata: watermarks out of order")
@@ -75,6 +86,48 @@ type HostLease struct {
 	GrantedAt   time.Time
 	LastRenewal time.Time
 	TTLSeconds  int32
+}
+
+// CapacityChange is one change to a host's committed-NVMe ledger (§28.2). It is a
+// bounded compare-and-set rather than a bare delta, because both rules that govern
+// the ledger used to live between a read and a write that were two statements:
+//
+//   - Limit is the §28.2 oversubscription bound, as the placement policy computes it
+//     for this host (placement.Policy.Limit) — the highest committed value the host
+//     may hold *after a reservation*. placement.Choose is pure and advisory: two
+//     operations that read the fleet before either reserved anything pick the same
+//     destination and both commit, and the host lands past the declared bound with
+//     neither caller having made a mistake. Re-checking in Go only narrows that
+//     window; the bound is a bound only when the statement that adds the bytes
+//     evaluates it. The caller passes the policy's own answer so there is one copy
+//     of the rule.
+//
+//     It deliberately does not bound a *release*: a host that is already above the
+//     bound — its policy was tightened, its device came back smaller — must still be
+//     able to give bytes back, and a release that bounced off the bound would wedge
+//     every drain of that host.
+//
+//   - Expect, when set, is the ledger value the change is conditional on. A delta is
+//     not an idempotency key, so the only proof a resumed operation has that its own
+//     change already landed is the value it recorded before attempting it — and that
+//     proof is worth nothing if a third party can write between the read and the
+//     write. With the comparison inside the statement, a ledger that moved is
+//     ErrCapacityConflict and nothing is applied.
+type CapacityChange struct {
+	// DeltaBytes is added to the host's committed bytes; negative releases.
+	DeltaBytes int64
+	// Limit bounds a reservation (DeltaBytes > 0) and nothing else. Zero admits no
+	// reservation at all, which is the fail-closed direction: a caller that cannot
+	// name a bound has not been told the host can hold anything.
+	Limit int64
+	// Expect, when non-nil, is the committed value the change is conditional on.
+	Expect *int64
+}
+
+// Expecting returns c conditional on the host's committed bytes being committed.
+func (c CapacityChange) Expecting(committed int64) CapacityChange {
+	c.Expect = &committed
+	return c
 }
 
 // Volume is the durable-volume record (§8). Watermarks are informative (§5.8).

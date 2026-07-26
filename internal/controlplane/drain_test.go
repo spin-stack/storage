@@ -1219,6 +1219,97 @@ func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
 	w.noBoundary(t, w.vols[1], 2)
 }
 
+// TestDrainRefusesADestinationAnotherPlacementFilled is the §28.2 bound at the write
+// that adds the bytes. placement.Choose evaluates the bound correctly and is pure, so
+// two operations that read the fleet before either reserved anything — here a drain
+// and a clone — choose the same destination and both commit. Nothing between the
+// drain's read and its reservation re-evaluates the rule, so the destination lands
+// past MaxOversubscription × NVMeTotalBytes with neither caller having made a
+// mistake, and the volumes that follow are placed against a ledger that already lies.
+func TestDrainRefusesADestinationAnotherPlacementFilled(t *testing.T) {
+	ctx := context.Background()
+	// The destination holds one volume-worth of NVMe; under the 2.0 policy its
+	// declared ceiling is 2*volSize.
+	w := newDrainWorld(t, volSize)
+	w.pastFencingWait()
+	const limit = 2 * volSize
+
+	// A clone admitted against the same fleet read takes the whole ceiling, landing
+	// in the window between the drain's placement decision and its reservation.
+	var raced bool
+	w.hooks.beforeCommit = func(hostID string, delta int64) error {
+		if raced || hostID != destHost || delta <= 0 {
+			return nil
+		}
+		raced = true
+		return w.base.CommitHostCapacity(ctx, w.term, destHost, limit)
+	}
+
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if !errors.Is(err, metadata.ErrCapacityExceeded) {
+		t.Fatalf("want ErrCapacityExceeded, got %v", err)
+	}
+	if got := w.committed(t, destHost); got != limit {
+		t.Fatalf("destination committed = %d, want %d — the reservation went past the declared bound", got, limit)
+	}
+	// Nothing was moved onto a host the policy says cannot hold it.
+	first, _ := w.md.GetVolume(ctx, format.UUIDString(w.vols[0]))
+	if first.PrimaryHostID != cloneHostA || first.CurrentEpoch != 1 {
+		t.Fatalf("a volume was promoted onto an over-committed destination: %+v", first)
+	}
+	w.noBoundary(t, w.vols[0], 2)
+}
+
+// TestDrainRefusesAReleaseWhoseLedgerMovedUnderTheRead is the other half of the same
+// check-then-act. A resumed pass proves its own delta landed by comparing the ledger
+// against a value it recorded — a read, then a write, with a window between them. A
+// third party writing in that window is invisible when its effect is exactly one
+// volume size: the drain reads the value it expected, releases on top of it, and the
+// result is indistinguishable from a correct one while the other operation's
+// reservation has silently been consumed.
+func TestDrainRefusesAReleaseWhoseLedgerMovedUnderTheRead(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	// Stop the first pass exactly at the source's release: the move is recorded as
+	// RELEASING with the ledger noted, and the release itself never happened.
+	var stopped bool
+	w.hooks.beforeCommit = func(hostID string, delta int64) error {
+		if stopped || hostID != cloneHostA || delta >= 0 {
+			return nil
+		}
+		stopped = true
+		return errProgressLost
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
+		t.Fatalf("setup: want errProgressLost, got %v", err)
+	}
+	if got := w.committed(t, cloneHostA); got != 2*volSize {
+		t.Fatalf("setup: source committed = %d, want %d (nothing released yet)", got, 2*volSize)
+	}
+
+	// The resumed pass reads the ledger, agrees it is where it left it — and a clone
+	// books a volume onto the source before the release lands.
+	var raced bool
+	w.hooks.beforeCommit = func(hostID string, delta int64) error {
+		if raced || hostID != cloneHostA || delta >= 0 {
+			return nil
+		}
+		raced = true
+		return w.base.CommitHostCapacity(ctx, w.term, cloneHostA, volSize)
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrCapacityLedgerMoved) {
+		t.Fatalf("want ErrCapacityLedgerMoved, got %v", err)
+	}
+	// The other operation's reservation is still on the books: the drain's release
+	// did not land on top of it.
+	if got := w.committed(t, cloneHostA); got != 3*volSize {
+		t.Fatalf("source committed = %d, want %d — the release consumed another operation's reservation",
+			got, 3*volSize)
+	}
+}
+
 // TestDrainRefusesToGuessWhenTheCapacityLedgerMoved: the resumed pass proves whether
 // its own release landed by comparing the host's committed bytes against what it
 // recorded before attempting it. When a third party has moved the same ledger in the
