@@ -12,6 +12,21 @@
 // It never produces a partial volume. A source whose digest does not match its
 // contents, a referenced object that is missing, or a gap in the referenced sequence
 // range all fail hard before any state is handed back.
+//
+// # It does not check who holds the epoch, on purpose
+//
+// The publishers gate on the epoch's holder (recovery.VerifyPublisher): claiming
+// wal/<vol>/<epoch>/ or checkpoints/<vol>/<epoch>/ is exclusive to the host the epoch
+// was granted to. Reading them is not, and the same check here would be a bug rather
+// than defence in depth: ADR-0008 has a drain's destination rebuild the durable prefix
+// of the epoch the *source* still holds, before the fence, exactly so that a host can
+// be evacuated while it is dead, partitioned, or uncooperative. §22.5 tooling and
+// cross-host clones read epochs they will never own for the same reason.
+//
+// What keeps a non-holder's read honest is not ownership but immutability: a superseded
+// epoch has a ceiling (§12.5), every object is validated against its own header, and
+// two objects that disagree about a sequence are refused (INV-21). So what a reader
+// that holds nothing can see is exactly what the promotion adopted — never more.
 package materialize
 
 import (
