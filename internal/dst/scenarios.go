@@ -245,14 +245,54 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 		}
 	}
 
-	// Wait it out, then the same operation completes.
+	// Wait it out, then the same operation completes — through a seed-chosen number of
+	// backend refusals landing somewhere inside it. A drain is a long, multi-write
+	// operation carrying an op id precisely so it can be re-driven; a refusal in the
+	// middle must leave it resumable, and the resumed pass must move each volume once.
 	s.Tick(leaseTTL + maxSkew + time.Second)
-	res, err := drainer.Drain(ctx, term, srcHost, drainOp)
+	refusals := s.Rand.Intn(4)
+	if refusals > 0 {
+		s.Store.InjectThrottle(refusals)
+		s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("object store refuses %d operations during the drain", refusals)})
+	}
+	var res controlplane.DrainResult
+	passes := 0
+	for range refusals + 2 {
+		passes++
+		res, err = drainer.Drain(ctx, term, srcHost, drainOp)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, sim.ErrThrottled) {
+			return fmt.Errorf("drain pass %d: %w", passes, err)
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("drain: %w", err)
+		return fmt.Errorf("the drain never completed in %d passes: %w", passes, err)
 	}
 	if res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 2 {
-		return fmt.Errorf("drain result = %+v", res)
+		return fmt.Errorf("drain result after %d passes = %+v", passes, res)
+	}
+	// Re-driving a finished drain is a duplicate request, not a second evacuation: it
+	// short-circuits on the terminal operation, moves nothing, and — the part that
+	// matters — grants no further epoch, which would fence the writer it just installed.
+	epochAfter := map[string]int64{}
+	for _, mv := range res.Moved {
+		v, _ := md.GetVolume(ctx, mv.VolumeID)
+		epochAfter[mv.VolumeID] = v.CurrentEpoch
+	}
+	again, err := drainer.Drain(ctx, term, srcHost, drainOp)
+	if err != nil {
+		return fmt.Errorf("re-driving a finished drain: %w", err)
+	}
+	if again.Phase != lifecycle.OpSucceeded || len(again.Moved) != 0 {
+		return fmt.Errorf("a duplicate drain re-evacuated: %+v", again)
+	}
+	for vid, ep := range epochAfter {
+		v, _ := md.GetVolume(ctx, vid)
+		if v.CurrentEpoch != ep {
+			return fmt.Errorf("a duplicate drain advanced volume %s from epoch %d to %d (INV-10)", vid, ep, v.CurrentEpoch)
+		}
 	}
 
 	for _, mv := range res.Moved {
