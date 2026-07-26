@@ -414,6 +414,11 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
+	// INV-03 before the insert, so a disordered triple is ErrWatermarkOrder rather
+	// than the volumes_watermarks_ordered constraint arriving as an opaque 23514.
+	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
+		return err
+	}
 	boundHost, addBytes, limit, err := boundParams(bound)
 	if err != nil {
 		return err
@@ -527,9 +532,8 @@ func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID strin
 	if err != nil {
 		return err
 	}
-	if published > durable || durable > local {
-		return fmt.Errorf("%w: published=%d durable=%d local=%d",
-			metadata.ErrWatermarkOrder, published, durable, local)
+	if err := metadata.CheckWatermarkOrder(local, durable, published); err != nil {
+		return err
 	}
 	// The query itself is monotonic (GREATEST), so a late report is ignored rather
 	// than rejected — see volumes.sql.

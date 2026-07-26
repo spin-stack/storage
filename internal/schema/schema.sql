@@ -86,10 +86,23 @@ CREATE TABLE volumes (
     chain_depth        INTEGER NOT NULL DEFAULT 0,
     dek_wrapped        BYTEA NOT NULL,                  -- DEK wrapped with the KEK
     kek_id             TEXT NOT NULL,
-    -- Watermarks are INFORMATIVE (lazy); authority is S3 (§5.8).
+    -- Watermarks are INFORMATIVE (lazy); authority is S3 (§5.8). Informative is not
+    -- unconstrained: INV-03 (§5.6) says published <= durable <= local at every
+    -- observation point, and this is that rule at the table rather than in the
+    -- queries that happen to write it. The triple is what an operator reads during
+    -- an incident to decide whether to accept data loss; a disordered one is not a
+    -- wrong number but three numbers that cannot all be true.
+    --
+    -- Nothing on the reporting path can trip it: UpdateVolumeWatermarks and
+    -- CreateVolume's conflict path both advance the three with GREATEST, and
+    -- component-wise max preserves the ordering of ordered inputs. What it does
+    -- catch is a row written out of order at birth — which no later report could
+    -- repair, since each watermark only ever moves forward.
     local_sequence     BIGINT NOT NULL DEFAULT 0,
     durable_sequence   BIGINT NOT NULL DEFAULT 0,
     published_sequence BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT volumes_watermarks_ordered
+        CHECK (published_sequence <= durable_sequence AND durable_sequence <= local_sequence),
     -- When the Control Plane observed the lease of the writer it is fencing
     -- (ADR-0015). Stamped by this database's clock — the same clock that stamps
     -- host_leases.last_renewal, and so the one every fencing deadline lives on —

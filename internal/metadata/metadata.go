@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -66,6 +67,22 @@ var (
 	// contradicts that assertion.
 	ErrHostNotServing = errors.New("metadata: host is not serving")
 )
+
+// CheckWatermarkOrder returns ErrWatermarkOrder unless published ≤ durable ≤ local
+// (INV-03, §5.6). It is the Go half of the CHECK constraint the volumes table
+// carries: every store validates the triple before writing it, so the two
+// implementations refuse the same input with the same sentinel instead of one of
+// them surfacing an integrity error the caller cannot classify.
+//
+// Only the writes that *set* the triple need it. The ones that advance it take a
+// component-wise maximum, and the max of two ordered triples is ordered.
+func CheckWatermarkOrder(local, durable, published int64) error {
+	if published > durable || durable > local {
+		return fmt.Errorf("%w: published=%d durable=%d local=%d",
+			ErrWatermarkOrder, published, durable, local)
+	}
+	return nil
+}
 
 // The lifecycle vocabularies (host/volume/snapshot/operation states, §7/§19/§28.1)
 // live in internal/lifecycle: they are typed, so a state from the wrong vocabulary
