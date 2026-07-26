@@ -10,6 +10,12 @@
 - **Related:** DEV-0007 (no Agent exists yet, so nothing reports device usage),
   ADR-0009 (typed lifecycles), ADR-0012 (the GC is about the bucket).
 
+> **Note, 2026-07-26.** ADR-0014 settles the division of labour: the **volume quota is
+> soft** and never fails a guest write, so the budget described here is the *only* hard
+> limit on the write path and the only source of an ENOSPC a guest can see. That raises
+> the stakes on §1 and §4 below — a soft quota deliberately does not stop a runaway
+> writer, which makes the device budget the thing that does.
+
 ## Context
 
 "What happens when a node runs out of disk" has an answer that is easy to get wrong,

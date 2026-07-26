@@ -1,7 +1,8 @@
 # ADR-0014 — A volume's quota charges what it wrote and what its snapshots retain, and space is reclaimed by squash
 
-- **Status:** Proposed (needs human review — it changes what a volume *costs*, the
-  snapshot/GC reachability rules, and the on-S3 segment layout)
+- **Status:** Accepted 2026-07-26 (the four open questions are answered in the second
+  amendment; implementation waits on Phase 12 for squash and on DEV-0007 for anything
+  guest-facing)
 - **Date:** 2026-07-26
 - **Deciders:** human (to decide), implementer agent (proposes)
 - **Implements/Extends:** §3 (volume model, grow-only resize), §19 (snapshots), §20
@@ -10,7 +11,81 @@
 - **Related:** ADR-0013 (the *device* budget on a host — a different question with a
   similar name), ADR-0012 (GC anchors).
 
-## Amendment, 2026-07-26 — the snapshot digest resolves in favour of content, and INV-16 already said so
+## Amendment 2, 2026-07-26 — the four open questions, answered
+
+**1. The quota is soft. The device budget is the hard one.**
+
+A quota is an *allocation control*: it makes consumption predictable and it is what an
+operator sets when creating a disk. It never fails a guest write. The condition that
+must never happen — a node with no space — is physical, and its defence is ADR-0013's
+device budget, which is hard and which returns ENOSPC to the guest. Two limits, two
+jobs, and the guest only ever sees the physical one.
+
+This simplifies the design considerably: quota accounting leaves the data path
+entirely. It is computed at publish, compaction and snapshot deletion, so it may lag
+without endangering anything, and no write ever waits on it.
+
+Soft has to mean something, though, or it is not a limit. Over quota:
+
+- snapshot creation, clone, resize and new volumes on the lineage are refused
+  (`ErrQuotaExceeded`);
+- the lineage is flagged for the operator, with the overage as a number rather than a
+  boolean;
+- the CP may **shrink the lineage's device share** (ADR-0013) rather than fail anything
+  — backpressure, which the guest experiences as slower FLUSHes, not as an error.
+
+What it deliberately does not do is stop a runaway writer. That is the device budget's
+job, and pretending otherwise would put a billing control on the durability path.
+
+**2. The base image is free, and stays free.**
+
+The inherited set — the objects of the snapshot a lineage was cloned from, when that
+snapshot belongs to a *different* lineage — is never charged to the clone. That is the
+point of it: reuse of a golden image is what makes consumption predictable, so
+predictability is what the rule protects. A base cloned from a snapshot inside the same
+lineage is charged normally, because it is the lineage's own data.
+
+Revisit only if a base image is ever charged to nobody — today it is charged to the
+lineage that owns it, and that lineage cannot be deleted while a clone references it
+(§5 below).
+
+**3. Snapshot identity is content-addressed.** Confirmed; see amendment 1 below for the
+mechanism and what it costs.
+
+**4. The quota is per lineage, not per volume.**
+
+A lineage is the transitive closure of clone-from-snapshot: the root volume, every clone
+of it, and every clone of those. `volumes.lineage_id` is set at create — its own id for
+a root, inherited on clone — and the quota and the charge live on the lineage, not on
+the volume:
+
+```
+charged(L) = Σ unique physical bytes written by the members of L
+           − the inherited set (a base image from another lineage)
+```
+
+Two things fall out of this, and both are why it is the right unit:
+
+- **The "who pays when the parent is deleted" problem disappears.** §5 below spends
+  three options on it; with a lineage charge the bytes belong to the lineage regardless
+  of which member is deleted, and no re-charging is needed.
+- **Content addressing makes the dedup exact.** Once identity is a content hash
+  (amendment 1), "unique bytes across the lineage" is a set union over hashes rather
+  than an estimate — the same change pays for itself twice.
+
+The cost is that one runaway volume can exhaust its siblings' room. That is what a
+tenant-level limit means, and it is visible: the overage names the lineage, and the
+per-volume contribution is a sum the CP can already compute.
+
+### Schema shape
+
+A `lineages` table (`lineage_id`, `quota_bytes` NULL = unlimited, `charged_bytes`,
+term-guarded like every CP mutation) and `volumes.lineage_id NOT NULL` with an index —
+it is a FK-referencing column, so the schema's own rule requires one. `charged_bytes`
+stays a cache that `rebuild-metadata` recomputes from S3, with the recompute-equals-
+stored test that keeps every other cached number here honest.
+
+## Amendment 1, 2026-07-26 — the snapshot digest resolves in favour of content, and INV-16 already said so
 
 The crux flagged below ("a published snapshot's manifest is immutable and its digest
 covers key strings, so squash cannot touch what a snapshot names") turns out to be a
@@ -131,10 +206,9 @@ Three gates, each with a different audience:
 - **Publication / compaction** — the CP refuses to publish a segment that would push a
   volume past its quota, and the volume enters a typed `QUOTA_EXCEEDED` degradation
   (the `wal.Degradation` vocabulary from wave 3 is the right shape).
-- **The guest write path** — a volume over quota must return a **device-full error to
-  the guest**, not block. A hang is the worst outcome: the guest's filesystem has no
-  way to react, while ENOSPC is something every filesystem already handles. This means
-  the quota state has to reach the virtio path, which does not exist yet (DEV-0007).
+- ~~**The guest write path**~~ — **withdrawn by amendment 2.** The quota is soft and
+  never fails a guest write; the only ENOSPC a guest sees comes from the device budget
+  (ADR-0013). Keeping a billing control on the durability path was the wrong trade.
 
 Soft/hard: the guest write path is refused only at the hard limit; snapshot creation is
 refused at a soft limit (proposal: 90%), so a volume cannot be pushed into a state where
@@ -231,12 +305,9 @@ or they become free storage forever. Proposal, in order of preference:
 - Until the Agent exists (DEV-0007) the guest-facing half — ENOSPC to the guest — cannot
   be implemented; the snapshot and publication gates can, and are useful on their own.
 
-## Open questions for the reviewer
+## Open questions — answered 2026-07-26
 
-1. Is the quota **hard** (writes refused) or **soft** (alert + refuse new snapshots)?
-   The design above assumes hard at the write path and soft at 90% for snapshots.
-2. Does the base image stay free forever, or only while the origin exists?
-3. Snapshot identity: content-addressed digest (enables squash across snapshots), or
-   object-list digest (simpler, and snapshots pin their objects until deleted)?
-4. Does a quota apply to a volume, or to a *lineage* (a volume and its clones)? Per
-   volume is proposed; per lineage is what a tenant-level bill actually wants.
+1. **Soft**, with the device budget as the hard limit (amendment 2).
+2. **Free, and it stays free** (amendment 2).
+3. **Content-addressed** (amendment 1).
+4. **Per lineage** (amendment 2).
