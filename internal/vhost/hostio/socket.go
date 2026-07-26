@@ -19,9 +19,13 @@ import (
 // descriptors until it hits its rlimit.
 const maxFilesPerMessage = 8
 
-// controlBufferSize is the ancillary-data buffer one Recv needs to hold
-// maxFilesPerMessage descriptors.
-var controlBufferSize = unix.CmsgSpace(maxFilesPerMessage * 4)
+// controlBufferSize is the ancillary-data buffer one Recv needs. It holds one
+// descriptor *more* than any legitimate message carries, on purpose: the kernel
+// silently drops whatever does not fit and sets MSG_CTRUNC, so a buffer sized to
+// exactly the limit makes an over-limit message indistinguishable from a
+// conforming one and leaves the count check below unreachable. With room for one
+// extra, too many descriptors arrive intact and are refused by name.
+var controlBufferSize = unix.CmsgSpace((maxFilesPerMessage + 1) * 4)
 
 // Listen creates a listening Unix socket at path, removing a stale one left by
 // a previous run.
@@ -83,13 +87,20 @@ func (c *conn) Recv() (vhost.Message, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 
-	n, oobn, _, _, err := c.c.ReadMsgUnix(c.hdr[:], c.ctrl)
+	n, oobn, flags, _, err := c.c.ReadMsgUnix(c.hdr[:], c.ctrl)
 	if err != nil {
 		return vhost.Message{}, err
 	}
 	files, err := parseFiles(c.ctrl[:oobn])
 	if err != nil {
 		return vhost.Message{}, err
+	}
+	// MSG_CTRUNC means the kernel dropped descriptors that did not fit. Carrying
+	// on would mean serving a SET_MEM_TABLE whose regions have no files, and the
+	// symptom — a device that maps nothing — points nowhere near here.
+	if flags&unix.MSG_CTRUNC != 0 {
+		closeAll(files)
+		return vhost.Message{}, fmt.Errorf("%w: the message's descriptors were truncated in transit", vhost.ErrProtocol)
 	}
 	if n < vhost.HeaderSize {
 		// A short header read means the peer sent a partial message or closed

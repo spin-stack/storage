@@ -21,8 +21,12 @@ import (
 // only by integration/vhost against real QEMU; this file settles the first, and
 // covers the failure paths a real front-end is not obliging enough to produce.
 
-// socketPath keeps the path short: a Unix socket address is capped at 108 bytes
-// and a deep t.TempDir() under a long module path gets close.
+// socketPath keeps the path short. A Unix socket address is capped at 108 bytes
+// by the kernel, and t.TempDir() builds its directory out of the *test's name*:
+// the longest name in this file already spends 48 of them, subtests add more,
+// and the failure is a bind error that reads like a permissions problem.
+//
+//nolint:usetesting // t.TempDir() is the rule; sun_path is 108 bytes and does not care.
 func socketPath(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "vhostsock")

@@ -103,9 +103,6 @@ func (a *AddressSpace) Close() {
 	a.regions = nil
 }
 
-// Regions reports the installed memory table.
-func (a *AddressSpace) Regions() []Region { return a.regions }
-
 // Guest translates a guest-physical address: what virtqueue descriptors carry.
 func (a *AddressSpace) Guest(addr, n uint64) ([]byte, error) {
 	return a.translate(addr, n, func(r Region) uint64 { return r.GuestPhys }, "guest-physical")
