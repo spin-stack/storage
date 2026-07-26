@@ -129,8 +129,13 @@ func TestASubstitutedPolicyCanBreakWatermarkOrder(t *testing.T) {
 }
 
 // TestASubstitutedPolicyCanTruncateAbovePublished is the same for INV-13: the
-// truncation actually happens — the local file is reset — so what the checker sees is
-// data loss, not a number.
+// truncation actually happens — segments are unlinked and their records are gone — so
+// what the checker sees is data loss, not a number.
+//
+// It takes two segments to stage that. Reclamation never touches the newest segment,
+// so a log with one segment loses nothing however permissive the policy is; the seam
+// only proves something when there is an older segment holding records above the
+// published point, which is exactly the shape a real violation has.
 func TestASubstitutedPolicyCanTruncateAbovePublished(t *testing.T) {
 	l, _, d := newLog(t, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	for i := range 3 {
@@ -138,16 +143,15 @@ func TestASubstitutedPolicyCanTruncateAbovePublished(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	f, err := d.Open("wal/active.wal")
-	if err != nil {
+	if err := l.Seal(); err != nil { // sequences 1..3 are now in a sealed segment
 		t.Fatal(err)
 	}
-	before, err := f.Size()
-	if err != nil {
+	if _, err := l.Write(1<<20, []byte("newest"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if before == 0 {
-		t.Fatal("nothing was written")
+	before := walSize(t, l)
+	if len(l.SegmentNames()) != 2 {
+		t.Fatalf("staged %d segments, want 2", len(l.SegmentNames()))
 	}
 
 	l.SetOrderPolicy(permissive{})
@@ -161,12 +165,18 @@ func TestASubstitutedPolicyCanTruncateAbovePublished(t *testing.T) {
 		t.Fatalf("truncated to %d with published %d: the invariant is not broken",
 			l.TruncatedUpTo(), l.Watermarks().Published)
 	}
-	after, err := f.Size()
+	after := walSize(t, l)
+	if after >= before {
+		t.Fatalf("the WAL still holds %d of %d bytes; records above the published point survived, so no data was lost and the seam proves nothing", after, before)
+	}
+	recs, err := wal.ReplaySegments(d, "wal", [16]byte{}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after != 0 {
-		t.Fatalf("the WAL file is %d bytes; records above the published point survived, so no data was lost and the seam proves nothing", after)
+	for _, r := range recs {
+		if r.Sequence <= 3 {
+			t.Fatalf("sequence %d survived a truncation that discarded its segment", r.Sequence)
+		}
 	}
 }
 

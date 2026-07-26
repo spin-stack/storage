@@ -335,11 +335,15 @@ func observeBoundary(s *Sim, vol [16]byte, epoch uint64) error {
 // recLog opens a remote-enabled log for one epoch, continuing the sequence space
 // after `startSeq` (§12.5: a volume's sequences are continuous across epochs).
 func recLog(s *Sim, vol [16]byte, epoch, startSeq uint64) (*wal.Log, error) {
-	f, err := s.Disk.Create(fmt.Sprintf("wal/epoch-%d.wal", epoch))
-	if err != nil {
-		return nil, err
-	}
-	l := wal.NewLogAfter(f, s.Clock, vol, epoch, startSeq, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	return recLogAt(s, "wal", vol, epoch, startSeq)
+}
+
+// recLogAt is recLog with the WAL root named. A scenario that stages two writers over
+// one (volume, epoch) — which is the whole point of the split-brain and late-PUT
+// cases — gives each its own root: they share the bucket, which is where the conflict
+// lives, and not a local directory, which two hosts never would.
+func recLogAt(s *Sim, root string, vol [16]byte, epoch, startSeq uint64) (*wal.Log, error) {
+	l := wal.NewLogAfter(s.Disk, root, s.Clock, vol, epoch, startSeq, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(
 		wal.NewBatcher(s.Clock, vol, epoch, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
@@ -388,7 +392,7 @@ func scenarioSupersededEpochCeiling(s *Sim) error {
 	}
 
 	// W1's in-flight PUT completes now. The object is valid; its writer is not.
-	late, err := recLog(s, vol, 1, acked)
+	late, err := recLogAt(s, "wal-late", vol, 1, acked)
 	if err != nil {
 		return err
 	}
@@ -572,11 +576,9 @@ func scenarioDivergentObjectsRefused(s *Sim) error {
 	// sequence.
 	s.Store.SetEventualList(true)
 	for i, payload := range []string{"written-by-w1", "written-by-w2"} {
-		f, err := s.Disk.Create(fmt.Sprintf("wal/split-%d.wal", i))
-		if err != nil {
-			return err
-		}
-		w := wal.NewLogAfter(f, s.Clock, vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		// Two hosts, so two WAL roots: they share the volume and the epoch, which is
+		// exactly the split this scenario stages, but not a directory.
+		w := wal.NewLogAfter(s.Disk, fmt.Sprintf("wal-split-%d", i), s.Clock, vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
 		w.EnableRemote(
 			wal.NewBatcher(s.Clock, vol, 2, 0, wal.DefaultBatchConfig()),
 			wal.NewUploader(s.Store, 5),

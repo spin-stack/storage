@@ -167,11 +167,7 @@ func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 			t.Fatal(err)
 		}
 
-		f, err := d.Create("wal/" + volID + ".wal")
-		if err != nil {
-			t.Fatal(err)
-		}
-		l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 		l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 		if _, err := l.Write(0, []byte("volume-"+volID[:4]), 0); err != nil {
 			t.Fatal(err)

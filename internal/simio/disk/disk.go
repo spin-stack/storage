@@ -41,7 +41,22 @@ type Usage struct {
 
 // Disk is a flat-ish namespace of append-only files (names may contain "/").
 type Disk interface {
-	// Create returns a new empty file, truncating any existing one.
+	// Create returns a new empty file, truncating any existing one, and makes the
+	// file's *name* durable before returning: on a real filesystem that means
+	// fsyncing the parent directory (and every directory Create had to make).
+	//
+	// The guarantee belongs here rather than in a separate SyncDir the caller is
+	// trusted to remember. File.Sync makes a file's contents durable and says nothing
+	// about the directory entry pointing at them, so a crash can lose a freshly
+	// created file whole — with its fdatasync'd records inside it. The WAL, which
+	// creates a segment per 32 MiB and ACKs writes into it, is one Create away from
+	// that at all times, and so is every future caller. Making it a property of the
+	// interface removes the possibility of forgetting it; the cost is one fsync per
+	// file creation, and nothing in this tree creates files at a rate where that is
+	// visible.
+	//
+	// Unlink is deliberately *not* covered: a directory entry that outlives a crash
+	// costs a file a later sweep removes, never data.
 	Create(name string) (File, error)
 	// Open returns an existing file for read and append.
 	Open(name string) (File, error)

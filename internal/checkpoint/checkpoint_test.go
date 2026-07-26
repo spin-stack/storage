@@ -20,8 +20,7 @@ func v7Vol() [16]byte {
 func remoteLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]byte) *wal.Log {
 	t.Helper()
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	return l
 }

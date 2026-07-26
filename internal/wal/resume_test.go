@@ -3,29 +3,16 @@ package wal_test
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/recovery"
-	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
-
-// reopen returns a second handle on the same WAL file, which is what an agent
-// restart has: the file is still there, full of records, and the process that knew
-// the watermarks is gone (§16 ATTACHING→ACTIVE validates the epoch, it does not
-// bump it).
-func reopen(t *testing.T, d *sim.Disk, name string) disk.File {
-	t.Helper()
-	f, err := d.Open(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return f
-}
 
 // TestNewLogOverANonEmptyWALIsRefused: NewLog always starts the sequence space at
 // the boundary it was given, so building one over a WAL that already holds records
@@ -40,12 +27,8 @@ func reopen(t *testing.T, d *sim.Disk, name string) disk.File {
 func TestNewLogOverANonEmptyWALIsRefused(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create("wal/active.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
 	vol := [16]byte{11}
-	l1 := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l1 := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	for i := range 3 {
 		if _, err := l1.Write(uint64(i)*64, []byte("pre-crash"), 0); err != nil {
 			t.Fatal(err)
@@ -54,17 +37,17 @@ func TestNewLogOverANonEmptyWALIsRefused(t *testing.T) {
 	if err := l1.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	sizeBefore, _ := f.Size()
+	sizeBefore := walSize(t, l1)
 
 	// The agent restarts and re-attaches at the same epoch.
-	l2 := wal.NewLog(reopen(t, d, "wal/active.wal"), clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l2 := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	seq, err := l2.Write(4096, []byte("post-restart"), 0)
 	if err == nil {
 		t.Fatalf("a log rebuilt over a non-empty WAL wrote sequence %d, re-issuing the sequence space", seq)
 	}
 
 	// Nothing was appended: the rejected write must not leave a record behind.
-	sizeAfter, _ := f.Size()
+	sizeAfter := walSize(t, l1)
 	if sizeAfter != sizeBefore {
 		t.Fatalf("refused write still appended %d bytes", sizeAfter-sizeBefore)
 	}
@@ -88,11 +71,7 @@ func newResumeWorld(t *testing.T, enc *wal.Encryption) *resumeWorld {
 		store: sim.NewObjectStore(),
 		vol:   [16]byte{21},
 	}
-	f, err := w.disk.Create("wal/active.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.log = wal.NewLog(f, w.clk, w.vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	w.log = wal.NewLog(w.disk, "wal", w.clk, w.vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	w.log.EnableRemote(
 		wal.NewBatcher(w.clk, w.vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(w.store, 5),
@@ -121,7 +100,7 @@ func TestResumeContinuesTheSequenceSpaceAndTheView(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resumed, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, w.vol, 1, 0,
+	resumed, err := wal.Resume(w.disk, "wal", w.clk, w.vol, 1, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
@@ -166,7 +145,7 @@ func TestResumeRebuildsAnEncryptedView(t *testing.T) {
 	}
 
 	enc := &wal.Encryption{DEK: dek, VolumeID: w.vol}
-	resumed, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, w.vol, 1, 0,
+	resumed, err := wal.Resume(w.disk, "wal", w.clk, w.vol, 1, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, enc)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
@@ -181,10 +160,34 @@ func TestResumeRebuildsAnEncryptedView(t *testing.T) {
 	}
 }
 
-// TestResumeRefusesRecordsFromAnotherEpoch: a WAL file replayed under the wrong
-// identity is the restored-backup / reused-directory case. A record from another
-// epoch must never be adopted as this epoch's — it would be applied to the guest's
-// extents and counted in this epoch's sequence space.
+// misfileWAL moves every segment of (fromVol, fromEpoch) into the directory of
+// (toVol, toEpoch), keeping the file names. It is the restored-backup / reused-
+// directory / path-bug case in one operation: the segments are exactly where this
+// volume's WAL is expected to be, and only their headers say otherwise.
+func misfileWAL(t *testing.T, d *sim.Disk, fromVol [16]byte, fromEpoch uint64, toVol [16]byte, toEpoch uint64) {
+	t.Helper()
+	names, err := wal.SegmentFiles(d, "wal", fromVol, fromEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) == 0 {
+		t.Fatal("nothing to misfile: the source WAL has no segments")
+	}
+	to := wal.SegmentDir("wal", toVol, toEpoch)
+	for _, name := range names {
+		base := name[strings.LastIndex(name, "/")+1:]
+		if err := d.Rename(name, to+"/"+base); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestResumeRefusesRecordsFromAnotherEpoch: the epoch is in the WAL's path, so a log
+// resuming epoch N never reads epoch M's directory — that is the point of putting it
+// there. What is still possible is a directory *filed* under this epoch whose
+// segments belong to another one: a restored backup, a reused directory, a path bug.
+// The segment header says what the file is, the path says where it was filed, and
+// when they disagree the resume fails closed before a record is decoded.
 func TestResumeRefusesRecordsFromAnotherEpoch(t *testing.T) {
 	w := newResumeWorld(t, nil)
 	if _, err := w.log.Write(0, []byte("epoch-1 record"), 0); err != nil {
@@ -193,17 +196,18 @@ func TestResumeRefusesRecordsFromAnotherEpoch(t *testing.T) {
 	if err := w.log.Sync(); err != nil {
 		t.Fatal(err)
 	}
+	misfileWAL(t, w.disk, w.vol, 1, w.vol, 9)
 
-	if _, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, w.vol, 9, 0,
+	if _, err := wal.Resume(w.disk, "wal", w.clk, w.vol, 9, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil); !errors.Is(err, wal.ErrForeignEpoch) {
-		t.Fatalf("resuming epoch 9 over an epoch-1 WAL must fail closed, got %v", err)
+		t.Fatalf("resuming epoch 9 over epoch 1's segments must fail closed, got %v", err)
 	}
 }
 
 // TestResumeRefusesAnotherVolumesRecords: the same fail-closed check as the epoch
-// one, on the identity that has no other guard. A WAL file that ends up under the
-// wrong volume's directory (a restored backup, a reused directory, a path bug)
-// replays into that volume's read view and continues its sequence space.
+// one, on the identity that has no other guard. An encrypted volume's payloads are
+// bound to their volume by the GCM AAD, but DISCARD and WRITE_ZEROES carry no payload
+// and a plaintext volume carries no tag — nothing else would notice.
 func TestResumeRefusesAnotherVolumesRecords(t *testing.T) {
 	w := newResumeWorld(t, nil) // volume {21}
 	if _, err := w.log.Write(0, []byte("volume-21's data"), 0); err != nil {
@@ -212,11 +216,12 @@ func TestResumeRefusesAnotherVolumesRecords(t *testing.T) {
 	if err := w.log.Sync(); err != nil {
 		t.Fatal(err)
 	}
-
 	other := [16]byte{99}
-	if _, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, other, 1, 0,
+	misfileWAL(t, w.disk, w.vol, 1, other, 1)
+
+	if _, err := wal.Resume(w.disk, "wal", w.clk, other, 1, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil); !errors.Is(err, wal.ErrForeignVolume) {
-		t.Fatalf("resuming volume %x over volume %x's WAL must fail closed, got %v", other, w.vol, err)
+		t.Fatalf("resuming volume %x over volume %x's segments must fail closed, got %v", other, w.vol, err)
 	}
 }
 
@@ -246,7 +251,7 @@ func TestResumeUploadsOnlyTheTailS3NeverGot(t *testing.T) {
 	durable := w.log.Watermarks().Durable
 	objectsBefore, _ := w.store.List(ctx, "wal/")
 
-	resumed, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, w.vol, 1, durable,
+	resumed, err := wal.Resume(w.disk, "wal", w.clk, w.vol, 1, durable,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
@@ -287,12 +292,14 @@ func TestResumeStopsAtATornTail(t *testing.T) {
 	if err := w.log.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	f, _ := w.disk.Open("wal/active.wal")
-	size, _ := f.Size()
-	w.disk.TornTail("wal/active.wal", int(size)-10) // the third record is cut short
-	w.disk.Crash()                                  // the page cache is gone with the process
+	// The third record is cut short in the newest (and only) segment, which is the
+	// one place a torn tail is allowed.
+	newest := w.log.SegmentNames()[len(w.log.SegmentNames())-1]
+	size := walSize(t, w.log)
+	w.disk.TornTail(newest, int(size)-10)
+	w.disk.Crash() // the page cache is gone with the process
 
-	resumed, err := wal.Resume(reopen(t, w.disk, "wal/active.wal"), w.clk, w.vol, 1, 0,
+	resumed, err := wal.Resume(w.disk, "wal", w.clk, w.vol, 1, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil)
 	if err != nil {
 		t.Fatalf("a torn tail is the normal crash case, not an error: %v", err)
@@ -311,8 +318,7 @@ func TestRemoteGapBackpressureIsExplicit(t *testing.T) {
 	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/local.wal")
-	l := wal.NewLog(f, clk, [16]byte{22}, 1, wal.Limits{
+	l := wal.NewLog(d, "wal", clk, [16]byte{22}, 1, wal.Limits{
 		MaxUnflushedBytes: 1 << 20, // roomy: this is not the limit under test
 		MaxRemoteGapBytes: 400,     // ~2 records (104-byte header + payload)
 	})

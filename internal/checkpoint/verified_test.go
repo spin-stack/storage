@@ -165,11 +165,7 @@ func TestCheckpointRefusesWhenS3HoldsMoreThanThisLogAcked(t *testing.T) {
 	// shape: two logs, one epoch, one prefix.
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create("wal/second.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l2 := wal.NewLogAfter(f, clk, w.vol, 1, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l2 := wal.NewLogAfter(d, "wal", clk, w.vol, 1, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l2.EnableRemote(wal.NewBatcher(clk, w.vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(w.store, 5), leaseOK{})
 	if _, err := l2.Write(4096, []byte("someone else"), 0); err != nil {
 		t.Fatal(err)

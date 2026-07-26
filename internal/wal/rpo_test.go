@@ -60,11 +60,7 @@ func localModeLog(t *testing.T, sink *metricSink) (*wal.Log, *sim.Clock) {
 	t.Helper()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create("wal/local.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLog(f, clk, [16]byte{5}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, [16]byte{5}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.SetDurabilityMode(wal.ModeLocal)
 	l.SetRecorder(sink.rec, "vol-5")
 	return l, clk
@@ -160,9 +156,8 @@ func TestVerifiedUploadIsWhatClosesTheGap(t *testing.T) {
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{6}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	l.SetRecorder(sink.rec, "vol-6")
 

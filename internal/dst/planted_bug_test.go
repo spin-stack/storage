@@ -242,11 +242,7 @@ func publishedAheadOfDurable(relax bool) Scenario {
 		vol[6], vol[8] = 0x70, 0x80
 		vol[15] = 0xd2
 
-		f, err := s.Disk.Create("wal/active.wal")
-		if err != nil {
-			return err
-		}
-		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 		l.EnableRemote(
 			wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 			wal.NewUploader(s.Store, 5),
@@ -262,10 +258,20 @@ func publishedAheadOfDurable(relax bool) Scenario {
 				}
 			}
 		}
+		// Record 3 has to sit in a segment that is not the newest, because the newest
+		// is the one reclamation never takes. Sealing here is what an ordinary
+		// checkpoint would have done a moment later; the fourth record opens the next
+		// segment and is no more durable than the third.
+		if err := l.Seal(); err != nil {
+			return fmt.Errorf("seal: %w", err)
+		}
+		if _, err := l.Write(24, []byte("also-never-uploaded"), 0); err != nil {
+			return err
+		}
 		emitWatermarks(s, l)
 		w := l.Watermarks()
-		if w.Local != 3 || w.Durable != 2 {
-			return fmt.Errorf("setup: local=%d durable=%d, want 3 and 2", w.Local, w.Durable)
+		if w.Local != 4 || w.Durable != 2 {
+			return fmt.Errorf("setup: local=%d durable=%d, want 4 and 2", w.Local, w.Durable)
 		}
 
 		if relax {
@@ -290,12 +296,15 @@ func publishedAheadOfDurable(relax bool) Scenario {
 		if err := l.TruncateLocal(l.Watermarks().Published); err != nil {
 			return fmt.Errorf("truncate to the published point: %w", err)
 		}
-		size, err := f.Size()
+		left, err := wal.ReplaySegments(s.Disk, "wal", vol, 1)
 		if err != nil {
 			return err
 		}
-		if size != 0 {
-			return fmt.Errorf("the WAL still holds %d bytes; the plant did not reach the file", size)
+		for _, r := range left {
+			if r.Sequence == 3 {
+				return errors.New("the plant did not reach the disk: the record no object store " +
+					"holds is still in the local WAL")
+			}
 		}
 		return errPublishedAheadOfDurable
 	}
@@ -528,11 +537,7 @@ func truncateAfterListingRegresses(regress bool) Scenario {
 		vol[6], vol[8] = 0x70, 0x80
 		vol[15] = 0xd1
 
-		f, err := s.Disk.Create("wal/active.wal")
-		if err != nil {
-			return err
-		}
-		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 		l.EnableRemote(
 			wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 			wal.NewUploader(s.Store, 5),

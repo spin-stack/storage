@@ -9,17 +9,17 @@ import (
 	"github.com/spin-stack/storage/internal/wal/format"
 )
 
-// ErrForeignEpoch means the WAL file holds records that do not belong to the epoch
-// being resumed. A file replayed under the wrong identity — a restored backup, a
+// ErrForeignEpoch means the WAL holds records or segments that do not belong to the
+// epoch being resumed. A WAL replayed under the wrong identity — a restored backup, a
 // reused volume directory, a path bug — would apply another writer's records to this
 // volume's extents and count them in this epoch's sequence space.
-var ErrForeignEpoch = errors.New("wal: the WAL file holds records from another epoch")
+var ErrForeignEpoch = errors.New("wal: the WAL holds records from another epoch")
 
-// ErrForeignVolume means the WAL file holds records belonging to another volume. It
-// is the check that has no fallback: an encrypted volume's payloads are bound to
-// their volume by the GCM AAD, but DISCARD and WRITE_ZEROES carry no payload and a
-// plaintext volume carries no tag, so nothing else would notice.
-var ErrForeignVolume = errors.New("wal: the WAL file holds records from another volume")
+// ErrForeignVolume means the WAL holds records or segments belonging to another
+// volume. It is the check that has no fallback: an encrypted volume's payloads are
+// bound to their volume by the GCM AAD, but DISCARD and WRITE_ZEROES carry no payload
+// and a plaintext volume carries no tag, so nothing else would notice.
+var ErrForeignVolume = errors.New("wal: the WAL holds records from another volume")
 
 // resumedRecord is a record that was in the local WAL but is not yet covered by a
 // verified object: it must be handed back to the batcher when the remote path is
@@ -45,31 +45,27 @@ type resumedRecord struct {
 // the remote gap; records at or below it are replayed into the view only, so no span
 // the bucket already holds is re-issued.
 //
-// A torn tail is the normal crash case and is not an error: Replay returns the intact
-// prefix (INV-05) and the log continues after the last whole record. Corruption
-// *inside* the file is an error — the records after it cannot be read, and silently
-// resuming at the corruption point would drop them without saying so.
-func Resume(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption) (*Log, error) {
-	size, err := file.Size()
-	if err != nil {
-		return nil, err
-	}
-	buf := make([]byte, size)
-	if size > 0 {
-		if _, err := file.ReadAt(buf, 0); err != nil {
-			return nil, fmt.Errorf("wal: read the WAL to resume it: %w", err)
-		}
-	}
-	recs, err := Replay(buf)
-	if err != nil {
-		return nil, fmt.Errorf("wal: resume: %w", err)
-	}
-
-	l := NewLogAfter(file, clk, volumeID, epoch, durableInS3, limits)
+// A torn tail in the newest segment is the normal crash case and is not an error:
+// replay returns the intact prefix (INV-05), the torn bytes are cut off so the next
+// record does not land behind a hole, and the log continues after the last whole
+// record. Corruption anywhere else is an error — a tear in a segment nothing should
+// have been appending to, a gap in the directory, or a bad CRC — because the records
+// after it cannot be read, and silently resuming at that point would drop them without
+// saying so.
+func Resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption) (*Log, error) {
+	l := NewLogAfter(d, root, clk, volumeID, epoch, durableInS3, limits)
 	l.enc = enc
 	l.replayed = true
 
-	for _, rec := range recs {
+	scan, err := scanSegments(d, l.segs.dir, volumeID, epoch)
+	if err != nil {
+		return nil, fmt.Errorf("wal: resume: %w", err)
+	}
+	if err := l.segs.adopt(scan); err != nil {
+		return nil, fmt.Errorf("wal: resume: %w", err)
+	}
+
+	for _, rec := range scan.records {
 		if rec.VolumeID != volumeID {
 			return nil, fmt.Errorf("%w: sequence %d belongs to volume %s, resuming %s",
 				ErrForeignVolume, rec.Sequence, format.UUIDString(rec.VolumeID), format.UUIDString(volumeID))

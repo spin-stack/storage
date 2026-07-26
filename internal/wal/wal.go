@@ -73,16 +73,26 @@ func Serialize(records []Record) ([]byte, error) {
 // It never returns a record whose content differs from what was written without an
 // error (INV-05).
 func Replay(b []byte) ([]Record, error) {
+	records, _, err := replayPrefix(b)
+	return records, err
+}
+
+// replayPrefix is Replay plus the byte count it consumed. The count is what tells a
+// torn tail from a clean end — Replay reports both as (records, nil), which is the
+// right answer for a single file whose tail is allowed to be torn, and not enough for
+// a directory of segments where only the newest one is.
+func replayPrefix(b []byte) ([]Record, int, error) {
 	var records []Record
-	for off := 0; off < len(b); {
+	off := 0
+	for off < len(b) {
 		h, payload, n, err := format.DecodeRecord(b[off:])
 		if err != nil {
 			if errors.Is(err, format.ErrShortBuf) {
 				// Torn tail: the last record was not fully written. Clean stop.
-				return records, nil
+				return records, off, nil
 			}
 			// CRC / magic / version mismatch: corruption. Surface it.
-			return records, err
+			return records, off, err
 		}
 		rec := Record{
 			Type:       h.RecordType,
@@ -102,7 +112,7 @@ func Replay(b []byte) ([]Record, error) {
 		records = append(records, rec)
 		off += n
 	}
-	return records, nil
+	return records, off, nil
 }
 
 // State is a sparse byte-addressed model of a volume, used to check that replay
@@ -142,6 +152,10 @@ func ApplyAll(records []Record) *State {
 	}
 	return s
 }
+
+// At reports the byte at off. A byte nothing wrote, or that a DISCARD/WRITE_ZEROES
+// cleared, reads as zero (§14.6) — the same answer the read view gives.
+func (s *State) At(off uint64) byte { return s.data[off] }
 
 // Equal reports whether two states have identical logical content (missing == 0).
 func (s *State) Equal(other *State) bool {

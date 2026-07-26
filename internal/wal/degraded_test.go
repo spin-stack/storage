@@ -31,7 +31,7 @@ import (
 
 const (
 	enospcPayload  = 200  // a 304-byte record: 104 bytes of header + payload
-	enospcCapacity = 1000 // three records fit; the fourth tears
+	enospcCapacity = 1040 // a 64-byte segment header plus three records; the fourth tears
 )
 
 // fillTheDevice writes until the device refuses, returning the log and how many
@@ -50,24 +50,23 @@ func fillTheDevice(t *testing.T, l *wal.Log) int {
 	return 0
 }
 
-func enospcLog(t *testing.T, name string) (*wal.Log, *sim.Disk) {
+// enospcLog caps the device under a WAL root. The cap covers the whole directory, not
+// one file: a WAL is a set of segments, and a per-file ceiling would be lifted by the
+// mere act of rotating to the next one.
+func enospcLog(t *testing.T, root string) (*wal.Log, *sim.Disk) {
 	t.Helper()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	d.InjectENOSPC(name, enospcCapacity)
-	return wal.NewLog(f, clk, [16]byte{9}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20}), d
+	d.InjectENOSPC(root, enospcCapacity)
+	return wal.NewLog(d, root, clk, [16]byte{9}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20}), d
 }
 
 // TestAFullDeviceIsAStickyTypedState is the finding itself: the caller can name the
 // failure, it does not evaporate on the next call, and it clears only once the device
 // has proven it can take bytes again.
 func TestAFullDeviceIsAStickyTypedState(t *testing.T) {
-	const name = "wal/full.wal"
-	l, d := enospcLog(t, name)
+	const root = "wal-full"
+	l, d := enospcLog(t, root)
 
 	if got := l.Degraded(); got != wal.DegradedNone {
 		t.Fatalf("a fresh log reports %q, want %q", got, wal.DegradedNone)
@@ -91,7 +90,7 @@ func TestAFullDeviceIsAStickyTypedState(t *testing.T) {
 	// Space comes back (a checkpoint authorised a truncation, or an operator grew the
 	// device). Only an append the device actually took proves that, so that is what
 	// clears the state.
-	d.ClearENOSPC(name)
+	d.ClearENOSPC(root)
 	if got := l.Degraded(); got != wal.DegradedOutOfSpace {
 		t.Fatalf("reclaiming space is not by itself proof; log reports %q", got)
 	}
@@ -113,7 +112,7 @@ func TestAFullDeviceIsAStickyTypedState(t *testing.T) {
 // host because a disk filled, or leave a full device looking healthy because the
 // lease is fine.
 func TestOutOfSpaceDoesNotFenceAndFencingIsNotOutOfSpace(t *testing.T) {
-	l, _ := enospcLog(t, "wal/orthogonal.wal")
+	l, _ := enospcLog(t, "wal-orthogonal")
 	fillTheDevice(t, l)
 	if l.Fenced() {
 		t.Fatal("a full device self-fenced the log; only a lease failure may do that (§16)")
@@ -123,11 +122,10 @@ func TestOutOfSpaceDoesNotFenceAndFencingIsNotOutOfSpace(t *testing.T) {
 	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/fenced.wal")
 	lm := lease.NewManager(clk, 10*time.Second)
 	lm.Grant()
 	vol := [16]byte{10}
-	fl := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	fl := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	fl.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(sim.NewObjectStore(), 5), lm)
 	if _, err := fl.Write(0, []byte("data"), 0); err != nil {
 		t.Fatal(err)
@@ -148,18 +146,14 @@ func TestOutOfSpaceDoesNotFenceAndFencingIsNotOutOfSpace(t *testing.T) {
 // "a caller cannot distinguish a full device from a transient I/O error". A state
 // that latched on every append failure would be exactly as useless as none.
 func TestATransientAppendErrorIsNotOutOfSpace(t *testing.T) {
-	const name = "wal/torn.wal"
+	const root = "wal-torn"
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLog(f, clk, [16]byte{11}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, root, clk, [16]byte{11}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	if _, err := l.Write(0, make([]byte, enospcPayload), 0); err != nil {
 		t.Fatal(err)
 	}
-	d.InjectShortAppend(name, 40) // a torn write, not a full device
+	d.InjectShortAppend(root, 40) // a torn write, not a full device
 	if _, err := l.Write(4096, make([]byte, enospcPayload), 0); err == nil {
 		t.Fatal("a short append must be reported to the caller")
 	}
@@ -194,8 +188,8 @@ func TestOutOfSpaceIsRecordedAsAGauge(t *testing.T) {
 	}
 	defer func() { _ = p.Shutdown(ctx) }()
 
-	const name = "wal/metric.wal"
-	l, d := enospcLog(t, name)
+	const root = "wal-metric"
+	l, d := enospcLog(t, root)
 	l.SetRecorder(obs.NewRecorder(p.Metrics), "vol-9")
 
 	fillTheDevice(t, l)
@@ -207,7 +201,7 @@ func TestOutOfSpaceIsRecordedAsAGauge(t *testing.T) {
 		t.Fatalf("wal_out_of_space = %v (present=%t) on a full device, want 1", got, ok)
 	}
 
-	d.ClearENOSPC(name)
+	d.ClearENOSPC(root)
 	if _, err := l.Write(1<<21, make([]byte, enospcPayload), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -227,18 +221,14 @@ func TestOutOfSpaceIsRecordedAsAGauge(t *testing.T) {
 // portable classifier over the message both share; a caller that *does* hold a typed
 // error replaces it.
 func TestOutOfSpaceClassifierIsInjectable(t *testing.T) {
-	const name = "wal/classifier.wal"
+	const root = "wal-classifier"
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLog(f, clk, [16]byte{12}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, root, clk, [16]byte{12}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	// A backend whose full-device error says nothing recognisable: the injected
 	// classifier is the only thing that can name it.
 	l.SetOutOfSpace(func(err error) bool { return errors.Is(err, sim.ErrShortWrite) })
-	d.InjectShortAppend(name, 8)
+	d.InjectShortAppend(root, 8)
 	if _, err := l.Write(0, make([]byte, enospcPayload), 0); err == nil {
 		t.Fatal("the short append must be reported")
 	}
@@ -268,8 +258,7 @@ func TestOutOfSpaceClassifierIsInjectable(t *testing.T) {
 // TestNilClassifierRestoresTheDefault: SetOutOfSpace(nil) must restore
 // DefaultOutOfSpace, not leave the log unable to recognise a full device at all.
 func TestNilClassifierRestoresTheDefault(t *testing.T) {
-	const name = "wal/nil-classifier.wal"
-	l, _ := enospcLog(t, name)
+	l, _ := enospcLog(t, "wal-nil-classifier")
 	l.SetOutOfSpace(func(error) bool { return false })
 	l.SetOutOfSpace(nil)
 	fillTheDevice(t, l)

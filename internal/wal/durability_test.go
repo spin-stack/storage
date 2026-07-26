@@ -16,9 +16,8 @@ import (
 func remoteLeasedLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, lm *lease.Manager) *wal.Log {
 	t.Helper()
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{7}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(
 		wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(store, 5),
@@ -69,9 +68,8 @@ func TestRemoteFlushWithALeaseButNoUploaderFailsClosed(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{13}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(nil, nil, leaseOK{}) // a lease, no batcher, no uploader
 
 	if _, err := l.Write(0, []byte("data"), 0); err != nil {
@@ -264,9 +262,8 @@ func TestWriteFUAWithoutALeaseFailsClosed(t *testing.T) {
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{16}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), nil)
 
 	if _, err := l.WriteFUA(ctx, 0, []byte("fua-payload")); !errors.Is(err, wal.ErrNoLease) {
@@ -283,8 +280,7 @@ func TestLocalModeWriteFUAAcksOnFdatasync(t *testing.T) {
 	ctx := t.Context()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/local.wal")
-	l := wal.NewLog(f, clk, [16]byte{17}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, [16]byte{17}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.SetDurabilityMode(wal.ModeLocal)
 
 	seq, err := l.WriteFUA(ctx, 0, []byte("fua-payload"))
@@ -334,9 +330,8 @@ func TestRemoteModeWithoutALeaseFailsClosed(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{7}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), nil)
 
 	if _, err := l.Write(0, []byte("data"), 0); err != nil {
@@ -358,9 +353,8 @@ func TestLocalModeWithoutALeaseStillAcks(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/local.wal")
 	vol := [16]byte{8}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), nil)
 	l.SetDurabilityMode(wal.ModeLocal)
 
