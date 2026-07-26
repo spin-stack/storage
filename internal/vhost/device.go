@@ -193,10 +193,12 @@ func (d *Device) protocolMask() uint64 {
 	return d.protocol
 }
 
-//nolint:gocyclo // A protocol dispatch is a flat switch over the wire's request
-// numbers. Splitting it into helpers by category would hide the one property
-// that matters here — that every request QEMU can send has a case — behind a
-// call graph.
+// dispatch answers one front-end request. It is a flat switch over the wire's
+// request numbers: splitting it into helpers by category would hide the one
+// property that matters here — that every request QEMU can send has a case —
+// behind a call graph.
+//
+//nolint:gocyclo // the flat switch is the point; see above.
 func (d *Device) dispatch(ctx context.Context, m Message) (*Message, error) {
 	switch m.Request {
 	case ReqGetFeatures:

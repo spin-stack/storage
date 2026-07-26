@@ -343,18 +343,42 @@ func (l *fakeListener) Close() error {
 }
 
 // fakeEvent is a channel standing in for an eventfd.
+//
+// signal is fixed at construction. It used to be assigned after the queue loop
+// had already wired itself up, which is a data race between the test goroutine
+// and the loop's — and, worse, a lost notification: the loop can drain and
+// signal before the assignment lands, and the test then waits forever for a
+// completion that was already delivered to a nil hook.
 type fakeEvent struct {
 	ch     chan struct{}
 	closed chan struct{}
 	once   sync.Once
 	signal func()
+
+	// waiting announces that the drain preceding a Wait has finished. A real
+	// front-end and a real backend share the ring across a process boundary, so
+	// their accesses race by construction and the ring's own rules order them.
+	// Here both sides are goroutines in one process, and the race detector is
+	// right to object: a test that writes the ring while the queue loop is
+	// reading it has no happens-before edge at all. Receiving from this channel
+	// gives the test one, and it is the loop's own progress that provides it
+	// rather than a sleep.
+	waiting chan struct{}
 }
 
 func newFakeEvent() *fakeEvent {
-	return &fakeEvent{ch: make(chan struct{}, 64), closed: make(chan struct{})}
+	return &fakeEvent{
+		ch:      make(chan struct{}, 64),
+		closed:  make(chan struct{}),
+		waiting: make(chan struct{}, 64),
+	}
 }
 
 func (e *fakeEvent) Wait(ctx context.Context) error {
+	select {
+	case e.waiting <- struct{}{}:
+	default:
+	}
 	// Prefer a pending signal over a close: the two are often both ready when a
 	// session is shutting down, and a random choice there is a flaky test.
 	select {

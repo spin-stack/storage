@@ -18,7 +18,15 @@ import (
 
 // eventFactory hands out the fake eventfds the queue loop wires itself to, and
 // announces when it has done so.
+//
+// The call event's hook is installed here, at construction, rather than by the
+// test once `wired` closes. The queue loop drains and signals as soon as it
+// exists — for a request published before the handshake, that is *before* the
+// factory returns — so a hook installed afterwards both races the loop and
+// misses the completion it was waiting for.
 type eventFactory struct {
+	onSignal func()
+
 	mu    sync.Mutex
 	kick  *fakeEvent
 	call  *fakeEvent
@@ -37,6 +45,7 @@ func (f *eventFactory) make(*os.File) (EventFD, error) {
 	case 1:
 		f.kick = e
 	case 2:
+		e.signal = f.onSignal
 		f.call = e
 		close(f.wired)
 	}
@@ -90,6 +99,7 @@ func newSession(t *testing.T) *session {
 		done:      make(chan error, 1),
 		completed: make(chan struct{}, 64),
 	}
+	s.f.onSignal = func() { s.completed <- struct{}{} }
 	s.ln = newFakeListener(s.conn)
 	srv, err := NewServer(s.ln, Config{Backend: s.raw, Mapper: &fakeMapper{g: g}, QueueSize: g.num, Serial: "spin"}, s.f.make)
 	if err != nil {
@@ -116,8 +126,13 @@ func (s *session) handshake(t *testing.T) {
 		<-s.conn.out
 	}
 	<-s.f.wired
-	s.f.call.signal = func() { s.completed <- struct{}{} }
 }
+
+// idle blocks until the queue loop has finished a drain and is waiting on the
+// kick. Publishing into the ring before that edge exists is a data race with
+// the loop's own reads — inherent to a shared virtqueue, and detectable here
+// only because both halves are goroutines rather than processes.
+func (s *session) idle() { <-s.f.kick.waiting }
 
 // TestServerServesAGuestEndToEnd drives the whole session the way a front-end
 // does: handshake over the connection, kick, completion, notification.
@@ -128,6 +143,7 @@ func TestServerServesAGuestEndToEnd(t *testing.T) {
 	if d := s.srv.Device(); d == nil || !d.Ready() {
 		t.Fatal("the device is not ready once the queue loop has wired itself up")
 	}
+	s.idle()
 
 	data := pattern(0x9e, 2*SectorSize)
 	bufs := s.g.publish(0, readable(blkHeader(blkTypeOut, 4)), readable(data), writable(1))
@@ -178,6 +194,7 @@ func TestServerDrainsWorkQueuedBeforeTheKick(t *testing.T) {
 func TestSessionEndsWhenTheQueueLoopFails(t *testing.T) {
 	s := newSession(t)
 	s.handshake(t)
+	s.idle()
 
 	// A descriptor pointing nowhere: fatal to the ring, and therefore to the
 	// session.
