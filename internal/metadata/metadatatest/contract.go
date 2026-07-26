@@ -78,7 +78,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
-		{"CapacityIsBoundedAndConditional", capacity},
+		{"CapacityIsDerivedAndTheBoundIsAPredicateOfTheWrite", capacity},
 		{"OperationsAreListableByHost", operationsByHost},
 		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
@@ -135,22 +135,6 @@ func revokeHostLease(ctx context.Context, s metadata.Store, term int64, hostID s
 		return fmt.Errorf("%w: no RevokeHostLease (§12.6: nothing can take a lease back)", errNotExpressible)
 	}
 	return m.RevokeHostLease(ctx, term, hostID)
-}
-
-type capacityCommitter interface {
-	CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error
-}
-
-// commitCapacity is the §28.2 ledger write. A bare delta cannot express either of
-// the two things the write has to decide: whether the reservation stays inside the
-// declared oversubscription bound, and whether the ledger is still where the caller
-// last saw it. Both are check-then-act in Go and races in production.
-func commitCapacity(ctx context.Context, s metadata.Store, term int64, hostID string, c metadata.CapacityChange) error {
-	m, ok := s.(capacityCommitter)
-	if !ok {
-		return fmt.Errorf("%w: CommitHostCapacity takes a bare delta (§28.2: neither the oversubscription bound nor an expected value is expressible at the write)", errNotExpressible)
-	}
-	return m.CommitHostCapacity(ctx, term, hostID, c)
 }
 
 type authorityClocker interface {
@@ -210,7 +194,7 @@ func newWorld(t *testing.T, s metadata.Store) world {
 	if err := s.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: w.vol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		PrimaryHostID: w.host, DEKWrapped: []byte{1}, KEKID: "kek",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	if err := s.CreateSnapshot(ctx, term, metadata.Snapshot{
@@ -244,11 +228,14 @@ func everyMutation() []mutation {
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.SetHostState(ctx, term, w.host, lifecycle.HostCordoned)
 		}},
-		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.CommitHostCapacity(ctx, term, w.host, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
-		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.RenewHostLease(ctx, term, w.host, 10)
+		}},
+		{"BlockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.BlockHostRenewals(ctx, term, w.host, time.Minute)
+		}},
+		{"UnblockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.UnblockHostRenewals(ctx, term, w.host)
 		}},
 		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return revokeHostLease(ctx, s, term, w.host)
@@ -257,7 +244,7 @@ func everyMutation() []mutation {
 			return s.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: id(), SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
 				DEKWrapped: []byte{1}, KEKID: "k",
-			})
+			}, nil)
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			_, err := bumpVolumeEpoch(ctx, s, term, w.vol, w.host, 0)
@@ -291,7 +278,7 @@ func everyMutation() []mutation {
 		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.UpdateOperation(ctx, term, metadata.Operation{
 				OperationID: w.op, Phase: lifecycle.OpRunning, CurrentState: []byte(`{}`),
-			})
+			}, nil)
 		}},
 	}
 }
@@ -344,11 +331,14 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.SetHostState(ctx, term, ghostHost, lifecycle.HostCordoned)
 		}},
-		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CommitHostCapacity(ctx, term, ghostHost, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
-		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
+		}},
+		{"BlockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.BlockHostRenewals(ctx, term, ghostHost, time.Minute)
+		}},
+		{"UnblockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.UnblockHostRenewals(ctx, term, ghostHost)
 		}},
 		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return revokeHostLease(ctx, s, term, ghostHost)
@@ -372,7 +362,7 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.UpdateOperation(ctx, term, metadata.Operation{
 				OperationID: ghostOp, Phase: lifecycle.OpRunning, CurrentState: []byte(`{}`),
-			})
+			}, nil)
 		}},
 	}
 	for _, tc := range tests {
@@ -430,12 +420,6 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 			_, err := bumpVolumeEpoch(ctx, s, stale, w.vol, w.host, 99)
 			return err
 		}},
-		{"missing host under a stale term", func() error {
-			return s.CommitHostCapacity(ctx, stale, ghost, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
-		}},
-		{"over-release under a stale term", func() error {
-			return s.CommitHostCapacity(ctx, stale, w.host, metadata.CapacityChange{DeltaBytes: -1})
-		}},
 		{"illegal host transition under a stale term", func() error {
 			return s.SetHostState(ctx, stale, w.host, lifecycle.HostActive)
 		}},
@@ -467,7 +451,7 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 		DEKWrapped: []byte{9, 8, 7}, KEKID: "kek-7",
 		LocalSequence: 900, DurableSequence: 800, PublishedSequence: 700,
 	}
-	if err := s.CreateVolume(ctx, w.term, want); err != nil {
+	if err := s.CreateVolume(ctx, w.term, want, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetVolume(ctx, want.VolumeID)
@@ -497,7 +481,7 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 	if err := s.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: vol, SizeBytes: 1 << 30, BlockSize: 65536, CurrentEpoch: 5,
 		State: lifecycle.VolumeActive, PrimaryHostID: w.host, DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateWatermarks(ctx, w.term, vol, 500, 400, 300); err != nil {
@@ -508,7 +492,7 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 	if err := s.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: vol, SizeBytes: 1 << 20, BlockSize: 65536, CurrentEpoch: 2,
 		State: lifecycle.VolumeDetached, DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("re-creating an existing volume must converge, not abort: %v", err)
 	}
 
@@ -621,23 +605,27 @@ func watermarks(t *testing.T, s metadata.Store) {
 // upsertHost: a host is cordoned and being drained; its next routine heartbeat
 // carries State ACTIVE and whatever committed bytes the agent believes. If the
 // heartbeat wins, AcceptsPlacement() starts handing the host new volumes while its
-// own are being evacuated, and the drain's later release underflows.
+// own are being evacuated.
+//
+// Committed capacity is derived (ADR-0017), so the second half of this is now
+// structural rather than a rule the write has to remember: whatever the agent puts
+// in the field, the host still reports the volumes it holds. The assertion stays
+// because "the heartbeat cannot rewrite the accounting" is the property, and which
+// mechanism enforces it is an implementation detail that may change again.
 func upsertHost(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
-	w := newWorld(t, s)
-	if err := s.CommitHostCapacity(ctx, w.term, w.host, metadata.CapacityChange{DeltaBytes: 700, Limit: 1 << 40}); err != nil {
-		t.Fatal(err)
-	}
+	w := newWorld(t, s) // one ACTIVE host holding one 1 GiB volume
+	const held = int64(1) << 30
 	if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned); err != nil {
 		t.Fatal(err)
 	}
 
 	// A heartbeat-shaped upsert: the agent's own view, which knows nothing about
-	// cordoning or about the Control Plane's capacity ledger.
+	// cordoning and has its own idea of what the host is committed to.
 	if err := s.UpsertHost(ctx, w.term, metadata.Host{
 		HostID: w.host, State: lifecycle.HostActive, AgentVersion: "v2",
 		MaxFormatVersion: 3, NVMeTotalBytes: 1 << 41, NVMeUsedBytes: 123,
-		NVMeCommittedBytes: 0,
+		NVMeCommittedBytes: 999,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -648,8 +636,8 @@ func upsertHost(t *testing.T, s metadata.Store) {
 	switch {
 	case h.State != lifecycle.HostCordoned:
 		t.Fatalf("a heartbeat un-cordoned the host: state = %q", h.State)
-	case h.NVMeCommittedBytes != 700:
-		t.Fatalf("a heartbeat rewrote the capacity ledger: committed = %d", h.NVMeCommittedBytes)
+	case h.NVMeCommittedBytes != held:
+		t.Fatalf("a heartbeat changed the committed capacity: committed = %d, want %d", h.NVMeCommittedBytes, held)
 	case h.AgentVersion != "v2" || h.MaxFormatVersion != 3 || h.NVMeTotalBytes != 1<<41 || h.NVMeUsedBytes != 123:
 		t.Fatalf("a heartbeat did not update the fields it owns: %+v", h)
 	}
@@ -885,8 +873,8 @@ func hostLeases(t *testing.T, s metadata.Store) {
 
 	t.Run("a cordoned or draining host still renews", func(t *testing.T) {
 		// A cordon stops new placement and a drain evacuates, but both hosts are
-		// still serving the volumes they hold: taking their lease away would stop
-		// their ACKs mid-evacuation.
+		// still serving the volumes they hold: taking their lease away for the whole
+		// evacuation would stop the ACKs of volumes nobody is moving (ADR-0016).
 		for _, state := range []lifecycle.HostState{lifecycle.HostCordoned, lifecycle.HostDraining} {
 			if err := s.SetHostState(ctx, w.term, w.host, state); err != nil {
 				t.Fatal(err)
@@ -896,121 +884,245 @@ func hostLeases(t *testing.T, s metadata.Store) {
 			}
 		}
 	})
+
+	// ADR-0016 stage 1: the bounded version of that refusal. The Control Plane
+	// revokes a lease to fence one volume, and the host's next heartbeat would put it
+	// straight back; the window is how long that heartbeat is refused for.
+	t.Run("a revocation window refuses renewals while it is open", func(t *testing.T) {
+		if err := s.BlockHostRenewals(ctx, w.term, w.host, time.Minute); err != nil {
+			t.Fatalf("BlockHostRenewals: %v", err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+			t.Fatalf("renewing inside the window: want ErrRenewalsBlocked, got %v", err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.RenewalsBlockedUntil.IsZero() {
+			t.Fatal("the window is not visible on the host row")
+		}
+	})
+
+	t.Run("closing it lets the host renew again", func(t *testing.T) {
+		if err := s.UnblockHostRenewals(ctx, w.term, w.host); err != nil {
+			t.Fatalf("UnblockHostRenewals: %v", err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+			t.Fatalf("renewing after the window closed: %v", err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !h.RenewalsBlockedUntil.IsZero() {
+			t.Fatalf("the window is still recorded as open: %v", h.RenewalsBlockedUntil)
+		}
+	})
+
+	t.Run("closing a window that is not open is a no-op", func(t *testing.T) {
+		if err := s.UnblockHostRenewals(ctx, w.term, w.host); err != nil {
+			t.Fatalf("a second close must converge, not fail: %v", err)
+		}
+	})
+
+	t.Run("a window that has expired stops refusing", func(t *testing.T) {
+		// The Control Plane that opened it may not survive to close it, so the
+		// deadline is the backstop: a host whose drain died must serve again.
+		if err := s.BlockHostRenewals(ctx, w.term, w.host, -time.Minute); err != nil {
+			t.Fatalf("BlockHostRenewals: %v", err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+			t.Fatalf("an expired window still refuses renewals: %v", err)
+		}
+	})
+
+	t.Run("a heartbeat cannot close a window the Control Plane opened", func(t *testing.T) {
+		if err := s.BlockHostRenewals(ctx, w.term, w.host, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		// UpsertHost is the Agent reporting on itself; the window is the CP's.
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{
+			HostID: w.host, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+			t.Fatalf("a heartbeat closed the window fencing one of its volumes: %v", err)
+		}
+		if err := s.UnblockHostRenewals(ctx, w.term, w.host); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
-// capacity: §28.2's oversubscription bound and the compare-and-set every resumed
-// Control-Plane operation's exactly-once proof rests on.
+// capacity is ADR-0017: committed capacity is derived from the rows that already
+// say who holds what, and the §28.2 oversubscription bound is a predicate of the
+// writes that place bytes on a host.
 //
-// placement.Choose evaluates the bound correctly and is pure, which is exactly why
-// it cannot enforce it: two operations that read the fleet before either reserved
-// anything — a drain and a clone, or two drains — choose the same destination, both
-// commit, and the host ends up past MaxOversubscription × NVMeTotalBytes with
-// neither caller having made a mistake. Re-checking in Go narrows the window and
-// keeps the race. The same is true of the delta: an operation that resumes cannot
-// tell "my change already landed" from "somebody else's change happens to add up",
-// unless the comparison is inside the statement that writes.
+//	committed(host) = Σ size_bytes of the volumes whose primary is host
+//	                + Σ size_bytes reserved by in-flight operation plans targeting it
 //
-// The steps run in order against one host: each case's wantCommitted is the state
-// the next one starts from, so a write that lands when it should not is visible in
-// the case after it as well as in its own.
+// The bound has to live inside those writes and not before them, for the reason
+// wave 3 established: placement.Choose evaluates it correctly and is pure, so two
+// operations that read the fleet before either placed anything choose the same
+// destination, both proceed, and the host ends up past MaxOversubscription ×
+// NVMeTotalBytes with neither caller having made a mistake. Re-checking in Go
+// narrows the window and keeps the race.
+//
+// What is *not* here any more is everything a ledger needed: the non-negative
+// guard, the expected-value compare-and-set, the "did my own delta land?" proof. A
+// derived value has no delta to apply twice.
 func capacity(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
-	w := newWorld(t, s) // one ACTIVE host, 1 TiB of NVMe, nothing committed
+	w := newWorld(t, s) // one ACTIVE host, 1 TiB of NVMe, holding one 1 GiB volume
 	const (
 		gib   = int64(1) << 30
 		total = int64(1) << 40 // 1024 GiB
 	)
-	stale := int64(999 * gib)
+	other := id()
+	if err := s.UpsertHost(ctx, w.term, metadata.Host{
+		HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: total,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	tests := []struct {
-		name          string
-		change        metadata.CapacityChange
-		wantErr       error
-		wantCommitted int64
-	}{
-		{
-			// A 1.0 policy: committed may not exceed total.
-			name:          "a reservation inside the bound lands",
-			change:        metadata.CapacityChange{DeltaBytes: 600 * gib, Limit: total},
-			wantCommitted: 600 * gib,
-		},
-		{
-			// The second half of the race above: the same decision, taken against the
-			// same fleet read, arriving after the first one landed.
-			name:          "the placement that lost the race is refused, not absorbed",
-			change:        metadata.CapacityChange{DeltaBytes: 600 * gib, Limit: total},
-			wantErr:       metadata.ErrCapacityExceeded,
-			wantCommitted: 600 * gib,
-		},
-		{
-			name:          "exactly at the bound is admitted",
-			change:        metadata.CapacityChange{DeltaBytes: 424 * gib, Limit: total},
-			wantCommitted: total,
-		},
-		{
-			name:          "one byte past the bound is refused",
-			change:        metadata.CapacityChange{DeltaBytes: 1, Limit: total},
-			wantErr:       metadata.ErrCapacityExceeded,
-			wantCommitted: total,
-		},
-		{
-			// The host is above the bound offered here — a tightened policy, a device
-			// that came back smaller. A release that bounced off the bound would leave
-			// the only operation that can fix the situation unable to run.
-			name:          "a release is never bounded",
-			change:        metadata.CapacityChange{DeltaBytes: -24 * gib, Limit: 512 * gib},
-			wantCommitted: 1000 * gib,
-		},
-		{
-			name:          "an over-release is still an underflow",
-			change:        metadata.CapacityChange{DeltaBytes: -1001 * gib, Limit: total},
-			wantErr:       metadata.ErrCapacityUnderflow,
-			wantCommitted: 1000 * gib,
-		},
-		{
-			name:          "a conditional change lands when the ledger is where the caller left it",
-			change:        metadata.CapacityChange{DeltaBytes: 24 * gib, Limit: total}.Expecting(1000 * gib),
-			wantCommitted: total,
-		},
-		{
-			// The caller recorded 1000 GiB before its previous attempt; the ledger is
-			// now 1024. Applying the delta anyway either double-releases or eats a
-			// reservation belonging to a volume nobody is moving.
-			name:          "a conditional change whose expectation is stale writes nothing",
-			change:        metadata.CapacityChange{DeltaBytes: -24 * gib, Limit: total}.Expecting(1000 * gib),
-			wantErr:       metadata.ErrCapacityConflict,
-			wantCommitted: total,
-		},
-		{
-			// Both predicates fail. The expectation wins the diagnosis: when the ledger
-			// is not where the caller last saw it, everything else the caller computed
-			// from that read — the bound included — was computed about another world.
-			name:          "a stale expectation is reported before the bound",
-			change:        metadata.CapacityChange{DeltaBytes: gib, Limit: 0}.Expecting(stale),
-			wantErr:       metadata.ErrCapacityConflict,
-			wantCommitted: total,
-		},
-		{
-			name:          "a conditional release with a matching expectation lands",
-			change:        metadata.CapacityChange{DeltaBytes: -total, Limit: 0}.Expecting(total),
-			wantCommitted: 0,
-		},
+	committed := func(t *testing.T, hostID string) int64 {
+		t.Helper()
+		h, err := s.GetHost(ctx, hostID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h.NVMeCommittedBytes
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			err := commitCapacity(ctx, s, w.term, w.host, tc.change)
-			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("CommitHostCapacity(%+v) = %v, want %v", tc.change, err, tc.wantErr)
-			}
-			h, gerr := s.GetHost(ctx, w.host)
-			if gerr != nil {
-				t.Fatal(gerr)
-			}
-			if h.NVMeCommittedBytes != tc.wantCommitted {
-				t.Fatalf("committed = %d, want %d", h.NVMeCommittedBytes, tc.wantCommitted)
-			}
-		})
-	}
+
+	t.Run("a host is charged for the volumes whose primary it is", func(t *testing.T) {
+		if got := committed(t, w.host); got != gib {
+			t.Fatalf("committed = %d, want %d (the world's one volume)", got, gib)
+		}
+		if got := committed(t, other); got != 0 {
+			t.Fatalf("an empty host reports %d committed bytes", got)
+		}
+	})
+
+	t.Run("an in-flight plan charges the destination before the volume is primary there", func(t *testing.T) {
+		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: w.op, Phase: lifecycle.OpRunning,
+			CurrentState: plan(w.vol, other, "MOVING"),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := committed(t, other); got != gib {
+			t.Fatalf("destination committed = %d, want %d — a volume in flight to it is not charged", got, gib)
+		}
+		// And it is still charged to the source, which is still serving it. Both
+		// sides is the conservative direction: the alternative is two placements
+		// that each believe they have the room.
+		if got := committed(t, w.host); got != gib {
+			t.Fatalf("source committed = %d, want %d while it still holds the volume", got, gib)
+		}
+	})
+
+	t.Run("a settled entry reserves nothing", func(t *testing.T) {
+		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: w.op, Phase: lifecycle.OpRunning,
+			CurrentState: plan(w.vol, other, "DONE"),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := committed(t, other); got != 0 {
+			t.Fatalf("a DONE entry still reserves %d bytes", got)
+		}
+	})
+
+	t.Run("a finished operation reserves nothing", func(t *testing.T) {
+		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: w.op, Phase: lifecycle.OpRunning,
+			CurrentState: plan(w.vol, other, "MOVING"),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := committed(t, other); got != gib {
+			t.Fatalf("setup: destination committed = %d, want %d", got, gib)
+		}
+		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: w.op, Phase: lifecycle.OpSucceeded,
+			CurrentState: plan(w.vol, other, "MOVING"),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := committed(t, other); got != 0 {
+			t.Fatalf("a terminal operation still reserves %d bytes", got)
+		}
+	})
+
+	t.Run("the bound is a predicate of the write that places a volume", func(t *testing.T) {
+		tight := &metadata.CapacityBound{HostID: other, AddBytes: 2 * gib, Limit: gib}
+		fresh := id()
+		err := s.CreateVolume(ctx, w.term, metadata.Volume{
+			VolumeID: fresh, SizeBytes: 2 * gib, BlockSize: 65536, State: lifecycle.VolumeActive,
+			PrimaryHostID: other, DEKWrapped: []byte{1}, KEKID: "k",
+		}, tight)
+		if !errors.Is(err, metadata.ErrCapacityExceeded) {
+			t.Fatalf("CreateVolume past the bound = %v, want ErrCapacityExceeded", err)
+		}
+		if _, gerr := s.GetVolume(ctx, fresh); !errors.Is(gerr, metadata.ErrNotFound) {
+			t.Fatalf("a refused placement wrote the volume anyway: %v", gerr)
+		}
+		// Exactly at the bound is admitted, and the same write with no bound at all
+		// is not a placement decision and is never refused.
+		if err := s.CreateVolume(ctx, w.term, metadata.Volume{
+			VolumeID: fresh, SizeBytes: 2 * gib, BlockSize: 65536, State: lifecycle.VolumeActive,
+			PrimaryHostID: other, DEKWrapped: []byte{1}, KEKID: "k",
+		}, &metadata.CapacityBound{HostID: other, AddBytes: 2 * gib, Limit: 2 * gib}); err != nil {
+			t.Fatalf("a placement exactly at the bound was refused: %v", err)
+		}
+		if got := committed(t, other); got != 2*gib {
+			t.Fatalf("destination committed = %d, want %d", got, 2*gib)
+		}
+	})
+
+	t.Run("the bound is a predicate of the write that records a plan", func(t *testing.T) {
+		// `other` now holds 2 GiB. A plan that would add the world's 1 GiB volume
+		// under a 2 GiB ceiling has to be refused, progress and all: the entry *is*
+		// the reservation.
+		// A fresh operation: the one above was taken to SUCCEEDED, and a terminal
+		// operation is refused by the lifecycle guard before the bound is reached.
+		live := id()
+		if _, rerr := s.RecordOperation(ctx, w.term, metadata.Operation{
+			OperationID: live, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
+			HostID: w.host, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+		}); rerr != nil {
+			t.Fatal(rerr)
+		}
+		before, err := s.GetOperation(ctx, live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: live, Phase: lifecycle.OpRunning,
+			CurrentState: plan(w.vol, other, "MOVING"),
+		}, &metadata.CapacityBound{HostID: other, AddBytes: gib, Limit: 2 * gib})
+		if !errors.Is(err, metadata.ErrCapacityExceeded) {
+			t.Fatalf("UpdateOperation past the bound = %v, want ErrCapacityExceeded", err)
+		}
+		after, err := s.GetOperation(ctx, live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(after.CurrentState) != string(before.CurrentState) || after.Phase != before.Phase {
+			t.Fatalf("a refused reservation still wrote the progress: %+v", after)
+		}
+		if got := committed(t, other); got != 2*gib {
+			t.Fatalf("destination committed = %d, want %d", got, 2*gib)
+		}
+	})
+}
+
+// plan builds the current_state a drain records for one volume in flight.
+func plan(volumeID, toHost, stage string) []byte {
+	return fmt.Appendf(nil, `{"total":1,"volumes":[{"volume_id":%q,"stage":%q,"to_host":%q}]}`,
+		volumeID, stage, toHost)
 }
 
 // operationsByHost: an operation id is the only handle GetOperation offers, and the
@@ -1129,11 +1241,14 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.SetHostState(ctx, term, "", lifecycle.HostCordoned)
 		}},
-		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CommitHostCapacity(ctx, term, "", metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
-		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, "", 10)
+		}},
+		{"BlockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.BlockHostRenewals(ctx, term, "", time.Minute)
+		}},
+		{"UnblockHostRenewals", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.UnblockHostRenewals(ctx, term, "")
 		}},
 		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return revokeHostLease(ctx, s, term, "")
@@ -1142,7 +1257,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			return s.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: "", SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
 				DEKWrapped: []byte{1}, KEKID: "k",
-			})
+			}, nil)
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			_, err := bumpVolumeEpoch(ctx, s, term, "", w.host, 0)
@@ -1176,7 +1291,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.UpdateOperation(ctx, term, metadata.Operation{
 				OperationID: "", Phase: lifecycle.OpRunning, CurrentState: []byte(`{}`),
-			})
+			}, nil)
 		}},
 	}
 	for _, tc := range tests {

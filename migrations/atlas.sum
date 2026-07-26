@@ -1,6 +1,9 @@
-h1:mX/AsFiUcpaL9mNkIIihnXDr6ftfP+zeFtI0dEM1GPw=
+h1:myjfI4esOAvNZDs1xHks6B/PAzbGjVSRHoHosjeXiPE=
 20260725111325_initial.sql h1:Vs4MY2xFCc4g43LQt/qF49Rn0rwwrmGPwgBBc09qVVU=
 20260725112223_uuidv7_checks.sql h1:/kNOxHHrU5UTOH6nnO0/WvCOdopYAb25X/DpC+Hz+I0=
 20260725192437_lifecycle_state_checks.sql h1:5InOkSyyquNmAub+rOVXWJZK4qqZATfNIoSHOu48OU0=
 20260725194240_fk_and_query_indexes.sql h1:484cvn5Y1r5aVu2rNrf7qnOCjOipl2oVocAGQh0Iez4=
 20260726010840_operations_by_host_index.sql h1:nyScP+mM4dHiFuvAaZFNM1tzZAFbY8Mco2JuAvq6DtA=
+20260726115803_capacity_is_derived.sql h1:Jjuf4R0r2gk46TTLGY2ZqdgqnNs9WuXvAFvph7fK5dQ=
+20260726120557_fencing_wait_observation.sql h1:Rgb8+sy/bMHmgsijWUFFx/qIgJn0dQxtMdv697Vv1Bk=
+20260726122007_revocation_window.sql h1:zT3o5bbqa6JLkG/JpLQlnwKnxqiaX3zUBp5yIykVHzM=

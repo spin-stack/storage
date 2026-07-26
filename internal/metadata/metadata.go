@@ -11,6 +11,7 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -25,20 +26,17 @@ var (
 	ErrNotFound = errors.New("metadata: not found")
 	// ErrShrinkNotAllowed means a resize tried to reduce a volume's size (§3 non-goal).
 	ErrShrinkNotAllowed = errors.New("metadata: volume shrink not allowed")
-	// ErrCapacityUnderflow means a capacity release would drive a host's committed
-	// bytes below zero — an accounting bug, never silently clamped (§28.2).
-	ErrCapacityUnderflow = errors.New("metadata: committed capacity would go negative")
-	// ErrCapacityExceeded means a reservation would take a host past the placement
-	// bound it was offered (§28.2). It is the opposite incident to
-	// ErrCapacityUnderflow — bytes that were never released against bytes that were
-	// never available — and callers branch differently on the two: an over-commit
-	// re-places the volume somewhere else, an underflow is an accounting bug that
-	// must stop the operation and be looked at.
+	// ErrCapacityExceeded means a write would take a host past the §28.2
+	// oversubscription bound it was offered: the volume it places, plus what the
+	// host already holds and what is already in flight to it, is more than the
+	// policy admits. Nothing was written, and the caller re-places the volume
+	// somewhere else.
+	//
+	// It is the only capacity sentinel left. The underflow and expected-value
+	// errors it used to sit beside were properties of an incremental ledger —
+	// "this delta was applied twice", "the books moved under my read" — and a
+	// derived value has neither (ADR-0017).
 	ErrCapacityExceeded = errors.New("metadata: committed capacity would exceed the placement bound")
-	// ErrCapacityConflict means the ledger was not at the value the change was
-	// conditional on: somebody else wrote the same books between the caller's read
-	// and its write. Nothing was applied.
-	ErrCapacityConflict = errors.New("metadata: committed capacity is not the expected value")
 	// ErrWatermarkOrder means a watermark report violates
 	// published ≤ durable ≤ local (INV-03).
 	ErrWatermarkOrder = errors.New("metadata: watermarks out of order")
@@ -50,6 +48,18 @@ var (
 	// against: another promoter got there first (§12.3). The caller must re-read and
 	// decide again — it has *not* been granted an epoch.
 	ErrEpochConflict = errors.New("metadata: volume is not at the expected epoch")
+	// ErrRenewalsBlocked means a host's lease renewals are refused for as long as a
+	// bounded revocation window is open on it (§12.6, ADR-0016 stage 1). The Control
+	// Plane opens one for the duration of a single volume's promotion, so that the
+	// lease it revoked to fence the source cannot be re-armed by the source's next
+	// heartbeat; without it the fencing wait measures from an instant that keeps
+	// moving and a healthy host can never be drained.
+	//
+	// It is deliberately not ErrHostNotServing. The host *is* serving — the volumes
+	// nobody is moving are still its, and their WAL keeps accepting writes; what
+	// waits is the durable ACK, for at most one lease_ttl + max_clock_skew per volume
+	// moved. A caller that reads this should retry, not conclude the host is gone.
+	ErrRenewalsBlocked = errors.New("metadata: host lease renewals are blocked by a revocation window")
 	// ErrHostNotServing means the operation needs a host the fleet still considers a
 	// writer, and this one is DEAD (§28.1). Marking a host dead is the Control Plane
 	// asserting that its writer is gone; handing it a fresh lease afterwards
@@ -70,14 +80,29 @@ type Leader struct {
 
 // Host is a compute host (§8).
 type Host struct {
-	HostID             string
-	State              lifecycle.HostState
-	AgentVersion       string
-	MaxFormatVersion   int32
-	NVMeTotalBytes     int64
-	NVMeUsedBytes      int64
+	HostID           string
+	State            lifecycle.HostState
+	AgentVersion     string
+	MaxFormatVersion int32
+	NVMeTotalBytes   int64
+	NVMeUsedBytes    int64
+	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by
+	// the store on every read, and never stored anywhere (ADR-0017):
+	//
+	//	committed(host) = Σ size_bytes of the volumes whose primary is host
+	//	                + Σ size_bytes reserved by in-flight operation plans
+	//	                  targeting host
+	//
+	// It is therefore ignored on the way in: UpsertHost cannot set it, and neither
+	// can anything else. A number S3 or SQL can recompute is a cache, never an
+	// authority, and the cheapest cache to keep honest is the one that does not
+	// exist.
 	NVMeCommittedBytes int64
 	LastHeartbeat      time.Time
+	// RenewalsBlockedUntil is the end of the bounded revocation window (ADR-0016
+	// stage 1): until this instant, on the store's clock, RenewHostLease refuses.
+	// Zero means the host renews normally.
+	RenewalsBlockedUntil time.Time
 }
 
 // HostLease is the per-host lease (§12.6).
@@ -88,46 +113,72 @@ type HostLease struct {
 	TTLSeconds  int32
 }
 
-// CapacityChange is one change to a host's committed-NVMe ledger (§28.2). It is a
-// bounded compare-and-set rather than a bare delta, because both rules that govern
-// the ledger used to live between a read and a write that were two statements:
+// CapacityBound is the §28.2 oversubscription ceiling a write must respect, stated
+// by the caller that took the placement decision so there is one copy of the rule.
 //
-//   - Limit is the §28.2 oversubscription bound, as the placement policy computes it
-//     for this host (placement.Policy.Limit) — the highest committed value the host
-//     may hold *after a reservation*. placement.Choose is pure and advisory: two
-//     operations that read the fleet before either reserved anything pick the same
-//     destination and both commit, and the host lands past the declared bound with
-//     neither caller having made a mistake. Re-checking in Go only narrows that
-//     window; the bound is a bound only when the statement that adds the bytes
-//     evaluates it. The caller passes the policy's own answer so there is one copy
-//     of the rule.
+// placement.Choose is pure and advisory: two operations that read the fleet before
+// either reserved anything pick the same destination and both proceed, and the host
+// lands past the declared bound with neither caller having made a mistake.
+// Re-checking in Go only narrows that window; the bound is a bound only when the
+// statement that places the bytes evaluates it. So it travels *with* the write:
 //
-//     It deliberately does not bound a *release*: a host that is already above the
-//     bound — its policy was tightened, its device came back smaller — must still be
-//     able to give bytes back, and a release that bounced off the bound would wedge
-//     every drain of that host.
+//	committed(HostID) + AddBytes <= Limit
 //
-//   - Expect, when set, is the ledger value the change is conditional on. A delta is
-//     not an idempotency key, so the only proof a resumed operation has that its own
-//     change already landed is the value it recorded before attempting it — and that
-//     proof is worth nothing if a third party can write between the read and the
-//     write. With the comparison inside the statement, a ledger that moved is
-//     ErrCapacityConflict and nothing is applied.
-type CapacityChange struct {
-	// DeltaBytes is added to the host's committed bytes; negative releases.
-	DeltaBytes int64
-	// Limit bounds a reservation (DeltaBytes > 0) and nothing else. Zero admits no
-	// reservation at all, which is the fail-closed direction: a caller that cannot
-	// name a bound has not been told the host can hold anything.
+// where committed is the derived value (ADR-0017) as it stands immediately before
+// the write. A write that carries no bound is not a placement decision —
+// rebuild-metadata recreating volumes that already occupy their hosts, a progress
+// save that reserves nothing new — and a bound is never applied to a write that
+// gives capacity back: a host can be over its ceiling for reasons that have nothing
+// to do with the caller (a tightened policy, a device that came back smaller), and
+// refusing the write that brings it down would wedge every drain of that host.
+type CapacityBound struct {
+	// HostID is the host being placed on.
+	HostID string
+	// AddBytes is what this write places there. Zero is legitimate: a write may be
+	// bounded without adding anything, which asserts the host is not already over.
+	AddBytes int64
+	// Limit is the highest committed value the host may hold afterwards
+	// (placement.Policy.Limit). Zero admits nothing, which is the fail-closed
+	// direction: a caller that cannot name a bound has not been told the host can
+	// hold anything.
 	Limit int64
-	// Expect, when non-nil, is the committed value the change is conditional on.
-	Expect *int64
 }
 
-// Expecting returns c conditional on the host's committed bytes being committed.
-func (c CapacityChange) Expecting(committed int64) CapacityChange {
-	c.Expect = &committed
-	return c
+// PlanReservation is one entry of the "volumes" array an operation records in its
+// current_state: a volume this operation has committed to place on ToHost. It is the
+// second term of ADR-0017's derived capacity — "reserved but not yet primary" — and
+// it is declared here, next to CapacityBound, because three things have to agree on
+// it: the drain that writes it, the sim store that sums it in Go, and the
+// host_committed_bytes view that sums it in SQL. A shape that lived only in
+// internal/controlplane would be a shape the accounting had to guess at.
+//
+// It is decoded leniently. A plan nobody can read reserves nothing, which makes the
+// destination look emptier than it is (ADR-0017 says so explicitly) — but a plan
+// that made every capacity read fail would take the fleet down instead.
+type PlanReservation struct {
+	VolumeID string `json:"volume_id"`
+	ToHost   string `json:"to_host"`
+	Stage    string `json:"stage"`
+}
+
+// settledStages are the stages of a plan entry that reserve nothing: the move is
+// finished, or it turned out to belong to somebody else.
+var settledStages = map[string]bool{"DONE": true, "FOREIGN": true}
+
+// Reserves reports whether this entry still charges its destination.
+func (r PlanReservation) Reserves() bool {
+	return r.ToHost != "" && r.VolumeID != "" && !settledStages[r.Stage]
+}
+
+// PlanReservations decodes the reservation entries of an operation's current_state.
+func PlanReservations(currentState []byte) []PlanReservation {
+	var plan struct {
+		Volumes []PlanReservation `json:"volumes"`
+	}
+	if err := json.Unmarshal(currentState, &plan); err != nil {
+		return nil
+	}
+	return plan.Volumes
 }
 
 // Volume is the durable-volume record (§8). Watermarks are informative (§5.8).
@@ -146,6 +197,15 @@ type Volume struct {
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64
+	// FencingStartedAt is the instant the Control Plane observed the lease of the
+	// writer it is fencing, stamped by the store's own clock when the volume entered
+	// FENCING_WAIT (§7, ADR-0015). It is the durable half of the promotion dwell: a
+	// Control Plane that restarts mid-fence has no memory of having observed
+	// anything, and without this would have to start the wait again.
+	//
+	// Zero means "no fence is running, or nobody recorded one", which a promoter
+	// answers by starting a full dwell now. Fail slow, never short.
+	FencingStartedAt time.Time
 }
 
 // Snapshot is a catalog entry for a published snapshot (§8, §19).
@@ -203,10 +263,10 @@ type Store interface {
 
 	// UpsertHost registers a host or refreshes what the host itself reports:
 	// agent version, format version, NVMe totals, heartbeat. It deliberately does
-	// NOT carry the fleet state or the committed-capacity ledger — those belong to
-	// the Control Plane (SetHostState, CommitHostCapacity), and a routine heartbeat
-	// that carried them would un-cordon a draining host and zero its ledger.
-	// Term-guarded.
+	// NOT carry the fleet state — that belongs to the Control Plane (SetHostState),
+	// and a routine heartbeat that carried it would un-cordon a draining host.
+	// Committed capacity is not carried either, and could not be: it is derived
+	// from the volumes and plans that name the host (ADR-0017). Term-guarded.
 	UpsertHost(ctx context.Context, term int64, h Host) error
 	// GetHost returns a host.
 	GetHost(ctx context.Context, hostID string) (Host, error)
@@ -216,21 +276,34 @@ type Store interface {
 	// is checked against the lifecycle table: an unknown value is
 	// lifecycle.ErrUnknownState, an illegal move lifecycle.ErrInvalidTransition.
 	SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState) error
-	// CommitHostCapacity applies c to a host's committed NVMe ledger, term-guarded.
-	// Every rule the ledger has is evaluated inside the write (see CapacityChange):
-	// a release below zero is ErrCapacityUnderflow rather than a clamp (§28.2), a
-	// reservation past c.Limit is ErrCapacityExceeded, and a change conditional on a
-	// value the ledger has moved away from is ErrCapacityConflict. In all three cases
-	// nothing is written.
-	CommitHostCapacity(ctx context.Context, term int64, hostID string, c CapacityChange) error
 	// RenewHostLease renews (or grants) a host's lease with the given TTL
 	// (term-guarded). A host the fleet has recorded as DEAD is refused with
 	// ErrHostNotServing: that state is the Control Plane asserting the writer is
 	// gone — the same assertion promotion accepts as a reason to skip the fencing
 	// wait — so a routine heartbeat must not be able to re-arm it. A CORDONED or
 	// DRAINING host still renews: both are still serving the volumes they hold, and
-	// stopping their ACKs mid-evacuation is the failure this would cause.
+	// stopping their ACKs for the whole evacuation is the failure that would cause.
+	//
+	// It is also refused, with ErrRenewalsBlocked, while a revocation window is open
+	// on the host (ADR-0016 stage 1) — the bounded version of that same refusal, for
+	// the length of one volume's promotion.
 	RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error
+	// BlockHostRenewals opens (or re-arms) the revocation window on hostID for d
+	// (term-guarded, §12.6/ADR-0016). While it is open the host's renewals are
+	// ErrRenewalsBlocked, so the lease the Control Plane revoked to fence one of its
+	// volumes cannot be put back by the host's next heartbeat.
+	//
+	// The window carries its own deadline rather than being a flag, because the
+	// Control Plane that opened it may not survive to close it: a host that can never
+	// renew again is worse than the bug the window fixes. d is therefore the length
+	// of one promotion — one lease_ttl + max_clock_skew — and a pass that is still
+	// running re-arms it rather than relying on the first call.
+	BlockHostRenewals(ctx context.Context, term int64, hostID string, d time.Duration) error
+	// UnblockHostRenewals closes the window (term-guarded). It is idempotent: a host
+	// with no window is the state the caller asked for, which matters because this
+	// runs on every exit path of a promotion, including the ones that never opened
+	// one.
+	UnblockHostRenewals(ctx context.Context, term int64, hostID string) error
 	// RevokeHostLease drops a host's lease (term-guarded), so nothing keeps its
 	// Agent-side lease alive once the Control Plane has fenced it. It is idempotent:
 	// revoking a lease that is not there is the state the caller asked for. An
@@ -249,7 +322,14 @@ type Store interface {
 	// lowers current_epoch, shrinks size_bytes, rewinds a watermark, blanks an
 	// owner, or rewrites the lifecycle state. Ownership and state move only through
 	// BumpVolumeEpoch and SetVolumeState.
-	CreateVolume(ctx context.Context, term int64, v Volume) error
+	//
+	// A volume with a primary host is a placement, so this is one of the two writes
+	// that carry the §28.2 bound (§28.2, ADR-0017): a non-nil bound makes the
+	// insert affect 0 rows — ErrCapacityExceeded, nothing written — when the
+	// destination cannot hold it. rebuild-metadata passes none: it is recording
+	// volumes that already occupy their hosts, and a ceiling that refused to record
+	// reality would leave the catalog short of it.
+	CreateVolume(ctx context.Context, term int64, v Volume, bound *CapacityBound) error
 	// GetVolume returns a volume.
 	GetVolume(ctx context.Context, volumeID string) (Volume, error)
 	// ListVolumesByHost returns the volumes whose primary is hostID, ordered by
@@ -304,5 +384,11 @@ type Store interface {
 	// visible progress of a long-running reconciled operation (§7, §28.1). It is
 	// term-guarded, and the phase move is guarded by the lifecycle table, so a
 	// terminal operation is never resurrected (lifecycle.ErrInvalidTransition).
-	UpdateOperation(ctx context.Context, term int64, op Operation) error
+	//
+	// It is also the write that records a reservation, because an operation's
+	// progress *is* its plan: a drain entry naming a destination charges that host
+	// for a volume which is not primary there yet (ADR-0017). So it is the second
+	// write carrying the §28.2 bound; a non-nil bound that the derived value cannot
+	// admit is ErrCapacityExceeded with nothing written, including the progress.
+	UpdateOperation(ctx context.Context, term int64, op Operation, bound *CapacityBound) error
 }

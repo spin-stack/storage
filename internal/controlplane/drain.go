@@ -25,23 +25,10 @@ var (
 	ErrOperationMismatch = errors.New("controlplane: the operation id belongs to another drain")
 
 	// ErrEpochAdvanced means the volume is no longer where this operation's own
-	// promotion put it: somebody else moved it on. Everything the drain still owes
-	// that volume — its epoch boundary, its capacity release — is now unauthorable,
-	// because both are statements about a promotion this operation can no longer
-	// prove it performed.
+	// promotion put it: somebody else moved it on. The epoch boundary the drain
+	// still owes that volume is now unauthorable, because it is a statement about a
+	// promotion this operation can no longer prove it performed.
 	ErrEpochAdvanced = errors.New("controlplane: the volume advanced past the epoch this drain granted")
-
-	// ErrCapacityLedgerMoved means a host's committed bytes are neither what they
-	// were before this move's capacity change nor what they would be after it: a
-	// third party is writing the same ledger. The drain reports it instead of
-	// guessing, because a wrong guess either wedges the operation (an underflow
-	// every later pass repeats) or silently consumes another volume's reservation.
-	ErrCapacityLedgerMoved = errors.New("controlplane: the host's committed capacity changed under the move")
-
-	// ErrReservationNotReleased means a move that will not happen could not give its
-	// destination reservation back. A reservation nobody remembers making is a host
-	// placement under-uses forever, so it is surfaced rather than swallowed (§28.2).
-	ErrReservationNotReleased = errors.New("controlplane: a destination reservation could not be released")
 
 	// ErrHostAlreadyDraining means another drain operation is still live for this
 	// host. Two evacuations of one host capture the same plan and promote the same
@@ -93,28 +80,28 @@ type plan struct {
 type stage string
 
 const (
-	// stageReserving: the destination is chosen and its reservation is about to be
-	// committed.
-	stageReserving stage = "RESERVING"
-	// stageMoving: the reservation is held; materialization and promotion may run.
+	// stageMoving: the destination is chosen and the entry that records it is the
+	// destination's reservation (ADR-0017); materialization and promotion may run.
 	stageMoving stage = "MOVING"
 	// stagePromoted: *this operation* fenced the source and was granted NewEpoch on
 	// ToHost. Only a volume in this stage may have its epoch boundary written here.
 	stagePromoted stage = "PROMOTED"
-	// stageReleasing: the boundary is written and the source's release is next.
-	stageReleasing stage = "RELEASING"
 	// stageDone: the move is complete.
 	stageDone stage = "DONE"
 	// stageForeign: the volume left the source under somebody else's promotion. It is
-	// evacuated, but not by this operation, which therefore writes no boundary for it
-	// and releases no capacity for it.
+	// evacuated, but not by this operation, which therefore writes no boundary for it.
 	stageForeign stage = "FOREIGN"
 )
 
-// volumeProgress is what this operation has established about one volume. The
-// capacity fields are the ledger values observed immediately before a change: with
-// CommitHostCapacity being a delta rather than a compare-and-set, they are the only
-// proof a resumed pass has that its own change already landed.
+// The stage vocabulary is read by two things besides this file: metadata's
+// PlanReservation (which decides that DONE and FOREIGN reserve nothing) and the
+// host_committed_bytes view, which says the same in SQL. Adding or renaming a stage
+// means editing all three, deliberately.
+
+// volumeProgress is what this operation has established about one volume. It is
+// also the destination's reservation: an entry naming ToHost charges that host for
+// the volume until the volume is actually primary there (ADR-0017), which is why
+// there are no ledger fields left to record — there is no ledger.
 type volumeProgress struct {
 	VolumeID  string `json:"volume_id"`
 	Stage     stage  `json:"stage"`
@@ -123,8 +110,6 @@ type volumeProgress struct {
 	NewEpoch  uint64 `json:"new_epoch,omitempty"`
 	UpTo      uint64 `json:"recovered_up_to,omitempty"`
 	Bytes     int64  `json:"bytes,omitempty"`
-	DstBefore int64  `json:"dst_committed_before,omitempty"`
-	SrcBefore int64  `json:"src_committed_before,omitempty"`
 	Note      string `json:"note,omitempty"`
 }
 
@@ -152,11 +137,12 @@ func (p *progress) volume(volumeID string) *volumeProgress {
 	return nil
 }
 
-// begin records the intent to move volumeID to dest before anything is reserved.
-func (p *progress) begin(volumeID, dest string, prevEpoch uint64, dstCommitted int64) *volumeProgress {
+// begin records the intent to move volumeID to dest. Writing this entry *is* the
+// reservation: from the moment it is durable, the derived capacity of dest includes
+// the volume (ADR-0017).
+func (p *progress) begin(volumeID, dest string, prevEpoch uint64) *volumeProgress {
 	p.Volumes = append(p.Volumes, volumeProgress{
-		VolumeID: volumeID, Stage: stageReserving, ToHost: dest,
-		PrevEpoch: prevEpoch, DstBefore: dstCommitted,
+		VolumeID: volumeID, Stage: stageMoving, ToHost: dest, PrevEpoch: prevEpoch,
 	})
 	return &p.Volumes[len(p.Volumes)-1]
 }
@@ -165,7 +151,7 @@ func (p *progress) begin(volumeID, dest string, prevEpoch uint64, dstCommitted i
 func (p *progress) foreign(volumeID, owner string) {
 	p.Volumes = append(p.Volumes, volumeProgress{
 		VolumeID: volumeID, Stage: stageForeign, ToHost: owner,
-		Note: "promoted by another actor; this operation wrote no boundary and released no capacity",
+		Note: "promoted by another actor; this operation wrote no boundary for it",
 	})
 }
 
@@ -238,7 +224,7 @@ func (d *Drainer) Cancel(ctx context.Context, term int64, operationID string) er
 	// The store refuses this on a terminal operation (lifecycle.ErrInvalidTransition):
 	// a finished drain cannot be un-finished.
 	op.Phase = lifecycle.OpCanceling
-	return d.md.UpdateOperation(ctx, term, op)
+	return d.md.UpdateOperation(ctx, term, op, nil)
 }
 
 // Drain evacuates hostID. It cordons the host, then moves every volume in the plan
@@ -446,10 +432,6 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 	vol := [16]byte(parsed)
 
 	vp := prog.volume(v.VolumeID)
-	entry := stage("") // the stage this pass started from; later ones are first attempts
-	if vp != nil {
-		entry = vp.Stage
-	}
 
 	if vp == nil {
 		if v.PrimaryHostID != source {
@@ -464,31 +446,36 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 		if err != nil {
 			return Move{}, err
 		}
-		vp = prog.begin(v.VolumeID, dest, uint64(v.CurrentEpoch), dh.NVMeCommittedBytes)
-		if err := d.save(ctx, term, operationID, *prog); err != nil {
-			return Move{}, err
-		}
-	}
-
-	if vp.Stage == stageReserving {
-		if err := d.applyCapacity(ctx, term, vp.ToHost, v.SizeBytes, vp.DstBefore, entry == stageReserving); err != nil {
-			// Nothing is reserved, so there is nothing to give back: forget the
-			// volume and let a later pass place it afresh.
+		vp = prog.begin(v.VolumeID, dest, uint64(v.CurrentEpoch))
+		// This write *is* the reservation (ADR-0017): once the entry is durable the
+		// destination's derived capacity includes the volume, so the §28.2 bound
+		// travels with it. A destination another placement filled between
+		// d.choose and here refuses the write and nothing is reserved — there is no
+		// second statement that could have landed, so there is nothing to undo.
+		if err := d.reserve(ctx, term, operationID, *prog, dest, v.SizeBytes, dh); err != nil {
 			prog.drop(v.VolumeID)
 			return Move{}, errors.Join(err, d.save(ctx, term, operationID, *prog))
-		}
-		vp.Stage = stageMoving
-		if err := d.save(ctx, term, operationID, *prog); err != nil {
-			return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 		}
 	}
 
 	if vp.Stage == stageMoving {
 		if err := d.stillOurs(v, source, vp); err != nil {
-			if v.PrimaryHostID == vp.ToHost {
+			switch {
+			case v.PrimaryHostID == vp.ToHost:
 				return Move{}, err // the reservation covers what is actually there
+			case v.PrimaryHostID != source:
+				// It left the source under somebody else's promotion while this
+				// operation was still holding a reservation for it. It is evacuated,
+				// just not by us: record that, which also releases the reservation
+				// (ADR-0017: the entry was the reservation), and move on. Failing the
+				// pass instead would make the drain of a host somebody else is also
+				// repairing terminate on every attempt.
+				prog.drop(v.VolumeID)
+				prog.foreign(v.VolumeID, v.PrimaryHostID)
+				return Move{}, d.save(ctx, term, operationID, *prog)
+			default:
+				return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 			}
-			return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 		}
 		// Bulk pass: rebuild on the destination from S3 while the source still serves.
 		// This is where the cold RTO is spent (§22.3), overlapping the fencing wait.
@@ -496,23 +483,20 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 			return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 		}
 
-		// Fence the source before the destination can write: promotion waits out
-		// lease_ttl + max_clock_skew and CASes the epoch object (§12.3–12.4).
-		//
-		// The revocation is skipped once the volume is already on the destination —
-		// this operation's own promotion, being resumed. The lease this would take
-		// away then is the one that promotion granted to the *new* writer.
-		if v.PrimaryHostID != vp.ToHost {
-			if ferr := d.fenceSource(ctx, term, operationID, v.PrimaryHostID, prog); ferr != nil {
-				return Move{}, d.abandon(ctx, term, operationID, prog, v, ferr)
-			}
-		}
-		newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
+		newEpoch, err := d.fenceAndPromote(ctx, term, operationID, v, vp, prog)
 		if err != nil {
+			if errors.Is(err, ErrFencingWaitNotElapsed) {
+				// The fence is running, not failed. The entry stays: it is the
+				// destination's reservation, and handing it back on every pass would
+				// let another placement take the room this move is waiting for, so
+				// the drain would come back to a host that no longer fits it.
+				return Move{}, err
+			}
 			return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 		}
-		// From here the volume is the destination's: nothing below releases the
-		// reservation, whatever goes wrong.
+		// From here the volume is the destination's, and the derived accounting says
+		// so on its own: the source stops being charged the moment it stops being
+		// primary, whatever goes wrong below.
 		if newEpoch != vp.PrevEpoch+1 {
 			return Move{}, fmt.Errorf("%w: %s was promoted to epoch %d, this drain planned %d",
 				ErrEpochAdvanced, v.VolumeID, newEpoch, vp.PrevEpoch+1)
@@ -549,21 +533,7 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 		if err := d.writeRecoveryPoint(ctx, vol, vp.NewEpoch, vp.PrevEpoch, mp.UpTo, vp.ToHost); err != nil {
 			return Move{}, err
 		}
-		src, err := d.md.GetHost(ctx, source)
-		if err != nil {
-			return Move{}, err
-		}
-		vp.UpTo, vp.Bytes, vp.SrcBefore = mp.UpTo, mp.Bytes, src.NVMeCommittedBytes
-		vp.Stage = stageReleasing
-		if err := d.save(ctx, term, operationID, *prog); err != nil {
-			return Move{}, err
-		}
-	}
-
-	if vp.Stage == stageReleasing {
-		if err := d.applyCapacity(ctx, term, source, -v.SizeBytes, vp.SrcBefore, entry == stageReleasing); err != nil {
-			return Move{}, err
-		}
+		vp.UpTo, vp.Bytes = mp.UpTo, mp.Bytes
 		vp.Stage = stageDone
 		if err := d.save(ctx, term, operationID, *prog); err != nil {
 			return Move{}, err
@@ -574,6 +544,68 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 		VolumeID: v.VolumeID, FromHost: source, ToHost: vp.ToHost,
 		NewEpoch: vp.NewEpoch, UpTo: vp.UpTo, Bytes: vp.Bytes,
 	}, nil
+}
+
+// fenceAndPromote fences the source and grants the volume's next epoch to the
+// destination (§12.3–12.5), inside a bounded revocation window (ADR-0016 stage 1).
+//
+// The window is what makes the revocation stick. Taking the lease away is what lets a
+// *healthy* host be evacuated — the promoter refuses a source whose lease is live, so
+// on a host that is up and heartbeating the deadline keeps moving forward — but the
+// host's next heartbeat puts back exactly what was taken, and the drain waits for
+// ever. Refusing renewals for any DRAINING host would fix that at a price wave 2
+// rejected: the lease is per host and the evacuation is per volume, so it would stop
+// the durable ACKs of every volume the host still holds, for the whole drain. This is
+// the same refusal, scoped to one volume's promotion.
+//
+// It is closed on every exit path but one, and the exception is named: a fencing wait
+// that has not elapsed is the promotion *in progress*, not a failure, and handing the
+// lease back at that point restarts the dwell the window exists to protect. That path
+// is covered instead by the window's own deadline, which every pass re-arms — so a
+// Control Plane that dies mid-promotion costs the host one dwell of blocked renewals,
+// not for ever.
+//
+// The consequence, in the runbook's words: **draining a healthy host briefly
+// interrupts durable ACKs for its other volumes** — at most one lease_ttl +
+// max_clock_skew per volume moved. A guest sees a FLUSH take longer, not a write
+// fail: the WAL keeps accepting writes; it is the durable ACK that waits. It also
+// means the reconciler has to come back inside the window it armed; a pass that
+// arrives after it has lapsed finds the source renewed, and the dwell starts again.
+// Stage 2 of ADR-0016 — the ACK gate becoming epoch holdership for *that volume* —
+// is what removes both costs.
+//
+// Nothing is opened, and nothing revoked, once the volume is already on the
+// destination: that is this operation's own promotion being resumed, and the lease
+// that would be blocked is the one promotion granted to the *new* writer.
+func (d *Drainer) fenceAndPromote(ctx context.Context, term int64, operationID string,
+	v metadata.Volume, vp *volumeProgress, prog *progress,
+) (uint64, error) {
+	source := v.PrimaryHostID
+	if source == "" || source == vp.ToHost {
+		return d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
+	}
+
+	if err := d.md.BlockHostRenewals(ctx, term, source, d.promoter.FencingDwell()); err != nil {
+		return 0, err
+	}
+	fencing := false
+	defer func() {
+		if fencing {
+			return
+		}
+		// Every other way out of this function — the promotion landed, the
+		// destination died, the lease could not be revoked, a panic — gives the host
+		// its renewals back. A cancelled context must not stop that: the window is
+		// the one thing whose absence is worse than the operation failing.
+		_ = d.md.UnblockHostRenewals(context.WithoutCancel(ctx), term, source)
+	}()
+
+	if err := d.fenceSource(ctx, term, operationID, source, prog); err != nil {
+		return 0, err
+	}
+	newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
+	fencing = errors.Is(err, ErrFencingWaitNotElapsed)
+	return newEpoch, err
 }
 
 // fenceSource is the Control Plane withdrawing its own record of hostID as a writer:
@@ -641,72 +673,20 @@ func (d *Drainer) stillOurs(v metadata.Volume, source string, vp *volumeProgress
 		ErrEpochAdvanced, v.VolumeID, v.PrimaryHostID, epoch, vp.ToHost, vp.PrevEpoch+1)
 }
 
-// abandon gives back the reservation held for a move that will not happen and
-// forgets the volume, so a later pass places it afresh. A release that fails is
-// joined into the reported error rather than swallowed: leadership can change
-// between the reservation and the promotion, and a phantom reservation nobody
-// reconciles makes placement under-use a host that is actually empty.
+// abandon forgets a volume whose move will not happen, so a later pass places it
+// afresh.
+//
+// Under ADR-0017 that single write is also the release: the reservation *was* the
+// entry, so dropping it gives the destination's capacity back with no second
+// statement that could fail on its own. What used to live here — a bounded release,
+// a joined ErrReservationNotReleased, a phantom reservation nobody reconciles when
+// leadership changed between the two writes — was the cost of carrying the number.
 func (d *Drainer) abandon(ctx context.Context, term int64, operationID string, prog *progress, v metadata.Volume, cause error) error {
-	errs := []error{cause}
-	if vp := prog.volume(v.VolumeID); vp != nil {
-		// A release is never bounded: the destination may be over its ceiling by now
-		// (another placement landed there), and refusing to hand the bytes back would
-		// leave the reservation stranded on exactly the host that can least afford it.
-		if rerr := d.md.CommitHostCapacity(ctx, term, vp.ToHost,
-			metadata.CapacityChange{DeltaBytes: -v.SizeBytes}); rerr != nil {
-			errs = append(errs, fmt.Errorf("%w: %s still holds %d bytes for %s: %w",
-				ErrReservationNotReleased, vp.ToHost, v.SizeBytes, v.VolumeID, rerr))
-		}
-	}
 	prog.drop(v.VolumeID)
 	if serr := d.save(ctx, term, operationID, *prog); serr != nil {
-		errs = append(errs, serr)
+		return errors.Join(cause, serr)
 	}
-	return errors.Join(errs...)
-}
-
-// applyCapacity moves a host's committed bytes by delta exactly once across resumed
-// passes, under the §28.2 bound.
-//
-// A first attempt is an unconditional change: there is nothing to be idempotent
-// about yet, and what protects it is the bound — the placement decision behind it
-// was taken against a fleet read that any number of other operations shared, so the
-// statement that adds the bytes is the only place the ceiling still means anything.
-//
-// A resumed attempt is conditional. CommitHostCapacity is a delta, not an
-// idempotency key, so the only proof this pass has that its own change already
-// landed is the ledger value recorded before it was attempted: `before` means it did
-// not, `before+delta` means it did. Comparing those in Go leaves a window in which a
-// third party's change is indistinguishable from ours, so the comparison is a
-// predicate of the write itself; a ledger that moved comes back as
-// ErrCapacityConflict with nothing applied, and the drain reports it rather than
-// guessing. Releasing twice either wedges the drain with ErrCapacityUnderflow or
-// silently consumes another volume's reservation.
-func (d *Drainer) applyCapacity(ctx context.Context, term int64, hostID string, delta, before int64, resumed bool) error {
-	h, err := d.md.GetHost(ctx, hostID)
-	if err != nil {
-		return err
-	}
-	change := metadata.CapacityChange{DeltaBytes: delta, Limit: d.policy.Limit(h)}
-	if resumed {
-		change = change.Expecting(before)
-	}
-	err = d.md.CommitHostCapacity(ctx, term, hostID, change)
-	if !errors.Is(err, metadata.ErrCapacityConflict) {
-		return err
-	}
-	// The ledger is not where this pass left it. An earlier pass of this same
-	// operation having applied the delta is the one reading that is still ours to
-	// finish; anything else is a third party writing the same books.
-	h, gerr := d.md.GetHost(ctx, hostID)
-	if gerr != nil {
-		return gerr
-	}
-	if resumed && h.NVMeCommittedBytes == before+delta {
-		return nil
-	}
-	return fmt.Errorf("%w: %s holds %d committed bytes, expected %d before the change or %d after: %w",
-		ErrCapacityLedgerMoved, hostID, h.NVMeCommittedBytes, before, before+delta, err)
+	return cause
 }
 
 // guardDurableFloor refuses a boundary that would move the durable point backwards.
@@ -798,7 +778,20 @@ func (d *Drainer) save(ctx context.Context, term int64, operationID string, p pr
 func (d *Drainer) record(ctx context.Context, term int64, operationID string, phase lifecycle.OperationPhase, p progress, opErr string) error {
 	return d.md.UpdateOperation(ctx, term, metadata.Operation{
 		OperationID: operationID, Phase: phase, CurrentState: mustJSON(p), Error: opErr,
-	})
+	}, nil)
+}
+
+// reserve is the progress write that first names a destination, carrying the §28.2
+// bound the placement decision was taken under (ADR-0017). Passing the policy's own
+// answer keeps one copy of the rule: placement.Choose is pure and advisory, so the
+// statement that records the reservation is the only place the ceiling still means
+// anything.
+func (d *Drainer) reserve(ctx context.Context, term int64, operationID string, p progress,
+	dest string, sizeBytes int64, h metadata.Host,
+) error {
+	return d.md.UpdateOperation(ctx, term, metadata.Operation{
+		OperationID: operationID, Phase: lifecycle.OpRunning, CurrentState: mustJSON(p),
+	}, &metadata.CapacityBound{HostID: dest, AddBytes: sizeBytes, Limit: d.policy.Limit(h)})
 }
 
 // mustJSON marshals progress-shaped values; these types always marshal.

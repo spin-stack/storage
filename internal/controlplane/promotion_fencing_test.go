@@ -69,7 +69,7 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 		VolumeID: fenceVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: fenceHostA,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := epochs.Init(ctx, fenceVol, 1); err != nil {
@@ -79,6 +79,12 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 		md: md, epochs: epochs, clk: clk, dbClk: dbClk, term: term,
 		p: controlplane.NewPromoter(md, epochs, clk, fenceTTL, fenceSkew),
 	}
+}
+
+// promote is Promote driven past the ADR-0015 dwell, advancing both clocks together.
+func (w *fenceWorld) promote(t *testing.T, renewedAt time.Time, newHost string) (uint64, error) {
+	t.Helper()
+	return promoteAfterTheDwell(t, w.p, w.advance, t.Context(), w.term, fenceVol, renewedAt, newHost)
 }
 
 func (w *fenceWorld) state(t *testing.T) lifecycle.VolumeState {
@@ -185,7 +191,7 @@ func TestPromoteRefusesWhenTheVolumeMovedOnSinceTheCommandWasIssued(t *testing.T
 	observed := w.clk.Wall()
 	w.advance(fenceTTL + fenceSkew + time.Second)
 
-	first, err := w.p.Promote(ctx, w.term, fenceVol, observed, fenceHostB)
+	first, err := w.promote(t, observed, fenceHostB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +351,7 @@ func TestPromoteFinishesAResumeOntoAHostThatWasCordonedMeanwhile(t *testing.T) {
 	renewedAt := w.clk.Wall()
 	w.advance(fenceTTL + fenceSkew + time.Second)
 
-	first, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB)
+	first, err := w.promote(t, renewedAt, fenceHostB)
 	if err != nil {
 		t.Fatal(err)
 	}

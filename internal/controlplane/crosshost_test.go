@@ -52,7 +52,7 @@ func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snap
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
 		State: lifecycle.VolumeActive, PrimaryHostID: cloneHostA, DEKWrapped: []byte{7}, KEKID: "kek",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -101,19 +101,26 @@ func TestCloneCrossHostMaterializesOnDestination(t *testing.T) {
 	if res.Progress.Objects == 0 || res.Progress.Bytes == 0 {
 		t.Fatalf("progress not reported: %+v", res.Progress)
 	}
-	// Capacity is committed on the destination, not on the source.
+	// The clone charges the destination — because the destination is now the primary
+	// of a volume — and leaves the source charged for the parent it still holds
+	// (ADR-0017: capacity follows the rows, not a ledger the clone had to remember
+	// to write).
 	dst, _ := md.GetHost(ctx, destHost)
 	if dst.NVMeCommittedBytes != volSize {
 		t.Fatalf("destination committed = %d, want %d", dst.NVMeCommittedBytes, volSize)
 	}
-	if src, _ := md.GetHost(ctx, cloneHostA); src.NVMeCommittedBytes != 0 {
-		t.Fatalf("source committed = %d, want 0", src.NVMeCommittedBytes)
+	if src, _ := md.GetHost(ctx, cloneHostA); src.NVMeCommittedBytes != volSize {
+		t.Fatalf("source committed = %d, want %d (the parent it still holds)", src.NVMeCommittedBytes, volSize)
 	}
 }
 
-// TestCloneCrossHostReleasesCapacityOnFailure: a failed materialization must not
-// leak a reservation, or the fleet slowly loses placeable capacity (§28.2).
-func TestCloneCrossHostReleasesCapacityOnFailure(t *testing.T) {
+// TestCloneCrossHostChargesNothingOnFailure: a failed materialization must not leak
+// capacity on the destination, or the fleet slowly loses placeable room (§28.2).
+//
+// Under ADR-0017 there is nothing to leak: the destination is charged when the
+// volume row naming it exists, and a failed clone never writes one. The test is kept
+// as the regression guard for that structural claim.
+func TestCloneCrossHostChargesNothingOnFailure(t *testing.T) {
 	ctx := t.Context()
 	md, term, store, m := crossHostWorld(t)
 

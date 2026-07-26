@@ -34,7 +34,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
 		State: lifecycle.VolumeActive, ChainDepth: 0, DEKWrapped: []byte{7}, KEKID: "kek",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
@@ -44,7 +44,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	clone, err := controlplane.Clone(ctx, md, term, snapID, cloneVol, cloneHostA)
+	clone, err := controlplane.Clone(ctx, md, term, snapID, cloneVol, cloneHostA, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,14 +66,14 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 func TestCloneWithStaleTermFails(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"}, nil)
 	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID})
 
 	stale := term
 	if _, err := md.AcquireLeadership(ctx, "cp-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Clone(ctx, md, stale, snapID, cloneVol, cloneHostA); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := controlplane.Clone(ctx, md, stale, snapID, cloneVol, cloneHostA, nil); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("want ErrStaleTerm, got %v", err)
 	}
 }
@@ -81,7 +81,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 func TestCloneFromMissingSnapshotFails(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	if _, err := controlplane.Clone(ctx, md, term, "no-such-snap", cloneVol, cloneHostA); !errors.Is(err, metadata.ErrNotFound) {
+	if _, err := controlplane.Clone(ctx, md, term, "no-such-snap", cloneVol, cloneHostA, nil); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("clone from a missing snapshot: want ErrNotFound, got %v", err)
 	}
 }
@@ -89,7 +89,7 @@ func TestCloneFromMissingSnapshotFails(t *testing.T) {
 func TestResizeGrowsOnly(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 100, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 100, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 
 	if err := md.ResizeVolume(ctx, term, parentVol, 200); err != nil {
 		t.Fatalf("grow: %v", err)
@@ -106,7 +106,7 @@ func TestResizeGrowsOnly(t *testing.T) {
 func TestSnapshotCatalogRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"})
+	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 	snap := metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 2, TargetSequence: 7, RootDigest: "d", State: lifecycle.SnapshotPublished, ManifestKey: "snapshots/x", RequestID: reqID}
 	if err := md.CreateSnapshot(ctx, term, snap); err != nil {
 		t.Fatal(err)

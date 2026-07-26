@@ -17,14 +17,14 @@ type ControlPlaneLeader struct {
 }
 
 type Host struct {
-	HostID             uuid.UUID          `json:"host_id"`
-	State              string             `json:"state"`
-	AgentVersion       string             `json:"agent_version"`
-	MaxFormatVersion   int32              `json:"max_format_version"`
-	NvmeTotalBytes     int64              `json:"nvme_total_bytes"`
-	NvmeUsedBytes      int64              `json:"nvme_used_bytes"`
-	NvmeCommittedBytes int64              `json:"nvme_committed_bytes"`
-	LastHeartbeat      pgtype.Timestamptz `json:"last_heartbeat"`
+	HostID               uuid.UUID          `json:"host_id"`
+	State                string             `json:"state"`
+	AgentVersion         string             `json:"agent_version"`
+	MaxFormatVersion     int32              `json:"max_format_version"`
+	NvmeTotalBytes       int64              `json:"nvme_total_bytes"`
+	NvmeUsedBytes        int64              `json:"nvme_used_bytes"`
+	LastHeartbeat        pgtype.Timestamptz `json:"last_heartbeat"`
+	RenewalsBlockedUntil pgtype.Timestamptz `json:"renewals_blocked_until"`
 }
 
 type HostLease struct {
@@ -79,6 +79,7 @@ type Volume struct {
 	LocalSequence     int64              `json:"local_sequence"`
 	DurableSequence   int64              `json:"durable_sequence"`
 	PublishedSequence int64              `json:"published_sequence"`
+	FencingStartedAt  pgtype.Timestamptz `json:"fencing_started_at"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }

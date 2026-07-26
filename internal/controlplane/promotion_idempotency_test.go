@@ -2,6 +2,7 @@ package controlplane_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -50,7 +51,7 @@ func newPromoWorld(t *testing.T) *promoWorld {
 		VolumeID: promoVolume, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: promoOld,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	epochs := epoch.NewStore(store)
@@ -70,13 +71,19 @@ func newPromoWorld(t *testing.T) *promoWorld {
 	}
 }
 
+// promote is Promote driven past the ADR-0015 dwell.
+func (w *promoWorld) promote(t *testing.T, renewedAt time.Time, newHost string) (uint64, error) {
+	t.Helper()
+	return promoteAfterTheDwell(t, w.p, w.clk.Advance, t.Context(), w.term, promoVolume, renewedAt, newHost)
+}
+
 // TestPromoteIsIdempotent: the reconciler running the same promotion twice must not
 // grant two epochs. A second epoch would fence the writer that was just promoted.
 func TestPromoteIsIdempotent(t *testing.T) {
 	ctx := t.Context()
 	w := newPromoWorld(t)
 
-	first, err := w.p.Promote(ctx, w.term, promoVolume, time.Time{}, promoNew)
+	first, err := w.promote(t, time.Time{}, promoNew)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +288,7 @@ func TestConcurrentPromotionsLeaveExactlyOneWriter(t *testing.T) {
 		VolumeID: promoVolume, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: source,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	epochs := epoch.NewStore(sim.NewObjectStore())
@@ -293,6 +300,13 @@ func TestConcurrentPromotionsLeaveExactlyOneWriter(t *testing.T) {
 	}
 	clk.Advance(30 * time.Second) // the source's lease can no longer be valid
 	p := controlplane.NewPromoter(md, epochs, clk, 10*time.Second, 2*time.Second)
+	// One look starts the fence (ADR-0015: the dwell is measured from the promoter's
+	// own observation, so the call that opens one always refuses). The race that
+	// matters is the one *after* the wait, where every promoter is free to grant.
+	if _, err := p.Promote(ctx, term, promoVolume, time.Time{}, hosts[0]); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: want ErrFencingWaitNotElapsed, got %v", err)
+	}
+	clk.Advance(p.FencingDwell() + time.Second)
 
 	var (
 		mu      sync.Mutex

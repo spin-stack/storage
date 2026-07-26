@@ -349,6 +349,28 @@ func (m *replicaLeaseMD) GetHostLease(ctx context.Context, hostID string) (metad
 	return l, nil
 }
 
+// timestampDwellMD is the design ADR-0015 replaced, planted: a promoter that decides
+// how long it has been fencing by reading a timestamp somebody else wrote, instead of
+// measuring elapsed time since it looked. The store reports a fence that began an hour
+// ago, so the dwell is over before it starts — which is exactly what a lagging replica,
+// a restored backup or a mis-set database clock would produce.
+type timestampDwellMD struct {
+	metadata.Store
+}
+
+func (m *timestampDwellMD) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
+	v, err := m.Store.GetVolume(ctx, volumeID)
+	if err != nil {
+		return v, err
+	}
+	now, nerr := m.Now(ctx)
+	if nerr != nil {
+		return v, nerr
+	}
+	v.FencingStartedAt = now.Add(-time.Hour)
+	return v, nil
+}
+
 // promoFault is what the promotion scenario runs against.
 type promoFault struct {
 	// jump steps the *wall clock* forward before the attempt — an NTP correction, a VM
@@ -357,8 +379,13 @@ type promoFault struct {
 	// carries the CP past the deadline carries the writer past the end of its lease
 	// too. It is kept as a control against a checker that would cry wolf.
 	jump time.Duration
-	// replicaLag is how far behind the lease row the CP reads is.
+	// replicaLag is how far behind the lease row the CP reads is. Since ADR-0015 it
+	// is a control rather than a plant: the dwell is measured from the promoter's own
+	// observation, so however old the row is the wait is still served in full.
 	replicaLag time.Duration
+	// timestampDwell reverts the dwell to a timestamp comparison (see
+	// timestampDwellMD). This is the plant.
+	timestampDwell bool
 }
 
 // earlyPromotion drives a real controlplane.Promoter against a volume whose primary
@@ -372,6 +399,9 @@ func earlyPromotion(f promoFault) Scenario {
 		var md metadata.Store = metasim.New(s.Clock.Wall)
 		if f.replicaLag > 0 {
 			md = &replicaLeaseMD{Store: md, lag: f.replicaLag}
+		}
+		if f.timestampDwell {
+			md = &timestampDwellMD{Store: md}
 		}
 		epochs := epoch.NewStore(s.Store)
 		p := controlplane.NewPromoter(md, epochs, s.Clock, fencingLeaseTTL, fencingSkew)
@@ -388,7 +418,7 @@ func earlyPromotion(f promoFault) Scenario {
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: fencedVol, State: lifecycle.VolumeActive,
 			PrimaryHostID: fencedHost1, DEKWrapped: []byte{1}, KEKID: "k",
-		}); err != nil {
+		}, nil); err != nil {
 			return err
 		}
 		if _, err := epochs.Init(ctx, fencedVol, 0); err != nil {
@@ -430,8 +460,9 @@ func earlyPromotion(f promoFault) Scenario {
 		}
 
 		// Past the deadline the same promotion must succeed: a checker that fires on
-		// every promotion would say nothing about the early ones.
-		s.Tick(fencingLeaseTTL)
+		// every promotion would say nothing about the early ones. The wait is the
+		// promoter's dwell (ADR-0015), which is a skew longer than the lease TTL.
+		s.Tick(p.FencingDwell() + time.Second)
 		newEpoch, err = p.Promote(ctx, term, fencedVol, time.Time{}, fencedHost2)
 		if err != nil {
 			return fmt.Errorf("promotion after the wait: %w", err)
@@ -447,19 +478,31 @@ func earlyPromotion(f promoFault) Scenario {
 	}
 }
 
-// INV-11: no epoch is granted before FENCING_WAIT elapses. Planted by reading the
-// lease row from a replica that is behind the primary — the deadline the promoter
-// derives has passed, the writer's own monotonic lease has not, and the epoch is
+// INV-11: no epoch is granted before FENCING_WAIT elapses. Planted by reverting the
+// fencing wait to what ADR-0015 replaced — a comparison against a timestamp in a row
+// rather than elapsed time since the promoter itself looked. The row says the fence
+// began an hour ago, the writer's own monotonic lease says otherwise, and the epoch is
 // granted over a writer that can still ACK a FLUSH (§12.2, §12.3).
 //
-// The two controls matter as much as the plant: an honest run must be green, and so
-// must a wall clock that steps forward, which is not an early grant and would make the
-// checker cry wolf if it were counted as one.
+// The three controls matter as much as the plant: an honest run must be green, so must
+// a wall clock that steps forward (not an early grant, and a checker that counted it as
+// one would cry wolf), and so must a lease read from a lagging replica — the case this
+// checker used to be planted with, and the one ADR-0015 exists to close.
 func TestPlantedBugEarlyPromotion(t *testing.T) {
 	requirePasses(t, 14, NewPromotionWaitChecker(), earlyPromotion(promoFault{}))
 	requirePasses(t, 14, NewPromotionWaitChecker(), earlyPromotion(promoFault{jump: fencingLeaseTTL}))
+	// The lagging replica used to be the plant. ADR-0015 closed it — the dwell is
+	// elapsed time since the promoter observed the fence, not a deadline derived from
+	// the row — so it is a *control* now: it must pass, and if it ever stops passing
+	// the fix has been undone.
+	requirePasses(t, 14, NewPromotionWaitChecker(), earlyPromotion(promoFault{replicaLag: 2 * fencingLeaseTTL}))
+	// The plant is the design that was replaced, under the deployment that made it
+	// wrong: how long the fence has been running read out of a row instead of
+	// measured, with the rows served by the lagging replica. Both halves are needed
+	// — which is the point of the control above: with the dwell in place the lag on
+	// its own buys nothing.
 	plantedBug(t, 14, NewPromotionWaitChecker(), "promotion-fencing-wait",
-		earlyPromotion(promoFault{replicaLag: 2 * fencingLeaseTTL}))
+		earlyPromotion(promoFault{replicaLag: 2 * fencingLeaseTTL, timestampDwell: true}))
 }
 
 // truncateAfterListingRegresses is INV-13 end to end: a checkpoint publishes a durable

@@ -149,7 +149,7 @@ func TestRebuildRepairsAVolumeRowLeftBehindByS3(t *testing.T) {
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 2,
 		State: lifecycle.VolumeActive, PrimaryHostID: staleHost,
 		KEKID: "kek-1", DEKWrapped: []byte{7, 7},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -304,7 +304,7 @@ func TestRebuildNamesARowThatIsAheadOfS3(t *testing.T) {
 		VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 7,
 		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -355,7 +355,7 @@ func TestRebuildGrowsARowThatShrankUnderAPITR(t *testing.T) {
 		VolumeID: staleVol, SizeBytes: 4 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1,
 		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 

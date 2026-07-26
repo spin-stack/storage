@@ -29,6 +29,8 @@ func drainScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "drain-crash-at-every-boundary", Run: scenarioDrainCrashAtEveryBoundary},
 		{Name: "drain-source-cannot-ack-afterwards", Run: scenarioDrainSourceCannotAck},
+		{Name: "stale-lease-read-does-not-shorten-the-fence", Run: scenarioStaleLeaseReadDoesNotShortenTheFence},
+		{Name: "drain-revocation-window-is-bounded", Run: scenarioDrainRevocationWindowIsBounded},
 	}
 }
 
@@ -51,27 +53,54 @@ type crashHere struct{ at string }
 // scenario can put the crash on either side of a durable effect.
 type faultMD struct {
 	metadata.Store
-	onCommit func(hostID string, delta int64, done bool)
 	onUpdate func(op metadata.Operation, done bool)
 	onLease  func(hostID string)
+	// staleLease, when non-zero, is the last_renewal every lease read reports: a
+	// replica lagging far enough that any deadline derived from the timestamp
+	// elapsed long ago (ADR-0015).
+	staleLease time.Time
+	// wholeDrainWindow is the design ADR-0016 rejected, planted: renewals refused for
+	// as long as the host is DRAINING, rather than for the length of one promotion.
+	// It fixes the same bug and turns every drain of a healthy host into an
+	// availability event for the volumes nobody is moving.
+	wholeDrainWindow bool
+	// ancientFence is the design ADR-0015 replaced, planted: the fence-start instant
+	// is read out of the row as an hour ago, so the promoter believes it has been
+	// waiting all that time instead of measuring since it looked.
+	ancientFence bool
 }
 
-func (s *faultMD) CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error {
-	if s.onCommit != nil {
-		s.onCommit(hostID, c.DeltaBytes, false)
+func (s *faultMD) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {
+	if s.wholeDrainWindow {
+		h, err := s.GetHost(ctx, hostID)
+		if err != nil {
+			return err
+		}
+		if h.State == lifecycle.HostDraining {
+			return fmt.Errorf("%w: planted: %s is draining", metadata.ErrRenewalsBlocked, hostID)
+		}
 	}
-	err := s.Store.CommitHostCapacity(ctx, term, hostID, c)
-	if err == nil && s.onCommit != nil {
-		s.onCommit(hostID, c.DeltaBytes, true)
-	}
-	return err
+	return s.Store.RenewHostLease(ctx, term, hostID, ttlSeconds)
 }
 
-func (s *faultMD) UpdateOperation(ctx context.Context, term int64, op metadata.Operation) error {
+func (s *faultMD) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
+	v, err := s.Store.GetVolume(ctx, volumeID)
+	if err != nil || !s.ancientFence {
+		return v, err
+	}
+	now, nerr := s.Now(ctx)
+	if nerr != nil {
+		return v, nerr
+	}
+	v.FencingStartedAt = now.Add(-time.Hour)
+	return v, nil
+}
+
+func (s *faultMD) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
 	if s.onUpdate != nil {
 		s.onUpdate(op, false)
 	}
-	err := s.Store.UpdateOperation(ctx, term, op)
+	err := s.Store.UpdateOperation(ctx, term, op, bound)
 	if err == nil && s.onUpdate != nil {
 		s.onUpdate(op, true)
 	}
@@ -82,7 +111,11 @@ func (s *faultMD) GetHostLease(ctx context.Context, hostID string) (metadata.Hos
 	if s.onLease != nil {
 		s.onLease(hostID)
 	}
-	return s.Store.GetHostLease(ctx, hostID)
+	l, err := s.Store.GetHostLease(ctx, hostID)
+	if err == nil && !s.staleLease.IsZero() {
+		l.LastRenewal = s.staleLease
+	}
+	return l, err
 }
 
 // faultStore wraps the object store so the epoch-boundary PUT can be crashed at,
@@ -118,7 +151,7 @@ type drainWorld struct {
 	volID   string
 	log     *wal.Log
 	acked   uint64
-	srcHeld int64
+	dstHeld int64
 }
 
 // newDrainWorld builds that world with ids derived from tag, so several worlds can
@@ -158,17 +191,23 @@ func newDrainWorld(s *Sim, tag byte, fence wal.LeaseChecker) (*drainWorld, error
 		VolumeID: w.volID, SizeBytes: drainVolBytes, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
 		CurrentEpoch: 1, PrimaryHostID: w.src, DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		return nil, err
 	}
-	// The source also holds a reservation for a volume nobody is moving: a release
-	// that lands twice must be visible as theft, not absorbed into a zero.
-	w.srcHeld = 2 * drainVolBytes
-	if err := base.CommitHostCapacity(ctx, term, w.src, metadata.CapacityChange{
-		DeltaBytes: w.srcHeld, Limit: 10 * drainVolBytes,
-	}); err != nil {
+	// The destination already holds a volume of its own, so "the moved volume was
+	// charged exactly once" is visible as a number rather than as a zero: a second
+	// charge shows up as 3 GiB, a missing one as 1 GiB.
+	var idle [16]byte
+	idle[6], idle[8] = 0x70, 0x80
+	idle[14], idle[15] = tag, 0xb1
+	if err := base.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: format.UUIDString(idle), SizeBytes: drainVolBytes, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
+		CurrentEpoch: 1, PrimaryHostID: w.dst, DEKWrapped: []byte{1}, KEKID: "k",
+	}, nil); err != nil {
 		return nil, err
 	}
+	w.dstHeld = drainVolBytes
 
 	w.epochs = epoch.NewStore(s.Store)
 	if _, err := w.epochs.Init(ctx, w.volID, 1); err != nil {
@@ -214,9 +253,24 @@ func (w *drainWorld) pass() (crashed bool, err error) {
 	return crashed, err
 }
 
+// settle runs Drain passes until the operation stops asking for time. A fencing wait
+// is not a failure, and after ADR-0015 there is one per volume: each volume's dwell
+// begins when its own promotion does, so the pass that fences volume k+1 is the pass
+// that promotes volume k. A crash stops the loop at once — that is what it is for.
+func (w *drainWorld) settle(s *Sim) (crashed bool, err error) {
+	for range 8 {
+		crashed, err = w.pass()
+		if crashed || !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return crashed, err
+		}
+		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+	}
+	return crashed, err
+}
+
 // disarm removes every fault, so the resumed pass runs clean.
 func (w *drainWorld) disarm() {
-	w.md.onCommit, w.md.onUpdate, w.md.onLease = nil, nil, nil
+	w.md.onUpdate, w.md.onLease = nil, nil
 	w.store.onPut = nil
 }
 
@@ -233,8 +287,10 @@ func drainBoundaries() []drainBoundary {
 	crash := func(at string) { panic(crashHere{at: at}) }
 	return []drainBoundary{
 		{"after reserving the destination", func(w *drainWorld) {
-			w.md.onCommit = func(hostID string, delta int64, done bool) {
-				if done && hostID == w.dst && delta > 0 {
+			// The reservation is the progress entry that names the destination
+			// (ADR-0017), so this is the far side of that write.
+			w.md.onUpdate = func(op metadata.Operation, done bool) {
+				if done && strings.Contains(string(op.CurrentState), w.dst) {
 					crash("reserve")
 				}
 			}
@@ -268,9 +324,12 @@ func drainBoundaries() []drainBoundary {
 				}
 			}
 		}},
-		{"after releasing the source", func(w *drainWorld) {
-			w.md.onCommit = func(hostID string, delta int64, done bool) {
-				if done && hostID == w.src && delta < 0 {
+		{"after the volume became the destination's", func(w *drainWorld) {
+			// Where the source's release used to be. There is no release any more —
+			// the source stops being charged because the volume stopped being its
+			// primary — so the boundary is the write that records the promotion.
+			w.md.onUpdate = func(op metadata.Operation, done bool) {
+				if done && strings.Contains(string(op.CurrentState), `"PROMOTED"`) {
 					crash("release")
 				}
 			}
@@ -291,9 +350,9 @@ func drainBoundaries() []drainBoundary {
 // step of move() in turn, resumed under the same operation id, and then asked for
 // all four claims at once:
 //
-//   - the source's committed bytes moved by exactly one volume size — never twice
-//     (which eats another volume's reservation, or underflows and wedges the drain
-//     on every later pass), never not at all;
+//   - the accounting moved by exactly one volume size: the source is charged for
+//     nothing and the destination for its own volume plus the moved one — never
+//     twice, never not at all;
 //   - exactly one epoch was granted, in PostgreSQL and in the S3 epoch object;
 //   - exactly one epoch-boundary object exists, with the PrevEpoch and RecoveredUpTo
 //     the move actually established — the object is create-only, so a second,
@@ -311,12 +370,14 @@ func scenarioDrainCrashAtEveryBoundary(s *Sim) error {
 		if err != nil {
 			return err
 		}
-		// Wait the fence out: this scenario is about the crash boundaries, not about
-		// FENCING_WAIT (scenarioDrainMovesVolumesFenced owns that).
+		// The fence is waited out by settle rather than by one tick: this scenario is
+		// about the crash boundaries, not about FENCING_WAIT
+		// (scenarioDrainMovesVolumesFenced owns that), and after ADR-0015 the pass
+		// that opens a volume's fence is never the pass that promotes it.
 		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
 
 		b.arm(w)
-		crashed, err := w.pass()
+		crashed, err := w.settle(s)
 		if err != nil {
 			return fmt.Errorf("%s: the armed pass failed instead of crashing: %w", b.name, err)
 		}
@@ -326,7 +387,7 @@ func scenarioDrainCrashAtEveryBoundary(s *Sim) error {
 		s.Emit(Event{Kind: EventFault, Msg: "drain crashed " + b.name})
 
 		w.disarm()
-		if _, err := w.pass(); err != nil {
+		if _, err := w.settle(s); err != nil {
 			return fmt.Errorf("%s: resume: %w", b.name, err)
 		}
 		if err := w.assertMovedExactlyOnce(ctx); err != nil {
@@ -350,17 +411,16 @@ func (w *drainWorld) assertMovedExactlyOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if want := w.srcHeld - drainVolBytes; src.NVMeCommittedBytes != want {
-		return fmt.Errorf("source committed %d bytes, want %d (exactly one release of %d)",
-			src.NVMeCommittedBytes, want, drainVolBytes)
+	if src.NVMeCommittedBytes != 0 {
+		return fmt.Errorf("the evacuated source is still charged %d bytes", src.NVMeCommittedBytes)
 	}
 	dst, err := w.md.GetHost(ctx, w.dst)
 	if err != nil {
 		return err
 	}
-	if dst.NVMeCommittedBytes != drainVolBytes {
-		return fmt.Errorf("destination committed %d bytes, want %d (exactly one reservation)",
-			dst.NVMeCommittedBytes, drainVolBytes)
+	if want := w.dstHeld + drainVolBytes; dst.NVMeCommittedBytes != want {
+		return fmt.Errorf("destination committed %d bytes, want %d (its own volume plus exactly one move)",
+			dst.NVMeCommittedBytes, want)
 	}
 
 	v, err := w.md.GetVolume(ctx, w.volID)
@@ -489,13 +549,13 @@ func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 		if agent.Valid() {
 			return fmt.Errorf("the promotion is about to run against an Agent whose lease is still valid")
 		}
-		if _, err := w.pass(); err != nil {
+		if _, err := w.settle(s); err != nil {
 			return fmt.Errorf("drain of a healthy source: %w", err)
 		}
 	} else {
 		// The Control Plane waits the fence out and evacuates the host.
 		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
-		if _, err := w.pass(); err != nil {
+		if _, err := w.settle(s); err != nil {
 			return fmt.Errorf("drain: %w", err)
 		}
 	}
@@ -536,4 +596,210 @@ func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 	}
 	s.Notef("drained source self-fenced: no ACK after the promotion, boundary bounds its last one")
 	return nil
+}
+
+// scenarioStaleLeaseReadDoesNotShortenTheFence is ADR-0015 in the harness. Every read
+// of the source's lease is served by a replica lagging by more than
+// lease_ttl + max_clock_skew, so the timestamp the row carries says the wait was over
+// before the promotion was even contemplated. Both clocks agree — the Control Plane's
+// and the store's — so the §12.1 offset check sees nothing wrong. It is the *data*
+// that is old, and a wait derived from it is no wait at all.
+//
+// The source here is a real Agent counting its own lease down on the monotonic clock,
+// exactly as §12.2 requires, and it never hears about any of this. So the claim is
+// decidable: while that Agent's lease is valid the epoch must not be granted, however
+// old the row looks.
+//
+// PromotionWaitChecker is driven from the same two facts (the Agent's own answer and
+// whether the grant landed), so reverting the dwell to a comparison against
+// last_renewal makes the checker fail, not just the assertions.
+func scenarioStaleLeaseReadDoesNotShortenTheFence(s *Sim) error {
+	return staleLeaseFence(false)(s)
+}
+
+// staleLeaseFence is the scenario, with the ADR-0015 design optionally reverted.
+// plantTimestampDwell makes the promoter read how long it has been fencing out of the
+// same lagging rows, which is what the wait used to be — and the planted-bug proof in
+// planted_bug_drain_test.go requires it to be caught.
+func staleLeaseFence(plantTimestampDwell bool) Scenario {
+	return func(s *Sim) error {
+		return staleLeaseFenceRun(s, plantTimestampDwell)
+	}
+}
+
+func staleLeaseFenceRun(s *Sim, plantTimestampDwell bool) error {
+	ctx := context.Background()
+	agent := lease.NewManager(s.Clock, drainLeaseTTL)
+	agent.Grant()
+	w, err := newDrainWorld(s, 0x2f, agent)
+	if err != nil {
+		return err
+	}
+	// The replica is an hour behind: last_renewal predates the simulation.
+	w.md.staleLease = s.Clock.Wall().Add(-time.Hour)
+	w.md.ancientFence = plantTimestampDwell
+
+	// First pass. Whatever the row says, this Control Plane has observed nothing yet.
+	_, err = w.pass()
+	s.Emit(Event{
+		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
+		Msg: "first look at an hour-stale lease row",
+	})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("an hour-stale lease read let the drain promote at once: %v", err)
+	}
+	// The observation is durable, recorded with the §7 state (ADR-0015).
+	v, err := w.md.GetVolume(ctx, w.volID)
+	if err != nil {
+		return err
+	}
+	if v.State != lifecycle.VolumeFencingWait {
+		return fmt.Errorf("volume state is %q, want FENCING_WAIT", v.State)
+	}
+	if v.FencingStartedAt.IsZero() {
+		return fmt.Errorf("the promoter waited without recording when it started")
+	}
+
+	// Half a TTL in, the Agent's lease is provably still valid: a grant here is
+	// exactly the loss INV-11 exists to prevent, and the row says the wait is over.
+	s.Tick(drainLeaseTTL / 2)
+	if !agent.Valid() {
+		return fmt.Errorf("the Agent's lease expired early; this step no longer tests anything")
+	}
+	_, err = w.pass()
+	s.Emit(Event{
+		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
+		Msg: "half a TTL in, with the writer's own lease still valid",
+	})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("the dwell was cut short by the stale row while the writer was alive: %v", err)
+	}
+
+	// One second short of the dwell, still refused.
+	s.Tick(drainLeaseTTL/2 + drainMaxSkew - time.Second)
+	_, err = w.pass()
+	s.Emit(Event{
+		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
+		Msg: "one second short of the dwell",
+	})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("the dwell was cut short by the stale row: %v", err)
+	}
+
+	// Past it, and only there.
+	s.Tick(2 * time.Second)
+	if agent.Valid() {
+		return fmt.Errorf("the promotion is about to run against an Agent whose lease is still valid")
+	}
+	if _, err := w.settle(s); err != nil {
+		return fmt.Errorf("the dwell elapsed and the drain still refused: %w", err)
+	}
+	v, err = w.md.GetVolume(ctx, w.volID)
+	if err != nil {
+		return err
+	}
+	if v.PrimaryHostID != w.dst || v.CurrentEpoch != 2 {
+		return fmt.Errorf("the volume did not move: %+v", v)
+	}
+	s.Emit(Event{Kind: EventPromotion, EarlyGrant: agent.Valid(), Msg: "granted after a full monotonic dwell"})
+	s.Notef("an hour-stale lease read cost the fence nothing: the dwell ran on the promoter's own clock")
+	return nil
+}
+
+// scenarioDrainRevocationWindowIsBounded is ADR-0016 stage 1. The drain has to stop
+// the source re-arming the lease it just revoked, or a healthy heartbeating host can
+// never be evacuated: every renewal moves the instant the fencing wait is measured
+// from, and the promotion never starts.
+//
+// The whole question is *how long* that refusal lasts. The fix wave 2 rejected —
+// refusing renewals for any DRAINING host — stops the durable ACKs of every volume
+// the host still holds, including the ones nobody is moving, for as long as the drain
+// runs. Stage 1 keeps the mechanism and bounds it to one promotion: at most one
+// lease_ttl + max_clock_skew per volume moved.
+//
+// So the scenario measures it. The drain is deliberately slow — the reconciler comes
+// back long after the dwell has elapsed, which is what a busy Control Plane looks like
+// — and the source has to be able to renew again in the gap. plantWholeDrain reverts
+// the decision, and the assertion below catches it.
+func scenarioDrainRevocationWindowIsBounded(s *Sim) error {
+	return revocationWindow(false)(s)
+}
+
+func revocationWindow(plantWholeDrain bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		agent := lease.NewManager(s.Clock, drainLeaseTTL)
+		agent.Grant()
+		w, err := newDrainWorld(s, 0x3f, agent)
+		if err != nil {
+			return err
+		}
+		w.md.wholeDrainWindow = plantWholeDrain
+		renew := func() error { return w.md.RenewHostLease(ctx, w.term, w.src, int(drainLeaseTTL/time.Second)) }
+
+		// Before anything is drained the source renews normally.
+		if err := renew(); err != nil {
+			return fmt.Errorf("a healthy source could not renew before the drain started: %w", err)
+		}
+
+		// The first pass fences the volume: the window opens, and with it the refusal
+		// that makes the evacuation possible at all.
+		if _, err := w.pass(); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return fmt.Errorf("the first pass must open the fence, got %v", err)
+		}
+		if err := renew(); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+			return fmt.Errorf("the source re-armed the lease the drain revoked: %v", err)
+		}
+		s.Emit(Event{Kind: EventFault, Msg: "the source's renewals are refused while its volume is promoted"})
+
+		// Now the reconciler is slow. The window is bounded by the promotion it was
+		// opened for, so once that much time has passed with nobody driving the drain,
+		// the host is serving normally again — its other volumes can ACK a FLUSH.
+		// This is the assertion the rejected design fails: a window that lasts as long
+		// as the host is DRAINING is still shut here.
+		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+		if err := renew(); err != nil {
+			return fmt.Errorf("the revocation window outlived the promotion it was opened for: %w", err)
+		}
+		s.Emit(Event{Kind: EventNote, Msg: "the window closed on its own; the source is serving again"})
+
+		// And the drain still converges once the reconciler is running at its normal
+		// cadence — inside the window it arms, where a real one polls in seconds. The
+		// source heartbeats before every pass, which is what a healthy host does, and
+		// must not be able to wedge its own evacuation.
+		blocked := 0
+		for range 12 {
+			switch rerr := renew(); {
+			case errors.Is(rerr, metadata.ErrRenewalsBlocked):
+				blocked++
+			case rerr != nil:
+				return fmt.Errorf("unexpected renewal error: %w", rerr)
+			}
+			_, err = w.pass()
+			if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+				break
+			}
+			s.Tick((drainLeaseTTL + drainMaxSkew) / 2)
+		}
+		if blocked == 0 {
+			return fmt.Errorf("no heartbeat was ever refused, so nothing stopped the source re-arming its lease")
+		}
+		if err != nil {
+			return fmt.Errorf("a heartbeating source wedged its own evacuation: %w", err)
+		}
+		v, err := w.md.GetVolume(ctx, w.volID)
+		if err != nil {
+			return err
+		}
+		if v.PrimaryHostID != w.dst {
+			return fmt.Errorf("the volume did not move: %+v", v)
+		}
+
+		// The evacuation is over: nothing keeps the source from renewing.
+		if err := renew(); err != nil {
+			return fmt.Errorf("the drain finished with the window still open: %w", err)
+		}
+		s.Notef("the revocation window lasted one promotion, not the length of the drain")
+		return nil
+	}
 }

@@ -61,6 +61,32 @@ INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoc
                      local_sequence, durable_sequence, published_sequence)
 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
 WHERE EXISTS (SELECT 1 FROM valid)
+  -- The §28.2 oversubscription bound, as a predicate of the write that places the
+  -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
+  -- read that another operation shared lands here, against the derived value, and
+  -- affects 0 rows instead of taking the destination past its declared ceiling.
+  -- A write with no bound is not a placement decision: rebuild-metadata recreates
+  -- volumes that already exist and already occupy the host, and bounding it would
+  -- refuse to record reality.
+  -- The derived value is hosts.sql's GetHost expression; see the comment there.
+  -- A bound naming a host nobody registered admits nothing: fail closed.
+  AND ($16::uuid IS NULL
+       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = $16::uuid)
+           AND (
+               COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+               WHERE v.primary_host_id = $16::uuid), 0)
+               + COALESCE((SELECT SUM(rv.size_bytes)
+               FROM operations o
+               CROSS JOIN LATERAL jsonb_array_elements(
+               CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
+               THEN o.current_state -> 'volumes'
+               ELSE '[]'::jsonb END) AS e
+               JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+               WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
+               AND e ->> 'to_host' = ($16::uuid)::text
+               AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+               AND rv.primary_host_id IS DISTINCT FROM $16::uuid), 0))::BIGINT
+               + $17::bigint <= $18::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       durability = EXCLUDED.durability,
@@ -93,6 +119,9 @@ type CreateVolumeParams struct {
 	DurableSequence   int64       `json:"durable_sequence"`
 	PublishedSequence int64       `json:"published_sequence"`
 	Term              int64       `json:"term"`
+	BoundHost         pgtype.UUID `json:"bound_host"`
+	BoundAddBytes     int64       `json:"bound_add_bytes"`
+	BoundLimit        int64       `json:"bound_limit"`
 }
 
 // Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
@@ -122,6 +151,9 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.DurableSequence,
 		arg.PublishedSequence,
 		arg.Term,
+		arg.BoundHost,
+		arg.BoundAddBytes,
+		arg.BoundLimit,
 	)
 	if err != nil {
 		return 0, err
@@ -130,7 +162,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -153,6 +185,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.LocalSequence,
 		&i.DurableSequence,
 		&i.PublishedSequence,
+		&i.FencingStartedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -160,7 +193,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -190,6 +223,7 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.LocalSequence,
 			&i.DurableSequence,
 			&i.PublishedSequence,
+			&i.FencingStartedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -228,7 +262,13 @@ func (q *Queries) ResizeVolume(ctx context.Context, arg ResizeVolumeParams) (int
 
 const setVolumeState = `-- name: SetVolumeState :execrows
 UPDATE volumes
-   SET state = $2, updated_at = now()
+   SET state = $2,
+       fencing_started_at = CASE
+           WHEN $2 <> 'FENCING_WAIT'            THEN NULL
+           WHEN fencing_started_at IS NOT NULL   THEN fencing_started_at
+           ELSE now()
+       END,
+       updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
    AND state = ANY($4::text[])
@@ -245,6 +285,19 @@ type SetVolumeStateParams struct {
 // states that may legally become $2, taken from the lifecycle table. In the
 // predicate rather than in Go so two Control Planes reacting to the same suspicion
 // cannot both win a read-modify-write.
+//
+// It also stamps the fence-start instant (ADR-0015), because the observation and the
+// state it belongs to are one fact and must land in one write. Three rules, all in
+// the CASE:
+//
+//   - entering FENCING_WAIT with nothing recorded starts the dwell, by *this*
+//     database's clock — the one last_renewal is stamped by, so the two are
+//     comparable (§12.1);
+//   - entering it again does not move the instant. Promotion is resumable and
+//     re-affirms the state on every pass; an instant that moved forward each time
+//     would make a retried promotion wait for ever;
+//   - leaving it clears the record, so the next promotion of this volume waits its
+//     own dwell instead of inheriting an elapsed one.
 func (q *Queries) SetVolumeState(ctx context.Context, arg SetVolumeStateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setVolumeState,
 		arg.VolumeID,

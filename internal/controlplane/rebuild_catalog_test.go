@@ -206,7 +206,7 @@ func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeDetached,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 

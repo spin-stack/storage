@@ -13,7 +13,13 @@ import (
 // materialization is Phase 11. The clone inherits the parent's size, block size,
 // durability, and DEK (so it can read the shared base), and increments the chain
 // depth (§20.1). Returns the new volume's descriptor-shaped record.
-func Clone(ctx context.Context, md metadata.Store, term int64, parentSnapshotID, newVolumeID, newHostID string) (metadata.Volume, error) {
+//
+// bound is the §28.2 ceiling the new volume is placed under (ADR-0017): creating it
+// is what charges newHostID, so it is the write the bound belongs to. A same-host
+// clone that the caller has already admitted may pass nil.
+func Clone(ctx context.Context, md metadata.Store, term int64, parentSnapshotID, newVolumeID, newHostID string,
+	bound *metadata.CapacityBound,
+) (metadata.Volume, error) {
 	snap, err := md.GetSnapshot(ctx, parentSnapshotID)
 	if err != nil {
 		return metadata.Volume{}, err
@@ -34,7 +40,7 @@ func Clone(ctx context.Context, md metadata.Store, term int64, parentSnapshotID,
 		DEKWrapped:    parent.DEKWrapped,
 		KEKID:         parent.KEKID,
 	}
-	if err := md.CreateVolume(ctx, term, clone); err != nil {
+	if err := md.CreateVolume(ctx, term, clone, bound); err != nil {
 		return metadata.Volume{}, err
 	}
 	return clone, nil

@@ -34,8 +34,27 @@ CREATE TABLE hosts (
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
     nvme_used_bytes      BIGINT NOT NULL DEFAULT 0,
-    nvme_committed_bytes BIGINT NOT NULL DEFAULT 0,   -- thin provisioning
-    last_heartbeat       TIMESTAMPTZ NOT NULL
+    -- There is deliberately no nvme_committed_bytes column (ADR-0017). Committed
+    -- capacity is derived from the rows that already say who holds what; see the
+    -- note at the bottom of this file.
+    last_heartbeat       TIMESTAMPTZ NOT NULL,
+    -- The end of the bounded revocation window (§12.6, ADR-0016 stage 1): until this
+    -- instant, by this database's clock, the host's lease renewals are refused.
+    --
+    -- The drain revokes the source's lease to fence it, and the source's next
+    -- heartbeat would otherwise re-arm it — moving the instant the fencing wait is
+    -- measured from, so a healthy host could never be evacuated. Refusing renewals
+    -- for any DRAINING host fixes that and costs too much: the lease is per host and
+    -- the evacuation is per volume, so it stops the durable ACKs of every volume the
+    -- host still holds, including the ones nobody is moving. This column is the same
+    -- mechanism with the blast radius cut to one promotion.
+    --
+    -- It is a deadline rather than a flag on purpose. The Control Plane closes the
+    -- window on every exit path of the promotion, but a Control Plane that dies
+    -- mid-promotion runs no closing write at all, and a host that can never renew
+    -- again is worse than the bug this fixes. The deadline is the backstop: at most
+    -- one lease_ttl + max_clock_skew per volume moved, whatever happens to the CP.
+    renewals_blocked_until TIMESTAMPTZ
 );
 
 -- Lease POR HOST (§12.6): one grouped renewal per host, not per volume. Each volume
@@ -69,6 +88,23 @@ CREATE TABLE volumes (
     local_sequence     BIGINT NOT NULL DEFAULT 0,
     durable_sequence   BIGINT NOT NULL DEFAULT 0,
     published_sequence BIGINT NOT NULL DEFAULT 0,
+    -- When the Control Plane observed the lease of the writer it is fencing
+    -- (ADR-0015). Stamped by this database's clock — the same clock that stamps
+    -- host_leases.last_renewal, and so the one every fencing deadline lives on —
+    -- when the volume enters FENCING_WAIT, and cleared when it leaves.
+    --
+    -- The promotion dwell is measured from here rather than from
+    -- host_leases.last_renewal, because last_renewal answers a question about the
+    -- *writer* and this answers a question about the *promoter*: a read served by a
+    -- lagging replica reports a last_renewal old enough that the wait already looks
+    -- over, and the epoch is granted while the old writer's monotonic lease is still
+    -- valid. This column is written by the promoter and read back by it, so a stale
+    -- read of it returns NULL — which starts a full dwell. Fail slow, never short.
+    --
+    -- It is what makes FENCING_WAIT load-bearing state rather than a marker: a
+    -- Control Plane that restarts mid-fence resumes the wait its predecessor started
+    -- instead of beginning a new one.
+    fencing_started_at TIMESTAMPTZ,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -149,3 +185,29 @@ CREATE INDEX snapshots_volume_id_idx ON snapshots (volume_id);
 CREATE INDEX snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 CREATE INDEX operations_volume_id_idx ON operations (volume_id);
+
+-- Committed NVMe capacity (§28.2) is DERIVED, not stored (ADR-0017). There is no
+-- column for it and no view either:
+--
+--   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
+--                   + Σ size_bytes reserved by in-flight operation plans targeting it
+--
+-- Both terms are queries over rows that already exist and are already term-guarded,
+-- so there is no delta to apply and nothing to apply twice: a resumed pass computes
+-- the same answer as the pass that crashed. The column this replaces was an
+-- incremental ledger, and every safeguard the last two waves added to it — the
+-- non-negative guard, the expected-value predicate, the per-volume release stage —
+-- existed only because a delta is not an idempotency key.
+--
+-- **Why the expression is repeated in internal/db/queries instead of living in a
+-- view.** A view is the obvious home for it, and it is not available: Atlas
+-- Community (the pinned toolchain, ATLAS_VERSION in Taskfile.yml) refuses to diff a
+-- schema containing one — "views are available to logged-in users only". Pinning a
+-- licensed Atlas, or hand-writing the migration outside `task db:migrate:diff`,
+-- would buy syntactic sugar over a sum four queries can each do for themselves, at
+-- the price of the one property that makes the schema trustworthy: that
+-- internal/schema/schema.sql is the declared state and the migrations are derived
+-- from it mechanically. So the four copies are deliberate. They live in
+-- internal/db/queries/hosts.sql (GetHost, ListHosts), volumes.sql (CreateVolume's
+-- bound) and operations.sql (UpdateOperationPhase's bound), and hosts.sql carries
+-- the full reasoning; if you change one, change all four.

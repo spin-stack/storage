@@ -57,7 +57,7 @@ func (f *fixture) createVolume(t *testing.T, v metadata.Volume) {
 	if v.Durability == "" {
 		v.Durability = lifecycle.DurabilityRemote
 	}
-	if err := f.md.CreateVolume(t.Context(), f.term, v); err != nil {
+	if err := f.md.CreateVolume(t.Context(), f.term, v, nil); err != nil {
 		t.Fatal(err)
 	}
 }
