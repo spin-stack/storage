@@ -21,7 +21,16 @@ without VM restart, zero I/O lost or duplicated).
 
 ---
 
-## Increment 3.1 — vhost-user-blk raw backend
+## Increment 3.1 — vhost-user-blk raw backend — **DONE 2026-07-26**
+
+> Verified by execution against the pinned QEMU 11.0.2 (`task test:integration:qemu`),
+> not against a simulator: full handshake, then SeaBIOS reading LBA 0 through our
+> virtqueue and a boot sector reading and writing sectors that are asserted on the
+> backend. TCG (no `/dev/kvm` for this user), guest RAM over memfd. What the spec did
+> not say is recorded in RISKS.md under RISK-10. **FLUSH is not exercised by a guest**
+> — SeaBIOS has no flush verb and the lane has no kernel — and reconnection /
+> inflight-shmfd are untouched.
+
 **Objective:** a minimal vhost-user-blk backend exposing a raw block device (backed by
 the WAL/CoW engine or, initially, a raw file) to QEMU 11.0.2 over a Unix socket; single
 queue, queue depth 128; READ/WRITE/FLUSH handled.

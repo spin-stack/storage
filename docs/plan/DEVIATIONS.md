@@ -36,8 +36,10 @@ gate** (PLAN §2).
   under a real QEMU guest over vhost-user-blk running write → FLUSH → verified object →
   checkpoint → truncate. **Status: open — partially built.** `api/` (Connect),
   `internal/agent`, `internal/cpserver`, `cmd/volume-agent` and `cmd/control-plane`
-  exist and are exercised end to end over real HTTP; what is missing is the data path
-  (vhost-user-blk, a `wal.Log`-backed volume source) and the QEMU integration lane.
+  exist and are exercised end to end over real HTTP; `internal/vhost` serves a block
+  device to a real QEMU 11.0.2 guest (increment 3.1) with its own integration lane.
+  What is missing is the join: a `wal.Log`-backed `vhost.Backend`, so a guest write
+  reaches the WAL rather than a raw file.
 
 ## Resolved
 

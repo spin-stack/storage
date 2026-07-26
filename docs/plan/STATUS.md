@@ -4,9 +4,10 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
 work, then `REBASELINE.md` — a human review on 2026-07-25 found this file claiming
 more than the repository does, and the maturity model below is the correction.
 
-- **Date:** 2026-07-26 (wave 4 merged: the spine exists — `api/` over Connect, an Agent
-  that pulls — and the three decided Control-Plane fixes landed. 76 of the 78 audit
-  findings are closed; the two left wait on formats, not on effort.)
+- **Date:** 2026-07-26. The spine exists and **a guest now boots against it**:
+  increment 3.1 serves `vhost-user-blk` to the pinned QEMU 11.0.2, verified by
+  execution, not by simulation. 76 of the 78 audit findings are closed; the two left
+  wait on formats. Schema tooling moved from Atlas to pgschema (ADR-0019).
 - **Where the work is:** everything is on **`main`**, pushed to `origin`
   (`/home/aledbf/spin-storage.git`, a bare repo — the old bundle remote is gone).
 - **Gate on `main`:** `task ci:full` green — that is now the merge gate and it includes
@@ -30,7 +31,8 @@ Nine roadmap phases have merged increments — as models.
 |---|---|---|
 | 0 planning | done | — |
 | 01 skeleton (simio + DST harness + obs) | **model** | metrics are recorded by the paths that own them (DEV-0010 closed); wiring continues with each new path |
-| 02 guest layout / 03 vhost-user | **not started** | the QEMU 11.0.2 build now exists (`task build:qemu`); the guest/vhost work does not |
+| 02 guest layout | **not started** | needs guest mounts / a VM; nothing in the durability chain depends on it |
+| 03 vhost-user | **3.1 integrated** | a real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). FLUSH is *not* exercised by a guest (no kernel in the lane) and 3.2 reconnection / 3.3 inflight-shmfd are untouched — RISK-10 stays open |
 | 04 WAL/CoW format + property tests | **model** | format review still pending (human-review zone) |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
 | 06 remote WAL (batching, idempotent PUT, summary) | **model** | — |
@@ -116,16 +118,17 @@ converging — it corrupts nothing, it just does not finish.
 2. ~~`cmd/volume-agent` skeleton~~ **done**: pull reconciliation, heartbeat carrying
    device total/used/backlog, epoch-qualified watermark reports, a lease armed only by
    a successful heartbeat and anchored to the instant the request left.
-3. **Next — the data path**: vhost-user-blk against the published QEMU image, one
-   volume on one host, `guest write → WAL → FLUSH → verified object → checkpoint →
-   TruncateLocal`. Three small gaps block it and should land first:
-   - `internal/simio/disk` has no statfs, so the Agent estimates device usage instead of
-     reading it (`Usage() (Usage, error)`, `unix.Statfs` in real, budget in sim);
-   - `metadata.Host` has no field for the aggregate remote backlog, so `cpserver`
-     receives the number and drops it;
-   - `DesiredVolume` carries no key material, so the Agent cannot open a volume — and
-     the right shape is a separate key-fetch RPC, not keys in every state answer.
-4. The integration lane, using the image the QEMU workflow publishes.
+3. ~~The three gaps that blocked the data path~~ **done**: `disk.Usage()` with statfs
+   (and a device budget in the simulator, the knob ADR-0013 needs), the aggregate
+   remote backlog on `metadata.Host`, and `GetVolumeKeys` as its own RPC — authorised
+   per request against the volume's current primary, which a list response could not
+   express. Known gap recorded there: the response carries no DEK **version**, because
+   no column holds one and `0` means plaintext in the WAL.
+4. ~~vhost-user-blk~~ **done for 3.1** — see the phase table.
+5. **Next — put `wal.Log` behind the `Backend` seam.** The interface does not change;
+   what is missing is an offset-addressed adapter over the CoW view (Phase 04 work).
+   Then FLUSH stops being an `fsync` and becomes the §14.4 ACK path, DISCARD /
+   WRITE_ZEROES can be offered, and the slice of ADR-0018 is closed end to end.
 
 **That slice is the definition of done for "integrated"** — the first time any phase
 stops being a model.
