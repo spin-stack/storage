@@ -36,6 +36,15 @@ var (
 	errBoundaryLost = errors.New("test: the epoch boundary write never landed")
 )
 
+// failBoundaryWrite kills the pass exactly where the promotion has landed and the
+// epoch boundary has not.
+func failBoundaryWrite(key string) error {
+	if strings.HasSuffix(key, "recovery-point.json") {
+		return errBoundaryLost
+	}
+	return nil
+}
+
 // hookedStore wraps a metadata.Store so a test can act at an exact point inside one
 // Drain pass. beforeUpdate/beforeCommit run ahead of the call and may fail it;
 // afterCommit runs once the call has landed. That is how a crash *between* two
@@ -556,6 +565,12 @@ func TestDrainOfEmptyHostIsDrained(t *testing.T) {
 // is released — used to lose the volume on the next pass: it was no longer listed
 // under the source, so nothing ever finished it. The pass must be driven by what the
 // operation planned, not by who currently owns the volume.
+//
+// The crash is now produced by failing this drain's own boundary write. The setup
+// used to stand it in with an external BumpVolumeEpoch, which is indistinguishable
+// from another actor promoting the volume — the case a drain must refuse to finish
+// (TestDrainRefusesToFinishAVolumeAnotherActorPromoted), so it can no longer stand in
+// for this one.
 func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 	ctx := context.Background()
 	w := newDrainWorld(t, 10*volSize)
@@ -568,10 +583,15 @@ func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 	}
 	w.pastFencingWait()
 
-	// Now the crash: the next pass promoted the first volume and died before writing
+	// Now the crash: the next pass promotes the first volume and dies before writing
 	// the epoch boundary and releasing the source's capacity.
-	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
-		t.Fatal(err)
+	w.faults.fail = failBoundaryWrite
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+		t.Fatalf("setup: want errBoundaryLost, got %v", err)
+	}
+	w.faults.fail = nil
+	if v, _ := w.md.GetVolume(ctx, firstID); v.CurrentEpoch != 2 || v.PrimaryHostID != destHost {
+		t.Fatalf("setup: the volume should be promoted with no boundary yet: %+v", v)
 	}
 
 	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
@@ -669,9 +689,12 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	w.pastFencingWait()
-	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
-		t.Fatal(err)
+	// This drain's own promotion landed; the boundary write did not.
+	w.faults.fail = failBoundaryWrite
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+		t.Fatalf("setup: want errBoundaryLost, got %v", err)
 	}
+	w.faults.fail = nil
 	// Corrupt the epoch's only object so the durable point cannot be established.
 	objs, _ := w.store.List(ctx, "wal/"+firstID+"/1/")
 	if len(objs) == 0 {
@@ -981,12 +1004,7 @@ func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
 
-	w.faults.fail = func(key string) error {
-		if strings.HasSuffix(key, "recovery-point.json") {
-			return errBoundaryLost
-		}
-		return nil
-	}
+	w.faults.fail = failBoundaryWrite
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
 		t.Fatalf("setup: want errBoundaryLost, got %v", err)
 	}
@@ -1001,8 +1019,9 @@ func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
-		t.Fatal("a drain whose volume advanced past its own promotion must refuse, not guess")
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if !errors.Is(err, controlplane.ErrEpochAdvanced) {
+		t.Fatalf("want ErrEpochAdvanced, got %v", err)
 	}
 	// Nothing may be written for the epoch this drain did not grant.
 	w.noBoundary(t, w.vols[0], 3)
