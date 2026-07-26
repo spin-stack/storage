@@ -416,7 +416,7 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: vid, CurrentEpoch: 1, State: lifecycle.VolumeActive,
 		PrimaryHostID: seededHost1, DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		return err
 	}
 	if _, err := epochs.Init(ctx, vid, 1); err != nil {

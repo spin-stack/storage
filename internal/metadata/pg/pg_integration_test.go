@@ -79,7 +79,7 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 	if err := store.CreateVolume(ctx, termA, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1, 2, 3}, KEKID: "kek-1",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,7 +130,7 @@ func TestPGOperationIdempotency(t *testing.T) {
 	op.Phase = lifecycle.OpRunning
 	op.CurrentState = []byte(`{"total":2,"moved":1}`)
 	op.Error = "waiting for fencing"
-	if err := store.UpdateOperation(ctx, term, op); err != nil {
+	if err := store.UpdateOperation(ctx, term, op, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetOperation(ctx, op.OperationID)
@@ -143,7 +143,7 @@ func TestPGOperationIdempotency(t *testing.T) {
 		t.Fatalf("current_state = %s err=%v", got.CurrentState, err)
 	}
 	op.OperationID = ids.New().String()
-	if err := store.UpdateOperation(ctx, term, op); !errors.Is(err, metadata.ErrNotFound) {
+	if err := store.UpdateOperation(ctx, term, op, nil); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("update of a missing operation: want ErrNotFound, got %v", err)
 	}
 }
@@ -187,36 +187,22 @@ func TestPGFleetSurface(t *testing.T) {
 		t.Fatalf("SetHostState on a missing host: want ErrNotFound, got %v", err)
 	}
 
-	// Capacity accounting (§28.2): reserve, release, and refuse to go negative.
-	// (The bound and the expected-value predicate are pinned for both stores by the
-	// shared contract; these are the adapter's own round trips.)
-	if err := store.CommitHostCapacity(ctx, term, hostA, metadata.CapacityChange{DeltaBytes: 700, Limit: 1000}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitHostCapacity(ctx, term, hostA, metadata.CapacityChange{DeltaBytes: -200}); err != nil {
-		t.Fatal(err)
-	}
-	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 500 {
-		t.Fatalf("committed = %d, want 500", h.NVMeCommittedBytes)
-	}
-	if err := store.CommitHostCapacity(ctx, term, hostA, metadata.CapacityChange{DeltaBytes: -501}); !errors.Is(err, metadata.ErrCapacityUnderflow) {
-		t.Fatalf("over-release: want ErrCapacityUnderflow, got %v", err)
-	}
-	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 500 {
-		t.Fatalf("failed release mutated committed to %d", h.NVMeCommittedBytes)
+	// Capacity accounting (§28.2) is derived (ADR-0017): an empty host is committed
+	// to nothing, and the number appears when a volume names it. The semantics are
+	// pinned for both stores by the shared contract; this is the adapter's own round
+	// trip through the host_committed_bytes view.
+	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 0 {
+		t.Fatalf("an empty host committed %d bytes", h.NVMeCommittedBytes)
 	}
 	staleTerm := term
 	term, _ = store.AcquireLeadership(ctx, "cp-b")
-	if err := store.CommitHostCapacity(ctx, staleTerm, hostA, metadata.CapacityChange{DeltaBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrStaleTerm) {
-		t.Fatalf("stale-term commit: want ErrStaleTerm, got %v", err)
-	}
 
 	// Volumes by host: exactly the ones whose primary is that host.
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1}, KEKID: "k", PrimaryHostID: hostA,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	vols, err := store.ListVolumesByHost(ctx, hostA)
@@ -237,7 +223,7 @@ func TestPGRejectsNonV7(t *testing.T) {
 	err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: "11111111-1111-1111-1111-111111111111", SizeBytes: 1, BlockSize: 65536,
 		State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("Postgres must reject a non-v7 volume_id (INV-22 CHECK)")
 	}
@@ -260,7 +246,7 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	snapID, reqID := ids.New().String(), ids.New().String()
@@ -327,7 +313,7 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -365,15 +351,15 @@ func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	op.Phase = lifecycle.OpRunning
-	if err := store.UpdateOperation(ctx, term, op); err != nil {
+	if err := store.UpdateOperation(ctx, term, op, nil); err != nil {
 		t.Fatal(err)
 	}
 	op.Phase = lifecycle.OpSucceeded
-	if err := store.UpdateOperation(ctx, term, op); err != nil {
+	if err := store.UpdateOperation(ctx, term, op, nil); err != nil {
 		t.Fatal(err)
 	}
 	op.Phase = lifecycle.OpRunning
-	if err := store.UpdateOperation(ctx, term, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := store.UpdateOperation(ctx, term, op, nil); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
 	}
 	got, _ := store.GetOperation(ctx, op.OperationID)
@@ -449,7 +435,7 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 		if err := store.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: ids.New().String(), SizeBytes: 1 << 30, BlockSize: 65536,
 			State: lifecycle.VolumeActive, PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k",
-		}); err != nil {
+		}, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

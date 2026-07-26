@@ -45,7 +45,7 @@ func TestTheSpineEndToEnd(t *testing.T) {
 		{VolumeID: "vol-stolen", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 9, PrimaryHostID: testHost,
 			State: lifecycle.VolumeActive, Durability: lifecycle.DurabilityRemote},
 	} {
-		if err := md.CreateVolume(t.Context(), term, v); err != nil {
+		if err := md.CreateVolume(t.Context(), term, v, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

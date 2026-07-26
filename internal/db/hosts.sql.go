@@ -9,80 +9,73 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const commitHostCapacity = `-- name: CommitHostCapacity :execrows
-UPDATE hosts
-   SET nvme_committed_bytes = nvme_committed_bytes + $2
- WHERE host_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
-   AND nvme_committed_bytes + $2 >= 0
-   AND ($2 <= 0 OR nvme_committed_bytes + $2 <= $4)
-   AND ($5::bigint IS NULL
-        OR nvme_committed_bytes = $5::bigint)
-`
-
-type CommitHostCapacityParams struct {
-	HostID             uuid.UUID   `json:"host_id"`
-	NvmeCommittedBytes int64       `json:"nvme_committed_bytes"`
-	Term               int64       `json:"term"`
-	LimitBytes         int64       `json:"limit_bytes"`
-	ExpectedBytes      pgtype.Int8 `json:"expected_bytes"`
-}
-
-// Reserve (positive) or release (negative) committed NVMe bytes (§28.2), term-
-// guarded. Every rule the ledger has is a predicate here rather than a check the
-// caller performs before calling, because each one of them is otherwise a window
-// between a read and a write:
-//
-//   - the non-negative guard makes an over-release affect 0 rows instead of
-//     corrupting the accounting;
-//   - the oversubscription bound makes two placements that raced for the same
-//     destination — both admitted by a pure placement.Choose against the same fleet
-//     read — land as one reservation and one ErrCapacityExceeded, instead of two
-//     reservations and a host past its declared ceiling. $4 is the policy's own
-//     answer for this host (placement.Policy.Limit), so there is one copy of the
-//     rule rather than a second one written in SQL;
-//   - the `$2 <= 0` disjunct exempts *releases* from the bound. A host can be above
-//     its ceiling for reasons that have nothing to do with this write (a tightened
-//     policy, a device that came back smaller), and a release that bounced off the
-//     bound would wedge the only operation that can bring it back down;
-//   - the expected value, when the caller supplies one, is what makes a resumed
-//     operation's "did my own delta already land?" a single statement. A delta is
-//     not an idempotency key: the recorded before-value is the only proof there is,
-//     and comparing it in Go leaves a window in which a third party's change — one
-//     that nets to exactly one volume size — is indistinguishable from our own.
-func (q *Queries) CommitHostCapacity(ctx context.Context, arg CommitHostCapacityParams) (int64, error) {
-	result, err := q.db.Exec(ctx, commitHostCapacity,
-		arg.HostID,
-		arg.NvmeCommittedBytes,
-		arg.Term,
-		arg.LimitBytes,
-		arg.ExpectedBytes,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const getHost = `-- name: GetHost :one
-SELECT host_id, state, agent_version, max_format_version, nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat FROM hosts WHERE host_id = $1
+SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, (
+       COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+       WHERE v.primary_host_id = h.host_id), 0)
+       + COALESCE((SELECT SUM(rv.size_bytes)
+       FROM operations o
+       CROSS JOIN LATERAL jsonb_array_elements(
+       CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
+       THEN o.current_state -> 'volumes'
+       ELSE '[]'::jsonb END) AS e
+       JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+       WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
+       AND e ->> 'to_host' = (h.host_id)::text
+       AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+       AND rv.primary_host_id IS DISTINCT FROM h.host_id), 0))::BIGINT AS committed_bytes
+  FROM hosts h
+ WHERE h.host_id = $1
 `
 
-func (q *Queries) GetHost(ctx context.Context, hostID uuid.UUID) (*Host, error) {
+type GetHostRow struct {
+	Host           Host  `json:"host"`
+	CommittedBytes int64 `json:"committed_bytes"`
+}
+
+// Committed capacity comes with the host because every reader of a host is a
+// placement decision waiting to happen, and a §28.2 decision taken against a stale
+// copy of that number is exactly what ADR-0017 removed the copy to prevent.
+//
+// This is the canonical derivation; three other queries repeat it (ListHosts below,
+// and the bound predicates in volumes.sql and operations.sql). schema.sql says why
+// it is not a view: the pinned Atlas Community refuses to diff a schema containing
+// one, and a licensed toolchain — or a hand-written migration — is too high a price
+// for sugar over a sum.
+//
+//	committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
+//	                + Σ size_bytes reserved by in-flight operation plans targeting it
+//
+// The second term is what makes it correct rather than merely simple: a volume being
+// moved must be charged to its destination *before* it becomes the primary there, or
+// two placements would both see room. It is read out of the operation's own recorded
+// progress, which carries a per-volume stage, so "reserved but not yet primary" is
+// readable rather than inferred. An entry stops reserving the moment the volume it
+// names is actually primary on the host — otherwise the volume is charged twice,
+// once as a plan and once as a placement — and a settled entry (DONE, FOREIGN)
+// reserves nothing at all.
+//
+// The join is on volume_id::text rather than a cast of the JSON value to uuid: a
+// malformed plan must make the row disappear from the sum, not make every capacity
+// read raise. The consequence, stated in ADR-0017, is that an operation whose plan is
+// lost makes its destination look emptier than it is — which is why the plan is
+// written term-guarded, before the work it describes.
+//
+// It runs at placement time, not on the data path, over a fleet of hundreds of rows.
+func (q *Queries) GetHost(ctx context.Context, hostID uuid.UUID) (*GetHostRow, error) {
 	row := q.db.QueryRow(ctx, getHost, hostID)
-	var i Host
+	var i GetHostRow
 	err := row.Scan(
-		&i.HostID,
-		&i.State,
-		&i.AgentVersion,
-		&i.MaxFormatVersion,
-		&i.NvmeTotalBytes,
-		&i.NvmeUsedBytes,
-		&i.NvmeCommittedBytes,
-		&i.LastHeartbeat,
+		&i.Host.HostID,
+		&i.Host.State,
+		&i.Host.AgentVersion,
+		&i.Host.MaxFormatVersion,
+		&i.Host.NvmeTotalBytes,
+		&i.Host.NvmeUsedBytes,
+		&i.Host.LastHeartbeat,
+		&i.CommittedBytes,
 	)
 	return &i, err
 }
@@ -115,28 +108,49 @@ func (q *Queries) HostExists(ctx context.Context, hostID uuid.UUID) (bool, error
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT host_id, state, agent_version, max_format_version, nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat FROM hosts ORDER BY host_id
+SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, (
+       COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+       WHERE v.primary_host_id = h.host_id), 0)
+       + COALESCE((SELECT SUM(rv.size_bytes)
+       FROM operations o
+       CROSS JOIN LATERAL jsonb_array_elements(
+       CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
+       THEN o.current_state -> 'volumes'
+       ELSE '[]'::jsonb END) AS e
+       JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+       WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
+       AND e ->> 'to_host' = (h.host_id)::text
+       AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+       AND rv.primary_host_id IS DISTINCT FROM h.host_id), 0))::BIGINT AS committed_bytes
+  FROM hosts h
+ ORDER BY h.host_id
 `
 
+type ListHostsRow struct {
+	Host           Host  `json:"host"`
+	CommittedBytes int64 `json:"committed_bytes"`
+}
+
 // Deterministic order: placement decisions must not depend on row order (INV-02).
-func (q *Queries) ListHosts(ctx context.Context) ([]*Host, error) {
+// The committed-bytes expression is GetHost's; see the comment there.
+func (q *Queries) ListHosts(ctx context.Context) ([]*ListHostsRow, error) {
 	rows, err := q.db.Query(ctx, listHosts)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []*Host{}
+	items := []*ListHostsRow{}
 	for rows.Next() {
-		var i Host
+		var i ListHostsRow
 		if err := rows.Scan(
-			&i.HostID,
-			&i.State,
-			&i.AgentVersion,
-			&i.MaxFormatVersion,
-			&i.NvmeTotalBytes,
-			&i.NvmeUsedBytes,
-			&i.NvmeCommittedBytes,
-			&i.LastHeartbeat,
+			&i.Host.HostID,
+			&i.Host.State,
+			&i.Host.AgentVersion,
+			&i.Host.MaxFormatVersion,
+			&i.Host.NvmeTotalBytes,
+			&i.Host.NvmeUsedBytes,
+			&i.Host.LastHeartbeat,
+			&i.CommittedBytes,
 		); err != nil {
 			return nil, err
 		}
@@ -254,13 +268,13 @@ func (q *Queries) SetHostState(ctx context.Context, arg SetHostStateParams) (int
 
 const upsertHost = `-- name: UpsertHost :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $7
 )
 INSERT INTO hosts (
     host_id, state, agent_version, max_format_version,
-    nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat
+    nvme_total_bytes, nvme_used_bytes, last_heartbeat
 )
-SELECT $1, $2, $3, $4, $5, $6, $7, now()
+SELECT $1, $2, $3, $4, $5, $6, now()
 WHERE EXISTS (SELECT 1 FROM valid)
 ON CONFLICT (host_id) DO UPDATE
   SET agent_version = EXCLUDED.agent_version,
@@ -271,23 +285,23 @@ ON CONFLICT (host_id) DO UPDATE
 `
 
 type UpsertHostParams struct {
-	HostID             uuid.UUID `json:"host_id"`
-	State              string    `json:"state"`
-	AgentVersion       string    `json:"agent_version"`
-	MaxFormatVersion   int32     `json:"max_format_version"`
-	NvmeTotalBytes     int64     `json:"nvme_total_bytes"`
-	NvmeUsedBytes      int64     `json:"nvme_used_bytes"`
-	NvmeCommittedBytes int64     `json:"nvme_committed_bytes"`
-	Term               int64     `json:"term"`
+	HostID           uuid.UUID `json:"host_id"`
+	State            string    `json:"state"`
+	AgentVersion     string    `json:"agent_version"`
+	MaxFormatVersion int32     `json:"max_format_version"`
+	NvmeTotalBytes   int64     `json:"nvme_total_bytes"`
+	NvmeUsedBytes    int64     `json:"nvme_used_bytes"`
+	Term             int64     `json:"term"`
 }
 
 // Term-guarded (§7): the INSERT ... SELECT produces no row when the term is stale,
 // so a zombie CP affects 0 rows.
 // The conflict path is a heartbeat: it refreshes only what the host knows about
-// itself. `state` and `nvme_committed_bytes` are the Control Plane's (SetHostState,
-// CommitHostCapacity) and are deliberately absent — a routine heartbeat carrying
-// State=ACTIVE would un-cordon a host that is being drained, and one carrying the
-// agent's idea of committed bytes would zero the ledger the drain releases against.
+// itself. `state` is the Control Plane's (SetHostState) and is deliberately absent —
+// a routine heartbeat carrying State=ACTIVE would un-cordon a host that is being
+// drained. Committed capacity is not here either, and no longer could be: it is
+// derived from the volumes and plans that name the host (ADR-0017), so there is
+// nothing for a heartbeat to overwrite.
 func (q *Queries) UpsertHost(ctx context.Context, arg UpsertHostParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertHost,
 		arg.HostID,
@@ -296,7 +310,6 @@ func (q *Queries) UpsertHost(ctx context.Context, arg UpsertHostParams) (int64, 
 		arg.MaxFormatVersion,
 		arg.NvmeTotalBytes,
 		arg.NvmeUsedBytes,
-		arg.NvmeCommittedBytes,
 		arg.Term,
 	)
 	if err != nil {

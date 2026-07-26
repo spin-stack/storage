@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/materialize"
@@ -20,17 +21,21 @@ type CrossHostClone struct {
 }
 
 // CloneCrossHost creates a clone on destHost by full materialization from the
-// object store (§20 cross-host, §22.3 cold): capacity is committed on the
-// destination *before* the fetch starts, the parent snapshot's state is rebuilt
+// object store (§20 cross-host, §22.3 cold): the parent snapshot's state is rebuilt
 // there from S3 alone — the source host is never contacted — and only a complete,
 // verified materialization records the clone.
 //
-// If anything fails the reservation is released, so a failed move never leaks
-// committed capacity. Whether destHost *should* take the volume is the placement
-// policy's decision (internal/placement); this function commits what that decision
-// implies — and re-states the policy's bound as a predicate of the reservation
-// itself, because the decision was taken against a fleet read that a drain or
-// another clone may have been holding at the same time (§28.2).
+// There is no reservation to take and none to release (ADR-0017). The destination is
+// charged when the volume row naming it exists, and not before, so a clone that
+// fails at any point leaks nothing: there is no delta anybody has to remember to
+// reverse, and no leadership change that can strand one.
+//
+// The §28.2 bound is checked twice, for two different reasons. The advisory check
+// here refuses before a cold materialization is started against a host that plainly
+// cannot hold the result. The authoritative one is a predicate of CreateVolume,
+// because the decision was taken against a fleet read that a drain or another clone
+// may have shared: two clones that both fetch and one that is refused at the write
+// is wasted work, and it is the only shape in which the ceiling cannot be exceeded.
 func CloneCrossHost(ctx context.Context, md metadata.Store, mat *materialize.Materializer,
 	policy placement.Policy, term int64, parentSnapshotID, newVolumeID, destHost string,
 ) (CrossHostClone, error) {
@@ -47,28 +52,21 @@ func CloneCrossHost(ctx context.Context, md metadata.Store, mat *materialize.Mat
 		return CrossHostClone{}, err
 	}
 
-	// Reserve first: a materialization that fills the destination's NVMe is worse
-	// than one that is refused (§28.2).
-	if err := md.CommitHostCapacity(ctx, term, destHost, metadata.CapacityChange{
-		DeltaBytes: parent.SizeBytes, Limit: policy.Limit(dest),
-	}); err != nil {
-		return CrossHostClone{}, err
-	}
-	release := func() {
-		// Best-effort rollback; a stale term means another CP owns the accounting.
-		// Unbounded: giving bytes back must not be refused by the ceiling.
-		_ = md.CommitHostCapacity(ctx, term, destHost, metadata.CapacityChange{DeltaBytes: -parent.SizeBytes})
+	// A materialization that fills the destination's NVMe is worse than one that is
+	// refused, so ask before fetching (§28.2).
+	if !policy.Admits(dest, parent.SizeBytes) {
+		return CrossHostClone{}, fmt.Errorf("%w: host %s holds %d of %d committed bytes and cannot take %d",
+			metadata.ErrCapacityExceeded, destHost, dest.NVMeCommittedBytes, policy.Limit(dest), parent.SizeBytes)
 	}
 
 	view, prog, err := mat.FromSnapshot(ctx, snap.VolumeID, parentSnapshotID)
 	if err != nil {
-		release()
 		return CrossHostClone{}, err
 	}
 
-	clone, err := Clone(ctx, md, term, parentSnapshotID, newVolumeID, destHost)
+	clone, err := Clone(ctx, md, term, parentSnapshotID, newVolumeID, destHost,
+		&metadata.CapacityBound{HostID: destHost, AddBytes: parent.SizeBytes, Limit: policy.Limit(dest)})
 	if err != nil {
-		release()
 		return CrossHostClone{}, err
 	}
 	return CrossHostClone{Volume: clone, View: view, Progress: prog}, nil

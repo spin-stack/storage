@@ -50,7 +50,7 @@ func newPromoWorld(t *testing.T) *promoWorld {
 		VolumeID: promoVolume, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: promoOld,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	epochs := epoch.NewStore(store)
@@ -281,7 +281,7 @@ func TestConcurrentPromotionsLeaveExactlyOneWriter(t *testing.T) {
 		VolumeID: promoVolume, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: source,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	epochs := epoch.NewStore(sim.NewObjectStore())

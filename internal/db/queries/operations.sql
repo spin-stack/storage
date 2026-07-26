@@ -23,8 +23,37 @@ SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id;
 -- name: UpdateOperationPhase :execrows
 -- Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
 -- terminal operation cannot be resurrected even by a buggy caller.
+--
+-- It also carries the §28.2 oversubscription bound (ADR-0017), because an operation's
+-- recorded progress *is* its reservation: the plan entry a drain writes here is what
+-- charges the destination for a volume that is not primary there yet. The bound is
+-- evaluated against the derived value as it stands before this write, plus the bytes
+-- this write is about to reserve, so two operations that chose the same destination
+-- against the same fleet read produce one reservation and one ErrCapacityExceeded.
+-- A write with no bound reserves nothing new (a progress save, a phase change).
+-- The outer column references are qualified because the capacity predicate below
+-- reads `operations` again (every in-flight plan, this one included): unqualified
+-- `operation_id` would then be ambiguous.
 UPDATE operations
    SET current_state = $2, phase = $3, error = $4, updated_at = now()
- WHERE operation_id = $1
+ WHERE operations.operation_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
-   AND phase = ANY(sqlc.arg(allowed_phases)::text[]);
+   AND operations.phase = ANY(sqlc.arg(allowed_phases)::text[])
+   -- The derived value is hosts.sql's GetHost expression; see the comment there.
+   AND (sqlc.narg(bound_host)::uuid IS NULL
+       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = sqlc.narg(bound_host)::uuid)
+           AND (
+               COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+               WHERE v.primary_host_id = sqlc.narg(bound_host)::uuid), 0)
+               + COALESCE((SELECT SUM(rv.size_bytes)
+               FROM operations plans
+               CROSS JOIN LATERAL jsonb_array_elements(
+               CASE WHEN jsonb_typeof(plans.current_state -> 'volumes') = 'array'
+               THEN plans.current_state -> 'volumes'
+               ELSE '[]'::jsonb END) AS e
+               JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+               WHERE plans.phase NOT IN ('SUCCEEDED', 'CANCELED')
+               AND e ->> 'to_host' = (sqlc.narg(bound_host)::uuid)::text
+               AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+               AND rv.primary_host_id IS DISTINCT FROM sqlc.narg(bound_host)::uuid), 0))::BIGINT
+               + sqlc.arg(bound_add_bytes)::bigint <= sqlc.arg(bound_limit)::bigint));

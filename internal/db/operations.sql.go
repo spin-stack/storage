@@ -117,9 +117,27 @@ func (q *Queries) RecordOperation(ctx context.Context, arg RecordOperationParams
 const updateOperationPhase = `-- name: UpdateOperationPhase :execrows
 UPDATE operations
    SET current_state = $2, phase = $3, error = $4, updated_at = now()
- WHERE operation_id = $1
+ WHERE operations.operation_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $5
-   AND phase = ANY($6::text[])
+   AND operations.phase = ANY($6::text[])
+   -- The derived value is hosts.sql's GetHost expression; see the comment there.
+   AND ($7::uuid IS NULL
+       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = $7::uuid)
+           AND (
+               COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+               WHERE v.primary_host_id = $7::uuid), 0)
+               + COALESCE((SELECT SUM(rv.size_bytes)
+               FROM operations plans
+               CROSS JOIN LATERAL jsonb_array_elements(
+               CASE WHEN jsonb_typeof(plans.current_state -> 'volumes') = 'array'
+               THEN plans.current_state -> 'volumes'
+               ELSE '[]'::jsonb END) AS e
+               JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+               WHERE plans.phase NOT IN ('SUCCEEDED', 'CANCELED')
+               AND e ->> 'to_host' = ($7::uuid)::text
+               AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+               AND rv.primary_host_id IS DISTINCT FROM $7::uuid), 0))::BIGINT
+               + $8::bigint <= $9::bigint))
 `
 
 type UpdateOperationPhaseParams struct {
@@ -129,10 +147,24 @@ type UpdateOperationPhaseParams struct {
 	Error         pgtype.Text `json:"error"`
 	Term          int64       `json:"term"`
 	AllowedPhases []string    `json:"allowed_phases"`
+	BoundHost     pgtype.UUID `json:"bound_host"`
+	BoundAddBytes int64       `json:"bound_add_bytes"`
+	BoundLimit    int64       `json:"bound_limit"`
 }
 
 // Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
 // terminal operation cannot be resurrected even by a buggy caller.
+//
+// It also carries the §28.2 oversubscription bound (ADR-0017), because an operation's
+// recorded progress *is* its reservation: the plan entry a drain writes here is what
+// charges the destination for a volume that is not primary there yet. The bound is
+// evaluated against the derived value as it stands before this write, plus the bytes
+// this write is about to reserve, so two operations that chose the same destination
+// against the same fleet read produce one reservation and one ErrCapacityExceeded.
+// A write with no bound reserves nothing new (a progress save, a phase change).
+// The outer column references are qualified because the capacity predicate below
+// reads `operations` again (every in-flight plan, this one included): unqualified
+// `operation_id` would then be ambiguous.
 func (q *Queries) UpdateOperationPhase(ctx context.Context, arg UpdateOperationPhaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateOperationPhase,
 		arg.OperationID,
@@ -141,6 +173,9 @@ func (q *Queries) UpdateOperationPhase(ctx context.Context, arg UpdateOperationP
 		arg.Error,
 		arg.Term,
 		arg.AllowedPhases,
+		arg.BoundHost,
+		arg.BoundAddBytes,
+		arg.BoundLimit,
 	)
 	if err != nil {
 		return 0, err

@@ -17,6 +17,32 @@ INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoc
                      local_sequence, durable_sequence, published_sequence)
 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
 WHERE EXISTS (SELECT 1 FROM valid)
+  -- The §28.2 oversubscription bound, as a predicate of the write that places the
+  -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
+  -- read that another operation shared lands here, against the derived value, and
+  -- affects 0 rows instead of taking the destination past its declared ceiling.
+  -- A write with no bound is not a placement decision: rebuild-metadata recreates
+  -- volumes that already exist and already occupy the host, and bounding it would
+  -- refuse to record reality.
+  -- The derived value is hosts.sql's GetHost expression; see the comment there.
+  -- A bound naming a host nobody registered admits nothing: fail closed.
+  AND (sqlc.narg(bound_host)::uuid IS NULL
+       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = sqlc.narg(bound_host)::uuid)
+           AND (
+               COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+               WHERE v.primary_host_id = sqlc.narg(bound_host)::uuid), 0)
+               + COALESCE((SELECT SUM(rv.size_bytes)
+               FROM operations o
+               CROSS JOIN LATERAL jsonb_array_elements(
+               CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
+               THEN o.current_state -> 'volumes'
+               ELSE '[]'::jsonb END) AS e
+               JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+               WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
+               AND e ->> 'to_host' = (sqlc.narg(bound_host)::uuid)::text
+               AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+               AND rv.primary_host_id IS DISTINCT FROM sqlc.narg(bound_host)::uuid), 0))::BIGINT
+               + sqlc.arg(bound_add_bytes)::bigint <= sqlc.arg(bound_limit)::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       durability = EXCLUDED.durability,

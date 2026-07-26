@@ -34,7 +34,9 @@ CREATE TABLE hosts (
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
     nvme_used_bytes      BIGINT NOT NULL DEFAULT 0,
-    nvme_committed_bytes BIGINT NOT NULL DEFAULT 0,   -- thin provisioning
+    -- There is deliberately no nvme_committed_bytes column (ADR-0017). Committed
+    -- capacity is derived from the rows that already say who holds what; see the
+    -- host_committed_bytes view at the bottom of this file.
     last_heartbeat       TIMESTAMPTZ NOT NULL
 );
 
@@ -149,3 +151,29 @@ CREATE INDEX snapshots_volume_id_idx ON snapshots (volume_id);
 CREATE INDEX snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 CREATE INDEX operations_volume_id_idx ON operations (volume_id);
+
+-- Committed NVMe capacity (§28.2) is DERIVED, not stored (ADR-0017). There is no
+-- column for it and no view either:
+--
+--   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
+--                   + Σ size_bytes reserved by in-flight operation plans targeting it
+--
+-- Both terms are queries over rows that already exist and are already term-guarded,
+-- so there is no delta to apply and nothing to apply twice: a resumed pass computes
+-- the same answer as the pass that crashed. The column this replaces was an
+-- incremental ledger, and every safeguard the last two waves added to it — the
+-- non-negative guard, the expected-value predicate, the per-volume release stage —
+-- existed only because a delta is not an idempotency key.
+--
+-- **Why the expression is repeated in internal/db/queries instead of living in a
+-- view.** A view is the obvious home for it, and it is not available: Atlas
+-- Community (the pinned toolchain, ATLAS_VERSION in Taskfile.yml) refuses to diff a
+-- schema containing one — "views are available to logged-in users only". Pinning a
+-- licensed Atlas, or hand-writing the migration outside `task db:migrate:diff`,
+-- would buy syntactic sugar over a sum four queries can each do for themselves, at
+-- the price of the one property that makes the schema trustworthy: that
+-- internal/schema/schema.sql is the declared state and the migrations are derived
+-- from it mechanically. So the four copies are deliberate. They live in
+-- internal/db/queries/hosts.sql (GetHost, ListHosts), volumes.sql (CreateVolume's
+-- bound) and operations.sql (UpdateOperationPhase's bound), and hosts.sql carries
+-- the full reasoning; if you change one, change all four.

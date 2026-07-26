@@ -388,7 +388,7 @@ func earlyPromotion(f promoFault) Scenario {
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: fencedVol, State: lifecycle.VolumeActive,
 			PrimaryHostID: fencedHost1, DEKWrapped: []byte{1}, KEKID: "k",
-		}); err != nil {
+		}, nil); err != nil {
 			return err
 		}
 		if _, err := epochs.Init(ctx, fencedVol, 0); err != nil {

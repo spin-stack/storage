@@ -128,6 +128,38 @@ func (s *Store) staleIfZero(ctx context.Context, term, rows int64, err error) er
 	return nil
 }
 
+// boundParams turns the optional §28.2 bound into the three query parameters the
+// guarded writes take. A nil bound is a NULL host, which the predicate reads as
+// "this write is not a placement decision".
+func boundParams(b *metadata.CapacityBound) (pgtype.UUID, int64, int64, error) {
+	if b == nil {
+		return pgtype.UUID{}, 0, 0, nil
+	}
+	id, err := requireUUID("bound host", b.HostID)
+	if err != nil {
+		return pgtype.UUID{}, 0, 0, err
+	}
+	return pgtype.UUID{Bytes: id, Valid: true}, b.AddBytes, b.Limit, nil
+}
+
+// boundRefused diagnoses a 0-row write that carried a bound, on the 0-row path only:
+// the write did not land, so there is nothing to undo and nothing racing this read
+// can make it wrong about that. It returns nil when the bound is not what stopped it.
+func (s *Store) boundRefused(ctx context.Context, b *metadata.CapacityBound) error {
+	if b == nil {
+		return nil
+	}
+	h, err := s.GetHost(ctx, b.HostID)
+	if err != nil {
+		return err
+	}
+	if after := h.NVMeCommittedBytes + b.AddBytes; after > b.Limit {
+		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
+			metadata.ErrCapacityExceeded, b.HostID, after, b.Limit)
+	}
+	return nil
+}
+
 func notFound(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return metadata.ErrNotFound
@@ -165,17 +197,17 @@ func (s *Store) UpsertHost(ctx context.Context, term int64, h metadata.Host) err
 	if !h.State.Valid() {
 		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, h.State)
 	}
-	// state and nvme_committed_bytes are written only when the row is created; the
-	// conflict path is a heartbeat and does not carry them (see hosts.sql).
+	// state is written only when the row is created; the conflict path is a
+	// heartbeat and does not carry it (see hosts.sql). Committed capacity is not a
+	// column at all (ADR-0017), so h.NVMeCommittedBytes is dropped here.
 	rows, err := s.q.UpsertHost(ctx, db.UpsertHostParams{
-		HostID:             hostID,
-		State:              h.State.String(),
-		AgentVersion:       h.AgentVersion,
-		MaxFormatVersion:   h.MaxFormatVersion,
-		NvmeTotalBytes:     h.NVMeTotalBytes,
-		NvmeUsedBytes:      h.NVMeUsedBytes,
-		NvmeCommittedBytes: h.NVMeCommittedBytes,
-		Term:               term,
+		HostID:           hostID,
+		State:            h.State.String(),
+		AgentVersion:     h.AgentVersion,
+		MaxFormatVersion: h.MaxFormatVersion,
+		NvmeTotalBytes:   h.NVMeTotalBytes,
+		NvmeUsedBytes:    h.NVMeUsedBytes,
+		Term:             term,
 	})
 	return s.staleIfZero(ctx, term, rows, err)
 }
@@ -185,17 +217,17 @@ func (s *Store) GetHost(ctx context.Context, hostID string) (metadata.Host, erro
 	if err != nil {
 		return metadata.Host{}, err
 	}
-	h, err := s.q.GetHost(ctx, id)
+	row, err := s.q.GetHost(ctx, id)
 	if err != nil {
 		return metadata.Host{}, notFound(err)
 	}
-	return hostFromRow(h)
+	return hostFromRow(&row.Host, row.CommittedBytes)
 }
 
 // hostFromRow converts a generated row to the interface type. A row whose state is
 // outside the vocabulary is an error, not a silently propagated string (the DB CHECK
 // makes this unreachable in practice — this is the second line of defence).
-func hostFromRow(h *db.Host) (metadata.Host, error) {
+func hostFromRow(h *db.Host, committed int64) (metadata.Host, error) {
 	state, err := lifecycle.ParseHostState(h.State)
 	if err != nil {
 		return metadata.Host{}, fmt.Errorf("host %s: %w", h.HostID, err)
@@ -203,7 +235,7 @@ func hostFromRow(h *db.Host) (metadata.Host, error) {
 	return metadata.Host{
 		HostID: h.HostID.String(), State: state, AgentVersion: h.AgentVersion,
 		MaxFormatVersion: h.MaxFormatVersion, NVMeTotalBytes: h.NvmeTotalBytes,
-		NVMeUsedBytes: h.NvmeUsedBytes, NVMeCommittedBytes: h.NvmeCommittedBytes,
+		NVMeUsedBytes: h.NvmeUsedBytes, NVMeCommittedBytes: committed,
 		LastHeartbeat: fromTS(h.LastHeartbeat),
 	}, nil
 }
@@ -215,7 +247,7 @@ func (s *Store) ListHosts(ctx context.Context) ([]metadata.Host, error) {
 	}
 	hosts := make([]metadata.Host, 0, len(rows))
 	for _, row := range rows {
-		h, err := hostFromRow(row)
+		h, err := hostFromRow(&row.Host, row.CommittedBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -251,47 +283,6 @@ func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, sta
 	// The row looks legal now: it moved between the write and this read. The write
 	// did not land, and saying so beats reporting success.
 	return fmt.Errorf("%w: host %s changed state concurrently", lifecycle.ErrInvalidTransition, hostID)
-}
-
-func (s *Store) CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error {
-	id, err := requireUUID("host", hostID)
-	if err != nil {
-		return err
-	}
-	expected := pgtype.Int8{}
-	if c.Expect != nil {
-		expected = pgtype.Int8{Int64: *c.Expect, Valid: true}
-	}
-	rows, err := s.q.CommitHostCapacity(ctx, db.CommitHostCapacityParams{
-		HostID: id, NvmeCommittedBytes: c.DeltaBytes, Term: term,
-		LimitBytes: c.Limit, ExpectedBytes: expected,
-	})
-	ok, err := s.wrote(ctx, term, rows, err)
-	if err != nil || ok {
-		return err
-	}
-	// Still the leader, so 0 rows means a missing host or one of the three ledger
-	// predicates (§28.2). Which one is a re-read away — the write did not land, so
-	// there is nothing to undo and nothing racing this diagnosis can make it wrong
-	// about the fact that the caller's change is not in the books.
-	h, gerr := s.GetHost(ctx, hostID)
-	if gerr != nil {
-		return gerr
-	}
-	after := h.NVMeCommittedBytes + c.DeltaBytes
-	switch {
-	case c.Expect != nil && *c.Expect != h.NVMeCommittedBytes:
-		return fmt.Errorf("%w: host %s holds %d committed bytes, the change expected %d",
-			metadata.ErrCapacityConflict, hostID, h.NVMeCommittedBytes, *c.Expect)
-	case after < 0:
-		return metadata.ErrCapacityUnderflow
-	case c.DeltaBytes > 0 && after > c.Limit:
-		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
-			metadata.ErrCapacityExceeded, hostID, after, c.Limit)
-	}
-	// Every predicate looks satisfiable now, so the row moved between the write and
-	// this read. The write did not land, and saying so beats reporting success.
-	return fmt.Errorf("%w: host %s capacity changed concurrently", metadata.ErrCapacityConflict, hostID)
 }
 
 func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {
@@ -359,7 +350,7 @@ func (s *Store) GetHostLease(ctx context.Context, hostID string) (metadata.HostL
 	}, nil
 }
 
-func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume) error {
+func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume, bound *metadata.CapacityBound) error {
 	id, err := requireUUID("volume", v.VolumeID)
 	if err != nil {
 		return err
@@ -382,6 +373,10 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume)
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
+	boundHost, addBytes, limit, err := boundParams(bound)
+	if err != nil {
+		return err
+	}
 	rows, err := s.q.CreateVolume(ctx, db.CreateVolumeParams{
 		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability.String(),
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
@@ -389,8 +384,17 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume)
 		PrimaryHostID: primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence, Term: term,
+		BoundHost: boundHost, BoundAddBytes: addBytes, BoundLimit: limit,
 	})
-	return s.staleIfZero(ctx, term, rows, err)
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// Still the leader, so the only other predicate is the §28.2 bound (ADR-0017).
+	if berr := s.boundRefused(ctx, bound); berr != nil {
+		return berr
+	}
+	return fmt.Errorf("%w: host %s capacity changed concurrently", metadata.ErrCapacityExceeded, bound.HostID)
 }
 
 // volumeFromRow converts a generated row to the interface type, parsing its state
@@ -663,7 +667,7 @@ func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Ope
 	return s.wrote(ctx, term, rows, err)
 }
 
-func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Operation) error {
+func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
 	id, err := requireUUID("operation", op.OperationID)
 	if err != nil {
 		return err
@@ -671,23 +675,34 @@ func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Ope
 	if !op.Phase.Valid() {
 		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
 	}
+	boundHost, addBytes, limit, err := boundParams(bound)
+	if err != nil {
+		return err
+	}
 	rows, err := s.q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
 		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
 		AllowedPhases: op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
 		Term:          term,                        // and the §7 term guard
+		BoundHost:     boundHost,                   // and the §28.2 bound (ADR-0017)
+		BoundAddBytes: addBytes,
+		BoundLimit:    limit,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
 		return err
 	}
-	// Still the leader, so 0 rows means the operation is missing or the phase move
-	// is illegal — a terminal operation is never resurrected.
+	// Still the leader, so 0 rows means the operation is missing, the phase move is
+	// illegal — a terminal operation is never resurrected — or the reservation this
+	// progress records does not fit.
 	cur, gerr := s.GetOperation(ctx, op.OperationID)
 	if gerr != nil {
 		return gerr
 	}
 	if terr := cur.Phase.Transition(op.Phase); terr != nil {
 		return terr
+	}
+	if berr := s.boundRefused(ctx, bound); berr != nil {
+		return berr
 	}
 	return fmt.Errorf("%w: operation %s changed phase concurrently", lifecycle.ErrInvalidTransition, op.OperationID)
 }

@@ -95,7 +95,11 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			ChainDepth: d.ChainDepth,
 			DEKWrapped: d.DEKWrapped,
 			KEKID:      d.KEKID,
-		}); err != nil {
+			// No §28.2 bound (ADR-0017): rebuild-metadata records volumes that
+			// already exist and already occupy their hosts. A ceiling that refused
+			// to write them would leave the catalog short of reality, which is the
+			// one thing this run exists to prevent.
+		}, nil); err != nil {
 			return res, fmt.Errorf("rebuild %s create: %w", id, err)
 		}
 		switch {

@@ -51,27 +51,15 @@ type crashHere struct{ at string }
 // scenario can put the crash on either side of a durable effect.
 type faultMD struct {
 	metadata.Store
-	onCommit func(hostID string, delta int64, done bool)
 	onUpdate func(op metadata.Operation, done bool)
 	onLease  func(hostID string)
 }
 
-func (s *faultMD) CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error {
-	if s.onCommit != nil {
-		s.onCommit(hostID, c.DeltaBytes, false)
-	}
-	err := s.Store.CommitHostCapacity(ctx, term, hostID, c)
-	if err == nil && s.onCommit != nil {
-		s.onCommit(hostID, c.DeltaBytes, true)
-	}
-	return err
-}
-
-func (s *faultMD) UpdateOperation(ctx context.Context, term int64, op metadata.Operation) error {
+func (s *faultMD) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
 	if s.onUpdate != nil {
 		s.onUpdate(op, false)
 	}
-	err := s.Store.UpdateOperation(ctx, term, op)
+	err := s.Store.UpdateOperation(ctx, term, op, bound)
 	if err == nil && s.onUpdate != nil {
 		s.onUpdate(op, true)
 	}
@@ -118,7 +106,7 @@ type drainWorld struct {
 	volID   string
 	log     *wal.Log
 	acked   uint64
-	srcHeld int64
+	dstHeld int64
 }
 
 // newDrainWorld builds that world with ids derived from tag, so several worlds can
@@ -158,17 +146,23 @@ func newDrainWorld(s *Sim, tag byte, fence wal.LeaseChecker) (*drainWorld, error
 		VolumeID: w.volID, SizeBytes: drainVolBytes, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
 		CurrentEpoch: 1, PrimaryHostID: w.src, DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		return nil, err
 	}
-	// The source also holds a reservation for a volume nobody is moving: a release
-	// that lands twice must be visible as theft, not absorbed into a zero.
-	w.srcHeld = 2 * drainVolBytes
-	if err := base.CommitHostCapacity(ctx, term, w.src, metadata.CapacityChange{
-		DeltaBytes: w.srcHeld, Limit: 10 * drainVolBytes,
-	}); err != nil {
+	// The destination already holds a volume of its own, so "the moved volume was
+	// charged exactly once" is visible as a number rather than as a zero: a second
+	// charge shows up as 3 GiB, a missing one as 1 GiB.
+	var idle [16]byte
+	idle[6], idle[8] = 0x70, 0x80
+	idle[14], idle[15] = tag, 0xb1
+	if err := base.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: format.UUIDString(idle), SizeBytes: drainVolBytes, BlockSize: 65536,
+		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
+		CurrentEpoch: 1, PrimaryHostID: w.dst, DEKWrapped: []byte{1}, KEKID: "k",
+	}, nil); err != nil {
 		return nil, err
 	}
+	w.dstHeld = drainVolBytes
 
 	w.epochs = epoch.NewStore(s.Store)
 	if _, err := w.epochs.Init(ctx, w.volID, 1); err != nil {
@@ -216,7 +210,7 @@ func (w *drainWorld) pass() (crashed bool, err error) {
 
 // disarm removes every fault, so the resumed pass runs clean.
 func (w *drainWorld) disarm() {
-	w.md.onCommit, w.md.onUpdate, w.md.onLease = nil, nil, nil
+	w.md.onUpdate, w.md.onLease = nil, nil
 	w.store.onPut = nil
 }
 
@@ -233,8 +227,10 @@ func drainBoundaries() []drainBoundary {
 	crash := func(at string) { panic(crashHere{at: at}) }
 	return []drainBoundary{
 		{"after reserving the destination", func(w *drainWorld) {
-			w.md.onCommit = func(hostID string, delta int64, done bool) {
-				if done && hostID == w.dst && delta > 0 {
+			// The reservation is the progress entry that names the destination
+			// (ADR-0017), so this is the far side of that write.
+			w.md.onUpdate = func(op metadata.Operation, done bool) {
+				if done && strings.Contains(string(op.CurrentState), w.dst) {
 					crash("reserve")
 				}
 			}
@@ -268,9 +264,12 @@ func drainBoundaries() []drainBoundary {
 				}
 			}
 		}},
-		{"after releasing the source", func(w *drainWorld) {
-			w.md.onCommit = func(hostID string, delta int64, done bool) {
-				if done && hostID == w.src && delta < 0 {
+		{"after the volume became the destination's", func(w *drainWorld) {
+			// Where the source's release used to be. There is no release any more —
+			// the source stops being charged because the volume stopped being its
+			// primary — so the boundary is the write that records the promotion.
+			w.md.onUpdate = func(op metadata.Operation, done bool) {
+				if done && strings.Contains(string(op.CurrentState), `"PROMOTED"`) {
 					crash("release")
 				}
 			}
@@ -291,9 +290,9 @@ func drainBoundaries() []drainBoundary {
 // step of move() in turn, resumed under the same operation id, and then asked for
 // all four claims at once:
 //
-//   - the source's committed bytes moved by exactly one volume size — never twice
-//     (which eats another volume's reservation, or underflows and wedges the drain
-//     on every later pass), never not at all;
+//   - the accounting moved by exactly one volume size: the source is charged for
+//     nothing and the destination for its own volume plus the moved one — never
+//     twice, never not at all;
 //   - exactly one epoch was granted, in PostgreSQL and in the S3 epoch object;
 //   - exactly one epoch-boundary object exists, with the PrevEpoch and RecoveredUpTo
 //     the move actually established — the object is create-only, so a second,
@@ -350,17 +349,16 @@ func (w *drainWorld) assertMovedExactlyOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if want := w.srcHeld - drainVolBytes; src.NVMeCommittedBytes != want {
-		return fmt.Errorf("source committed %d bytes, want %d (exactly one release of %d)",
-			src.NVMeCommittedBytes, want, drainVolBytes)
+	if src.NVMeCommittedBytes != 0 {
+		return fmt.Errorf("the evacuated source is still charged %d bytes", src.NVMeCommittedBytes)
 	}
 	dst, err := w.md.GetHost(ctx, w.dst)
 	if err != nil {
 		return err
 	}
-	if dst.NVMeCommittedBytes != drainVolBytes {
-		return fmt.Errorf("destination committed %d bytes, want %d (exactly one reservation)",
-			dst.NVMeCommittedBytes, drainVolBytes)
+	if want := w.dstHeld + drainVolBytes; dst.NVMeCommittedBytes != want {
+		return fmt.Errorf("destination committed %d bytes, want %d (its own volume plus exactly one move)",
+			dst.NVMeCommittedBytes, want)
 	}
 
 	v, err := w.md.GetVolume(ctx, w.volID)

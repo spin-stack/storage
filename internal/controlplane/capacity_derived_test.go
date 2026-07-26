@@ -158,8 +158,8 @@ func TestCommittedCapacityIsDerivedFromState(t *testing.T) {
 // identity holds on every host after every pass. There is no number to reconcile, so
 // there is no interleaving that can break it.
 func TestCommittedCapacityHoldsUnderAnyInterleaving(t *testing.T) {
+	ctx := t.Context()
 	rapid.Check(t, func(rt *rapid.T) {
-		ctx := context.Background()
 		w := newDrainWorld(t, 10*volSize)
 
 		for i := range rapid.IntRange(1, 6).Draw(rt, "passes") {

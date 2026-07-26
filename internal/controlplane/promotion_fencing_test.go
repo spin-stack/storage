@@ -69,7 +69,7 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 		VolumeID: fenceVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: fenceHostA,
 		DEKWrapped: []byte{1}, KEKID: "k",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := epochs.Init(ctx, fenceVol, 1); err != nil {

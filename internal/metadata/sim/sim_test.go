@@ -40,7 +40,7 @@ func TestZombieCPCannotMutate(t *testing.T) {
 
 	termA, _ := s.AcquireLeadership(ctx, "cp-a")
 	// Set up a volume under cp-a.
-	if err := s.CreateVolume(ctx, termA, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}); err != nil {
+	if err := s.CreateVolume(ctx, termA, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -76,7 +76,7 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 			return s.RenewHostLease(ctx, term, "h", 10)
 		}},
 		{"CreateVolume", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", State: lifecycle.VolumeActive})
+			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", State: lifecycle.VolumeActive}, nil)
 		}},
 		{"BumpVolumeEpoch", func(s *sim.Store, term int64) error {
 			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h", 0)
@@ -149,7 +149,7 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 		t.Fatalf("GetHost: %+v err=%v", h, err)
 	}
 
-	if err := s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive}); err != nil {
+	if err := s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateWatermarks(ctx, term, "v1", 10, 5, 3); err != nil {
@@ -199,12 +199,12 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 			return s.SetHostState(ctx, term, "h", lifecycle.HostState("PUBLISHED"))
 		}},
 		{"CreateVolume with the zero state", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", Durability: lifecycle.DurabilityRemote})
+			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", Durability: lifecycle.DurabilityRemote}, nil)
 		}},
 		{"CreateVolume with an unknown durability", func(s *sim.Store, term int64) error {
 			return s.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: "v", State: lifecycle.VolumeActive, Durability: lifecycle.Durability("cheap"),
-			})
+			}, nil)
 		}},
 		{"CreateSnapshot with an unknown state", func(s *sim.Store, term int64) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: "s", State: lifecycle.SnapshotState("DONE")})
@@ -248,20 +248,20 @@ func TestUpdateOperationEnforcesThePhaseLifecycle(t *testing.T) {
 	}
 
 	op.Phase = lifecycle.OpRunning
-	if err := s.UpdateOperation(ctx, term, op); err != nil {
+	if err := s.UpdateOperation(ctx, term, op, nil); err != nil {
 		t.Fatalf("PENDING -> RUNNING: %v", err)
 	}
 	op.Phase = lifecycle.OpSucceeded
-	if err := s.UpdateOperation(ctx, term, op); err != nil {
+	if err := s.UpdateOperation(ctx, term, op, nil); err != nil {
 		t.Fatalf("RUNNING -> SUCCEEDED: %v", err)
 	}
 
 	op.Phase = lifecycle.OpRunning
-	if err := s.UpdateOperation(ctx, term, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := s.UpdateOperation(ctx, term, op, nil); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
 	}
 	op.Phase = lifecycle.OpCanceling
-	if err := s.UpdateOperation(ctx, term, op); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := s.UpdateOperation(ctx, term, op, nil); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("SUCCEEDED -> CANCELING: want ErrInvalidTransition, got %v", err)
 	}
 	got, _ := s.GetOperation(ctx, "op-1")
@@ -323,53 +323,79 @@ func TestSetHostState(t *testing.T) {
 	}
 }
 
-// TestCommitHostCapacity is the §28.2 accounting: reservations add, releases
-// subtract, and committed bytes can never go negative.
-func TestCommitHostCapacity(t *testing.T) {
+// TestDerivedCapacity is the §28.2 accounting after ADR-0017: the sim's committed
+// bytes are a function of the volumes and in-flight plans that name the host, so
+// there is nothing to reserve, nothing to release, and nothing that can be applied
+// twice. What is left to check here is that the sim sums the same two terms the
+// host_committed_bytes view sums in SQL (the shared contract pins the semantics for
+// both stores; this is the sim's own arithmetic).
+func TestDerivedCapacity(t *testing.T) {
 	ctx := t.Context()
 	s := newStore()
 	term, _ := s.AcquireLeadership(ctx, "cp")
-	if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h1", State: lifecycle.HostActive, NVMeTotalBytes: 1000}); err != nil {
+	for _, h := range []string{"h1", "h2"} {
+		if err := s.UpsertHost(ctx, term, metadata.Host{HostID: h, State: lifecycle.HostActive, NVMeTotalBytes: 1000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: "v1", SizeBytes: 400, State: lifecycle.VolumeActive, PrimaryHostID: "h1",
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
+	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 400 {
+		t.Fatalf("committed = %d, want 400 (the volume it holds)", h.NVMeCommittedBytes)
+	}
+	if h, _ := s.GetHost(ctx, "h2"); h.NVMeCommittedBytes != 0 {
+		t.Fatalf("an empty host committed %d", h.NVMeCommittedBytes)
+	}
 
-	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: 400, Limit: 1000}); err != nil {
+	// A plan in flight charges its destination before the volume is primary there.
+	if _, err := s.RecordOperation(ctx, term, metadata.Operation{
+		OperationID: "op1", Kind: lifecycle.OpDrain, HostID: "h1", Phase: lifecycle.OpRunning,
+		DesiredState: []byte(`{}`),
+		CurrentState: []byte(`{"volumes":[{"volume_id":"v1","stage":"MOVING","to_host":"h2"}]}`),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: 300, Limit: 1000}); err != nil {
+	if h, _ := s.GetHost(ctx, "h2"); h.NVMeCommittedBytes != 400 {
+		t.Fatalf("destination committed = %d, want 400 (in flight to it)", h.NVMeCommittedBytes)
+	}
+
+	// Once it is primary there the plan stops charging: exactly one, never two.
+	if _, err := s.BumpVolumeEpoch(ctx, term, "v1", "h2", 0); err != nil {
 		t.Fatal(err)
 	}
-	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 700 {
-		t.Fatalf("committed = %d, want 700", h.NVMeCommittedBytes)
+	if h, _ := s.GetHost(ctx, "h2"); h.NVMeCommittedBytes != 400 {
+		t.Fatalf("destination committed = %d, want 400 — charged twice", h.NVMeCommittedBytes)
+	}
+	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 0 {
+		t.Fatalf("source committed = %d, want 0 — the move itself is the release", h.NVMeCommittedBytes)
 	}
 
-	// Release.
-	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: -400}); err != nil {
-		t.Fatal(err)
+	// The §28.2 bound is a predicate of the write that places a volume.
+	err := s.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: "v2", SizeBytes: 700, State: lifecycle.VolumeActive, PrimaryHostID: "h2",
+	}, &metadata.CapacityBound{HostID: "h2", AddBytes: 700, Limit: 1000})
+	if !errors.Is(err, metadata.ErrCapacityExceeded) {
+		t.Fatalf("past the bound: want ErrCapacityExceeded, got %v", err)
 	}
-	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 300 {
-		t.Fatalf("committed after release = %d, want 300", h.NVMeCommittedBytes)
+	if _, gerr := s.GetVolume(ctx, "v2"); !errors.Is(gerr, metadata.ErrNotFound) {
+		t.Fatalf("a refused placement wrote the volume: %v", gerr)
+	}
+	if err := s.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: "v2", SizeBytes: 600, State: lifecycle.VolumeActive, PrimaryHostID: "h2",
+	}, &metadata.CapacityBound{HostID: "h2", AddBytes: 600, Limit: 1000}); err != nil {
+		t.Fatalf("exactly at the bound was refused: %v", err)
 	}
 
-	// Releasing more than is committed is a bug, not a silent negative.
-	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: -301}); !errors.Is(err, metadata.ErrCapacityUnderflow) {
-		t.Fatalf("underflow: want ErrCapacityUnderflow, got %v", err)
+	// A bound naming a host nobody registered is ErrNotFound, not a silent pass.
+	if err := s.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: "v3", SizeBytes: 1, State: lifecycle.VolumeActive,
+	}, &metadata.CapacityBound{HostID: "absent", AddBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("bound on a missing host: want ErrNotFound, got %v", err)
 	}
-	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 300 {
-		t.Fatalf("failed release still mutated committed to %d", h.NVMeCommittedBytes)
-	}
-
-	// Term-guarded and existence-checked.
-	stale := term
-	_, _ = s.AcquireLeadership(ctx, "cp-b")
-	if err := s.CommitHostCapacity(ctx, stale, "h1", metadata.CapacityChange{DeltaBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrStaleTerm) {
-		t.Fatalf("stale commit: want ErrStaleTerm, got %v", err)
-	}
-	newTerm, _ := s.AcquireLeadership(ctx, "cp-c")
-	if err := s.CommitHostCapacity(ctx, newTerm, "absent", metadata.CapacityChange{DeltaBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("missing host: want ErrNotFound, got %v", err)
-	}
-	if err := s.SetHostState(ctx, newTerm, "absent", lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
+	if err := s.SetHostState(ctx, term, "absent", lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("missing host SetHostState: want ErrNotFound, got %v", err)
 	}
 }
@@ -388,7 +414,7 @@ func TestListVolumesByHost(t *testing.T) {
 		{VolumeID: "v-d", State: lifecycle.VolumeActive}, // unattached
 	}
 	for _, v := range vols {
-		if err := s.CreateVolume(ctx, term, v); err != nil {
+		if err := s.CreateVolume(ctx, term, v, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

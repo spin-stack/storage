@@ -104,14 +104,14 @@ func (s *Store) UpsertHost(_ context.Context, term int64, h metadata.Host) error
 	if err := s.checkTerm(term); err != nil {
 		return err
 	}
-	// A heartbeat refreshes what the host knows about itself. The fleet state and
-	// the committed-capacity ledger are the Control Plane's (§28.1/§28.2): letting a
-	// heartbeat carry them un-cordons a host that is being drained and zeroes the
-	// ledger the drain is about to release against.
+	// A heartbeat refreshes what the host knows about itself. The fleet state is the
+	// Control Plane's (§28.1): letting a heartbeat carry it un-cordons a host that
+	// is being drained. Committed capacity is derived (ADR-0017), so whatever the
+	// caller put in the field is dropped rather than stored.
 	if cur, exists := s.hosts[h.HostID]; exists {
 		h.State = cur.State
-		h.NVMeCommittedBytes = cur.NVMeCommittedBytes
 	}
+	h.NVMeCommittedBytes = 0
 	h.LastHeartbeat = s.now()
 	s.hosts[h.HostID] = h
 	return nil
@@ -124,6 +124,7 @@ func (s *Store) GetHost(_ context.Context, hostID string) (metadata.Host, error)
 	if !ok {
 		return metadata.Host{}, metadata.ErrNotFound
 	}
+	h.NVMeCommittedBytes = s.committedLocked(hostID)
 	return h, nil
 }
 
@@ -131,11 +132,60 @@ func (s *Store) ListHosts(_ context.Context) ([]metadata.Host, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	hosts := make([]metadata.Host, 0, len(s.hosts))
-	for _, h := range s.hosts {
+	for id, h := range s.hosts {
+		h.NVMeCommittedBytes = s.committedLocked(id)
 		hosts = append(hosts, h)
 	}
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].HostID < hosts[j].HostID })
 	return hosts, nil
+}
+
+// committedLocked is ADR-0017's derived §28.2 capacity, computed the same way the
+// host_committed_bytes view computes it in SQL: what the host holds, plus what is in
+// flight to it and not there yet. Nothing is stored, so there is no delta to apply
+// and nothing to apply twice — a resumed pass computes the same answer as the pass
+// that crashed.
+func (s *Store) committedLocked(hostID string) int64 {
+	var total int64
+	primary := map[string]bool{}
+	for _, v := range s.vols {
+		if v.PrimaryHostID == hostID {
+			total += v.SizeBytes
+			primary[v.VolumeID] = true
+		}
+	}
+	for _, op := range s.ops {
+		if op.Phase.Terminal() {
+			continue // a finished plan reserves nothing
+		}
+		for _, r := range metadata.PlanReservations(op.CurrentState) {
+			// A volume already primary here is counted by the first term; counting
+			// the plan too would charge the destination twice for one volume.
+			if r.ToHost != hostID || !r.Reserves() || primary[r.VolumeID] {
+				continue
+			}
+			if v, ok := s.vols[r.VolumeID]; ok {
+				total += v.SizeBytes
+			}
+		}
+	}
+	return total
+}
+
+// boundLocked is the §28.2 ceiling evaluated where the write happens, against the
+// derived value as it stands before it. Nil is not a placement decision.
+func (s *Store) boundLocked(b *metadata.CapacityBound) error {
+	if b == nil {
+		return nil
+	}
+	if _, ok := s.hosts[b.HostID]; !ok {
+		return metadata.ErrNotFound
+	}
+	if after := s.committedLocked(b.HostID) + b.AddBytes; after > b.Limit {
+		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
+			metadata.ErrCapacityExceeded, b.HostID, after, b.Limit)
+	}
+	return nil
 }
 
 func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state lifecycle.HostState) error {
@@ -158,41 +208,6 @@ func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state
 		return err
 	}
 	h.State = state
-	s.hosts[hostID] = h
-	return nil
-}
-
-// CommitHostCapacity applies one change to the ledger under the lock, so the rules
-// the pg adapter states as predicates hold here for the same reason: the read and
-// the write are one step. The diagnosis order is the contract's — the expectation
-// first, because when the ledger is not where the caller last saw it, everything
-// else the caller computed from that read (the bound included) is about another
-// world; then the underflow; then the bound.
-func (s *Store) CommitHostCapacity(_ context.Context, term int64, hostID string, c metadata.CapacityChange) error {
-	if err := requireID("host", hostID); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return err
-	}
-	h, ok := s.hosts[hostID]
-	if !ok {
-		return metadata.ErrNotFound
-	}
-	after := h.NVMeCommittedBytes + c.DeltaBytes
-	switch {
-	case c.Expect != nil && *c.Expect != h.NVMeCommittedBytes:
-		return fmt.Errorf("%w: host %s holds %d committed bytes, the change expected %d",
-			metadata.ErrCapacityConflict, hostID, h.NVMeCommittedBytes, *c.Expect)
-	case after < 0:
-		return metadata.ErrCapacityUnderflow
-	case c.DeltaBytes > 0 && after > c.Limit:
-		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
-			metadata.ErrCapacityExceeded, hostID, after, c.Limit)
-	}
-	h.NVMeCommittedBytes = after
 	s.hosts[hostID] = h
 	return nil
 }
@@ -255,7 +270,7 @@ func (s *Store) GetHostLease(_ context.Context, hostID string) (metadata.HostLea
 	return l, nil
 }
 
-func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume) error {
+func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, bound *metadata.CapacityBound) error {
 	if err := requireID("volume", v.VolumeID); err != nil {
 		return err
 	}
@@ -271,6 +286,9 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	if err := s.boundLocked(bound); err != nil {
 		return err
 	}
 	if cur, exists := s.vols[v.VolumeID]; exists {
@@ -502,7 +520,7 @@ func (s *Store) RecordOperation(_ context.Context, term int64, op metadata.Opera
 	return true, nil
 }
 
-func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Operation) error {
+func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
 	if err := requireID("operation", op.OperationID); err != nil {
 		return err
 	}
@@ -519,6 +537,11 @@ func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Opera
 		return metadata.ErrNotFound
 	}
 	if err := cur.Phase.Transition(op.Phase); err != nil {
+		return err
+	}
+	// The progress about to be written is this operation's reservation, so the
+	// §28.2 bound is a predicate of the write (ADR-0017), not a check before it.
+	if err := s.boundLocked(bound); err != nil {
 		return err
 	}
 	cur.Phase, cur.CurrentState, cur.Error = op.Phase, op.CurrentState, op.Error
