@@ -45,7 +45,7 @@ state.
    allowed predecessors from the table become the SQL predicate
    (`AND state = ANY($n)`), so the check is atomic in Postgres (no read-modify-write
    race) and the same rule runs in `metadata/sim`.
-3. **Database** — `CHECK` constraints on every one of those columns (Atlas migration),
+3. **Database** — `CHECK` constraints on every one of those columns (in `schema.sql`),
    so no client, script, or manual `psql` can write a state that does not exist.
 
 Drain drops its ad-hoc phases for the generic reconciliation lifecycle

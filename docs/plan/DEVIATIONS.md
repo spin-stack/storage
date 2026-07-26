@@ -18,21 +18,6 @@ gate** (PLAN §2).
 
 ## Open
 
-### DEV-0011 — `task db:migrate:lint` cannot succeed with the pinned toolchain
-- Detected: 2026-07-26 by the wave-3 capacity increment
-- Doc section(s): none (tooling; CLAUDE.md documents the task)
-- Divergence: Atlas v1.2.3 gates `atlas migrate lint` behind Atlas Pro (`atlas login`),
-  so the task fails for everyone with an authentication notice. It is documented in
-  CLAUDE.md as one of the commands, and it is not part of `task ci`, so this has been
-  invisible: every migration so far has been authored without the unsafe-change lint
-  that the command exists to provide.
-- Severity: low (no incorrect artefact is produced; a review step is simply absent)
-- Resolution: decide between (a) authenticating in CI and keeping the task, (b) pinning
-  a pre-v0.38 Atlas for lint only, or (c) dropping the task and replacing the check
-  with explicit review rules in `schema.sql`. Until then the task carries a comment
-  saying it needs `atlas login`, so nobody reads its failure as a broken migration.
-  **Status: open.**
-
 ### DEV-0007 — Several phases marked done are partial models
 - Detected: 2026-07-25 by human review (rebaseline)
 - Doc section(s): §19, §20, §21.1, §22.3

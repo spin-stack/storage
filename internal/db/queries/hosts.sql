@@ -30,9 +30,9 @@ ON CONFLICT (host_id) DO UPDATE
 --
 -- This is the canonical derivation; three other queries repeat it (ListHosts below,
 -- and the bound predicates in volumes.sql and operations.sql). schema.sql says why
--- it is not a view: the pinned Atlas Community refuses to diff a schema containing
--- one, and a licensed toolchain — or a hand-written migration — is too high a price
--- for sugar over a sum.
+-- it is not a view: the tool that refused one is gone (ADR-0019), and moving the
+-- derivation into a view is a deliberate follow-up rather than a rider on the tool
+-- change. Until then the copies stay; if you change one, change all four.
 --
 --   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
 --                   + Σ size_bytes reserved by in-flight operation plans targeting it
