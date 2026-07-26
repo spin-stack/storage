@@ -117,13 +117,13 @@ func TestASubstitutedPolicyCanBreakWatermarkOrder(t *testing.T) {
 		t.Fatalf("the substituted policy was not consulted: %v", err)
 	}
 	w := l.Watermarks()
-	if !(w.Published > w.Durable) {
+	if w.Published <= w.Durable {
 		t.Fatalf("watermarks %+v still satisfy published <= durable; the seam changed nothing", w)
 	}
 	if err := l.AdvanceDurable(50); err != nil {
 		t.Fatalf("the substituted policy was not consulted on durable: %v", err)
 	}
-	if w := l.Watermarks(); !(w.Durable > w.Local) {
+	if w := l.Watermarks(); w.Durable <= w.Local {
 		t.Fatalf("watermarks %+v still satisfy durable <= local", w)
 	}
 }
@@ -197,5 +197,30 @@ func TestStrictOrderIsUsableStandalone(t *testing.T) {
 	}
 	if err := p.AllowTruncate(4, w); !errors.Is(err, wal.ErrTruncateAboveDurable) {
 		t.Fatalf("truncate above the published point: %v", err)
+	}
+}
+
+// TestTheZeroValueLogIsStrict: the Log's zero value must not be a way to lose the
+// invariants either. Nothing constructs one today, but a struct literal added in a
+// future refactor would silently arrive with a nil policy.
+func TestTheZeroValueLogIsStrict(t *testing.T) {
+	var l wal.Log
+	if err := l.AdvanceDurable(1); !errors.Is(err, wal.ErrWatermarkOrder) {
+		t.Fatalf("durable 1 on an empty log = %v, want ErrWatermarkOrder", err)
+	}
+	if err := l.AdvancePublished(1); !errors.Is(err, wal.ErrWatermarkOrder) {
+		t.Fatalf("published 1 on an empty log = %v, want ErrWatermarkOrder", err)
+	}
+	if err := l.TruncateLocal(1); !errors.Is(err, wal.ErrTruncateAboveDurable) {
+		t.Fatalf("truncate to 1 on an empty log = %v, want ErrTruncateAboveDurable", err)
+	}
+	if got := l.Degraded(); got != wal.DegradedNone {
+		t.Fatalf("the zero value reports %q, want %q", got, wal.DegradedNone)
+	}
+	if got := wal.Degradation("").String(); got != "NONE" {
+		t.Fatalf("the zero Degradation renders as %q, want \"NONE\"", got)
+	}
+	if got := wal.DegradedOutOfSpace.String(); got != "OUT_OF_SPACE" {
+		t.Fatalf("DegradedOutOfSpace renders as %q", got)
 	}
 }

@@ -263,3 +263,16 @@ func TestOutOfSpaceClassifierIsInjectable(t *testing.T) {
 		})
 	}
 }
+
+// TestNilClassifierRestoresTheDefault: SetOutOfSpace(nil) must restore
+// DefaultOutOfSpace, not leave the log unable to recognise a full device at all.
+func TestNilClassifierRestoresTheDefault(t *testing.T) {
+	const name = "wal/nil-classifier.wal"
+	l, _ := enospcLog(t, name)
+	l.SetOutOfSpace(func(error) bool { return false })
+	l.SetOutOfSpace(nil)
+	fillTheDevice(t, l)
+	if got := l.Degraded(); got != wal.DegradedOutOfSpace {
+		t.Fatalf("after SetOutOfSpace(nil) the log reports %q, want %q", got, wal.DegradedOutOfSpace)
+	}
+}
