@@ -55,8 +55,19 @@ type MandatoryScenario struct {
 	Run  Scenario
 }
 
-// MandatoryScenarios is the set the `task dst` gate runs.
+// MandatoryScenarios is the set the `task dst` gate runs. It is assembled from the
+// per-area lists (core here, then drain, recovery and harness) so two increments can
+// add scenarios without both editing one literal.
 func MandatoryScenarios() []MandatoryScenario {
+	all := coreScenarios()
+	all = append(all, drainScenarios()...)
+	all = append(all, recoveryScenarios()...)
+	all = append(all, harnessScenarios()...)
+	return all
+}
+
+// coreScenarios are the §25.1 entries that predate the split by area.
+func coreScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "lost-put-idempotent-retry", Run: scenarioLostPutIdempotent},
 		{Name: "crash-around-fdatasync", Run: scenarioCrashAroundFdatasync},

@@ -244,6 +244,17 @@ func (c *BackgroundYieldsChecker) Check() error { return c.violation }
 
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
+	all := coreCheckers()
+	all = append(all, drainCheckers()...)
+	all = append(all, recoveryCheckers()...)
+	all = append(all, harnessCheckers()...)
+	return all
+}
+
+// coreCheckers are the checkers that predate the split by area; new ones belong in
+// the per-area file (scenarios_drain.go, scenarios_recovery.go, scenarios_harness.go)
+// so two increments never edit the same list.
+func coreCheckers() []Checker {
 	return []Checker{
 		NewMonotonicClockChecker(),
 		NewNoPermanentDeleteChecker(),
