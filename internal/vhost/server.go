@@ -84,8 +84,20 @@ func (s *Server) Device() *Device {
 }
 
 // Serve accepts connections until ctx is done or the listener is closed.
+//
+// Accept is a blocking call on a real Unix socket and no context reaches into
+// it, so cancellation is wired to the listener: closing it is what makes the
+// pending Accept return, and every Listener implementation already has to make
+// Close do that. Without this the Agent could not be shut down while idle, which
+// is most of the time.
 func (s *Server) Serve(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, func() { _ = s.ln.Close() })
+	defer stop()
+
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		conn, err := s.ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {

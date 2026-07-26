@@ -22,12 +22,22 @@ import (
 // count and blocks at zero, and a write adds to it. Wrapping them in an os.File
 // puts them under the Go runtime's poller, which is what makes Wait cancellable
 // — a blocking raw read would have to be interrupted with a signal.
+// The mutex guards `closed` and the read buffer, and is never held across the
+// blocking read. Holding it there is the shape of the bug this used to have:
+// Close needs the same mutex, so a queue loop parked in Wait could not be
+// stopped by closing its kick — which is exactly how the session's shutdown path
+// stops it.
 type EventFD struct {
 	f *os.File
 
 	mu     sync.Mutex
 	closed bool
-	buf    [8]byte
+
+	// readBuf is only ever touched by the single Wait a queue loop runs; it is
+	// its own field rather than a stack slot so a wait per kick does not
+	// allocate.
+	rmu     sync.Mutex
+	readBuf [8]byte
 }
 
 // deadlineInThePast expires a pending read immediately. It is a fixed instant
@@ -67,6 +77,11 @@ func NewEventFD(f *os.File) (vhost.EventFD, error) {
 
 // Wait blocks until the descriptor is signalled. It returns io.EOF once the
 // EventFD is closed, which is how the queue loop learns the session is over.
+//
+// Two things can end a wait, and neither may be blocked by the other: the
+// context (a deadline in the past, which the runtime poller turns into an
+// immediate error) and Close (which closes the descriptor out from under the
+// read). Both act on the *file*, not on a lock this function holds.
 func (e *EventFD) Wait(ctx context.Context) error {
 	// Cancellation goes through the deadline rather than a goroutine per wait:
 	// a queue loop waits once per kick, and a goroutine per kick would be a
@@ -74,21 +89,32 @@ func (e *EventFD) Wait(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() { _ = e.f.SetReadDeadline(deadlineNow()) })
 	defer stop()
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
+	if e.isClosed() {
 		return io.EOF
 	}
-	if _, err := io.ReadFull(e.f, e.buf[:]); err != nil {
+	e.rmu.Lock()
+	defer e.rmu.Unlock()
+	if _, err := io.ReadFull(e.f, e.readBuf[:]); err != nil {
 		if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return io.EOF
 		}
-		if errors.Is(err, os.ErrDeadlineExceeded) && ctx.Err() != nil {
-			return ctx.Err()
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// The deadline fired without the context being done: Close set it
+			// on its way to closing the descriptor.
+			return io.EOF
 		}
 		return fmt.Errorf("hostio: waiting on notification descriptor: %w", err)
 	}
 	return nil
+}
+
+func (e *EventFD) isClosed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.closed
 }
 
 // Signal wakes the other side. The value is 1 because an eventfd accumulates:
@@ -104,6 +130,11 @@ func (e *EventFD) Signal() error {
 }
 
 // Close releases the descriptor and unblocks a Wait.
+//
+// The deadline goes first. Closing an os.File does wake a read blocked on the
+// runtime poller, but only a descriptor that was registered with it — and the
+// deadline costs nothing and covers the case where it was not. Whichever of the
+// two lands, the waiter sees io.EOF.
 func (e *EventFD) Close() error {
 	e.mu.Lock()
 	already := e.closed
@@ -112,6 +143,7 @@ func (e *EventFD) Close() error {
 	if already {
 		return nil
 	}
+	_ = e.f.SetReadDeadline(deadlineNow())
 	return e.f.Close()
 }
 

@@ -246,8 +246,14 @@ func (d *Device) dispatch(ctx context.Context, m Message) (*Message, error) {
 
 	case ReqSetConfig:
 		// The guest may not resize or reconfigure the device from inside.
-		// REPLY_ACK turns this into a visible refusal.
-		return m.replyU64(1), nil
+		// REPLY_ACK turns this into a visible refusal — but only when the
+		// front-end asked for one. vhost-user frames by header alone, so a reply
+		// nobody is reading is read as the front of the next request, and the
+		// socket never recovers.
+		if m.NeedsReply() && has(d.protocolMask(), protocolReplyAck) {
+			return m.replyU64(1), nil
+		}
+		return nil, nil
 
 	case ReqSetMemTable:
 		return nil, d.setMemTable(m)
@@ -324,17 +330,35 @@ func (d *Device) setFeatures(v uint64) error {
 // feature bit means for every field in it.
 const blkConfigSize = 60
 
+// MaxConfigSize is VHOST_USER_MAX_CONFIG_SIZE: the largest configuration space
+// the protocol allows a GET_CONFIG/SET_CONFIG to describe. It is the bound on
+// the peer-controlled offset and size, and it is deliberately the protocol's
+// number rather than this device's 60 bytes — see getConfig.
+const MaxConfigSize = 256
+
 func (d *Device) getConfig(m Message) (*Message, error) {
 	req, err := decodeConfig(m)
 	if err != nil {
 		return nil, err
 	}
-	if req.Size == 0 || req.Size > MaxPayload-configHeaderSize {
-		return nil, fmt.Errorf("%w: GET_CONFIG asks for %d bytes", ErrProtocol, req.Size)
+	// Both fields are peer-controlled uint32s inside a 12-byte message, so the
+	// window they describe is bounded by the protocol's own maximum before it is
+	// allowed to size an allocation. Sizing the buffer from offset+size instead —
+	// as this did — turns a GET_CONFIG of four bytes at 0xffff_f000 into a
+	// four-gigabyte allocation.
+	//
+	// The bound is MaxConfigSize, not the 60 bytes this backend fills: QEMU asks
+	// for whatever its own struct virtio_blk_config is, and that struct grows
+	// between QEMU versions. Refusing the excess would break against a front-end
+	// newer than the one we tested; answering it with zeros is what an unset
+	// feature bit means for every field past our 60.
+	if req.Size == 0 || req.Offset >= MaxConfigSize || req.Size > MaxConfigSize-req.Offset {
+		return nil, fmt.Errorf("%w: GET_CONFIG asks for %d bytes at offset %d; the configuration space is at most %d bytes",
+			ErrProtocol, req.Size, req.Offset, MaxConfigSize)
 	}
-	full := make([]byte, max(int(req.Size)+int(req.Offset), blkConfigSize))
+	full := make([]byte, MaxConfigSize)
 	d.fillConfig(full)
-	region := full[req.Offset : int(req.Offset)+int(req.Size)]
+	region := full[req.Offset : req.Offset+req.Size]
 	return m.reply(encodeConfig(configRequest{Offset: req.Offset, Size: req.Size, Region: region})), nil
 }
 

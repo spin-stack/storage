@@ -436,8 +436,13 @@ func TestSetConfigIsRefusedOnlyWhenTheFrontEndAsked(t *testing.T) {
 // TestGetConfigRejectsAnOffsetOutsideTheConfigSpace. The offset is an attacker-
 // or bug-controlled uint32 in a 12-byte message, and the reply buffer used to be
 // sized offset+size: a front-end asking for 4 bytes at 0xffff_f000 made this
-// backend allocate four gigabytes. virtio-blk's configuration space is 60 bytes,
-// so anything past it is a request that cannot be honoured, not a large one.
+// backend allocate four gigabytes.
+//
+// The bound is the protocol's VHOST_USER_MAX_CONFIG_SIZE, not the 60 bytes this
+// backend fills. Requests past 60 must still be *answered*, with zeros: QEMU
+// asks for the size of its own struct virtio_blk_config, and that struct grows
+// between QEMU versions. QEMU 11.0.2 asks for 60 (asserted in the integration
+// lane), so the cases past it are the compatibility guarantee, not decoration.
 func TestGetConfigRejectsAnOffsetOutsideTheConfigSpace(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -447,9 +452,12 @@ func TestGetConfigRejectsAnOffsetOutsideTheConfigSpace(t *testing.T) {
 	}{
 		{name: "the whole config space", size: blkConfigSize, wantRegionSize: blkConfigSize},
 		{name: "a field in the middle", offset: 20, size: 4, wantRegionSize: 4},
-		{name: "the last byte", offset: blkConfigSize - 1, size: 1, wantRegionSize: 1},
-		{name: "one byte past the end", offset: blkConfigSize, size: 1, wantErr: true},
-		{name: "a window straddling the end", offset: blkConfigSize - 2, size: 4, wantErr: true},
+		{name: "the last byte this backend fills", offset: blkConfigSize - 1, size: 1, wantRegionSize: 1},
+		{name: "a newer front-end's larger struct", size: blkConfigSize + 16, wantRegionSize: blkConfigSize + 16},
+		{name: "a window straddling what we fill", offset: blkConfigSize - 2, size: 4, wantRegionSize: 4},
+		{name: "the whole protocol maximum", size: MaxConfigSize, wantRegionSize: MaxConfigSize},
+		{name: "one byte past the protocol maximum", offset: MaxConfigSize, size: 1, wantErr: true},
+		{name: "a window straddling the protocol maximum", offset: MaxConfigSize - 2, size: 4, wantErr: true},
 		{name: "an offset that would allocate the host", offset: 0xffff_f000, size: 4, wantErr: true},
 		{name: "a size that would allocate the host", size: MaxPayload, wantErr: true},
 		{name: "an empty window", size: 0, wantErr: true},
