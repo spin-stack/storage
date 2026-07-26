@@ -32,11 +32,16 @@ import (
 // reality, and each is injected into the simulated I/O or into how the code under test
 // is built — never into the code itself.
 //
-// One checker has no such proof yet, because inverting it needs a seam in production
-// code that does not exist. It keeps a literal-event proof, is grouped separately below
-// with the missing seam named, and is counted by
-// TestPlantedBugCoverageIsNotSilentlyWeakened so the gap is visible in the source
-// rather than implied by its absence.
+// Every checker now has one. TestPlantedBugCoverageIsNotSilentlyWeakened pins the
+// count, so a checker quietly downgraded to a hand-written Emit fails there rather than
+// disappearing into the absence of a test.
+//
+// Two of them are planted at a seam rather than at an I/O fault: INV-03's ordering
+// rules and INV-17's arbitration are comparisons over numbers held in memory, and no
+// disk, clock or object-store fault changes their answer. Those plants substitute one
+// named policy (wal.OrderPolicy) or omit one constructor argument (the scheduler a
+// background consumer is handed), which is how both invariants are actually lost —
+// never by editing the code under test.
 
 // Planted-bug outcomes. A behavioural planted bug also trips the scenario's own
 // assertions; these name what went wrong for a reader of a failing run.
@@ -206,21 +211,17 @@ func TestPlantedBugMonotonicClock(t *testing.T) {
 	plantedBug(t, 777, NewMonotonicClockChecker(), "monotonic-clock", sc(9*time.Second))
 }
 
-// ---------------------------------------------------------------------------
-// Literal-event proofs: the checker is proven to read the field, but nothing in the
-// simulation can produce the event, because inverting the behaviour needs a seam in
-// production code that does not exist. Each names the missing seam.
-// ---------------------------------------------------------------------------
+// publishAnything is the one ordering rule this plant removes: published may move
+// anywhere, durable and truncation stay exactly as production has them (wal.StrictOrder
+// is zero-size, so embedding it keeps the other two rules verbatim rather than
+// reimplementing them here).
+//
+// One rule, not three. A Log with no rules at all would prove nothing about which
+// check the checker depends on, and a checker that only fires when everything is off
+// is not a regression test for anything.
+type publishAnything struct{ wal.StrictOrder }
 
-// INV-03: published <= durable <= local. wal.Log enforces the ordering internally
-// (ErrWatermarkOrder) and exposes no way to set the three independently, so no I/O
-// fault can produce this event. Needs a seam in internal/wal.
-func TestPlantedBugWatermarkOrder(t *testing.T) {
-	plantedBug(t, 11, NewWatermarkOrderChecker(), "watermark-order", func(s *Sim) error {
-		s.Emit(Event{Kind: EventWatermark, Published: 9, Durable: 3, Local: 5})
-		return nil
-	})
-}
+func (publishAnything) AllowPublished(uint64, wal.Watermarks) error { return nil }
 
 // publishedAheadOfDurable is INV-03 where it costs something. A log holds three
 // records and has ACKed two of them: local=3, durable=2, published=0. Advancing
@@ -267,6 +268,7 @@ func publishedAheadOfDurable(relax bool) Scenario {
 		}
 
 		if relax {
+			l.SetOrderPolicy(publishAnything{})
 			s.Emit(Event{Kind: EventFault, Msg: "the published watermark stopped being checked against durable"})
 		}
 		// What a checkpoint's second step does, for a checkpoint that covers a record
@@ -573,7 +575,8 @@ const (
 	// code violate the invariant, and the checker catches it through a real scenario.
 	proofBehavioural proofKind = iota
 	// proofLiteral: only the event is planted. The checker is proven to read the
-	// field; nothing proves a real run could ever set it.
+	// field; nothing proves a real run could ever set it. No checker is here now; the
+	// kind stays so a new checker can be added honestly before its proof exists.
 	proofLiteral
 )
 
@@ -589,7 +592,7 @@ var plantedProofs = map[string]proofKind{
 	"promotion-fencing-wait":      proofBehavioural,
 	"no-truncate-above-published": proofBehavioural,
 	"background-yields":           proofBehavioural,
-	"watermark-order":             proofLiteral,
+	"watermark-order":             proofBehavioural,
 	// Contributed by scenarios_recovery.go; proofs in planted_bug_recovery_test.go.
 	"boundary-monotonic":      proofBehavioural,
 	"durable-point-monotonic": proofBehavioural,
@@ -612,7 +615,7 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 // Converting a literal proof to a behavioural one is progress and raises this number;
 // a checker quietly downgraded to a hand-written Emit is not, and fails here.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 12
+	const wantBehavioural = 13
 	got := 0
 	for _, kind := range plantedProofs {
 		if kind == proofBehavioural {
