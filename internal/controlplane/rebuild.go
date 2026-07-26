@@ -21,6 +21,18 @@ import (
 type RebuildResult struct {
 	Volumes   int
 	Snapshots int
+	// Repaired names the volumes whose row was already there but disagreed with the
+	// object store, and was corrected from it. A PITR restore rewinds
+	// volumes.current_epoch while the epoch object still carries the epoch that was
+	// actually granted, and that row is unattachable until something reconciles it —
+	// so "already present" is not the same as "already right", and the count of rows
+	// *created* says nothing about it.
+	Repaired []string
+	// Conflicting names the volumes whose row is *ahead* of the object store. The
+	// rebuild will not rewind a fencing token from a descriptor that may itself be
+	// stale (§12.4), so it cannot repair these: they need a human, and silence about
+	// them would be the same failure Repaired exists to end.
+	Conflicting []string
 	// NotReconstructible names the tables the object store cannot speak for. They
 	// have to come back from a PostgreSQL PITR restore or from the fleet
 	// re-registering itself.
@@ -45,10 +57,9 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 		return res, err
 	}
 	for _, id := range ids {
-		present := false
-		if _, err := md.GetVolume(ctx, id); err == nil {
-			present = true // already there; its snapshots may still be missing
-		} else if !errors.Is(err, metadata.ErrNotFound) {
+		cur, err := md.GetVolume(ctx, id)
+		present := err == nil // already there; it may still disagree with S3
+		if err != nil && !errors.Is(err, metadata.ErrNotFound) {
 			return res, err
 		}
 
@@ -66,15 +77,11 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			return res, fmt.Errorf("rebuild %s epoch: %w", id, err)
 		}
 
-		if present {
-			n, err := rebuildSnapshots(ctx, store, md, term, id)
-			if err != nil {
-				return res, err
-			}
-			res.Snapshots += n
-			continue
-		}
-
+		// CreateVolume converges without regressing (§22.5): it raises the epoch and
+		// the size to what S3 says, refreshes the columns the descriptor owns, and
+		// leaves ownership and the §7 lifecycle state alone. So the same write both
+		// creates a missing row and repairs a stale one, and running it for a row
+		// that already agrees is a no-op.
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID:     d.VolumeID,
 			SizeBytes:    d.SizeBytes,
@@ -91,7 +98,17 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 		}); err != nil {
 			return res, fmt.Errorf("rebuild %s create: %w", id, err)
 		}
-		res.Volumes++
+		switch {
+		case !present:
+			res.Volumes++
+		case cur.CurrentEpoch > currentEpoch:
+			// The row claims an epoch the object store never recorded. Converging
+			// cannot fix that direction and rewinding the fence is not the rebuild's
+			// call, so name it instead of reporting a clean run.
+			res.Conflicting = append(res.Conflicting, id)
+		case cur.CurrentEpoch < currentEpoch || cur.SizeBytes < d.SizeBytes:
+			res.Repaired = append(res.Repaired, id)
+		}
 
 		n, err := rebuildSnapshots(ctx, store, md, term, id)
 		if err != nil {

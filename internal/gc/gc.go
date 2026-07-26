@@ -4,6 +4,25 @@
 // versioned bucket where a delete marker is reversible. Because the GC cannot delete,
 // a GC bug cannot cause the worst incident (INV-14). Reachability is computed from
 // the self-describing S3 layout, so a live object is never marked.
+//
+// # Precondition: LIST must be strongly consistent
+//
+// Anchors are discovered by listing the bucket, so an anchor that exists but is not
+// yet visible to LIST anchors nothing as far as this package can tell. On a store
+// with an eventually consistent LIST (objectstore.Store permits one), a snapshot
+// manifest published moments ago is invisible while the WAL objects it names — older
+// than the manifest by construction, §21.1 — are already listed and already past the
+// grace period. The sweep then marks live data, and no amount of re-listing inside
+// this package fixes it: both listings miss the same anchor.
+//
+// The sweep is therefore only sound against a backend whose LIST is strongly
+// consistent. That is not an assumption: it is certified per backend by the §6.1
+// conformance suite (integration/backend, TestListSeesAFreshPut), which is blocking
+// for every backend version. Do not run a sweep against a store that has not passed
+// it. Closing the gap *inside* this package would need a root the sweep can read by
+// deterministic key rather than by listing — the snapshot catalog, or a per-volume
+// snapshot index in the descriptor — and that is a Control-Plane/on-S3-format
+// decision, not a GC one.
 package gc
 
 import (

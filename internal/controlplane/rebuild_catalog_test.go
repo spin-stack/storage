@@ -2,6 +2,8 @@ package controlplane_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -218,5 +220,95 @@ func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
 	}
 	if _, err := md.GetSnapshot(ctx, rebuiltSnap); err != nil {
 		t.Fatalf("the snapshot was not added to the existing volume: %v", err)
+	}
+}
+
+// Finding 2 (medium). Two operators run rebuild-metadata at the same time — the
+// ordinary shape of an incident, where whoever is awake runs the runbook. Both see
+// ErrNotFound for the same volume and both INSERT; the loser used to abort with a
+// unique-violation after having written an arbitrary prefix of the catalog, and
+// returned a RebuildResult whose Volumes count reads exactly like a completed
+// rebuild. Wave 1 made CreateVolume/CreateSnapshot converge on conflict instead of
+// aborting; this pins that from the rebuild's side, which is the only place the
+// consequence is visible.
+func TestTwoConcurrentRebuildsBothComplete(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	epochs := epoch.NewStore(store)
+
+	// Enough volumes, each with a snapshot, that the two runs genuinely interleave.
+	const volumes = 8
+	type want struct{ epoch int64 }
+	expected := map[string]want{}
+	for i := range volumes {
+		volID := fmt.Sprintf("00000000-0000-7000-8000-0000000%05d", i)
+		snapID := fmt.Sprintf("00000000-0000-7000-8000-0000001%05d", i)
+		ep := int64(i + 1)
+		if err := descriptor.Write(ctx, store, descriptor.Descriptor{
+			VolumeID: volID, SizeBytes: int64(i+1) << 20, BlockSize: 65536,
+			Durability: lifecycle.DurabilityRemote, CurrentEpoch: ep, KEKID: "k", DEKWrapped: []byte{byte(i)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := epochs.Init(ctx, volID, uint64(ep)); err != nil {
+			t.Fatal(err)
+		}
+		m := snapshot.Manifest{SnapshotID: snapID, VolumeID: volID, Epoch: uint64(ep), TargetSequence: uint64(i)}
+		m.RootDigest = snapshot.Digest(m.TargetSequence, m.Objects)
+		if err := snapshot.Publish(ctx, store, m); err != nil {
+			t.Fatal(err)
+		}
+		expected[volID] = want{epoch: ep}
+	}
+
+	md := metasim.New(clk.Wall)
+	term, err := md.AcquireLeadership(ctx, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		errs  []error
+		start = make(chan struct{})
+		res   [2]controlplane.RebuildResult
+	)
+	for i := range res {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release both operators at once
+			r, err := controlplane.RebuildMetadata(ctx, store, epochs, md, term)
+			mu.Lock()
+			defer mu.Unlock()
+			res[i] = r
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for _, err := range errs {
+		t.Fatalf("a concurrent rebuild aborted part-way through the catalog: %v", err)
+	}
+	for volID, w := range expected {
+		v, err := md.GetVolume(ctx, volID)
+		if err != nil {
+			t.Fatalf("%s never made it into the catalog: %v", volID, err)
+		}
+		if v.CurrentEpoch != w.epoch {
+			t.Fatalf("%s is at epoch %d, S3 says %d", volID, v.CurrentEpoch, w.epoch)
+		}
+	}
+	// Neither run may claim more than exists: a count larger than the bucket holds
+	// reads as a rebuild that found more than it did.
+	for i, r := range res {
+		if r.Volumes > volumes || r.Snapshots > volumes {
+			t.Fatalf("run %d reported %+v, but S3 holds %d volumes", i, r, volumes)
+		}
 	}
 }

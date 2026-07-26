@@ -210,3 +210,76 @@ func TestZeroPolicyRefusesOversubscription(t *testing.T) {
 		t.Fatalf("within total: host=%q err=%v", got, err)
 	}
 }
+
+// Finding 12 (low). §28.2 declares a hard bound — committed/total may not exceed
+// MaxOversubscription — and Policy.Choose is the only place that evaluates it. Choose
+// is pure: it reads a host list and returns a name. Two callers that read the same
+// list (a drain and a clone, or two drains) both get the same destination, both
+// commit, and the destination lands past the bound with nobody having made a mistake.
+// Nothing on the write path re-checks it: CommitHostCapacity only guards against the
+// committed total going negative.
+//
+// The bound belongs in the write that reserves — one statement that both adds the
+// bytes and refuses if the result breaks the policy. Until that exists, placement at
+// least has to *expose* the check, so the reserving path has something to call and
+// the rule lives in one place instead of being re-derived by every caller.
+func TestTwoPlacementsRacingForOneDestination(t *testing.T) {
+	policy := placement.Policy{MaxOversubscription: 2.0}
+	dest := host("h-dest", lifecycle.HostActive, 100*gib, 150*gib)
+	hosts := []metadata.Host{dest}
+	req := placement.Request{SizeBytes: 40 * gib}
+
+	// Both operations read the fleet before either has committed anything.
+	first, err := policy.Choose(hosts, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := policy.Choose(hosts, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "h-dest" || second != "h-dest" {
+		t.Fatalf("placements chose %q and %q, want the only host twice", first, second)
+	}
+
+	// The first reservation lands. The second is now the one that breaks §28.2, and
+	// the policy must say so when it is re-checked against the state that exists —
+	// which is the whole point of the check being callable at commit time.
+	dest.NVMeCommittedBytes += req.SizeBytes
+	if !policy.Admits(dest, req.SizeBytes) {
+		return // correctly refused
+	}
+	t.Fatalf("committing the second placement takes %s to %d/%d bytes, past the declared %.1fx bound",
+		dest.HostID, dest.NVMeCommittedBytes+req.SizeBytes, dest.NVMeTotalBytes, policy.MaxOversubscription)
+}
+
+// TestAdmitsIsTheBoundChooseUsed: the commit-time check and the placement-time check
+// must be the same rule. Two rules is how a host ends up holding what placement
+// believed it refused.
+func TestAdmitsIsTheBoundChooseUsed(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy placement.Policy
+		host   metadata.Host
+		size   int64
+		want   bool
+	}{
+		{"exactly at the bound is admitted", placement.Policy{MaxOversubscription: 2.0}, host("h", lifecycle.HostActive, 100*gib, 150*gib), 50 * gib, true},
+		{"one byte past the bound is refused", placement.Policy{MaxOversubscription: 2.0}, host("h", lifecycle.HostActive, 100*gib, 150*gib), 50*gib + 1, false},
+		{"the zero policy is no oversubscription", placement.Policy{}, host("h", lifecycle.HostActive, 100*gib, 100*gib), 1, false},
+		{"a cordoned host admits nothing", placement.Policy{MaxOversubscription: 2.0}, host("h", lifecycle.HostCordoned, 100*gib, 0), gib, false},
+		{"a host reporting no NVMe admits nothing", placement.Policy{MaxOversubscription: 2.0}, host("h", lifecycle.HostActive, 0, 0), 1, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.policy.Admits(tc.host, tc.size); got != tc.want {
+				t.Fatalf("Admits = %v, want %v", got, tc.want)
+			}
+			// Choose must agree: it is the same bound.
+			_, err := tc.policy.Choose([]metadata.Host{tc.host}, placement.Request{SizeBytes: tc.size})
+			if chose := err == nil; chose != tc.want {
+				t.Fatalf("Choose admitted %v while Admits said %v", chose, tc.want)
+			}
+		})
+	}
+}
