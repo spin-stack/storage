@@ -973,10 +973,65 @@ func TestDrainRefusesToFinishAVolumeAnotherActorPromoted(t *testing.T) {
 	}
 }
 
-// TestTwoDrainsOfTheSameHostReleaseCapacityOnce: two operation ids planning the same
-// host while its volumes are still there. Whichever moves a volume owns its release;
-// the other must not release it again — silently consuming another volume's
-// reservation, or wedging the fleet's accounting with ErrCapacityUnderflow.
+// TestASecondDrainOfTheSameHostIsRefused: an operator retry that reaches for a fresh
+// operation id — a UI that regenerated it, a request replayed after a timeout, a
+// reconciler that lost track of the first — must not start a second evacuation of a
+// host that already has one. Two drains capture the same plan and promote the same
+// volumes; each race one of them loses leaves it holding a destination reservation
+// nobody will release, and placement under-uses that host forever (§28.2).
+//
+// The exclusion is over *live* work: once the owning operation is finished, the same
+// host may be drained again.
+func TestASecondDrainOfTheSameHostIsRefused(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+
+	// The first operation records its plan and stops on the fencing wait.
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: %v", err)
+	}
+	w.pastFencingWait()
+
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID2)
+	if !errors.Is(err, controlplane.ErrHostAlreadyDraining) {
+		t.Fatalf("want ErrHostAlreadyDraining, got %v", err)
+	}
+	if !strings.Contains(err.Error(), drainOpID) {
+		t.Fatalf("the refusal must name the operation that owns the host: %v", err)
+	}
+	// The refused request recorded nothing, reserved nothing and moved nothing.
+	if _, gerr := w.md.GetOperation(ctx, drainOpID2); !errors.Is(gerr, metadata.ErrNotFound) {
+		t.Fatalf("the refused drain recorded an operation: %v", gerr)
+	}
+	if got := w.committed(t, destHost); got != 0 {
+		t.Fatalf("the refused drain reserved %d bytes", got)
+	}
+	for _, vol := range w.vols {
+		if v, _ := w.md.GetVolume(ctx, format.UUIDString(vol)); v.PrimaryHostID != cloneHostA {
+			t.Fatalf("the refused drain moved a volume: %+v", v)
+		}
+	}
+
+	// The operation that owns the host still runs, and its own passes are never
+	// refused by its own record.
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+		t.Fatalf("the owning drain: %v", err)
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID2); err != nil {
+		t.Fatalf("a fresh drain once the first finished: %v", err)
+	}
+}
+
+// TestTwoDrainsOfTheSameHostReleaseCapacityOnce is the ledger half of the same
+// finding, kept because the refusal is only as good as what it prevents: a second
+// operation id must leave the source's committed bytes and the destination's
+// reservations exactly as the owning drain left them, whether or not it ever runs.
+//
+// It used to run both drains to completion and check that the second released
+// nothing it had not moved. That is now unreachable through Drain — the second is
+// refused before it can capture a plan — so the setup states the refusal and the
+// assertions stay: they are about the fleet's accounting, not about which of the two
+// mechanisms enforces it.
 func TestTwoDrainsOfTheSameHostReleaseCapacityOnce(t *testing.T) {
 	ctx := context.Background()
 	w := newDrainWorld(t, 10*volSize)
@@ -985,11 +1040,8 @@ func TestTwoDrainsOfTheSameHostReleaseCapacityOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Both operations capture the same plan before either can move anything.
-	for _, id := range []string{drainOpID, drainOpID2} {
-		if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, id); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
-			t.Fatalf("setup %s: %v", id, err)
-		}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: %v", err)
 	}
 	w.pastFencingWait()
 

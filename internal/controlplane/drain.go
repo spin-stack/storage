@@ -43,6 +43,12 @@ var (
 	// placement under-uses forever, so it is surfaced rather than swallowed (§28.2).
 	ErrReservationNotReleased = errors.New("controlplane: a destination reservation could not be released")
 
+	// ErrHostAlreadyDraining means another drain operation is still live for this
+	// host. Two evacuations of one host capture the same plan and promote the same
+	// volumes; the one that loses each race holds a destination reservation that
+	// nobody will ever release, and placement under-uses that host forever (§28.2).
+	ErrHostAlreadyDraining = errors.New("controlplane: the host already has a live drain operation")
+
 	// ErrDurableRegression means a move was about to record an epoch boundary below
 	// what the volume already had durable. The boundary is immutable and is what
 	// every later recovery treats as the floor, so writing one that goes backwards
