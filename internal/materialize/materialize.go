@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/spin-stack/storage/internal/checkpoint"
 	"github.com/spin-stack/storage/internal/cow"
@@ -186,13 +185,6 @@ type source struct {
 	refs     []objectRef
 }
 
-// object is one fetched WAL object with its validated sequence span.
-type object struct {
-	key         string
-	first, last uint64
-	body        []byte
-}
-
 // grant takes a background token for one object fetch. With no scheduler the caller
 // is not competing with a data path (offline restore), so it always proceeds.
 func (m *Materializer) grant() bool {
@@ -213,9 +205,15 @@ func (m *Materializer) grant() bool {
 // rewritten, torn, or restored to a wrong version after the document was published
 // leaves the digest matching — and wal.Replay stops cleanly at a torn record, which
 // is how a short view used to escape while Progress reported the header's full span.
+// The contiguity walk is over sequences, not over object boundaries, and it shares
+// both rules with recovery.DurablePrefix — one bucket must not be durable to one
+// reader and a sequence gap to the other. Overlapping objects (a restarted writer's
+// re-batch) are folded at record level, and objects that disagree about a sequence
+// they both carry are a hard failure (INV-21, §14.5) rather than a race between two
+// replays.
 func (m *Materializer) fetchAndReplay(ctx context.Context, src source) (*cow.IntervalMap, Progress, error) {
 	var prog Progress
-	objs := make([]object, 0, len(src.refs))
+	objs := make([]recovery.ObjectRun, 0, len(src.refs))
 	for _, ref := range src.refs {
 		if !m.grant() {
 			return nil, Progress{}, fmt.Errorf("%w: fetching %s", ErrThrottled, ref.key)
@@ -231,31 +229,32 @@ func (m *Materializer) fetchAndReplay(ctx context.Context, src source) (*cow.Int
 		if err != nil {
 			return nil, Progress{}, err
 		}
-		objs = append(objs, object{key: ref.key, first: span.First, last: span.Last, body: body})
+		objs = append(objs, recovery.ObjectRun{Key: ref.key, First: span.First, Last: span.Last, Body: body})
 		prog.Objects++
 		prog.Bytes += int64(len(body))
 	}
-	sort.Slice(objs, func(i, j int) bool { return objs[i].first < objs[j].first })
-
-	for i := 1; i < len(objs); i++ {
-		if objs[i].first != objs[i-1].last+1 {
-			return nil, Progress{}, fmt.Errorf("%w: %s ends at %d, %s starts at %d",
-				ErrSequenceGap, objs[i-1].key, objs[i-1].last, objs[i].key, objs[i].first)
-		}
+	recovery.SortRuns(objs)
+	if err := recovery.VerifyAgreement(objs); err != nil {
+		return nil, Progress{}, err
 	}
+
 	// A run can be perfectly contiguous and still be missing its start: an aborted
 	// GC, a partial bucket restore or a mis-scoped lifecycle rule takes the early
 	// objects, and what is left rebuilds as a volume with a hole at the front.
-	if len(objs) > 0 && objs[0].first != src.floor {
+	if len(objs) > 0 && objs[0].First != src.floor {
 		return nil, Progress{}, fmt.Errorf("%w: %s starts at %d, the epoch's first sequence is %d",
-			ErrPrefixFloor, objs[0].key, objs[0].first, src.floor)
+			ErrPrefixFloor, objs[0].Key, objs[0].First, src.floor)
+	}
+	// Unlike recovery, which stops at a gap and reports the shorter prefix, a
+	// materialization that is missing a sequence in the middle of what it was asked
+	// for must not boot: the destination would be a volume with a hole.
+	covered := recovery.ContiguousEnd(objs, src.floor)
+	if n := len(objs); n > 0 && covered < objs[n-1].Last {
+		return nil, Progress{}, fmt.Errorf("%w: the referenced objects stop at %d but %s carries %d..%d",
+			ErrSequenceGap, covered, objs[n-1].Key, objs[n-1].First, objs[n-1].Last)
 	}
 	// And the cheap cross-check that catches the rest: whatever the source claims to
 	// cover, the objects have to actually reach it.
-	covered := src.floor - 1
-	if n := len(objs); n > 0 {
-		covered = objs[n-1].last
-	}
 	if covered != src.target {
 		return nil, Progress{}, fmt.Errorf("%w: the objects cover up to %d, the source claims %d",
 			ErrCoverageShort, covered, src.target)
@@ -264,9 +263,9 @@ func (m *Materializer) fetchAndReplay(ctx context.Context, src source) (*cow.Int
 
 	view := cow.NewIntervalMap()
 	for _, o := range objs {
-		recs, err := wal.Replay(o.body[format.ObjectHeaderSize:])
+		recs, err := wal.Replay(o.Body[format.ObjectHeaderSize:])
 		if err != nil {
-			return nil, Progress{}, fmt.Errorf("materialize: replay %s: %w", o.key, err)
+			return nil, Progress{}, fmt.Errorf("materialize: replay %s: %w", o.Key, err)
 		}
 		for _, rec := range recs {
 			if err := recovery.ApplyRecord(view, m.enc, rec); err != nil {

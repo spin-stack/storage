@@ -266,6 +266,9 @@ var plantedProofs = map[string]proofKind{
 	"promotion-fencing-wait":      proofLiteral,
 	"no-truncate-above-published": proofLiteral,
 	"background-yields":           proofLiteral,
+	// Contributed by scenarios_recovery.go; proofs in planted_bug_recovery_test.go.
+	"boundary-monotonic":      proofLiteral,
+	"durable-point-monotonic": proofLiteral,
 }
 
 // TestEveryCheckerHasAPlantedBugProof fails when a checker is added without one, so
