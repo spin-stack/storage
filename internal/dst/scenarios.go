@@ -63,6 +63,7 @@ func MandatoryScenarios() []MandatoryScenario {
 	all = append(all, drainScenarios()...)
 	all = append(all, recoveryScenarios()...)
 	all = append(all, harnessScenarios()...)
+	all = append(all, gcScenarios()...)
 	return all
 }
 
