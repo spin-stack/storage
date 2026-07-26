@@ -10,6 +10,55 @@
 - **Related:** ADR-0013 (the *device* budget on a host — a different question with a
   similar name), ADR-0012 (GC anchors).
 
+## Amendment, 2026-07-26 — the snapshot digest resolves in favour of content, and INV-16 already said so
+
+The crux flagged below ("a published snapshot's manifest is immutable and its digest
+covers key strings, so squash cannot touch what a snapshot names") turns out to be a
+gap between an invariant and its implementation, not a conflict between two
+requirements. **INV-16 already permits this**, in its own words:
+
+> Compaction may replace objects with byte-for-byte logically-equal ones, never alter
+> referenced logical content.
+
+The invariant constrains the *logical content* of a published snapshot. What contradicts
+squash is `snapshot.Digest(target, objects)` — a hash over the object **key list** — so
+replacing an object with a logically-equal one breaks `DigestMatches` even though INV-16
+explicitly allows the replacement. The invariants table has said the compaction arm
+lands in Phase 10/12 since it was written; this is that arm.
+
+### Resolution: separate what a snapshot *is* from where its bytes *live*
+
+- **Identity is content.** `root_digest` becomes a Merkle root over the snapshot's
+  extent map — `(offset, length) → content hash` — not over key strings. Two byte-equal
+  snapshots have one digest whatever objects hold them, and squash *proves* it preserved
+  the snapshot: reconstruct from the new segments, recompute, and the digest must be
+  unchanged. That is a verification, not a hope, and it is the thing a manifest full of
+  key strings could never give.
+- **Placement is a generation.** Where each extent currently lives moves to a location
+  index published create-only per generation. Squash writes segments, writes the next
+  generation, and advances the pointer; a crash leaves an unreferenced generation the GC
+  collects. The current generation is found **by deterministic key** — the same
+  per-volume index the ADR-0012 amendment puts into Phase 12's format, which is now
+  carrying its third job and should be designed once.
+- **INV-16 keeps its wording and gains its checker.** `ImmutableSnapshotChecker` must
+  compare the *content digest* across a run, not the object list; today it would pass a
+  squash that silently dropped an extent and fail a squash that was perfectly correct.
+  Both halves of that are wrong.
+
+### What it costs
+
+- **A manifest format v2**, and a decision for the ones already published: recompute
+  their content digest by reading their objects once (expensive, verifiable, one-off), or
+  pin them as v1 and never squash them. Recommend recompute — a permanently
+  unsquashable class of snapshot is the failure this whole ADR exists to avoid.
+- **The pointer is the one mutable object** in a create-only design. It advances by CAS
+  on a generation that only increases (the same shape as the epoch object, §12.4), so a
+  lost response is re-resolvable and two squashers cannot both win.
+- `rebuild-metadata` must recompute the current generation from S3, like every other
+  cached number here.
+
+Everything below stands; open question 3 is answered by this amendment.
+
 ## Context
 
 A volume today has one size: `volumes.size_bytes`, the provisioned capacity a guest
