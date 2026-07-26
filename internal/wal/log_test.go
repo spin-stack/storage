@@ -13,11 +13,7 @@ func newLog(t *testing.T, limits wal.Limits) (*wal.Log, *sim.Clock, *sim.Disk) {
 	t.Helper()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, err := d.Create("wal/active.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return wal.NewLog(f, clk, [16]byte{}, 1, limits), clk, d
+	return wal.NewLog(d, "wal", clk, [16]byte{}, 1, limits), clk, d
 }
 
 func TestLogWriteReadBack(t *testing.T) {

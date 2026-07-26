@@ -214,11 +214,7 @@ func newDrainWorld(s *Sim, tag byte, fence wal.LeaseChecker) (*drainWorld, error
 		return nil, err
 	}
 
-	f, err := s.Disk.Create("wal/" + w.volID + ".wal")
-	if err != nil {
-		return nil, err
-	}
-	w.log = wal.NewLog(f, s.Clock, w.vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	w.log = wal.NewLog(s.Disk, "wal", s.Clock, w.vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	w.log.EnableRemote(wal.NewBatcher(s.Clock, w.vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5), fence)
 	if _, err := w.log.Write(0, []byte("on-source"), 0); err != nil {

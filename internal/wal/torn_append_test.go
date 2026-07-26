@@ -38,28 +38,24 @@ func TestRejectedAppendLeavesNothingBehind(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 			d := sim.NewDisk()
-			f, err := d.Create("wal/active.wal")
-			if err != nil {
-				t.Fatal(err)
-			}
-			l := wal.NewLog(f, clk, [16]byte{7}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+			vol := [16]byte{7}
+			l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 
 			if _, err := l.Write(0, []byte("accepted-01"), 0); err != nil {
 				t.Fatal(err)
 			}
-			sizeAfterAccepted, err := f.Size()
-			if err != nil {
-				t.Fatal(err)
-			}
+			sizeAfterAccepted := walSize(t, l)
 
-			d.InjectShortAppend("wal/active.wal", tc.limit)
+			// The fault is aimed at the whole WAL directory: which segment the next
+			// record lands in is the log's business, not the test's.
+			d.InjectShortAppend("wal", tc.limit)
 			if _, err := l.Write(4096, []byte("rejected-02"), 0); err == nil {
 				t.Fatal("a short append must be reported to the caller")
 			}
 
 			// Nothing of the rejected record may remain.
-			if size, err := f.Size(); err != nil || size != sizeAfterAccepted {
-				t.Fatalf("file is %d bytes after a rejected append, want %d (the bytes were left behind)",
+			if size := walSize(t, l); size != sizeAfterAccepted {
+				t.Fatalf("the WAL is %d bytes after a rejected append, want %d (the bytes were left behind)",
 					size, sizeAfterAccepted)
 			}
 
@@ -76,12 +72,7 @@ func TestRejectedAppendLeavesNothingBehind(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			size, _ := f.Size()
-			buf := make([]byte, size)
-			if _, err := f.ReadAt(buf, 0); err != nil {
-				t.Fatal(err)
-			}
-			recs, err := wal.Replay(buf)
+			recs, err := wal.ReplaySegments(d, "wal", vol, 1)
 			if err != nil {
 				t.Fatalf("replay of the repaired log: %v", err)
 			}
@@ -108,15 +99,14 @@ func TestRejectedAppendLeavesNothingBehind(t *testing.T) {
 func TestRejectedAppendDoesNotAdvanceTheWatermark(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, clk, [16]byte{7}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, [16]byte{7}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 
 	if _, err := l.Write(0, []byte("accepted"), 0); err != nil {
 		t.Fatal(err)
 	}
 	before := l.Watermarks()
 
-	d.InjectShortAppend("wal/active.wal", 60)
+	d.InjectShortAppend("wal", 60)
 	if _, err := l.Write(4096, []byte("rejected"), 0); err == nil {
 		t.Fatal("expected the short append to fail")
 	}

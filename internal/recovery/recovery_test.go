@@ -73,8 +73,7 @@ func TestRecoverReconstructsState(t *testing.T) {
 	vol := v7Vol()
 
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), leaseOK{})
 
 	_, _ = l.Write(0, []byte("hello"), 0)
@@ -110,8 +109,7 @@ func TestRecoverEncrypted(t *testing.T) {
 	enc := &wal.Encryption{DEK: dek, VolumeID: vol}
 
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableEncryption(enc)
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, dek.KeyID, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), leaseOK{})
 

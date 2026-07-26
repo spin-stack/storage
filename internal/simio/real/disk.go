@@ -28,16 +28,75 @@ func NewDisk(dir string) (*Disk, error) {
 
 func (d *Disk) path(name string) string { return filepath.Join(d.root, filepath.FromSlash(name)) }
 
+// Create makes the file and then makes its *name* durable, which is the contract
+// disk.Disk states and the one fdatasync does not give: a newly created file's
+// directory entry lives in the parent directory, and syncing the file's contents says
+// nothing about it. A crash between the two loses the whole file — records the WAL
+// already ACKed included.
+//
+// Every directory MkdirAll had to create is in the same position, so the sync walks
+// from the file's parent up to the shallowest directory that did not exist before. In
+// the steady state that is one fsync of an already-cached directory inode.
 func (d *Disk) Create(name string) (disk.File, error) {
 	p := d.path(name)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	top := shallowestMissing(dir, d.root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
 	}
+	if err := syncDirs(dir, top); err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
 	return &realFile{f: f}, nil
+}
+
+// shallowestMissing returns the highest ancestor of dir (at or below root) that does
+// not exist yet, or "" when the whole chain is already there. Its own parent is what
+// has to be fsynced for its name to survive.
+func shallowestMissing(dir, root string) string {
+	missing := ""
+	for p := dir; strings.HasPrefix(p, root) && p != root; p = filepath.Dir(p) {
+		if _, err := os.Stat(p); err != nil {
+			missing = p
+			continue
+		}
+		break
+	}
+	return missing
+}
+
+// syncDirs fsyncs dir and, when top is non-empty, every ancestor up to and including
+// top's parent — the directories whose entries were created by this call.
+func syncDirs(dir, top string) error {
+	stop := dir
+	if top != "" {
+		stop = filepath.Dir(top)
+	}
+	for p := dir; ; p = filepath.Dir(p) {
+		if err := fsyncDir(p); err != nil {
+			return err
+		}
+		if p == stop {
+			return nil
+		}
+	}
+}
+
+// fsyncDir flushes a directory's own entries. A directory has to be opened read-only
+// for this; on Linux fsync of that descriptor is what persists the names in it.
+func fsyncDir(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return fmt.Errorf("simio/real: open %q to fsync it: %w", p, err)
+	}
+	if err := f.Sync(); err != nil {
+		return errors.Join(fmt.Errorf("simio/real: fsync %q: %w", p, err), f.Close())
+	}
+	return f.Close()
 }
 
 func (d *Disk) Open(name string) (disk.File, error) {

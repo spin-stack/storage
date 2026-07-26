@@ -398,7 +398,7 @@ tasks:
     desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1, §25.2).
     cmds:
       - go test -race -count=1 -run 'TestMandatoryScenarios|TestDeterministicReplay|TestPlantedBug|TestEveryCheckerHasAPlantedBugProof' ./internal/dst/
-      - go test -race -count=1 -run 'TestWALReplayProperty' ./internal/wal/
+      - go test -race -count=1 -run 'TestWALReplayProperty|TestWALSegmentReplayProperty' ./internal/wal/
 
   fmt:
     desc: Format code with the pinned golangci-lint formatters (gofmt + goimports).

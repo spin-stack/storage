@@ -34,11 +34,7 @@ func vol9() [16]byte {
 func writeDurableWAL(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]byte) {
 	t.Helper()
 	d := sim.NewDisk()
-	f, err := d.Create("wal/active.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	for i := range 2 {
 		if _, err := l.Write(uint64(i)*4096, []byte("acked-write"), 0); err != nil {
@@ -160,8 +156,7 @@ func TestReachableCoversEveryEpochOfAVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/epoch2.wal")
-	l := wal.NewLog(f, clk, vol, 2, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 2, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 2, 2, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	if _, err := l.Write(0, []byte("after the move"), 0); err != nil {
 		t.Fatal(err)

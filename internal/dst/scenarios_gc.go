@@ -60,11 +60,7 @@ func scenarioGCKeepsSupersededEpochSnapshot(s *Sim) error {
 		return err
 	}
 
-	f, err := s.Disk.Create("wal/superseded.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	for i := range 2 {
@@ -172,11 +168,7 @@ func scenarioSnapshotPublisherMustHoldTheEpoch(s *Sim) error {
 		return fmt.Errorf("granting epoch 1: %w", err)
 	}
 
-	f, err := s.Disk.Create("wal/snapshot-holder.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	for i := range 2 {

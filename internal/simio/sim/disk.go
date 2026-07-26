@@ -57,27 +57,64 @@ func NewDisk() *Disk {
 	}
 }
 
-// InjectENOSPC caps the device backing name at capacity bytes. Appends are accepted
+// InjectENOSPC caps the device backing target at capacity bytes. Appends are accepted
 // while they fit; the one that crosses the cap writes only what fits and returns
 // ErrNoSpace (the partial append a real ENOSPC delivers), and every append after it
-// writes nothing and returns ErrNoSpace. Growing the file with Truncate is refused
-// the same way. Space is reclaimed by truncating the file down or by ClearENOSPC.
+// writes nothing and returns ErrNoSpace. Growing a file with Truncate is refused the
+// same way. Space is reclaimed by truncating a file down, by removing one, or by
+// ClearENOSPC.
+//
+// target is a file name or a directory prefix, and the cap is charged against the
+// *sum* of the files under it. A WAL is a directory of segments, so "how much room
+// this volume's log has" is not a property of any one file, and a per-file cap would
+// be lifted by the mere act of rotating to a new segment.
 //
 // Allocation is charged at append time, so Sync of bytes the device already took
 // always succeeds. A filesystem that defers allocation can instead fail at fsync;
 // that variant is not modelled.
-func (d *Disk) InjectENOSPC(name string, capacity int64) {
+func (d *Disk) InjectENOSPC(target string, capacity int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.capacity[name] = capacity
+	d.capacity[target] = capacity
 }
 
-// ClearENOSPC removes the device cap on name (the operator grew the device, or a
+// ClearENOSPC removes the device cap on target (the operator grew the device, or a
 // checkpoint authorised a truncation that freed it).
-func (d *Disk) ClearENOSPC(name string) {
+func (d *Disk) ClearENOSPC(target string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	delete(d.capacity, name)
+	delete(d.capacity, target)
+}
+
+// matches reports whether a fault registered under target applies to name: the exact
+// file, or any file under it as a directory prefix.
+func matches(target, name string) bool {
+	return name == target || strings.HasPrefix(name, target+"/")
+}
+
+// faultTarget returns the key under which a fault is registered for name, preferring
+// the most specific (longest) match so a per-file injection wins over a directory-wide
+// one.
+func faultTarget[V any](m map[string]V, name string) (string, bool) {
+	best, found := "", false
+	for target := range m {
+		if matches(target, name) && len(target) >= len(best) {
+			best, found = target, true
+		}
+	}
+	return best, found
+}
+
+// chargedBytes sums the visible size of every file the cap registered under target
+// covers. Callers hold d.mu.
+func (d *Disk) chargedBytes(target string) int64 {
+	var used int64
+	for name, c := range d.files {
+		if matches(target, name) {
+			used += int64(len(c.cache))
+		}
+	}
+	return used
 }
 
 // SetDeviceBudget declares how big this simulated device is: the total Usage
@@ -128,13 +165,13 @@ func (d *Disk) usedLocked() int64 {
 }
 
 // freeSpace reports the bytes an append to name may still take, and whether
-// anything caps it at all. Two ceilings apply — the per-file cap of InjectENOSPC and
+// anything caps it at all. Two ceilings apply — the InjectENOSPC cap covering name and
 // the whole-device budget — and the tighter one wins, because a real writer meets
 // whichever it reaches first. Callers hold d.mu.
-func (d *Disk) freeSpace(name string, used int64) (int64, bool) {
+func (d *Disk) freeSpace(name string) (int64, bool) {
 	free, capped := int64(0), false
-	if capacity, ok := d.capacity[name]; ok {
-		free, capped = max(capacity-used, 0), true
+	if target, ok := faultTarget(d.capacity, name); ok {
+		free, capped = max(d.capacity[target]-d.chargedBytes(target), 0), true
 	}
 	if d.budget > 0 {
 		deviceFree := max(d.budget-d.usedLocked(), 0)
@@ -145,19 +182,21 @@ func (d *Disk) freeSpace(name string, used int64) (int64, bool) {
 	return free, capped
 }
 
-// InjectShortAppend makes the next Append to name write only n bytes then fail.
-func (d *Disk) InjectShortAppend(name string, n int) {
+// InjectShortAppend makes the next Append under target write only n bytes then fail.
+// target is a file name or a directory prefix (see InjectENOSPC), so a fault can be
+// aimed at a volume's WAL without naming the segment it will land in.
+func (d *Disk) InjectShortAppend(target string, n int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.shortAppend[name] = n
+	d.shortAppend[target] = n
 }
 
-// InjectSyncLoss makes the next Sync of name report success without persisting
+// InjectSyncLoss makes the next Sync under target report success without persisting
 // (the data stays vulnerable to a subsequent Crash).
-func (d *Disk) InjectSyncLoss(name string) {
+func (d *Disk) InjectSyncLoss(target string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.syncLoss[name] = true
+	d.syncLoss[target] = true
 }
 
 // Crash discards every file's unsynced cache, reverting to durable content.
@@ -179,6 +218,15 @@ func (d *Disk) TornTail(name string, keep int) {
 	}
 }
 
+// Create adds the file with durable-but-empty content, which is the simulated form of
+// the interface's contract: the *name* survives a crash (the real disk fsyncs the
+// parent directory), the contents do not until they are Synced.
+//
+// Unlink durability is deliberately not modelled the same way: a Remove here is
+// immediate and final, whereas a real one can be undone by a crash before the
+// directory is synced. Nothing depends on the difference — a resurrected file costs a
+// later sweep, never data — and modelling it would only add a fault no caller may
+// react to.
 func (d *Disk) Create(name string) (disk.File, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -246,13 +294,14 @@ func (f *simFile) Append(p []byte) (int, error) {
 	f.d.mu.Lock()
 	defer f.d.mu.Unlock()
 	c := f.d.files[f.name]
-	if limit, ok := f.d.shortAppend[f.name]; ok {
-		delete(f.d.shortAppend, f.name)
+	if target, ok := faultTarget(f.d.shortAppend, f.name); ok {
+		limit := f.d.shortAppend[target]
+		delete(f.d.shortAppend, target)
 		n := min(limit, len(p))
 		c.cache = append(c.cache, p[:n]...)
 		return n, ErrShortWrite
 	}
-	if free, capped := f.d.freeSpace(f.name, int64(len(c.cache))); capped && int64(len(p)) > free {
+	if free, capped := f.d.freeSpace(f.name); capped && int64(len(p)) > free {
 		c.cache = append(c.cache, p[:free]...)
 		return int(free), ErrNoSpace
 	}
@@ -283,7 +332,7 @@ func (f *simFile) Truncate(size int64) error {
 		c.cache = c.cache[:size]
 	default:
 		grow := size - int64(len(c.cache))
-		if free, capped := f.d.freeSpace(f.name, int64(len(c.cache))); capped && grow > free {
+		if free, capped := f.d.freeSpace(f.name); capped && grow > free {
 			return ErrNoSpace
 		}
 		c.cache = append(c.cache, make([]byte, grow)...)
@@ -294,8 +343,8 @@ func (f *simFile) Truncate(size int64) error {
 func (f *simFile) Sync() error {
 	f.d.mu.Lock()
 	defer f.d.mu.Unlock()
-	if f.d.syncLoss[f.name] {
-		delete(f.d.syncLoss, f.name)
+	if target, ok := faultTarget(f.d.syncLoss, f.name); ok {
+		delete(f.d.syncLoss, target)
 		return nil // reported success, not persisted
 	}
 	c := f.d.files[f.name]

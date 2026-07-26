@@ -8,7 +8,6 @@ import (
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/recovery"
-	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -24,22 +23,7 @@ func (r *ramp) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func readAll(t *testing.T, f disk.File) []byte {
-	t.Helper()
-	sz, _ := f.Size()
-	buf := make([]byte, sz)
-	if sz > 0 {
-		if _, err := f.ReadAt(buf, 0); err != nil {
-			// io.EOF at the exact end is fine.
-			if int64(len(buf)) != sz {
-				t.Fatalf("readAll: %v", err)
-			}
-		}
-	}
-	return buf
-}
-
-func encryptedLog(t *testing.T) (*wal.Log, disk.File, *wal.Encryption) {
+func encryptedLog(t *testing.T) (*wal.Log, *sim.Disk, *wal.Encryption) {
 	t.Helper()
 	dek, err := crypto.GenerateDEK(&ramp{b: 1}, 1)
 	if err != nil {
@@ -47,17 +31,16 @@ func encryptedLog(t *testing.T) (*wal.Log, disk.File, *wal.Encryption) {
 	}
 	enc := &wal.Encryption{DEK: dek, VolumeID: [16]byte{9, 9, 9}}
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), enc.VolumeID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), enc.VolumeID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableEncryption(enc)
-	return l, f, enc
+	return l, d, enc
 }
 
 // TestEncryptedWALIsCiphertextButReadsPlaintext is INV-15: the on-disk WAL bytes
 // (which later leave the host as S3 objects) must not contain the plaintext, while
 // live reads through the log return plaintext (it stays in host memory).
 func TestEncryptedWALIsCiphertextButReadsPlaintext(t *testing.T) {
-	l, f, _ := encryptedLog(t)
+	l, d, enc := encryptedLog(t)
 	canary := []byte("TOP-SECRET-GUEST-PAYLOAD")
 
 	if _, err := l.Write(0, canary, 0); err != nil {
@@ -65,7 +48,7 @@ func TestEncryptedWALIsCiphertextButReadsPlaintext(t *testing.T) {
 	}
 
 	// On disk: ciphertext, no plaintext canary.
-	raw := readAll(t, f)
+	raw := walBytes(t, d, "wal", enc.VolumeID, 1)
 	if bytes.Contains(raw, canary) {
 		t.Fatal("plaintext canary found in the on-disk WAL — INV-15 violation")
 	}
@@ -81,7 +64,7 @@ func TestEncryptedWALIsCiphertextButReadsPlaintext(t *testing.T) {
 // TestEncryptedReplayDecrypts verifies recovery: replay the ciphertext WAL and
 // decrypt back to the original plaintext.
 func TestEncryptedReplayDecrypts(t *testing.T) {
-	l, f, enc := encryptedLog(t)
+	l, d, enc := encryptedLog(t)
 	payloads := [][]byte{[]byte("alpha"), []byte("bravo-payload"), []byte("charlie")}
 	for i, p := range payloads {
 		if _, err := l.Write(uint64(i*64), p, 0); err != nil {
@@ -89,7 +72,7 @@ func TestEncryptedReplayDecrypts(t *testing.T) {
 		}
 	}
 
-	recs, err := wal.Replay(readAll(t, f))
+	recs, err := wal.Replay(walBytes(t, d, "wal", enc.VolumeID, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,11 +93,11 @@ func TestEncryptedReplayDecrypts(t *testing.T) {
 // TestOnDiskTamperFailsClosed corrupts a ciphertext byte on disk; decryption must
 // fail (GCM), never return silently-wrong plaintext.
 func TestOnDiskTamperFailsClosed(t *testing.T) {
-	l, f, enc := encryptedLog(t)
+	l, d, enc := encryptedLog(t)
 	if _, err := l.Write(0, []byte("important guest bytes"), 0); err != nil {
 		t.Fatal(err)
 	}
-	raw := readAll(t, f)
+	raw := walBytes(t, d, "wal", enc.VolumeID, 1)
 	// Corrupt a byte inside the ciphertext payload (past the 104-byte header).
 	raw[len(raw)-3] ^= 0xFF
 
@@ -129,9 +112,9 @@ func TestOnDiskTamperFailsClosed(t *testing.T) {
 
 // TestCryptoShred models §15.3: without the DEK, remnants are undecryptable.
 func TestCryptoShred(t *testing.T) {
-	l, f, _ := encryptedLog(t)
+	l, d, enc := encryptedLog(t)
 	_, _ = l.Write(0, []byte("shred me"), 0)
-	recs, _ := wal.Replay(readAll(t, f))
+	recs, _ := wal.Replay(walBytes(t, d, "wal", enc.VolumeID, 1))
 
 	// A different DEK (the original "destroyed") cannot read the remnants.
 	otherDEK, _ := crypto.GenerateDEK(&ramp{b: 200}, 1)
@@ -154,16 +137,15 @@ func TestUnversionedDEKIsRefusedAtWriteTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{9, 9, 9}
-	l := wal.NewLog(f, sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableEncryption(&wal.Encryption{DEK: dek, VolumeID: vol})
 
 	if _, err := l.Write(0, []byte("guest bytes"), 0); err == nil {
 		t.Fatal("a WRITE sealed with a KeyID-0 DEK was accepted; it can never be replayed")
 	}
-	if sz, _ := f.Size(); sz != 0 {
-		t.Fatalf("the refused write left %d bytes in the WAL", sz)
+	if raw := walBytes(t, d, "wal", vol, 1); len(raw) != 0 {
+		t.Fatalf("the refused write left %d bytes in the WAL", len(raw))
 	}
 }
 
@@ -181,9 +163,8 @@ func TestEncryptedObjectHeaderCarriesTheDEKKeyID(t *testing.T) {
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{9, 9, 9}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	// The batcher is told KeyID 0 — the value every call site in the tree passes.
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	l.EnableEncryption(&wal.Encryption{DEK: dek, VolumeID: vol})
@@ -219,10 +200,9 @@ func TestEncryptedWriteSurvivesTheS3RoundTrip(t *testing.T) {
 	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{9, 9, 9}
 	enc := &wal.Encryption{DEK: dek, VolumeID: vol}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, dek.KeyID, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	l.EnableEncryption(enc)
 
@@ -298,8 +278,7 @@ func TestNewEncryptionRefusesAnUnversionedDEK(t *testing.T) {
 // a record from another epoch must never be applied as ours).
 func TestRecordsCarryTheLogsEpoch(t *testing.T) {
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), [16]byte{1}, 5, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), [16]byte{1}, 5, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	if _, err := l.Write(0, []byte("w"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +288,7 @@ func TestRecordsCarryTheLogsEpoch(t *testing.T) {
 	if _, err := l.WriteZeroes(128, 8); err != nil {
 		t.Fatal(err)
 	}
-	recs, err := wal.Replay(readAll(t, f))
+	recs, err := wal.Replay(walBytes(t, d, "wal", [16]byte{1}, 5))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,8 +312,7 @@ func TestRecordsCarryTheLogsEpoch(t *testing.T) {
 func TestRecordsCarryTheLogsVolumeID(t *testing.T) {
 	vol := [16]byte{0xA1, 0xB2, 0xC3}
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	if _, err := l.Write(0, []byte("w"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +322,7 @@ func TestRecordsCarryTheLogsVolumeID(t *testing.T) {
 	if _, err := l.WriteZeroes(128, 8); err != nil {
 		t.Fatal(err)
 	}
-	recs, err := wal.Replay(readAll(t, f))
+	recs, err := wal.Replay(walBytes(t, d, "wal", vol, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,11 +336,11 @@ func TestRecordsCarryTheLogsVolumeID(t *testing.T) {
 // TestEncryptedRecordsCarryTheVolumeID: the encrypted path builds its header
 // separately, so it needs its own assertion.
 func TestEncryptedRecordsCarryTheVolumeID(t *testing.T) {
-	l, f, _ := encryptedLog(t)
+	l, d, enc := encryptedLog(t)
 	if _, err := l.Write(0, []byte("sealed"), 0); err != nil {
 		t.Fatal(err)
 	}
-	recs, err := wal.Replay(readAll(t, f))
+	recs, err := wal.Replay(walBytes(t, d, "wal", enc.VolumeID, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,8 +351,7 @@ func TestEncryptedRecordsCarryTheVolumeID(t *testing.T) {
 
 func TestDiscardAccounting(t *testing.T) {
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
-	l := wal.NewLog(f, sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	_, _ = l.Write(0, []byte("data"), 0)
 	_, _ = l.Discard(0, 4096)
 	_, _ = l.WriteZeroes(8192, 2048)

@@ -20,11 +20,7 @@ import (
 func epochWriter(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, vol [16]byte, epoch, startSeq uint64) *wal.Log {
 	t.Helper()
 	d := sim.NewDisk()
-	f, err := d.Create("wal/e" + string(rune('0'+epoch)) + ".wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLogAfter(f, clk, vol, epoch, startSeq, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLogAfter(d, "wal", clk, vol, epoch, startSeq, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, epoch, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	return l
 }

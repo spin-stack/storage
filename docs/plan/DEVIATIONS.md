@@ -18,6 +18,26 @@ gate** (PLAN §2).
 
 ## Open
 
+### DEV-0011 — A segment's space is charged as it is used, not reserved when it is created
+- Detected: 2026-07-26 by implementer agent in the WAL-segmentation increment
+- Doc section(s): WAL-SEGMENTS-SPEC §"The failure cases" case 4, ADR-0013 §4
+- Divergence: the spec asks that "creating a segment must be charged against the device
+  budget *before* the first append, so the out-of-space state is reached at a segment
+  boundary rather than mid-record". `segments.create` charges only the 64-byte header it
+  writes and syncs; the remaining `SegmentBytes` is charged append by append, as the
+  single-file WAL charged it. Reserving the whole segment would mean growing the file to
+  its full size at creation, and a segment whose tail is zero-filled cannot be replayed
+  by reading to the end of the file — the zeros decode as a bad magic, which is a hard
+  error, so replay would need a separately-tracked write offset that a crash can lose.
+- Severity: medium (device-pressure behaviour, not data loss: the existing rollback
+  already guarantees a refused append leaves no partial record, and ENOSPC hit while
+  creating a segment is reported and latched exactly like ENOSPC hit while appending —
+  see `TestAFullDeviceAtASegmentBoundaryLeavesNoStub`)
+- Resolution: **open** — revisit with ADR-0013's device budget, where the Agent knows a
+  volume's share and could reserve against the budget it computes rather than against
+  the filesystem. Reserving in the filesystem needs `fallocate` on `simio/disk` plus a
+  durable write offset in the segment, which is a format change of its own.
+
 ### DEV-0007 — Several phases marked done are partial models
 - Detected: 2026-07-25 by human review (rebaseline)
 - Doc section(s): §19, §20, §21.1, §22.3

@@ -27,11 +27,11 @@ var ErrWatermarkOrder = errors.New("wal: watermark ordering violation")
 // verified checkpoint.
 var ErrTruncateAboveDurable = errors.New("wal: truncate above verified published point")
 
-// ErrDirtyLog is returned by the first append to a log built over a WAL file that
-// already holds records. Such a log did not replay them, so it does not know where
+// ErrDirtyLog is returned by the first append to a log built over a WAL directory that
+// already holds segments. Such a log did not replay them, so it does not know where
 // the sequence space ends: it would re-issue sequences that are already on disk and
 // (for an encrypted volume) already used as GCM nonces for this (volume, epoch).
-var ErrDirtyLog = errors.New("wal: the WAL file already holds records this log did not replay")
+var ErrDirtyLog = errors.New("wal: the WAL directory already holds segments this log did not replay")
 
 // ErrFUAOnWrite is returned when a WRITE carries FlagFUA. A FUA write carries the
 // FLUSH ACK contract (§14.3.1, §14.8) — fdatasync, verified PUT, valid lease — and
@@ -61,6 +61,15 @@ type Limits struct {
 	// remote one riding out an S3 outage) nothing else stops the device from filling
 	// with writes no other machine has. 0 disables it.
 	MaxRemoteGapBytes int64
+	// SegmentBytes is the size at which a WAL segment is sealed and the next one
+	// started. 0 means SegmentBytes, the 32 MiB default.
+	//
+	// It is configurable because ADR-0013 wants it derived from the volume's share of
+	// the device budget (clamp(share/8, 8 MiB, 64 MiB)) once the Agent computes one,
+	// and because a test that has to write 32 MiB to cross one boundary tests the
+	// same code more slowly. It is not a correctness knob: nothing below depends on
+	// the value, only on it being the same for the life of a log.
+	SegmentBytes int64
 }
 
 // Log is the append-only local WAL for one volume, with a read view over the
@@ -68,7 +77,7 @@ type Limits struct {
 // WRITE (§5.3, INV-18) — it has no object store at all; durability is a later
 // phase's concern.
 type Log struct {
-	file     disk.File
+	segs     *segments
 	clk      clock.Clock
 	volumeID [16]byte
 	epoch    uint64
@@ -116,6 +125,7 @@ type Log struct {
 	hasGap         bool
 	discardedBytes int64
 	truncatedUpTo  uint64          // local WAL discarded up to this sequence (§14.7)
+	reclaimedBytes int64           // bytes given back to the device by unlinked segments
 	uploaded       []SummaryObject // durable objects, for the summary (§22.1)
 
 	rec      *obs.Recorder // nil = telemetry not wired (no-op)
@@ -125,21 +135,38 @@ type Log struct {
 // TruncatedUpTo reports the sequence below which local WAL has been reclaimed.
 func (l *Log) TruncatedUpTo() uint64 { return l.truncatedUpTo }
 
-// TruncateLocal reclaims local WAL up to and including upTo. It refuses to truncate
-// above the verified published point (§21.1, INV-13): records not yet in a published,
-// verified checkpoint must never be discarded. When the whole log is objectized it
-// resets the local file.
+// ReclaimedBytes reports the local bytes truncation has given back over this log's
+// life. It is the number ADR-0013's device pressure is measured against, and the one
+// the pre-segment WAL could not produce: it truncated the file only when the
+// checkpoint had reached the very end of the log, so on a volume under continuous
+// write it reclaimed nothing, ever.
+func (l *Log) ReclaimedBytes() int64 { return l.reclaimedBytes }
+
+// LocalBytes reports what this log occupies on the device right now, across every
+// retained segment.
+func (l *Log) LocalBytes() (int64, error) { return l.segs.bytes() }
+
+// SegmentNames returns the disk names of the retained segments, oldest first.
+func (l *Log) SegmentNames() []string { return l.segs.names() }
+
+// TruncateLocal reclaims local WAL up to and including upTo by unlinking the segments
+// whose records are all at or below it. It refuses to truncate above the verified
+// published point (§21.1, INV-13): records not yet in a published, verified checkpoint
+// must never be discarded.
+//
+// The segment holding upTo is kept whole, so the floor of what a checkpoint can give
+// back is one segment. Unlinking is the last step and runs oldest-first: the published
+// watermark advanced before this was called, so a crash part-way through leaves
+// segments a later truncation removes, where the reverse order would remove data the
+// published point does not yet cover.
 func (l *Log) TruncateLocal(upTo uint64) error {
 	if err := l.orderPolicy().AllowTruncate(upTo, l.Watermarks()); err != nil {
 		return err
 	}
 	l.truncatedUpTo = upTo
-	if upTo >= l.local {
-		if err := l.file.Truncate(0); err != nil {
-			return err
-		}
-	}
-	return nil
+	freed, err := l.segs.reclaim(upTo)
+	l.reclaimedBytes += freed
+	return err
 }
 
 // SetDurabilityMode selects the FLUSH/FUA ACK contract (§14.8). Default is remote.
@@ -234,9 +261,11 @@ func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
 	}
 }
 
-// NewLog creates a log backed by file, timed by clk.
-func NewLog(file disk.File, clk clock.Clock, volumeID [16]byte, epoch uint64, limits Limits) *Log {
-	return NewLogAfter(file, clk, volumeID, epoch, 0, limits)
+// NewLog creates a log over the WAL directory <root>/<volume-id>/<epoch>, timed by
+// clk. The directory is not touched until the first record: an attached volume that
+// never writes leaves nothing behind.
+func NewLog(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch uint64, limits Limits) *Log {
+	return NewLogAfter(d, root, clk, volumeID, epoch, 0, limits)
 }
 
 // NewLogAfter creates a log whose first record continues the volume's sequence space
@@ -244,9 +273,9 @@ func NewLog(file disk.File, clk clock.Clock, volumeID [16]byte, epoch uint64, li
 // belong to the volume, not to the epoch: a log that restarted at 1 would write
 // records that collide with the previous epoch's, and recovery, which chains the
 // epochs together, would see two different records claiming the same sequence.
-func NewLogAfter(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, boundary uint64, limits Limits) *Log {
+func NewLogAfter(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, boundary uint64, limits Limits) *Log {
 	return &Log{
-		file:       file,
+		segs:       newSegments(d, root, clk, volumeID, epoch, limits.SegmentBytes),
 		clk:        clk,
 		volumeID:   volumeID,
 		epoch:      epoch,
@@ -279,37 +308,40 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	if err := l.backpressure(len(enc)); err != nil {
 		return 0, err
 	}
-	// A failed append is not necessarily an append of nothing: a partial write
-	// (ENOSPC, a torn write at a device boundary) leaves bytes that are not a record.
-	// Roll the file back to the last intact record before reporting the failure —
-	// otherwise the rejected write either replays as a record the guest was told
-	// failed (with a sequence the next accepted write reuses) or truncates the log,
-	// making replay stop at the tear and silently drop everything after it.
-	before, err := l.file.Size()
-	if err != nil {
-		return 0, err
-	}
-	// Nothing has been appended through this log yet, but the file is not empty:
-	// this log was built over a WAL whose records it never read (an agent restart
-	// re-attaching at the same epoch, §16). Its sequence counter starts at the
+	// Nothing has been appended through this log yet, but the WAL directory is not
+	// empty: this log was built over segments whose records it never read (an agent
+	// restart re-attaching at the same epoch, §16). Its sequence counter starts at the
 	// boundary it was handed, so the next append would re-issue sequences that are
 	// already on disk — duplicate sequences in the same (volume, epoch), reused GCM
 	// nonces (§15.2), and two objects claiming one span (INV-21). Fail at the first
 	// append rather than produce them.
-	if !l.replayed && l.local == l.start && before > 0 {
-		return 0, fmt.Errorf("%w: %d bytes at sequence %d", ErrDirtyLog, before, l.start)
+	if !l.replayed && l.local == l.start && l.segs.empty() {
+		existing, err := listSegments(l.segs.d, l.segs.dir)
+		if err != nil {
+			return 0, err
+		}
+		if len(existing) > 0 {
+			return 0, fmt.Errorf("%w: %d segment(s) under %s, resuming at sequence %d",
+				ErrDirtyLog, len(existing), l.segs.dir, l.start)
+		}
 	}
-	_, err = l.file.Append(enc)
+	// A failed append is not necessarily an append of nothing: a partial write
+	// (ENOSPC, a torn write at a device boundary) leaves bytes that are not a record.
+	// The segment is rolled back to its last intact record before the failure is
+	// reported — otherwise the rejected write either replays as a record the guest was
+	// told failed (with a sequence the next accepted write reuses) or truncates the
+	// segment, making replay stop at the tear and silently drop everything after it.
+	err, rollbackErr := l.segs.appendRecord(seq, enc)
 	// Whether the device took the bytes is the only evidence there is about its
 	// state, so it is read here, on the accepted path as well as the refused one: a
 	// full device stays full until an append proves otherwise (see Degraded).
 	l.noteAppendResult(err)
 	if err != nil {
-		if terr := l.file.Truncate(before); terr != nil {
+		if rollbackErr != nil {
 			// The log's tail is now unknown. Refuse to serve it rather than ACK
-			// anything against a file we cannot describe.
+			// anything against a segment we cannot describe.
 			l.fenced = true
-			return 0, errors.Join(err, fmt.Errorf("wal: could not roll back a partial append: %w", terr))
+			return 0, errors.Join(err, fmt.Errorf("wal: could not roll back a partial append: %w", rollbackErr))
 		}
 		return 0, err
 	}
@@ -414,12 +446,27 @@ func (l *Log) Read(offset uint64, buf []byte) { l.view.Read(offset, buf) }
 // accounting. It does not advance the durable watermark — that requires remote
 // durability via Flush.
 func (l *Log) Sync() error {
-	if err := l.file.Sync(); err != nil {
+	if err := l.segs.sync(); err != nil {
 		return err
 	}
 	l.clearUnflushed()
 	return nil
 }
+
+// Close releases the segment this log holds open. It is not a durability step — Sync
+// and Flush are — and it seals nothing: a log that is closed and rebuilt goes through
+// Resume, which reopens the newest segment for append.
+func (l *Log) Close() error { return l.segs.close() }
+
+// Seal makes the newest segment durable and closes it for append; the next record
+// starts a new file. It writes nothing to the segment being sealed — that is what
+// keeps a sealed segment immutable and a crash mid-seal uninteresting — and it is a
+// no-op when nothing is open.
+//
+// The data path seals through AdvancePublished, at the moment reclamation becomes
+// possible, and through the size rotation inside the append path. This exposes the
+// same act on its own so a caller can rotate deliberately.
+func (l *Log) Seal() error { return l.segs.seal() }
 
 // Flush makes a FLUSH/FUA durable and ACKs it, following §14.4. Order: capture
 // target, close the batch, fdatasync, then per durability mode (§14.8):
@@ -448,7 +495,7 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	if l.batcher != nil {
 		l.batcher.Flush() // step 2: close current batch
 	}
-	if err := l.file.Sync(); err != nil { // step 3: fdatasync local
+	if err := l.segs.sync(); err != nil { // step 3: fdatasync local
 		return err
 	}
 
@@ -555,11 +602,22 @@ func (l *Log) AdvanceDurable(seq uint64) error {
 	return nil
 }
 
-// AdvancePublished advances the published watermark, enforcing published <= durable.
+// AdvancePublished advances the published watermark, enforcing published <= durable,
+// and seals the open segment.
+//
+// Sealing here rather than on a timer is the whole of the age policy: a segment is
+// only worth sealing at the moment reclamation becomes possible, and that moment is
+// the checkpoint that publishes. An idle volume holds at most one partly-filled
+// segment either way, and a per-volume timer would buy nothing this does not.
+//
+// The watermark moves first and the seal follows. A seal that fails is a local
+// durability failure worth reporting, but it does not un-publish the checkpoint that
+// is already in S3 — and AllowPublished refuses to move the watermark backwards, so
+// pretending the publication had not happened is not available even if it were right.
 func (l *Log) AdvancePublished(seq uint64) error {
 	if err := l.orderPolicy().AllowPublished(seq, l.Watermarks()); err != nil {
 		return err
 	}
 	l.published = seq
-	return nil
+	return l.segs.seal()
 }

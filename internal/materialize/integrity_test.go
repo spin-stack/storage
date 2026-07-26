@@ -59,11 +59,7 @@ func rewriteObject(t *testing.T, store *sim.ObjectStore, key string, mut func(h 
 func epoch2Log(t *testing.T, w *world, boundary uint64) *wal.Log {
 	t.Helper()
 	d := sim.NewDisk()
-	f, err := d.Create("wal/epoch2.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLogAfter(f, w.clk, w.vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLogAfter(d, "wal", w.clk, w.vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(w.clk, w.vol, 2, 0, wal.DefaultBatchConfig()), wal.NewUploader(w.store, 5), leaseOK{})
 	return l
 }

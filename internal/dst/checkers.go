@@ -249,6 +249,7 @@ func DefaultCheckers() []Checker {
 	all = append(all, recoveryCheckers()...)
 	all = append(all, harnessCheckers()...)
 	all = append(all, gcCheckers()...)
+	all = append(all, walCheckers()...)
 	return all
 }
 

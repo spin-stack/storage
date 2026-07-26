@@ -17,9 +17,8 @@ func remoteLog(t *testing.T, store *sim.ObjectStore) *wal.Log {
 	t.Helper()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	d := sim.NewDisk()
-	f, _ := d.Create("wal/active.wal")
 	vol := [16]byte{2}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(
 		wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(store, 5),

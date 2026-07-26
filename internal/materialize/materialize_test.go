@@ -37,11 +37,7 @@ func newWorld(t *testing.T, enc *wal.Encryption) *world {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := v7Vol()
 	d := sim.NewDisk()
-	f, err := d.Create("wal/active.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := wal.NewLog(f, clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
 	if enc != nil {
 		l.EnableEncryption(enc)
@@ -445,11 +441,7 @@ func TestFromEpochChainsAcrossAPromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := sim.NewDisk()
-	f, err := d.Create("wal/epoch2.wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l2 := wal.NewLogAfter(f, w.clk, w.vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l2 := wal.NewLogAfter(d, "wal", w.clk, w.vol, 2, boundary, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l2.EnableRemote(wal.NewBatcher(w.clk, w.vol, 2, 0, wal.DefaultBatchConfig()), wal.NewUploader(w.store, 5), leaseOK{})
 	if _, err := l2.Write(4096, []byte("after-move"), 0); err != nil {
 		t.Fatal(err)

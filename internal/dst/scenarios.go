@@ -64,6 +64,7 @@ func MandatoryScenarios() []MandatoryScenario {
 	all = append(all, recoveryScenarios()...)
 	all = append(all, harnessScenarios()...)
 	all = append(all, gcScenarios()...)
+	all = append(all, walScenarios()...)
 	return all
 }
 
@@ -102,13 +103,9 @@ func coreScenarios() []MandatoryScenario {
 // a rejected-but-persisted record turns into a phantom write or a silently truncated
 // replay.
 func scenarioTornAppend(s *Sim) error {
-	f, err := s.Disk.Create("wal/torn.wal")
-	if err != nil {
-		return err
-	}
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 
 	if _, err := l.Write(0, []byte("accepted"), 0); err != nil {
 		return err
@@ -117,7 +114,7 @@ func scenarioTornAppend(s *Sim) error {
 
 	// The disk accepts a seed-dependent slice of the next record and then fails.
 	limit := s.Rand.Intn(140)
-	s.Disk.InjectShortAppend("wal/torn.wal", limit)
+	s.Disk.InjectShortAppend("wal", limit) // the WAL directory: any segment will do
 	if _, err := l.Write(4096, []byte("rejected"), 0); err == nil {
 		return fmt.Errorf("a short append of %d bytes was not reported to the caller", limit)
 	}
@@ -133,15 +130,7 @@ func scenarioTornAppend(s *Sim) error {
 		return err
 	}
 
-	size, err := f.Size()
-	if err != nil {
-		return err
-	}
-	buf := make([]byte, size)
-	if _, err := f.ReadAt(buf, 0); err != nil {
-		return err
-	}
-	recs, err := wal.Replay(buf)
+	recs, err := wal.ReplaySegments(s.Disk, "wal", vol, 1)
 	if err != nil {
 		return fmt.Errorf("replay after a repaired tear: %w", err)
 	}
@@ -210,11 +199,7 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 		if _, err := epochs.Init(ctx, vid, 1); err != nil {
 			return err
 		}
-		f, err := s.Disk.Create("wal/" + vid + ".wal")
-		if err != nil {
-			return err
-		}
-		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 		l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 		if _, err := l.Write(0, []byte("on-source"), 0); err != nil {
 			return err
@@ -370,11 +355,7 @@ func crossHostMaterialization(s *Sim, scheduled bool) error {
 	const snapID = "00000000-0000-7000-8000-0000000000c2"
 
 	// Source host writes and publishes a snapshot.
-	f, err := s.Disk.Create("wal/source.wal")
-	if err != nil {
-		return err
-	}
-	src := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	src := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	src.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	if _, err := src.Write(0, []byte("cross-host"), 0); err != nil {
 		return err
@@ -498,8 +479,7 @@ func scenarioGCMarksOrphansNotLive(s *Sim) error {
 
 	// A live WAL object anchored by a checkpoint, plus structural metadata.
 	_ = descriptor.Write(ctx, s.Store, descriptor.Descriptor{VolumeID: vid, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
-	lf, _ := s.Disk.Create("wal/active.wal")
-	l := wal.NewLog(lf, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = l.Write(0, []byte("live"), 0)
 	if err := l.Flush(ctx); err != nil {
@@ -577,11 +557,7 @@ func scenarioCheckpointThenTruncate(s *Sim) error {
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
 
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 
 	_, _ = l.Write(0, []byte("a"), 0)
@@ -630,8 +606,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: pvs, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 
 	// Parent writes + snapshot.
-	pf, _ := s.Disk.Create("wal/parent.wal")
-	parent := wal.NewLog(pf, s.Clock, pv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	parent := wal.NewLog(s.Disk, "wal", s.Clock, pv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	parent.EnableRemote(wal.NewBatcher(s.Clock, pv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = parent.Write(0, []byte("parent"), 0)
 	if err := parent.Flush(ctx); err != nil {
@@ -649,8 +624,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 	if _, err := controlplane.Clone(ctx, md, term, m.SnapshotID, cvs, "00000000-0000-7000-8000-0000000000f1", nil); err != nil {
 		return err
 	}
-	cf, _ := s.Disk.Create("wal/clone.wal")
-	clone := wal.NewLog(cf, s.Clock, cv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	clone := wal.NewLog(s.Disk, "wal", s.Clock, cv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	clone.EnableRemote(wal.NewBatcher(s.Clock, cv, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = clone.Write(0, []byte("clone-only"), 0)
 	if err := clone.Flush(ctx); err != nil {
@@ -681,11 +655,7 @@ func scenarioSnapshotPauseFreeImmutable(s *Sim) error {
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
 
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 
 	_, _ = l.Write(0, []byte("a"), 0)
@@ -772,11 +742,7 @@ func scenarioRecoveryAuthorityIsS3(s *Sim) error {
 	vol[6], vol[8] = 0x70, 0x80
 
 	// Write two records to S3 through a Log.
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = l.Write(0, []byte("a"), 0)
 	_, _ = l.Write(8, []byte("b"), 0)
@@ -845,11 +811,7 @@ func scenarioFencedWriterNoLostAck(s *Sim) error {
 	// W1: remote leased log at epoch 1.
 	lm := lease.NewManager(s.Clock, 10*time.Second)
 	lm.Grant()
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
-	w1 := wal.NewLog(f, s.Clock, volID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	w1 := wal.NewLog(s.Disk, "wal", s.Clock, volID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	w1.EnableRemote(
 		wal.NewBatcher(s.Clock, volID, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
@@ -981,10 +943,6 @@ func scenarioLeaseFencesDurableAck(s *Sim) error {
 func leaseFencesDurableAck(s *Sim, lying bool) error {
 	ctx := context.Background()
 	vol := [16]byte{8}
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
 	lm := lease.NewManager(s.Clock, 10*time.Second)
 	lm.Grant()
 
@@ -995,7 +953,7 @@ func leaseFencesDurableAck(s *Sim, lying bool) error {
 	if lying {
 		check = alwaysValidLease{}
 	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(
 		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
@@ -1018,7 +976,7 @@ func leaseFencesDurableAck(s *Sim, lying bool) error {
 		return err
 	}
 	s.Clock.Advance(11 * time.Second) // no renewal
-	err = l.Flush(ctx)
+	err := l.Flush(ctx)
 	if err == nil {
 		// The FLUSH ACKed. Record it with the real lease's verdict: if that lease had
 		// expired, a durable ACK just escaped an invalid fence.
@@ -1044,11 +1002,7 @@ func leaseFencesDurableAck(s *Sim, lying bool) error {
 }
 
 func remoteLog(s *Sim, vol [16]byte) (*wal.Log, error) {
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return nil, err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(
 		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
@@ -1144,11 +1098,7 @@ func walPlaintextScenario(s *Sim, encrypted bool) error {
 	}
 	enc := &wal.Encryption{DEK: dek, VolumeID: [16]byte{7}}
 
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, enc.VolumeID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, enc.VolumeID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	if encrypted {
 		l.EnableEncryption(enc)
 	}
@@ -1159,9 +1109,10 @@ func walPlaintextScenario(s *Sim, encrypted bool) error {
 	}
 
 	// Inspect the bytes bound to leave the host.
-	sz, _ := f.Size()
-	raw := make([]byte, sz)
-	_, _ = f.ReadAt(raw, 0)
+	raw, err := walRawBytes(s, enc.VolumeID, 1)
+	if err != nil {
+		return err
+	}
 	leak := bytes.Contains(raw, canary)
 	s.Emit(Event{Kind: EventLeavesHost, ClearLeak: leak, Msg: "wal object bytes"})
 	if leak {
@@ -1169,7 +1120,7 @@ func walPlaintextScenario(s *Sim, encrypted bool) error {
 	}
 
 	// Recovery still works.
-	recs, err := wal.Replay(raw)
+	recs, err := wal.ReplaySegments(s.Disk, "wal", enc.VolumeID, 1)
 	if err != nil {
 		return fmt.Errorf("replay: %w", err)
 	}
@@ -1197,11 +1148,7 @@ func emitWatermarks(s *Sim, l *wal.Log) {
 // back, they issue no object-store PUT (§5.3, INV-18), and the watermarks stay
 // ordered (§5.6, INV-03).
 func scenarioWALWritePathNoPut(s *Sim) error {
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20, MaxUnflushedAge: 30 * time.Second})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 1 << 20, MaxUnflushedAge: 30 * time.Second})
 
 	n := 3 + s.Rand.Intn(6)
 	written := map[uint64][]byte{}
@@ -1239,12 +1186,8 @@ func scenarioWALWritePathNoPut(s *Sim) error {
 // scenarioWALBackpressure: exceeding the unflushed byte limit yields an explicit
 // error (§5.7, INV-04), and after Sync writes resume.
 func scenarioWALBackpressure(s *Sim) error {
-	f, err := s.Disk.Create("wal/active.wal")
-	if err != nil {
-		return err
-	}
 	// Room for one record (104-byte header + small payload) but not two.
-	l := wal.NewLog(f, s.Clock, [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 200})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, [16]byte{}, 1, wal.Limits{MaxUnflushedBytes: 200})
 
 	if _, err := l.Write(0, make([]byte, 32), 0); err != nil {
 		return fmt.Errorf("first write should fit: %w", err)

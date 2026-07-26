@@ -66,20 +66,18 @@ func scenarioDiskFillsWithS3Down(s *Sim) error {
 // enospcBackpressureFirst is arm 1: the remote-gap bound fires before the device does.
 func enospcBackpressureFirst(s *Sim) error {
 	const (
-		device   = "wal/gap-bound.wal"
+		// The cap covers the volume's whole WAL directory, not one file: a WAL is a
+		// set of segments, and a per-file ceiling would be lifted by rotating.
+		device   = "wal-gap-bound"
 		capacity = 1 << 13 // 8 KiB of device
 		gapBound = 1500    // ~4 records: reached long before the device is
 	)
-	f, err := s.Disk.Create(device)
-	if err != nil {
-		return err
-	}
 	s.Disk.InjectENOSPC(device, capacity)
 
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
 	vol[15] = 0xf1
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20, MaxRemoteGapBytes: gapBound})
+	l := wal.NewLog(s.Disk, device, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20, MaxRemoteGapBytes: gapBound})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 2), alwaysValidLease{})
 
 	// S3 is unreachable for the whole arm: nothing can close the gap.
@@ -96,7 +94,7 @@ func enospcBackpressureFirst(s *Sim) error {
 			s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("backpressure after %d records", accepted)})
 			// The bound did its job: the device still has room, so no WRITE ever saw
 			// a raw ENOSPC.
-			size, serr := f.Size()
+			size, serr := l.LocalBytes()
 			if serr != nil {
 				return serr
 			}
@@ -131,19 +129,15 @@ func enospcBackpressureFirst(s *Sim) error {
 // numbering once space is reclaimed.
 func enospcTailReplaysClean(s *Sim) error {
 	const (
-		device   = "wal/no-bound.wal"
-		capacity = 1000 // three 304-byte records fit, the fourth does not
+		device   = "wal-no-bound"
+		capacity = 1040 // a 64-byte segment header and three 304-byte records fit; the fourth does not
 	)
-	f, err := s.Disk.Create(device)
-	if err != nil {
-		return err
-	}
 	s.Disk.InjectENOSPC(device, capacity)
 
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
 	vol[15] = 0xf2
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, device, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 
 	accepted := 0
 	var full error
@@ -201,15 +195,7 @@ func enospcTailReplaysClean(s *Sim) error {
 	if err := l.Sync(); err != nil {
 		return err
 	}
-	size, err := f.Size()
-	if err != nil {
-		return err
-	}
-	buf := make([]byte, size)
-	if _, err := f.ReadAt(buf, 0); err != nil {
-		return err
-	}
-	recs, err := wal.Replay(buf)
+	recs, err := wal.ReplaySegments(s.Disk, device, vol, 1)
 	if err != nil {
 		return fmt.Errorf("replay of a WAL whose tail was cut by ENOSPC: %w", err)
 	}
@@ -266,11 +252,7 @@ func scenarioLaggingListNeverLowersTheBoundary(s *Sim) error {
 	s.Store.SetListLag(lag)
 	s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("LIST lags %d operations behind", lag)})
 
-	f, err := s.Disk.Create("wal/lagging.wal")
-	if err != nil {
-		return err
-	}
-	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 
 	for i := range 3 {
@@ -431,11 +413,7 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 	const leaseTTL = 10 * time.Second
 	lm := lease.NewManager(s.Clock, leaseTTL)
 	lm.Grant()
-	f, err := s.Disk.Create("wal/seeded.wal")
-	if err != nil {
-		return err
-	}
-	w1 := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	w1 := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	w1.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), lm)
 
 	for i := range plan.records {
