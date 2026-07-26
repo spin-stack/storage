@@ -12,6 +12,7 @@ import (
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
@@ -57,7 +58,7 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	loop, err := agent.New(testConfig(), agent.Deps{
 		Clock:        clk,
 		ControlPlane: storagev1connect.NewControlPlaneServiceClient(httpSrv.Client(), httpSrv.URL),
-		Device:       fakeDevice{usage: agent.DeviceUsage{TotalBytes: 1 << 40, UsedBytes: 512 << 30}},
+		Device:       fakeDevice{usage: disk.Usage{TotalBytes: 1 << 40, UsedBytes: 512 << 30}},
 		Volumes:      vols,
 	})
 	if err != nil {

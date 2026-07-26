@@ -15,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
+	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
@@ -138,11 +139,11 @@ func (f *fakeCP) instants() []clock.Instant {
 
 // fakeDevice reports a fixed device picture.
 type fakeDevice struct {
-	usage agent.DeviceUsage
+	usage disk.Usage
 	err   error
 }
 
-func (d fakeDevice) Usage(context.Context) (agent.DeviceUsage, error) { return d.usage, d.err }
+func (d fakeDevice) Usage(context.Context) (disk.Usage, error) { return d.usage, d.err }
 
 const (
 	testHost     = "host-a"
@@ -159,7 +160,6 @@ func testConfig() agent.Config {
 		HeartbeatInterval: testInterval,
 		RetryBackoff:      testBackoff,
 		LeaseTTL:          30 * time.Second,
-		DeviceTotalBytes:  1 << 40,
 	}
 }
 
@@ -171,7 +171,7 @@ type harness struct {
 	prov *obs.Provider
 }
 
-func newHarness(t *testing.T, cfg agent.Config, usage agent.DeviceUsage) *harness {
+func newHarness(t *testing.T, cfg agent.Config, usage disk.Usage) *harness {
 	t.Helper()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	cp := newFakeCP(clk)
@@ -225,7 +225,7 @@ func (h *harness) awaitBeat(t *testing.T, n int) {
 // what finally produces total, used, and the aggregate remote backlog — the last of
 // which no per-volume limit ever sums.
 func TestReconcileReportsTheDevicePicture(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 1 << 40, UsedBytes: 300 << 30})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 1 << 40, UsedBytes: 300 << 30})
 	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-b", Epoch: 2, RemoteGapBytes: 11})
 	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 1, RemoteGapBytes: 7})
 
@@ -252,7 +252,7 @@ func TestReconcileReportsTheDevicePicture(t *testing.T) {
 // TestReconcileReportsEpochQualifiedWatermarks: every watermark the Agent reports
 // carries the epoch it was produced under, in volume-id order (INV-02).
 func TestReconcileReportsEpochQualifiedWatermarks(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 10})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 10})
 	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-b", Epoch: 9, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10})
 	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 4, LocalSequence: 3, DurableSequence: 2, PublishedSequence: 1})
 
@@ -292,7 +292,7 @@ func TestRefusedReportMarksTheVolumeFenced(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+			h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 			h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 1})
 			h.cp.outcomes["vol-a"] = tc.outcome
 
@@ -310,7 +310,7 @@ func TestRefusedReportMarksTheVolumeFenced(t *testing.T) {
 // TestReconcileRecordsDesiredState: what the Agent learned is what a data path
 // would reconcile against, so it has to be readable after the cycle.
 func TestReconcileRecordsDesiredState(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	h.cp.desired = []*storagev1.DesiredVolume{
 		{VolumeId: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096, Epoch: 3, State: storagev1.VolumeState_VOLUME_STATE_ACTIVE},
 	}
@@ -330,7 +330,7 @@ func TestReconcileRecordsDesiredState(t *testing.T) {
 // TestReconcileStopsAtTheFirstFailure: the calls are ordered, and a Control Plane
 // that did not answer the heartbeat has nothing useful to say to the rest.
 func TestReconcileStopsAtTheFirstFailure(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	h.cp.setErr(errUnreachable)
 
 	err := h.loop.Reconcile(t.Context())
@@ -347,7 +347,7 @@ func TestReconcileStopsAtTheFirstFailure(t *testing.T) {
 // TestRunHoldsItsCadence: the loop runs immediately, then once per interval, on
 // the injected clock. Nothing here waits on real time.
 func TestRunHoldsItsCadence(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -384,7 +384,7 @@ func TestRunHoldsItsCadence(t *testing.T) {
 // stall, and must return to the normal cadence once the Control Plane answers —
 // the retry delay doubles and is capped at one heartbeat interval.
 func TestRunBacksOffAfterAFailureAndRecovers(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	h.cp.setErr(errUnreachable)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -433,7 +433,7 @@ func TestRunBacksOffAfterAFailureAndRecovers(t *testing.T) {
 // to be told it was fenced.
 func TestLeaseLapsesWhenHeartbeatsFail(t *testing.T) {
 	cfg := testConfig()
-	h := newHarness(t, cfg, agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, cfg, disk.Usage{TotalBytes: 100, UsedBytes: 1})
 
 	if err := h.loop.Reconcile(t.Context()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -471,7 +471,7 @@ func TestLeaseLapsesWhenHeartbeatsFail(t *testing.T) {
 // request left the host, never to the instant the answer arrived. A slow round trip
 // must shorten the Agent's window, not extend it.
 func TestLeaseIsAnchoredToTheRequest(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	h.cp.roundTrip = 25 * time.Second // a GC pause, a PG failover retry, a healing partition
 
 	sent := h.clk.Now()
@@ -493,7 +493,7 @@ func TestLeaseIsAnchoredToTheRequest(t *testing.T) {
 // with no lease at all. The Agent must not keep an armed lease on the strength of a
 // successful HTTP round trip.
 func TestDeadHostStopsTheLease(t *testing.T) {
-	h := newHarness(t, testConfig(), agent.DeviceUsage{TotalBytes: 100, UsedBytes: 1})
+	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	if err := h.loop.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}

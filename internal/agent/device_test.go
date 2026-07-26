@@ -110,7 +110,6 @@ func TestConfigValidate(t *testing.T) {
 		HeartbeatInterval: 5 * time.Second,
 		RetryBackoff:      time.Second,
 		LeaseTTL:          30 * time.Second,
-		DeviceTotalBytes:  1 << 30,
 	}
 	tests := []struct {
 		name string
@@ -126,7 +125,6 @@ func TestConfigValidate(t *testing.T) {
 		{"backoff above the interval", func(c *agent.Config) { c.RetryBackoff = 10 * time.Second }, false},
 		{"no lease ttl", func(c *agent.Config) { c.LeaseTTL = 0 }, false},
 		{"lease ttl below the interval", func(c *agent.Config) { c.LeaseTTL = time.Second }, false},
-		{"no device total", func(c *agent.Config) { c.DeviceTotalBytes = 0 }, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

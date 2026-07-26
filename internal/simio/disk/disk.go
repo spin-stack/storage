@@ -21,6 +21,24 @@ var ErrNotExist = errors.New("simio/disk: file does not exist")
 // comparison in the durability path.
 var ErrNoSpace = errors.New("simio/disk: no space left on device")
 
+// Usage is the state of the device backing a Disk: what statfs answers, in bytes.
+//
+// The three numbers do not add up on a real filesystem and are not meant to:
+// TotalBytes counts blocks that are reserved for root and therefore appear in
+// neither of the other two, so Used + Avail <= Total. Callers that want "how full is
+// this device" want Used/Total; callers that want "can I still write" want Avail.
+type Usage struct {
+	// TotalBytes is the capacity of the device.
+	TotalBytes int64
+	// UsedBytes is what is occupied on it — by this process and by everything else
+	// sharing the filesystem. The difference from summing our own files is the
+	// point: those bytes are not reclaimable by any checkpoint or truncation of
+	// ours, and a threshold that ignores them fires too late.
+	UsedBytes int64
+	// AvailBytes is what an unprivileged writer can still take.
+	AvailBytes int64
+}
+
 // Disk is a flat-ish namespace of append-only files (names may contain "/").
 type Disk interface {
 	// Create returns a new empty file, truncating any existing one.
@@ -35,6 +53,10 @@ type Disk interface {
 	Exists(name string) (bool, error)
 	// List returns the names of files with the given prefix, sorted.
 	List(prefix string) ([]string, error)
+	// Usage reports the device backing this Disk (ADR-0013). It takes no context:
+	// the real implementation is a single statfs, which does not block on I/O and
+	// cannot be cancelled halfway.
+	Usage() (Usage, error)
 }
 
 // File is an append-only file with random reads and durable sync.

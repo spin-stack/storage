@@ -14,6 +14,7 @@ import (
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
+	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
 // Deps are the Agent's injected collaborators (INV-01). None of them may be nil
@@ -136,7 +137,7 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 	return l.report(ctx, vols)
 }
 
-func (l *Loop) heartbeat(ctx context.Context, usage DeviceUsage, vols []VolumeStatus) error {
+func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeStatus) error {
 	var backlog int64
 	for _, v := range vols {
 		backlog += v.RemoteGapBytes

@@ -102,6 +102,31 @@ func (d *Disk) List(prefix string) ([]string, error) {
 	return names, nil
 }
 
+// Usage answers ADR-0013's question with the only thing that can answer it
+// honestly: a statfs of the filesystem holding this Disk's root. Summing our own
+// files — what the Agent did before this existed — misses every byte another tenant
+// of the same filesystem occupies, and those are the bytes no checkpoint or
+// truncation of ours will ever give back.
+//
+// syscall is denied everywhere but internal/simio (§25.1, depguard); this is one of
+// the two places in the tree that needs it, next to the ENOSPC translation below.
+// The uint64→int64 conversions are safe on any device this code will ever see: a
+// signed byte count overflows at 8 EiB, and Bfree is never above Blocks.
+func (d *Disk) Usage() (disk.Usage, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(d.root, &st); err != nil {
+		return disk.Usage{}, fmt.Errorf("simio/real: statfs %q: %w", d.root, err)
+	}
+	// Bsize is the block size the counts below are expressed in. It is int64 on
+	// Linux and uint32 on Darwin; the conversion is what keeps this one file.
+	bsize := int64(st.Bsize)
+	return disk.Usage{
+		TotalBytes: int64(st.Blocks) * bsize,
+		UsedBytes:  int64(st.Blocks-st.Bfree) * bsize,
+		AvailBytes: int64(st.Bavail) * bsize,
+	}, nil
+}
+
 type realFile struct {
 	f *os.File
 }
