@@ -129,6 +129,46 @@ func TestOpenMissingIsErrNotExist(t *testing.T) {
 	}
 }
 
+// TestUsageReportsADevice is the statfs contract (ADR-0013): a Disk can say how big
+// the device under it is and how much of it is left. Everything the Agent decides
+// about local pressure is a ratio of these numbers, so an implementation that cannot
+// produce them leaves the thresholds fed by an estimate.
+//
+// Only the invariants are asserted here. "Used grows when you write" is exact in the
+// simulator — the device is ours alone there — and cannot be asserted against a real
+// filesystem the rest of the machine is also writing to. That asymmetry is the whole
+// reason for the call: what statfs adds over summing our own files is precisely the
+// space other tenants occupy.
+func TestUsageReportsADevice(t *testing.T) {
+	rd, err := real.NewDisk(t.TempDir())
+	if err != nil {
+		t.Fatalf("real disk: %v", err)
+	}
+	sd := sim.NewDisk()
+	sd.SetDeviceBudget(1 << 30)
+
+	for name, d := range map[string]disk.Disk{"real": rd, "sim": sd} {
+		t.Run(name, func(t *testing.T) {
+			u, err := d.Usage()
+			if err != nil {
+				t.Fatalf("Usage: %v", err)
+			}
+			switch {
+			case u.TotalBytes <= 0:
+				t.Fatalf("a device with no capacity: %+v", u)
+			case u.UsedBytes < 0 || u.UsedBytes > u.TotalBytes:
+				t.Fatalf("used outside the device: %+v", u)
+			case u.AvailBytes < 0 || u.AvailBytes > u.TotalBytes:
+				t.Fatalf("available outside the device: %+v", u)
+			case u.UsedBytes+u.AvailBytes > u.TotalBytes:
+				// A real filesystem reserves blocks that are neither used nor
+				// available; nothing may claim more than the device holds.
+				t.Fatalf("used + available exceeds the device: %+v", u)
+			}
+		})
+	}
+}
+
 // --- sim-specific: crash model and fault injection ---
 
 func TestSimCrashLosesUnsyncedData(t *testing.T) {

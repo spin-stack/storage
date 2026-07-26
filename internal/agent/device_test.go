@@ -24,36 +24,42 @@ func writeFile(t *testing.T, d *sim.Disk, name string, n int) {
 	}
 }
 
-// TestDiskUsageSumsWhatTheAgentOccupies: `used` is the Agent's own footprint under
-// its data prefix — the WAL and checkpoint files whose growth ADR-0013 is about —
-// and nothing outside that prefix counts.
-func TestDiskUsageSumsWhatTheAgentOccupies(t *testing.T) {
+// TestDiskUsageReportsTheDeviceNotAnEstimate is the gap this closes. The Agent used
+// to sum the files under its own prefix and take the capacity from a flag, which
+// reports the two numbers ADR-0013 needs least: it cannot see what anything else on
+// the filesystem occupies, and it believes whoever started the process about how big
+// the device is. Both are now the device's own answer.
+//
+// The file outside the Agent's prefix is the whole assertion: it is space the Agent
+// cannot reclaim by any checkpoint or truncation, and a threshold that ignores it
+// fires after the device is already full.
+func TestDiskUsageReportsTheDeviceNotAnEstimate(t *testing.T) {
 	d := sim.NewDisk()
+	d.SetDeviceBudget(1 << 20)
 	writeFile(t, d, "volumes/a/wal", 100)
 	writeFile(t, d, "volumes/b/wal", 250)
-	writeFile(t, d, "unrelated/file", 999)
+	writeFile(t, d, "somebody-elses/file", 999)
 
-	u := agent.NewDiskUsage(d, "volumes/", 1<<20)
-	got, err := u.Usage(t.Context())
+	got, err := agent.NewDiskUsage(d).Usage(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.TotalBytes != 1<<20 {
 		t.Errorf("TotalBytes = %d, want %d", got.TotalBytes, 1<<20)
 	}
-	if got.UsedBytes != 350 {
-		t.Errorf("UsedBytes = %d, want 350", got.UsedBytes)
+	if got.UsedBytes != 1349 {
+		t.Errorf("UsedBytes = %d, want 1349 (everything on the device, not just ours)", got.UsedBytes)
+	}
+	if got.AvailBytes != 1<<20-1349 {
+		t.Errorf("AvailBytes = %d, want %d", got.AvailBytes, 1<<20-1349)
 	}
 }
 
-func TestDiskUsageOnAnEmptyDevice(t *testing.T) {
-	u := agent.NewDiskUsage(sim.NewDisk(), "volumes/", 4096)
-	got, err := u.Usage(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.UsedBytes != 0 || got.TotalBytes != 4096 {
-		t.Fatalf("empty device reported %+v", got)
+// TestDiskUsageFailureIsReported: a device that cannot be measured must fail the
+// cycle, never report a zero that reads as an empty disk.
+func TestDiskUsageFailureIsReported(t *testing.T) {
+	if _, err := agent.NewDiskUsage(sim.NewDisk()).Usage(t.Context()); err == nil {
+		t.Fatal("an unmeasurable device reported a usage")
 	}
 }
 
