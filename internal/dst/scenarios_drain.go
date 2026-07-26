@@ -472,17 +472,23 @@ func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 		if _, err := w.md.GetHostLease(ctx, w.src); !errors.Is(err, metadata.ErrNotFound) {
 			return fmt.Errorf("the drain waited on the source's lease but never revoked it: %v", err)
 		}
-		// Revoking is not a shortcut through the wait: at lease_ttl the Agent's own
-		// copy is still valid, and so is the fence.
-		s.Tick(drainLeaseTTL)
+		// Revoking is not a shortcut through the wait. One second short of the TTL the
+		// Agent's own copy of the lease is still valid — it never heard about the row
+		// — and the promotion must still be refused.
+		s.Tick(drainLeaseTTL - time.Second)
+		if !agent.Valid() {
+			return fmt.Errorf("the Agent's lease expired early; this step no longer tests anything")
+		}
 		if _, err := w.pass(); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
 			return fmt.Errorf("revoking the lease shortened the fencing wait, got %v", err)
 		}
-		if !agent.Valid() {
-			return fmt.Errorf("the Agent's lease expired before the wait it is meant to cover")
-		}
 		s.Emit(Event{Kind: EventFault, Msg: "drain revoked the lease of a healthy source"})
-		s.Tick(drainMaxSkew + time.Second)
+
+		// Past lease_ttl + max_clock_skew, and only there, the healthy host moves.
+		s.Tick(drainMaxSkew + 2*time.Second)
+		if agent.Valid() {
+			return fmt.Errorf("the promotion is about to run against an Agent whose lease is still valid")
+		}
 		if _, err := w.pass(); err != nil {
 			return fmt.Errorf("drain of a healthy source: %w", err)
 		}

@@ -133,6 +133,12 @@ type progress struct {
 	Total   int              `json:"total"`
 	Current string           `json:"current_volume,omitempty"`
 	Volumes []volumeProgress `json:"volumes,omitempty"`
+	// SrcLease is the latest renewal of the source host's lease this operation ever
+	// observed, recorded *before* the lease was revoked. Once the row is gone nothing
+	// can read that instant again, and a promotion with no instant to measure from
+	// refuses outright rather than guess (ErrSourceLeaseUnknown, §12.3), so every
+	// later pass measures the same fencing wait from what this one saw.
+	SrcLease time.Time `json:"src_lease_renewed_at,omitzero"`
 }
 
 // volume returns the recorded progress for volumeID, or nil if this operation has
@@ -492,15 +498,16 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 
 		// Fence the source before the destination can write: promotion waits out
 		// lease_ttl + max_clock_skew and CASes the epoch object (§12.3–12.4).
-		// No lease row means the host never held one (or it was already revoked): the
-		// zero instant puts the fencing deadline far in the past, so promotion proceeds.
-		var renewedAt time.Time
-		if l, lerr := d.md.GetHostLease(ctx, v.PrimaryHostID); lerr == nil {
-			renewedAt = l.LastRenewal
-		} else if !errors.Is(lerr, metadata.ErrNotFound) {
-			return Move{}, d.abandon(ctx, term, operationID, prog, v, lerr)
+		//
+		// The revocation is skipped once the volume is already on the destination —
+		// this operation's own promotion, being resumed. The lease this would take
+		// away then is the one that promotion granted to the *new* writer.
+		if v.PrimaryHostID != vp.ToHost {
+			if ferr := d.fenceSource(ctx, term, operationID, v.PrimaryHostID, prog); ferr != nil {
+				return Move{}, d.abandon(ctx, term, operationID, prog, v, ferr)
+			}
 		}
-		newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, renewedAt, vp.ToHost)
+		newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
 		if err != nil {
 			return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 		}
@@ -567,6 +574,44 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 		VolumeID: v.VolumeID, FromHost: source, ToHost: vp.ToHost,
 		NewEpoch: vp.NewEpoch, UpTo: vp.UpTo, Bytes: vp.Bytes,
 	}, nil
+}
+
+// fenceSource is the Control Plane withdrawing its own record of hostID as a writer:
+// it notes when the host's lease was last renewed and then takes the lease away
+// (term-guarded). Both steps, in that order, before the promotion waits the fence
+// out (§12.3).
+//
+// The revocation is what makes a *healthy* host evacuable. The drain refuses to
+// promote a source whose lease is live, so on a host that is up and heartbeating the
+// deadline keeps moving forward and the evacuation never starts. Deleting the row is
+// the CP saying it will not count that host as a writer again.
+//
+// It shortens nothing. The Agent counts its own copy of the lease down on a
+// monotonic clock (§12.2) and never learns the row is gone, so the promotion still
+// waits out last_renewal + lease_ttl + max_clock_skew — which is why the instant is
+// recorded, and saved, *before* the row that carries it is deleted. A later pass
+// finds no lease and measures from what this one saw; a host that renewed again in
+// the meantime moves that instant forward, never back.
+//
+// No lease row and nothing recorded means the host never held one. That is "I know
+// nothing", not "it expired long ago", and the promoter refuses on it (§12.3) unless
+// the fleet has recorded the host DEAD — the drain does not paper over it here.
+func (d *Drainer) fenceSource(ctx context.Context, term int64, operationID, hostID string, prog *progress) error {
+	l, err := d.md.GetHostLease(ctx, hostID)
+	switch {
+	case err == nil:
+		if prog.SrcLease.Before(l.LastRenewal) {
+			prog.SrcLease = l.LastRenewal
+			if serr := d.save(ctx, term, operationID, *prog); serr != nil {
+				return serr
+			}
+		}
+	case errors.Is(err, metadata.ErrNotFound):
+		return nil // already revoked by an earlier pass, or never held
+	default:
+		return err
+	}
+	return d.md.RevokeHostLease(ctx, term, hostID)
 }
 
 // choose picks the destination for a volume (§20 step 2 / §22.3: a warm standby is
