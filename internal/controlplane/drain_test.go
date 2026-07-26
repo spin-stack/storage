@@ -203,6 +203,20 @@ func (w *drainWorld) noBoundary(t *testing.T, vol [16]byte, epoch uint64) {
 	}
 }
 
+// killAfterTheRelease makes every progress write fail once the volume's bytes are
+// already off the source — the window between a completed move and the record of it,
+// with nothing surviving to say the move happened. A one-shot fault would not do:
+// the pass's own FAILED record would then persist the progress the crash lost.
+func (w *drainWorld) killAfterTheRelease(t *testing.T, volumeID string) {
+	t.Helper()
+	w.hooks.beforeUpdate = func(op metadata.Operation) error {
+		if !strings.Contains(string(op.CurrentState), volumeID) || w.committed(t, cloneHostA) != volSize {
+			return nil
+		}
+		return errProgressLost
+	}
+}
+
 // addHost registers an extra ACTIVE host with room for ten volumes.
 func (w *drainWorld) addHost(t *testing.T, hostID string) {
 	t.Helper()
@@ -832,19 +846,7 @@ func TestDrainReleasesCapacityOnceWhenTheProgressWriteFails(t *testing.T) {
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
 
-	// Fail the progress write that names the first volume once its bytes are already
-	// off the source — i.e. after the release, before it was recorded as done.
-	var failed bool
-	w.hooks.beforeUpdate = func(op metadata.Operation) error {
-		if failed || !strings.Contains(string(op.CurrentState), firstID) {
-			return nil
-		}
-		if w.committed(t, cloneHostA) != volSize {
-			return nil
-		}
-		failed = true
-		return errProgressLost
-	}
+	w.killAfterTheRelease(t, firstID)
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
 		t.Fatalf("setup: want errProgressLost, got %v", err)
 	}
@@ -1215,4 +1217,35 @@ func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
 		t.Fatalf("a volume was promoted away from a host holding a live lease: %+v", second)
 	}
 	w.noBoundary(t, w.vols[1], 2)
+}
+
+// TestDrainRefusesToGuessWhenTheCapacityLedgerMoved: the resumed pass proves whether
+// its own release landed by comparing the host's committed bytes against what it
+// recorded before attempting it. When a third party has moved the same ledger in the
+// meantime that proof is gone, and the drain says so rather than guessing — releasing
+// again would consume a reservation belonging to a volume nobody is moving.
+func TestDrainRefusesToGuessWhenTheCapacityLedgerMoved(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+	firstID := format.UUIDString(w.vols[0])
+
+	// Kill the pass between the release and the record of it.
+	w.killAfterTheRelease(t, firstID)
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
+		t.Fatalf("setup: want errProgressLost, got %v", err)
+	}
+	w.hooks.beforeUpdate = nil
+
+	// Somebody else books three volumes onto the source before the drain resumes.
+	if err := w.base.CommitHostCapacity(ctx, w.term, cloneHostA, 3*volSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrCapacityLedgerMoved) {
+		t.Fatalf("want ErrCapacityLedgerMoved, got %v", err)
+	}
+	// Whatever else is true, the drain did not release a second time.
+	if got := w.committed(t, cloneHostA); got != 4*volSize {
+		t.Fatalf("source committed = %d, want %d — the resumed pass released again", got, 4*volSize)
+	}
 }

@@ -576,6 +576,10 @@ func (d *Drainer) abandon(ctx context.Context, term int64, operationID string, p
 // Anything else is a third party writing the same books, and it is reported rather
 // than guessed — releasing twice either wedges the drain with ErrCapacityUnderflow
 // or silently consumes another volume's reservation.
+//
+// What this cannot see is a third party whose changes cancel out to exactly one
+// volume size in the meantime; a compare-and-set on the reserving query is the only
+// thing that would close that, and it belongs to the store, not here (§28.2).
 func (d *Drainer) applyCapacity(ctx context.Context, term int64, hostID string, delta, before int64, resumed bool) error {
 	if !resumed {
 		return d.md.CommitHostCapacity(ctx, term, hostID, delta)
