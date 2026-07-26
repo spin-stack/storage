@@ -11,7 +11,7 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files, then wave 3 (G1–G5). **Two entries are
+own worktree over a disjoint set of files, then wave 3 (G1–G5). **One entry is
 still open**, and every one of them is listed below with what it is waiting on.
 Findings that turned out to be already covered are recorded as such rather than
 counted as work; two of the open entries are new, found by the harness while proving
@@ -100,11 +100,12 @@ that a checker could catch a real bug.
 | A lease read served by a lagging replica made the fencing wait look elapsed, granting an epoch over a live writer (ADR-0015: the wait is a monotonic dwell, seeded from a durable record) | `725bc69` |
 | Nothing stopped a heartbeat re-arming the lease a drain had just revoked, so a healthy host could not be evacuated (ADR-0016 stage 1: a revocation window bounded to one promotion) | `f54221d` |
 | Capacity was an incremental ledger that a crash could apply twice, and no guard could tell a stranger's equal-and-opposite change from its own (ADR-0017: committed bytes are derived from state, the column is gone) | `a42fed4` |
+| `TruncateLocal` reclaimed nothing on a volume being written to — it freed bytes only when the checkpoint had reached the end of the log, so every defence against a full device sat downstream of a no-op (the WAL is now a directory of segments) | `phase-04/wal-segments` |
 | Watermarks were not epoch-qualified at the store, so a fenced epoch-N writer's late report was accepted — there was no caller that knew its own epoch until the Agent reported one (`ReportVolumeState`, enforced in `cpserver`) | `28cb8c5` |
 
 ## Open
 
-Two entries, each named with what it is waiting on.
+One entry, named with what it is waiting on.
 
 ### Waiting on a format that Phase 12 will introduce (1)
 
@@ -117,19 +118,6 @@ Two entries, each named with what it is waiting on.
   - **decided (ADR-0012 amendment, Accepted):** Phase 12's segment format is born with a
     per-volume index readable by deterministic key, rather than retrofitting one. The
     same object ADR-0014's squash needs, designed once.
-
-### Waiting on the WAL segment format review (1)
-
-- **`TruncateLocal` reclaims nothing on an active volume** _(wal-durability, new)_
-  - It records `truncatedUpTo` and calls `file.Truncate(0)` only when `upTo >= local`,
-    so the space below a published checkpoint is freed only when the checkpoint reached
-    the end of the log — which on a volume under continuous write never happens. The
-    WAL is a file that grows and is emptied when the volume goes idle. Every other
-    defence against a full device is downstream of this one, and none of them helps
-    while the reclaim path is a no-op.
-  - waiting on: ADR-0013 (Proposed). The fix is to segment the WAL so truncation
-    unlinks whole segments, which is an on-disk format change and needs the format
-    review before the code.
 
 ### Known-weaker coverage, deliberately (0)
 
