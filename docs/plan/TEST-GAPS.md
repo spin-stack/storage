@@ -11,7 +11,7 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files, then wave 3 (G1–G5). **Seven entries are
+own worktree over a disjoint set of files, then wave 3 (G1–G5). **Six entries are
 still open**, and every one of them is listed below with what it is waiting on.
 Findings that turned out to be already covered are recorded as such rather than
 counted as work; two of the open entries are new, found by the harness while proving
@@ -91,10 +91,11 @@ that a checker could catch a real bug.
 | The GC's epoch ceiling — a permanent number computed from a listing — licensed destroying a superseded epoch's objects that a pre-promotion manifest still named (ADR-0012) | `0c2b4a4` |
 | Four checkers were still proven against a fabricated event; all thirteen are now behavioural, with controls, and `InjectStaleListing` un-lists a settled key so a durable point can regress from a real race | `a0c8565`, `069fe8e` |
 | The WAL classified a full device by matching an error message, because the disk interface declared no sentinel | `58f398b` |
+| `internal/snapshot` published a create-only manifest without consulting the epoch object, so a fenced host could snapshot into an epoch granted to somebody else — the last ungated publisher | `5e88ebc` |
 
 ## Open
 
-Seven entries. Three are new: two found by the harness while proving that a checker
+Six entries. Three are new: two found by the harness while proving that a checker
 could catch a real bug, and one found while answering how a node protects itself from a
 full device. Each names what it is waiting on.
 
@@ -158,13 +159,9 @@ full device. Each names what it is waiting on.
     still be accepted. It needs a caller that knows its epoch, and there is none yet.
   - waiting on: DEV-0007 (the Agent spine).
 
-### Known-weaker coverage, deliberately (1)
+### Known-weaker coverage, deliberately (0)
 
-- **`internal/snapshot` does not check holdership before publishing a manifest.**
-  `Snapshotter.Create` builds a create-only manifest from the live log, so only the host
-  holding the volume can take one (§19) — but nothing enforces that at the object store.
-  The gate is ready (`recovery.VerifyPublisher`); it is a pre-check only, since `Publish`
-  is the last step of `Create`.
+None. The snapshot publisher was the last entry here and is closed below.
 
 ## Interpretations that deserve a second look
 
