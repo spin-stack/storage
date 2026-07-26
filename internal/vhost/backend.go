@@ -47,15 +47,17 @@ var ErrOutOfRange = errors.New("vhost: request is outside the device")
 // block device held in host memory, where FLUSH is a no-op because there is no
 // stable media under it.
 //
-// It exists so Increment 3.1 can prove the *transport* — handshake, ring
-// walking, request completion — against something with no behaviour of its own.
-// The WAL is the next increment's job, and wiring it here would mean debugging
-// two new things at once.
+// It exists so the unit tests can prove the *transport* — handshake, ring
+// walking, request completion — against something with no behaviour of its own,
+// and so they can do it without touching a filesystem. The device a real guest
+// is served from is hostio.RawFile; the WAL is Phase 04's job, and wiring it
+// here would mean debugging two new things at once.
 //
-// It is not backed by simio/disk on purpose: disk.File is append-only (Append,
-// ReadAt, Truncate, Sync) because that is what a WAL needs, and a raw block
-// device needs random writes. See the note on WriteAt in the increment report —
-// the missing primitive is disk.File.WriteAt(p []byte, off int64) (int, error).
+// Neither this nor hostio.RawFile is backed by simio/disk: disk.File is
+// append-only (Append, ReadAt, Truncate, Sync) because that is what a WAL needs,
+// and a block device needs random writes. The missing primitive is
+// disk.File.WriteAt(p []byte, off int64) (int, error); ADR-0020 records why it
+// is not being added for scaffolding.
 type RawDevice struct {
 	mu     sync.Mutex
 	data   []byte
