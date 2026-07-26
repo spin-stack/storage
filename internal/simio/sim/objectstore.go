@@ -34,6 +34,13 @@ type ObjectStore struct {
 	objs map[string]*simObject
 	// LIST consistency: when eventual, keys become List-visible only after Settle.
 	eventualList bool
+	// listLag delays List-visibility by that many further store operations, which is
+	// how a real eventually consistent listing behaves: it catches up on its own,
+	// after a while. 0 = strongly consistent.
+	listLag int
+	// ops counts every store operation, so a lag can be expressed in operations
+	// rather than in wall time (which the store does not have).
+	ops uint64
 	// one-shot faults
 	lostResponse map[string]bool
 	throttle     int
@@ -43,6 +50,10 @@ type simObject struct {
 	data      []byte
 	etag      string
 	listReady bool
+	// visibleAt is the operation count from which List reports this version, when the
+	// store was configured with a finite lag. 0 means "not on a lag" — either already
+	// listable (listReady) or waiting for Settle (eventualList).
+	visibleAt uint64
 	// marked models a versioned bucket's delete marker (§21.3): the object stops
 	// answering reads and listings, and its bytes stay until the lifecycle sweeps
 	// them. Nothing in this package removes a marked object's data — that is the
@@ -87,13 +98,47 @@ func (s *ObjectStore) SetEventualList(eventual bool) {
 	s.eventualList = eventual
 }
 
-// Settle makes all objects List-visible (models LIST catching up).
+// SetListLag makes a freshly written key List-visible only after n further store
+// operations, modelling an eventually consistent listing that catches up by itself
+// (§6.1). n <= 0 restores a strongly consistent LIST.
+//
+// This is the seed-drivable form of SetEventualList: a scenario picks n from its PRNG
+// and the catch-up lands at a different point relative to the promotion, the boundary
+// write, or the GC's second listing on every seed, while the run stays reproducible —
+// the counter is operations, not time, so it advances only when the scenario acts.
+// SetEventualList(true) is the same thing with an unbounded lag, and takes precedence
+// while it is on.
+func (s *ObjectStore) SetListLag(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	s.listLag = n
+}
+
+// Settle makes all objects List-visible (models LIST catching up), whatever the
+// configured lag.
 func (s *ObjectStore) Settle() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, o := range s.objs {
 		o.listReady = true
+		o.visibleAt = 0
 	}
+}
+
+// begin counts an operation. Every exported store method except List calls it under
+// the lock, so a LIST lag expressed in operations advances with the scenario and
+// nothing else.
+func (s *ObjectStore) begin() { s.ops++ }
+
+// listVisible reports whether List should report o now. Callers hold s.mu.
+func (s *ObjectStore) listVisible(o *simObject) bool {
+	if o.marked {
+		return false
+	}
+	return o.listReady || (o.visibleAt > 0 && s.ops >= o.visibleAt)
 }
 
 // InjectLostResponse makes the next Put to key persist but return ErrLostResponse.
@@ -126,6 +171,7 @@ func simEtag(data []byte) string {
 func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.begin()
 	if s.throttled() {
 		return objectstore.PutResult{}, ErrThrottled
 	}
@@ -146,9 +192,12 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	stored := &simObject{
 		data:       append([]byte(nil), data...),
 		etag:       simEtag(data),
-		listReady:  !s.eventualList,
+		listReady:  !s.eventualList && s.listLag == 0,
 		superseded: rewroteAMarkedKey,
 		createdAt:  s.now(),
+	}
+	if !s.eventualList && s.listLag > 0 {
+		stored.visibleAt = s.ops + uint64(s.listLag)
 	}
 	s.objs[key] = stored
 
@@ -163,6 +212,7 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.begin()
 	if s.throttled() {
 		return nil, ErrThrottled
 	}
@@ -176,6 +226,7 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.begin()
 	if s.throttled() {
 		return objectstore.ObjectInfo{}, ErrThrottled
 	}
@@ -186,6 +237,8 @@ func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInf
 	return objectstore.ObjectInfo{Key: key, Size: int64(len(o.data)), ETag: o.etag, LastModified: o.createdAt}, nil
 }
 
+// List does not advance the lag counter: observing a backend does not make it catch
+// up, and a caller that polls the listing must not be able to hurry it along.
 func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,10 +247,7 @@ func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.Obje
 	}
 	var out []objectstore.ObjectInfo
 	for key, o := range s.objs {
-		if o.marked {
-			continue
-		}
-		if !o.listReady || !strings.HasPrefix(key, prefix) {
+		if !s.listVisible(o) || !strings.HasPrefix(key, prefix) {
 			continue
 		}
 		out = append(out, objectstore.ObjectInfo{
@@ -215,6 +265,7 @@ func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.Obje
 func (s *ObjectStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.begin()
 	if s.throttled() {
 		return ErrThrottled
 	}
@@ -235,6 +286,7 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 func (s *ObjectStore) Restore(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.begin()
 	o, ok := s.objs[key]
 	if !ok {
 		return objectstore.ErrNotFound
