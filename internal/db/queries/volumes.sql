@@ -40,14 +40,23 @@ SELECT * FROM volumes WHERE volume_id = $1;
 SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id;
 
 -- name: BumpVolumeEpoch :one
--- Increment the epoch and set the primary host, term-guarded. Returns 0 rows if
--- the term is stale or the volume is missing (§12.3).
+-- Grant the next epoch to a host, term-guarded — and guarded by the epoch the
+-- promoter read (§12.3). The expected-epoch predicate is what makes this a
+-- compare-and-set rather than an increment: a promotion computes its target from
+-- the epoch it read, so n promoters that all read e must produce one winner at e+1.
+-- A blind increment gives each of them an epoch, they all CAS the S3 epoch object to
+-- the number *they* computed, one CAS wins, and every one of them has already
+-- written its own host into primary_host_id — leaving the row naming a host that
+-- holds neither the object nor a lease.
+--
+-- 0 rows means a stale term, a missing volume, or an epoch that moved on.
 UPDATE volumes
    SET current_epoch = current_epoch + 1,
        primary_host_id = $2,
        updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND current_epoch = sqlc.arg(expected_epoch)
 RETURNING current_epoch;
 
 -- name: ResizeVolume :execrows

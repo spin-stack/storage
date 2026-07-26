@@ -12,3 +12,10 @@ RETURNING term;
 SELECT term, holder_id, renewed_at
 FROM control_plane_leader
 WHERE singleton;
+
+-- name: DatabaseNow :one
+-- The database's own clock. Every fencing deadline is derived from a timestamp this
+-- clock stamped (host_leases.last_renewal), so the Control Plane compares against
+-- this rather than against its own wall clock: a container clock that jumps forward
+-- would otherwise shorten the fencing wait by exactly that offset (§12.1).
+SELECT now()::timestamptz;

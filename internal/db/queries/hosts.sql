@@ -55,16 +55,40 @@ UPDATE hosts
 -- turns "lease for an id nobody registered" into 0 rows (ErrNotFound) instead of a
 -- foreign-key error: a lease is a fencing token, and granting one to an unknown
 -- host invents authority over a volume nobody can find.
+--
+-- The state predicate is the second half of that rule. Marking a host DEAD is the
+-- Control Plane asserting its writer is gone — the assertion promotion accepts as a
+-- reason to skip the fencing wait — so a routine heartbeat must not be able to
+-- re-arm the lease of a host that has just been fenced. CORDONED and DRAINING are
+-- deliberately still allowed: both are still serving the volumes they hold, and
+-- refusing their renewals would stop their ACKs in the middle of an evacuation.
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $3
 )
 INSERT INTO host_leases (host_id, granted_at, last_renewal, ttl_seconds)
 SELECT $1, now(), now(), $2
 WHERE EXISTS (SELECT 1 FROM valid)
-  AND EXISTS (SELECT 1 FROM hosts WHERE host_id = $1)
+  AND EXISTS (SELECT 1 FROM hosts
+               WHERE host_id = $1
+                 AND state = ANY(sqlc.arg(serving_states)::text[]))
 ON CONFLICT (host_id) DO UPDATE
   SET last_renewal = now(),
       ttl_seconds = EXCLUDED.ttl_seconds;
+
+-- name: RevokeHostLease :execrows
+-- Take a host's lease away (§12.6), term-guarded. Deleting the row is what stops
+-- the Control Plane's own view of the lease from being renewed behind a fence; the
+-- Agent counts its copy down on a monotonic clock and never learns the row is gone,
+-- which is why a promotion still waits out the full lease_ttl + max_clock_skew.
+--
+-- The host-exists predicate keeps "no such host" (0 rows, ErrNotFound) apart from
+-- "that host holds no lease", which is the state the caller asked for.
+DELETE FROM host_leases
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $2;
+
+-- name: HostExists :one
+SELECT EXISTS (SELECT 1 FROM hosts WHERE host_id = $1);
 
 -- name: GetHostLease :one
 SELECT * FROM host_leases WHERE host_id = $1;

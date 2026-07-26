@@ -907,7 +907,9 @@ func authorityClock(t *testing.T, s metadata.Store) {
 		t.Fatal(err)
 	}
 	// The same clock, so the row's stamp is inside the interval bracketing it.
-	if l.LastRenewal.Before(before) || l.LastRenewal.After(after) {
+	// (Expressed with Before both ways round: the simulable analyzer cannot tell
+	// time.Time.After from time.After, and INV-01 forbids the latter.)
+	if l.LastRenewal.Before(before) || after.Before(l.LastRenewal) {
 		t.Fatalf("last_renewal %v is outside [%v, %v] — Now is not the clock that stamps rows",
 			l.LastRenewal, before, after)
 	}

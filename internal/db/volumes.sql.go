@@ -19,6 +19,7 @@ UPDATE volumes
        updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND current_epoch = $4
 RETURNING current_epoch
 `
 
@@ -26,12 +27,26 @@ type BumpVolumeEpochParams struct {
 	VolumeID      uuid.UUID   `json:"volume_id"`
 	PrimaryHostID pgtype.UUID `json:"primary_host_id"`
 	Term          int64       `json:"term"`
+	ExpectedEpoch int64       `json:"expected_epoch"`
 }
 
-// Increment the epoch and set the primary host, term-guarded. Returns 0 rows if
-// the term is stale or the volume is missing (§12.3).
+// Grant the next epoch to a host, term-guarded — and guarded by the epoch the
+// promoter read (§12.3). The expected-epoch predicate is what makes this a
+// compare-and-set rather than an increment: a promotion computes its target from
+// the epoch it read, so n promoters that all read e must produce one winner at e+1.
+// A blind increment gives each of them an epoch, they all CAS the S3 epoch object to
+// the number *they* computed, one CAS wins, and every one of them has already
+// written its own host into primary_host_id — leaving the row naming a host that
+// holds neither the object nor a lease.
+//
+// 0 rows means a stale term, a missing volume, or an epoch that moved on.
 func (q *Queries) BumpVolumeEpoch(ctx context.Context, arg BumpVolumeEpochParams) (int64, error) {
-	row := q.db.QueryRow(ctx, bumpVolumeEpoch, arg.VolumeID, arg.PrimaryHostID, arg.Term)
+	row := q.db.QueryRow(ctx, bumpVolumeEpoch,
+		arg.VolumeID,
+		arg.PrimaryHostID,
+		arg.Term,
+		arg.ExpectedEpoch,
+	)
 	var current_epoch int64
 	err := row.Scan(&current_epoch)
 	return current_epoch, err

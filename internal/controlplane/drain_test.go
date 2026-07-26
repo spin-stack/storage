@@ -473,7 +473,7 @@ func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 
 	// Now the crash: the next pass promoted the first volume and died before writing
 	// the epoch boundary and releasing the source's capacity.
-	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
+	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost, 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -572,7 +572,7 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	w.pastFencingWait()
-	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost); err != nil {
+	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, firstID, destHost, 1); err != nil {
 		t.Fatal(err)
 	}
 	// Corrupt the epoch's only object so the durable point cannot be established.

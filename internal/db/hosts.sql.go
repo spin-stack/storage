@@ -72,6 +72,17 @@ func (q *Queries) GetHostLease(ctx context.Context, hostID uuid.UUID) (*HostLeas
 	return &i, err
 }
 
+const hostExists = `-- name: HostExists :one
+SELECT EXISTS (SELECT 1 FROM hosts WHERE host_id = $1)
+`
+
+func (q *Queries) HostExists(ctx context.Context, hostID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hostExists, hostID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const listHosts = `-- name: ListHosts :many
 SELECT host_id, state, agent_version, max_format_version, nvme_total_bytes, nvme_used_bytes, nvme_committed_bytes, last_heartbeat FROM hosts ORDER BY host_id
 `
@@ -113,24 +124,65 @@ WITH valid AS (
 INSERT INTO host_leases (host_id, granted_at, last_renewal, ttl_seconds)
 SELECT $1, now(), now(), $2
 WHERE EXISTS (SELECT 1 FROM valid)
-  AND EXISTS (SELECT 1 FROM hosts WHERE host_id = $1)
+  AND EXISTS (SELECT 1 FROM hosts
+               WHERE host_id = $1
+                 AND state = ANY($4::text[]))
 ON CONFLICT (host_id) DO UPDATE
   SET last_renewal = now(),
       ttl_seconds = EXCLUDED.ttl_seconds
 `
 
 type RenewHostLeaseParams struct {
-	HostID     uuid.UUID `json:"host_id"`
-	TtlSeconds int32     `json:"ttl_seconds"`
-	Term       int64     `json:"term"`
+	HostID        uuid.UUID `json:"host_id"`
+	TtlSeconds    int32     `json:"ttl_seconds"`
+	Term          int64     `json:"term"`
+	ServingStates []string  `json:"serving_states"`
 }
 
 // Grouped per-host lease renewal (§12.6), term-guarded. The host-exists predicate
 // turns "lease for an id nobody registered" into 0 rows (ErrNotFound) instead of a
 // foreign-key error: a lease is a fencing token, and granting one to an unknown
 // host invents authority over a volume nobody can find.
+//
+// The state predicate is the second half of that rule. Marking a host DEAD is the
+// Control Plane asserting its writer is gone — the assertion promotion accepts as a
+// reason to skip the fencing wait — so a routine heartbeat must not be able to
+// re-arm the lease of a host that has just been fenced. CORDONED and DRAINING are
+// deliberately still allowed: both are still serving the volumes they hold, and
+// refusing their renewals would stop their ACKs in the middle of an evacuation.
 func (q *Queries) RenewHostLease(ctx context.Context, arg RenewHostLeaseParams) (int64, error) {
-	result, err := q.db.Exec(ctx, renewHostLease, arg.HostID, arg.TtlSeconds, arg.Term)
+	result, err := q.db.Exec(ctx, renewHostLease,
+		arg.HostID,
+		arg.TtlSeconds,
+		arg.Term,
+		arg.ServingStates,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeHostLease = `-- name: RevokeHostLease :execrows
+DELETE FROM host_leases
+ WHERE host_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $2
+`
+
+type RevokeHostLeaseParams struct {
+	HostID uuid.UUID `json:"host_id"`
+	Term   int64     `json:"term"`
+}
+
+// Take a host's lease away (§12.6), term-guarded. Deleting the row is what stops
+// the Control Plane's own view of the lease from being renewed behind a fence; the
+// Agent counts its copy down on a monotonic clock and never learns the row is gone,
+// which is why a promotion still waits out the full lease_ttl + max_clock_skew.
+//
+// The host-exists predicate keeps "no such host" (0 rows, ErrNotFound) apart from
+// "that host holds no lease", which is the state the caller asked for.
+func (q *Queries) RevokeHostLease(ctx context.Context, arg RevokeHostLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeHostLease, arg.HostID, arg.Term)
 	if err != nil {
 		return 0, err
 	}

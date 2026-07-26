@@ -79,7 +79,7 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 			})
 		}},
 		{"BumpVolumeEpoch primary host", func() error {
-			_, err := store.BumpVolumeEpoch(ctx, term, volID, truncated)
+			_, err := store.BumpVolumeEpoch(ctx, term, volID, truncated, 0)
 			return err
 		}},
 		{"CreateSnapshot source host", func() error {
