@@ -11,9 +11,11 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files. **Twelve entries are still open**, and
-every one of them is listed below with what it is waiting on. Findings that turned out
-to be already covered are recorded as such rather than counted as work.
+own worktree over a disjoint set of files, then wave 3 (G1–G5). **Six entries are
+still open**, and every one of them is listed below with what it is waiting on.
+Findings that turned out to be already covered are recorded as such rather than
+counted as work; two of the open entries are new, found by the harness while proving
+that a checker could catch a real bug.
 
 ## Closed — wave 1 (packages A–E)
 
@@ -71,93 +73,85 @@ to be already covered are recorded as such rather than counted as work.
 | Planted bugs emitted a literal event instead of breaking production behaviour, so a checker could pass while catching nothing real — 7 of 11 are now behavioural and the count is pinned | `a0c8565` |
 | The CP term had no anchor outside the database it is restored from: a rewound `control_plane_leader` re-issued a term a live leader was still using, and both passed every §7 guard (ADR-0011, accepted) | `0265627` |
 
+## Closed — wave 3 (packages G1–G5)
+
+| Finding | Commit |
+|---|---|
+| `CommitHostCapacity` enforced no oversubscription bound: two operations reading the fleet before either reserved both committed, and nothing re-checked §28.2 at the write | `016b257` |
+| A resumed drain proved its own capacity delta landed with a read then a write, so a third party's change in between passed as its own | `016b257` |
+| A second concurrent drain of one host was neither refused nor serialized (`ListOperationsByHost`, chosen over a partial index so 'live' stays the transition table's answer) | `e857cc6` |
+| A healthy host could not be evacuated at all: the drain now observes `last_renewal`, records it, and only then revokes — the order is the fix, since Promote refuses a zero instant | `b9a0f76` |
+| `wal.Log` could not tell a full device from any other I/O error, and no metric said so (`Degraded()`, `wal_out_of_space`, orthogonal to `Fenced()`) | `c83bf1b` |
+| The uploader retried a coordinated throttle with no backoff, exhausting its budget inside one throttling window | `e348fed` |
+| The uploader could publish a span overlapping one it had already published (a foreign writer's overlap stays recovery's, argued in the code) | `781c976` |
+| INV-03 and INV-13 were unreachable by any injected fault, so their checkers had nothing to catch (`OrderPolicy`, strict by default and by omission) | `273a3ae` |
+| **`Log.AdvancePublished` accepted a value below its own past**: one stale listing walked the published point backwards under WAL that INV-13 had already authorised discarding | `dde33d9` |
+| The publishers never consulted the epoch object at all — not 'number-only', *nothing* — so a fenced host could publish a checkpoint into another host's epoch and advance `published` | `94e9ec7` |
+| The drain wrote the epoch boundary anonymously, so a resumed pass could record a create-only boundary for an epoch an overtaking promotion had moved on | `2a6e62e` |
+| The GC's epoch ceiling — a permanent number computed from a listing — licensed destroying a superseded epoch's objects that a pre-promotion manifest still named (ADR-0012) | `0c2b4a4` |
+| Four checkers were still proven against a fabricated event; all thirteen are now behavioural, with controls, and `InjectStaleListing` un-lists a settled key so a durable point can regress from a real race | `a0c8565`, `069fe8e` |
+| The WAL classified a full device by matching an error message, because the disk interface declared no sentinel | `58f398b` |
+
 ## Open
 
-Twelve entries. Each names what it is waiting on; none is waiting on someone finding
-the time to write a test.
+Six entries, and two of them are new — found by the harness while proving that a
+checker could catch a real bug. Each names what it is waiting on.
 
-### Needs a decision (1)
+### Needs a decision (3)
+
+- **A lagging replica read makes the fencing wait elapse early** _(fencing-promotion, new)_
+  - `Promote` takes the `host_leases` row as the whole authority for FENCING_WAIT. A
+    read served by a replica behind by more than `lease_ttl + max_clock_skew` reports a
+    `last_renewal` old enough that the wait looks over, and an epoch is granted over a
+    live writer. The clock-offset check added in wave 2 cannot see it: both clocks
+    agree, it is the *data* that is old.
+  - waiting on: a decision between reading leases from the primary explicitly (a
+    deployment guarantee the adapter would have to state and enforce) and a monotonic
+    dwell measured from when *this* promoter first observed the lease. The second is
+    the one that does not depend on how the database is deployed.
+
+- **A heartbeat will re-arm the lease a drain revokes** _(fencing-promotion, new)_
+  - `RenewHostLease` deliberately accepts CORDONED and DRAINING, because both still
+    serve what they hold. Nothing renews leases outside promotion today, so the drain's
+    revoke works — but once the Agent heartbeat exists (DEV-0007), a source that keeps
+    heartbeating re-arms the lease the drain just revoked and the wait never elapses.
+  - waiting on: an ADR in the lease/fencing zone. Either the CP refuses renewals for a
+    host it is draining (which flips a wave-2 contract test that exists on purpose), or
+    a host state means "fenced" distinctly from "cordoned".
 
 - **A GC sweep cannot see an anchor its listing has not caught up to** _(gc-objectstore)_
-  - With an eventually consistent LIST, a freshly published manifest is GET-visible and
-    LIST-invisible while the WAL objects it anchors — older by construction (§21.1) —
-    are already listed and already past grace. The sweep marks live data. Re-listing
-    does not help, and neither would having Mark consume Reachable's listing: both
-    listings miss the same anchor.
-  - waiting on: a root the sweep can read **by deterministic key** rather than by
-    listing (a snapshot catalog query, or a snapshot index in the volume descriptor).
-    That is a Control-Plane / on-S3-format decision, not a GC one.
-  - bounded today: `TestListSeesAFreshPut` certifies strongly consistent LIST per
-    backend and is blocking (§6.1). The precondition is now stated in the `gc` and
-    `recovery` package docs.
+  - Narrowed, not closed, by ADR-0012: the epoch ceiling no longer licenses destruction,
+    and the reproduction that decided it — a hole in the listing *below* a durable point
+    marks ACKed data with no manifest involved at all — showed no index would have
+    helped. Strongly consistent LIST stays a precondition, certified per backend by
+    `TestListSeesAFreshPut` (§6.1, blocking).
+  - revisit when: compaction/objectization (Phase 12) makes a manifest the *sole* anchor
+    of the WAL objects a segment replaced. That is the point where there is a format
+    worth indexing.
 
-### Needs an increment owning files no wave-2 package owned (5)
+### Needs an increment owning files no package owned (2)
 
-- **`CommitHostCapacity` enforces no oversubscription bound** _(drain-placement-dst)_
-  - Two operations that read the fleet before either reserved anything choose the same
-    destination and both commit, pushing it past `MaxOversubscription × NVMeTotalBytes`
-    with neither caller having made a mistake. `Choose` evaluates the bound correctly:
-    this is not a placement bug, it is a check-then-act between the read and the write.
-  - shape: keep the non-negativity guard and add
-    `AND ($2 <= 0 OR nvme_committed_bytes + $2 <= floor(max_oversubscription * nvme_total_bytes))`
-    — the `$2 <= 0` disjunct is what stops a *release* bouncing off the bound on a host
-    already above it — surfaced as a distinct `ErrCapacityExceeded`, with callers
-    passing `placement.Policy.Limit` rather than a second copy of the rule.
-  - needs one increment owning `internal/db/queries/hosts.sql` **and** `drain.go` /
-    `crosshost.go`.
+- **Capacity accounting has no idempotency key** _(drain-placement-dst)_
+  - The expected-value predicate closes the read→write window, not a crash: if the drain
+    dies before its reservation and a stranger's change nets to exactly one volume size,
+    the resumed compare-and-set fails, the re-read shows `before + delta`, and the pass
+    concludes its own delta landed.
+  - waiting on: a reservation row keyed by `(operation_id, volume_id)` — a schema
+    decision, deliberately not taken by an implementer.
 
-- **A second concurrent drain of one host is neither refused nor serialized** _(drain-placement-dst)_
-  - The harm is closed — capacity is released once and no second destination is
-    reserved — but two drains still run, both promote the same volumes, and the loser's
-    reservation is released by nobody.
-  - waiting on: a way to find live drain operations for a host. There is only
-    `GetOperation` by id; this needs `ListOperationsByHost`, or a unique partial index
-    on live drain operations per host.
+- **Watermarks are not epoch-qualified at the store** _(metadata-cp)_
+  - The monotonic floor covers the regression the original finding named, but a fenced
+    epoch-N writer reporting a *higher* durable sequence than epoch N+1 published would
+    still be accepted. It needs a caller that knows its epoch, and there is none yet.
+  - waiting on: DEV-0007 (the Agent spine).
 
-- **A healthy host still cannot be evacuated** _(drain-placement-dst)_
-  - The drain refuses to promote a source whose lease is still live, and
-    `RevokeHostLease` now exists — but nothing wires them together, so draining a host
-    that keeps heartbeating waits forever.
-  - waiting on: the drain calling the revoke, term-guarded, as part of its fencing
-    step, with `drain-source-cannot-ack-afterwards` extended to a healthy source.
+### Known-weaker coverage, deliberately (1)
 
-- **`applyCapacity` cannot see a third party whose changes cancel out** _(drain-placement-dst)_
-  - The drain proves its own delta landed by comparing the ledger against a recorded
-    value, which is blind to another writer whose net effect between passes is exactly
-    one volume size.
-  - waiting on: an expected-value predicate in the reserving query — the same increment
-    as the oversubscription bound.
-
-- **`wal.Log` has no out-of-space state** _(wal-durability)_
-  - The DST scenario asserts everything observable — backpressure before the device
-    fills, no phantom sequence, sticky failure, a clean replay — but a caller cannot
-    distinguish a full device from a transient I/O error, and no metric says it.
-  - waiting on: a sticky `Degraded()` set when an append fails for want of space and
-    cleared by a successful append after truncation, plus a `wal_out_of_space` gauge on
-    the existing recorder. `internal/wal` was owned by no wave-2 package.
-
-### Known-weaker coverage, deliberately (6)
-
-- **Four checkers still have only a literal planted-bug proof**: `watermark-order` and
-  `no-truncate-above-published` need a fault seam in `internal/wal` (`Log` enforces both
-  internally and no simulated I/O reaches the check), `promotion-fencing-wait` needs a
-  fault double for `metadata.Store`, and `background-yields` sits in `internal/ioclass`,
-  which is pure in-process arbitration. `TestPlantedBugCoverageIsNotSilentlyWeakened`
-  pins the behavioural count at 7 so this cannot quietly get worse.
-- **Watermarks are not epoch-qualified at the store.** The monotonic floor covers the
-  regression the finding named, but a fenced epoch-N writer reporting a *higher* durable
-  sequence than epoch N+1 published would still be accepted. It needs a caller that
-  knows its epoch, and there is none yet (DEV-0007).
-- **The uploader has no backoff** between retries, so a coordinated throttle exhausts
-  the budget faster than the backend recovers. The context half is closed.
-- **The uploader detects an identical span, not a partial overlap** (`{1-3}` vs
-  `{2-5}`), and its check is a LIST, so a lagging listing blinds it. Recovery is now the
-  backstop; whether the write path should also detect it is a `wal` owner's call.
-- **Publishers still call the number-only `epoch.Verify`** (`recovery`, `checkpoint`,
-  `snapshot`, `dst/scenarios.go`), so `VerifyHolder` is defence in depth rather than the
-  gate everywhere.
-- **A durable point cannot regress from a real backend race in the sim**, only from a
-  planted bug, because `sim.ObjectStore` cannot un-list a settled key.
+- **`internal/snapshot` does not check holdership before publishing a manifest.**
+  `Snapshotter.Create` builds a create-only manifest from the live log, so only the host
+  holding the volume can take one (§19) — but nothing enforces that at the object store.
+  The gate is ready (`recovery.VerifyPublisher`); it is a pre-check only, since `Publish`
+  is the last step of `Create`.
 
 ## Interpretations that deserve a second look
 
@@ -166,9 +160,12 @@ the time to write a test.
   alternative — any overlap is fatal — would make a restarted writer's harmless
   re-batch permanently unrecoverable. This interprets §14.5 and may warrant an ADR; the
   strict rule is a two-line change in `agree`.
-- Giving a superseded epoch a ceiling means its objects **above** that ceiling are no
-  longer reachable roots, so the GC will mark them (reversibly, INV-14). They are
-  unadopted orphans and marking them is correct, but it is a real semantic change.
+- ~~Giving a superseded epoch a ceiling means its objects above that ceiling are no
+  longer reachable roots, so the GC will mark them.~~ **Reversed by ADR-0012.** That
+  reading was right about what the volume contains and wrong about what may be
+  destroyed: an object above the ceiling is either a snapshot object a pre-promotion
+  manifest still names, or the evidence of a boundary that was itself computed from a
+  listing. Every WAL object of a closed epoch is now a root.
 - The §7 volume states record that a fence is in progress; they do **not** give mutual
   exclusion, because a self-transition is legal and two CPs can both reach
   FENCING_WAIT. Exclusion comes from the two compare-and-sets. Said here because the
