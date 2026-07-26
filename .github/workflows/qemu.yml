@@ -1,0 +1,88 @@
+name: QEMU
+
+# QEMU 11.0.2 is pinned for CI and production alike (CLAUDE.md), and building it from
+# source takes tens of minutes — far too slow for the per-push gate. So it is its own
+# workflow, triggered only when something that can change the artefact changes, and it
+# publishes the result so nobody has to rebuild it: a container image in GitHub
+# Packages for the integration lane, and the extracted binaries as an artefact for a
+# developer who wants to run them directly.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.qemu
+      - .github/workflows/qemu.yml
+      - Taskfile.yml # the version and the build flags live here
+  pull_request:
+    paths:
+      - Dockerfile.qemu
+      - .github/workflows/qemu.yml
+      - Taskfile.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: qemu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Task
+        uses: go-task/setup-task@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The pinned version comes from the Taskfile, never from a literal here: two
+      # places to bump is how CI and production end up on different QEMUs.
+      - name: Read the pinned QEMU version
+        id: qemu
+        run: echo "version=$(task qemu:version)" >> "$GITHUB_OUTPUT"
+
+      # `task build:qemu` runs the same buildx command a developer runs, with the
+      # cache backend swapped for the GitHub Actions one. It ends in `task
+      # qemu:verify`, which asserts the binary is the pinned version and really has
+      # vhost-user-blk-pci — the property the whole §3 data path depends on. A build
+      # that produces a QEMU without it fails here rather than in an integration test
+      # six weeks later.
+      - name: Build QEMU and verify what came out
+        run: task build:qemu QEMU_CACHE_FROM=type=gha QEMU_CACHE_TO=type=gha,mode=max QEMU_JOBS=4
+
+      - name: Upload the extracted binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ steps.qemu.outputs.version }}-linux-amd64
+          path: _output/
+          retention-days: 30
+          if-no-files-found: error
+
+      # Publishing is skipped for pull requests: a fork's token cannot write packages,
+      # and an unreviewed branch has no business claiming the version tag.
+      - name: Log in to GitHub Packages
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Two tags: the QEMU version, which is what everything pins, and the commit,
+      # which is what makes a specific build reproducible when the version tag has
+      # moved because a flag changed.
+      - name: Publish the runtime image
+        if: github.event_name != 'pull_request'
+        run: |
+          task build:qemu:push \
+            QEMU_IMAGE=ghcr.io/${{ github.repository }}/qemu \
+            QEMU_IMAGE_EXTRA_TAG=${{ github.sha }} \
+            QEMU_CACHE_FROM=type=gha \
+            QEMU_CACHE_TO=type=gha,mode=max \
+            QEMU_JOBS=4

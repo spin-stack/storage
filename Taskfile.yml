@@ -20,6 +20,14 @@ vars:
   # QEMU is pinned here and in CLAUDE.md; the same version runs in CI and prod.
   QEMU_VERSION: 11.0.2
   QEMU_JOBS: '{{.QEMU_JOBS | default 8}}'
+  # BuildKit cache backends. Local by default (a laptop); CI overrides them with
+  # `type=gha` so the build is not duplicated in a workflow file — the Dockerfile and
+  # the flags stay in one place, which is the rule the whole Taskfile exists for.
+  QEMU_CACHE_FROM: '{{.QEMU_CACHE_FROM | default (printf "type=local,src=%s" .BUILDKIT_CACHE_QEMU)}}'
+  QEMU_CACHE_TO: '{{.QEMU_CACHE_TO | default (printf "type=local,dest=%s,mode=max,compression=zstd" .BUILDKIT_CACHE_QEMU)}}'
+  # Where the runtime image is published. Overridden in CI with the GitHub Packages
+  # path; the default is a local tag so `task build:qemu:image` needs no registry.
+  QEMU_IMAGE: '{{.QEMU_IMAGE | default "spin-stack/storage-qemu"}}'
   # Object-store backend under test (§6.1 conformance suite). Pinned by digest so a
   # re-tagged image cannot silently change what the suite certified.
   RUSTFS_IMAGE: "rustfs/rustfs:latest@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
@@ -137,8 +145,8 @@ tasks:
           --file Dockerfile.qemu \
           --target extract \
           --platform linux/amd64 \
-          --cache-from type=local,src={{.BUILDKIT_CACHE_QEMU}} \
-          --cache-to type=local,dest={{.BUILDKIT_CACHE_QEMU}},mode=max,compression=zstd \
+          --cache-from {{.QEMU_CACHE_FROM}} \
+          --cache-to {{.QEMU_CACHE_TO}} \
           --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
           --build-arg JOBS={{.QEMU_JOBS}} \
           --output type=local,dest={{.OUTPUT_DIR}} \
@@ -168,11 +176,39 @@ tasks:
           --file Dockerfile.qemu \
           --target runtime \
           --platform linux/amd64 \
-          --cache-from type=local,src={{.BUILDKIT_CACHE_QEMU}} \
+          --cache-from {{.QEMU_CACHE_FROM}} \
           --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
           --build-arg JOBS={{.QEMU_JOBS}} \
-          --tag spin-stack/storage-qemu:{{.QEMU_VERSION}} \
+          --tag {{.QEMU_IMAGE}}:{{.QEMU_VERSION}} \
           --load \
+          .
+
+  qemu:version:
+    desc: Print the pinned QEMU version (the single source of truth for CI tags).
+    silent: true
+    cmds:
+      - echo "{{.QEMU_VERSION}}"
+
+  build:qemu:push:
+    desc: >-
+      Build and push the QEMU runtime image. Usage:
+      task build:qemu:push QEMU_IMAGE=ghcr.io/<owner>/<repo>/qemu QEMU_IMAGE_EXTRA_TAG=<sha>
+      Requires a `docker login` to that registry.
+    vars:
+      QEMU_IMAGE_EXTRA_TAG: '{{.QEMU_IMAGE_EXTRA_TAG | default ""}}'
+    cmds:
+      - |
+        docker buildx build \
+          --file Dockerfile.qemu \
+          --target runtime \
+          --platform linux/amd64 \
+          --cache-from {{.QEMU_CACHE_FROM}} \
+          --cache-to {{.QEMU_CACHE_TO}} \
+          --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
+          --build-arg JOBS={{.QEMU_JOBS}} \
+          --tag {{.QEMU_IMAGE}}:{{.QEMU_VERSION}} \
+          {{if .QEMU_IMAGE_EXTRA_TAG}}--tag {{.QEMU_IMAGE}}:{{.QEMU_IMAGE_EXTRA_TAG}} \{{end}}
+          --push \
           .
 
   backend:conformance:

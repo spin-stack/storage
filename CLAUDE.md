@@ -42,10 +42,19 @@ task db:migrate:validate         # check migrations against atlas.sum
 task db:migrate:lint -- --latest N  # lint pending migrations for unsafe changes
 task build:qemu         # build the pinned QEMU (vhost-user-blk) into _output/
 task qemu:verify        # assert the built QEMU is pinned + has vhost-user-blk-pci
+task build:qemu:push    # publish the runtime image (CI does this into GitHub Packages)
+task qemu:version       # print the pinned version — the single source CI tags from
 task backend:conformance # §6.1 object-store conformance suite (blocking per backend)
 ```
 
-**Infrastructure.** QEMU 11.0.2 is built from `Dockerfile.qemu` (modelled on
+**Infrastructure.** QEMU is built by its own workflow (`.github/workflows/qemu.yml`),
+not by the per-push gate: the build takes tens of minutes, so it runs only when
+`Dockerfile.qemu`, the Taskfile or the workflow changes, and publishes
+`ghcr.io/<owner>/<repo>/qemu:<version>` plus the extracted binaries as an artefact.
+The workflow calls the same Taskfile targets a developer runs, with the BuildKit cache
+backend swapped (`QEMU_CACHE_FROM/TO`), so there is one definition of the build.
+
+QEMU 11.0.2 is built from `Dockerfile.qemu` (modelled on
 spinbox's, with `--enable-vhost-user-blk-server` and without its `CONFIG_CXL=n`
 debloat, which breaks the 11.0.2 link). The object-store backend for tests is RustFS,
 pinned by digest and started with TestContainers (`internal/testinfra`); the S3 SDK is
