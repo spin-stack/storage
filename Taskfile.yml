@@ -7,7 +7,8 @@ version: "3"
 # Reproducibility rule: every tool this project needs is pinned here and installed
 # into ./.tools/bin by `task tools`. Nothing depends on what happens to be on the
 # developer's PATH, and no task downloads an unpinned "latest". If you find yourself
-# typing `sqlc`, `atlas`, `golangci-lint`, or `gofmt` by hand, that is a missing task.
+# typing `sqlc`, `pgschema`, `golangci-lint`, or `gofmt` by hand, that is a missing
+# task.
 
 vars:
   SIMULABLE: ./hack/analyzers/simulable/cmd/simulable
@@ -33,7 +34,27 @@ vars:
   RUSTFS_IMAGE: "rustfs/rustfs:latest@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
   # --- pinned tool versions (the single place each is declared) ---
   SQLC_VERSION: v1.30.0
-  ATLAS_VERSION: v1.2.3
+  PGSCHEMA_VERSION: v1.12.0
+  # Postgres for every schema task. The same tag the integration lane starts with
+  # TestContainers, so `task db:plan` and the tests can never disagree about what
+  # the server accepts.
+  POSTGRES_IMAGE: postgres:18-alpine
+  DEVDB_CONTAINER: spin-storage-devdb
+  DEVDB_PORT: '{{.DEVDB_PORT | default "55432"}}'
+  # Target database for db:plan / db:apply — the local development database by
+  # default. Point DB_* at a real one to plan or apply against it; the password
+  # comes from the environment (PGPASSWORD), never from a var in this file.
+  DB_HOST: '{{.DB_HOST | default "localhost"}}'
+  DB_PORT: '{{.DB_PORT | default .DEVDB_PORT}}'
+  DB_NAME: '{{.DB_NAME | default "cp"}}'
+  DB_USER: '{{.DB_USER | default "cp"}}'
+  # Flags for the database being changed.
+  PGSCHEMA_TARGET: --host {{.DB_HOST}} --port {{.DB_PORT}} --db {{.DB_NAME}} --user {{.DB_USER}} --sslmode disable
+  # Flags for the scratch database pgschema materializes the desired state in while
+  # diffing. Always given explicitly: with no --plan-host, pgschema downloads and
+  # runs an embedded PostgreSQL of its own choosing at plan time — unpinned, and not
+  # the version this project targets.
+  PGSCHEMA_PLAN: --plan-host {{.DB_HOST}} --plan-port {{.DB_PORT}} --plan-db {{.DB_NAME}} --plan-user {{.DB_USER}} --plan-sslmode disable
   # Protobuf/Connect toolchain (ADR-0018). protoc itself is never used: buf
   # compiles the schema and drives the two plugins. PROTOC_GEN_GO_VERSION must
   # match the google.golang.org/protobuf version in go.mod, and
@@ -54,10 +75,10 @@ tasks:
   # --- tools -----------------------------------------------------------------
 
   tools:
-    desc: Install every pinned tool into ./.tools/bin (sqlc, atlas, golangci-lint, buf + proto plugins).
+    desc: Install every pinned tool into ./.tools/bin (sqlc, pgschema, golangci-lint, buf + proto plugins).
     cmds:
       - task: tools:sqlc
-      - task: tools:atlas
+      - task: tools:pgschema
       - task: tools:golangci
       - task: tools:buf
       - task: tools:protoc-plugins
@@ -69,23 +90,15 @@ tasks:
     cmds:
       - GOBIN={{.TOOLS_BIN}} go install github.com/sqlc-dev/sqlc/cmd/sqlc@{{.SQLC_VERSION}}
 
-  tools:atlas:
-    desc: Install the pinned Atlas CLI (ADR-0007), downloaded by version and checksum-verified.
-    # `go install ariga.io/atlas/cmd/atlas@…` only resolves up to v0.13.1 (the CLI
-    # module stopped being tagged in the proxy), so this fetches the released binary
-    # for the pinned version — never `latest`, and never piped into a shell.
+  tools:pgschema:
+    desc: Install the pinned pgschema (ADR-0019) — the schema tool.
+    # Built from source at an exact tag rather than downloading a release binary:
+    # the module proxy and go.sum give the same reproducibility a published
+    # checksum would, through the toolchain every other tool here already uses.
     status:
-      - test -x {{.TOOLS_BIN}}/atlas && {{.TOOLS_BIN}}/atlas version | grep -q '{{.ATLAS_VERSION}}'
+      - test -x {{.TOOLS_BIN}}/pgschema && {{.TOOLS_BIN}}/pgschema --help | grep -q '{{.PGSCHEMA_VERSION | trimPrefix "v"}}'
     cmds:
-      - mkdir -p {{.TOOLS_BIN}}
-      - |
-        set -euo pipefail
-        url="https://release.ariga.io/atlas/atlas-$(go env GOOS)-$(go env GOARCH)-{{.ATLAS_VERSION}}"
-        tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-        curl -fsSL -o "$tmp/atlas" "$url"
-        curl -fsSL -o "$tmp/atlas.sha256" "$url.sha256"
-        echo "$(cat "$tmp/atlas.sha256")  $tmp/atlas" | sha256sum -c -
-        install -m 0755 "$tmp/atlas" {{.TOOLS_BIN}}/atlas
+      - GOBIN={{.TOOLS_BIN}} go install github.com/pgplex/pgschema@{{.PGSCHEMA_VERSION}}
 
   tools:golangci:
     desc: Install the pinned golangci-lint v2.
@@ -161,38 +174,63 @@ tasks:
       - "{{.TOOLS_BIN}}/buf lint"
       - "{{.TOOLS_BIN}}/buf format --diff --exit-code"
 
-  db:migrate:diff:
-    desc: "Generate an Atlas migration from schema.sql changes (ADR-0007). Usage: task db:migrate:diff -- <name>"
-    deps: [tools:atlas]
-    cmds:
-      - "{{.TOOLS_BIN}}/atlas migrate diff {{.CLI_ARGS}} --env local"
+  # --- schema (pgschema, ADR-0019) --------------------------------------------
+  #
+  # internal/schema/schema.sql is the declared state; pgschema computes the DDL that
+  # takes a live database there. There is no history table and no checksum chain, so
+  # the reviewable record is the plan itself: `db:plan` writes one into migrations/,
+  # and `db:apply` executes *that file*. Reviewing plan A and applying a plan B
+  # recomputed at deploy time is the failure mode a state-based tool invites; the
+  # only apply path here reads a committed plan, and pgschema refuses it if the
+  # database has moved since it was made.
 
-  db:migrate:
-    desc: Apply Atlas migrations to the local database.
-    deps: [tools:atlas]
+  db:dev:up:
+    desc: Start (or reuse) the local Postgres 18 development database that db:plan diffs against.
     cmds:
-      - "{{.TOOLS_BIN}}/atlas migrate apply --env local"
+      - POSTGRES_IMAGE={{.POSTGRES_IMAGE}} DEVDB_CONTAINER={{.DEVDB_CONTAINER}} DEVDB_PORT={{.DEVDB_PORT}} bash hack/db.sh up
 
-  db:migrate:status:
-    desc: Show Atlas migration status.
-    deps: [tools:atlas]
+  db:dev:down:
+    desc: Remove the local development database.
     cmds:
-      - "{{.TOOLS_BIN}}/atlas migrate status --env local"
+      - DEVDB_CONTAINER={{.DEVDB_CONTAINER}} POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh down
 
-  db:migrate:validate:
-    desc: Validate the migration directory against atlas.sum.
-    deps: [tools:atlas]
+  db:plan:
+    desc: "Plan schema.sql against the development database; commit the result under migrations/. Usage: task db:plan -- <name>"
+    deps: [tools:pgschema, db:dev:up]
     cmds:
-      - "{{.TOOLS_BIN}}/atlas migrate validate --env local"
+      - |
+        set -euo pipefail
+        name='{{.CLI_ARGS}}'
+        test -n "$name" || { echo "usage: task db:plan -- <name>   (e.g. task db:plan -- revocation_window)"; exit 1; }
+        out="migrations/$(date -u +%Y%m%d%H%M%S)_${name}"
+        export PGPASSWORD="${PGPASSWORD:-cp}" PGSCHEMA_PLAN_PASSWORD="${PGSCHEMA_PLAN_PASSWORD:-$PGPASSWORD}"
+        {{.TOOLS_BIN}}/pgschema plan {{.PGSCHEMA_TARGET}} {{.PGSCHEMA_PLAN}} \
+          --file internal/schema/schema.sql --no-color \
+          --output-human stdout --output-sql "$out.sql" --output-json "$out.json"
+        if ! grep -q '[^[:space:]]' "$out.sql"; then
+          rm -f "$out.sql" "$out.json"
+          echo "nothing to plan: the database already matches internal/schema/schema.sql"
+          exit 0
+        fi
+        echo
+        echo "wrote $out.sql (review this) and $out.json (what db:apply executes)"
 
-  db:migrate:lint:
-    # Requires `atlas login`: Atlas gates `migrate lint` behind Atlas Pro since v0.38,
-    # so this fails with an authentication notice rather than a migration problem
-    # (DEV-0011). It is deliberately not part of `task ci`.
-    desc: "Lint the pending migrations against the last N (default 1) — needs `atlas login`. Usage: task db:migrate:lint -- --latest 3"
-    deps: [tools:atlas]
+  db:apply:
+    desc: "Apply a saved plan — never a recomputed one. Usage: task db:apply PLAN=migrations/<file>.json"
+    deps: [tools:pgschema]
     cmds:
-      - "{{.TOOLS_BIN}}/atlas migrate lint --env local {{.CLI_ARGS | default \"--latest 1\"}}"
+      - |
+        set -euo pipefail
+        plan='{{.PLAN}}'
+        test -n "$plan" || { echo "usage: task db:apply PLAN=migrations/<timestamp>_<name>.json"; exit 1; }
+        export PGPASSWORD="${PGPASSWORD:-cp}"
+        {{.TOOLS_BIN}}/pgschema apply {{.PGSCHEMA_TARGET}} --plan "$plan" {{if .AUTO_APPROVE}}--auto-approve{{end}}
+
+  db:verify:
+    desc: Apply schema.sql to an empty Postgres 18 and assert a plan against the result has nothing to do (replaces atlas.sum).
+    deps: [tools:pgschema]
+    cmds:
+      - PGSCHEMA={{.TOOLS_BIN}}/pgschema POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh verify
 
   # --- infrastructure (QEMU, object-store backend) ----------------------------
 
@@ -364,7 +402,7 @@ tasks:
     cmds:
       - task: ci
       - task: generate:check
-      - task: db:migrate:validate
+      - task: db:verify
       - task: cover
       - task: test:integration
       - task: backend:conformance
