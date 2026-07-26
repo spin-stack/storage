@@ -11,7 +11,7 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files. **Thirteen entries are still open**, and
+own worktree over a disjoint set of files. **Twelve entries are still open**, and
 every one of them is listed below with what it is waiting on. Findings that turned out
 to be already covered are recorded as such rather than counted as work.
 
@@ -69,23 +69,14 @@ to be already covered are recorded as such rather than counted as work.
 | 17 of 21 mandatory scenarios ignored the seed; no seed-driven fault reached fencing, promotion or the recovery point | `9780fd1`, `3f7a362` |
 | A full device was not modelled anywhere, so the WAL's ENOSPC path was never exercised | `9d2284b` |
 | Planted bugs emitted a literal event instead of breaking production behaviour, so a checker could pass while catching nothing real — 7 of 11 are now behavioural and the count is pinned | `a0c8565` |
+| The CP term had no anchor outside the database it is restored from: a rewound `control_plane_leader` re-issued a term a live leader was still using, and both passed every §7 guard (ADR-0011, accepted) | `0265627` |
 
 ## Open
 
-Thirteen entries. Each names what it is waiting on; none is waiting on someone finding
+Twelve entries. Each names what it is waiting on; none is waiting on someone finding
 the time to write a test.
 
-### Needs a decision (2)
-
-- **The CP term has no anchor outside PostgreSQL** _(fencing-promotion)_
-  - A PITR restore rewinds `control_plane_leader.term` behind a live leader's back and
-    a new CP is granted a term the incumbent still holds. Both then pass every
-    `(SELECT term ...) = N` guard: both drive drains, both release capacity, both set
-    `primary_host_id`, and §7's whole defence is silently disabled during exactly the
-    incident where two CPs running at once is most likely.
-  - waiting on: **ADR-0011** (Proposed). It moves leadership out of `metadata.Store`,
-    which several increments depend on, and it is a fencing-zone change — the spec
-    needs a human before the code.
+### Needs a decision (1)
 
 - **A GC sweep cannot see an anchor its listing has not caught up to** _(gc-objectstore)_
   - With an eventually consistent LIST, a freshly published manifest is GET-visible and
