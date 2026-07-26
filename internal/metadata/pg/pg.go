@@ -139,6 +139,16 @@ func (s *Store) AcquireLeadership(ctx context.Context, holderID string) (int64, 
 	return s.q.AcquireLeadership(ctx, holderID)
 }
 
+// Now is PostgreSQL's clock: the one that stamps last_renewal, and so the one every
+// fencing deadline has to be measured against (§12.1).
+func (s *Store) Now(ctx context.Context) (time.Time, error) {
+	ts, err := s.q.DatabaseNow(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fromTS(ts), nil
+}
+
 func (s *Store) GetLeader(ctx context.Context) (metadata.Leader, error) {
 	row, err := s.q.GetLeader(ctx)
 	if err != nil {
@@ -274,13 +284,47 @@ func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, t
 	}
 	rows, err := s.q.RenewHostLease(ctx, db.RenewHostLeaseParams{
 		HostID: id, TtlSeconds: int32(ttlSeconds), Term: term,
+		ServingStates: lifecycle.ServingHostStateNames(), // §28.1, as a predicate
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
 		return err
 	}
-	// Still the leader: the only other predicate is the host-exists one.
-	return metadata.ErrNotFound
+	// Still the leader, so the row was filtered by the host predicate: either there
+	// is no such host, or it is one the fleet no longer counts as a writer.
+	h, gerr := s.GetHost(ctx, hostID)
+	if gerr != nil {
+		return gerr
+	}
+	if !h.State.Serving() {
+		return fmt.Errorf("%w: host %s is %s", metadata.ErrHostNotServing, hostID, h.State)
+	}
+	// The host looks eligible now: it changed state between the write and this read.
+	// The write did not land, and saying so beats reporting success.
+	return fmt.Errorf("%w: host %s changed state concurrently", metadata.ErrHostNotServing, hostID)
+}
+
+// RevokeHostLease drops a host's lease. Idempotent: no lease is the state asked for.
+func (s *Store) RevokeHostLease(ctx context.Context, term int64, hostID string) error {
+	id, err := requireUUID("host", hostID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.RevokeHostLease(ctx, db.RevokeHostLeaseParams{HostID: id, Term: term})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// Still the leader and nothing was deleted: either the host holds no lease
+	// (which is what the caller wanted) or there is no such host.
+	exists, err := s.q.HostExists(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return metadata.ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) GetHostLease(ctx context.Context, hostID string) (metadata.HostLease, error) {
@@ -385,7 +429,7 @@ func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadat
 	return vols, nil
 }
 
-func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error) {
+func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error) {
 	id, err := requireUUID("volume", volumeID)
 	if err != nil {
 		return 0, err
@@ -395,16 +439,22 @@ func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, prima
 		return 0, err
 	}
 	epoch, err := s.q.BumpVolumeEpoch(ctx, db.BumpVolumeEpochParams{
-		VolumeID: id, PrimaryHostID: primary, Term: term,
+		VolumeID: id, PrimaryHostID: primary, Term: term, ExpectedEpoch: expectedEpoch,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		// 0 rows: a stale term or a volume that is gone (§12.3). They are not the
-		// same instruction to the caller — one means step down, the other means stop
-		// reconciling this volume — so they are not reported as the same error.
+		// 0 rows: a stale term, a volume that is gone, or an epoch that moved on
+		// (§12.3). They are three different instructions to the caller — step down,
+		// stop reconciling this volume, re-read and decide again — so they are not
+		// reported as the same error.
 		if terr := s.currentTerm(ctx, term); terr != nil {
 			return 0, terr
 		}
-		return 0, metadata.ErrNotFound
+		v, gerr := s.GetVolume(ctx, volumeID)
+		if gerr != nil {
+			return 0, gerr
+		}
+		return 0, fmt.Errorf("%w: volume %s is at %d, expected %d",
+			metadata.ErrEpochConflict, volumeID, v.CurrentEpoch, expectedEpoch)
 	}
 	return epoch, err
 }

@@ -150,6 +150,26 @@ func (s HostState) Valid() bool { return hostMachine.valid(s) }
 // AcceptsPlacement is the §28.1/§28.2 rule: only an ACTIVE host takes new volumes.
 func (s HostState) AcceptsPlacement() bool { return s == HostActive }
 
+// Serving reports whether the fleet still counts this host as a writer, which is
+// every state but DEAD. Taking new work and serving what you already hold are two
+// different questions: a CORDONED host is not given new volumes and a DRAINING one
+// is being evacuated, but both still ACK for the volumes they hold, so both keep
+// their lease (§12.6). DEAD is the Control Plane asserting the writer is gone — the
+// assertion promotion accepts as a reason to skip the fencing wait — so it is the
+// one state in which a lease must not be renewed.
+func (s HostState) Serving() bool { return s.Valid() && s != HostDead }
+
+// ServingHostStateNames is Serving as stored strings — the store's SQL predicate.
+func ServingHostStateNames() []string {
+	var serving []HostState
+	for _, s := range hostMachine.all {
+		if s.Serving() {
+			serving = append(serving, s)
+		}
+	}
+	return names(serving)
+}
+
 // CanTransitionTo reports whether the fleet lifecycle allows this move.
 func (s HostState) CanTransitionTo(to HostState) bool { return hostMachine.allows(s, to) }
 

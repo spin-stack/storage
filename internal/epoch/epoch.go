@@ -29,12 +29,27 @@ var (
 	// re-issuing one puts two writers in one namespace and recovery can only read
 	// the result as a truncated or spliced history (§12.4, INV-08/INV-10).
 	ErrEpochNotAdvancing = errors.New("epoch: new epoch does not advance the stored one")
+	// ErrNotHolder means the epoch object is at the expected number but was granted
+	// to a different host — or to nobody. The caller has not been fenced by a *newer*
+	// epoch; it was never given this one, which a number-only check cannot tell apart
+	// (§12.4).
+	ErrNotHolder = errors.New("epoch: the epoch is held by another host")
 )
 
-// record is the on-S3 epoch object body (self-describing for rebuild-metadata).
-type record struct {
+// Record is the on-S3 epoch object body (self-describing for rebuild-metadata).
+//
+// HolderID is the host the epoch was granted to. The number alone says *when* a
+// writer was fenced but never *who* holds the current epoch, and the two durable
+// records of a promotion — volumes.primary_host_id in PostgreSQL and this object —
+// are written by two different steps of §12.3. A promoter that crashed between them,
+// or one that was overtaken, can leave them naming different hosts at the same
+// epoch; both hosts then pass a number-only check and publish into the same
+// wal/<vol>/<epoch>/ namespace. It is empty for an epoch nobody has been granted:
+// a volume that was just created or rebuilt (§22.5).
+type Record struct {
 	VolumeID string `json:"volume_id"`
 	Epoch    uint64 `json:"epoch"`
+	HolderID string `json:"holder_id,omitempty"`
 }
 
 // Store reads and writes epoch objects.
@@ -49,8 +64,10 @@ func NewStore(obj objectstore.Store) *Store { return &Store{obj: obj} }
 func Key(volumeID string) string { return "volumes/" + volumeID + "/epoch" }
 
 // Init create-only writes the initial epoch (§22.5). It fails if it already exists.
+// The epoch it writes is held by nobody: a volume that has just been created or
+// rebuilt has no writer, and the first holder is named by the first Grant.
 func (s *Store) Init(ctx context.Context, volumeID string, ep uint64) (etag string, err error) {
-	body, err := json.Marshal(record{VolumeID: volumeID, Epoch: ep})
+	body, err := json.Marshal(Record{VolumeID: volumeID, Epoch: ep})
 	if err != nil {
 		return "", err
 	}
@@ -72,27 +89,34 @@ func (s *Store) Init(ctx context.Context, volumeID string, ep uint64) (etag stri
 // (§12.4, INV-10). A read that could not be made stable returns ErrCASConflict: the
 // caller is racing another promoter and must re-read.
 func (s *Store) Current(ctx context.Context, volumeID string) (ep uint64, etag string, err error) {
+	r, etag, err := s.CurrentRecord(ctx, volumeID)
+	return r.Epoch, etag, err
+}
+
+// CurrentRecord is Current with the holder: the whole object plus the ETag a
+// subsequent Grant must be made against.
+func (s *Store) CurrentRecord(ctx context.Context, volumeID string) (Record, string, error) {
 	key := Key(volumeID)
 	before, err := s.obj.Head(ctx, key)
 	if err != nil {
-		return 0, "", err
+		return Record{}, "", err
 	}
 	body, err := s.obj.Get(ctx, key)
 	if err != nil {
-		return 0, "", err
+		return Record{}, "", err
 	}
 	after, err := s.obj.Head(ctx, key)
 	if err != nil {
-		return 0, "", err
+		return Record{}, "", err
 	}
 	if before.ETag != after.ETag {
-		return 0, "", fmt.Errorf("%w: %s changed while it was being read", ErrCASConflict, key)
+		return Record{}, "", fmt.Errorf("%w: %s changed while it was being read", ErrCASConflict, key)
 	}
-	var r record
+	var r Record
 	if err := json.Unmarshal(body, &r); err != nil {
-		return 0, "", fmt.Errorf("epoch: decode %s: %w", key, err)
+		return Record{}, "", fmt.Errorf("epoch: decode %s: %w", key, err)
 	}
-	return r.Epoch, after.ETag, nil
+	return r, after.ETag, nil
 }
 
 // CompareAndAdvance CASes the epoch object from fromETag to newEpoch (§12.4). A
@@ -105,6 +129,15 @@ func (s *Store) Current(ctx context.Context, volumeID string) (ep uint64, etag s
 // convention: nothing downstream can tell two writers apart once they share a
 // wal/<vol>/<epoch>/ namespace.
 func (s *Store) CompareAndAdvance(ctx context.Context, volumeID, fromETag string, newEpoch uint64) (etag string, err error) {
+	return s.Grant(ctx, volumeID, fromETag, newEpoch, "")
+}
+
+// Grant is CompareAndAdvance naming the host the new epoch is granted to (§12.3
+// step 4b). Publishing is gated on VerifyHolder, so the name written here is what
+// decides which of two hosts that both believe they are at this epoch may write.
+// An empty holderID advances the number without naming an owner, which leaves
+// nobody able to publish — correct for the epoch of a volume that has no writer.
+func (s *Store) Grant(ctx context.Context, volumeID, fromETag string, newEpoch uint64, holderID string) (etag string, err error) {
 	stored, currentETag, err := s.Current(ctx, volumeID)
 	if err != nil {
 		return "", err
@@ -115,7 +148,7 @@ func (s *Store) CompareAndAdvance(ctx context.Context, volumeID, fromETag string
 	if newEpoch <= stored {
 		return "", fmt.Errorf("%w: %d -> %d", ErrEpochNotAdvancing, stored, newEpoch)
 	}
-	body, err := json.Marshal(record{VolumeID: volumeID, Epoch: newEpoch})
+	body, err := json.Marshal(Record{VolumeID: volumeID, Epoch: newEpoch, HolderID: holderID})
 	if err != nil {
 		return "", err
 	}
@@ -132,6 +165,10 @@ func (s *Store) CompareAndAdvance(ctx context.Context, volumeID, fromETag string
 // Verify checks that the stored epoch still equals expected; otherwise the caller
 // has been fenced and must not publish (§12.4, §18). A low-frequency publish calls
 // this before writing a checkpoint/manifest.
+//
+// It answers the number only. A caller that knows which host it is speaking for —
+// a promoter, or an Agent about to publish — uses VerifyHolder instead: two hosts
+// can believe they are at the same epoch, and only one of them was granted it.
 func (s *Store) Verify(ctx context.Context, volumeID string, expected uint64) error {
 	ep, _, err := s.Current(ctx, volumeID)
 	if err != nil {
@@ -139,6 +176,25 @@ func (s *Store) Verify(ctx context.Context, volumeID string, expected uint64) er
 	}
 	if ep != expected {
 		return ErrEpochChanged
+	}
+	return nil
+}
+
+// VerifyHolder is Verify plus "and it is yours": the stored epoch must equal
+// expected *and* have been granted to holderID. An epoch that was never granted to
+// anybody (a freshly created or rebuilt volume) is held by nobody, so this fails
+// closed with ErrNotHolder — the record does not name you.
+func (s *Store) VerifyHolder(ctx context.Context, volumeID string, expected uint64, holderID string) error {
+	r, _, err := s.CurrentRecord(ctx, volumeID)
+	if err != nil {
+		return err
+	}
+	if r.Epoch != expected {
+		return ErrEpochChanged
+	}
+	if r.HolderID == "" || r.HolderID != holderID {
+		return fmt.Errorf("%w: epoch %d of %s is held by %q, not %q",
+			ErrNotHolder, r.Epoch, volumeID, r.HolderID, holderID)
 	}
 	return nil
 }

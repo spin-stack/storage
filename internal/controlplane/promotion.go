@@ -47,6 +47,17 @@ var ErrSourceLeaseUnknown = errors.New("controlplane: the source host's lease is
 // nobody able to ACK (§8, §12.3).
 var ErrDestinationHostUnusable = errors.New("controlplane: destination host cannot take the volume")
 
+// ErrVolumeNotPromotable means the volume's §7 state has no route to a new writer.
+// A DETACHED volume has no guest and no writer to fence; granting it an epoch and a
+// lease would arm a volume the Control Plane has already released.
+var ErrVolumeNotPromotable = errors.New("controlplane: volume cannot be promoted from its current state")
+
+// ErrClockOffsetTooLarge means the Control Plane's wall clock and the clock that
+// stamped the lease row disagree by more than max_clock_skew, so no deadline derived
+// from the two of them means anything (§12.1). Promotion refuses rather than compute
+// a fencing wait it cannot justify; the fleet needs its clocks fixed.
+var ErrClockOffsetTooLarge = errors.New("controlplane: control-plane and metadata clocks differ by more than max_clock_skew")
+
 // Promoter runs the promotion protocol.
 type Promoter struct {
 	md           metadata.Store
@@ -83,13 +94,18 @@ func (p *Promoter) FencingDeadline(renewedAt time.Time) time.Time {
 //
 //	pg == s3, primary is already newHost -> the promotion completed; return it
 //	pg == s3                             -> nothing done yet; grant pg+1
-//	pg == s3 + 1                         -> PG bumped, the CAS never landed; finish it
-//	s3 >  pg                             -> another CP promoted further; refuse
+//	pg == s3 + 1, primary is newHost     -> PG bumped, the CAS never landed; finish it
+//	anything else                        -> not our promotion to finish; refuse
 //
 // Every step is then idempotent: the PG bump only runs when PG is behind, the CAS is
 // skipped when the object already carries the target, and the lease grant is an
 // upsert. Two runs of the same promotion therefore grant one epoch — a second one
 // would fence the writer the first one just installed.
+//
+// The resume branch checks the owner as well as the number, because "PostgreSQL is
+// one ahead of the object" is *another* promoter's half-finished work just as often
+// as it is ours. Finishing theirs would write our host into the epoch object while
+// PostgreSQL records theirs, and both would believe they hold the same epoch.
 //
 // oldLeaseRenewedAt is what the *caller* observed about the primary. It is a floor,
 // not the authority: the promoter reads the lease of the host it is actually fencing
@@ -108,11 +124,20 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 	if err := p.checkDestination(ctx, newHost, v.PrimaryHostID != newHost); err != nil {
 		return 0, err
 	}
+	state := v.State
 	// Step 3: FENCING_WAIT, measured against the host that is actually serving the
 	// volume. If that is already newHost, this is our own promotion being resumed:
 	// the wait was served the first time round, and re-waiting on the lease we just
 	// granted would strand the volume (§12.3 steps 3-5).
+	//
+	// The §7 state is recorded *before* the wait, not after it: the window a second
+	// Control Plane, a second reconciler pass or an operator could start a competing
+	// promotion in is exactly the minutes the wait lasts, and a volume stored as
+	// ACTIVE throughout it looks healthy to all of them.
 	if v.PrimaryHostID != newHost {
+		if state, err = p.recordState(ctx, term, v, state, lifecycle.VolumeFencingWait); err != nil {
+			return 0, err
+		}
 		if err := p.fencingWaitElapsed(ctx, v.PrimaryHostID, oldLeaseRenewedAt); err != nil {
 			return 0, err
 		}
@@ -126,31 +151,30 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 
 	var target uint64
 	switch {
-	case stored > pgEpoch:
-		return 0, fmt.Errorf("%w: object at %d, PostgreSQL at %d", ErrEpochConflict, stored, pgEpoch)
 	case pgEpoch == stored && v.PrimaryHostID == newHost && pgEpoch > 0:
 		// Already promoted to this host: finish any tail step and report the epoch.
 		target = pgEpoch
 	case pgEpoch == stored:
 		target = pgEpoch + 1
-		newEpoch, err := p.md.BumpVolumeEpoch(ctx, term, volumeID, newHost) // step 4a
+		newEpoch, err := p.md.BumpVolumeEpoch(ctx, term, volumeID, newHost, v.CurrentEpoch) // step 4a
 		if err != nil {
 			return 0, err
 		}
 		if uint64(newEpoch) != target {
 			return 0, fmt.Errorf("%w: PostgreSQL granted %d, expected %d", ErrEpochConflict, newEpoch, target)
 		}
-	case pgEpoch == stored+1:
-		// Resume: PostgreSQL was bumped, the CAS never landed.
+	case pgEpoch == stored+1 && v.PrimaryHostID == newHost:
+		// Resume: PostgreSQL was bumped for us, the CAS never landed.
 		target = pgEpoch
 	default:
-		return 0, fmt.Errorf("%w: object at %d, PostgreSQL at %d", ErrEpochConflict, stored, pgEpoch)
+		return 0, fmt.Errorf("%w: object at %d, PostgreSQL at %d on %q",
+			ErrEpochConflict, stored, pgEpoch, v.PrimaryHostID)
 	}
 
-	// Step 4b: CAS the S3 epoch object to the target (§12.4), unless it is already
-	// there from a previous attempt.
+	// Step 4b: CAS the S3 epoch object to the target (§12.4), naming the host it is
+	// granted to — unless it is already there from a previous attempt.
 	if stored != target {
-		if _, err := p.epochs.CompareAndAdvance(ctx, volumeID, etag, target); err != nil {
+		if _, err := p.epochs.Grant(ctx, volumeID, etag, target, newHost); err != nil {
 			return 0, err
 		}
 	}
@@ -159,7 +183,68 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 	if err := p.md.RenewHostLease(ctx, term, newHost, int(p.leaseTTL/time.Second)); err != nil {
 		return 0, err
 	}
+	// The epoch is granted, so §7 says the volume needs recovery before it serves
+	// again — it never goes straight back to ACTIVE on a promotion.
+	if _, err := p.recordState(ctx, term, v, state, lifecycle.VolumeRecoveryRequired); err != nil {
+		return 0, err
+	}
 	return target, nil
+}
+
+// promotionPath is §7's route from a serving volume to one that needs recovery. A
+// promotion records every step it passes rather than jumping, so the stored state is
+// never one the transition table says is unreachable from the last one.
+var promotionPath = []lifecycle.VolumeState{
+	lifecycle.VolumePrimarySuspected,
+	lifecycle.VolumeFencingWait,
+	lifecycle.VolumeRecoveryRequired,
+}
+
+// promotionStep is where a volume in state s sits on that path: the index of the
+// next step it has to take. A DETACHED volume is not on it at all.
+func promotionStep(s lifecycle.VolumeState) (int, bool) {
+	switch s {
+	case lifecycle.VolumeActive:
+		return 0, true
+	case lifecycle.VolumePrimarySuspected:
+		return 1, true
+	case lifecycle.VolumeFencingWait:
+		return 2, true
+	case lifecycle.VolumeRecoveryRequired, lifecycle.VolumeRecovering:
+		// Already at (or past) the end: a re-promotion of a volume that is being
+		// recovered puts it back to needing recovery, which the table allows.
+		return 2, true
+	}
+	return 0, false
+}
+
+// pathIndex is where a state sits on promotionPath (-1 if it is not a step of it).
+func pathIndex(s lifecycle.VolumeState) int {
+	for i, step := range promotionPath {
+		if step == s {
+			return i
+		}
+	}
+	return -1
+}
+
+// recordState walks the volume from `from` up to target along promotionPath,
+// persisting each step (term-guarded, and transition-guarded inside the write), and
+// returns the state now stored. Every step is idempotent — a state may always be
+// re-written as itself — so a retried promotion re-affirms rather than fails.
+func (p *Promoter) recordState(ctx context.Context, term int64, v metadata.Volume,
+	from, target lifecycle.VolumeState) (lifecycle.VolumeState, error) {
+	first, ok := promotionStep(from)
+	if !ok {
+		return from, fmt.Errorf("%w: %s is %s", ErrVolumeNotPromotable, v.VolumeID, from)
+	}
+	for i, last := first, pathIndex(target); i <= last; i++ {
+		if err := p.md.SetVolumeState(ctx, term, v.VolumeID, promotionPath[i]); err != nil {
+			return from, err
+		}
+		from = promotionPath[i]
+	}
+	return from, nil
 }
 
 // checkDestination refuses a host that cannot hold the volume. It is deliberately
@@ -187,6 +272,16 @@ func (p *Promoter) checkDestination(ctx context.Context, hostID string, mustAcce
 // With no lease row and nothing from the caller there is no conservative answer, so
 // the promotion is refused (ErrSourceLeaseUnknown) unless the fleet has recorded the
 // host as DEAD, which is the CP asserting that the writer is gone.
+//
+// The deadline is checked on two clocks. last_renewal is stamped by the metadata
+// store, so that store's clock is the one the deadline actually lives on; comparing
+// it against the Control Plane's wall clock shortens the wait by exactly the offset
+// between them, and a container clock that jumps forward (NTP correction, a VM
+// restored from a snapshot, a bad RTC) then grants an epoch while the old writer's
+// monotonic lease is still valid. Both clocks must agree the wait is over, so a CP
+// running behind still waits longer (§12.1) and a CP running ahead cannot grant
+// early. An offset larger than max_clock_skew is refused outright: at that point no
+// deadline built from the two of them means anything.
 func (p *Promoter) fencingWaitElapsed(ctx context.Context, primary string, callerRenewedAt time.Time) error {
 	if primary == "" {
 		return nil // no writer to fence
@@ -210,9 +305,18 @@ func (p *Promoter) fencingWaitElapsed(ctx context.Context, primary string, calle
 		return err
 	}
 
-	// Adding max_clock_skew covers a CP wall clock running up to that far ahead of
-	// true time; a CP behind simply waits longer (§12.1).
-	if p.clk.Wall().Before(renewedAt.Add(ttl + p.maxClockSkew)) {
+	storeNow, err := p.md.Now(ctx)
+	if err != nil {
+		return err
+	}
+	cpNow := p.clk.Wall()
+	if offset := cpNow.Sub(storeNow); offset > p.maxClockSkew || offset < -p.maxClockSkew {
+		return fmt.Errorf("%w: %v", ErrClockOffsetTooLarge, offset)
+	}
+	// max_clock_skew is added on top because the Agent's own clock may run that far
+	// ahead of the one that stamped the row (§12.1).
+	deadline := renewedAt.Add(ttl + p.maxClockSkew)
+	if storeNow.Before(deadline) || cpNow.Before(deadline) {
 		return ErrFencingWaitNotElapsed
 	}
 	return nil

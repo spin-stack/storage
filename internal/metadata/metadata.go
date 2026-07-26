@@ -35,6 +35,15 @@ var (
 	// implementation that constrains identifier syntax) malformed. It is never
 	// coerced to NULL or to a row nobody can find again.
 	ErrInvalidID = errors.New("metadata: invalid identifier")
+	// ErrEpochConflict means a volume was not at the epoch the caller compared
+	// against: another promoter got there first (§12.3). The caller must re-read and
+	// decide again — it has *not* been granted an epoch.
+	ErrEpochConflict = errors.New("metadata: volume is not at the expected epoch")
+	// ErrHostNotServing means the operation needs a host the fleet still considers a
+	// writer, and this one is DEAD (§28.1). Marking a host dead is the Control Plane
+	// asserting that its writer is gone; handing it a fresh lease afterwards
+	// contradicts that assertion.
+	ErrHostNotServing = errors.New("metadata: host is not serving")
 )
 
 // The lifecycle vocabularies (host/volume/snapshot/operation states, §7/§19/§28.1)
@@ -131,6 +140,13 @@ type Store interface {
 	AcquireLeadership(ctx context.Context, holderID string) (int64, error)
 	// GetLeader returns the current leader record.
 	GetLeader(ctx context.Context) (Leader, error)
+	// Now returns the store's own clock: the one that stamps last_renewal, and so
+	// the one every fencing deadline is derived from (§12.1). A Control Plane that
+	// compares those stamps against its own wall clock shortens the fencing wait by
+	// exactly the offset between the two — an NTP correction, a VM restored from a
+	// snapshot, a bad RTC — and grants an epoch while the old writer's monotonic
+	// lease is still valid. Reading the deadline's own clock removes the comparison.
+	Now(ctx context.Context) (time.Time, error)
 
 	// UpsertHost registers a host or refreshes what the host itself reports:
 	// agent version, format version, NVMe totals, heartbeat. It deliberately does
@@ -151,8 +167,23 @@ type Store interface {
 	// releases), term-guarded. A release below zero fails with ErrCapacityUnderflow
 	// instead of being clamped (§28.2).
 	CommitHostCapacity(ctx context.Context, term int64, hostID string, deltaBytes int64) error
-	// RenewHostLease renews (or grants) a host's lease with the given TTL (term-guarded).
+	// RenewHostLease renews (or grants) a host's lease with the given TTL
+	// (term-guarded). A host the fleet has recorded as DEAD is refused with
+	// ErrHostNotServing: that state is the Control Plane asserting the writer is
+	// gone — the same assertion promotion accepts as a reason to skip the fencing
+	// wait — so a routine heartbeat must not be able to re-arm it. A CORDONED or
+	// DRAINING host still renews: both are still serving the volumes they hold, and
+	// stopping their ACKs mid-evacuation is the failure this would cause.
 	RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error
+	// RevokeHostLease drops a host's lease (term-guarded), so nothing keeps its
+	// Agent-side lease alive once the Control Plane has fenced it. It is idempotent:
+	// revoking a lease that is not there is the state the caller asked for. An
+	// unregistered host is ErrNotFound.
+	//
+	// Revoking does *not* shorten a fencing wait. The Agent counts its own lease down
+	// on a monotonic clock (§12.2) and never learns that the row is gone, so a
+	// promotion still waits out last_renewal + lease_ttl + max_clock_skew.
+	RevokeHostLease(ctx context.Context, term int64, hostID string) error
 	// GetHostLease returns a host's lease.
 	GetHostLease(ctx context.Context, hostID string) (HostLease, error)
 
@@ -168,9 +199,15 @@ type Store interface {
 	// ListVolumesByHost returns the volumes whose primary is hostID, ordered by
 	// volume id — what a drain iterates over (§28.1).
 	ListVolumesByHost(ctx context.Context, hostID string) ([]Volume, error)
-	// BumpVolumeEpoch increments the epoch and sets the primary host (term-guarded),
-	// returning the new epoch (§12.3).
-	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string) (int64, error)
+	// BumpVolumeEpoch advances the epoch to expectedEpoch+1 and sets the primary
+	// host, term-guarded, returning the new epoch (§12.3). It is a compare-and-set,
+	// not an increment: a promotion chooses which epoch to grant by reading the
+	// volume first, and expectedEpoch is what it read. A volume that has moved on
+	// since is ErrEpochConflict and nothing is written — otherwise each of n racing
+	// promoters burns an epoch and the last one writes its own host into
+	// primary_host_id, naming an owner that never won the S3 epoch object and never
+	// got a lease.
+	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
 	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
 	// A report violating published ≤ durable ≤ local is ErrWatermarkOrder (INV-03).
 	// A report that is merely *late* — an epoch-N primary's, delivered after epoch

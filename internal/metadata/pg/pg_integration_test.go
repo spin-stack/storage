@@ -87,10 +87,10 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 	if err := store.UpsertHost(ctx, termB, metadata.Host{HostID: hostB, State: lifecycle.HostActive}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.BumpVolumeEpoch(ctx, termA, volID, hostA); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := store.BumpVolumeEpoch(ctx, termA, volID, hostA, 0); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale term bump: want ErrStaleTerm, got %v", err)
 	}
-	epoch, err := store.BumpVolumeEpoch(ctx, termB, volID, hostB)
+	epoch, err := store.BumpVolumeEpoch(ctx, termB, volID, hostB, 0)
 	if err != nil || epoch != 1 {
 		t.Fatalf("current bump: epoch=%d err=%v", epoch, err)
 	}

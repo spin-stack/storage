@@ -75,6 +75,14 @@ func (s *Store) AcquireLeadership(_ context.Context, holderID string) (int64, er
 	return s.leaderTerm, nil
 }
 
+// Now is the store's own clock — the one that stamps every timestamp below, and so
+// the one a fencing deadline must be measured against (§12.1).
+func (s *Store) Now(_ context.Context) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.now(), nil
+}
+
 func (s *Store) GetLeader(_ context.Context) (metadata.Leader, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,8 +194,14 @@ func (s *Store) RenewHostLease(_ context.Context, term int64, hostID string, ttl
 	}
 	// A lease belongs to a registered host (the FK in the schema). Granting one to
 	// an unknown id invents a fencing token for a host nobody can find.
-	if _, exists := s.hosts[hostID]; !exists {
+	h, exists := s.hosts[hostID]
+	if !exists {
 		return metadata.ErrNotFound
+	}
+	// A DEAD host has been declared gone by the Control Plane itself; re-arming its
+	// lease contradicts that while the new primary is materialising the epoch.
+	if !h.State.Serving() {
+		return fmt.Errorf("%w: host %s is %s", metadata.ErrHostNotServing, hostID, h.State)
 	}
 	now := s.now()
 	l, ok := s.leases[hostID]
@@ -197,6 +211,23 @@ func (s *Store) RenewHostLease(_ context.Context, term int64, hostID string, ttl
 	l.LastRenewal = now
 	l.TTLSeconds = int32(ttlSeconds)
 	s.leases[hostID] = l
+	return nil
+}
+
+// RevokeHostLease drops a host's lease. Idempotent: no lease is the state asked for.
+func (s *Store) RevokeHostLease(_ context.Context, term int64, hostID string) error {
+	if err := requireID("host", hostID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	if _, exists := s.hosts[hostID]; !exists {
+		return metadata.ErrNotFound
+	}
+	delete(s.leases, hostID)
 	return nil
 }
 
@@ -279,7 +310,7 @@ func (s *Store) ListVolumesByHost(_ context.Context, hostID string) ([]metadata.
 	return vols, nil
 }
 
-func (s *Store) BumpVolumeEpoch(_ context.Context, term int64, volumeID, primaryHostID string) (int64, error) {
+func (s *Store) BumpVolumeEpoch(_ context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error) {
 	if err := requireID("volume", volumeID); err != nil {
 		return 0, err
 	}
@@ -291,6 +322,12 @@ func (s *Store) BumpVolumeEpoch(_ context.Context, term int64, volumeID, primary
 	v, ok := s.vols[volumeID]
 	if !ok {
 		return 0, metadata.ErrNotFound
+	}
+	// Compare-and-set, not increment: the caller computed its target from the epoch
+	// it read, and a volume that moved on since belongs to another promoter.
+	if v.CurrentEpoch != expectedEpoch {
+		return 0, fmt.Errorf("%w: volume %s is at %d, expected %d",
+			metadata.ErrEpochConflict, volumeID, v.CurrentEpoch, expectedEpoch)
 	}
 	v.CurrentEpoch++
 	v.PrimaryHostID = primaryHostID

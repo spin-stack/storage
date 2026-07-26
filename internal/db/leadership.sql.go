@@ -29,6 +29,21 @@ func (q *Queries) AcquireLeadership(ctx context.Context, holderID string) (int64
 	return term, err
 }
 
+const databaseNow = `-- name: DatabaseNow :one
+SELECT now()::timestamptz
+`
+
+// The database's own clock. Every fencing deadline is derived from a timestamp this
+// clock stamped (host_leases.last_renewal), so the Control Plane compares against
+// this rather than against its own wall clock: a container clock that jumps forward
+// would otherwise shorten the fencing wait by exactly that offset (§12.1).
+func (q *Queries) DatabaseNow(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, databaseNow)
+	var column_1 pgtype.Timestamptz
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const getLeader = `-- name: GetLeader :one
 SELECT term, holder_id, renewed_at
 FROM control_plane_leader
