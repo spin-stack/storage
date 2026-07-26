@@ -118,6 +118,8 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 		"immutable-snapshots":         true,
 		"no-truncate-above-published": true,
 		"background-yields":           true,
+		"boundary-monotonic":          true, // planted_bug_recovery_test.go
+		"durable-point-monotonic":     true, // planted_bug_recovery_test.go
 	}
 	for _, c := range dst.DefaultCheckers() {
 		if !proven[c.Name()] {
