@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
@@ -19,6 +21,41 @@ var (
 	ErrUploadRetriesExhausted = errors.New("wal: upload retries exhausted")
 )
 
+// Backoff is the wait between upload attempts. It is exponential from Base, doubling
+// each attempt and capped at Max (0 = uncapped). A zero Base means no wait, which is
+// what an uploader built without WithBackoff does.
+//
+// There is deliberately no jitter. Two things rule it out: a DST run must be
+// reproducible from its seed, and a jittered delay would have to draw from an
+// injected source of randomness for that to hold; and spreading a fleet's retries so
+// they do not resonate is a property of the fleet, not of one volume's WAL — a caller
+// that wants it can supply its own schedule per volume.
+type Backoff struct {
+	// Base is the wait before the second attempt. 0 disables waiting entirely.
+	Base time.Duration
+	// Max caps the wait. 0 means no cap.
+	Max time.Duration
+}
+
+// Delay returns the wait before the given attempt, counting the first attempt as 0.
+// Delay(0) is always 0: the first try is what the caller asked for, not a retry.
+func (b Backoff) Delay(attempt int) time.Duration {
+	if attempt < 1 || b.Base <= 0 {
+		return 0
+	}
+	d := b.Base
+	for range attempt - 1 {
+		d *= 2
+		if d <= 0 || (b.Max > 0 && d >= b.Max) { // overflow or past the cap
+			return b.Max
+		}
+	}
+	if b.Max > 0 && d > b.Max {
+		return b.Max
+	}
+	return d
+}
+
 // Uploader PUTs closed batches to the object store idempotently (§14.5): create-only
 // with If-None-Match; on a lost response it retries, and a 412 is reconciled by HEAD
 // + checksum (idempotent success) or a hard fail on divergence. It is provider-
@@ -26,14 +63,52 @@ var (
 type Uploader struct {
 	store       objectstore.Store
 	maxAttempts int
+
+	// clk/backoff space the retries out. Without them the budget is spent inside a
+	// single throttling window (see UploaderOption); nil clk means no waiting.
+	clk     clock.Clock
+	backoff Backoff
+}
+
+// UploaderOption configures an Uploader at construction.
+type UploaderOption func(*Uploader)
+
+// WithBackoff spaces retries out on the injected clock (§25.1, INV-01: never
+// time.Sleep). It is opt-in rather than the default for two reasons: an uploader
+// built without a clock cannot wait at all, and the wait is only correct if the
+// caller's clock actually advances — under a simulated clock driven step by step, a
+// waiting uploader is a stopped one until the scenario advances time.
+func WithBackoff(clk clock.Clock, b Backoff) UploaderOption {
+	return func(u *Uploader) {
+		u.clk = clk
+		u.backoff = b
+	}
 }
 
 // NewUploader returns an uploader with a bounded retry budget (never infinite).
-func NewUploader(store objectstore.Store, maxAttempts int) *Uploader {
+func NewUploader(store objectstore.Store, maxAttempts int, opts ...UploaderOption) *Uploader {
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	return &Uploader{store: store, maxAttempts: maxAttempts}
+	u := &Uploader{store: store, maxAttempts: maxAttempts}
+	for _, opt := range opts {
+		opt(u)
+	}
+	return u
+}
+
+// wait pauses before a retry. It returns the context's error if the caller is gone,
+// which is the same reason the attempt loop checks ctx: spending the schedule on a
+// backend that is already being torn down helps nobody.
+func (u *Uploader) wait(ctx context.Context, attempt int) error {
+	if u.clk == nil {
+		return nil
+	}
+	d := u.backoff.Delay(attempt)
+	if d <= 0 {
+		return nil
+	}
+	return u.clk.Sleep(ctx, d)
 }
 
 // Upload stores the batch's WAL object idempotently and returns its key once the
@@ -47,6 +122,12 @@ func (u *Uploader) Upload(ctx context.Context, cb *ClosedBatch) (string, error) 
 		// already being torn down helps nobody, and the error it would return
 		// ("retries exhausted") describes the wrong failure.
 		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		// Space the retries out. Without this the whole budget is spent inside the
+		// throttling window the first attempt already lost to: N attempts cost N
+		// round trips, not N × anything the backend needs to recover.
+		if err := u.wait(ctx, attempt); err != nil {
 			return "", err
 		}
 		if err := u.spanClaimed(ctx, obj.Key); err != nil {
