@@ -86,3 +86,28 @@ func (p *Provider) CollectedMetrics(ctx context.Context) (map[string]bool, error
 	}
 	return out, nil
 }
+
+// GaugeValues returns the latest value of every collected Float64 gauge. A state
+// gauge (`wal_out_of_space`) is only useful to an operator if it reads 1 while the
+// condition holds and 0 once it clears, so a test that asserts merely "the name was
+// recorded" would pass on a gauge wired backwards. The last data point wins, which
+// is what a gauge means.
+func (p *Provider) GaugeValues(ctx context.Context) (map[string]float64, error) {
+	var rm metricdata.ResourceMetrics
+	if err := p.reader.Collect(ctx, &rm); err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			g, ok := m.Data.(metricdata.Gauge[float64])
+			if !ok {
+				continue
+			}
+			for _, dp := range g.DataPoints {
+				out[m.Name] = dp.Value
+			}
+		}
+	}
+	return out, nil
+}
