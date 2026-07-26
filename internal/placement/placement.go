@@ -49,13 +49,29 @@ func (p Policy) maxRatio() float64 {
 	return p.MaxOversubscription
 }
 
-// fits reports whether h can take sizeBytes more without breaking the policy.
-func (p Policy) fits(h metadata.Host, sizeBytes int64) bool {
+// Admits reports whether h can take sizeBytes more without breaking the policy: the
+// §28.2 bound, evaluated against the host as it is *now*.
+//
+// Choose is advisory. It is pure, so two operations that read the fleet before
+// either has reserved anything — a drain and a clone, or two drains — both get the
+// same destination and both commit, and the destination ends up past the declared
+// bound with neither caller having made a mistake. The bound therefore has to be
+// re-evaluated by whatever performs the reservation, and it has to be the same rule:
+// two copies of it is how a host ends up holding what placement believed it refused.
+//
+// This is the check, not the enforcement. Enforcement belongs inside the write that
+// adds the bytes — otherwise the read and the write are still two steps and the race
+// survives, just narrower.
+func (p Policy) Admits(h metadata.Host, sizeBytes int64) bool {
 	if !h.State.AcceptsPlacement() || h.NVMeTotalBytes <= 0 {
 		return false
 	}
-	limit := int64(p.maxRatio() * float64(h.NVMeTotalBytes))
-	return h.NVMeCommittedBytes+sizeBytes <= limit
+	return h.NVMeCommittedBytes+sizeBytes <= p.Limit(h)
+}
+
+// Limit is the highest committed-bytes value the policy allows on h (§28.2).
+func (p Policy) Limit(h metadata.Host) int64 {
+	return int64(p.maxRatio() * float64(h.NVMeTotalBytes))
 }
 
 // Choose returns the host for req, following the §20 order. It never mutates hosts.
@@ -63,7 +79,7 @@ func (p Policy) Choose(hosts []metadata.Host, req Request) (string, error) {
 	// 1. The source host: no download at all if it still has room.
 	if req.SourceHostID != "" {
 		for _, h := range hosts {
-			if h.HostID == req.SourceHostID && p.fits(h, req.SizeBytes) {
+			if h.HostID == req.SourceHostID && p.Admits(h, req.SizeBytes) {
 				return h.HostID, nil
 			}
 		}
@@ -95,7 +111,7 @@ func (p Policy) best(hosts []metadata.Host, sizeBytes int64, only []string) (str
 		if only != nil && !contains(only, h.HostID) {
 			continue
 		}
-		if !p.fits(h, sizeBytes) {
+		if !p.Admits(h, sizeBytes) {
 			continue
 		}
 		ratio := float64(h.NVMeCommittedBytes+sizeBytes) / float64(h.NVMeTotalBytes)
