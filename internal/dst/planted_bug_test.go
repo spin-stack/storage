@@ -3,12 +3,20 @@ package dst
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/checkpoint"
+	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/lifecycle"
+	"github.com/spin-stack/storage/internal/metadata"
+	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/wal"
 )
 
 // A checker that cannot fail is decoration — but a checker proven against a
@@ -19,22 +27,32 @@ import (
 // So a planted bug here breaks *production behaviour* and the checker has to see it
 // through a scenario driving real code: a bucket without versioning, a backend without
 // conditional writes, a backend serving a stale read, a listing that never catches up,
-// a clock that goes backwards, a lease checker that keeps saying yes, a volume created
-// without encryption. Every one is an operational reality, and each is injected into
-// the simulated I/O rather than edited into the code under test.
+// a listing that goes backwards, a clock that goes backwards, a lease row read from a
+// replica, a lease checker that keeps saying yes, a volume created without encryption,
+// a background consumer wired without a scheduler. Every one is an operational
+// reality, and each is injected into the simulated I/O or into how the code under test
+// is built — never into the code itself.
 //
-// Four checkers have no such proof yet, because inverting them needs a seam in
-// production code that does not exist. They keep a literal-event proof, are grouped
-// separately below with the missing seam named, and are counted by
-// TestPlantedBugCoverageIsNotSilentlyWeakened so the gap is visible in the source
-// rather than implied by its absence.
+// Every checker now has one. TestPlantedBugCoverageIsNotSilentlyWeakened pins the
+// count, so a checker quietly downgraded to a hand-written Emit fails there rather than
+// disappearing into the absence of a test.
+//
+// Two of them are planted at a seam rather than at an I/O fault: INV-03's ordering
+// rules and INV-17's arbitration are comparisons over numbers held in memory, and no
+// disk, clock or object-store fault changes their answer. Those plants substitute one
+// named policy (wal.OrderPolicy) or omit one constructor argument (the scheduler a
+// background consumer is handed), which is how both invariants are actually lost —
+// never by editing the code under test.
 
 // Planted-bug outcomes. A behavioural planted bug also trips the scenario's own
 // assertions; these name what went wrong for a reader of a failing run.
 var (
-	errNotYetExpired        = errors.New("planted: the lease should already have expired")
-	errLeaseResurrected     = errors.New("planted: a monotonic regression revalidated an expired lease")
-	errStaleWriterPublished = errors.New("planted: a fenced writer verified its own epoch")
+	errNotYetExpired           = errors.New("planted: the lease should already have expired")
+	errLeaseResurrected        = errors.New("planted: a monotonic regression revalidated an expired lease")
+	errStaleWriterPublished    = errors.New("planted: a fenced writer verified its own epoch")
+	errPromotedOverLiveLease   = errors.New("planted: an epoch was granted while the fenced writer's lease was still valid")
+	errTruncatedAbovePublished = errors.New("planted: local WAL was reclaimed above the verified published point")
+	errPublishedAheadOfDurable = errors.New("planted: a record no object store holds was reclaimed as published")
 )
 
 // plantedBug runs sc and requires checker to reject it, naming itself and printing the
@@ -194,48 +212,357 @@ func TestPlantedBugMonotonicClock(t *testing.T) {
 	plantedBug(t, 777, NewMonotonicClockChecker(), "monotonic-clock", sc(9*time.Second))
 }
 
-// ---------------------------------------------------------------------------
-// Literal-event proofs: the checker is proven to read the field, but nothing in the
-// simulation can produce the event, because inverting the behaviour needs a seam in
-// production code that does not exist. Each names the missing seam.
-// ---------------------------------------------------------------------------
+// publishAnything is the one ordering rule this plant removes: published may move
+// anywhere, durable and truncation stay exactly as production has them (wal.StrictOrder
+// is zero-size, so embedding it keeps the other two rules verbatim rather than
+// reimplementing them here).
+//
+// One rule, not three. A Log with no rules at all would prove nothing about which
+// check the checker depends on, and a checker that only fires when everything is off
+// is not a regression test for anything.
+type publishAnything struct{ wal.StrictOrder }
 
-// INV-03: published <= durable <= local. wal.Log enforces the ordering internally
-// (ErrWatermarkOrder) and exposes no way to set the three independently, so no I/O
-// fault can produce this event. Needs a seam in internal/wal.
-func TestPlantedBugWatermarkOrder(t *testing.T) {
-	plantedBug(t, 11, NewWatermarkOrderChecker(), "watermark-order", func(s *Sim) error {
-		s.Emit(Event{Kind: EventWatermark, Published: 9, Durable: 3, Local: 5})
-		return nil
-	})
+func (publishAnything) AllowPublished(uint64, wal.Watermarks) error { return nil }
+
+// publishedAheadOfDurable is INV-03 where it costs something. A log holds three
+// records and has ACKed two of them: local=3, durable=2, published=0. Advancing
+// published to 3 claims that a verified checkpoint covers a record the object store
+// has never seen — and INV-13, still strict, then *correctly* allows the local copy of
+// that record to be reclaimed, because published is exactly what INV-13 trusts. The
+// record exists nowhere afterwards.
+//
+// The move is the real one a checkpointer makes (Log.AdvancePublished, §21.1 step 2)
+// and the trio is the log's own. relax substitutes the ordering policy behind that one
+// move and leaves the other two rules strict, so what the checker sees is one rule
+// missing rather than a Log with no rules at all.
+func publishedAheadOfDurable(relax bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		var vol [16]byte
+		vol[6], vol[8] = 0x70, 0x80
+		vol[15] = 0xd2
+
+		f, err := s.Disk.Create("wal/active.wal")
+		if err != nil {
+			return err
+		}
+		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l.EnableRemote(
+			wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+			wal.NewUploader(s.Store, 5),
+			alwaysValidLease{},
+		)
+		for i, payload := range []string{"acked", "acked-too", "never-uploaded"} {
+			if _, err := l.Write(uint64(i)*8, []byte(payload), 0); err != nil {
+				return err
+			}
+			if i == 1 {
+				if err := l.Flush(ctx); err != nil {
+					return fmt.Errorf("flush: %w", err)
+				}
+			}
+		}
+		emitWatermarks(s, l)
+		w := l.Watermarks()
+		if w.Local != 3 || w.Durable != 2 {
+			return fmt.Errorf("setup: local=%d durable=%d, want 3 and 2", w.Local, w.Durable)
+		}
+
+		if relax {
+			l.SetOrderPolicy(publishAnything{})
+			s.Emit(Event{Kind: EventFault, Msg: "the published watermark stopped being checked against durable"})
+		}
+		// What a checkpoint's second step does, for a checkpoint that covers a record
+		// S3 does not hold.
+		switch err := l.AdvancePublished(w.Local); {
+		case relax && err != nil:
+			return fmt.Errorf("the relaxed policy still refused the move: %w", err)
+		case !relax && !errors.Is(err, wal.ErrWatermarkOrder):
+			return fmt.Errorf("publishing above durable: want ErrWatermarkOrder, got %v", err)
+		}
+		emitWatermarks(s, l)
+		if !relax {
+			return nil
+		}
+
+		// INV-13 is untouched and does its job against a number that is now a lie: the
+		// only copy of record 3 is reclaimed.
+		if err := l.TruncateLocal(l.Watermarks().Published); err != nil {
+			return fmt.Errorf("truncate to the published point: %w", err)
+		}
+		size, err := f.Size()
+		if err != nil {
+			return err
+		}
+		if size != 0 {
+			return fmt.Errorf("the WAL still holds %d bytes; the plant did not reach the file", size)
+		}
+		return errPublishedAheadOfDurable
+	}
 }
 
-// INV-11: no epoch granted before FENCING_WAIT. The promoter and the scenario read the
-// same wall clock, so skewing it moves the deadline along with the observation. Needs
-// a fault double for metadata.Store (the lease row the promoter reads), which lives in
-// internal/metadata/sim.
+// INV-03: published <= durable <= local at every observation.
+//
+// FAILS: the ordering rules are three comparisons over numbers held in memory and the
+// Log applies them itself, so the trio it reports is ordered by construction whatever
+// the disk and the object store do. Driving the real move only produces the error the
+// Log is supposed to return.
+func TestPlantedBugPublishedAheadOfDurable(t *testing.T) {
+	requirePasses(t, 20, NewWatermarkOrderChecker(), publishedAheadOfDurable(false))
+	plantedBug(t, 20, NewWatermarkOrderChecker(), "watermark-order", publishedAheadOfDurable(true))
+}
+
+// Ids for the fencing-wait plant, kept apart from the mandatory scenario's so the two
+// never share an epoch object.
+const (
+	fencedVol   = "00000000-0000-7000-8000-0000000000c0"
+	fencedHost1 = "00000000-0000-7000-8000-0000000000c1"
+	fencedHost2 = "00000000-0000-7000-8000-0000000000c2"
+)
+
+// The §12 parameters this plant runs with.
+const (
+	fencingLeaseTTL = 10 * time.Second
+	fencingSkew     = 2 * time.Second
+)
+
+// replicaLeaseMD answers GetHostLease from a PostgreSQL read replica that is `lag`
+// behind the primary: the row it hands back carries the renewal *before* the one the
+// Agent has already made. Everything else goes to the real store.
+//
+// This is a deployment, not a bug: reads are routed to a replica to keep them off the
+// primary, and replication lag is measured in seconds on a good day. The promoter has
+// no defence against it — with no instant from the caller, the lease row is the whole
+// authority for FENCING_WAIT, and the deadline it computes from a stale renewal has
+// already passed while the writer's own monotonic countdown has not.
+type replicaLeaseMD struct {
+	metadata.Store
+	lag time.Duration
+}
+
+func (m *replicaLeaseMD) GetHostLease(ctx context.Context, hostID string) (metadata.HostLease, error) {
+	l, err := m.Store.GetHostLease(ctx, hostID)
+	if err != nil {
+		return l, err
+	}
+	l.LastRenewal = l.LastRenewal.Add(-m.lag)
+	return l, nil
+}
+
+// promoFault is what the promotion scenario runs against.
+type promoFault struct {
+	// jump steps the *wall clock* forward before the attempt — an NTP correction, a VM
+	// restored from a snapshot, a bad RTC. It is not a violation and must not be read
+	// as one: the promoter and the Agent's lease sit on the same clock, so a jump that
+	// carries the CP past the deadline carries the writer past the end of its lease
+	// too. It is kept as a control against a checker that would cry wolf.
+	jump time.Duration
+	// replicaLag is how far behind the lease row the CP reads is.
+	replicaLag time.Duration
+}
+
+// earlyPromotion drives a real controlplane.Promoter against a volume whose primary
+// still holds a valid lease on its own monotonic clock, and reports whether the epoch
+// was granted anyway. Both halves of that question are answered by production code:
+// the grant is Promote's return, and the liveness of the writer being fenced is a real
+// lease.Manager counting down the same TTL the Control Plane recorded.
+func earlyPromotion(f promoFault) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		var md metadata.Store = metasim.New(s.Clock.Wall)
+		if f.replicaLag > 0 {
+			md = &replicaLeaseMD{Store: md, lag: f.replicaLag}
+		}
+		epochs := epoch.NewStore(s.Store)
+		p := controlplane.NewPromoter(md, epochs, s.Clock, fencingLeaseTTL, fencingSkew)
+
+		term, err := md.AcquireLeadership(ctx, "cp")
+		if err != nil {
+			return err
+		}
+		for _, h := range []string{fencedHost1, fencedHost2} {
+			if err := md.UpsertHost(ctx, term, metadata.Host{HostID: h, State: lifecycle.HostActive}); err != nil {
+				return err
+			}
+		}
+		if err := md.CreateVolume(ctx, term, metadata.Volume{
+			VolumeID: fencedVol, State: lifecycle.VolumeActive,
+			PrimaryHostID: fencedHost1, DEKWrapped: []byte{1}, KEKID: "k",
+		}); err != nil {
+			return err
+		}
+		if _, err := epochs.Init(ctx, fencedVol, 0); err != nil {
+			return err
+		}
+
+		// W1 takes the lease the Control Plane records. The row and the Agent's own
+		// monotonic countdown start at the same instant, which is the only condition
+		// under which the CP's deadline says anything about the writer (§12.1).
+		if err := md.RenewHostLease(ctx, term, fencedHost1, int(fencingLeaseTTL/time.Second)); err != nil {
+			return err
+		}
+		w1 := lease.NewManager(s.Clock, fencingLeaseTTL)
+		w1.Grant()
+		renewedAt := s.Clock.Wall()
+
+		// Half a TTL in: the reconciler has seen missed heartbeats and carries no
+		// instant of its own, so the lease row is the whole authority (§12.3).
+		s.Tick(fencingLeaseTTL / 2)
+		if f.jump > 0 {
+			s.Clock.Advance(f.jump)
+			s.Emit(Event{Kind: EventFault, Msg: "the Control Plane's wall clock stepped forward"})
+		}
+		if f.replicaLag > 0 {
+			s.Emit(Event{Kind: EventFault, Msg: "the lease row is read from a replica that is behind"})
+		}
+		newEpoch, err := p.Promote(ctx, term, fencedVol, time.Time{}, fencedHost2)
+		granted := err == nil
+		s.Emit(Event{
+			Kind: EventPromotion, EarlyGrant: granted && w1.Valid(),
+			Msg: fmt.Sprintf("epoch=%d granted=%t w1_lease_valid=%t deadline=%s",
+				newEpoch, granted, w1.Valid(), p.FencingDeadline(renewedAt).UTC()),
+		})
+		switch {
+		case granted && w1.Valid():
+			return errPromotedOverLiveLease
+		case !granted && !errors.Is(err, controlplane.ErrFencingWaitNotElapsed):
+			return fmt.Errorf("promotion before the wait: want ErrFencingWaitNotElapsed, got %w", err)
+		}
+
+		// Past the deadline the same promotion must succeed: a checker that fires on
+		// every promotion would say nothing about the early ones.
+		s.Tick(fencingLeaseTTL)
+		newEpoch, err = p.Promote(ctx, term, fencedVol, time.Time{}, fencedHost2)
+		if err != nil {
+			return fmt.Errorf("promotion after the wait: %w", err)
+		}
+		s.Emit(Event{
+			Kind: EventPromotion, EarlyGrant: w1.Valid(),
+			Msg: fmt.Sprintf("epoch=%d after the wait w1_lease_valid=%t", newEpoch, w1.Valid()),
+		})
+		if newEpoch != 1 {
+			return fmt.Errorf("new epoch = %d, want 1", newEpoch)
+		}
+		return nil
+	}
+}
+
+// INV-11: no epoch is granted before FENCING_WAIT elapses. Planted by reading the
+// lease row from a replica that is behind the primary — the deadline the promoter
+// derives has passed, the writer's own monotonic lease has not, and the epoch is
+// granted over a writer that can still ACK a FLUSH (§12.2, §12.3).
+//
+// The two controls matter as much as the plant: an honest run must be green, and so
+// must a wall clock that steps forward, which is not an early grant and would make the
+// checker cry wolf if it were counted as one.
 func TestPlantedBugEarlyPromotion(t *testing.T) {
-	plantedBug(t, 14, NewPromotionWaitChecker(), "promotion-fencing-wait", func(s *Sim) error {
-		s.Emit(Event{Kind: EventPromotion, EarlyGrant: true, Msg: "granted on a missed heartbeat"})
-		return nil
-	})
+	requirePasses(t, 14, NewPromotionWaitChecker(), earlyPromotion(promoFault{}))
+	requirePasses(t, 14, NewPromotionWaitChecker(), earlyPromotion(promoFault{jump: fencingLeaseTTL}))
+	plantedBug(t, 14, NewPromotionWaitChecker(), "promotion-fencing-wait",
+		earlyPromotion(promoFault{replicaLag: 2 * fencingLeaseTTL}))
 }
 
-// INV-13: never truncate above the verified published point. Needs Log.TruncateLocal
-// to be made to accept an upTo above published; no I/O fault reaches that decision.
+// truncateAfterListingRegresses is INV-13 end to end: a checkpoint publishes a durable
+// point, local WAL is reclaimed up to it, and then the volume is checkpointed again.
+//
+// Both numbers in the event come from the log itself — what it reclaimed and what it
+// has verified as published — so the only way to make them disagree is to make real
+// code move one of them. checkpoint.Create recomputes the published point from what
+// the object store can prove *now* (a LIST) and hands it to Log.AdvancePublished, which
+// guards the ordering against durable but not against its own past: a listing that
+// went backwards would walk the published point back under WAL that no longer exists.
+//
+// regress asks the store for one listing served by an index replica that is behind the
+// data — an eventually consistent LIST offers no monotonic-read guarantee, so the
+// second of two listings can be the older one. The checkpointer then publishes a lower
+// point, walks published back under WAL that has already been reclaimed, and reports
+// no error at all: the volume is missing records and every number the system prints
+// about it is consistent.
+func truncateAfterListingRegresses(regress bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		var vol [16]byte
+		vol[6], vol[8] = 0x70, 0x80
+		vol[15] = 0xd1
+
+		f, err := s.Disk.Create("wal/active.wal")
+		if err != nil {
+			return err
+		}
+		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l.EnableRemote(
+			wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+			wal.NewUploader(s.Store, 5),
+			alwaysValidLease{},
+		)
+		// Two objects, so a listing can lose the newer one and still answer.
+		for i, payload := range []string{"a", "b", "c"} {
+			if _, err := l.Write(uint64(i)*8, []byte(payload), 0); err != nil {
+				return err
+			}
+			if i == 1 {
+				if err := l.Flush(ctx); err != nil {
+					return fmt.Errorf("flush %d: %w", i, err)
+				}
+			}
+		}
+		if err := l.Flush(ctx); err != nil {
+			return err
+		}
+
+		cp := checkpoint.NewCheckpointer(s.Store)
+		if _, err := cp.Create(ctx, l, vol, 1); err != nil {
+			return fmt.Errorf("first checkpoint: %w", err)
+		}
+		published := l.Watermarks().Published
+		if published != l.Watermarks().Durable {
+			return fmt.Errorf("the checkpoint published %d of %d durable", published, l.Watermarks().Durable)
+		}
+		// §21.1: published, verified, and only then is the local copy disposable.
+		if err := l.TruncateLocal(published); err != nil {
+			return fmt.Errorf("truncate to the published point: %w", err)
+		}
+		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: l.TruncatedUpTo(), Published: published})
+
+		if regress {
+			s.Store.InjectStaleListing(s.Rand, 1)
+			s.Emit(Event{Kind: EventFault, Msg: "the listing that proves the durable point goes backwards"})
+		}
+		// The next checkpoint recomputes the published point from the backend.
+		if _, err := cp.Create(ctx, l, vol, 1); err != nil {
+			return fmt.Errorf("second checkpoint: %w", err)
+		}
+		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: l.TruncatedUpTo(), Published: l.Watermarks().Published})
+		if l.TruncatedUpTo() > l.Watermarks().Published {
+			return errTruncatedAbovePublished
+		}
+		return nil
+	}
+}
+
+// INV-13: local WAL is never truncated above the verified published point. Planted by
+// one listing served from behind the data, which is enough for checkpoint.Create to
+// republish at a lower sequence and for Log.AdvancePublished — which guards the
+// ordering against durable but not against its own past — to accept it.
 func TestPlantedBugTruncateAbovePublished(t *testing.T) {
-	plantedBug(t, 18, NewTruncateBelowPublishedChecker(), "no-truncate-above-published", func(s *Sim) error {
-		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: 50, Published: 20})
-		return nil
-	})
+	requirePasses(t, 18, NewTruncateBelowPublishedChecker(), truncateAfterListingRegresses(false))
+	plantedBug(t, 18, NewTruncateBelowPublishedChecker(), "no-truncate-above-published", truncateAfterListingRegresses(true))
 }
 
-// INV-17: background I/O yields. The ioclass scheduler is pure in-process arbitration
-// with no simulated I/O in it, so inverting it means a seam in internal/ioclass.
+// INV-17: background I/O yields. Planted where the invariant is actually lost — not in
+// the arbitration, which is a counter no injected fault can reach, but in a background
+// consumer that was never handed the scheduler. A real cross-host materialization then
+// fetches object after object while a foreground op is in flight, exactly as it would
+// on a host serving a guest, and the checker sees the grant against a real in-flight
+// count.
+//
+// The control is the same scenario wired to the same scheduler: it yields with
+// ErrThrottled and the checker stays quiet.
 func TestPlantedBugBackgroundDidNotYield(t *testing.T) {
+	requirePasses(t, 19, NewBackgroundYieldsChecker(), scenarioCrossHostMaterialization)
 	plantedBug(t, 19, NewBackgroundYieldsChecker(), "background-yields", func(s *Sim) error {
-		s.Emit(Event{Kind: EventIOClass, BgGranted: true, HighInFlight: true})
-		return nil
+		s.Emit(Event{Kind: EventFault, Msg: "the materializer was built without the data path's scheduler"})
+		return crossHostMaterialization(s, unscheduledMaterializer)
 	})
 }
 
@@ -249,7 +576,8 @@ const (
 	// code violate the invariant, and the checker catches it through a real scenario.
 	proofBehavioural proofKind = iota
 	// proofLiteral: only the event is planted. The checker is proven to read the
-	// field; nothing proves a real run could ever set it.
+	// field; nothing proves a real run could ever set it. No checker is here now; the
+	// kind stays so a new checker can be added honestly before its proof exists.
 	proofLiteral
 )
 
@@ -262,13 +590,13 @@ var plantedProofs = map[string]proofKind{
 	"durable-ack-requires-lease":  proofBehavioural,
 	"no-plaintext-leaves-host":    proofBehavioural,
 	"monotonic-clock":             proofBehavioural,
-	"watermark-order":             proofLiteral,
-	"promotion-fencing-wait":      proofLiteral,
-	"no-truncate-above-published": proofLiteral,
-	"background-yields":           proofLiteral,
+	"promotion-fencing-wait":      proofBehavioural,
+	"no-truncate-above-published": proofBehavioural,
+	"background-yields":           proofBehavioural,
+	"watermark-order":             proofBehavioural,
 	// Contributed by scenarios_recovery.go; proofs in planted_bug_recovery_test.go.
-	"boundary-monotonic":      proofLiteral,
-	"durable-point-monotonic": proofLiteral,
+	"boundary-monotonic":      proofBehavioural,
+	"durable-point-monotonic": proofBehavioural,
 }
 
 // TestEveryCheckerHasAPlantedBugProof fails when a checker is added without one, so
@@ -288,15 +616,21 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 // Converting a literal proof to a behavioural one is progress and raises this number;
 // a checker quietly downgraded to a hand-written Emit is not, and fails here.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 7
+	const wantBehavioural = 13
 	got := 0
-	for _, kind := range plantedProofs {
-		if kind == proofBehavioural {
+	var literal []string
+	for name, kind := range plantedProofs {
+		switch kind {
+		case proofBehavioural:
 			got++
+		case proofLiteral:
+			literal = append(literal, name)
 		}
 	}
 	if got != wantBehavioural {
-		t.Fatalf("%d checkers have a behavioural planted-bug proof, expected %d: "+
-			"raise the constant when converting one, never lower it", got, wantBehavioural)
+		sort.Strings(literal)
+		t.Fatalf("%d checkers have a behavioural planted-bug proof, expected %d "+
+			"(literal: %v): raise the constant when converting one, never lower it",
+			got, wantBehavioural, literal)
 	}
 }
