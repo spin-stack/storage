@@ -283,6 +283,17 @@ tasks:
     cmds:
       - go build ./...
 
+  build:cmd:
+    desc: Build the binaries (volume-agent, control-plane) into _output/bin.
+    vars:
+      # The version each binary reports about itself: the Agent sends it in every
+      # heartbeat (§13.4, fleet-mixed), so "dev" from an untagged build is a
+      # deliberate answer, not a missing one.
+      VERSION: '{{.VERSION | default "dev"}}'
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}/bin
+      - go build -ldflags "-X main.version={{.VERSION}}" -o {{.OUTPUT_DIR}}/bin/ ./cmd/...
+
   test:
     desc: Run the full unit/property test suite with the race detector.
     cmds:

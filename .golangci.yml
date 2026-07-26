@@ -48,6 +48,16 @@ linters:
         linters:
           - depguard
           - forbidigo
+      # cmd/ mains are where the real world is wired up: INV-01 puts the real
+      # implementations behind simio, and their *construction* in main. The one
+      # thing that needs the syscall package here is signal handling
+      # (syscall.SIGTERM — a daemon that ignores it is not deployable), and Go
+      # offers no other spelling of it. Narrow on purpose: only depguard, only
+      # cmd/, and the authoritative simulable analyzer still runs over cmd/, so a
+      # real read/write/fsync smuggled into a main is still a failure.
+      - path: ^cmd/
+        linters:
+          - depguard
       # analyzer golden fixtures deliberately contain violations.
       - path: hack/analyzers/.*/testdata/
         linters:
