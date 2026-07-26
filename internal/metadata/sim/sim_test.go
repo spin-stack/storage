@@ -334,10 +334,10 @@ func TestCommitHostCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.CommitHostCapacity(ctx, term, "h1", 400); err != nil {
+	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: 400, Limit: 1000}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CommitHostCapacity(ctx, term, "h1", 300); err != nil {
+	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: 300, Limit: 1000}); err != nil {
 		t.Fatal(err)
 	}
 	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 700 {
@@ -345,7 +345,7 @@ func TestCommitHostCapacity(t *testing.T) {
 	}
 
 	// Release.
-	if err := s.CommitHostCapacity(ctx, term, "h1", -400); err != nil {
+	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: -400}); err != nil {
 		t.Fatal(err)
 	}
 	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 300 {
@@ -353,7 +353,7 @@ func TestCommitHostCapacity(t *testing.T) {
 	}
 
 	// Releasing more than is committed is a bug, not a silent negative.
-	if err := s.CommitHostCapacity(ctx, term, "h1", -301); !errors.Is(err, metadata.ErrCapacityUnderflow) {
+	if err := s.CommitHostCapacity(ctx, term, "h1", metadata.CapacityChange{DeltaBytes: -301}); !errors.Is(err, metadata.ErrCapacityUnderflow) {
 		t.Fatalf("underflow: want ErrCapacityUnderflow, got %v", err)
 	}
 	if h, _ := s.GetHost(ctx, "h1"); h.NVMeCommittedBytes != 300 {
@@ -363,11 +363,11 @@ func TestCommitHostCapacity(t *testing.T) {
 	// Term-guarded and existence-checked.
 	stale := term
 	_, _ = s.AcquireLeadership(ctx, "cp-b")
-	if err := s.CommitHostCapacity(ctx, stale, "h1", 1); !errors.Is(err, metadata.ErrStaleTerm) {
+	if err := s.CommitHostCapacity(ctx, stale, "h1", metadata.CapacityChange{DeltaBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale commit: want ErrStaleTerm, got %v", err)
 	}
 	newTerm, _ := s.AcquireLeadership(ctx, "cp-c")
-	if err := s.CommitHostCapacity(ctx, newTerm, "absent", 1); !errors.Is(err, metadata.ErrNotFound) {
+	if err := s.CommitHostCapacity(ctx, newTerm, "absent", metadata.CapacityChange{DeltaBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("missing host: want ErrNotFound, got %v", err)
 	}
 	if err := s.SetHostState(ctx, newTerm, "absent", lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {

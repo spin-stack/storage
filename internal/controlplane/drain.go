@@ -557,7 +557,11 @@ func (d *Drainer) stillOurs(v metadata.Volume, source string, vp *volumeProgress
 func (d *Drainer) abandon(ctx context.Context, term int64, operationID string, prog *progress, v metadata.Volume, cause error) error {
 	errs := []error{cause}
 	if vp := prog.volume(v.VolumeID); vp != nil {
-		if rerr := d.md.CommitHostCapacity(ctx, term, vp.ToHost, -v.SizeBytes); rerr != nil {
+		// A release is never bounded: the destination may be over its ceiling by now
+		// (another placement landed there), and refusing to hand the bytes back would
+		// leave the reservation stranded on exactly the host that can least afford it.
+		if rerr := d.md.CommitHostCapacity(ctx, term, vp.ToHost,
+			metadata.CapacityChange{DeltaBytes: -v.SizeBytes}); rerr != nil {
 			errs = append(errs, fmt.Errorf("%w: %s still holds %d bytes for %s: %w",
 				ErrReservationNotReleased, vp.ToHost, v.SizeBytes, v.VolumeID, rerr))
 		}
@@ -570,33 +574,47 @@ func (d *Drainer) abandon(ctx context.Context, term int64, operationID string, p
 }
 
 // applyCapacity moves a host's committed bytes by delta exactly once across resumed
-// passes. CommitHostCapacity is a delta, not a compare-and-set, so the only proof a
-// resumed pass has that its own delta already landed is the ledger value recorded
-// before it was attempted: `before` means it did not, `before+delta` means it did.
-// Anything else is a third party writing the same books, and it is reported rather
-// than guessed — releasing twice either wedges the drain with ErrCapacityUnderflow
-// or silently consumes another volume's reservation.
+// passes, under the §28.2 bound.
 //
-// What this cannot see is a third party whose changes cancel out to exactly one
-// volume size in the meantime; a compare-and-set on the reserving query is the only
-// thing that would close that, and it belongs to the store, not here (§28.2).
+// A first attempt is an unconditional change: there is nothing to be idempotent
+// about yet, and what protects it is the bound — the placement decision behind it
+// was taken against a fleet read that any number of other operations shared, so the
+// statement that adds the bytes is the only place the ceiling still means anything.
+//
+// A resumed attempt is conditional. CommitHostCapacity is a delta, not an
+// idempotency key, so the only proof this pass has that its own change already
+// landed is the ledger value recorded before it was attempted: `before` means it did
+// not, `before+delta` means it did. Comparing those in Go leaves a window in which a
+// third party's change is indistinguishable from ours, so the comparison is a
+// predicate of the write itself; a ledger that moved comes back as
+// ErrCapacityConflict with nothing applied, and the drain reports it rather than
+// guessing. Releasing twice either wedges the drain with ErrCapacityUnderflow or
+// silently consumes another volume's reservation.
 func (d *Drainer) applyCapacity(ctx context.Context, term int64, hostID string, delta, before int64, resumed bool) error {
-	if !resumed {
-		return d.md.CommitHostCapacity(ctx, term, hostID, delta)
-	}
 	h, err := d.md.GetHost(ctx, hostID)
 	if err != nil {
 		return err
 	}
-	switch h.NVMeCommittedBytes {
-	case before + delta:
-		return nil // an earlier pass already applied it
-	case before:
-		return d.md.CommitHostCapacity(ctx, term, hostID, delta)
-	default:
-		return fmt.Errorf("%w: %s holds %d committed bytes, expected %d before the change or %d after",
-			ErrCapacityLedgerMoved, hostID, h.NVMeCommittedBytes, before, before+delta)
+	change := metadata.CapacityChange{DeltaBytes: delta, Limit: d.policy.Limit(h)}
+	if resumed {
+		change = change.Expecting(before)
 	}
+	err = d.md.CommitHostCapacity(ctx, term, hostID, change)
+	if !errors.Is(err, metadata.ErrCapacityConflict) {
+		return err
+	}
+	// The ledger is not where this pass left it. An earlier pass of this same
+	// operation having applied the delta is the one reading that is still ours to
+	// finish; anything else is a third party writing the same books.
+	h, gerr := d.md.GetHost(ctx, hostID)
+	if gerr != nil {
+		return gerr
+	}
+	if resumed && h.NVMeCommittedBytes == before+delta {
+		return nil
+	}
+	return fmt.Errorf("%w: %s holds %d committed bytes, expected %d before the change or %d after: %w",
+		ErrCapacityLedgerMoved, hostID, h.NVMeCommittedBytes, before, before+delta, err)
 }
 
 // guardDurableFloor refuses a boundary that would move the durable point backwards.

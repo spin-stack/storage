@@ -56,13 +56,13 @@ type faultMD struct {
 	onLease  func(hostID string)
 }
 
-func (s *faultMD) CommitHostCapacity(ctx context.Context, term int64, hostID string, delta int64) error {
+func (s *faultMD) CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error {
 	if s.onCommit != nil {
-		s.onCommit(hostID, delta, false)
+		s.onCommit(hostID, c.DeltaBytes, false)
 	}
-	err := s.Store.CommitHostCapacity(ctx, term, hostID, delta)
+	err := s.Store.CommitHostCapacity(ctx, term, hostID, c)
 	if err == nil && s.onCommit != nil {
-		s.onCommit(hostID, delta, true)
+		s.onCommit(hostID, c.DeltaBytes, true)
 	}
 	return err
 }
@@ -164,7 +164,9 @@ func newDrainWorld(s *Sim, tag byte, fence wal.LeaseChecker) (*drainWorld, error
 	// The source also holds a reservation for a volume nobody is moving: a release
 	// that lands twice must be visible as theft, not absorbed into a zero.
 	w.srcHeld = 2 * drainVolBytes
-	if err := base.CommitHostCapacity(ctx, term, w.src, w.srcHeld); err != nil {
+	if err := base.CommitHostCapacity(ctx, term, w.src, metadata.CapacityChange{
+		DeltaBytes: w.srcHeld, Limit: 10 * drainVolBytes,
+	}); err != nil {
 		return nil, err
 	}
 

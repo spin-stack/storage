@@ -207,7 +207,9 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 		}); err != nil {
 			return err
 		}
-		if err := md.CommitHostCapacity(ctx, term, srcHost, volBytes); err != nil {
+		if err := md.CommitHostCapacity(ctx, term, srcHost, metadata.CapacityChange{
+			DeltaBytes: volBytes, Limit: 10 * volBytes,
+		}); err != nil {
 			return err
 		}
 		if _, err := epochs.Init(ctx, vid, 1); err != nil {

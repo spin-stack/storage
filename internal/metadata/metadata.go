@@ -216,10 +216,13 @@ type Store interface {
 	// is checked against the lifecycle table: an unknown value is
 	// lifecycle.ErrUnknownState, an illegal move lifecycle.ErrInvalidTransition.
 	SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState) error
-	// CommitHostCapacity adds deltaBytes to a host's committed NVMe (negative
-	// releases), term-guarded. A release below zero fails with ErrCapacityUnderflow
-	// instead of being clamped (§28.2).
-	CommitHostCapacity(ctx context.Context, term int64, hostID string, deltaBytes int64) error
+	// CommitHostCapacity applies c to a host's committed NVMe ledger, term-guarded.
+	// Every rule the ledger has is evaluated inside the write (see CapacityChange):
+	// a release below zero is ErrCapacityUnderflow rather than a clamp (§28.2), a
+	// reservation past c.Limit is ErrCapacityExceeded, and a change conditional on a
+	// value the ledger has moved away from is ErrCapacityConflict. In all three cases
+	// nothing is written.
+	CommitHostCapacity(ctx context.Context, term int64, hostID string, c CapacityChange) error
 	// RenewHostLease renews (or grants) a host's lease with the given TTL
 	// (term-guarded). A host the fleet has recorded as DEAD is refused with
 	// ErrHostNotServing: that state is the Control Plane asserting the writer is

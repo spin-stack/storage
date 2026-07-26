@@ -253,28 +253,45 @@ func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, sta
 	return fmt.Errorf("%w: host %s changed state concurrently", lifecycle.ErrInvalidTransition, hostID)
 }
 
-func (s *Store) CommitHostCapacity(ctx context.Context, term int64, hostID string, deltaBytes int64) error {
+func (s *Store) CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error {
 	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return err
 	}
+	expected := pgtype.Int8{}
+	if c.Expect != nil {
+		expected = pgtype.Int8{Int64: *c.Expect, Valid: true}
+	}
 	rows, err := s.q.CommitHostCapacity(ctx, db.CommitHostCapacityParams{
-		HostID: id, NvmeCommittedBytes: deltaBytes, Term: term,
+		HostID: id, NvmeCommittedBytes: c.DeltaBytes, Term: term,
+		LimitBytes: c.Limit, ExpectedBytes: expected,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
 		return err
 	}
-	// Still the leader, so 0 rows means a missing host or an over-release — the
-	// non-negative guard (§28.2), which is an accounting bug, never a silent clamp.
+	// Still the leader, so 0 rows means a missing host or one of the three ledger
+	// predicates (§28.2). Which one is a re-read away — the write did not land, so
+	// there is nothing to undo and nothing racing this diagnosis can make it wrong
+	// about the fact that the caller's change is not in the books.
 	h, gerr := s.GetHost(ctx, hostID)
 	if gerr != nil {
 		return gerr
 	}
-	if h.NVMeCommittedBytes+deltaBytes < 0 {
+	after := h.NVMeCommittedBytes + c.DeltaBytes
+	switch {
+	case c.Expect != nil && *c.Expect != h.NVMeCommittedBytes:
+		return fmt.Errorf("%w: host %s holds %d committed bytes, the change expected %d",
+			metadata.ErrCapacityConflict, hostID, h.NVMeCommittedBytes, *c.Expect)
+	case after < 0:
 		return metadata.ErrCapacityUnderflow
+	case c.DeltaBytes > 0 && after > c.Limit:
+		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
+			metadata.ErrCapacityExceeded, hostID, after, c.Limit)
 	}
-	return fmt.Errorf("%w: host %s capacity changed concurrently", metadata.ErrCapacityUnderflow, hostID)
+	// Every predicate looks satisfiable now, so the row moved between the write and
+	// this read. The write did not land, and saying so beats reporting success.
+	return fmt.Errorf("%w: host %s capacity changed concurrently", metadata.ErrCapacityConflict, hostID)
 }
 
 func (s *Store) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {

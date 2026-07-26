@@ -144,9 +144,7 @@ type capacityCommitter interface {
 // declared oversubscription bound, and whether the ledger is still where the caller
 // last saw it. Both are check-then-act in Go and races in production.
 func commitCapacity(ctx context.Context, s metadata.Store, term int64, hostID string, c metadata.CapacityChange) error {
-	// Asserted through `any` while metadata.Store still declares the bare-delta form:
-	// the two method signatures conflict, so a direct assertion does not compile.
-	m, ok := any(s).(capacityCommitter)
+	m, ok := s.(capacityCommitter)
 	if !ok {
 		return fmt.Errorf("%w: CommitHostCapacity takes a bare delta (§28.2: neither the oversubscription bound nor an expected value is expressible at the write)", errNotExpressible)
 	}
@@ -245,7 +243,7 @@ func everyMutation() []mutation {
 			return s.SetHostState(ctx, term, w.host, lifecycle.HostCordoned)
 		}},
 		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.CommitHostCapacity(ctx, term, w.host, 1)
+			return s.CommitHostCapacity(ctx, term, w.host, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.RenewHostLease(ctx, term, w.host, 10)
@@ -345,7 +343,7 @@ func missingRows(t *testing.T, s metadata.Store) {
 			return s.SetHostState(ctx, term, ghostHost, lifecycle.HostCordoned)
 		}},
 		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CommitHostCapacity(ctx, term, ghostHost, 1)
+			return s.CommitHostCapacity(ctx, term, ghostHost, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
@@ -431,10 +429,10 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 			return err
 		}},
 		{"missing host under a stale term", func() error {
-			return s.CommitHostCapacity(ctx, stale, ghost, 1)
+			return s.CommitHostCapacity(ctx, stale, ghost, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"over-release under a stale term", func() error {
-			return s.CommitHostCapacity(ctx, stale, w.host, -1)
+			return s.CommitHostCapacity(ctx, stale, w.host, metadata.CapacityChange{DeltaBytes: -1})
 		}},
 		{"illegal host transition under a stale term", func() error {
 			return s.SetHostState(ctx, stale, w.host, lifecycle.HostActive)
@@ -625,7 +623,7 @@ func watermarks(t *testing.T, s metadata.Store) {
 func upsertHost(t *testing.T, s metadata.Store) {
 	ctx := context.Background()
 	w := newWorld(t, s)
-	if err := s.CommitHostCapacity(ctx, w.term, w.host, 700); err != nil {
+	if err := s.CommitHostCapacity(ctx, w.term, w.host, metadata.CapacityChange{DeltaBytes: 700, Limit: 1 << 40}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned); err != nil {
@@ -1064,7 +1062,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			return s.SetHostState(ctx, term, "", lifecycle.HostCordoned)
 		}},
 		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CommitHostCapacity(ctx, term, "", 1)
+			return s.CommitHostCapacity(ctx, term, "", metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, "", 10)

@@ -11,6 +11,7 @@ import (
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/snapshot"
 	"github.com/spin-stack/storage/internal/wal"
@@ -21,6 +22,11 @@ const (
 	destHost = "00000000-0000-7000-8000-0000000000d2"
 	volSize  = int64(1) << 30
 )
+
+// clonePolicy is the §28.2 bound a cross-host clone reserves under — the same rule
+// placement used to admit the destination in the first place, passed to the write so
+// the ceiling still means something when two placements raced for it.
+var clonePolicy = placement.Policy{MaxOversubscription: 2.0}
 
 // crossHostWorld sets up a volume with durable data in S3, its published snapshot,
 // and a metadata store with a source and a destination host.
@@ -81,7 +87,7 @@ func TestCloneCrossHostMaterializesOnDestination(t *testing.T) {
 	md, term, store, m := crossHostWorld(t)
 
 	res, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
-		term, m.SnapshotID, cloneVol, destHost)
+		clonePolicy, term, m.SnapshotID, cloneVol, destHost)
 	if err != nil {
 		t.Fatalf("cross-host clone: %v", err)
 	}
@@ -117,7 +123,7 @@ func TestCloneCrossHostReleasesCapacityOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
-		term, m.SnapshotID, cloneVol, destHost)
+		clonePolicy, term, m.SnapshotID, cloneVol, destHost)
 	if !errors.Is(err, materialize.ErrMissingObject) {
 		t.Fatalf("want ErrMissingObject, got %v", err)
 	}
@@ -144,7 +150,7 @@ func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
-		term, orphanSnap, cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
+		clonePolicy, term, orphanSnap, cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	if dst, _ := md.GetHost(ctx, destHost); dst.NVMeCommittedBytes != 0 {
@@ -152,14 +158,14 @@ func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
 	}
 }
 
-// TestCloneCrossHostToUnknownHostFails: the reservation is what fails first, so no
-// materialization work is started for a destination that does not exist.
+// TestCloneCrossHostToUnknownHostFails: the destination is read before anything is
+// reserved, so no materialization work is started for a host that does not exist.
 func TestCloneCrossHostToUnknownHostFails(t *testing.T) {
 	ctx := context.Background()
 	md, term, store, m := crossHostWorld(t)
 
 	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
-		term, m.SnapshotID, cloneVol, "00000000-0000-7000-8000-00000000dead"); !errors.Is(err, metadata.ErrNotFound) {
+		clonePolicy, term, m.SnapshotID, cloneVol, "00000000-0000-7000-8000-00000000dead"); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
@@ -174,7 +180,7 @@ func TestCloneCrossHostFromMissingSnapshotFails(t *testing.T) {
 	md, term, store, _ := crossHostWorld(t)
 
 	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
-		term, "no-such-snap", cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
+		clonePolicy, term, "no-such-snap", cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	if dst, _ := md.GetHost(ctx, destHost); dst.NVMeCommittedBytes != 0 {

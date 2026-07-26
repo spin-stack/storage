@@ -29,6 +29,11 @@ const (
 	maxSkew    = 2 * time.Second
 )
 
+// drainPolicy is the §28.2 rule the drain world runs under. Test-side ledger writes
+// go through it too (drainWorld.book), so a test can never set up a fleet state the
+// production write would have refused.
+var drainPolicy = placement.Policy{MaxOversubscription: 2.0}
+
 // Faults the drain tests inject. They stand for "the process died here": the effect
 // of everything before them landed, and nothing after them ran.
 var (
@@ -65,15 +70,15 @@ func (s *hookedStore) UpdateOperation(ctx context.Context, term int64, op metada
 	return s.Store.UpdateOperation(ctx, term, op)
 }
 
-func (s *hookedStore) CommitHostCapacity(ctx context.Context, term int64, hostID string, delta int64) error {
+func (s *hookedStore) CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error {
 	if s.beforeCommit != nil {
-		if err := s.beforeCommit(hostID, delta); err != nil {
+		if err := s.beforeCommit(hostID, c.DeltaBytes); err != nil {
 			return err
 		}
 	}
-	err := s.Store.CommitHostCapacity(ctx, term, hostID, delta)
+	err := s.Store.CommitHostCapacity(ctx, term, hostID, c)
 	if err == nil && s.afterCommit != nil {
-		s.afterCommit(hostID, delta)
+		s.afterCommit(hostID, c.DeltaBytes)
 	}
 	return err
 }
@@ -154,7 +159,7 @@ func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if err := md.CommitHostCapacity(ctx, term, cloneHostA, volSize); err != nil {
+		if err := w.book(cloneHostA, volSize); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := epochs.Init(ctx, volID, 1); err != nil {
@@ -178,9 +183,20 @@ func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 
 	w.drainer = controlplane.NewDrainer(md,
 		controlplane.NewPromoter(md, epochs, clk, leaseTTL, maxSkew),
-		materialize.New(store, nil, nil), faults,
-		placement.Policy{MaxOversubscription: 2.0})
+		materialize.New(store, nil, nil), faults, drainPolicy)
 	return w
+}
+
+// book is another operation's reservation (positive) or release (negative) on a
+// host's ledger, committed under the same bound the drain reserves under.
+func (w *drainWorld) book(hostID string, delta int64) error {
+	ctx := context.Background()
+	h, err := w.base.GetHost(ctx, hostID)
+	if err != nil {
+		return err
+	}
+	return w.base.CommitHostCapacity(ctx, w.term, hostID,
+		metadata.CapacityChange{DeltaBytes: delta, Limit: drainPolicy.Limit(h)})
 }
 
 // committed reports a host's committed NVMe bytes.
@@ -335,7 +351,7 @@ func TestDrainIsResumableAndDoesNotMoveTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	// UpsertHost rewrites the row, so restore the committed bytes of the first move.
-	if err := w.md.CommitHostCapacity(ctx, w.term, destHost, volSize); err != nil {
+	if err := w.book(destHost, volSize); err != nil {
 		t.Fatal(err)
 	}
 	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
@@ -486,7 +502,7 @@ func TestDrainSurfacesBrokenCapacityAccounting(t *testing.T) {
 	w.pastFencingWait()
 
 	// Wipe the source's committed bytes behind the drain's back.
-	if err := w.md.CommitHostCapacity(ctx, w.term, cloneHostA, -2*volSize); err != nil {
+	if err := w.book(cloneHostA, -2*volSize); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, metadata.ErrCapacityUnderflow) {
@@ -640,7 +656,7 @@ func TestDrainReleasesSourceCapacityExactlyOnce(t *testing.T) {
 	w.pastFencingWait()
 
 	// Give the source an extra reservation that does not belong to this drain.
-	if err := w.md.CommitHostCapacity(ctx, w.term, cloneHostA, 3*volSize); err != nil {
+	if err := w.book(cloneHostA, 3*volSize); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
@@ -813,7 +829,7 @@ func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.md.CommitHostCapacity(ctx, w.term, cloneHostA, volSize); err != nil {
+	if err := w.book(cloneHostA, volSize); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := epoch.NewStore(w.store).Init(ctx, emptyID, 1); err != nil {
@@ -935,7 +951,7 @@ func TestDrainRefusesToFinishAVolumeAnotherActorPromoted(t *testing.T) {
 	if _, err := w.base.BumpVolumeEpoch(ctx, w.term, firstID, drainHostC, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.base.CommitHostCapacity(ctx, w.term, drainHostC, volSize); err != nil {
+	if err := w.book(drainHostC, volSize); err != nil {
 		t.Fatal(err)
 	}
 
@@ -965,7 +981,7 @@ func TestTwoDrainsOfTheSameHostReleaseCapacityOnce(t *testing.T) {
 	ctx := context.Background()
 	w := newDrainWorld(t, 10*volSize)
 	// Reservations on the source that belong to volumes no drain is moving.
-	if err := w.base.CommitHostCapacity(ctx, w.term, cloneHostA, 3*volSize); err != nil {
+	if err := w.book(cloneHostA, 3*volSize); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1205,7 +1221,7 @@ func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	// UpsertHost rewrites the row, so restore the committed bytes of the first move.
-	if err := w.base.CommitHostCapacity(ctx, w.term, destHost, volSize); err != nil {
+	if err := w.book(destHost, volSize); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1242,7 +1258,7 @@ func TestDrainRefusesADestinationAnotherPlacementFilled(t *testing.T) {
 			return nil
 		}
 		raced = true
-		return w.base.CommitHostCapacity(ctx, w.term, destHost, limit)
+		return w.book(destHost, limit)
 	}
 
 	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
@@ -1297,7 +1313,7 @@ func TestDrainRefusesAReleaseWhoseLedgerMovedUnderTheRead(t *testing.T) {
 			return nil
 		}
 		raced = true
-		return w.base.CommitHostCapacity(ctx, w.term, cloneHostA, volSize)
+		return w.book(cloneHostA, volSize)
 	}
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrCapacityLedgerMoved) {
 		t.Fatalf("want ErrCapacityLedgerMoved, got %v", err)
@@ -1329,7 +1345,7 @@ func TestDrainRefusesToGuessWhenTheCapacityLedgerMoved(t *testing.T) {
 	w.hooks.beforeUpdate = nil
 
 	// Somebody else books three volumes onto the source before the drain resumes.
-	if err := w.base.CommitHostCapacity(ctx, w.term, cloneHostA, 3*volSize); err != nil {
+	if err := w.book(cloneHostA, 3*volSize); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrCapacityLedgerMoved) {

@@ -162,7 +162,13 @@ func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state
 	return nil
 }
 
-func (s *Store) CommitHostCapacity(_ context.Context, term int64, hostID string, deltaBytes int64) error {
+// CommitHostCapacity applies one change to the ledger under the lock, so the rules
+// the pg adapter states as predicates hold here for the same reason: the read and
+// the write are one step. The diagnosis order is the contract's — the expectation
+// first, because when the ledger is not where the caller last saw it, everything
+// else the caller computed from that read (the bound included) is about another
+// world; then the underflow; then the bound.
+func (s *Store) CommitHostCapacity(_ context.Context, term int64, hostID string, c metadata.CapacityChange) error {
 	if err := requireID("host", hostID); err != nil {
 		return err
 	}
@@ -175,10 +181,18 @@ func (s *Store) CommitHostCapacity(_ context.Context, term int64, hostID string,
 	if !ok {
 		return metadata.ErrNotFound
 	}
-	if h.NVMeCommittedBytes+deltaBytes < 0 {
+	after := h.NVMeCommittedBytes + c.DeltaBytes
+	switch {
+	case c.Expect != nil && *c.Expect != h.NVMeCommittedBytes:
+		return fmt.Errorf("%w: host %s holds %d committed bytes, the change expected %d",
+			metadata.ErrCapacityConflict, hostID, h.NVMeCommittedBytes, *c.Expect)
+	case after < 0:
 		return metadata.ErrCapacityUnderflow
+	case c.DeltaBytes > 0 && after > c.Limit:
+		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
+			metadata.ErrCapacityExceeded, hostID, after, c.Limit)
 	}
-	h.NVMeCommittedBytes += deltaBytes
+	h.NVMeCommittedBytes = after
 	s.hosts[hostID] = h
 	return nil
 }
