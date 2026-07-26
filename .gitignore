@@ -23,6 +23,11 @@ cover*.out
 # BuildKit cache + build output (task build:qemu)
 /.cache/
 /_output/
+# ...and _output as a symlink. The trailing-slash form above matches directories
+# only, so a worktree that symlinks _output at the primary checkout's build
+# output shows it as an untracked *file* and the next `git add -A` commits the
+# link — with an absolute path that means nothing on any other machine.
+/_output
 
 # Coverage intermediates
 cover.raw
