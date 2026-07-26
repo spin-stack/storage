@@ -1,7 +1,9 @@
 # WAL segmentation — format spec for review
 
-**Status:** draft for human review. This is the *format* review CLAUDE.md requires
-before an on-disk change is implemented (ADR-0013 §4). Nothing here is built.
+**Status:** **approved 2026-07-26** by the human owner — this is the format review
+CLAUDE.md requires before an on-disk change is implemented (ADR-0013 §4). The four open
+questions at the end are settled. Implementation follows; the *diff* still gets a human
+review before merge, as every data-loss-zone change does.
 
 **Why:** `TruncateLocal` records `truncatedUpTo` and calls `file.Truncate(0)` only when
 `upTo >= local` — i.e. only when the checkpoint reached the end of the log. On a volume
