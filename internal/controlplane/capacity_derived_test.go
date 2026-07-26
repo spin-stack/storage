@@ -130,7 +130,7 @@ func TestCommittedCapacityIsDerivedFromState(t *testing.T) {
 
 	// Stop the pass exactly where the source's bytes would stop being charged.
 	w.killAfterThePromotion(t)
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err == nil {
 		t.Fatal("setup: the pass was supposed to die after the promotion")
 	}
 	first, err := w.base.GetVolume(ctx, format.UUIDString(w.vols[0]))
@@ -145,7 +145,7 @@ func TestCommittedCapacityIsDerivedFromState(t *testing.T) {
 	}
 
 	w.clearFaults()
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	if err := capacityIsDerived(ctx, w.base); err != nil {
@@ -179,7 +179,7 @@ func TestCommittedCapacityHoldsUnderAnyInterleaving(t *testing.T) {
 			// Every outcome is admissible here: a completed pass, a refusal (the
 			// fencing wait, no capacity), or a fault. The identity must hold after
 			// each of them, which is the whole claim.
-			_, _ = w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+			_, _ = w.reconcile(t, cloneHostA, drainOpID)
 			if err := capacityIsDerived(ctx, w.base); err != nil {
 				rt.Fatalf("after %d passes: %v", i+1, err)
 			}
@@ -194,8 +194,8 @@ func TestVolumeInFlightIsChargedToItsDestinationOnce(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
-	// A first pass plans the move and stops at the fencing wait: the volume is still
-	// on the source, and the destination already carries the reservation.
+	// One raw pass: it plans the move and stops at the fencing wait, so the volume is
+	// still on the source while the destination already carries the reservation.
 	_, _ = w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
 	first, err := w.base.GetVolume(ctx, format.UUIDString(w.vols[0]))
 	if err != nil {
@@ -213,7 +213,7 @@ func TestVolumeInFlightIsChargedToItsDestinationOnce(t *testing.T) {
 	}
 
 	w.pastFencingWait()
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
 	// Both volumes are primary on the destination and charged exactly once.

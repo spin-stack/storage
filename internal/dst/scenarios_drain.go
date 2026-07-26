@@ -58,6 +58,23 @@ type faultMD struct {
 	// replica lagging far enough that any deadline derived from the timestamp
 	// elapsed long ago (ADR-0015).
 	staleLease time.Time
+	// ancientFence is the design ADR-0015 replaced, planted: the fence-start instant
+	// is read out of the row as an hour ago, so the promoter believes it has been
+	// waiting all that time instead of measuring since it looked.
+	ancientFence bool
+}
+
+func (s *faultMD) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
+	v, err := s.Store.GetVolume(ctx, volumeID)
+	if err != nil || !s.ancientFence {
+		return v, err
+	}
+	now, nerr := s.Now(ctx)
+	if nerr != nil {
+		return v, nerr
+	}
+	v.FencingStartedAt = now.Add(-time.Hour)
+	return v, nil
 }
 
 func (s *faultMD) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
@@ -217,6 +234,21 @@ func (w *drainWorld) pass() (crashed bool, err error) {
 	return crashed, err
 }
 
+// settle runs Drain passes until the operation stops asking for time. A fencing wait
+// is not a failure, and after ADR-0015 there is one per volume: each volume's dwell
+// begins when its own promotion does, so the pass that fences volume k+1 is the pass
+// that promotes volume k. A crash stops the loop at once — that is what it is for.
+func (w *drainWorld) settle(s *Sim) (crashed bool, err error) {
+	for range 8 {
+		crashed, err = w.pass()
+		if crashed || !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return crashed, err
+		}
+		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+	}
+	return crashed, err
+}
+
 // disarm removes every fault, so the resumed pass runs clean.
 func (w *drainWorld) disarm() {
 	w.md.onUpdate, w.md.onLease = nil, nil
@@ -319,12 +351,14 @@ func scenarioDrainCrashAtEveryBoundary(s *Sim) error {
 		if err != nil {
 			return err
 		}
-		// Wait the fence out: this scenario is about the crash boundaries, not about
-		// FENCING_WAIT (scenarioDrainMovesVolumesFenced owns that).
+		// The fence is waited out by settle rather than by one tick: this scenario is
+		// about the crash boundaries, not about FENCING_WAIT
+		// (scenarioDrainMovesVolumesFenced owns that), and after ADR-0015 the pass
+		// that opens a volume's fence is never the pass that promotes it.
 		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
 
 		b.arm(w)
-		crashed, err := w.pass()
+		crashed, err := w.settle(s)
 		if err != nil {
 			return fmt.Errorf("%s: the armed pass failed instead of crashing: %w", b.name, err)
 		}
@@ -334,7 +368,7 @@ func scenarioDrainCrashAtEveryBoundary(s *Sim) error {
 		s.Emit(Event{Kind: EventFault, Msg: "drain crashed " + b.name})
 
 		w.disarm()
-		if _, err := w.pass(); err != nil {
+		if _, err := w.settle(s); err != nil {
 			return fmt.Errorf("%s: resume: %w", b.name, err)
 		}
 		if err := w.assertMovedExactlyOnce(ctx); err != nil {
@@ -496,13 +530,13 @@ func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 		if agent.Valid() {
 			return fmt.Errorf("the promotion is about to run against an Agent whose lease is still valid")
 		}
-		if _, err := w.pass(); err != nil {
+		if _, err := w.settle(s); err != nil {
 			return fmt.Errorf("drain of a healthy source: %w", err)
 		}
 	} else {
 		// The Control Plane waits the fence out and evacuates the host.
 		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
-		if _, err := w.pass(); err != nil {
+		if _, err := w.settle(s); err != nil {
 			return fmt.Errorf("drain: %w", err)
 		}
 	}
@@ -561,6 +595,20 @@ func drainSourceCannotAck(s *Sim, tag byte, healthy bool) error {
 // whether the grant landed), so reverting the dwell to a comparison against
 // last_renewal makes the checker fail, not just the assertions.
 func scenarioStaleLeaseReadDoesNotShortenTheFence(s *Sim) error {
+	return staleLeaseFence(false)(s)
+}
+
+// staleLeaseFence is the scenario, with the ADR-0015 design optionally reverted.
+// plantTimestampDwell makes the promoter read how long it has been fencing out of the
+// same lagging rows, which is what the wait used to be — and the planted-bug proof in
+// planted_bug_drain_test.go requires it to be caught.
+func staleLeaseFence(plantTimestampDwell bool) Scenario {
+	return func(s *Sim) error {
+		return staleLeaseFenceRun(s, plantTimestampDwell)
+	}
+}
+
+func staleLeaseFenceRun(s *Sim, plantTimestampDwell bool) error {
 	ctx := context.Background()
 	agent := lease.NewManager(s.Clock, drainLeaseTTL)
 	agent.Grant()
@@ -570,6 +618,7 @@ func scenarioStaleLeaseReadDoesNotShortenTheFence(s *Sim) error {
 	}
 	// The replica is an hour behind: last_renewal predates the simulation.
 	w.md.staleLease = s.Clock.Wall().Add(-time.Hour)
+	w.md.ancientFence = plantTimestampDwell
 
 	// First pass. Whatever the row says, this Control Plane has observed nothing yet.
 	_, err = w.pass()
@@ -592,9 +641,23 @@ func scenarioStaleLeaseReadDoesNotShortenTheFence(s *Sim) error {
 		return fmt.Errorf("the promoter waited without recording when it started")
 	}
 
-	// One second short of the dwell the Agent's lease is still valid, so the grant
-	// would be exactly the loss INV-11 exists to prevent.
-	s.Tick(drainLeaseTTL + drainMaxSkew - time.Second)
+	// Half a TTL in, the Agent's lease is provably still valid: a grant here is
+	// exactly the loss INV-11 exists to prevent, and the row says the wait is over.
+	s.Tick(drainLeaseTTL / 2)
+	if !agent.Valid() {
+		return fmt.Errorf("the Agent's lease expired early; this step no longer tests anything")
+	}
+	_, err = w.pass()
+	s.Emit(Event{
+		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
+		Msg: "half a TTL in, with the writer's own lease still valid",
+	})
+	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		return fmt.Errorf("the dwell was cut short by the stale row while the writer was alive: %v", err)
+	}
+
+	// One second short of the dwell, still refused.
+	s.Tick(drainLeaseTTL/2 + drainMaxSkew - time.Second)
 	_, err = w.pass()
 	s.Emit(Event{
 		Kind: EventPromotion, EarlyGrant: err == nil && agent.Valid(),
@@ -603,16 +666,13 @@ func scenarioStaleLeaseReadDoesNotShortenTheFence(s *Sim) error {
 	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
 		return fmt.Errorf("the dwell was cut short by the stale row: %v", err)
 	}
-	if !agent.Valid() {
-		return fmt.Errorf("the Agent's lease expired early; this step no longer tests anything")
-	}
 
 	// Past it, and only there.
 	s.Tick(2 * time.Second)
 	if agent.Valid() {
 		return fmt.Errorf("the promotion is about to run against an Agent whose lease is still valid")
 	}
-	if _, err := w.pass(); err != nil {
+	if _, err := w.settle(s); err != nil {
 		return fmt.Errorf("the dwell elapsed and the drain still refused: %w", err)
 	}
 	v, err = w.md.GetVolume(ctx, w.volID)

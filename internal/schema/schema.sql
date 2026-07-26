@@ -71,6 +71,23 @@ CREATE TABLE volumes (
     local_sequence     BIGINT NOT NULL DEFAULT 0,
     durable_sequence   BIGINT NOT NULL DEFAULT 0,
     published_sequence BIGINT NOT NULL DEFAULT 0,
+    -- When the Control Plane observed the lease of the writer it is fencing
+    -- (ADR-0015). Stamped by this database's clock — the same clock that stamps
+    -- host_leases.last_renewal, and so the one every fencing deadline lives on —
+    -- when the volume enters FENCING_WAIT, and cleared when it leaves.
+    --
+    -- The promotion dwell is measured from here rather than from
+    -- host_leases.last_renewal, because last_renewal answers a question about the
+    -- *writer* and this answers a question about the *promoter*: a read served by a
+    -- lagging replica reports a last_renewal old enough that the wait already looks
+    -- over, and the epoch is granted while the old writer's monotonic lease is still
+    -- valid. This column is written by the promoter and read back by it, so a stale
+    -- read of it returns NULL — which starts a full dwell. Fail slow, never short.
+    --
+    -- It is what makes FENCING_WAIT load-bearing state rather than a marker: a
+    -- Control Plane that restarts mid-fence resumes the wait its predecessor started
+    -- instead of beginning a new one.
+    fencing_started_at TIMESTAMPTZ,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );

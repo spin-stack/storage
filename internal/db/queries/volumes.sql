@@ -112,8 +112,27 @@ UPDATE volumes
 -- states that may legally become $2, taken from the lifecycle table. In the
 -- predicate rather than in Go so two Control Planes reacting to the same suspicion
 -- cannot both win a read-modify-write.
+--
+-- It also stamps the fence-start instant (ADR-0015), because the observation and the
+-- state it belongs to are one fact and must land in one write. Three rules, all in
+-- the CASE:
+--
+--   * entering FENCING_WAIT with nothing recorded starts the dwell, by *this*
+--     database's clock — the one last_renewal is stamped by, so the two are
+--     comparable (§12.1);
+--   * entering it again does not move the instant. Promotion is resumable and
+--     re-affirms the state on every pass; an instant that moved forward each time
+--     would make a retried promotion wait for ever;
+--   * leaving it clears the record, so the next promotion of this volume waits its
+--     own dwell instead of inheriting an elapsed one.
 UPDATE volumes
-   SET state = $2, updated_at = now()
+   SET state = $2,
+       fencing_started_at = CASE
+           WHEN $2 <> 'FENCING_WAIT'            THEN NULL
+           WHEN fencing_started_at IS NOT NULL   THEN fencing_started_at
+           ELSE now()
+       END,
+       updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
    AND state = ANY(sqlc.arg(allowed_states)::text[]);

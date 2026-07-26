@@ -162,7 +162,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -185,6 +185,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.LocalSequence,
 		&i.DurableSequence,
 		&i.PublishedSequence,
+		&i.FencingStartedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -192,7 +193,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -222,6 +223,7 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.LocalSequence,
 			&i.DurableSequence,
 			&i.PublishedSequence,
+			&i.FencingStartedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -260,7 +262,13 @@ func (q *Queries) ResizeVolume(ctx context.Context, arg ResizeVolumeParams) (int
 
 const setVolumeState = `-- name: SetVolumeState :execrows
 UPDATE volumes
-   SET state = $2, updated_at = now()
+   SET state = $2,
+       fencing_started_at = CASE
+           WHEN $2 <> 'FENCING_WAIT'            THEN NULL
+           WHEN fencing_started_at IS NOT NULL   THEN fencing_started_at
+           ELSE now()
+       END,
+       updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
    AND state = ANY($4::text[])
@@ -277,6 +285,19 @@ type SetVolumeStateParams struct {
 // states that may legally become $2, taken from the lifecycle table. In the
 // predicate rather than in Go so two Control Planes reacting to the same suspicion
 // cannot both win a read-modify-write.
+//
+// It also stamps the fence-start instant (ADR-0015), because the observation and the
+// state it belongs to are one fact and must land in one write. Three rules, all in
+// the CASE:
+//
+//   - entering FENCING_WAIT with nothing recorded starts the dwell, by *this*
+//     database's clock — the one last_renewal is stamped by, so the two are
+//     comparable (§12.1);
+//   - entering it again does not move the instant. Promotion is resumable and
+//     re-affirms the state on every pass; an instant that moved forward each time
+//     would make a retried promotion wait for ever;
+//   - leaving it clears the record, so the next promotion of this volume waits its
+//     own dwell instead of inheriting an elapsed one.
 func (q *Queries) SetVolumeState(ctx context.Context, arg SetVolumeStateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setVolumeState,
 		arg.VolumeID,

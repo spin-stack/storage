@@ -279,6 +279,36 @@ func (w *drainWorld) addHost(t *testing.T, hostID string) {
 // pastFencingWait advances the wall clock beyond lease_ttl + max_clock_skew.
 func (w *drainWorld) pastFencingWait() { w.clk.Advance(leaseTTL + maxSkew + time.Second) }
 
+// reconcile drives Drain the way the reconciler does: a fencing wait is not a
+// failure, it is the operation asking for time. Every other outcome — success,
+// ErrNoCapacity, an injected fault — comes straight back, so a test that is about
+// one of those still sees it on the pass that produced it.
+//
+// A drain of N volumes needs N dwells, not one. Each volume enters FENCING_WAIT when
+// its own promotion starts, and ADR-0015 measures the wait from that observation, so
+// the pass that fences volume k+1 is the pass that promotes volume k. That is the
+// §28.1 cost ADR-0016 states in the same terms — at most one lease_ttl +
+// max_clock_skew per volume moved — and it is what stage 2 of that ADR removes.
+func (w *drainWorld) reconcile(t *testing.T, hostID, operationID string) (controlplane.DrainResult, error) {
+	t.Helper()
+	var (
+		res controlplane.DrainResult
+		err error
+	)
+	var moved []controlplane.Move
+	for range 16 {
+		res, err = w.drainer.Drain(t.Context(), w.term, hostID, operationID)
+		moved = append(moved, res.Moved...)
+		res.Moved = moved // what the *operation* moved, not just its last pass
+		if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return res, err
+		}
+		w.pastFencingWait()
+	}
+	t.Fatalf("the drain never settled: %+v err=%v", res, err)
+	return res, err
+}
+
 // TestDrainMovesEveryVolumeFenced is the §28.1 happy path: every volume ends on the
 // destination at a bumped epoch, the source is fenced first (INV-10/INV-11), the
 // materialized prefix covers what the source ACKed (INV-09), an epoch-boundary
@@ -288,7 +318,7 @@ func TestDrainMovesEveryVolumeFenced(t *testing.T) {
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
@@ -336,6 +366,7 @@ func TestDrainWaitsForFencing(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 
+	// A raw pass, not the reconcile loop: what is under test is the refusal itself.
 	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
 	if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
 		t.Fatalf("want ErrFencingWaitNotElapsed, got %v", err)
@@ -353,7 +384,7 @@ func TestDrainWaitsForFencing(t *testing.T) {
 
 	// Once the wait elapses the same operation completes.
 	w.pastFencingWait()
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil || res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 2 {
 		t.Fatalf("resumed drain: %+v err=%v", res, err)
 	}
@@ -368,7 +399,7 @@ func TestDrainIsResumableAndDoesNotMoveTwice(t *testing.T) {
 	w := newDrainWorld(t, volSize/2)
 	w.pastFencingWait()
 
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("want ErrNoCapacity for the second volume, got %v", err)
 	}
 	firstID := format.UUIDString(w.vols[0])
@@ -383,7 +414,7 @@ func TestDrainIsResumableAndDoesNotMoveTwice(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -406,7 +437,7 @@ func TestDrainCancelStopsAtVolumeBoundary(t *testing.T) {
 	if err := w.drainer.Cancel(ctx, w.term, drainOpID); err != nil {
 		t.Fatal(err)
 	}
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("canceled drain should not error: %v", err)
 	}
@@ -431,7 +462,7 @@ func TestDrainCancelAfterPartialProgress(t *testing.T) {
 	// Room for one volume only, so the first pass stops after moving one.
 	w := newDrainWorld(t, volSize/2)
 	w.pastFencingWait()
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("want ErrNoCapacity, got %v", err)
 	}
 
@@ -444,7 +475,7 @@ func TestDrainCancelAfterPartialProgress(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("canceled drain: %v", err)
 	}
@@ -471,7 +502,7 @@ func TestDrainToleratesItsOwnRecoveryPoint(t *testing.T) {
 	if err := recovery.WriteRecoveryPoint(ctx, w.store, first, 2, 1, w.acked[firstID]); err != nil {
 		t.Fatal(err)
 	}
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil || len(res.Moved) != 2 {
 		t.Fatalf("drain with its own recovery point already written: %+v err=%v", res, err)
 	}
@@ -482,7 +513,7 @@ func TestDrainToleratesItsOwnRecoveryPoint(t *testing.T) {
 	if err := recovery.WriteRecoveryPoint(ctx, w2.store, w2.vols[0], 2, 1, 999); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w2.drainer.Drain(ctx, w2.term, cloneHostA, drainOpID); err == nil {
+	if _, err := w2.reconcile(t, cloneHostA, drainOpID); err == nil {
 		t.Fatal("a conflicting recovery point must fail the move")
 	}
 }
@@ -509,7 +540,7 @@ func TestDrainReleasesCapacityWhenMaterializationFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err == nil {
 		t.Fatal("an unreadable WAL prefix must stop the drain")
 	}
@@ -525,9 +556,8 @@ func TestDrainReleasesCapacityWhenMaterializationFails(t *testing.T) {
 // TestDrainOfUnknownHostFails: a drain of a host that is not registered cannot even
 // cordon it, and fails before touching any volume.
 func TestDrainOfUnknownHostFails(t *testing.T) {
-	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
-	if _, err := w.drainer.Drain(ctx, w.term, "00000000-0000-7000-8000-00000000dead", drainOpID); !errors.Is(err, metadata.ErrNotFound) {
+	if _, err := w.reconcile(t, "00000000-0000-7000-8000-00000000dead", drainOpID); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -544,7 +574,7 @@ func TestDrainRejectsMalformedVolumeID(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err == nil {
 		t.Fatal("a malformed volume id must stop the drain")
 	}
 }
@@ -571,7 +601,7 @@ func TestDrainPrefersTheWarmStandby(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("drain: %v", err)
 	}
@@ -593,7 +623,7 @@ func TestDrainOfEmptyHostIsDrained(t *testing.T) {
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
-	res, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
+	res, err := w.reconcile(t, destHost, drainOpID)
 	if err != nil || res.Phase != lifecycle.OpSucceeded || len(res.Moved) != 0 {
 		t.Fatalf("empty drain: %+v err=%v", res, err)
 	}
@@ -628,7 +658,7 @@ func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 	// Now the crash: the next pass promotes the first volume and dies before writing
 	// the epoch boundary and releasing the source's capacity.
 	w.faults.fail = failBoundaryWrite
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
 		t.Fatalf("setup: want errBoundaryLost, got %v", err)
 	}
 	w.faults.fail = nil
@@ -636,7 +666,7 @@ func TestDrainFinishesAVolumeItAlreadyPromoted(t *testing.T) {
 		t.Fatalf("setup: the volume should be promoted with no boundary yet: %+v", v)
 	}
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("drain must finish the interrupted volume: %v", err)
 	}
@@ -679,10 +709,10 @@ func TestDrainLeavesTheSourceChargedForWhatItStillHolds(t *testing.T) {
 	w.fill(t, cloneHostA, 3)
 	w.pastFencingWait()
 
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatalf("re-running a finished drain must be a no-op: %v", err)
 	}
 	if got := w.committed(t, cloneHostA); got != 3*volSize {
@@ -716,7 +746,7 @@ func TestDrainResumeUsesTheRecordedPlan(t *testing.T) {
 	}
 
 	w.pastFencingWait()
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +772,7 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 	w.pastFencingWait()
 	// This drain's own promotion landed; the boundary write did not.
 	w.faults.fail = failBoundaryWrite
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
 		t.Fatalf("setup: want errBoundaryLost, got %v", err)
 	}
 	w.faults.fail = nil
@@ -759,7 +789,7 @@ func TestDrainRefusesToFinishAVolumeWhoseDataIsGone(t *testing.T) {
 	// recording one below what the volume already had durable loses that data
 	// permanently. With the object unreadable the prefix is empty, so the pass must
 	// refuse rather than write a zero.
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	_, err := w.reconcile(t, cloneHostA, drainOpID)
 	if !errors.Is(err, controlplane.ErrDurableRegression) {
 		t.Fatalf("want ErrDurableRegression, got %v", err)
 	}
@@ -806,7 +836,7 @@ func TestDrainRevokesTheSourceLeaseBeforeItPromotes(t *testing.T) {
 	// Past the full wait the healthy host is evacuated — the instant it is measured
 	// from survives the revocation.
 	w.clk.Advance(maxSkew + time.Second)
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("a healthy host must be evacuable: %v", err)
 	}
@@ -835,7 +865,7 @@ func TestDrainDoesNotRevokeTheDestinationsLease(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
 		t.Fatalf("setup: want errProgressLost, got %v", err)
 	}
 	w.hooks.beforeUpdate = nil
@@ -843,7 +873,7 @@ func TestDrainDoesNotRevokeTheDestinationsLease(t *testing.T) {
 		t.Fatalf("setup: the promotion should have landed: %+v", v)
 	}
 
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	if _, err := w.base.GetHostLease(ctx, destHost); err != nil {
@@ -858,7 +888,7 @@ func TestCancelAFinishedDrainIsRefused(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.drainer.Cancel(ctx, w.term, drainOpID); !errors.Is(err, lifecycle.ErrInvalidTransition) {
@@ -876,7 +906,7 @@ func TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan(t *testing.T) {
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 
-	if _, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID); err != nil {
+	if _, err := w.reconcile(t, destHost, drainOpID); err != nil {
 		t.Fatal(err)
 	}
 	op, err := w.md.GetOperation(ctx, drainOpID)
@@ -884,7 +914,7 @@ func TestDrainOfAHostWithNoVolumesRecordsAnEmptyPlan(t *testing.T) {
 		t.Fatalf("operation = %+v err=%v", op, err)
 	}
 	// And re-running it is a no-op rather than an illegal transition.
-	res, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
+	res, err := w.reconcile(t, destHost, drainOpID)
 	if err != nil || res.Phase != lifecycle.OpSucceeded || res.Remaining != 0 {
 		t.Fatalf("re-run of an empty drain: %+v err=%v", res, err)
 	}
@@ -905,7 +935,7 @@ func TestDrainRefusesAnEpochBoundaryBelowThePGWatermark(t *testing.T) {
 	}
 	w.pastFencingWait()
 
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	_, err := w.reconcile(t, cloneHostA, drainOpID)
 	if !errors.Is(err, controlplane.ErrDurableRegression) {
 		t.Fatalf("want ErrDurableRegression, got %v", err)
 	}
@@ -937,7 +967,7 @@ func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("an empty epoch must move cleanly: %v", err)
 	}
@@ -963,13 +993,12 @@ func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
 // uninteresting**: it is a regression guard on a class of bug that was removed
 // rather than guarded, not weak coverage of one that is still there.
 func TestDrainAccountsForOneMoveWhenTheProgressWriteFails(t *testing.T) {
-	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
 	firstID := format.UUIDString(w.vols[0])
 
 	w.killAfterTheMove(t, firstID)
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, errProgressLost) {
 		t.Fatalf("setup: want errProgressLost, got %v", err)
 	}
 	if got := w.committed(t, cloneHostA); got != volSize {
@@ -980,7 +1009,7 @@ func TestDrainAccountsForOneMoveWhenTheProgressWriteFails(t *testing.T) {
 	}
 
 	w.hooks.beforeUpdate = nil
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -1015,12 +1044,12 @@ func TestDrainCancelBetweenTheMoveAndTheProgressWrite(t *testing.T) {
 		canceled = true
 		return w.drainer.Cancel(ctx, w.term, drainOpID)
 	}
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err == nil {
 		t.Fatal("the progress write must fail once the operation is CANCELING")
 	}
 	w.hooks.beforeUpdate = nil
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("resume after cancel: %v", err)
 	}
@@ -1060,7 +1089,7 @@ func TestDrainRefusesToFinishAVolumeAnotherActorPromoted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil {
 		t.Fatalf("the drain must still evacuate the rest of the host: %v", err)
 	}
@@ -1106,7 +1135,7 @@ func TestASecondDrainOfTheSameHostIsRefused(t *testing.T) {
 	// not change it either way.
 	reserved := w.committed(t, destHost)
 
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID2)
+	_, err := w.reconcile(t, cloneHostA, drainOpID2)
 	if !errors.Is(err, controlplane.ErrHostAlreadyDraining) {
 		t.Fatalf("want ErrHostAlreadyDraining, got %v", err)
 	}
@@ -1128,10 +1157,10 @@ func TestASecondDrainOfTheSameHostIsRefused(t *testing.T) {
 
 	// The operation that owns the host still runs, and its own passes are never
 	// refused by its own record.
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatalf("the owning drain: %v", err)
 	}
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID2); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID2); err != nil {
 		t.Fatalf("a fresh drain once the first finished: %v", err)
 	}
 }
@@ -1155,7 +1184,7 @@ func TestTwoDrainsOfTheSameHostAccountForOneEvacuation(t *testing.T) {
 	}
 	w.pastFencingWait()
 
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatalf("first drain: %v", err)
 	}
 	if got := w.committed(t, cloneHostA); got != 0 {
@@ -1164,7 +1193,7 @@ func TestTwoDrainsOfTheSameHostAccountForOneEvacuation(t *testing.T) {
 
 	// A second operation id, now that the first is finished. It captures an empty
 	// plan and must move — and therefore charge — nothing.
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID2); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID2); err != nil {
 		t.Fatalf("second drain: %v", err)
 	}
 	if got := w.committed(t, cloneHostA); got != 0 {
@@ -1187,7 +1216,7 @@ func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
 	firstID := format.UUIDString(w.vols[0])
 
 	w.faults.fail = failBoundaryWrite
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
 		t.Fatalf("setup: want errBoundaryLost, got %v", err)
 	}
 	w.faults.fail = nil
@@ -1201,7 +1230,7 @@ func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	_, err := w.reconcile(t, cloneHostA, drainOpID)
 	if !errors.Is(err, controlplane.ErrEpochAdvanced) {
 		t.Fatalf("want ErrEpochAdvanced, got %v", err)
 	}
@@ -1225,7 +1254,7 @@ func TestDrainRefusesAnOperationIdRecordedForAnotherHost(t *testing.T) {
 	w.pastFencingWait()
 	reserved := w.committed(t, destHost) // the owning drain's own in-flight plan
 
-	_, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
+	_, err := w.reconcile(t, destHost, drainOpID)
 	if !errors.Is(err, controlplane.ErrOperationMismatch) {
 		t.Fatalf("want ErrOperationMismatch, got %v", err)
 	}
@@ -1253,14 +1282,14 @@ func TestDuplicateDrainDoesNotReCordonARepairedHost(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
 	w.pastFencingWait()
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.base.SetHostState(ctx, w.term, cloneHostA, lifecycle.HostActive); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	res, err := w.reconcile(t, cloneHostA, drainOpID)
 	if err != nil || res.Phase != lifecycle.OpSucceeded || res.Remaining != 0 {
 		t.Fatalf("duplicate of a finished drain: %+v err=%v", res, err)
 	}
@@ -1291,7 +1320,7 @@ func TestDrainAbortsWhenTheDestinationDiesBeforeThePromotion(t *testing.T) {
 		}
 	}
 
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	_, err := w.reconcile(t, cloneHostA, drainOpID)
 	if !errors.Is(err, controlplane.ErrDestinationHostUnusable) {
 		t.Fatalf("want ErrDestinationHostUnusable, got %v", err)
 	}
@@ -1358,7 +1387,7 @@ func TestDrainSurfacesAStaleTermInsteadOfMoving(t *testing.T) {
 		}
 	}
 
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	_, err := w.reconcile(t, cloneHostA, drainOpID)
 	if !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("want the stale term reported, got %v", err)
 	}
@@ -1378,7 +1407,7 @@ func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
 	// Room for exactly one volume, so the first pass stops after moving one.
 	w := newDrainWorld(t, volSize/2)
 	w.pastFencingWait()
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("setup: want ErrNoCapacity, got %v", err)
 	}
 
@@ -1432,7 +1461,7 @@ func TestDrainRefusesADestinationAnotherPlacementFilled(t *testing.T) {
 		return nil
 	}
 
-	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	_, err := w.reconcile(t, cloneHostA, drainOpID)
 	if !errors.Is(err, metadata.ErrCapacityExceeded) {
 		t.Fatalf("want ErrCapacityExceeded, got %v", err)
 	}
@@ -1469,7 +1498,7 @@ func TestDrainWritesTheBoundaryAsTheEpochHolder(t *testing.T) {
 	}
 	w.pastFencingWait()
 	w.faults.fail = failBoundaryWrite
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
 		t.Fatalf("setup: want errBoundaryLost, got %v", err)
 	}
 	w.faults.fail = nil
@@ -1484,7 +1513,7 @@ func TestDrainWritesTheBoundaryAsTheEpochHolder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
+	if _, err := w.reconcile(t, cloneHostA, drainOpID); err == nil {
 		t.Fatal("the resumed drain recorded a boundary for an epoch it no longer holds")
 	}
 	if _, rerr := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], r.Epoch); rerr == nil {

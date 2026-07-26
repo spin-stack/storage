@@ -1,6 +1,7 @@
 package controlplane_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -36,6 +37,30 @@ func setup(t *testing.T) (*controlplane.Promoter, metadata.Store, *epoch.Store, 
 	}
 	p := controlplane.NewPromoter(md, epochs, clk, 10*time.Second, 2*time.Second)
 	return p, md, epochs, clk, term
+}
+
+// promoteAfterTheDwell drives Promote the way a reconciler does. Since ADR-0015 the
+// fencing wait is elapsed time since *this* promoter observed the fence, so the call
+// that starts one always refuses and the reconciler comes back later; advance is how
+// the test's world moves every clock it has. Any other outcome is returned as it is,
+// so a test about a different refusal still sees it on the call that produced it.
+func promoteAfterTheDwell(t *testing.T, p *controlplane.Promoter, advance func(time.Duration),
+	ctx context.Context, term int64, volumeID string, renewedAt time.Time, newHost string,
+) (uint64, error) {
+	t.Helper()
+	var (
+		ep  uint64
+		err error
+	)
+	for range 4 {
+		ep, err = p.Promote(ctx, term, volumeID, renewedAt, newHost)
+		if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return ep, err
+		}
+		advance(p.FencingDwell() + time.Second)
+	}
+	t.Fatalf("the promotion never got past the fencing wait: %v", err)
+	return ep, err
 }
 
 // TestFencingWaitEnforced is INV-11: promotion is refused until
@@ -87,7 +112,7 @@ func TestDriftOnlyLengthensTheWait(t *testing.T) {
 		t.Fatalf("a lagging CP clock must wait longer, not grant early; got %v", err)
 	}
 	clk.SetSkew(0) // clock corrected → now reads T0+13s
-	if _, err := p.Promote(ctx, term, volID, renewedAt, host2); err != nil {
+	if _, err := promoteAfterTheDwell(t, p, clk.Advance, ctx, term, volID, renewedAt, host2); err != nil {
 		t.Fatalf("promote after correction: %v", err)
 	}
 }
@@ -104,7 +129,7 @@ func TestStaleWriterCannotPublishAfterPromotion(t *testing.T) {
 	_, w1ETag, _ := epochs.Current(ctx, volID)
 
 	clk.Advance(13 * time.Second)
-	if _, err := p.Promote(ctx, term, volID, renewedAt, host2); err != nil {
+	if _, err := promoteAfterTheDwell(t, p, clk.Advance, ctx, term, volID, renewedAt, host2); err != nil {
 		t.Fatal(err)
 	}
 

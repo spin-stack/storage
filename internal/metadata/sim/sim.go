@@ -309,7 +309,8 @@ func converge(cur, next metadata.Volume) metadata.Volume {
 	next.LocalSequence = max(cur.LocalSequence, next.LocalSequence)
 	next.DurableSequence = max(cur.DurableSequence, next.DurableSequence)
 	next.PublishedSequence = max(cur.PublishedSequence, next.PublishedSequence)
-	next.State = cur.State // moves only through SetVolumeState (§7)
+	next.State = cur.State                       // moves only through SetVolumeState (§7)
+	next.FencingStartedAt = cur.FencingStartedAt // and neither does its fence record
 	if cur.PrimaryHostID != "" {
 		next.PrimaryHostID = cur.PrimaryHostID
 	}
@@ -494,6 +495,17 @@ func (s *Store) SetVolumeState(_ context.Context, term int64, volumeID string, s
 		return err
 	}
 	v.State = state
+	// The fence observation lands with the state it belongs to (ADR-0015). Entering
+	// FENCING_WAIT starts the dwell by this store's clock; re-entering it does not
+	// move the instant, or a resumable promotion would push its own deadline forward
+	// on every pass; leaving it clears the record, so the next promotion of this
+	// volume waits its own dwell instead of inheriting an elapsed one.
+	switch {
+	case state != lifecycle.VolumeFencingWait:
+		v.FencingStartedAt = time.Time{}
+	case v.FencingStartedAt.IsZero():
+		v.FencingStartedAt = s.now()
+	}
 	s.vols[volumeID] = v
 	return nil
 }

@@ -415,6 +415,7 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		ChainDepth: v.ChainDepth, DEKWrapped: v.DekWrapped, KEKID: v.KekID,
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence,
+		FencingStartedAt:  fromTS(v.FencingStartedAt),
 	}, nil
 }
 

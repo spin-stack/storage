@@ -488,12 +488,17 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 		s.Store.InjectThrottleKey(epoch.Key(vid), plan.throttleEpoch)
 	}
 	granted, redrives := uint64(0), 0
-	budget := plan.promoteRetries + plan.throttleEpoch + 4
+	budget := plan.promoteRetries + plan.throttleEpoch + 5 // +1 for the dwell (ADR-0015)
 	for attempt := 0; attempt < budget && redrives < plan.promoteRetries; attempt++ {
 		newEpoch, err := p.Promote(ctx, term, vid, renewedAt, seededHost2)
 		switch {
 		case errors.Is(err, sim.ErrThrottled):
 			s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("promotion attempt %d refused by the epoch object", attempt)})
+			continue
+		case errors.Is(err, controlplane.ErrFencingWaitNotElapsed):
+			// ADR-0015: the wait is elapsed time since this promoter observed the
+			// fence, so the attempt that opens one always refuses. Sit it out.
+			s.Tick(p.FencingDwell() + time.Second)
 			continue
 		case err != nil:
 			return fmt.Errorf("promote attempt %d: %w", attempt, err)

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/spin-stack/storage/internal/epoch"
@@ -62,23 +63,47 @@ var ErrClockOffsetTooLarge = errors.New("controlplane: control-plane and metadat
 type Promoter struct {
 	md           metadata.Store
 	epochs       *epoch.Store
-	clk          clock.Clock // wall clock; the promotion wait is the only wall-clock dependency (§12.1)
+	clk          clock.Clock // the promoter's own clock: monotonic for the dwell, wall for the §12.1 offset check
 	leaseTTL     time.Duration
 	maxClockSkew time.Duration
+
+	// marks is this promoter's monotonic view of the fences it is running, keyed by
+	// volume. It is per-process on purpose: it is what a store clock cannot move
+	// (ADR-0015). The durable half lives in volumes.fencing_started_at, which is
+	// what a *replacement* promoter resumes from — a mark is seeded from it rather
+	// than restarting the dwell.
+	mu    sync.Mutex
+	marks map[string]fenceMark
+}
+
+// fenceMark is one running fence as this promoter sees it: which durable observation
+// it belongs to, and the monotonic instant at which this promoter's dwell is over.
+type fenceMark struct {
+	startedAt time.Time
+	deadline  clock.Instant
 }
 
 // NewPromoter builds a Promoter. leaseTTL and maxClockSkew are the §12 parameters.
 func NewPromoter(md metadata.Store, epochs *epoch.Store, clk clock.Clock, leaseTTL, maxClockSkew time.Duration) *Promoter {
-	return &Promoter{md: md, epochs: epochs, clk: clk, leaseTTL: leaseTTL, maxClockSkew: maxClockSkew}
+	return &Promoter{
+		md: md, epochs: epochs, clk: clk,
+		leaseTTL: leaseTTL, maxClockSkew: maxClockSkew,
+		marks: map[string]fenceMark{},
+	}
 }
 
-// FencingDeadline is the earliest wall instant at which a primary whose lease was
-// last renewed at renewedAt may be superseded (§12.3 step 3), for this CP's
-// configured lease TTL. Promote may wait past it — it also honours the lease row it
-// reads for the host being fenced, including a TTL longer than this one — so this is
-// a lower bound on the wait, never a promise that the promotion will proceed.
+// FencingDwell is how long a fence lasts for this Control Plane's parameters: one
+// lease_ttl + max_clock_skew (§12.3). Promote may wait longer — the lease row it
+// reads may have been granted with a longer TTL — so this is a lower bound.
+func (p *Promoter) FencingDwell() time.Duration { return p.leaseTTL + p.maxClockSkew }
+
+// FencingDeadline is the earliest instant at which a primary whose lease was last
+// renewed at renewedAt may be superseded, on the clock that stamped that instant.
+// Since ADR-0015 it is no longer what makes the wait long enough — the dwell is —
+// but the timestamp keeps its second job, refusing a promotion of a writer that
+// renewed after the fence began, so this remains a lower bound on the wait.
 func (p *Promoter) FencingDeadline(renewedAt time.Time) time.Time {
-	return renewedAt.Add(p.leaseTTL + p.maxClockSkew)
+	return renewedAt.Add(p.FencingDwell())
 }
 
 // Promote fences the suspected-dead primary of volumeID and grants epoch N+1 to
@@ -138,7 +163,14 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 		if state, err = p.recordState(ctx, term, v, state, lifecycle.VolumeFencingWait); err != nil {
 			return 0, err
 		}
-		if err := p.fencingWaitElapsed(ctx, v.PrimaryHostID, oldLeaseRenewedAt); err != nil {
+		// Read the observation back: SetVolumeState stamped it with the store's own
+		// clock, and the dwell is measured from it (ADR-0015). A read that does not
+		// see the write yet reports nothing, and nothing means a full dwell.
+		fenced, err := p.md.GetVolume(ctx, volumeID)
+		if err != nil {
+			return 0, err
+		}
+		if err := p.fencingWaitElapsed(ctx, volumeID, v.PrimaryHostID, oldLeaseRenewedAt, fenced.FencingStartedAt); err != nil {
 			return 0, err
 		}
 	}
@@ -188,6 +220,10 @@ func (p *Promoter) Promote(ctx context.Context, term int64, volumeID string, old
 	if _, err := p.recordState(ctx, term, v, state, lifecycle.VolumeRecoveryRequired); err != nil {
 		return 0, err
 	}
+	// The fence is over: leaving FENCING_WAIT cleared the durable record, and this
+	// drops the matching in-process mark so the map does not grow with every volume
+	// this Control Plane ever fenced.
+	p.forgetFence(volumeID)
 	return target, nil
 }
 
@@ -262,27 +298,42 @@ func (p *Promoter) checkDestination(ctx context.Context, hostID string, mustAcce
 }
 
 // fencingWaitElapsed reports whether the primary being fenced can still be ACKing
-// durability (§12.3 step 3). The caller's instant is a hint, not the authority: it
-// may have been read long ago, or from a host that is no longer the primary. The
-// promoter reads the lease of the host it is actually fencing and takes the most
-// conservative view of the two — including the TTL the lease was *granted* with,
-// which is what the Agent is counting down, even when this CP is configured with a
-// shorter one.
+// durability (§12.3 step 3). It is the whole of INV-11, and since ADR-0015 it is a
+// *dwell* — elapsed time since this Control Plane observed the situation — rather
+// than a comparison against a timestamp somebody else wrote.
+//
+// The distinction is not academic. The old form derived the deadline from
+// host_leases.last_renewal, so a read served by a replica lagging by more than
+// lease_ttl + max_clock_skew reported an instant old enough that the wait already
+// looked over, and the epoch was granted while the old writer's monotonic lease was
+// still valid. Nothing noticed: the §12.1 offset check compares *clocks*, and the
+// clocks were fine. It was the data that was old.
+//
+// So the wait now has to clear three bars, all of which must agree:
+//
+//  1. This promoter's own monotonic clock, since it first observed the fence. A
+//     mark it has not seen before is seeded from the durable record (see
+//     dwellElapsed), so a Control Plane that restarts mid-fence resumes the wait its
+//     predecessor started rather than beginning a new one — and once seeded, nothing
+//     the database's clock does can shorten it.
+//  2. The durable record itself, on the clock that stamped it. Missing — never
+//     written, lost to a restore, or simply not visible to this read yet — is not
+//     "long ago": it starts a full dwell. Fail slow, never short.
+//  3. The lease timestamp, which keeps its second job: a writer that renewed *after*
+//     the fence began is alive, whatever the dwell says, and its own TTL may be
+//     longer than this Control Plane's.
+//
+// The caller's instant is a hint, not the authority: it may have been read long ago,
+// or from a host that is no longer the primary. The promoter reads the lease of the
+// host it is actually fencing and takes the most conservative view of the two.
 //
 // With no lease row and nothing from the caller there is no conservative answer, so
 // the promotion is refused (ErrSourceLeaseUnknown) unless the fleet has recorded the
-// host as DEAD, which is the CP asserting that the writer is gone.
-//
-// The deadline is checked on two clocks. last_renewal is stamped by the metadata
-// store, so that store's clock is the one the deadline actually lives on; comparing
-// it against the Control Plane's wall clock shortens the wait by exactly the offset
-// between them, and a container clock that jumps forward (NTP correction, a VM
-// restored from a snapshot, a bad RTC) then grants an epoch while the old writer's
-// monotonic lease is still valid. Both clocks must agree the wait is over, so a CP
-// running behind still waits longer (§12.1) and a CP running ahead cannot grant
-// early. An offset larger than max_clock_skew is refused outright: at that point no
-// deadline built from the two of them means anything.
-func (p *Promoter) fencingWaitElapsed(ctx context.Context, primary string, callerRenewedAt time.Time) error {
+// host DEAD. That is the Control Plane asserting the writer is gone — an assertion,
+// not a stale read — and §12.3 accepts it as a reason to skip the wait entirely.
+func (p *Promoter) fencingWaitElapsed(ctx context.Context, volumeID, primary string,
+	callerRenewedAt time.Time, fenceStartedAt time.Time,
+) error {
 	if primary == "" {
 		return nil // no writer to fence
 	}
@@ -298,12 +349,16 @@ func (p *Promoter) fencingWaitElapsed(ctx context.Context, primary string, calle
 			ttl = granted
 		}
 	case errors.Is(err, metadata.ErrNotFound):
-		if renewedAt.IsZero() && !p.observedDead(ctx, primary) {
-			return fmt.Errorf("%w: %s", ErrSourceLeaseUnknown, primary)
+		if renewedAt.IsZero() {
+			if !p.observedDead(ctx, primary) {
+				return fmt.Errorf("%w: %s", ErrSourceLeaseUnknown, primary)
+			}
+			return nil // §12.3's escape hatch: the fleet says the writer is gone
 		}
 	default:
 		return err
 	}
+	dwell := ttl + p.maxClockSkew
 
 	storeNow, err := p.md.Now(ctx)
 	if err != nil {
@@ -313,13 +368,66 @@ func (p *Promoter) fencingWaitElapsed(ctx context.Context, primary string, calle
 	if offset := cpNow.Sub(storeNow); offset > p.maxClockSkew || offset < -p.maxClockSkew {
 		return fmt.Errorf("%w: %v", ErrClockOffsetTooLarge, offset)
 	}
-	// max_clock_skew is added on top because the Agent's own clock may run that far
-	// ahead of the one that stamped the row (§12.1).
-	deadline := renewedAt.Add(ttl + p.maxClockSkew)
+
+	// Bar 1: this promoter's own elapsed time. Seeding also happens here, so the
+	// call that starts a fence always refuses — which is what makes a stale read of
+	// the lease worth nothing.
+	if !p.dwellElapsed(volumeID, fenceStartedAt, storeNow, dwell) {
+		return ErrFencingWaitNotElapsed
+	}
+	// Bar 2: the durable observation, on the clock that stamped it.
+	if fenceStartedAt.IsZero() || storeNow.Before(fenceStartedAt.Add(dwell)) {
+		return ErrFencingWaitNotElapsed
+	}
+	// Bar 3: the writer's own last sign of life. max_clock_skew is added on top
+	// because the Agent's clock may run that far ahead of the one that stamped the
+	// row (§12.1), and both the store's clock and this one must agree — so a Control
+	// Plane running behind waits longer and one running ahead cannot grant early.
+	deadline := renewedAt.Add(dwell)
 	if storeNow.Before(deadline) || cpNow.Before(deadline) {
 		return ErrFencingWaitNotElapsed
 	}
 	return nil
+}
+
+// dwellElapsed reports whether dwell has passed on this promoter's monotonic clock
+// since it first observed the fence that began at startedAt.
+//
+// A fence this promoter has not seen before — its first pass, or the first pass
+// after a restart — is seeded rather than restarted: the time the durable record
+// says has already gone is subtracted, so a replacement finishes the wait its
+// predecessor started (ADR-0015's whole reason for making the record durable). Only
+// the *remainder* is then counted on this clock, which is the part no store clock
+// can move afterwards.
+//
+// A missing record (zero startedAt) seeds a full dwell, and a record from the future
+// counts as no elapsed time at all: both are the fail-slow direction.
+func (p *Promoter) dwellElapsed(volumeID string, startedAt, storeNow time.Time, dwell time.Duration) bool {
+	now := p.clk.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m, ok := p.marks[volumeID]
+	if !ok || !m.startedAt.Equal(startedAt) {
+		remaining := dwell
+		if !startedAt.IsZero() {
+			if gone := storeNow.Sub(startedAt); gone > 0 {
+				remaining = dwell - gone
+			}
+		}
+		if remaining < 0 {
+			remaining = 0
+		}
+		m = fenceMark{startedAt: startedAt, deadline: now.Add(remaining)}
+		p.marks[volumeID] = m
+	}
+	return now >= m.deadline
+}
+
+// forgetFence drops the in-process mark for a fence that is over.
+func (p *Promoter) forgetFence(volumeID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.marks, volumeID)
 }
 
 // observedDead reports whether the fleet has recorded the host as DEAD. A read
