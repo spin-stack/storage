@@ -94,6 +94,11 @@ type Log struct {
 	lease  LeaseChecker   // nil = no lease gate (dev/local without a CP)
 	fenced bool           // set once a FLUSH finds the lease invalid (§16 SELF_FENCED)
 
+	// degraded is what the local device is refusing to do, independently of the
+	// lease (see Degraded). outOfSpace classifies a disk error as ENOSPC.
+	degraded   Degradation
+	outOfSpace OutOfSpaceFunc
+
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
@@ -162,6 +167,9 @@ func (l *Log) recordWatermarks(ctx context.Context) {
 	// operator's only RPO signal telling them the opposite of the truth.
 	l.rec.Gauge(ctx, "wal_durable_gap_bytes", float64(l.gapBytes), vol)
 	l.rec.Gauge(ctx, "wal_durable_gap_seconds", l.gapAge().Seconds(), vol)
+	// Republished here so the series exists for a healthy volume too: an alert on
+	// "the device is full" cannot fire on a metric that only appears once it is.
+	l.recordDegraded(ctx)
 }
 
 // gapAge is how long the oldest un-remote-durable record has been waiting: the
@@ -234,15 +242,17 @@ func NewLog(file disk.File, clk clock.Clock, volumeID [16]byte, epoch uint64, li
 // epochs together, would see two different records claiming the same sequence.
 func NewLogAfter(file disk.File, clk clock.Clock, volumeID [16]byte, epoch, boundary uint64, limits Limits) *Log {
 	return &Log{
-		file:     file,
-		clk:      clk,
-		volumeID: volumeID,
-		epoch:    epoch,
-		start:    boundary,
-		local:    boundary,
-		durable:  boundary,
-		view:     cow.NewIntervalMap(),
-		limits:   limits,
+		file:       file,
+		clk:        clk,
+		volumeID:   volumeID,
+		epoch:      epoch,
+		start:      boundary,
+		local:      boundary,
+		durable:    boundary,
+		view:       cow.NewIntervalMap(),
+		limits:     limits,
+		degraded:   DegradedNone,
+		outOfSpace: DefaultOutOfSpace,
 	}
 }
 
@@ -284,7 +294,12 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	if !l.replayed && l.local == l.start && before > 0 {
 		return 0, fmt.Errorf("%w: %d bytes at sequence %d", ErrDirtyLog, before, l.start)
 	}
-	if _, err := l.file.Append(enc); err != nil {
+	_, err = l.file.Append(enc)
+	// Whether the device took the bytes is the only evidence there is about its
+	// state, so it is read here, on the accepted path as well as the refused one: a
+	// full device stays full until an append proves otherwise (see Degraded).
+	l.noteAppendResult(err)
+	if err != nil {
 		if terr := l.file.Truncate(before); terr != nil {
 			// The log's tail is now unknown. Refuse to serve it rather than ACK
 			// anything against a file we cannot describe.
