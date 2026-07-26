@@ -19,10 +19,20 @@
 // consistent. That is not an assumption: it is certified per backend by the §6.1
 // conformance suite (integration/backend, TestListSeesAFreshPut), which is blocking
 // for every backend version. Do not run a sweep against a store that has not passed
-// it. Closing the gap *inside* this package would need a root the sweep can read by
-// deterministic key rather than by listing — the snapshot catalog, or a per-volume
-// snapshot index in the descriptor — and that is a Control-Plane/on-S3-format
-// decision, not a GC one.
+// it.
+//
+// The precondition cannot be designed away here, and ADR-0012 explains why an index
+// of anchors readable by deterministic key does not do it: the same staleness costs
+// data with no anchor involved at all. A hole in the listing below a durable point
+// ends the contiguous run early, and the objects above the hole become orphans by
+// every rule this package has — "an ACKed object a lagging LIST hid" and "the late
+// PUT past a gap that §22.1 asks the GC to collect" are the same observation.
+//
+// What ADR-0012 *does* close is the case where a manifest is the sole anchor of an
+// object, which is how a lagging LIST turns into a destroyed snapshot: an epoch a
+// promotion has closed contributes all of its objects as roots, so the boundary — a
+// permanent number that was itself derived from a listing — never authorizes a
+// destructive act. See addDurablePrefixes.
 package gc
 
 import (
@@ -283,16 +293,17 @@ func MarkWithRecorder(ctx context.Context, store objectstore.Store, clk clock.Cl
 }
 
 // addDurablePrefixes marks every WAL object that is part of some volume/epoch's
-// durable prefix. The epochs are discovered from the keyspace itself (the layout is
-// self-describing, §22.5), so this needs no Control-Plane input — which matters,
-// because a GC that depended on PostgreSQL being right about epochs would delete data
-// whenever PostgreSQL was wrong.
+// durable prefix, and every WAL object of an epoch a promotion has already closed.
+// The epochs are discovered from the keyspace itself (the layout is self-describing,
+// §22.5), so this needs no Control-Plane input — which matters, because a GC that
+// depended on PostgreSQL being right about epochs would delete data whenever
+// PostgreSQL was wrong.
 func addDurablePrefixes(ctx context.Context, store objectstore.Store, all []objectstore.ObjectInfo, reachable map[string]bool) error {
 	type volEpoch struct {
 		vol   [16]byte
 		epoch uint64
 	}
-	seen := map[volEpoch]bool{}
+	seen := map[volEpoch][]string{}
 	for _, info := range all {
 		if !strings.HasPrefix(info.Key, "wal/") || !strings.HasSuffix(info.Key, ".wal") {
 			continue
@@ -309,23 +320,62 @@ func addDurablePrefixes(ctx context.Context, store objectstore.Store, all []obje
 		if err != nil {
 			continue
 		}
-		seen[volEpoch{vol: [16]byte(parsed), epoch: epoch}] = true
+		ve := volEpoch{vol: [16]byte(parsed), epoch: epoch}
+		seen[ve] = append(seen[ve], info.Key)
 	}
 
-	for ve := range seen {
+	for ve, keys := range seen {
 		durable, err := recovery.DurablePoint(ctx, store, ve.vol, ve.epoch)
 		if err != nil {
 			// If the durable point cannot be established, nothing here may be
 			// collected: an unreadable prefix is a reason to stop, not to sweep.
 			return fmt.Errorf("gc: durable point for %s/%d: %w", format.UUIDString(ve.vol), ve.epoch, err)
 		}
-		keys, err := recovery.ObjectKeysUpTo(ctx, store, ve.vol, ve.epoch, durable)
+		prefix, err := recovery.ObjectKeysUpTo(ctx, store, ve.vol, ve.epoch, durable)
 		if err != nil {
 			return err
 		}
+		for _, k := range prefix {
+			reachable[k] = true
+		}
+
+		closed, err := epochIsClosed(ctx, store, ve.vol, ve.epoch)
+		if err != nil {
+			return err
+		}
+		if !closed {
+			continue
+		}
+		// A superseded epoch's objects are roots (ADR-0012). The durable point above
+		// is clamped to the boundary the promotion recorded (§12.5), which answers
+		// "what is the volume's state?" — everything above it was written by a writer
+		// that was already fenced. The GC asks a different question, "what may I
+		// destroy?", and there that clamp is not an answer: an object above the
+		// boundary is either a pre-promotion snapshot's object, whose manifest is the
+		// youngest key involved (§21.1) and so the first one a lagging LIST loses, or
+		// it is the evidence that the boundary — a create-only, permanent number that
+		// was itself computed from a listing — is wrong. Neither is garbage.
+		//
+		// The cost is bounded and one-off: the objects a fenced writer landed after
+		// the boundary, per promotion, stay. Collecting them is an operator action on
+		// a named epoch, never an inference the sweep makes for itself (INV-14: one
+		// cycle late costs storage, one cycle early costs data).
 		for _, k := range keys {
 			reachable[k] = true
 		}
 	}
 	return nil
+}
+
+// epochIsClosed reports whether a promotion has already recorded this epoch's
+// boundary. It is decided by recovery.EpochCeiling, which reads the successor's
+// recovery point with a strongly consistent GET at a deterministic key — not from the
+// listing whose staleness is the hazard here. An unreadable boundary is an error, so
+// the sweep stops rather than judging an epoch whose status it does not know.
+func epochIsClosed(ctx context.Context, store objectstore.Store, vol [16]byte, epoch uint64) (bool, error) {
+	_, closed, err := recovery.EpochCeiling(ctx, store, vol, epoch)
+	if err != nil {
+		return false, fmt.Errorf("gc: epoch boundary for %s/%d: %w", format.UUIDString(vol), epoch, err)
+	}
+	return closed, nil
 }
