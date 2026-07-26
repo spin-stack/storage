@@ -63,18 +63,21 @@ func (e *SummaryOverclaim) Error() string {
 // Unwrap makes errors.Is(err, ErrSummaryOverclaims) work.
 func (e *SummaryOverclaim) Unwrap() error { return ErrSummaryOverclaims }
 
-// walObject is one WAL object with its parsed sequence span and raw bytes. Only
-// objects that passed validate() are ever represented here.
-type walObject struct {
-	key         string
-	first, last uint64
-	body        []byte
-}
-
 // ObjectSpan is the sequence range a validated WAL object actually carries — the
 // records', not the header's claim.
 type ObjectSpan struct {
 	First, Last uint64
+}
+
+// ObjectRun is a validated WAL object reduced to what a prefix walk needs: the
+// sequence span its records really cover and the bytes behind them. It is exported
+// because the durable point is not the only prefix walk over these objects —
+// cross-host materialization walks the very same runs (§20, §22.3) and must reach
+// the same verdict about the same bucket.
+type ObjectRun struct {
+	Key         string
+	First, Last uint64
+	Body        []byte // the whole object: header + payload
 }
 
 // VerifyObject is the single definition of "this stored object is what it claims"
@@ -161,13 +164,16 @@ func validate(volumeID string, epoch uint64, key string, h format.ObjectHeader, 
 // dropped rather than fatal: it simply cannot be part of the durable prefix, and the
 // contiguity walk stops where it is missing (§22.1). summary.json /
 // recovery-point.json are skipped.
-func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) ([]walObject, error) {
+// It also verifies that the surviving objects agree with each other (INV-21): the
+// listing is refused outright if any two of them carry different records for one
+// sequence, because from that point on no answer about the epoch is meaningful.
+func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) ([]ObjectRun, error) {
 	infos, err := store.List(ctx, walPrefix(volumeID, epoch))
 	if err != nil {
 		return nil, err
 	}
 	want := format.UUIDString(volumeID)
-	var objs []walObject
+	var objs []ObjectRun
 	for _, info := range infos {
 		if !strings.HasSuffix(info.Key, ".wal") {
 			continue
@@ -185,27 +191,142 @@ func listObjects(ctx context.Context, store objectstore.Store, volumeID [16]byte
 			// write to the bucket a denial of service over recovery.
 			continue
 		}
-		objs = append(objs, walObject{key: info.Key, first: span.First, last: span.Last, body: body})
+		objs = append(objs, ObjectRun{Key: info.Key, First: span.First, Last: span.Last, Body: body})
 	}
-	sort.Slice(objs, func(i, j int) bool { return objs[i].first < objs[j].first })
+	SortRuns(objs)
+	if err := VerifyAgreement(objs); err != nil {
+		return nil, err
+	}
 	return objs, nil
 }
 
-// contiguousLast returns the last sequence of the longest contiguous run that starts
-// exactly at floor. The floor matters as much as the contiguity: without it, a bucket
-// whose first objects are missing (a partial restore, an aborted GC, a mis-scoped
-// lifecycle rule) reads as a healthy prefix starting at whatever survived, and the
-// durable point jumps forward over lost data. Objects past a gap are late/orphan
-// (§22.1, §12.5).
-func contiguousLast(objs []walObject, floor uint64) uint64 {
+// SortRuns orders runs deterministically: by first sequence, then by last, then by
+// key. The last two keys matter — two objects starting at the same sequence used to
+// be ordered by whatever sort.Slice happened to do, which made the walk below depend
+// on the order the backend listed them in.
+func SortRuns(objs []ObjectRun) {
+	sort.Slice(objs, func(i, j int) bool {
+		switch {
+		case objs[i].First != objs[j].First:
+			return objs[i].First < objs[j].First
+		case objs[i].Last != objs[j].Last:
+			return objs[i].Last < objs[j].Last
+		default:
+			return objs[i].Key < objs[j].Key
+		}
+	})
+}
+
+// recordDigests hashes each record the run carries whose sequence is within [lo,hi].
+// The digest is over the record's canonical encoding, so it compares the record, not
+// the object it happens to be packed in: two writers that produced the same record
+// inside differently-cut objects agree, and two that produced different bytes for one
+// sequence do not.
+func (o ObjectRun) recordDigests(lo, hi uint64) (map[uint64][32]byte, error) {
+	recs, err := wal.Replay(o.Body[format.ObjectHeaderSize:])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrObjectIntegrity, o.Key, err)
+	}
+	out := make(map[uint64][32]byte, hi-lo+1)
+	for _, rec := range recs {
+		if rec.Sequence < lo || rec.Sequence > hi {
+			continue
+		}
+		enc, err := rec.Encode()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: re-encoding sequence %d: %v",
+				ErrObjectIntegrity, o.Key, rec.Sequence, err)
+		}
+		out[rec.Sequence] = sha256.Sum256(enc)
+	}
+	return out, nil
+}
+
+// VerifyAgreement enforces INV-21 (§14.5) where it is actually enforceable: where two
+// validated objects carry the same sequence, they must carry the same record.
+//
+// "Same range, different hash ⇒ hard fail" cannot be enforced at the PUT, because the
+// object key embeds the payload digest — divergent objects land on *different* keys,
+// so both create-only PUTs succeed and the create-only guard never fires. Both then
+// pass validation, both are replayed, and the recovered content is decided by
+// whichever SHA prefix sorts first. That is the signature of two writers in one epoch
+// or of a writer that re-batched after a restart, and it is unrecoverable ambiguity
+// rather than a smaller answer, so it fails loudly.
+//
+// A duplicate that agrees is not a divergence: a re-batched object re-sending records
+// it already sent carries the same bytes, and the run below folds it at record level.
+//
+// objs need not be sorted; the copy this takes is. The overlap scan costs nothing when
+// there is none, which is every healthy epoch.
+func VerifyAgreement(objs []ObjectRun) error {
+	sorted := append([]ObjectRun(nil), objs...)
+	SortRuns(sorted)
+
+	var maxLast uint64
+	for i, o := range sorted {
+		if i > 0 && o.First <= maxLast {
+			for j := range i {
+				if sorted[j].Last < o.First || sorted[j].First > o.Last {
+					continue
+				}
+				if err := agree(sorted[j], o); err != nil {
+					return err
+				}
+			}
+		}
+		if o.Last > maxLast {
+			maxLast = o.Last
+		}
+	}
+	return nil
+}
+
+// agree compares two overlapping runs record by record over the sequences they share.
+func agree(a, b ObjectRun) error {
+	lo, hi := max(a.First, b.First), min(a.Last, b.Last)
+	da, err := a.recordDigests(lo, hi)
+	if err != nil {
+		return err
+	}
+	db, err := b.recordDigests(lo, hi)
+	if err != nil {
+		return err
+	}
+	for seq := lo; seq <= hi; seq++ {
+		if da[seq] != db[seq] {
+			return fmt.Errorf("%w: %s and %s both carry sequence %d, with different records",
+				ErrAmbiguousSequence, a.Key, b.Key, seq)
+		}
+	}
+	return nil
+}
+
+// ContiguousEnd returns the last sequence of the longest run of *records* covering
+// [floor, …]. objs must be sorted (SortRuns) and must have passed VerifyAgreement, so
+// overlap here is redundancy rather than ambiguity.
+//
+// The floor matters as much as the contiguity: without it, a bucket whose first
+// objects are missing (a partial restore, an aborted GC, a mis-scoped lifecycle rule)
+// reads as a healthy prefix starting at whatever survived, and the durable point jumps
+// forward over lost data. Objects past a gap are late/orphan (§22.1, §12.5).
+//
+// The walk is over sequences, not over object boundaries. Demanding that each object
+// start exactly where the previous ended made overlapping objects — which a restarted
+// writer's re-batch produces — stop the walk early and under-report the durable point
+// with no error at all, which a promotion then writes down as an immutable floor.
+func ContiguousEnd(objs []ObjectRun, floor uint64) uint64 {
 	expected := floor
 	last := floor - 1
 	for _, o := range objs {
-		if o.first != expected {
-			break
+		if o.First > expected {
+			break // a real gap: nothing carries `expected`
 		}
-		last = o.last
-		expected = o.last + 1
+		if o.Last >= expected {
+			last = o.Last
+			expected = o.Last + 1
+		}
+		// Otherwise the object lies entirely below the floor or inside what an earlier
+		// one already covered: redundant, and it cannot extend the run.
 	}
 	return last
 }
@@ -323,26 +444,79 @@ func ObjectKeysUpTo(ctx context.Context, store objectstore.Store, volumeID [16]b
 	}
 	var keys []string
 	for _, o := range objs {
-		if o.last <= upTo {
-			keys = append(keys, o.key)
+		if o.Last <= upTo {
+			keys = append(keys, o.Key)
 		}
 	}
 	return keys, nil
 }
 
+// EpochCeiling is the highest sequence of `epoch` that anything ever adopted, and the
+// mirror of PrefixFloor. An epoch that has been superseded has one: the promotion that
+// opened the next epoch recorded, in a create-only object, exactly how far it
+// recovered (§12.5). Everything above that was written by a writer that was already
+// fenced and was never part of the volume.
+//
+// Without it, a PUT still in flight when the promotion happened — a slow backend, an
+// SDK retry — lands afterwards and extends the old epoch's prefix past the boundary.
+// Nothing rewrites the boundary, so from then on the same bucket answers two different
+// questions about one volume: `materialize.FromEpoch(vol, N)` rebuilds a state the
+// live volume at N+1 never had, and a drain resumed by finishMovedVolume recomputes a
+// number that contradicts an immutable object and fails hard for ever.
+//
+// The successor is `epoch+1`: epochs are consecutive here (the drain derives
+// prevEpoch as newEpoch-1), and the object is read with a strongly consistent GET
+// rather than found by a LIST. A boundary that records a *different* predecessor makes
+// no claim about this epoch and is not treated as its ceiling. An unreadable one is an
+// error: this number is as load-bearing as the floor, and guessing "no ceiling" is the
+// over-reporting the whole function exists to prevent.
+func EpochCeiling(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, bool, error) {
+	rp, err := ReadRecoveryPoint(ctx, store, volumeID, epoch+1)
+	switch {
+	case errors.Is(err, objectstore.ErrNotFound):
+		return 0, false, nil // still open: no promotion has closed this epoch
+	case err != nil:
+		return 0, false, fmt.Errorf("recovery: cannot read the epoch %d boundary of %s: %w",
+			epoch+1, format.UUIDString(volumeID), err)
+	}
+	if rp.PrevEpoch != epoch {
+		return 0, false, nil
+	}
+	return rp.RecoveredUpTo, true, nil
+}
+
 // DurablePrefix returns the durable point for a volume/epoch computed from S3 alone
-// (INV-08): the end of the longest contiguous run of *validated* objects starting at
-// the epoch's floor.
+// (INV-08): the end of the longest contiguous run of *validated* records between the
+// epoch's floor and, once a promotion has closed the epoch, its ceiling.
 func DurablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
+	_, adopted, err := durablePrefix(ctx, store, volumeID, epoch)
+	return adopted, err
+}
+
+// durablePrefix returns both numbers the callers need: `proven` is what the epoch's
+// own objects establish, and `adopted` is that clamped to the ceiling a successor
+// recorded. They differ exactly when a fenced writer's PUT landed late, and keeping
+// them apart is what stops that from being reported as a summary over-claim — the
+// summary is not lying, its epoch was simply superseded under it.
+func durablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (proven, adopted uint64, err error) {
 	objs, err := listObjects(ctx, store, volumeID, epoch)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	floor, err := PrefixFloor(ctx, store, format.UUIDString(volumeID), epoch)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return contiguousLast(objs, floor), nil
+	proven = ContiguousEnd(objs, floor)
+
+	ceiling, closed, err := EpochCeiling(ctx, store, volumeID, epoch)
+	if err != nil {
+		return 0, 0, err
+	}
+	if closed && ceiling < proven {
+		return proven, ceiling, nil
+	}
+	return proven, proven, nil
 }
 
 // readSummary loads the epoch's summary for the cross-check below. It separates the
@@ -383,8 +557,12 @@ func readSummary(ctx context.Context, store objectstore.Store, volumeID [16]byte
 // still prove, so a caller can act on the discrepancy (escalate, recover the shorter
 // prefix) instead of retrying an opaque error against an epoch that will never
 // answer differently.
+// The cross-check is against what the epoch's own objects prove, not against the
+// ceiling a successor imposed on it: a writer that ACKed up to 6 and was then fenced
+// at 4 wrote an honest summary, and reporting that as an over-claim would turn every
+// ordinary promotion into an unrecoverable epoch.
 func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
-	contiguous, err := DurablePrefix(ctx, store, volumeID, epoch)
+	proven, adopted, err := durablePrefix(ctx, store, volumeID, epoch)
 	if err != nil {
 		return 0, err
 	}
@@ -392,10 +570,10 @@ func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byt
 	if err != nil {
 		return 0, err
 	}
-	if ok && sum.DurableSequence > contiguous {
-		return 0, &SummaryOverclaim{Claimed: sum.DurableSequence, Contiguous: contiguous}
+	if ok && sum.DurableSequence > proven {
+		return 0, &SummaryOverclaim{Claimed: sum.DurableSequence, Contiguous: proven}
 	}
-	return contiguous, nil
+	return adopted, nil
 }
 
 // Recover reconstructs the read view (interval map) from S3 up to the durable point,
@@ -435,13 +613,16 @@ func replayEpoch(ctx context.Context, store objectstore.Store, enc *wal.Encrypti
 	if err != nil {
 		return err
 	}
+	// Objects are sorted and have been proven to agree wherever they overlap, so
+	// replaying a sequence twice is replaying the same record twice — idempotent for
+	// every record type (§14.1) — and the order stays deterministic.
 	for _, o := range objs {
-		if o.first > upto {
+		if o.First > upto {
 			break // past what this epoch contributes (sorted by first)
 		}
-		recs, err := wal.Replay(o.body[format.ObjectHeaderSize:])
+		recs, err := wal.Replay(o.Body[format.ObjectHeaderSize:])
 		if err != nil {
-			return fmt.Errorf("recovery: replay %s: %w", o.key, err)
+			return fmt.Errorf("recovery: replay %s: %w", o.Key, err)
 		}
 		for _, rec := range recs {
 			if rec.Sequence > upto {
