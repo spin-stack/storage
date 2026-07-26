@@ -60,6 +60,18 @@ type hookedStore struct {
 	metadata.Store
 	beforeUpdate func(op metadata.Operation) error
 	afterUpdate  func(op metadata.Operation)
+	// afterLease runs once the drain has read the lease of the host it is fencing —
+	// which is inside the ADR-0016 revocation window, and the only point at which a
+	// test can act while that window is open.
+	afterLease func(hostID string)
+}
+
+func (s *hookedStore) GetHostLease(ctx context.Context, hostID string) (metadata.HostLease, error) {
+	l, err := s.Store.GetHostLease(ctx, hostID)
+	if s.afterLease != nil {
+		s.afterLease(hostID)
+	}
+	return l, err
 }
 
 func (s *hookedStore) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
@@ -262,7 +274,7 @@ func (w *drainWorld) killAtTheProgressWrite(t *testing.T) {
 
 // clearFaults disarms every hook, so the next pass runs clean.
 func (w *drainWorld) clearFaults() {
-	w.hooks.beforeUpdate = nil
+	w.hooks.beforeUpdate, w.hooks.afterUpdate, w.hooks.afterLease = nil, nil, nil
 	w.faults.fail = nil
 }
 

@@ -48,6 +48,18 @@ var (
 	// against: another promoter got there first (§12.3). The caller must re-read and
 	// decide again — it has *not* been granted an epoch.
 	ErrEpochConflict = errors.New("metadata: volume is not at the expected epoch")
+	// ErrRenewalsBlocked means a host's lease renewals are refused for as long as a
+	// bounded revocation window is open on it (§12.6, ADR-0016 stage 1). The Control
+	// Plane opens one for the duration of a single volume's promotion, so that the
+	// lease it revoked to fence the source cannot be re-armed by the source's next
+	// heartbeat; without it the fencing wait measures from an instant that keeps
+	// moving and a healthy host can never be drained.
+	//
+	// It is deliberately not ErrHostNotServing. The host *is* serving — the volumes
+	// nobody is moving are still its, and their WAL keeps accepting writes; what
+	// waits is the durable ACK, for at most one lease_ttl + max_clock_skew per volume
+	// moved. A caller that reads this should retry, not conclude the host is gone.
+	ErrRenewalsBlocked = errors.New("metadata: host lease renewals are blocked by a revocation window")
 	// ErrHostNotServing means the operation needs a host the fleet still considers a
 	// writer, and this one is DEAD (§28.1). Marking a host dead is the Control Plane
 	// asserting that its writer is gone; handing it a fresh lease afterwards

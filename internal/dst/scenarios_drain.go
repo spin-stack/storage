@@ -30,6 +30,7 @@ func drainScenarios() []MandatoryScenario {
 		{Name: "drain-crash-at-every-boundary", Run: scenarioDrainCrashAtEveryBoundary},
 		{Name: "drain-source-cannot-ack-afterwards", Run: scenarioDrainSourceCannotAck},
 		{Name: "stale-lease-read-does-not-shorten-the-fence", Run: scenarioStaleLeaseReadDoesNotShortenTheFence},
+		{Name: "drain-revocation-window-is-bounded", Run: scenarioDrainRevocationWindowIsBounded},
 	}
 }
 
@@ -58,10 +59,28 @@ type faultMD struct {
 	// replica lagging far enough that any deadline derived from the timestamp
 	// elapsed long ago (ADR-0015).
 	staleLease time.Time
+	// wholeDrainWindow is the design ADR-0016 rejected, planted: renewals refused for
+	// as long as the host is DRAINING, rather than for the length of one promotion.
+	// It fixes the same bug and turns every drain of a healthy host into an
+	// availability event for the volumes nobody is moving.
+	wholeDrainWindow bool
 	// ancientFence is the design ADR-0015 replaced, planted: the fence-start instant
 	// is read out of the row as an hour ago, so the promoter believes it has been
 	// waiting all that time instead of measuring since it looked.
 	ancientFence bool
+}
+
+func (s *faultMD) RenewHostLease(ctx context.Context, term int64, hostID string, ttlSeconds int) error {
+	if s.wholeDrainWindow {
+		h, err := s.Store.GetHost(ctx, hostID)
+		if err != nil {
+			return err
+		}
+		if h.State == lifecycle.HostDraining {
+			return fmt.Errorf("%w: planted: %s is draining", metadata.ErrRenewalsBlocked, hostID)
+		}
+	}
+	return s.Store.RenewHostLease(ctx, term, hostID, ttlSeconds)
 }
 
 func (s *faultMD) GetVolume(ctx context.Context, volumeID string) (metadata.Volume, error) {
@@ -685,4 +704,94 @@ func staleLeaseFenceRun(s *Sim, plantTimestampDwell bool) error {
 	s.Emit(Event{Kind: EventPromotion, EarlyGrant: agent.Valid(), Msg: "granted after a full monotonic dwell"})
 	s.Notef("an hour-stale lease read cost the fence nothing: the dwell ran on the promoter's own clock")
 	return nil
+}
+
+// scenarioDrainRevocationWindowIsBounded is ADR-0016 stage 1. The drain has to stop
+// the source re-arming the lease it just revoked, or a healthy heartbeating host can
+// never be evacuated: every renewal moves the instant the fencing wait is measured
+// from, and the promotion never starts.
+//
+// The whole question is *how long* that refusal lasts. The fix wave 2 rejected —
+// refusing renewals for any DRAINING host — stops the durable ACKs of every volume
+// the host still holds, including the ones nobody is moving, for as long as the drain
+// runs. Stage 1 keeps the mechanism and bounds it to one promotion: at most one
+// lease_ttl + max_clock_skew per volume moved.
+//
+// So the scenario measures it. The drain is deliberately slow — the reconciler comes
+// back long after the dwell has elapsed, which is what a busy Control Plane looks like
+// — and the source has to be able to renew again in the gap. plantWholeDrain reverts
+// the decision, and the assertion below catches it.
+func scenarioDrainRevocationWindowIsBounded(s *Sim) error {
+	return revocationWindow(false)(s)
+}
+
+func revocationWindow(plantWholeDrain bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		agent := lease.NewManager(s.Clock, drainLeaseTTL)
+		agent.Grant()
+		w, err := newDrainWorld(s, 0x3f, agent)
+		if err != nil {
+			return err
+		}
+		w.md.wholeDrainWindow = plantWholeDrain
+		renew := func() error { return w.md.RenewHostLease(ctx, w.term, w.src, int(drainLeaseTTL/time.Second)) }
+
+		// Before anything is drained the source renews normally.
+		if err := renew(); err != nil {
+			return fmt.Errorf("a healthy source could not renew before the drain started: %w", err)
+		}
+
+		// The first pass fences the volume: the window opens, and with it the refusal
+		// that makes the evacuation possible at all.
+		if _, err := w.pass(); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+			return fmt.Errorf("the first pass must open the fence, got %v", err)
+		}
+		if err := renew(); !errors.Is(err, metadata.ErrRenewalsBlocked) {
+			return fmt.Errorf("the source re-armed the lease the drain revoked: %v", err)
+		}
+		s.Emit(Event{Kind: EventFault, Msg: "the source's renewals are refused while its volume is promoted"})
+
+		// Now the reconciler is slow. The window is bounded by the promotion it was
+		// opened for, so once that much time has passed with nobody driving the drain,
+		// the host is serving normally again — its other volumes can ACK a FLUSH.
+		// This is the assertion the rejected design fails: a window that lasts as long
+		// as the host is DRAINING is still shut here.
+		s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+		if err := renew(); err != nil {
+			return fmt.Errorf("the revocation window outlived the promotion it was opened for: %w", err)
+		}
+		s.Emit(Event{Kind: EventNote, Msg: "the window closed on its own; the source is serving again"})
+
+		// And the drain still converges, because the next pass re-opens it. A source
+		// that heartbeats between every pass — which is what a healthy host does — must
+		// not be able to wedge its own evacuation.
+		for range 8 {
+			if rerr := renew(); rerr != nil && !errors.Is(rerr, metadata.ErrRenewalsBlocked) {
+				return fmt.Errorf("unexpected renewal error: %w", rerr)
+			}
+			_, err = w.pass()
+			if !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+				break
+			}
+			s.Tick(drainLeaseTTL + drainMaxSkew + time.Second)
+		}
+		if err != nil {
+			return fmt.Errorf("a heartbeating source wedged its own evacuation: %w", err)
+		}
+		v, err := w.md.GetVolume(ctx, w.volID)
+		if err != nil {
+			return err
+		}
+		if v.PrimaryHostID != w.dst {
+			return fmt.Errorf("the volume did not move: %+v", v)
+		}
+
+		// The evacuation is over: nothing keeps the source from renewing.
+		if err := renew(); err != nil {
+			return fmt.Errorf("the drain finished with the window still open: %w", err)
+		}
+		s.Notef("the revocation window lasted one promotion, not the length of the drain")
+		return nil
+	}
 }
