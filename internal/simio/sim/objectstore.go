@@ -45,6 +45,12 @@ type ObjectStore struct {
 	lostResponse map[string]bool
 	throttle     int
 	keyThrottle  map[string]int
+	// standing backend defects: not transient failures but a backend that does not
+	// have the property the protocol assumes. Each is a configuration or conformance
+	// reality (§6.1), and each disables one of the fences silently.
+	permanentDelete     bool
+	ignorePreconditions bool
+	staleRead           map[string]bool
 }
 
 type simObject struct {
@@ -67,6 +73,10 @@ type simObject struct {
 	// was never the content that was marked (§21.3).
 	superseded bool
 	createdAt  time.Time
+	// prev is the version this one replaced, retained only so InjectStaleRead can
+	// serve it. A real backend keeps it for its own reasons (versioning, replication
+	// lag); nothing outside that injector may read it.
+	prev *simObject
 }
 
 // NewObjectStore returns an empty store with strongly consistent LIST.
@@ -75,6 +85,7 @@ func NewObjectStore() *ObjectStore {
 		objs:         map[string]*simObject{},
 		lostResponse: map[string]bool{},
 		keyThrottle:  map[string]int{},
+		staleRead:    map[string]bool{},
 	}
 }
 
@@ -171,6 +182,67 @@ func (s *ObjectStore) InjectThrottleKey(key string, n int) {
 	s.keyThrottle[key] = n
 }
 
+// InjectPermanentDelete makes Delete destroy the object instead of placing a
+// reversible marker: the bytes are gone and Restore reports ErrNotFound. This is a
+// bucket without versioning — one checkbox, no error anywhere, and every mark the GC
+// writes becomes irreversible (§21.3, INV-14). It is a standing property of the
+// store, not a one-shot fault, because that is how the mistake actually presents.
+func (s *ObjectStore) InjectPermanentDelete() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.permanentDelete = true
+}
+
+// InjectIgnorePreconditions makes Put accept If-None-Match and If-Match
+// unconditionally, modelling a backend whose conditional writes are advisory. Every
+// create-only publication in the system — snapshot manifests, epoch boundaries, the
+// epoch object's CAS — is then an overwrite, and nothing reports an error (§6.1).
+func (s *ObjectStore) InjectIgnorePreconditions() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ignorePreconditions = true
+}
+
+// InjectStaleRead makes Get and Head of key answer with the version that key held
+// before its most recent write, until ClearStaleRead. It models a backend without
+// read-after-write consistency on a small, frequently rewritten object — a replica
+// serving a lagging copy. §12.4's epoch fence is exactly one such object, so this is
+// the fault that quietly turns "am I still the writer?" into the wrong answer.
+//
+// A key with no earlier version reads as absent: to that replica the write has not
+// happened at all.
+func (s *ObjectStore) InjectStaleRead(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.staleRead[key] = true
+}
+
+// ClearStaleRead lets key catch up.
+func (s *ObjectStore) ClearStaleRead(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.staleRead, key)
+}
+
+// visible returns the version a reader of key sees, honouring an injected stale read.
+// Callers hold s.mu.
+func (s *ObjectStore) visible(key string) (*simObject, bool) {
+	o, ok := s.objs[key]
+	if !ok {
+		return nil, false
+	}
+	if s.staleRead[key] {
+		if o.prev == nil {
+			return nil, false
+		}
+		o = o.prev
+	}
+	if o.marked {
+		return nil, false
+	}
+	return o, true
+}
+
 func (s *ObjectStore) throttled() bool {
 	if s.throttle > 0 {
 		s.throttle--
@@ -213,11 +285,13 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 		// does not exist, which is how S3 behaves on a versioned bucket.
 		exists = false
 	}
-	if opts.IfNoneMatch && exists {
-		return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
-	}
-	if opts.IfMatch != "" && (!exists || existing.etag != opts.IfMatch) {
-		return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
+	if !s.ignorePreconditions {
+		if opts.IfNoneMatch && exists {
+			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
+		}
+		if opts.IfMatch != "" && (!exists || existing.etag != opts.IfMatch) {
+			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
+		}
 	}
 
 	stored := &simObject{
@@ -229,6 +303,13 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	}
 	if !s.eventualList && s.listLag > 0 {
 		stored.visibleAt = s.ops + uint64(s.listLag)
+	}
+	if existing != nil {
+		// Keep one older version so a stale read has something to serve; drop its own
+		// chain so the retained history stays bounded.
+		older := *existing
+		older.prev = nil
+		stored.prev = &older
 	}
 	s.objs[key] = stored
 
@@ -247,8 +328,8 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 	if s.throttled() || s.throttledKey(key) {
 		return nil, ErrThrottled
 	}
-	o, ok := s.objs[key]
-	if !ok || o.marked {
+	o, ok := s.visible(key)
+	if !ok {
 		return nil, objectstore.ErrNotFound
 	}
 	return append([]byte(nil), o.data...), nil
@@ -261,8 +342,8 @@ func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInf
 	if s.throttled() || s.throttledKey(key) {
 		return objectstore.ObjectInfo{}, ErrThrottled
 	}
-	o, ok := s.objs[key]
-	if !ok || o.marked {
+	o, ok := s.visible(key)
+	if !ok {
 		return objectstore.ObjectInfo{}, objectstore.ErrNotFound
 	}
 	return objectstore.ObjectInfo{Key: key, Size: int64(len(o.data)), ETag: o.etag, LastModified: o.createdAt}, nil
@@ -303,6 +384,11 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 	o, ok := s.objs[key]
 	if !ok || o.marked {
 		return objectstore.ErrNotFound
+	}
+	if s.permanentDelete {
+		// No versioning: the bytes are gone and nothing can bring them back.
+		delete(s.objs, key)
+		return nil
 	}
 	o.marked = true
 	// This version is now the one a restore would bring back.

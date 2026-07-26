@@ -463,33 +463,39 @@ func scenarioGCMarksOrphansNotLive(s *Sim) error {
 		return err
 	}
 
-	// Each mark is a reversible delete-marker — emit it as a non-permanent delete so
-	// the NoPermanentDeleteChecker (INV-14) validates the GC never permanent-deletes.
+	if len(marks) == 0 {
+		return errors.New("the GC should have marked the orphan")
+	}
+	// Whether a mark is permanent is not something this scenario may assert on the
+	// GC's behalf — it is a property of the bucket, and a bucket without versioning
+	// turns every mark into an irreversible delete with no error anywhere. So probe
+	// it: a marked object must be hidden from reads *and* come back on Restore, and
+	// the delete event carries what actually happened rather than what should have.
 	liveMarked := false
 	for _, m := range marks {
-		s.Emit(Event{Kind: EventDelete, Key: m, Permanent: false})
 		if m == live {
 			liveMarked = true
+		}
+		hiddenErr := func() error {
+			if _, err := s.Store.Head(ctx, m); err == nil {
+				return fmt.Errorf("a marked object must not answer reads: %q", m)
+			}
+			return nil
+		}()
+		restoreErr := s.Store.Restore(ctx, m)
+		_, backErr := s.Store.Head(ctx, m)
+		reversible := restoreErr == nil && backErr == nil
+		s.Emit(Event{Kind: EventDelete, Key: m, Permanent: !reversible})
+		if hiddenErr != nil {
+			return hiddenErr
+		}
+		if !reversible {
+			return fmt.Errorf("the GC's mark of %q is irreversible (restore=%v, read-back=%v): "+
+				"the bucket has no versioning and the bytes are gone (§5.11/§21.3, INV-14)", m, restoreErr, backErr)
 		}
 	}
 	if liveMarked {
 		return errors.New("the GC marked a live object")
-	}
-	if len(marks) == 0 {
-		return errors.New("the GC should have marked the orphan")
-	}
-	// A marked object is hidden from reads but its bytes survive: restoring it
-	// brings it back, which is what makes a GC mistake recoverable.
-	for _, m := range marks {
-		if _, err := s.Store.Head(ctx, m); err == nil {
-			return fmt.Errorf("a marked object must not answer reads: %q", m)
-		}
-		if err := s.Store.Restore(ctx, m); err != nil {
-			return fmt.Errorf("GC marks must be reversible, but %q cannot be restored: %w", m, err)
-		}
-		if _, err := s.Store.Head(ctx, m); err != nil {
-			return fmt.Errorf("GC marks must be reversible, but %q is gone", m)
-		}
 	}
 	s.Notef("GC marked %d orphan(s), no live object, no permanent delete", len(marks))
 	return nil
@@ -870,10 +876,23 @@ func scenarioPromotionFencingWait(s *Sim) error {
 	return nil
 }
 
+// Which lease checker the WAL is handed. honestLeaseChecker is the real manager;
+// lyingLeaseChecker keeps answering "valid" after the lease has expired — a stuck
+// renewal, or a heartbeat thread that died holding its last answer — and is how the
+// INV-06 checker is proven to catch a real violation rather than a fabricated event.
+const (
+	honestLeaseChecker = false
+	lyingLeaseChecker  = true
+)
+
 // scenarioLeaseFencesDurableAck is INV-06 (§12.2): a valid lease lets a FLUSH ACK;
 // once the lease expires, a FLUSH whose object still lands in S3 is NOT ACKed —
 // durable does not advance and the log self-fences.
 func scenarioLeaseFencesDurableAck(s *Sim) error {
+	return leaseFencesDurableAck(s, honestLeaseChecker)
+}
+
+func leaseFencesDurableAck(s *Sim, lying bool) error {
 	ctx := context.Background()
 	vol := [16]byte{8}
 	f, err := s.Disk.Create("wal/active.wal")
@@ -883,11 +902,18 @@ func scenarioLeaseFencesDurableAck(s *Sim) error {
 	lm := lease.NewManager(s.Clock, 10*time.Second)
 	lm.Grant()
 
+	// The log consults `check`; every durable-ack event carries `lm`'s verdict, which
+	// is the lease that actually governs the writer. When the two disagree the ACK is
+	// exactly the violation INV-06 forbids, and the checker must see it.
+	var check wal.LeaseChecker = lm
+	if lying {
+		check = alwaysValidLease{}
+	}
 	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(
 		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
 		wal.NewUploader(s.Store, 5),
-		lm,
+		check,
 	)
 
 	// (1) With a valid lease, the FLUSH ACKs.
@@ -907,6 +933,12 @@ func scenarioLeaseFencesDurableAck(s *Sim) error {
 	}
 	s.Clock.Advance(11 * time.Second) // no renewal
 	err = l.Flush(ctx)
+	if err == nil {
+		// The FLUSH ACKed. Record it with the real lease's verdict: if that lease had
+		// expired, a durable ACK just escaped an invalid fence.
+		s.Emit(Event{Kind: EventDurableAck, Durable: l.Watermarks().Durable, LeaseValid: lm.Valid()})
+		return fmt.Errorf("expired-lease flush ACKed seq %d (INV-06)", l.Watermarks().Durable)
+	}
 	if !errors.Is(err, wal.ErrSelfFenced) {
 		return fmt.Errorf("expired-lease flush: want ErrSelfFenced, got %v", err)
 	}
@@ -1003,10 +1035,23 @@ func scenarioIdempotentBatchUpload(s *Sim) error {
 	return nil
 }
 
+// Whether the volume under test was created with a DEK. plaintextWAL is not a bug in
+// the crypto — it is a Log that was never handed one, which is exactly how a plaintext
+// volume reaches production, and it is what proves the INV-15 checker catches a real
+// leak instead of a fabricated event.
+const (
+	encryptedWAL = true
+	plaintextWAL = false
+)
+
 // scenarioEncryptedWALNoPlaintextLeak: with per-volume encryption, the bytes that
 // will leave the host (the WAL file → later S3) contain no cleartext (§5.10,
 // INV-15), yet replay+decrypt recovers the plaintext.
 func scenarioEncryptedWALNoPlaintextLeak(s *Sim) error {
+	return walPlaintextScenario(s, encryptedWAL)
+}
+
+func walPlaintextScenario(s *Sim, encrypted bool) error {
 	dek, err := crypto.GenerateDEK(&deterministicReader{b: byte(s.Rand.Intn(200) + 1)}, 1)
 	if err != nil {
 		return err
@@ -1018,7 +1063,9 @@ func scenarioEncryptedWALNoPlaintextLeak(s *Sim) error {
 		return err
 	}
 	l := wal.NewLog(f, s.Clock, enc.VolumeID, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableEncryption(enc)
+	if encrypted {
+		l.EnableEncryption(enc)
+	}
 
 	canary := []byte("CLEARTEXT-CANARY-DO-NOT-LEAK")
 	if _, err := l.Write(0, canary, 0); err != nil {
