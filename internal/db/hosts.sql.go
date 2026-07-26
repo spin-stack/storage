@@ -36,7 +36,7 @@ func (q *Queries) BlockHostRenewals(ctx context.Context, arg BlockHostRenewalsPa
 }
 
 const getHost = `-- name: GetHost :one
-SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
+SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.nvme_remote_backlog_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
   JOIN host_committed_bytes c ON c.host_id = h.host_id
  WHERE h.host_id = $1
@@ -70,6 +70,7 @@ func (q *Queries) GetHost(ctx context.Context, hostID uuid.UUID) (*GetHostRow, e
 		&i.Host.MaxFormatVersion,
 		&i.Host.NvmeTotalBytes,
 		&i.Host.NvmeUsedBytes,
+		&i.Host.NvmeRemoteBacklogBytes,
 		&i.Host.LastHeartbeat,
 		&i.Host.RenewalsBlockedUntil,
 		&i.CommittedBytes,
@@ -105,7 +106,7 @@ func (q *Queries) HostExists(ctx context.Context, hostID uuid.UUID) (bool, error
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
+SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.nvme_remote_backlog_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
   JOIN host_committed_bytes c ON c.host_id = h.host_id
  ORDER BY h.host_id
@@ -133,6 +134,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]*ListHostsRow, error) {
 			&i.Host.MaxFormatVersion,
 			&i.Host.NvmeTotalBytes,
 			&i.Host.NvmeUsedBytes,
+			&i.Host.NvmeRemoteBacklogBytes,
 			&i.Host.LastHeartbeat,
 			&i.Host.RenewalsBlockedUntil,
 			&i.CommittedBytes,
@@ -282,30 +284,32 @@ func (q *Queries) UnblockHostRenewals(ctx context.Context, arg UnblockHostRenewa
 
 const upsertHost = `-- name: UpsertHost :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $7
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
 )
 INSERT INTO hosts (
     host_id, state, agent_version, max_format_version,
-    nvme_total_bytes, nvme_used_bytes, last_heartbeat
+    nvme_total_bytes, nvme_used_bytes, nvme_remote_backlog_bytes, last_heartbeat
 )
-SELECT $1, $2, $3, $4, $5, $6, now()
+SELECT $1, $2, $3, $4, $5, $6, $7, now()
 WHERE EXISTS (SELECT 1 FROM valid)
 ON CONFLICT (host_id) DO UPDATE
   SET agent_version = EXCLUDED.agent_version,
       max_format_version = EXCLUDED.max_format_version,
       nvme_total_bytes = EXCLUDED.nvme_total_bytes,
       nvme_used_bytes = EXCLUDED.nvme_used_bytes,
+      nvme_remote_backlog_bytes = EXCLUDED.nvme_remote_backlog_bytes,
       last_heartbeat = now()
 `
 
 type UpsertHostParams struct {
-	HostID           uuid.UUID `json:"host_id"`
-	State            string    `json:"state"`
-	AgentVersion     string    `json:"agent_version"`
-	MaxFormatVersion int32     `json:"max_format_version"`
-	NvmeTotalBytes   int64     `json:"nvme_total_bytes"`
-	NvmeUsedBytes    int64     `json:"nvme_used_bytes"`
-	Term             int64     `json:"term"`
+	HostID                 uuid.UUID `json:"host_id"`
+	State                  string    `json:"state"`
+	AgentVersion           string    `json:"agent_version"`
+	MaxFormatVersion       int32     `json:"max_format_version"`
+	NvmeTotalBytes         int64     `json:"nvme_total_bytes"`
+	NvmeUsedBytes          int64     `json:"nvme_used_bytes"`
+	NvmeRemoteBacklogBytes int64     `json:"nvme_remote_backlog_bytes"`
+	Term                   int64     `json:"term"`
 }
 
 // Term-guarded (§7): the INSERT ... SELECT produces no row when the term is stale,
@@ -324,6 +328,7 @@ func (q *Queries) UpsertHost(ctx context.Context, arg UpsertHostParams) (int64, 
 		arg.MaxFormatVersion,
 		arg.NvmeTotalBytes,
 		arg.NvmeUsedBytes,
+		arg.NvmeRemoteBacklogBytes,
 		arg.Term,
 	)
 	if err != nil {

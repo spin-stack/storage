@@ -70,9 +70,12 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[storagev1.H
 		MaxFormatVersion: msg.GetMaxFormatVersion(),
 		NVMeTotalBytes:   dev.GetTotalBytes(),
 		NVMeUsedBytes:    dev.GetUsedBytes(),
-		// dev.RemoteBacklogBytes has nowhere to go yet: the hosts table has no
-		// column for it. It is the one number ADR-0013 needs that the schema does
-		// not carry, and adding it belongs to whoever owns internal/schema.
+		// The remote backlog goes with the rest of what the host reports about
+		// itself. It is the only one of the three the fleet cannot recompute:
+		// committed capacity is derived from the rows naming this host (ADR-0017),
+		// but the bytes no verified object covers yet are measured on the host, in
+		// bytes, and no local truncation may reclaim them (INV-13).
+		RemoteBacklogBytes: dev.GetRemoteBacklogBytes(),
 	})
 	if err != nil {
 		return nil, rpcError(fmt.Errorf("cpserver: upserting host %q: %w", msg.GetHostId(), err))

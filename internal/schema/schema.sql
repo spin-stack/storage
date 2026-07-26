@@ -46,6 +46,18 @@ CREATE TABLE hosts (
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
     nvme_used_bytes      BIGINT NOT NULL DEFAULT 0,
+    -- The part of nvme_used_bytes that no verified object covers yet, summed over
+    -- every volume this host holds (ADR-0013 §1). Reported by the Agent in each
+    -- heartbeat, like the two columns above it.
+    --
+    -- It is stored rather than derived, unlike committed capacity, because nothing
+    -- in this database can compute it: it is the distance between what the host has
+    -- written locally and what S3 has acknowledged, and the volumes table carries
+    -- watermarks in sequence numbers, not bytes. It is also the number that
+    -- distinguishes the two ways a device fills — a busy host, and a host whose
+    -- object store stopped answering, which is the one that will not stop growing
+    -- because no local truncation may reclaim those records (INV-13).
+    nvme_remote_backlog_bytes BIGINT NOT NULL DEFAULT 0,
     -- There is deliberately no nvme_committed_bytes column (ADR-0017). Committed
     -- capacity is derived from the rows that already say who holds what; see the
     -- note at the bottom of this file.

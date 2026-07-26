@@ -17,14 +17,15 @@ type ControlPlaneLeader struct {
 }
 
 type Host struct {
-	HostID               uuid.UUID          `json:"host_id"`
-	State                string             `json:"state"`
-	AgentVersion         string             `json:"agent_version"`
-	MaxFormatVersion     int32              `json:"max_format_version"`
-	NvmeTotalBytes       int64              `json:"nvme_total_bytes"`
-	NvmeUsedBytes        int64              `json:"nvme_used_bytes"`
-	LastHeartbeat        pgtype.Timestamptz `json:"last_heartbeat"`
-	RenewalsBlockedUntil pgtype.Timestamptz `json:"renewals_blocked_until"`
+	HostID                 uuid.UUID          `json:"host_id"`
+	State                  string             `json:"state"`
+	AgentVersion           string             `json:"agent_version"`
+	MaxFormatVersion       int32              `json:"max_format_version"`
+	NvmeTotalBytes         int64              `json:"nvme_total_bytes"`
+	NvmeUsedBytes          int64              `json:"nvme_used_bytes"`
+	NvmeRemoteBacklogBytes int64              `json:"nvme_remote_backlog_bytes"`
+	LastHeartbeat          pgtype.Timestamptz `json:"last_heartbeat"`
+	RenewalsBlockedUntil   pgtype.Timestamptz `json:"renewals_blocked_until"`
 }
 
 type HostCommittedByte struct {
