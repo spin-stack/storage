@@ -185,16 +185,18 @@ func TestPGFleetSurface(t *testing.T) {
 	}
 
 	// Capacity accounting (§28.2): reserve, release, and refuse to go negative.
-	if err := store.CommitHostCapacity(ctx, term, hostA, 700); err != nil {
+	// (The bound and the expected-value predicate are pinned for both stores by the
+	// shared contract; these are the adapter's own round trips.)
+	if err := store.CommitHostCapacity(ctx, term, hostA, metadata.CapacityChange{DeltaBytes: 700, Limit: 1000}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CommitHostCapacity(ctx, term, hostA, -200); err != nil {
+	if err := store.CommitHostCapacity(ctx, term, hostA, metadata.CapacityChange{DeltaBytes: -200}); err != nil {
 		t.Fatal(err)
 	}
 	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 500 {
 		t.Fatalf("committed = %d, want 500", h.NVMeCommittedBytes)
 	}
-	if err := store.CommitHostCapacity(ctx, term, hostA, -501); !errors.Is(err, metadata.ErrCapacityUnderflow) {
+	if err := store.CommitHostCapacity(ctx, term, hostA, metadata.CapacityChange{DeltaBytes: -501}); !errors.Is(err, metadata.ErrCapacityUnderflow) {
 		t.Fatalf("over-release: want ErrCapacityUnderflow, got %v", err)
 	}
 	if h, _ := store.GetHost(ctx, hostA); h.NVMeCommittedBytes != 500 {
@@ -202,7 +204,7 @@ func TestPGFleetSurface(t *testing.T) {
 	}
 	staleTerm := term
 	term, _ = store.AcquireLeadership(ctx, "cp-b")
-	if err := store.CommitHostCapacity(ctx, staleTerm, hostA, 1); !errors.Is(err, metadata.ErrStaleTerm) {
+	if err := store.CommitHostCapacity(ctx, staleTerm, hostA, metadata.CapacityChange{DeltaBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale-term commit: want ErrStaleTerm, got %v", err)
 	}
 
@@ -452,13 +454,55 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var plan string
-	rows, err := pool.Query(ctx,
+	assertIndexed(t, pool, "volumes_primary_host_id_volume_id_idx", "volumes",
 		`EXPLAIN SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id`, hotHost)
+}
+
+// TestPGListOperationsByHostUsesItsIndex is the same rule for the other filter +
+// ORDER BY query. It runs before every pass of every drain, against a table that
+// only grows: completed operations are history and nothing deletes them, so a
+// sequential scan here gets slower for the rest of the cluster's life.
+func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	hotHost, coldHost := ids.New().String(), ids.New().String()
+	for _, h := range []string{hotHost, coldHost} {
+		if err := store.UpsertHost(ctx, term, metadata.Host{HostID: h, State: lifecycle.HostActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 2000 {
+		host := coldHost
+		if i%400 == 0 {
+			host = hotHost
+		}
+		if _, err := store.RecordOperation(ctx, term, metadata.Operation{
+			OperationID: ids.New().String(), Kind: lifecycle.OpDrain, HostID: host,
+			Phase: lifecycle.OpSucceeded, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `ANALYZE operations`); err != nil {
+		t.Fatal(err)
+	}
+
+	assertIndexed(t, pool, "operations_host_id_operation_id_idx", "operations",
+		`EXPLAIN SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id`, hotHost)
+}
+
+// assertIndexed fails unless the planner reaches for index on table for query.
+func assertIndexed(t *testing.T, pool *pgxpool.Pool, index, table, query string, args ...any) {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), query, args...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
+	var plan string
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
@@ -469,10 +513,10 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plan, "volumes_primary_host_id_volume_id_idx") {
-		t.Fatalf("ListVolumesByHost did not use its index:\n%s", plan)
+	if !strings.Contains(plan, index) {
+		t.Fatalf("the planner did not use %s:\n%s", index, plan)
 	}
-	if strings.Contains(plan, "Seq Scan on volumes") {
-		t.Fatalf("ListVolumesByHost still scans the whole table:\n%s", plan)
+	if strings.Contains(plan, "Seq Scan on "+table) {
+		t.Fatalf("the query still scans the whole %s table:\n%s", table, plan)
 	}
 }

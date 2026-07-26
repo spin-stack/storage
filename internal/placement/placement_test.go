@@ -212,17 +212,17 @@ func TestZeroPolicyRefusesOversubscription(t *testing.T) {
 }
 
 // Finding 12 (low). §28.2 declares a hard bound — committed/total may not exceed
-// MaxOversubscription — and Policy.Choose is the only place that evaluates it. Choose
-// is pure: it reads a host list and returns a name. Two callers that read the same
-// list (a drain and a clone, or two drains) both get the same destination, both
-// commit, and the destination lands past the bound with nobody having made a mistake.
-// Nothing on the write path re-checks it: CommitHostCapacity only guards against the
-// committed total going negative.
+// MaxOversubscription — and Policy.Choose is the only place that evaluates it at
+// placement time. Choose is pure: it reads a host list and returns a name. Two
+// callers that read the same list (a drain and a clone, or two drains) both get the
+// same destination, both commit, and the destination lands past the bound with
+// nobody having made a mistake.
 //
-// The bound belongs in the write that reserves — one statement that both adds the
-// bytes and refuses if the result breaks the policy. Until that exists, placement at
-// least has to *expose* the check, so the reserving path has something to call and
-// the rule lives in one place instead of being re-derived by every caller.
+// The bound therefore lives in the write that reserves — one statement that both
+// adds the bytes and refuses if the result breaks the policy (metadata.
+// CapacityChange.Limit, fed by Policy.Limit). This test is the other end of that
+// rule: the number the write is handed has to be the one Choose used, so the check
+// stays callable and stays a single copy.
 func TestTwoPlacementsRacingForOneDestination(t *testing.T) {
 	policy := placement.Policy{MaxOversubscription: 2.0}
 	dest := host("h-dest", lifecycle.HostActive, 100*gib, 150*gib)

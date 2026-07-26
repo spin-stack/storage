@@ -59,9 +59,11 @@ func (p Policy) maxRatio() float64 {
 // re-evaluated by whatever performs the reservation, and it has to be the same rule:
 // two copies of it is how a host ends up holding what placement believed it refused.
 //
-// This is the check, not the enforcement. Enforcement belongs inside the write that
-// adds the bytes — otherwise the read and the write are still two steps and the race
-// survives, just narrower.
+// This is the check; the enforcement is the same number handed to the write that
+// adds the bytes (metadata.CapacityChange.Limit, computed by Limit below), so the
+// bound is a predicate of that statement rather than a step before it. Re-checking
+// here and committing afterwards would leave the read and the write two steps apart,
+// and the race would survive — just narrower.
 func (p Policy) Admits(h metadata.Host, sizeBytes int64) bool {
 	if !h.State.AcceptsPlacement() || h.NVMeTotalBytes <= 0 {
 		return false

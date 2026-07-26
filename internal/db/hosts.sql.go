@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const commitHostCapacity = `-- name: CommitHostCapacity :execrows
@@ -17,19 +18,49 @@ UPDATE hosts
  WHERE host_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
    AND nvme_committed_bytes + $2 >= 0
+   AND ($2 <= 0 OR nvme_committed_bytes + $2 <= $4)
+   AND ($5::bigint IS NULL
+        OR nvme_committed_bytes = $5::bigint)
 `
 
 type CommitHostCapacityParams struct {
-	HostID             uuid.UUID `json:"host_id"`
-	NvmeCommittedBytes int64     `json:"nvme_committed_bytes"`
-	Term               int64     `json:"term"`
+	HostID             uuid.UUID   `json:"host_id"`
+	NvmeCommittedBytes int64       `json:"nvme_committed_bytes"`
+	Term               int64       `json:"term"`
+	LimitBytes         int64       `json:"limit_bytes"`
+	ExpectedBytes      pgtype.Int8 `json:"expected_bytes"`
 }
 
 // Reserve (positive) or release (negative) committed NVMe bytes (§28.2), term-
-// guarded. The non-negative guard makes an over-release affect 0 rows instead of
-// corrupting the accounting.
+// guarded. Every rule the ledger has is a predicate here rather than a check the
+// caller performs before calling, because each one of them is otherwise a window
+// between a read and a write:
+//
+//   - the non-negative guard makes an over-release affect 0 rows instead of
+//     corrupting the accounting;
+//   - the oversubscription bound makes two placements that raced for the same
+//     destination — both admitted by a pure placement.Choose against the same fleet
+//     read — land as one reservation and one ErrCapacityExceeded, instead of two
+//     reservations and a host past its declared ceiling. $4 is the policy's own
+//     answer for this host (placement.Policy.Limit), so there is one copy of the
+//     rule rather than a second one written in SQL;
+//   - the `$2 <= 0` disjunct exempts *releases* from the bound. A host can be above
+//     its ceiling for reasons that have nothing to do with this write (a tightened
+//     policy, a device that came back smaller), and a release that bounced off the
+//     bound would wedge the only operation that can bring it back down;
+//   - the expected value, when the caller supplies one, is what makes a resumed
+//     operation's "did my own delta already land?" a single statement. A delta is
+//     not an idempotency key: the recorded before-value is the only proof there is,
+//     and comparing it in Go leaves a window in which a third party's change — one
+//     that nets to exactly one volume size — is indistinguishable from our own.
 func (q *Queries) CommitHostCapacity(ctx context.Context, arg CommitHostCapacityParams) (int64, error) {
-	result, err := q.db.Exec(ctx, commitHostCapacity, arg.HostID, arg.NvmeCommittedBytes, arg.Term)
+	result, err := q.db.Exec(ctx, commitHostCapacity,
+		arg.HostID,
+		arg.NvmeCommittedBytes,
+		arg.Term,
+		arg.LimitBytes,
+		arg.ExpectedBytes,
+	)
 	if err != nil {
 		return 0, err
 	}

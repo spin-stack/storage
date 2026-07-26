@@ -43,6 +43,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +78,8 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
+		{"CapacityIsBoundedAndConditional", capacity},
+		{"OperationsAreListableByHost", operationsByHost},
 		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
 	for _, tc := range cases {
@@ -132,6 +135,22 @@ func revokeHostLease(ctx context.Context, s metadata.Store, term int64, hostID s
 		return fmt.Errorf("%w: no RevokeHostLease (§12.6: nothing can take a lease back)", errNotExpressible)
 	}
 	return m.RevokeHostLease(ctx, term, hostID)
+}
+
+type capacityCommitter interface {
+	CommitHostCapacity(ctx context.Context, term int64, hostID string, c metadata.CapacityChange) error
+}
+
+// commitCapacity is the §28.2 ledger write. A bare delta cannot express either of
+// the two things the write has to decide: whether the reservation stays inside the
+// declared oversubscription bound, and whether the ledger is still where the caller
+// last saw it. Both are check-then-act in Go and races in production.
+func commitCapacity(ctx context.Context, s metadata.Store, term int64, hostID string, c metadata.CapacityChange) error {
+	m, ok := s.(capacityCommitter)
+	if !ok {
+		return fmt.Errorf("%w: CommitHostCapacity takes a bare delta (§28.2: neither the oversubscription bound nor an expected value is expressible at the write)", errNotExpressible)
+	}
+	return m.CommitHostCapacity(ctx, term, hostID, c)
 }
 
 type authorityClocker interface {
@@ -226,7 +245,7 @@ func everyMutation() []mutation {
 			return s.SetHostState(ctx, term, w.host, lifecycle.HostCordoned)
 		}},
 		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.CommitHostCapacity(ctx, term, w.host, 1)
+			return s.CommitHostCapacity(ctx, term, w.host, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.RenewHostLease(ctx, term, w.host, 10)
@@ -326,7 +345,7 @@ func missingRows(t *testing.T, s metadata.Store) {
 			return s.SetHostState(ctx, term, ghostHost, lifecycle.HostCordoned)
 		}},
 		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CommitHostCapacity(ctx, term, ghostHost, 1)
+			return s.CommitHostCapacity(ctx, term, ghostHost, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
@@ -412,10 +431,10 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 			return err
 		}},
 		{"missing host under a stale term", func() error {
-			return s.CommitHostCapacity(ctx, stale, ghost, 1)
+			return s.CommitHostCapacity(ctx, stale, ghost, metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"over-release under a stale term", func() error {
-			return s.CommitHostCapacity(ctx, stale, w.host, -1)
+			return s.CommitHostCapacity(ctx, stale, w.host, metadata.CapacityChange{DeltaBytes: -1})
 		}},
 		{"illegal host transition under a stale term", func() error {
 			return s.SetHostState(ctx, stale, w.host, lifecycle.HostActive)
@@ -606,7 +625,7 @@ func watermarks(t *testing.T, s metadata.Store) {
 func upsertHost(t *testing.T, s metadata.Store) {
 	ctx := context.Background()
 	w := newWorld(t, s)
-	if err := s.CommitHostCapacity(ctx, w.term, w.host, 700); err != nil {
+	if err := s.CommitHostCapacity(ctx, w.term, w.host, metadata.CapacityChange{DeltaBytes: 700, Limit: 1 << 40}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned); err != nil {
@@ -879,6 +898,187 @@ func hostLeases(t *testing.T, s metadata.Store) {
 	})
 }
 
+// capacity: §28.2's oversubscription bound and the compare-and-set every resumed
+// Control-Plane operation's exactly-once proof rests on.
+//
+// placement.Choose evaluates the bound correctly and is pure, which is exactly why
+// it cannot enforce it: two operations that read the fleet before either reserved
+// anything — a drain and a clone, or two drains — choose the same destination, both
+// commit, and the host ends up past MaxOversubscription × NVMeTotalBytes with
+// neither caller having made a mistake. Re-checking in Go narrows the window and
+// keeps the race. The same is true of the delta: an operation that resumes cannot
+// tell "my change already landed" from "somebody else's change happens to add up",
+// unless the comparison is inside the statement that writes.
+//
+// The steps run in order against one host: each case's wantCommitted is the state
+// the next one starts from, so a write that lands when it should not is visible in
+// the case after it as well as in its own.
+func capacity(t *testing.T, s metadata.Store) {
+	ctx := context.Background()
+	w := newWorld(t, s) // one ACTIVE host, 1 TiB of NVMe, nothing committed
+	const (
+		gib   = int64(1) << 30
+		total = int64(1) << 40 // 1024 GiB
+	)
+	stale := int64(999 * gib)
+
+	tests := []struct {
+		name          string
+		change        metadata.CapacityChange
+		wantErr       error
+		wantCommitted int64
+	}{
+		{
+			// A 1.0 policy: committed may not exceed total.
+			name:          "a reservation inside the bound lands",
+			change:        metadata.CapacityChange{DeltaBytes: 600 * gib, Limit: total},
+			wantCommitted: 600 * gib,
+		},
+		{
+			// The second half of the race above: the same decision, taken against the
+			// same fleet read, arriving after the first one landed.
+			name:          "the placement that lost the race is refused, not absorbed",
+			change:        metadata.CapacityChange{DeltaBytes: 600 * gib, Limit: total},
+			wantErr:       metadata.ErrCapacityExceeded,
+			wantCommitted: 600 * gib,
+		},
+		{
+			name:          "exactly at the bound is admitted",
+			change:        metadata.CapacityChange{DeltaBytes: 424 * gib, Limit: total},
+			wantCommitted: total,
+		},
+		{
+			name:          "one byte past the bound is refused",
+			change:        metadata.CapacityChange{DeltaBytes: 1, Limit: total},
+			wantErr:       metadata.ErrCapacityExceeded,
+			wantCommitted: total,
+		},
+		{
+			// The host is above the bound offered here — a tightened policy, a device
+			// that came back smaller. A release that bounced off the bound would leave
+			// the only operation that can fix the situation unable to run.
+			name:          "a release is never bounded",
+			change:        metadata.CapacityChange{DeltaBytes: -24 * gib, Limit: 512 * gib},
+			wantCommitted: 1000 * gib,
+		},
+		{
+			name:          "an over-release is still an underflow",
+			change:        metadata.CapacityChange{DeltaBytes: -1001 * gib, Limit: total},
+			wantErr:       metadata.ErrCapacityUnderflow,
+			wantCommitted: 1000 * gib,
+		},
+		{
+			name:          "a conditional change lands when the ledger is where the caller left it",
+			change:        metadata.CapacityChange{DeltaBytes: 24 * gib, Limit: total}.Expecting(1000 * gib),
+			wantCommitted: total,
+		},
+		{
+			// The caller recorded 1000 GiB before its previous attempt; the ledger is
+			// now 1024. Applying the delta anyway either double-releases or eats a
+			// reservation belonging to a volume nobody is moving.
+			name:          "a conditional change whose expectation is stale writes nothing",
+			change:        metadata.CapacityChange{DeltaBytes: -24 * gib, Limit: total}.Expecting(1000 * gib),
+			wantErr:       metadata.ErrCapacityConflict,
+			wantCommitted: total,
+		},
+		{
+			// Both predicates fail. The expectation wins the diagnosis: when the ledger
+			// is not where the caller last saw it, everything else the caller computed
+			// from that read — the bound included — was computed about another world.
+			name:          "a stale expectation is reported before the bound",
+			change:        metadata.CapacityChange{DeltaBytes: gib, Limit: 0}.Expecting(stale),
+			wantErr:       metadata.ErrCapacityConflict,
+			wantCommitted: total,
+		},
+		{
+			name:          "a conditional release with a matching expectation lands",
+			change:        metadata.CapacityChange{DeltaBytes: -total, Limit: 0}.Expecting(total),
+			wantCommitted: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := commitCapacity(ctx, s, w.term, w.host, tc.change)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("CommitHostCapacity(%+v) = %v, want %v", tc.change, err, tc.wantErr)
+			}
+			h, gerr := s.GetHost(ctx, w.host)
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if h.NVMeCommittedBytes != tc.wantCommitted {
+				t.Fatalf("committed = %d, want %d", h.NVMeCommittedBytes, tc.wantCommitted)
+			}
+		})
+	}
+}
+
+// operationsByHost: an operation id is the only handle GetOperation offers, and the
+// question a reconciler has to answer before it starts work on a host — "is anything
+// already happening here?" — arrives with a *different* id every time. The listing is
+// what a second drain of one host is refused by, so its filter has to be exact: an
+// operation belonging to another host, or to no host at all, must never be counted
+// as work in progress here.
+func operationsByHost(t *testing.T, s metadata.Store) {
+	ctx := context.Background()
+	w := newWorld(t, s) // records one drain operation for w.host
+
+	other := id()
+	if err := s.UpsertHost(ctx, w.term, metadata.Host{
+		HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A second operation on the same host, one on another host, and one recorded
+	// with no host at all (a cancellation that arrived before the drain started).
+	mine := id()
+	for _, op := range []metadata.Operation{
+		{OperationID: mine, Kind: lifecycle.OpDrain, HostID: w.host, Phase: lifecycle.OpRunning},
+		{OperationID: id(), Kind: lifecycle.OpDrain, HostID: other, Phase: lifecycle.OpPending},
+		{OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpCanceling},
+	} {
+		op.DesiredState, op.CurrentState = []byte(`{}`), []byte(`{}`)
+		if _, err := s.RecordOperation(ctx, w.term, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ops, err := s.ListOperationsByHost(ctx, w.host)
+	if err != nil {
+		t.Fatalf("ListOperationsByHost: %v", err)
+	}
+	got := make([]string, 0, len(ops))
+	for _, op := range ops {
+		if op.HostID != w.host {
+			t.Fatalf("operation %s belongs to host %q", op.OperationID, op.HostID)
+		}
+		got = append(got, op.OperationID)
+	}
+	want := []string{w.op, mine}
+	sort.Strings(want) // the listing is ordered by operation id (INV-02)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("operations for the host = %v, want %v", got, want)
+	}
+	if ops[0].Kind != lifecycle.OpDrain || ops[0].Phase == "" {
+		t.Fatalf("the listing must round-trip kind and phase: %+v", ops[0])
+	}
+
+	t.Run("a host with no operations lists none", func(t *testing.T) {
+		ops, err := s.ListOperationsByHost(ctx, id())
+		if err != nil || len(ops) != 0 {
+			t.Fatalf("unknown host: %d operations, err=%v", len(ops), err)
+		}
+	})
+
+	t.Run("an empty host id is rejected", func(t *testing.T) {
+		// Not "every operation nobody attached to a host": that set is exactly the
+		// one a caller of this must never be handed.
+		if _, err := s.ListOperationsByHost(ctx, ""); !errors.Is(err, metadata.ErrInvalidID) {
+			t.Fatalf("empty host id: want ErrInvalidID, got %v", err)
+		}
+	})
+}
+
 // authorityClock: `last_renewal` is stamped by the store's clock, and the fencing
 // deadline is derived from it. A Control Plane that compares that stamp against its
 // own wall clock shortens the wait by exactly the offset between the two — an NTP
@@ -930,7 +1130,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			return s.SetHostState(ctx, term, "", lifecycle.HostCordoned)
 		}},
 		{"CommitHostCapacity", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CommitHostCapacity(ctx, term, "", 1)
+			return s.CommitHostCapacity(ctx, term, "", metadata.CapacityChange{DeltaBytes: 1, Limit: 1 << 40})
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, "", 10)

@@ -43,6 +43,12 @@ var (
 	// placement under-uses forever, so it is surfaced rather than swallowed (§28.2).
 	ErrReservationNotReleased = errors.New("controlplane: a destination reservation could not be released")
 
+	// ErrHostAlreadyDraining means another drain operation is still live for this
+	// host. Two evacuations of one host capture the same plan and promote the same
+	// volumes; the one that loses each race holds a destination reservation that
+	// nobody will ever release, and placement under-uses that host forever (§28.2).
+	ErrHostAlreadyDraining = errors.New("controlplane: the host already has a live drain operation")
+
 	// ErrDurableRegression means a move was about to record an epoch boundary below
 	// what the volume already had durable. The boundary is immutable and is what
 	// every later recovery treats as the floor, so writing one that goes backwards
@@ -127,6 +133,12 @@ type progress struct {
 	Total   int              `json:"total"`
 	Current string           `json:"current_volume,omitempty"`
 	Volumes []volumeProgress `json:"volumes,omitempty"`
+	// SrcLease is the latest renewal of the source host's lease this operation ever
+	// observed, recorded *before* the lease was revoked. Once the row is gone nothing
+	// can read that instant again, and a promotion with no instant to measure from
+	// refuses outright rather than guess (ErrSourceLeaseUnknown, §12.3), so every
+	// later pass measures the same fencing wait from what this one saw.
+	SrcLease time.Time `json:"src_lease_renewed_at,omitzero"`
 }
 
 // volume returns the recorded progress for volumeID, or nil if this operation has
@@ -249,6 +261,11 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 		// ACTIVE takes it out of placement again, silently, while the call reports
 		// success. That is why the cordon lives behind this short-circuit.
 		return DrainResult{Phase: op.Phase, Remaining: prog.remaining()}, nil
+	}
+
+	// One live evacuation per host, decided before anything is written.
+	if err := d.exclusive(ctx, hostID, operationID); err != nil {
+		return DrainResult{}, err
 	}
 
 	// Cordon first: even if this pass aborts immediately, nothing new lands here.
@@ -377,6 +394,42 @@ func (d *Drainer) operation(ctx context.Context, hostID, operationID string) (pl
 	return p, prog, &op, nil
 }
 
+// exclusive refuses to start a second evacuation of a host that already has one.
+// Two drains of one host are not two halves of the same work: each captures its own
+// plan, each promotes the same volumes, and whichever loses a race is left holding a
+// destination reservation nobody will release, because releasing it is the losing
+// operation's own next step and that step now fails forever (§28.2). The volumes are
+// safe either way — the promotion protocol serializes them — but the accounting is
+// not, and a host that placement believes is full is a host that stays empty.
+//
+// "Live" is the operation lifecycle's own answer: not Terminal. FAILED counts as
+// live deliberately, because FAILED -> RUNNING is a legal move and the reconciler
+// will resume it; an operator who really wants a different operation id cancels the
+// first one. A drain never blocks itself, so its own later passes are unaffected.
+//
+// This is a read followed by a write rather than a database constraint. The
+// alternative — a unique partial index over live drain operations per host — would
+// make it atomic, but it puts "live" in a migration instead of in the lifecycle
+// table, and it surfaces as a constraint violation through an INSERT whose ON
+// CONFLICT clause already belongs to operation_id, which the caller cannot tell from
+// any other integrity error. The Control Plane is single-active and every write here
+// is term-guarded, so the window this leaves is two goroutines inside one leader,
+// not two leaders; if that ever becomes real, the index is the answer.
+func (d *Drainer) exclusive(ctx context.Context, hostID, operationID string) error {
+	ops, err := d.md.ListOperationsByHost(ctx, hostID)
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		if op.Kind != lifecycle.OpDrain || op.OperationID == operationID || op.Phase.Terminal() {
+			continue
+		}
+		return fmt.Errorf("%w: %s is already being drained by operation %s (%s)",
+			ErrHostAlreadyDraining, hostID, op.OperationID, op.Phase)
+	}
+	return nil
+}
+
 // move evacuates one volume: place → reserve → bulk materialize → fence → final
 // materialize → epoch boundary → release the source's reservation. Every step is
 // preceded by a durable note of the intent, so a resumed pass continues from a fact
@@ -445,15 +498,16 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 
 		// Fence the source before the destination can write: promotion waits out
 		// lease_ttl + max_clock_skew and CASes the epoch object (§12.3–12.4).
-		// No lease row means the host never held one (or it was already revoked): the
-		// zero instant puts the fencing deadline far in the past, so promotion proceeds.
-		var renewedAt time.Time
-		if l, lerr := d.md.GetHostLease(ctx, v.PrimaryHostID); lerr == nil {
-			renewedAt = l.LastRenewal
-		} else if !errors.Is(lerr, metadata.ErrNotFound) {
-			return Move{}, d.abandon(ctx, term, operationID, prog, v, lerr)
+		//
+		// The revocation is skipped once the volume is already on the destination —
+		// this operation's own promotion, being resumed. The lease this would take
+		// away then is the one that promotion granted to the *new* writer.
+		if v.PrimaryHostID != vp.ToHost {
+			if ferr := d.fenceSource(ctx, term, operationID, v.PrimaryHostID, prog); ferr != nil {
+				return Move{}, d.abandon(ctx, term, operationID, prog, v, ferr)
+			}
 		}
-		newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, renewedAt, vp.ToHost)
+		newEpoch, err := d.promoter.Promote(ctx, term, v.VolumeID, prog.SrcLease, vp.ToHost)
 		if err != nil {
 			return Move{}, d.abandon(ctx, term, operationID, prog, v, err)
 		}
@@ -522,6 +576,44 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 	}, nil
 }
 
+// fenceSource is the Control Plane withdrawing its own record of hostID as a writer:
+// it notes when the host's lease was last renewed and then takes the lease away
+// (term-guarded). Both steps, in that order, before the promotion waits the fence
+// out (§12.3).
+//
+// The revocation is what makes a *healthy* host evacuable. The drain refuses to
+// promote a source whose lease is live, so on a host that is up and heartbeating the
+// deadline keeps moving forward and the evacuation never starts. Deleting the row is
+// the CP saying it will not count that host as a writer again.
+//
+// It shortens nothing. The Agent counts its own copy of the lease down on a
+// monotonic clock (§12.2) and never learns the row is gone, so the promotion still
+// waits out last_renewal + lease_ttl + max_clock_skew — which is why the instant is
+// recorded, and saved, *before* the row that carries it is deleted. A later pass
+// finds no lease and measures from what this one saw; a host that renewed again in
+// the meantime moves that instant forward, never back.
+//
+// No lease row and nothing recorded means the host never held one. That is "I know
+// nothing", not "it expired long ago", and the promoter refuses on it (§12.3) unless
+// the fleet has recorded the host DEAD — the drain does not paper over it here.
+func (d *Drainer) fenceSource(ctx context.Context, term int64, operationID, hostID string, prog *progress) error {
+	l, err := d.md.GetHostLease(ctx, hostID)
+	switch {
+	case err == nil:
+		if prog.SrcLease.Before(l.LastRenewal) {
+			prog.SrcLease = l.LastRenewal
+			if serr := d.save(ctx, term, operationID, *prog); serr != nil {
+				return serr
+			}
+		}
+	case errors.Is(err, metadata.ErrNotFound):
+		return nil // already revoked by an earlier pass, or never held
+	default:
+		return err
+	}
+	return d.md.RevokeHostLease(ctx, term, hostID)
+}
+
 // choose picks the destination for a volume (§20 step 2 / §22.3: a warm standby is
 // already hydrated, so the move is short).
 func (d *Drainer) choose(ctx context.Context, v metadata.Volume) (string, error) {
@@ -557,7 +649,11 @@ func (d *Drainer) stillOurs(v metadata.Volume, source string, vp *volumeProgress
 func (d *Drainer) abandon(ctx context.Context, term int64, operationID string, prog *progress, v metadata.Volume, cause error) error {
 	errs := []error{cause}
 	if vp := prog.volume(v.VolumeID); vp != nil {
-		if rerr := d.md.CommitHostCapacity(ctx, term, vp.ToHost, -v.SizeBytes); rerr != nil {
+		// A release is never bounded: the destination may be over its ceiling by now
+		// (another placement landed there), and refusing to hand the bytes back would
+		// leave the reservation stranded on exactly the host that can least afford it.
+		if rerr := d.md.CommitHostCapacity(ctx, term, vp.ToHost,
+			metadata.CapacityChange{DeltaBytes: -v.SizeBytes}); rerr != nil {
 			errs = append(errs, fmt.Errorf("%w: %s still holds %d bytes for %s: %w",
 				ErrReservationNotReleased, vp.ToHost, v.SizeBytes, v.VolumeID, rerr))
 		}
@@ -570,33 +666,47 @@ func (d *Drainer) abandon(ctx context.Context, term int64, operationID string, p
 }
 
 // applyCapacity moves a host's committed bytes by delta exactly once across resumed
-// passes. CommitHostCapacity is a delta, not a compare-and-set, so the only proof a
-// resumed pass has that its own delta already landed is the ledger value recorded
-// before it was attempted: `before` means it did not, `before+delta` means it did.
-// Anything else is a third party writing the same books, and it is reported rather
-// than guessed — releasing twice either wedges the drain with ErrCapacityUnderflow
-// or silently consumes another volume's reservation.
+// passes, under the §28.2 bound.
 //
-// What this cannot see is a third party whose changes cancel out to exactly one
-// volume size in the meantime; a compare-and-set on the reserving query is the only
-// thing that would close that, and it belongs to the store, not here (§28.2).
+// A first attempt is an unconditional change: there is nothing to be idempotent
+// about yet, and what protects it is the bound — the placement decision behind it
+// was taken against a fleet read that any number of other operations shared, so the
+// statement that adds the bytes is the only place the ceiling still means anything.
+//
+// A resumed attempt is conditional. CommitHostCapacity is a delta, not an
+// idempotency key, so the only proof this pass has that its own change already
+// landed is the ledger value recorded before it was attempted: `before` means it did
+// not, `before+delta` means it did. Comparing those in Go leaves a window in which a
+// third party's change is indistinguishable from ours, so the comparison is a
+// predicate of the write itself; a ledger that moved comes back as
+// ErrCapacityConflict with nothing applied, and the drain reports it rather than
+// guessing. Releasing twice either wedges the drain with ErrCapacityUnderflow or
+// silently consumes another volume's reservation.
 func (d *Drainer) applyCapacity(ctx context.Context, term int64, hostID string, delta, before int64, resumed bool) error {
-	if !resumed {
-		return d.md.CommitHostCapacity(ctx, term, hostID, delta)
-	}
 	h, err := d.md.GetHost(ctx, hostID)
 	if err != nil {
 		return err
 	}
-	switch h.NVMeCommittedBytes {
-	case before + delta:
-		return nil // an earlier pass already applied it
-	case before:
-		return d.md.CommitHostCapacity(ctx, term, hostID, delta)
-	default:
-		return fmt.Errorf("%w: %s holds %d committed bytes, expected %d before the change or %d after",
-			ErrCapacityLedgerMoved, hostID, h.NVMeCommittedBytes, before, before+delta)
+	change := metadata.CapacityChange{DeltaBytes: delta, Limit: d.policy.Limit(h)}
+	if resumed {
+		change = change.Expecting(before)
 	}
+	err = d.md.CommitHostCapacity(ctx, term, hostID, change)
+	if !errors.Is(err, metadata.ErrCapacityConflict) {
+		return err
+	}
+	// The ledger is not where this pass left it. An earlier pass of this same
+	// operation having applied the delta is the one reading that is still ours to
+	// finish; anything else is a third party writing the same books.
+	h, gerr := d.md.GetHost(ctx, hostID)
+	if gerr != nil {
+		return gerr
+	}
+	if resumed && h.NVMeCommittedBytes == before+delta {
+		return nil
+	}
+	return fmt.Errorf("%w: %s holds %d committed bytes, expected %d before the change or %d after: %w",
+		ErrCapacityLedgerMoved, hostID, h.NVMeCommittedBytes, before, before+delta, err)
 }
 
 // guardDurableFloor refuses a boundary that would move the durable point backwards.
