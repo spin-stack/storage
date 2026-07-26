@@ -178,3 +178,40 @@ func TestTermClaimKeysSortNumerically(t *testing.T) {
 		})
 	}
 }
+
+// HighestClaimedTerm is the diagnostic the ADR promises an operator: the bucket's
+// view of leadership, which is the one that survives the restore.
+func TestHighestClaimedTermReadsTheBucketNotTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	e := controlplane.NewElector(&scriptedTerms{terms: []int64{1, 2, 3}}, store)
+
+	if got, err := e.HighestClaimedTerm(ctx); err != nil || got != 0 {
+		t.Fatalf("with no claims: %d, %v; want 0, nil", got, err)
+	}
+	for range 3 {
+		if _, err := e.Acquire(ctx, "cp-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := e.HighestClaimedTerm(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Fatalf("highest claimed term = %d, want 3", got)
+	}
+}
+
+// An unreadable claim is not a zero: reporting 0 would tell an operator comparing the
+// bucket against the database that nothing was ever issued.
+func TestHighestClaimedTermRefusesAnUnreadableClaim(t *testing.T) {
+	ctx := context.Background()
+	store := sim.NewObjectStore()
+	if _, err := store.Put(ctx, controlplane.TermClaimKey(7), []byte("not json"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlplane.NewElector(nil, store).HighestClaimedTerm(ctx); err == nil {
+		t.Fatal("an unreadable term claim was reported as no claim at all")
+	}
+}
