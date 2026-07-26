@@ -118,7 +118,7 @@ func TestStaleWriterCannotPublishAfterPromotion(t *testing.T) {
 		t.Fatalf("stale writer CAS: want ErrCASConflict, got %v", err)
 	}
 	// And a zombie CP (stale term) cannot mutate PG (§7).
-	if _, err := md.BumpVolumeEpoch(ctx, term-1, volID, host1); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := md.BumpVolumeEpoch(ctx, term-1, volID, host1, 1); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale-term bump: want ErrStaleTerm, got %v", err)
 	}
 }

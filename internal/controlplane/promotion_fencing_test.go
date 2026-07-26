@@ -32,9 +32,18 @@ const (
 type fenceWorld struct {
 	md     metadata.Store
 	epochs *epoch.Store
-	clk    *sim.Clock
+	clk    *sim.Clock // the Control Plane's wall clock
+	dbClk  *sim.Clock // the store's clock: what stamps last_renewal (§12.1)
 	p      *controlplane.Promoter
 	term   int64
+}
+
+// advance moves both clocks together. They are separate objects so that a test can
+// skew one against the other — the case where the CP's container clock jumps and the
+// database's does not — but by default they agree.
+func (w *fenceWorld) advance(d time.Duration) {
+	w.clk.Advance(d)
+	w.dbClk.Advance(d)
 }
 
 // newFenceWorld builds a volume on fenceHostA at epoch 1. No lease row exists yet:
@@ -43,7 +52,8 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 	t.Helper()
 	ctx := context.Background()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	md := metasim.New(clk.Wall)
+	dbClk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	md := metasim.New(dbClk.Wall)
 	epochs := epoch.NewStore(sim.NewObjectStore())
 
 	term, err := md.AcquireLeadership(ctx, "cp")
@@ -66,9 +76,18 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 		t.Fatal(err)
 	}
 	return &fenceWorld{
-		md: md, epochs: epochs, clk: clk, term: term,
+		md: md, epochs: epochs, clk: clk, dbClk: dbClk, term: term,
 		p: controlplane.NewPromoter(md, epochs, clk, fenceTTL, fenceSkew),
 	}
+}
+
+func (w *fenceWorld) state(t *testing.T) lifecycle.VolumeState {
+	t.Helper()
+	v, err := w.md.GetVolume(context.Background(), fenceVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v.State
 }
 
 func (w *fenceWorld) unchanged(t *testing.T, wantEpoch int64, wantPrimary string) {
@@ -96,7 +115,7 @@ func (w *fenceWorld) unchanged(t *testing.T, wantEpoch int64, wantPrimary string
 func TestPromoteRefusesWhenTheSourceLeaseRecordIsMissing(t *testing.T) {
 	ctx := context.Background()
 	w := newFenceWorld(t)
-	w.clk.Advance(time.Hour) // however long the CP has been up, it never observed the lease
+	w.advance(time.Hour) // however long the CP has been up, it never observed the lease
 
 	_, err := w.p.Promote(ctx, w.term, fenceVol, time.Time{}, fenceHostB)
 	if !errors.Is(err, controlplane.ErrSourceLeaseUnknown) {
@@ -114,7 +133,7 @@ func TestPromoteOfAnObservedDeadSourceProceedsWithoutALeaseRow(t *testing.T) {
 	if err := w.md.SetHostState(ctx, w.term, fenceHostA, lifecycle.HostDead); err != nil {
 		t.Fatal(err)
 	}
-	w.clk.Advance(time.Hour)
+	w.advance(time.Hour)
 
 	got, err := w.p.Promote(ctx, w.term, fenceVol, time.Time{}, fenceHostB)
 	if err != nil {
@@ -134,7 +153,7 @@ func TestPromoteMeasuresTheWaitAgainstTheFencedHostsOwnLease(t *testing.T) {
 	w := newFenceWorld(t)
 
 	stale := w.clk.Wall() // what the caller observed at T0
-	w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+	w.advance(fenceTTL + fenceSkew + time.Second)
 	// ... but the source renewed its lease in the meantime: it is alive and ACKing.
 	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
 		t.Fatal(err)
@@ -146,7 +165,7 @@ func TestPromoteMeasuresTheWaitAgainstTheFencedHostsOwnLease(t *testing.T) {
 	w.unchanged(t, 1, fenceHostA)
 
 	// Once the source's own lease can no longer be valid, the promotion goes ahead.
-	w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+	w.advance(fenceTTL + fenceSkew + time.Second)
 	if _, err := w.p.Promote(ctx, w.term, fenceVol, stale, fenceHostB); err != nil {
 		t.Fatalf("promote after the source's lease expired: %v", err)
 	}
@@ -164,7 +183,7 @@ func TestPromoteRefusesWhenTheVolumeMovedOnSinceTheCommandWasIssued(t *testing.T
 		t.Fatal(err)
 	}
 	observed := w.clk.Wall()
-	w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+	w.advance(fenceTTL + fenceSkew + time.Second)
 
 	first, err := w.p.Promote(ctx, w.term, fenceVol, observed, fenceHostB)
 	if err != nil {
@@ -195,13 +214,13 @@ func TestPromoteHonoursALeaseTTLLongerThanTheConfiguredOne(t *testing.T) {
 	}
 	renewedAt := w.clk.Wall()
 
-	w.clk.Advance(fenceTTL + fenceSkew + time.Second) // past the *configured* deadline only
+	w.advance(fenceTTL + fenceSkew + time.Second) // past the *configured* deadline only
 	if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
 		t.Fatalf("promote inside the granted 60s lease: err = %v, want ErrFencingWaitNotElapsed", err)
 	}
 	w.unchanged(t, 1, fenceHostA)
 
-	w.clk.Advance(granted + fenceSkew)
+	w.advance(granted + fenceSkew)
 	if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); err != nil {
 		t.Fatalf("promote after the granted lease expired: %v", err)
 	}
@@ -243,7 +262,7 @@ func TestPromoteRefusesAHostThatCannotTakeTheVolume(t *testing.T) {
 				t.Fatal(err)
 			}
 			renewedAt := w.clk.Wall()
-			w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+			w.advance(fenceTTL + fenceSkew + time.Second)
 			if tc.prep != nil {
 				tc.prep(t, w)
 			}
@@ -280,7 +299,7 @@ func TestPromoteRefusesWhenTheSourceLeaseCannotBeRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	renewedAt := w.clk.Wall()
-	w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+	w.advance(fenceTTL + fenceSkew + time.Second)
 
 	down := errors.New("metadata unavailable")
 	p := controlplane.NewPromoter(unreadableLeases{Store: w.md, err: down}, w.epochs, w.clk, fenceTTL, fenceSkew)
@@ -295,7 +314,7 @@ func TestPromoteRefusesWhenTheSourceLeaseCannotBeRead(t *testing.T) {
 func TestPromoteOfAVolumeWithNoPrimaryNeedsNoWait(t *testing.T) {
 	ctx := context.Background()
 	w := newFenceWorld(t)
-	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, fenceVol, ""); err != nil {
+	if _, err := w.md.BumpVolumeEpoch(ctx, w.term, fenceVol, "", 1); err != nil {
 		t.Fatal(err)
 	}
 	if _, etag, err := w.epochs.Current(ctx, fenceVol); err != nil {
@@ -324,7 +343,7 @@ func TestPromoteFinishesAResumeOntoAHostThatWasCordonedMeanwhile(t *testing.T) {
 		t.Fatal(err)
 	}
 	renewedAt := w.clk.Wall()
-	w.clk.Advance(fenceTTL + fenceSkew + time.Second)
+	w.advance(fenceTTL + fenceSkew + time.Second)
 
 	first, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB)
 	if err != nil {
@@ -340,5 +359,113 @@ func TestPromoteFinishesAResumeOntoAHostThatWasCordonedMeanwhile(t *testing.T) {
 	}
 	if again != first {
 		t.Fatalf("the retry granted epoch %d after %d", again, first)
+	}
+}
+
+// TestPromoteRecordsTheFencingWaitDurably is the §7 machine, which until now nothing
+// drove: a volume mid-fence was stored as ACTIVE, so a restarted Control Plane, a
+// second reconciler pass or an operator saw a healthy volume and could start a
+// competing promotion. The state has to be in PostgreSQL *before* the wait — the
+// window it covers is exactly the minutes the wait lasts — and RECOVERY_REQUIRED
+// after the epoch is granted, because §7 never lets a fenced volume go straight back
+// to serving.
+func TestPromoteRecordsTheFencingWaitDurably(t *testing.T) {
+	ctx := context.Background()
+	w := newFenceWorld(t)
+	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	renewedAt := w.clk.Wall()
+
+	if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("promote inside the wait: err = %v, want ErrFencingWaitNotElapsed", err)
+	}
+	if got := w.state(t); got != lifecycle.VolumeFencingWait {
+		t.Fatalf("volume state during the fencing wait = %q, want FENCING_WAIT", got)
+	}
+
+	w.advance(fenceTTL + fenceSkew + time.Second)
+	if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); err != nil {
+		t.Fatalf("promote after the wait: %v", err)
+	}
+	if got := w.state(t); got != lifecycle.VolumeRecoveryRequired {
+		t.Fatalf("volume state after the epoch was granted = %q, want RECOVERY_REQUIRED", got)
+	}
+	// And running it again — the reconciler always does — keeps it there.
+	if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); err != nil {
+		t.Fatalf("re-running a completed promotion: %v", err)
+	}
+	if got := w.state(t); got != lifecycle.VolumeRecoveryRequired {
+		t.Fatalf("volume state after a retry = %q, want RECOVERY_REQUIRED", got)
+	}
+}
+
+// TestPromoteRefusesADetachedVolume: nothing is attached, so there is no writer to
+// fence and no guest to serve. Promoting one would grant an epoch and a lease for a
+// volume the Control Plane has already released.
+func TestPromoteRefusesADetachedVolume(t *testing.T) {
+	ctx := context.Background()
+	w := newFenceWorld(t)
+	if err := w.md.SetVolumeState(ctx, w.term, fenceVol, lifecycle.VolumeDetached); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	renewedAt := w.clk.Wall()
+	w.advance(fenceTTL + fenceSkew + time.Second)
+
+	if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); !errors.Is(err, controlplane.ErrVolumeNotPromotable) {
+		t.Fatalf("promoting a DETACHED volume: err = %v, want ErrVolumeNotPromotable", err)
+	}
+	w.unchanged(t, 1, fenceHostA)
+}
+
+// TestAControlPlaneClockAheadOfTheDatabaseDoesNotGrantEarly is the twin of
+// TestDriftOnlyLengthensTheWait, in the direction that loses data.
+//
+// `last_renewal` is stamped by the database's clock; the deadline derived from it was
+// compared against the Control Plane's own wall clock. If the CP's clock jumps
+// forward — an NTP correction, a VM restored from a snapshot, a bad RTC — the wait is
+// shortened by exactly that offset, and epoch N+1 is granted while the old writer's
+// monotonic lease is still valid. Only the safe direction was ever tested.
+func TestAControlPlaneClockAheadOfTheDatabaseDoesNotGrantEarly(t *testing.T) {
+	tests := []struct {
+		name string
+		skew time.Duration
+		want error
+	}{
+		// Inside the configured bound: the promotion is simply not due yet on the
+		// clock that stamped the row.
+		{"a small offset does not shorten the wait", fenceSkew, controlplane.ErrFencingWaitNotElapsed},
+		// Beyond it, the CP cannot reason about the deadline at all, in either
+		// direction: it refuses rather than compute a wait from two clocks that
+		// disagree by more than the protocol allows for (§12.1).
+		{"a jump forward past max_clock_skew is refused", 10 * fenceTTL, controlplane.ErrClockOffsetTooLarge},
+		{"a jump backwards past max_clock_skew is refused", -10 * fenceTTL, controlplane.ErrClockOffsetTooLarge},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			w := newFenceWorld(t)
+			if err := w.md.RenewHostLease(ctx, w.term, fenceHostA, int(fenceTTL/time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			renewedAt := w.dbClk.Wall()
+			w.advance(3 * time.Second) // well inside lease_ttl + max_clock_skew
+			w.clk.SetSkew(tc.skew)     // only the Control Plane's clock moves
+
+			if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); !errors.Is(err, tc.want) {
+				t.Fatalf("promote with a CP clock offset of %v: err = %v, want %v", tc.skew, err, tc.want)
+			}
+			w.unchanged(t, 1, fenceHostA)
+
+			// With the clocks agreeing again and the wait genuinely over, it proceeds.
+			w.clk.SetSkew(0)
+			w.advance(fenceTTL + fenceSkew)
+			if _, err := w.p.Promote(ctx, w.term, fenceVol, renewedAt, fenceHostB); err != nil {
+				t.Fatalf("promote once the wait really elapsed: %v", err)
+			}
+		})
 	}
 }

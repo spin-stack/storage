@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -75,6 +76,8 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"SnapshotLifecycleIsExpressible", snapshotLifecycle},
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
+		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
+		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,6 +120,45 @@ func setSnapshotState(ctx context.Context, s metadata.Store, term int64, snapsho
 		return fmt.Errorf("%w: no SetSnapshotState (§19 snapshot states)", errNotExpressible)
 	}
 	return m.SetSnapshotState(ctx, term, snapshotID, state)
+}
+
+type hostLeaseRevoker interface {
+	RevokeHostLease(ctx context.Context, term int64, hostID string) error
+}
+
+func revokeHostLease(ctx context.Context, s metadata.Store, term int64, hostID string) error {
+	m, ok := s.(hostLeaseRevoker)
+	if !ok {
+		return fmt.Errorf("%w: no RevokeHostLease (§12.6: nothing can take a lease back)", errNotExpressible)
+	}
+	return m.RevokeHostLease(ctx, term, hostID)
+}
+
+type authorityClocker interface {
+	Now(ctx context.Context) (time.Time, error)
+}
+
+func now(ctx context.Context, s metadata.Store) (time.Time, error) {
+	m, ok := s.(authorityClocker)
+	if !ok {
+		return time.Time{}, fmt.Errorf("%w: no Now (§12.1: the clock that stamps last_renewal)", errNotExpressible)
+	}
+	return m.Now(ctx)
+}
+
+type epochCASer interface {
+	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
+}
+
+// bumpVolumeEpoch is the compare-and-set form of the epoch bump. A blind increment
+// hands an epoch to whichever caller happened to run second, so the volume row ends
+// up naming a primary that never CASed the S3 epoch object and never got a lease.
+func bumpVolumeEpoch(ctx context.Context, s metadata.Store, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error) {
+	m, ok := s.(epochCASer)
+	if !ok {
+		return 0, fmt.Errorf("%w: BumpVolumeEpoch takes no expected epoch (§12.3: the bump is a blind increment)", errNotExpressible)
+	}
+	return m.BumpVolumeEpoch(ctx, term, volumeID, primaryHostID, expectedEpoch)
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -189,6 +231,9 @@ func everyMutation() []mutation {
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.RenewHostLease(ctx, term, w.host, 10)
 		}},
+		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return revokeHostLease(ctx, s, term, w.host)
+		}},
 		{"CreateVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: id(), SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
@@ -196,7 +241,7 @@ func everyMutation() []mutation {
 			})
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			_, err := s.BumpVolumeEpoch(ctx, term, w.vol, w.host)
+			_, err := bumpVolumeEpoch(ctx, s, term, w.vol, w.host, 0)
 			return err
 		}},
 		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, w world) error {
@@ -286,8 +331,11 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
 		}},
+		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return revokeHostLease(ctx, s, term, ghostHost)
+		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			_, err := s.BumpVolumeEpoch(ctx, term, ghostVol, w.host)
+			_, err := bumpVolumeEpoch(ctx, s, term, ghostVol, w.host, 0)
 			return err
 		}},
 		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
@@ -356,7 +404,11 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 	}{
 		{"shrink under a stale term", func() error { return s.ResizeVolume(ctx, stale, w.vol, 1) }},
 		{"missing volume under a stale term", func() error {
-			_, err := s.BumpVolumeEpoch(ctx, stale, ghost, w.host)
+			_, err := bumpVolumeEpoch(ctx, s, stale, ghost, w.host, 0)
+			return err
+		}},
+		{"wrong expected epoch under a stale term", func() error {
+			_, err := bumpVolumeEpoch(ctx, s, stale, w.vol, w.host, 99)
 			return err
 		}},
 		{"missing host under a stale term", func() error {
@@ -688,50 +740,176 @@ func snapshotLifecycle(t *testing.T, s metadata.Store) {
 	}
 }
 
-// concurrentBumps: an epoch is the fencing token. Two promoters racing must not
-// both be told they hold the same epoch — one of them would then be recorded as the
-// owner of a volume it never fenced, and every later read of primary_host_id (the
-// drain's listing, promotion's resume branch, rebuild) would be wrong about it.
+// concurrentBumps: an epoch is the fencing token, and a promotion decides which one
+// to grant by reading the volume first. So the bump has to be a compare-and-set on
+// what was read, not an increment: n promoters that all saw epoch e must produce one
+// winner at e+1, not n epochs burnt in a row.
+//
+// The damage the blind increment does is not the wasted numbers. Each promoter CASes
+// the S3 epoch object to the epoch *it* computed (e+1) and only one of those CASes
+// wins, while every one of them has already written its own host into
+// primary_host_id. The volume row then names a host that never won the object and
+// never got a lease, and the drain's listing, promotion's resume branch and
+// rebuild-metadata all read that row.
+//
+// This case replaces an earlier one that asserted the opposite — n bumps produce n
+// distinct epochs — which pinned the blind increment as if it were the contract.
 func concurrentBumps(t *testing.T, s metadata.Store) {
 	ctx := context.Background()
 	w := newWorld(t, s)
 	const n = 8
 
+	before, err := s.GetVolume(ctx, w.vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := make([]string, n)
+	for i := range hosts {
+		hosts[i] = id()
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{HostID: hosts[i], State: lifecycle.HostActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	var (
-		mu     sync.Mutex
-		epochs = map[int64]int{}
-		errs   []error
-		wg     sync.WaitGroup
+		mu      sync.Mutex
+		granted = map[string]int64{} // host -> epoch it was told it holds
+		wg      sync.WaitGroup
 	)
-	for range n {
+	for _, host := range hosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e, err := s.BumpVolumeEpoch(ctx, w.term, w.vol, w.host)
+			e, err := bumpVolumeEpoch(ctx, s, w.term, w.vol, host, before.CurrentEpoch)
 			mu.Lock()
 			defer mu.Unlock()
-			if err != nil {
-				errs = append(errs, err)
-				return
+			switch {
+			case err == nil:
+				granted[host] = e
+			case errors.Is(err, metadata.ErrEpochConflict):
+				// The volume moved on: this promoter must re-read and start again.
+			default:
+				t.Errorf("losing bump: want ErrEpochConflict, got %v", err)
 			}
-			epochs[e]++
 		}()
 	}
 	wg.Wait()
-	if len(errs) > 0 {
-		t.Fatalf("concurrent bumps errored: %v", errs)
+
+	if len(granted) != 1 {
+		t.Fatalf("%d promoters were told they hold an epoch, want exactly 1: %v", len(granted), granted)
 	}
-	for e, count := range epochs {
-		if count != 1 {
-			t.Fatalf("epoch %d was handed to %d promoters", e, count)
+	v, err := s.GetVolume(ctx, w.vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for host, e := range granted {
+		if e != before.CurrentEpoch+1 {
+			t.Fatalf("winner was granted epoch %d, want %d", e, before.CurrentEpoch+1)
+		}
+		if v.CurrentEpoch != e {
+			t.Fatalf("volume is at epoch %d while the winner holds %d", v.CurrentEpoch, e)
+		}
+		if v.PrimaryHostID != host {
+			t.Fatalf("volume names %q as primary while %q won the epoch", v.PrimaryHostID, host)
 		}
 	}
-	if len(epochs) != n {
-		t.Fatalf("%d distinct epochs for %d bumps", len(epochs), n)
+}
+
+// hostLeases: the lease is the Agent's authority to ACK a FLUSH (§12.2), and until
+// now nothing could take one back or refuse to issue one.
+//
+// The scenario is a host the Control Plane has already declared DEAD — the same
+// assertion promotion accepts as "the old writer is gone, skip the fencing wait".
+// If a routine heartbeat can still renew that host's lease, the CP contradicts
+// itself: it re-arms the writer it just fenced while the new primary is materialising
+// the epoch, and both ACK.
+func hostLeases(t *testing.T, s metadata.Store) {
+	ctx := context.Background()
+	w := newWorld(t, s)
+
+	if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+		t.Fatal(err)
 	}
-	v, _ := s.GetVolume(ctx, w.vol)
-	if v.CurrentEpoch != n {
-		t.Fatalf("current epoch = %d after %d bumps", v.CurrentEpoch, n)
+	if _, err := s.GetHostLease(ctx, w.host); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("revoking a lease takes it away", func(t *testing.T) {
+		if err := revokeHostLease(ctx, s, w.term, w.host); err != nil {
+			t.Fatalf("RevokeHostLease: %v", err)
+		}
+		if _, err := s.GetHostLease(ctx, w.host); !errors.Is(err, metadata.ErrNotFound) {
+			t.Fatalf("lease after revoke: want ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("revoking again is a no-op", func(t *testing.T) {
+		if err := revokeHostLease(ctx, s, w.term, w.host); err != nil {
+			t.Fatalf("a second revoke must converge, not fail: %v", err)
+		}
+	})
+
+	t.Run("a live host may take its lease back", func(t *testing.T) {
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+			t.Fatalf("re-granting a lease to a live host: %v", err)
+		}
+	})
+
+	t.Run("a dead host cannot renew", func(t *testing.T) {
+		if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostDead); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RenewHostLease(ctx, w.term, w.host, 10); !errors.Is(err, metadata.ErrHostNotServing) {
+			t.Fatalf("renewing the lease of a DEAD host: want ErrHostNotServing, got %v", err)
+		}
+	})
+
+	t.Run("a cordoned or draining host still renews", func(t *testing.T) {
+		// A cordon stops new placement and a drain evacuates, but both hosts are
+		// still serving the volumes they hold: taking their lease away would stop
+		// their ACKs mid-evacuation.
+		for _, state := range []lifecycle.HostState{lifecycle.HostCordoned, lifecycle.HostDraining} {
+			if err := s.SetHostState(ctx, w.term, w.host, state); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+				t.Fatalf("renewing the lease of a %s host: %v", state, err)
+			}
+		}
+	})
+}
+
+// authorityClock: `last_renewal` is stamped by the store's clock, and the fencing
+// deadline is derived from it. A Control Plane that compares that stamp against its
+// own wall clock shortens the wait by exactly the offset between the two — an NTP
+// correction, a VM restored from a snapshot, a bad RTC — so the promoter has to be
+// able to ask the store what time it thinks it is.
+func authorityClock(t *testing.T, s metadata.Store) {
+	ctx := context.Background()
+	w := newWorld(t, s)
+
+	before, err := now(ctx, s)
+	if err != nil {
+		t.Fatalf("Now: %v", err)
+	}
+	if before.IsZero() {
+		t.Fatal("Now returned the zero instant")
+	}
+	if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
+		t.Fatal(err)
+	}
+	l, err := s.GetHostLease(ctx, w.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := now(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same clock, so the row's stamp is inside the interval bracketing it.
+	if l.LastRenewal.Before(before) || l.LastRenewal.After(after) {
+		t.Fatalf("last_renewal %v is outside [%v, %v] — Now is not the clock that stamps rows",
+			l.LastRenewal, before, after)
 	}
 }
 
@@ -755,6 +933,9 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, "", 10)
 		}},
+		{"RevokeHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return revokeHostLease(ctx, s, term, "")
+		}},
 		{"CreateVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: "", SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
@@ -762,7 +943,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			})
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			_, err := s.BumpVolumeEpoch(ctx, term, "", w.host)
+			_, err := bumpVolumeEpoch(ctx, s, term, "", w.host, 0)
 			return err
 		}},
 		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, _ world) error {

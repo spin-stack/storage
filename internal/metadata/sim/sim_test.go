@@ -49,11 +49,11 @@ func TestZombieCPCannotMutate(t *testing.T) {
 	termB, _ := s.AcquireLeadership(ctx, "cp-b")
 
 	// The zombie cp-a cannot bump the epoch.
-	if _, err := s.BumpVolumeEpoch(ctx, termA, "v1", "host-a"); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := s.BumpVolumeEpoch(ctx, termA, "v1", "host-a", 0); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale term bump: want ErrStaleTerm, got %v", err)
 	}
 	// cp-b can.
-	epoch, err := s.BumpVolumeEpoch(ctx, termB, "v1", "host-b")
+	epoch, err := s.BumpVolumeEpoch(ctx, termB, "v1", "host-b", 0)
 	if err != nil || epoch != 1 {
 		t.Fatalf("current bump: epoch=%d err=%v", epoch, err)
 	}
@@ -80,7 +80,7 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", State: lifecycle.VolumeActive})
 		}},
 		{"BumpVolumeEpoch", func(s *sim.Store, term int64) error {
-			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h")
+			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h", 0)
 			return err
 		}},
 		{"UpdateWatermarks", func(s *sim.Store, term int64) error {
@@ -165,7 +165,7 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 		t.Fatalf("UpdateWatermarks missing: %v", err)
 	}
 	// BumpVolumeEpoch on a missing volume is ErrNotFound.
-	if _, err := s.BumpVolumeEpoch(ctx, term, "absent", "h1"); !errors.Is(err, metadata.ErrNotFound) {
+	if _, err := s.BumpVolumeEpoch(ctx, term, "absent", "h1", 0); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("BumpVolumeEpoch missing: %v", err)
 	}
 

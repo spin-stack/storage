@@ -182,3 +182,53 @@ func TestPGVolumeStateGuardIsAtomic(t *testing.T) {
 		t.Fatalf("state = %q after a refused transition", v.State)
 	}
 }
+
+// TestPGSnapshotStateGuardIsAtomic is the §19 twin of TestPGVolumeStateGuardIsAtomic
+// and TestPGOperationPhaseGuardIsAtomic: INV-16 says a PUBLISHED snapshot never
+// changes, and that rule has to live in the UPDATE predicate. A read-modify-write in
+// Go lets a publication that lands between the read and the write be overwritten by
+// a concurrent cleanup pass marking the snapshot FAILED.
+func TestPGSnapshotStateGuardIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	setter, ok := any(store).(interface {
+		SetSnapshotState(context.Context, int64, string, lifecycle.SnapshotState) error
+	})
+	if !ok {
+		t.Fatal("pg.Store cannot express the §19 snapshot lifecycle it stores: no SetSnapshotState")
+	}
+	term, err := store.AcquireLeadership(ctx, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	volID, snapID := ids.New().String(), ids.New().String()
+	if err := store.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
+		DEKWrapped: []byte{1}, KEKID: "k",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: snapID, VolumeID: volID, Epoch: 1, TargetSequence: 1, RootDigest: "d",
+		State: lifecycle.SnapshotCreating, RequestID: ids.New().String(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The publication lands under the caller, between its read and its write.
+	if _, err := pool.Exec(ctx,
+		`UPDATE snapshots SET state='PUBLISHED' WHERE snapshot_id=$1`, snapID); err != nil {
+		t.Fatal(err)
+	}
+	if err := setter.SetSnapshotState(ctx, term, snapID, lifecycle.SnapshotFailed); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("PUBLISHED -> FAILED: want ErrInvalidTransition, got %v", err)
+	}
+	got, err := store.GetSnapshot(ctx, snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != lifecycle.SnapshotPublished {
+		t.Fatalf("state = %q after a refused transition, want PUBLISHED", got.State)
+	}
+}
