@@ -719,11 +719,12 @@ Pieza más crítica de correctness del data path. Cambios v5: extents reales, ti
 ### 14.1 WAL Record
 
 ```go
-// Header de tamaño fijo: 96 bytes
+// Header de tamaño fijo: 104 bytes (erratum v5.1: los campos enumerados suman 104,
+// no 96 — ver ADR-0005 / DEV-0001. El "96" es anterior a los campos de cripto de v5.)
 type BlockWriteRecordHeader struct {
     Magic         [4]byte   // "VW02"
     Version       uint16    // 2
-    HeaderLen     uint16    // 96
+    HeaderLen     uint16    // 104
     RecordType    uint8     // 0=WRITE, 1=DISCARD, 2=WRITE_ZEROES
     Reserved0     [3]byte
     VolumeID      [16]byte  // UUID
@@ -749,10 +750,11 @@ type BlockWriteRecordHeader struct {
 ### 14.2 WAL Object (batch remoto)
 
 ```go
+// Header de tamaño fijo: 104 bytes (mismo erratum que §14.1 — ADR-0005 / DEV-0001).
 type WALObjectHeader struct {
     Magic          [4]byte   // "WB02"
     Version        uint16    // 2
-    HeaderLength   uint16    // 96
+    HeaderLength   uint16    // 104
     VolumeID       [16]byte
     Epoch          uint64
     FirstSequence  uint64

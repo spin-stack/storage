@@ -1,6 +1,7 @@
 # ADR-0005 — WAL header size is 104 bytes (doc says 96); little-endian; CRC coverage
 
-- **Status:** Accepted (Phase 04 / Increment 4.1) — **pending human format review**
+- **Status:** Accepted (Phase 04 / Increment 4.1). Human format review done 2026-07-25:
+  104 approved, and §14.1/§14.2 of the architecture doc corrected to match.
 - **Date:** 2026-07-25
 - **Deciders:** tech-lead agent
 - **Implements/Extends:** §14.1, §14.2. Recorded in DEVIATIONS.md as DEV-0001.

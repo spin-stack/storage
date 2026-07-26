@@ -1,7 +1,10 @@
 # ADR-0008 — Drain moves a volume from the durable prefix, not from a snapshot
 
-- **Status:** Accepted (Phase 11 / Increment 11.3) — **pending human review of the
-  fencing diff**
+- **Status:** Accepted (Phase 11 / Increment 11.3). Human review of the fencing diff
+  done 2026-07-25, after the wave-2 changes that touch it: the superseded-epoch ceiling
+  in `recovery` (so FromEpoch(prevEpoch) returns exactly recovered_up_to) and the
+  per-volume stages in the drain (so only the operation that promoted a volume writes
+  its boundary).
 - **Date:** 2026-07-25
 - **Deciders:** implementer agent, with the human review of the Phase 11 spec
 - **Implements/Extends:** §28.1 (cordon/drain), §20 (cross-host), §22.1/§22.3

@@ -1,6 +1,7 @@
 # ADR-0011 — The Control Plane term is claimed in the object store before it is used
 
-- **Status:** Proposed (needs human review — fencing/durability zone)
+- **Status:** Accepted 2026-07-25 (human review of the fencing/durability spec done:
+  the claim in the object store and the Elector shape were both approved)
 - **Date:** 2026-07-25
 - **Deciders:** human (to decide), implementer agent (proposes)
 - **Implements/Extends:** §7 (single-active Control Plane, term-guarded mutations),
@@ -143,12 +144,11 @@ are ever equal and that at most one process holds a lease-granting term at a tim
 - Operators gain an audit trail of every term ever issued, with its holder — useful in
   exactly the incident this ADR is about.
 
-## Why this is proposed rather than implemented
+## Implementation notes
 
-The change moves leadership out of `metadata.Store`, which is an interface three other
-in-flight increments depend on, and it lands in the fencing/durability zone that
-CLAUDE.md requires a human to review *before* implementation. The failing-test-first
-ritual would also have to start with an integration test that restores a database,
-which is new machinery for the pg lane. Nothing here is blocked on it: the wave-2
-fencing fixes stand on their own, and the risk this ADR addresses needs a rewound
-database to appear at all.
+Approved as specified, including moving leadership out of `metadata.Store`:
+`metadata.Store.AcquireLeadership` stays as the low-level step, and
+`controlplane.Elector` becomes the entry point every Control Plane uses. Existing
+callers that only need *a* term in a test keep calling the Store directly; a process
+that intends to act as leader must go through the Elector, which is where the claim
+is made.
