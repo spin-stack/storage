@@ -222,6 +222,32 @@ func TestSessionEndsOnAProtocolViolation(t *testing.T) {
 	}
 }
 
+// TestServeReturnsWhenTheContextIsCancelled. Serve's contract is "accepts
+// connections until ctx is done or the listener is closed", and the first half
+// of that was never true: with no front-end attached, Serve is parked in
+// Accept, which no cancellation reaches. An Agent that cannot stop serving a
+// socket cannot be shut down — it is Increment 3.2's rolling restart failing
+// before 3.2 is written.
+//
+// If this regresses the test does not fail, it hangs, and `go test -timeout`
+// turns that into the same red.
+func TestServeReturnsWhenTheContextIsCancelled(t *testing.T) {
+	g := newFakeGuest(128)
+	ln := newFakeListener()
+	t.Cleanup(func() { _ = ln.Close() })
+	srv, err := NewServer(ln, Config{Backend: NewRawDevice(testDeviceSize), Mapper: &fakeMapper{g: g}}, newEventFactory().make)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve returned %v, want context.Canceled", err)
+	}
+}
+
 func TestServeStopsWhenTheListenerCloses(t *testing.T) {
 	g := newFakeGuest(128)
 	ln := newFakeListener()

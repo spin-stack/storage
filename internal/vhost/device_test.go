@@ -385,15 +385,98 @@ func TestReplyAckIsSilentWhenNotNegotiated(t *testing.T) {
 	}
 }
 
-func TestSetConfigIsRefused(t *testing.T) {
-	g := newFakeGuest(128)
-	dev, _ := newTestDevice(t, g, 1<<20)
-	reply, err := dev.Handle(t.Context(), msg(ReqSetConfig, encodeConfig(configRequest{Size: 8, Region: make([]byte, 8)})))
-	if err != nil {
-		t.Fatal(err)
+// TestSetConfigIsRefusedOnlyWhenTheFrontEndAsked. The guest may not reconfigure
+// its own device, so SET_CONFIG is refused — but a refusal is only allowed to
+// take the shape of a reply when the front-end set NEED_REPLY. vhost-user has no
+// message length on the wire beyond the header, so a reply nobody is reading
+// becomes the *next* message's header: the socket desynchronizes permanently,
+// and the symptom appears several requests later as a nonsense request number.
+func TestSetConfigIsRefusedOnlyWhenTheFrontEndAsked(t *testing.T) {
+	body := encodeConfig(configRequest{Size: 8, Region: make([]byte, 8)})
+	tests := []struct {
+		name      string
+		negotiate bool
+		needReply bool
+		wantReply bool
+	}{
+		{"asked, and REPLY_ACK negotiated", true, true, true},
+		{"not asked", true, false, false},
+		{"asked, but REPLY_ACK never negotiated", false, true, false},
 	}
-	if reply == nil || binary.LittleEndian.Uint64(reply.Payload) == 0 {
-		t.Fatal("SET_CONFIG must be refused with a non-zero status; the guest may not resize its own device")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newFakeGuest(128)
+			dev, _ := newTestDevice(t, g, 1<<20)
+			if tc.negotiate {
+				if _, err := dev.Handle(t.Context(), msg(ReqSetProtocolFeatures, u64Payload(ProtocolFeatures))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := msg(ReqSetConfig, body)
+			if tc.needReply {
+				m.Flags |= flagNeedReply
+			}
+			reply, err := dev.Handle(t.Context(), m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantReply {
+				if reply != nil {
+					t.Fatal("sent an unsolicited reply; the next message the front-end writes will be read as this reply's tail")
+				}
+				return
+			}
+			if reply == nil || binary.LittleEndian.Uint64(reply.Payload) == 0 {
+				t.Fatal("SET_CONFIG must be refused with a non-zero status; the guest may not resize its own device")
+			}
+		})
+	}
+}
+
+// TestGetConfigRejectsAnOffsetOutsideTheConfigSpace. The offset is an attacker-
+// or bug-controlled uint32 in a 12-byte message, and the reply buffer used to be
+// sized offset+size: a front-end asking for 4 bytes at 0xffff_f000 made this
+// backend allocate four gigabytes. virtio-blk's configuration space is 60 bytes,
+// so anything past it is a request that cannot be honoured, not a large one.
+func TestGetConfigRejectsAnOffsetOutsideTheConfigSpace(t *testing.T) {
+	tests := []struct {
+		name           string
+		offset, size   uint32
+		wantErr        bool
+		wantRegionSize int
+	}{
+		{name: "the whole config space", size: blkConfigSize, wantRegionSize: blkConfigSize},
+		{name: "a field in the middle", offset: 20, size: 4, wantRegionSize: 4},
+		{name: "the last byte", offset: blkConfigSize - 1, size: 1, wantRegionSize: 1},
+		{name: "one byte past the end", offset: blkConfigSize, size: 1, wantErr: true},
+		{name: "a window straddling the end", offset: blkConfigSize - 2, size: 4, wantErr: true},
+		{name: "an offset that would allocate the host", offset: 0xffff_f000, size: 4, wantErr: true},
+		{name: "a size that would allocate the host", size: MaxPayload, wantErr: true},
+		{name: "an empty window", size: 0, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newFakeGuest(128)
+			dev, _ := newTestDevice(t, g, 1<<20)
+			m := msg(ReqGetConfig, encodeConfig(configRequest{Offset: tc.offset, Size: tc.size, Region: make([]byte, tc.size%1024)}))
+			reply, err := dev.Handle(t.Context(), m)
+			if tc.wantErr {
+				if !errors.Is(err, ErrProtocol) {
+					t.Fatalf("GET_CONFIG offset=%d size=%d: want ErrProtocol, got reply=%v err=%v", tc.offset, tc.size, reply, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := decodeConfig(*reply)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Region) != tc.wantRegionSize {
+				t.Fatalf("reply carries %d config bytes, want %d", len(got.Region), tc.wantRegionSize)
+			}
+		})
 	}
 }
 
