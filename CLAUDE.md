@@ -146,6 +146,21 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Metadata has two implementations** behind one interface: `metadata/sim` (in-memory,
   deterministic — for DST) and `metadata/pg` (sqlc adapter — verified by TestContainers).
 
+## Formats before the first deployment
+
+Nothing is deployed yet: no bucket holds objects anyone will read again, and there is no
+fleet to keep in step. **Until the spine ships (DEV-0007, ADR-0018), on-disk and on-S3
+formats change in place** — no v2 alongside v1, no migration, no compatibility shim. A
+format problem is corrected, not worked around: ADR-0005 fixed the WAL header to its
+real 104 bytes rather than versioning around the doc's error, and ADR-0014 changes the
+snapshot manifest outright rather than stranding a class of snapshot that could never be
+compacted.
+
+This narrows scope, it does not lower the bar. Format changes stay a human-review zone
+(below), every change still lands with its tests, and INV-19 (read-old / write-new,
+`max_format_version`) becomes binding the moment two Agents can run different versions —
+which is exactly when compatibility starts costing something real.
+
 ## Human-review zones (data-loss)
 
 On-disk / on-S3 **formats**, **fencing/leases**, **durability** (ACK rules, FLUSH/FUA

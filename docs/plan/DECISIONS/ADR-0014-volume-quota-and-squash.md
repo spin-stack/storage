@@ -122,10 +122,13 @@ lands in Phase 10/12 since it was written; this is that arm.
 
 ### What it costs
 
-- **A manifest format v2**, and a decision for the ones already published: recompute
-  their content digest by reading their objects once (expensive, verifiable, one-off), or
-  pin them as v1 and never squash them. Recommend recompute — a permanently
-  unsquashable class of snapshot is the failure this whole ADR exists to avoid.
+- **The manifest format changes in place.** There is no v2 and no migration: nothing is
+  deployed, no bucket holds a snapshot anyone will ever read, and inventing a
+  compatibility story for zero users would buy a permanently unsquashable class of
+  snapshot in exchange for nothing. The manifest gains the extent map and loses the
+  object-key digest, and the tests change with it. (See "Formats before the first
+  deployment" in CLAUDE.md; ADR-0005 set the precedent by correcting the WAL header to
+  104 bytes rather than versioning around the error.)
 - **The pointer is the one mutable object** in a create-only design. It advances by CAS
   on a generation that only increases (the same shape as the epoch object, §12.4), so a
   lost response is re-resolvable and two squashers cannot both win.
