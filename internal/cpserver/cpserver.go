@@ -130,6 +130,44 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 	return connect.NewResponse(&storagev1.GetDesiredStateResponse{Volumes: out}), nil
 }
 
+// GetVolumeKeys hands one volume's wrapped DEK to the host that writes it.
+//
+// It is a call of its own rather than a field of the desired state (see the proto
+// for the full reasoning), and this handler is why: the answer is authorised per
+// request, against the volume's current primary. A host that has been fenced, or
+// that never held the volume, is refused here — a check with no equivalent inside a
+// list answer, whose only unit is the whole list.
+//
+// The refusal is PermissionDenied rather than NotFound. Hiding the volume's
+// existence buys nothing from a caller that already had to authenticate as a host in
+// this fleet, and it costs the operator the one message that explains what happened:
+// "you are not this volume's writer any more" is the fencing story, and it is what
+// an Agent's log should say at 3am.
+func (s *Server) GetVolumeKeys(ctx context.Context, req *connect.Request[storagev1.GetVolumeKeysRequest]) (*connect.Response[storagev1.GetVolumeKeysResponse], error) {
+	hostID, volumeID := req.Msg.GetHostId(), req.Msg.GetVolumeId()
+	switch {
+	case hostID == "":
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("cpserver: host_id is required"))
+	case volumeID == "":
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("cpserver: volume_id is required"))
+	}
+
+	v, err := s.md.GetVolume(ctx, volumeID)
+	if err != nil {
+		return nil, rpcError(fmt.Errorf("cpserver: reading volume %q: %w", volumeID, err))
+	}
+	if v.PrimaryHostID != hostID {
+		return nil, connect.NewError(connect.CodePermissionDenied,
+			fmt.Errorf("cpserver: host %q is not the writer of volume %q", hostID, volumeID))
+	}
+
+	return connect.NewResponse(&storagev1.GetVolumeKeysResponse{
+		VolumeId:   v.VolumeID,
+		DekWrapped: v.DEKWrapped,
+		KekId:      v.KEKID,
+	}), nil
+}
+
 // ReportVolumeState applies epoch-qualified watermarks, one answer per report.
 func (s *Server) ReportVolumeState(ctx context.Context, req *connect.Request[storagev1.ReportVolumeStateRequest]) (*connect.Response[storagev1.ReportVolumeStateResponse], error) {
 	hostID := req.Msg.GetHostId()

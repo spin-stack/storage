@@ -1,7 +1,6 @@
 package agent_test
 
 import (
-	"math/rand/v2"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -119,6 +118,19 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	}
 }
 
+// ramp is a deterministic byte source: DEK generation and wrapping are the only
+// two consumers of randomness on this path (§15.2), and both take an injected
+// reader precisely so a test can pin them.
+type ramp struct{ b byte }
+
+func (r *ramp) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = r.b
+		r.b++
+	}
+	return len(p), nil
+}
+
 // TestTheAgentCanOpenAVolume closes the last of the three holes the spine left: the
 // desired state told the Agent a volume's geometry and epoch and nothing about how
 // to read a byte of it. Every payload on this path is sealed with the volume's DEK
@@ -145,11 +157,11 @@ func TestTheAgentCanOpenAVolume(t *testing.T) {
 		kek[i] = byte(i)
 	}
 	kms := crypto.NewDevKMS(kek, "kek-host-a")
-	dek, err := crypto.GenerateDEK(rand.New(rand.NewPCG(1, 2)), 1)
+	dek, err := crypto.GenerateDEK(&ramp{b: 1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrapped, err := kms.WrapDEK(rand.New(rand.NewPCG(3, 4)), dek)
+	wrapped, err := kms.WrapDEK(&ramp{b: 100}, dek)
 	if err != nil {
 		t.Fatal(err)
 	}

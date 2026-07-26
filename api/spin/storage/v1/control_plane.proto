@@ -9,9 +9,10 @@ package spin.storage.v1;
 
 option go_package = "github.com/spin-stack/storage/api/gen/spin/storage/v1;storagev1";
 
-// ControlPlaneService is what a Volume Agent talks to. Three calls, one loop:
-// say what this host is (Heartbeat), ask what it should be serving
-// (GetDesiredState), say what it observed (ReportVolumeState).
+// ControlPlaneService is what a Volume Agent talks to. Three calls make the
+// loop — say what this host is (Heartbeat), ask what it should be serving
+// (GetDesiredState), say what it observed (ReportVolumeState) — and a fourth,
+// off the loop, hands over the key material a volume cannot be opened without.
 //
 // Attach/detach are deliberately absent: a volume's lifecycle is driven by the
 // desired state the Agent reconciles against, not by commands, and the data path
@@ -32,6 +33,30 @@ service ControlPlaneService {
   // a report from a fenced writer names an epoch the volume has moved past, and
   // is refused rather than applied (INV-03, §12.3).
   rpc ReportVolumeState(ReportVolumeStateRequest) returns (ReportVolumeStateResponse);
+
+  // GetVolumeKeys returns the wrapped DEK of one volume, and the id of the KEK
+  // that wraps it (§15.1). Without it the desired state is an instruction the
+  // Agent cannot carry out: every payload on this path is sealed with the
+  // volume's DEK before it reaches the WAL or an S3 object.
+  //
+  // It is a call of its own rather than fields on DesiredVolume, for three
+  // reasons that all point the same way:
+  //
+  //   - Exposure. Key material is the one thing on this surface whose leak is
+  //     not repaired by re-reading the truth from S3. A separate call is
+  //     authorised per request against the volume's current primary, so a host
+  //     that has been fenced, or that never held the volume, is refused. Bundled
+  //     into a list answer there is no such granularity: the only unit available
+  //     to check is the whole list.
+  //   - Frequency. The desired state is polled by every host every few seconds,
+  //     for every volume it holds. Bundled, a wrapped DEK would cross the wire
+  //     thousands of times a day per volume, in exactly the message an operator
+  //     is most likely to dump while debugging an incident.
+  //   - Cacheability. The two have opposite lifetimes. Desired state is expected
+  //     to change and is re-read for that reason; key material does not change
+  //     while the volume is this host's, so it is fetched once and held, and
+  //     dropped when the volume leaves the desired state.
+  rpc GetVolumeKeys(GetVolumeKeysRequest) returns (GetVolumeKeysResponse);
 }
 
 // HostState mirrors internal/lifecycle.HostState (§28.1). The Agent needs it to
@@ -128,6 +153,35 @@ message DesiredVolume {
 message GetDesiredStateResponse {
   // volumes is ordered by volume id, deterministically (INV-02).
   repeated DesiredVolume volumes = 1;
+}
+
+message GetVolumeKeysRequest {
+  // host_id is the host asking. The answer is refused unless it is the volume's
+  // current primary: this is where a fenced host stops being able to open what
+  // it used to serve.
+  string host_id = 1;
+  string volume_id = 2;
+}
+
+// GetVolumeKeysResponse is what a host needs to seal and open this volume's
+// payloads, and nothing more. The Control Plane never holds the KEK — unwrapping
+// happens on the host, against the KMS it already reaches (§15.1) — so this
+// answer is inert to anyone who cannot reach that KMS.
+message GetVolumeKeysResponse {
+  string volume_id = 1;
+  // dek_wrapped is the volume's data-encryption key sealed under the KEK, byte
+  // for byte as the catalog holds it (§8, volumes.dek_wrapped).
+  bytes dek_wrapped = 2;
+  // kek_id names the key that wraps it, so a host holding more than one (a
+  // rotation in progress, a migrated fleet) knows which to unwrap with.
+  string kek_id = 3;
+  // The DEK's own version — RecordHeader.KeyID, the field that lets §15.1
+  // rotation re-key without re-encrypting history — is deliberately not here:
+  // nothing stores it. The catalog has dek_wrapped and kek_id and no column for
+  // a DEK version, so there is no honest value to put in this message, and a
+  // default of 0 would be actively wrong (0 means "plaintext record" on the WAL
+  // path). The increment that implements rotation adds the column and this
+  // field together.
 }
 
 // VolumeReport is one volume's watermarks as the Agent observes them, qualified

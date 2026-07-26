@@ -46,6 +46,13 @@ type Loop struct {
 	state    storagev1.HostState
 	fenced   []string
 	failures int
+	// keys is the key material this Agent has been handed, by volume id. It is a
+	// cache with one eviction rule and no expiry: an entry lives exactly as long as
+	// its volume stays in the desired state (see readDesiredState). Key material
+	// does not change while the volume is this host's, and when it stops being this
+	// host's the entry must go — not because it would be stale, but because holding
+	// it means holding the means to open a volume the fleet has taken away.
+	keys map[string]VolumeKeys
 }
 
 // New validates the configuration and the wiring and returns a Loop.
@@ -70,6 +77,7 @@ func New(cfg Config, deps Deps) (*Loop, error) {
 		dev:  deps.Device,
 		vols: deps.Volumes,
 		rec:  deps.Recorder,
+		keys: map[string]VolumeKeys{},
 	}, nil
 }
 
@@ -180,7 +188,73 @@ func (l *Loop) readDesiredState(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.desired = resp.Msg.GetVolumes()
+	l.forgetKeysOutsideLocked(l.desired)
 	return nil
+}
+
+// forgetKeysOutsideLocked drops the key material of every volume the Control Plane
+// no longer lists for this host. A volume leaves the desired state because it was
+// promoted away, detached, or fenced — in each case this host has stopped being its
+// writer, and there is no reason for it to keep what opens it. Callers hold l.mu.
+func (l *Loop) forgetKeysOutsideLocked(desired []*storagev1.DesiredVolume) {
+	if len(l.keys) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(desired))
+	for _, v := range desired {
+		live[v.GetVolumeId()] = true
+	}
+	for id := range l.keys {
+		if !live[id] {
+			delete(l.keys, id)
+		}
+	}
+}
+
+// VolumeKeys returns the key material for one volume, fetching it the first time and
+// holding it afterwards (§15.1, ADR-0018). It is what the data path will call before
+// opening a volume: every payload it writes is sealed with this DEK.
+//
+// Fetched once, not per cycle. The material does not change while the volume is this
+// host's, and the desired state — which is re-read every few seconds, for every
+// volume — is deliberately not where it travels. The entry is dropped when the
+// volume leaves that desired state, which is the only invalidation this cache has
+// and the only one it needs.
+func (l *Loop) VolumeKeys(ctx context.Context, volumeID string) (VolumeKeys, error) {
+	if volumeID == "" {
+		return VolumeKeys{}, errors.New("agent: a volume id is required to ask for key material")
+	}
+	if keys, ok := l.cachedKeys(volumeID); ok {
+		return keys, nil
+	}
+
+	resp, err := l.cp.GetVolumeKeys(ctx, connect.NewRequest(&storagev1.GetVolumeKeysRequest{
+		HostId:   l.cfg.HostID,
+		VolumeId: volumeID,
+	}))
+	if err != nil {
+		// A refusal here is the fencing story arriving through a different door:
+		// this host is not the volume's writer. It is returned rather than swallowed
+		// — an Agent that cannot get the keys must not open the volume.
+		return VolumeKeys{}, fmt.Errorf("agent: reading the keys of volume %q: %w", volumeID, err)
+	}
+
+	keys := VolumeKeys{
+		VolumeID:   volumeID,
+		DEKWrapped: resp.Msg.GetDekWrapped(),
+		KEKID:      resp.Msg.GetKekId(),
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.keys[volumeID] = keys
+	return keys, nil
+}
+
+func (l *Loop) cachedKeys(volumeID string) (VolumeKeys, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	keys, ok := l.keys[volumeID]
+	return keys, ok
 }
 
 func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {

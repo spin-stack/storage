@@ -49,6 +49,17 @@ type VolumeStatus struct {
 	RemoteGapBytes int64
 }
 
+// VolumeKeys is what a host needs to seal and open one volume's payloads (§15.1).
+// The DEK arrives wrapped and stays wrapped here: unwrapping is the KMS's, with a
+// KEK this Agent already holds and the Control Plane never sees.
+type VolumeKeys struct {
+	VolumeID string
+	// DEKWrapped is the volume's data-encryption key sealed under the KEK.
+	DEKWrapped []byte
+	// KEKID names the key that wraps it, for a host holding more than one.
+	KEKID string
+}
+
 // VolumeSource is the set of volumes this host is serving right now. The data path
 // will implement it over the live WAL; until then VolumeSet stands in.
 type VolumeSource interface {
