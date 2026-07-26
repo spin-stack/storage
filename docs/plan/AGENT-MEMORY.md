@@ -21,14 +21,16 @@ commit 1 (no `time.Now()`/sockets/disk/S3 outside `internal/simio`, lint-enforce
 INV-01); gate between increments; human-review zones = formats/fencing/durability/GC.
 
 ## SQL conventions (type: feedback)
-All SQL via **sqlc**; Postgres tested with **TestContainers**; migrations via **Atlas**;
-**Postgres 18**; identity columns are **uuid** with **UUIDv7** (INV-22, enforced two
-ways). Layout mirrors sibling `spin`: schema `internal/schema/schema.sql`, queries
-`internal/db/queries/*.sql`, generated `internal/db`, Atlas `migrations/` (+ `atlas.sum`,
-embedded via the `migrations` package). Driver pgx/v5. `metadata.Store` has two impls:
-`metadata/sim` (deterministic, for DST) and `metadata/pg` (sqlc, TestContainers-verified).
-See ADR-0006, ADR-0007. Atlas installed via `curl -sSL https://atlasbinaries.com/...` to
-`~/.local/bin/atlas`.
+All SQL via **sqlc**; Postgres tested with **TestContainers**; schema via **pgschema**
+(state-based, ADR-0019 — Atlas is gone); **Postgres 18**; identity columns are **uuid**
+with **UUIDv7** (INV-22, enforced two ways). Schema `internal/schema/schema.sql` is the
+single source of truth: sqlc generates from it and the integration lane builds its
+database from it. Queries `internal/db/queries/*.sql`, generated `internal/db`.
+`migrations/` holds the *reviewed plans* (`task db:plan`), not an apply path — there is
+no chain to replay and no `atlas.sum`; `task db:verify` checks the applied result
+instead. Driver pgx/v5. `metadata.Store` has two impls: `metadata/sim` (deterministic,
+for DST) and `metadata/pg` (sqlc, TestContainers-verified). See ADR-0006, ADR-0007,
+ADR-0019. pgschema is pinned in `Taskfile.yml` and installed by `task tools`.
 
 ## Current state (2026-07-25, REBASELINED)
 **Read `docs/plan/REBASELINE.md` first.** A human review found the status docs
@@ -63,8 +65,8 @@ scaffolding is `internal/testinfra` (integration build tag).
   snapshot (ADR-0008 / DEV-0002): the doc's "snapshot + restore" needs a live, cooperating
   source and the CP↔Agent RPC that Phases 02/03 will bring.
 - Tooling is pinned in `Taskfile.yml` and installed by `task tools` into
-  `./.tools/bin` (sqlc, Atlas, golangci-lint). Never run those binaries by hand —
-  every workflow (generate, migrations, format, lint, coverage) is a task.
+  `./.tools/bin` (sqlc, pgschema, golangci-lint). Never run those binaries by hand —
+  every workflow (generate, schema plan/apply/verify, format, lint, coverage) is a task.
 - RustFS answers `If-Match` on a missing key with **NoSuchKey**, not 412; multipart
   ETags carry a `-N` suffix (never treat an ETag as a content hash); a LIST page caps
   at 1000 keys, so the S3 store paginates internally (§22.1 depends on it).
@@ -74,10 +76,10 @@ scaffolding is `internal/testinfra` (integration build tag).
 - Postgres `jsonb` round-trips by value, not byte-for-byte — compare parsed JSON in tests.
 - Lifecycles are typed in `internal/lifecycle` (ADR-0009): never write a bare state
   string. Stored as TEXT + CHECK (not PG enums, not int codes); binary formats keep
-  numeric enums. A new state = constant + transition table + Atlas migration, or the
-  drift test fails.
+  numeric enums. A new state = constant + transition table + the CHECK in `schema.sql`,
+  or the drift test fails.
 
 - Two real bugs the tests caught and fixed: `Log.Discard/WriteZeroes` not feeding the
   remote batcher; the sim network letting a closed conn Send.
-- Coverage: `-coverpkg=./...`; 90% floor excludes generated db / integration-only pg &
-  migrations / cmd / dst harness (`hack/coverage.sh`).
+- Coverage: `-coverpkg=./...`; 90% floor excludes generated db / integration-only pg /
+  cmd / dst harness (`hack/coverage.sh`).

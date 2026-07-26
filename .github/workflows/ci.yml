@@ -23,7 +23,7 @@ jobs:
       - name: Set up Task
         uses: go-task/setup-task@v2
 
-      # Every other tool (sqlc, atlas, golangci-lint) is pinned in the Taskfile and
+      # Every other tool (sqlc, pgschema, golangci-lint) is pinned in the Taskfile and
       # installed into ./.tools/bin by `task tools` — the same command a developer
       # runs locally, so CI and laptops cannot drift.
       - name: Cache pinned tools
@@ -58,9 +58,13 @@ jobs:
       - name: DST (mandatory scenario set)
         run: task dst
 
-      # Migrations are checksummed (atlas.sum) and must match the files.
-      - name: Migrations validate (Atlas, ADR-0007)
-        run: task db:migrate:validate
+      # The schema is state-based (ADR-0019): there is no checksum chain to verify.
+      # Instead, build the database the way production would — apply schema.sql to an
+      # empty Postgres 18 — and assert a plan against the result has nothing left to
+      # do. It fails on anything pgschema can apply but not read back, which a
+      # checksum over file bytes could never see.
+      - name: Schema verify (pgschema, ADR-0019)
+        run: task db:verify
 
       # TestContainers Postgres integration (ADR-0006); ubuntu runners have Docker.
       - name: Integration (TestContainers Postgres)

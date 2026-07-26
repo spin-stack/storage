@@ -1,9 +1,8 @@
 # ADR-0019 — Replace Atlas with pgschema for schema management
 
-- **Status:** Proposed (needs human review — it changes how the database is built in
-  tests, CI and eventually production)
+- **Status:** Accepted — 2026-07-26 (implemented on `tooling/pgschema`)
 - **Date:** 2026-07-26
-- **Deciders:** human (to decide), implementer agent (proposes)
+- **Deciders:** human owner (approved), implementer agent (proposed)
 - **Supersedes the tooling half of:** ADR-0007 (Atlas + Postgres 18 + UUIDv7). The
   Postgres 18 and UUIDv7 decisions stand; only the migration tool changes.
 - **Closes:** DEV-0011 (`task db:migrate:lint` cannot run on the pinned Atlas).
@@ -93,15 +92,35 @@ sqlc generates from views like any other relation, so the Go side does not chang
 **Re-evaluating where a view actually helps is a follow-up to this ADR, not part of it**
 — the tool change should land first and be boring.
 
-## The work
+## The work — as implemented
 
-1. Pin `pgschema` in `Taskfile.yml`, install via `task tools`.
-2. Replace `db:migrate:*` with `db:plan` / `db:apply` / `db:verify`, keeping the names
-   descriptive of what they do rather than mirroring Atlas's.
-3. Point the test harness (`internal/testinfra`, the `migrations` embed) at `schema.sql`.
-4. Add the CI check: apply `schema.sql` to an empty PostgreSQL 18, then assert a plan
-   against it is empty.
-5. Fold the existing migration files into the initial state (nothing is deployed —
-   CLAUDE.md's "formats change in place until the spine ships" applies to the schema
-   too), or keep them as history with a note that they are no longer the apply path.
-6. Delete DEV-0011.
+1. **`PGSCHEMA_VERSION: v1.12.0`** in `Taskfile.yml`, installed by `task tools` into
+   `./.tools/bin` with `go install github.com/pgplex/pgschema@<tag>`. The project
+   publishes release binaries but no per-asset checksums; the module proxy and
+   `go.sum` give the pinning that `atlas`'s `.sha256` fetch was providing, through the
+   toolchain every other Go tool here already uses.
+2. **`db:plan` / `db:apply` / `db:verify`** replace `db:migrate:diff|status|validate|
+   lint`, plus `db:dev:up` / `db:dev:down` for the development database. No task
+   assumes a PostgreSQL on the machine: `hack/db.sh` starts the same pinned
+   `postgres:18-alpine` the integration lane uses. Every invocation passes
+   `--plan-host` explicitly — without it pgschema downloads and runs an *embedded*
+   PostgreSQL of its own choosing at plan time, which is neither pinned nor 18.
+3. The integration harness (`internal/metadata/pg`) applies `schema.SQL`; the
+   `migrations` Go package and its embed are gone.
+4. `task db:verify` is in `ci:full` and in `.github/workflows/ci.yml` where the
+   `atlas.sum` check was. It applies `schema.sql` to an empty Postgres 18 and asserts
+   the plan against the result is empty on two independent readings (no DDL in the SQL
+   rendering, `"groups": null` in the JSON one). It fails red on a schema the tool
+   cannot apply — verified by planting one.
+5. The eight Atlas files and `atlas.sum` are folded into `schema.sql`; `migrations/`
+   now holds the reviewed plans (seeded with the initial one) and a README saying so.
+6. DEV-0011 deleted.
+
+**Nothing in `schema.sql` was simplified to suit the tool** — the point of the ADR.
+pgschema round-trips every construct in it: the `get_byte(uuid_send(...)) >> 4 = 7`
+UUIDv7 CHECKs (INV-22), the `TEXT` + `CHECK (… IN (…))` lifecycle vocabularies, and the
+composite/FK indexes. Probed beyond the current schema, it also round-trips the three
+things the schema wants next — **views**, **partial indexes** (`CREATE INDEX … WHERE`,
+the deferred `operations (phase)` one) and declarative **partitioning**. The `sqlc`
+output did not change: `sqlc.yaml` already generated from `schema.sql`, never from the
+migration chain.

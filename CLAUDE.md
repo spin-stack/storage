@@ -20,10 +20,11 @@ in `docs/plan/DEVIATIONS.md`.
 
 ## Commands
 
-**Everything goes through Taskfile targets.** Tool versions (sqlc, Atlas,
+**Everything goes through Taskfile targets.** Tool versions (sqlc, pgschema,
 golangci-lint) are pinned in `Taskfile.yml` and installed into `./.tools/bin` by
-`task tools`; CI runs the same tasks. Never invoke `sqlc`, `atlas`, `golangci-lint`,
-`gofmt`, or a raw `go test -coverpkg` by hand — if something is missing, add a task.
+`task tools`; CI runs the same tasks. Never invoke `sqlc`, `pgschema`,
+`golangci-lint`, `gofmt`, or a raw `go test -coverpkg` by hand — if something is
+missing, add a task.
 
 ```
 task tools              # install the pinned toolchain into ./.tools/bin
@@ -37,9 +38,10 @@ task cover              # cross-package coverage; fails under 90% on production 
 task fmt / fmt:check    # format (gofmt+goimports via golangci-lint v2) / verify
 task generate           # sqlc generate
 task generate:check     # fail if the committed sqlc output is stale
-task db:migrate:diff -- <name>   # author an Atlas migration from schema.sql
-task db:migrate:validate         # check migrations against atlas.sum
-task db:migrate:lint -- --latest N  # lint pending migrations for unsafe changes
+task db:dev:up / db:dev:down     # the pinned Postgres 18 the schema tasks work against
+task db:plan -- <name>           # DDL for the current schema.sql change → migrations/
+task db:apply PLAN=<file>.json   # apply a *saved* plan, never a recomputed one
+task db:verify                   # apply schema.sql to an empty DB; assert the plan is empty
 task build:qemu         # build the pinned QEMU (vhost-user-blk) into _output/
 task qemu:verify        # assert the built QEMU is pinned + has vhost-user-blk-pci
 task build:qemu:push    # publish the runtime image (CI does this into GitHub Packages)
@@ -95,8 +97,8 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Coverage.** `task cover` reports cross-package coverage (measured with
   `-coverpkg=./...`, since Go's default under-counts cross-package exercise) and
   **enforces a 90% floor on production code**. Excluded from that floor: generated
-  (`internal/db`), integration-only (`internal/metadata/pg`, `migrations`), `cmd/`
-  mains, and the `internal/dst` harness. Don't chase unreachable `os`-error branches —
+  (`internal/db`), integration-only (`internal/metadata/pg`), `cmd/` mains, and the
+  `internal/dst` harness. Don't chase unreachable `os`-error branches —
   that is what the sim models.
 
 ## Go style (Dave Cheney's practical Go)
@@ -120,17 +122,23 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Prefer composition** over inheritance-style embedding gymnastics; small, focused
   types.
 
-## SQL: sqlc + Atlas + Postgres 18 (ADR-0006, ADR-0007)
+## SQL: sqlc + pgschema + Postgres 18 (ADR-0006, ADR-0007, ADR-0019)
 
 - **All SQL goes through sqlc.** No hand-built query strings. Schema (the desired
   state) is `internal/schema/schema.sql`; queries are `internal/db/queries/*.sql`;
   generated code (`package db`, pgx/v5) lands in `internal/db` and is committed. Run
   `task generate` after editing schema or queries.
-- **Migrations via Atlas.** `schema.sql` is the declared state; `task db:migrate:diff --
-  <name>` generates a versioned file in `migrations/` (checksummed by `atlas.sum`).
-  Migrations are forward-only and committed; the `migrations` package embeds them so
-  tests apply the real files. Install Atlas via `atlasgo.sh`.
-- **Postgres 18** everywhere (Atlas dev DB, TestContainers `postgres:18-alpine`, prod).
+- **Schema via pgschema, state-based (ADR-0019).** `schema.sql` is the declared state
+  and the only source of truth: sqlc generates from it, the integration lane builds
+  its database from it, and `task db:plan -- <name>` diffs it against a live database
+  to produce the DDL. **`migrations/` is the record of reviewed plans, not the apply
+  path** — nothing replays it, and `task db:apply` runs a *saved* plan file (pgschema
+  fingerprints the database it was planned against and refuses a stale one).
+  `task db:verify` replaces the old `atlas.sum` check by applying `schema.sql` to an
+  empty database and asserting the resulting plan is empty; it is in `ci:full` and CI.
+- **Postgres 18** everywhere (the `db:*` tasks' database, TestContainers
+  `postgres:18-alpine`, prod). No task assumes a PostgreSQL on your machine —
+  `task db:dev:up` starts the pinned one.
 - **Identity columns are `uuid`** (UUIDv7), not text — `volume_id` is the same 16-byte
   id the on-disk WAL format carries. The `metadata.Store` interface uses `string` ids at
   the boundary; the `pg` adapter parses `string ↔ uuid`.

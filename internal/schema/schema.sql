@@ -7,8 +7,10 @@
 -- UUID the on-disk WAL format carries (RecordHeader.VolumeID [16]byte). IDs are
 -- generated as UUIDv7 (time-ordered, better index locality) — app-side via
 -- google/uuid.NewV7 for values that must match the durable format, and the DB runs
--- Postgres 18 (native uuidv7()). Schema is the Atlas source of truth (atlas.hcl);
--- migrations live in migrations/ (ADR-0006, ADR-0007).
+-- Postgres 18 (native uuidv7()). This file is the declared state and the single
+-- source of truth: pgschema plans against it (ADR-0019), sqlc generates from it
+-- (ADR-0006), and the integration lane builds its database from it. migrations/
+-- holds the reviewed plans, not the apply path.
 
 -- Single-active Control Plane leadership with a verified term (§7). Every CP write
 -- transaction validates term = the holder's term; a zombie CP affects 0 rows.
@@ -199,15 +201,18 @@ CREATE INDEX operations_volume_id_idx ON operations (volume_id);
 -- non-negative guard, the expected-value predicate, the per-volume release stage —
 -- existed only because a delta is not an idempotency key.
 --
--- **Why the expression is repeated in internal/db/queries instead of living in a
--- view.** A view is the obvious home for it, and it is not available: Atlas
--- Community (the pinned toolchain, ATLAS_VERSION in Taskfile.yml) refuses to diff a
--- schema containing one — "views are available to logged-in users only". Pinning a
--- licensed Atlas, or hand-writing the migration outside `task db:migrate:diff`,
--- would buy syntactic sugar over a sum four queries can each do for themselves, at
--- the price of the one property that makes the schema trustworthy: that
--- internal/schema/schema.sql is the declared state and the migrations are derived
--- from it mechanically. So the four copies are deliberate. They live in
+-- **Why the expression is still repeated in internal/db/queries instead of living
+-- in a view.** A view is the obvious home for it, and until ADR-0019 it was not
+-- available at all: Atlas Community refused to diff a schema containing one, so the
+-- choice was between a licensed toolchain, a hand-written migration outside the
+-- tool, or four copies — and the four copies were the only one of the three that
+-- kept this file mechanically authoritative. pgschema diffs views fine, so that
+-- constraint is gone and the copies are now a debt rather than a necessity.
+--
+-- Paying it is a deliberate follow-up, not a rider on the tool change: ADR-0019
+-- lands the swap and stays boring, and where a view actually helps (this sum, the
+-- lineage charge of ADR-0014, the volumes-with-in-flight-plans join) gets decided on
+-- its own. Until then the four copies stand. They live in
 -- internal/db/queries/hosts.sql (GetHost, ListHosts), volumes.sql (CreateVolume's
 -- bound) and operations.sql (UpdateOperationPhase's bound), and hosts.sql carries
 -- the full reasoning; if you change one, change all four.

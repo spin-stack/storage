@@ -1,9 +1,19 @@
 # ADR-0007 — Atlas-versioned migrations, Postgres 18, UUID/UUIDv7 identity columns
 
-- **Status:** Accepted (Phase 07 / Increment 7.1)
+- **Status:** Accepted (Phase 07 / Increment 7.1) — **decision 1 superseded by
+  ADR-0019** (2026-07-26)
 - **Date:** 2026-07-25
 - **Deciders:** human owner + tech-lead agent
 - **Extends:** ADR-0006, §8
+
+> **Superseded in part.** Decision 1 (Atlas owns migrations) no longer holds:
+> **pgschema** replaces Atlas as of ADR-0019. `internal/schema/schema.sql` is still the
+> declared state and still the single source of truth — that half of the decision is
+> what ADR-0019 preserves — but there is no `atlas.hcl`, no versioned migration chain,
+> no `atlas.sum`, and no `db:migrate:*` task; `migrations/` holds reviewed plans rather
+> than the apply path, and tests build the database from `schema.sql` directly.
+> **Decisions 2, 3 and 4 stand unchanged:** Postgres 18 everywhere, `uuid` identity
+> columns, UUIDv7 (INV-22), and `string` ids at the Go boundary.
 
 ## Context
 

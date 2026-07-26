@@ -33,7 +33,7 @@ yields). Each gets a new DST scenario driving the *existing* checker.
 `SetHostState` (ACTIVE | CORDONED | DRAINING | DEAD, term-guarded), `ListVolumesByHost`,
 and `CommitHostCapacity(hostID, deltaBytes)` (term-guarded reservation/release of
 `nvme_committed_bytes`, refusing to go negative). Both implementations (`metadata/sim`
-and `metadata/pg` + sqlc queries + Atlas migration if the schema needs it) and the
+and `metadata/pg` + sqlc queries + a `schema.sql` change if the schema needs it) and the
 integration test.
 
 New package `internal/placement`: a pure, deterministic policy — no I/O, no clock.

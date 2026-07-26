@@ -1,7 +1,10 @@
 //go:build integration
 
 // Integration tests for the pg metadata adapter against a real Postgres 18 via
-// TestContainers (ADR-0006, ADR-0007). It applies the real Atlas migrations. Run
+// TestContainers (ADR-0006, ADR-0007). It builds the database from
+// internal/schema/schema.sql — the declared state that is the source of truth
+// (ADR-0019) — so what these tests run against is the artefact sqlc generates from
+// and `task db:verify` checks, not a replay that could have drifted from it. Run
 // with: task test:integration (requires Docker). Excluded from the unit/lint lane.
 package pg_test
 
@@ -22,7 +25,7 @@ import (
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/pg"
-	"github.com/spin-stack/storage/migrations"
+	"github.com/spin-stack/storage/internal/schema"
 )
 
 func startPostgres(t *testing.T) *pgxpool.Pool {
@@ -54,15 +57,10 @@ func startPostgres(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	// Apply the real, versioned Atlas migrations in order.
-	stmts, err := migrations.Ordered()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, s := range stmts {
-		if _, err := pool.Exec(ctx, s); err != nil {
-			t.Fatalf("apply migration %d: %v", i, err)
-		}
+	// Build the schema from the declared state itself (pgx uses the simple protocol
+	// for an argument-less Exec, so the whole multi-statement file goes in one go).
+	if _, err := pool.Exec(ctx, schema.SQL); err != nil {
+		t.Fatalf("apply schema.sql: %v", err)
 	}
 	return pool
 }
