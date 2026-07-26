@@ -546,7 +546,7 @@ func (d *Drainer) move(ctx context.Context, term int64, operationID, source stri
 		if err := d.guardDurableFloor(ctx, v, vol, vp.PrevEpoch, mp.UpTo); err != nil {
 			return Move{}, err
 		}
-		if err := d.writeRecoveryPoint(ctx, vol, vp.NewEpoch, vp.PrevEpoch, mp.UpTo); err != nil {
+		if err := d.writeRecoveryPoint(ctx, vol, vp.NewEpoch, vp.PrevEpoch, mp.UpTo, vp.ToHost); err != nil {
 			return Move{}, err
 		}
 		src, err := d.md.GetHost(ctx, source)
@@ -749,8 +749,12 @@ func (d *Drainer) guardDurableFloor(ctx context.Context, v metadata.Volume, vol 
 // so a move retried after a crash between promotion and this write finds its own
 // boundary already there: an identical one is accepted (§18), a different one means
 // two writers claimed the same epoch and is a hard error.
-func (d *Drainer) writeRecoveryPoint(ctx context.Context, vol [16]byte, newEpoch, oldEpoch, upTo uint64) error {
-	err := recovery.WriteRecoveryPoint(ctx, d.store, vol, newEpoch, oldEpoch, upTo)
+// It is written as the destination host, the one Promote just granted newEpoch to:
+// the boundary is the floor everything published in the new epoch is measured against,
+// so an author that does not hold the epoch has no business recording it (§12.5).
+func (d *Drainer) writeRecoveryPoint(ctx context.Context, vol [16]byte, newEpoch, oldEpoch, upTo uint64, hostID string) error {
+	rp := recovery.RecoveryPoint{PrevEpoch: oldEpoch, RecoveredUpTo: upTo}
+	err := rp.WriteAs(ctx, d.store, vol, newEpoch, hostID)
 	if !errors.Is(err, objectstore.ErrPreconditionFailed) {
 		return err
 	}

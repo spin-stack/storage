@@ -1491,3 +1491,48 @@ func TestDrainRefusesToGuessWhenTheCapacityLedgerMoved(t *testing.T) {
 		t.Fatalf("source committed = %d, want %d — the resumed pass released again", got, 4*volSize)
 	}
 }
+
+// TestDrainWritesTheBoundaryAsTheEpochHolder: the epoch boundary is the floor every
+// later claim about the new epoch is measured against, and the object is create-only —
+// once written it is the answer forever. So it may only be authored by the host the
+// epoch was granted to (§12.5), which the drain normally is: Promote granted the epoch
+// to its destination moments earlier.
+//
+// The case that is not: this drain's promotion lands, its boundary write does not, and
+// before it is resumed an overtaking promotion moves the volume on. The resumed pass
+// must not record a boundary for an epoch that now belongs to somebody else. The check
+// is a pre-check by construction — the PUT is the last thing WriteAs does and the
+// object is immutable, so a later read could refuse nothing — and reverting the drain
+// to the anonymous recovery.WriteRecoveryPoint makes this test fail.
+func TestDrainWritesTheBoundaryAsTheEpochHolder(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	firstID := format.UUIDString(w.vols[0])
+
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: %v", err)
+	}
+	w.pastFencingWait()
+	w.faults.fail = failBoundaryWrite
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, errBoundaryLost) {
+		t.Fatalf("setup: want errBoundaryLost, got %v", err)
+	}
+	w.faults.fail = nil
+
+	// Somebody else promotes the volume on before this drain is resumed.
+	epochs := epoch.NewStore(w.store)
+	r, etag, err := epochs.CurrentRecord(ctx, firstID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := epochs.Grant(ctx, firstID, etag, r.Epoch+1, drainHostC); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err == nil {
+		t.Fatal("the resumed drain recorded a boundary for an epoch it no longer holds")
+	}
+	if _, rerr := recovery.ReadRecoveryPoint(ctx, w.store, w.vols[0], r.Epoch); rerr == nil {
+		t.Fatal("a boundary was written by a host that does not hold the epoch")
+	}
+}
