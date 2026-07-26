@@ -20,9 +20,9 @@ wal/<volume-id>/
   ...
 ```
 
-- A segment is **sealed** when it reaches `SegmentBytes` (proposal: 64 MiB) or
-  `SegmentAge` (proposal: 5 min), whichever comes first; a new one is created for the
-  next record. Only the newest segment is open for append.
+- A segment is **sealed** when it reaches `SegmentBytes` (**32 MiB**, see below) or when
+  a checkpoint publishes; a new one is created for the next record. Only the newest
+  segment is open for append.
 - **A record never straddles a segment.** A record that does not fit in the remaining
   space seals the segment and starts the next one. This is what makes replay of a
   segment a self-contained operation and what makes an unlink safe to reason about.
@@ -116,16 +116,40 @@ matters — it is the maximum space a published checkpoint cannot yet reclaim.
   between unlinks, after the published advance) and assert INV-13 and the read view
   survive each one.
 
-## Open questions for the reviewer
+## Decisions on the four open questions (2026-07-26)
 
-1. **`SegmentBytes` = 64 MiB?** It is the granularity of reclamation *and* the amount a
-   crash can leave unsynced. Smaller reclaims sooner and costs more file descriptors and
-   more directory churn.
-2. **Do sealed segments stay open?** Keeping them open makes replay cheap and holds file
-   descriptors; reopening on demand is simpler and pays a syscall per recovery.
-3. **Is `SegmentAge` worth it?** It bounds how long an idle volume holds a partly-filled
-   segment, at the cost of a timer per volume. An alternative is to seal on the
-   checkpoint, which is when reclamation could happen anyway.
-4. **Does the segment name carry the epoch?** `wal/<vol>/<epoch>/<first-seq>.seg` would
-   make a foreign-epoch directory impossible rather than merely detected, at the cost of
-   a directory per promotion.
+**1. `SegmentBytes` = 32 MiB**, with the option to derive it from the volume's device
+share once ADR-0013 exists (`clamp(share/8, 8 MiB, 64 MiB)`).
+
+A correction to how this spec first framed it: segment size is **not** "the amount a
+crash leaves unsynced" — that is bounded by `MaxUnflushedBytes`, since we fdatasync per
+FLUSH. Segment size governs three things only: reclamation granularity, file
+descriptors, and directory churn.
+
+That makes the deciding cost scale with **volume count**, not with volume size: each
+volume retains up to one segment the checkpoint cannot yet reclaim. At 64 MiB and 100
+volumes on a host that is 6.4 GiB immobilised; at 32 MiB, 3.2 GiB.
+
+The reference points, all with the same structure (append-only segmented log, reclaim by
+segment): PostgreSQL WAL 16 MB, Cassandra/ScyllaDB commitlog 32 MB, etcd WAL 64 MB, TiKV
+raft-engine 128 MB. The closest analogue is the Cassandra/Scylla commitlog — many
+independent streams, a segment set per stream, reclamation tied to a progress point —
+and it uses 32 MB. Kafka's 1 GB is not a counter-example: its granularity works because
+retention is a policy, not a wait for a checkpoint.
+
+**2. Sealed segments are closed.** Only the newest is held open. Descriptors would
+otherwise scale with volumes × retained segments, which is the same quantity that
+already makes segment size matter; replay is rare (crash, attach) and pays an open per
+segment when it happens.
+
+**3. No `SegmentAge` timer. Seal on checkpoint instead.** A timer per volume buys
+nothing a checkpoint does not: sealing is only useful at the moment reclamation becomes
+possible, and that moment *is* the checkpoint. An idle volume holds at most one
+partly-filled segment either way.
+
+**4. Yes — the epoch is in the path**: `wal/<vol>/<epoch>/<first-seq>.seg`. It mirrors
+the S3 key layout (`wal/<vol>/<epoch>/`), makes a foreign-epoch directory impossible
+rather than merely detected, and makes "which epochs still have local segments" a
+directory listing. A promotion is rare, so a directory per promotion is free. The
+file-level `Epoch` in the header stays: the path says where it was filed, the header
+says what it is, and a restored directory can disagree with both.
