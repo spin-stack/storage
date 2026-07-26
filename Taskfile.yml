@@ -34,6 +34,14 @@ vars:
   # --- pinned tool versions (the single place each is declared) ---
   SQLC_VERSION: v1.30.0
   ATLAS_VERSION: v1.2.3
+  # Protobuf/Connect toolchain (ADR-0018). protoc itself is never used: buf
+  # compiles the schema and drives the two plugins. PROTOC_GEN_GO_VERSION must
+  # match the google.golang.org/protobuf version in go.mod, and
+  # PROTOC_GEN_CONNECT_GO_VERSION the connectrpc.com/connect one — a plugin
+  # newer than its runtime generates code the module cannot compile.
+  BUF_VERSION: v1.72.0
+  PROTOC_GEN_GO_VERSION: v1.36.11
+  PROTOC_GEN_CONNECT_GO_VERSION: v1.20.0
   # golangci-lint v2 also owns formatting (gofmt + goimports are configured as
   # `formatters` in .golangci.yml), so there is exactly one formatter binary.
   GOLANGCI_VERSION: v2.12.2
@@ -46,11 +54,13 @@ tasks:
   # --- tools -----------------------------------------------------------------
 
   tools:
-    desc: Install every pinned tool into ./.tools/bin (sqlc, atlas, golangci-lint).
+    desc: Install every pinned tool into ./.tools/bin (sqlc, atlas, golangci-lint, buf + proto plugins).
     cmds:
       - task: tools:sqlc
       - task: tools:atlas
       - task: tools:golangci
+      - task: tools:buf
+      - task: tools:protoc-plugins
 
   tools:sqlc:
     desc: Install the pinned sqlc (ADR-0006).
@@ -84,15 +94,43 @@ tasks:
     cmds:
       - GOBIN={{.TOOLS_BIN}} go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_VERSION}}
 
+  tools:buf:
+    desc: Install the pinned buf (ADR-0018) — the only protobuf compiler this project uses.
+    status:
+      - test -x {{.TOOLS_BIN}}/buf && {{.TOOLS_BIN}}/buf --version | grep -q '{{.BUF_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/bufbuild/buf/cmd/buf@{{.BUF_VERSION}}
+
+  tools:protoc-plugins:
+    desc: Install the pinned protoc-gen-go and protoc-gen-connect-go (ADR-0018).
+    status:
+      - test -x {{.TOOLS_BIN}}/protoc-gen-go && {{.TOOLS_BIN}}/protoc-gen-go --version | grep -q '{{.PROTOC_GEN_GO_VERSION}}'
+      - test -x {{.TOOLS_BIN}}/protoc-gen-connect-go && {{.TOOLS_BIN}}/protoc-gen-connect-go --version | grep -q '{{.PROTOC_GEN_CONNECT_GO_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install google.golang.org/protobuf/cmd/protoc-gen-go@{{.PROTOC_GEN_GO_VERSION}}
+      - GOBIN={{.TOOLS_BIN}} go install connectrpc.com/connect/cmd/protoc-gen-connect-go@{{.PROTOC_GEN_CONNECT_GO_VERSION}}
+
   # --- code generation and migrations ----------------------------------------
 
   generate:
+    desc: Regenerate every committed generated artifact (sqlc + protobuf/Connect).
+    cmds:
+      - task: generate:sqlc
+      - task: generate:proto
+
+  generate:check:
+    desc: Fail if any committed generated output is stale.
+    cmds:
+      - task: generate:sqlc:check
+      - task: generate:proto:check
+
+  generate:sqlc:
     desc: Regenerate sqlc code from schema + queries (ADR-0006).
     deps: [tools:sqlc]
     cmds:
       - "{{.TOOLS_BIN}}/sqlc generate"
 
-  generate:check:
+  generate:sqlc:check:
     desc: Fail if the committed sqlc output is stale (generate produced a diff).
     deps: [tools:sqlc]
     cmds:
@@ -100,6 +138,28 @@ tasks:
       # Only the generated files: hand-written tests living in internal/db must not
       # make this fail (it is about staleness, not about uncommitted work).
       - git diff --exit-code -- 'internal/db/*.go' ':!internal/db/*_test.go'
+
+  generate:proto:
+    desc: Regenerate the protobuf + Connect stubs in api/gen (ADR-0018).
+    deps: [tools:buf, tools:protoc-plugins]
+    dir: api
+    cmds:
+      - "{{.TOOLS_BIN}}/buf generate"
+
+  generate:proto:check:
+    desc: Fail if the committed protobuf/Connect output is stale.
+    deps: [tools:buf, tools:protoc-plugins]
+    cmds:
+      - task: generate:proto
+      - git diff --exit-code -- api/gen
+
+  lint:proto:
+    desc: Lint and format-check the protobuf schema (buf STANDARD).
+    deps: [tools:buf]
+    dir: api
+    cmds:
+      - "{{.TOOLS_BIN}}/buf lint"
+      - "{{.TOOLS_BIN}}/buf format --diff --exit-code"
 
   db:migrate:diff:
     desc: "Generate an Atlas migration from schema.sql changes (ADR-0007). Usage: task db:migrate:diff -- <name>"
@@ -223,6 +283,17 @@ tasks:
     cmds:
       - go build ./...
 
+  build:cmd:
+    desc: Build the binaries (volume-agent, control-plane) into _output/bin.
+    vars:
+      # The version each binary reports about itself: the Agent sends it in every
+      # heartbeat (§13.4, fleet-mixed), so "dev" from an untagged build is a
+      # deliberate answer, not a missing one.
+      VERSION: '{{.VERSION | default "dev"}}'
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}/bin
+      - go build -ldflags "-X main.version={{.VERSION}}" -o {{.OUTPUT_DIR}}/bin/ ./cmd/...
+
   test:
     desc: Run the full unit/property test suite with the race detector.
     cmds:
@@ -243,6 +314,7 @@ tasks:
     cmds:
       - task: lint:golangci
       - task: lint:simulable
+      - task: lint:proto
 
   lint:golangci:
     desc: Run golangci-lint (incl. forbidigo/depguard belt-and-suspenders).

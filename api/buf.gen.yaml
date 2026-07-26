@@ -1,0 +1,15 @@
+version: v2
+# Generated Go lands in api/gen/<proto path> and is committed, exactly like the
+# sqlc output in internal/db (ADR-0006/ADR-0018). Regenerate with
+# `task generate:proto`; `task generate:proto:check` fails if it is stale.
+#
+# The plugins are addressed by their path inside the project-local toolchain
+# (./.tools/bin, installed by `task tools`) so a stray protoc-gen-go on the
+# developer's PATH cannot change what is generated.
+plugins:
+  - local: ../.tools/bin/protoc-gen-go
+    out: gen
+    opt: paths=source_relative
+  - local: ../.tools/bin/protoc-gen-connect-go
+    out: gen
+    opt: paths=source_relative
