@@ -149,8 +149,17 @@ type simTimer struct {
 
 func (t *simTimer) C() <-chan clock.Instant { return t.ch }
 
+// fire marks the timer fired and delivers the instant. The flag is set under the
+// clock's lock because Stop reads it there: without that, a Sleep whose context is
+// cancelled while another goroutine Advances is a data race, and the race is not
+// theoretical — it decides whether Stop reports that it removed a timer that had
+// already fired. The send happens outside the lock: the channel is buffered, and
+// holding the clock while delivering would let a receiver's next clock call deadlock
+// against the sender.
 func (t *simTimer) fire(now clock.Instant) {
+	t.clk.mu.Lock()
 	t.fired = true
+	t.clk.mu.Unlock()
 	t.ch <- now
 }
 
