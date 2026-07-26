@@ -210,8 +210,7 @@ CREATE INDEX snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 CREATE INDEX operations_volume_id_idx ON operations (volume_id);
 
--- Committed NVMe capacity (§28.2) is DERIVED, not stored (ADR-0017). There is no
--- column for it and no view either:
+-- Committed NVMe capacity (§28.2) is DERIVED, not stored (ADR-0017):
 --
 --   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
 --                   + Σ size_bytes reserved by in-flight operation plans targeting it
@@ -223,18 +222,51 @@ CREATE INDEX operations_volume_id_idx ON operations (volume_id);
 -- non-negative guard, the expected-value predicate, the per-volume release stage —
 -- existed only because a delta is not an idempotency key.
 --
--- **Why the expression is still repeated in internal/db/queries instead of living
--- in a view.** A view is the obvious home for it, and until ADR-0019 it was not
--- available at all: Atlas Community refused to diff a schema containing one, so the
--- choice was between a licensed toolchain, a hand-written migration outside the
--- tool, or four copies — and the four copies were the only one of the three that
--- kept this file mechanically authoritative. pgschema diffs views fine, so that
--- constraint is gone and the copies are now a debt rather than a necessity.
+-- It is a view because it is a rule, and a rule lives once. It was inlined in four
+-- queries until now for a tooling reason that no longer exists (Atlas Community
+-- refused to diff a schema containing a view; ADR-0019 replaced it), and four copies
+-- of an accounting rule is four places for a placement decision to be taken against
+-- a different definition of "full".
 --
--- Paying it is a deliberate follow-up, not a rider on the tool change: ADR-0019
--- lands the swap and stays boring, and where a view actually helps (this sum, the
--- lineage charge of ADR-0014, the volumes-with-in-flight-plans join) gets decided on
--- its own. Until then the four copies stand. They live in
--- internal/db/queries/hosts.sql (GetHost, ListHosts), volumes.sql (CreateVolume's
--- bound) and operations.sql (UpdateOperationPhase's bound), and hosts.sql carries
--- the full reasoning; if you change one, change all four.
+-- The second term is what makes it correct rather than merely simple: a volume being
+-- moved must be charged to its destination *before* it becomes the primary there, or
+-- two placements would both see room. It is read out of the operation's own recorded
+-- progress, which carries a per-volume stage, so "reserved but not yet primary" is
+-- readable rather than inferred. An entry stops reserving the moment the volume it
+-- names is actually primary on the host — otherwise the volume is charged twice,
+-- once as a plan and once as a placement — and a settled entry (DONE, FOREIGN)
+-- reserves nothing at all.
+--
+-- The join is on volume_id::text rather than a cast of the JSON value to uuid: a
+-- malformed plan must make the row disappear from the sum, not make every capacity
+-- read raise. The consequence, stated in ADR-0017, is that an operation whose plan
+-- is lost makes its destination look emptier than it is — which is why the plan is
+-- written term-guarded, before the work it describes.
+--
+-- Both sums are correlated subqueries in the select list rather than an aggregate
+-- over a join, so a reader asking about one host is charged for one host: the
+-- host_id filter is applied to the scan of `hosts` and the subqueries run only for
+-- the rows that survive it. That is the property a view puts at risk and the one
+-- TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet measures — the drain reads this
+-- on every pass, per host it considers.
+--
+-- It is a plain view and not a materialized one on purpose: staleness in an
+-- accounting path is the exact failure ADR-0017 removed when it deleted the ledger,
+-- and a materialized view is a ledger with a refresh job.
+CREATE VIEW host_committed_bytes AS
+SELECT h.host_id,
+       (COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+                   WHERE v.primary_host_id = h.host_id), 0)
+        + COALESCE((SELECT SUM(rv.size_bytes)
+                      FROM operations o
+                      CROSS JOIN LATERAL jsonb_array_elements(
+                          CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
+                               THEN o.current_state -> 'volumes'
+                               ELSE '[]'::jsonb END) AS e
+                      JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
+                     WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
+                       AND e ->> 'to_host' = (h.host_id)::text
+                       AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
+                       AND rv.primary_host_id IS DISTINCT FROM h.host_id), 0))::BIGINT
+           AS committed_bytes
+  FROM hosts h;

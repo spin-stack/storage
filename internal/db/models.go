@@ -27,6 +27,11 @@ type Host struct {
 	RenewalsBlockedUntil pgtype.Timestamptz `json:"renewals_blocked_until"`
 }
 
+type HostCommittedByte struct {
+	HostID         uuid.UUID `json:"host_id"`
+	CommittedBytes int64     `json:"committed_bytes"`
+}
+
 type HostLease struct {
 	HostID      uuid.UUID          `json:"host_id"`
 	GrantedAt   pgtype.Timestamptz `json:"granted_at"`

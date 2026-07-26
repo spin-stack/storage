@@ -109,7 +109,15 @@ func TestCommittedBytesIsDerivedInOnePlace(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := strings.Count(string(body), "host_committed_bytes"); got != want {
+		// Comments are stripped first: a file that only *mentions* the view in the
+		// prose explaining why it reads it would otherwise count as reading it.
+		var sql strings.Builder
+		for line := range strings.Lines(string(body)) {
+			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+				sql.WriteString(line)
+			}
+		}
+		if got := strings.Count(sql.String(), "host_committed_bytes"); got != want {
 			t.Fatalf("%s reads host_committed_bytes %d times, want %d", file, got, want)
 		}
 	}

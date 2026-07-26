@@ -28,66 +28,25 @@ ON CONFLICT (host_id) DO UPDATE
 -- placement decision waiting to happen, and a §28.2 decision taken against a stale
 -- copy of that number is exactly what ADR-0017 removed the copy to prevent.
 --
--- This is the canonical derivation; three other queries repeat it (ListHosts below,
--- and the bound predicates in volumes.sql and operations.sql). schema.sql says why
--- it is not a view: the tool that refused one is gone (ADR-0019), and moving the
--- derivation into a view is a deliberate follow-up rather than a rider on the tool
--- change. Until then the copies stay; if you change one, change all four.
---
---   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
---                   + Σ size_bytes reserved by in-flight operation plans targeting it
---
--- The second term is what makes it correct rather than merely simple: a volume being
--- moved must be charged to its destination *before* it becomes the primary there, or
--- two placements would both see room. It is read out of the operation's own recorded
--- progress, which carries a per-volume stage, so "reserved but not yet primary" is
--- readable rather than inferred. An entry stops reserving the moment the volume it
--- names is actually primary on the host — otherwise the volume is charged twice,
--- once as a plan and once as a placement — and a settled entry (DONE, FOREIGN)
--- reserves nothing at all.
---
--- The join is on volume_id::text rather than a cast of the JSON value to uuid: a
--- malformed plan must make the row disappear from the sum, not make every capacity
--- read raise. The consequence, stated in ADR-0017, is that an operation whose plan is
--- lost makes its destination look emptier than it is — which is why the plan is
--- written term-guarded, before the work it describes.
+-- The derivation itself is the host_committed_bytes view (schema.sql), which is
+-- where its reasoning lives; three other queries read the same view (ListHosts
+-- below, and the bound predicates in volumes.sql and operations.sql). It used to be
+-- copied into all four, for a tooling reason ADR-0019 removed.
 --
 -- It runs at placement time, not on the data path, over a fleet of hundreds of rows.
-SELECT sqlc.embed(h), (
-       COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
-       WHERE v.primary_host_id = h.host_id), 0)
-       + COALESCE((SELECT SUM(rv.size_bytes)
-       FROM operations o
-       CROSS JOIN LATERAL jsonb_array_elements(
-       CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
-       THEN o.current_state -> 'volumes'
-       ELSE '[]'::jsonb END) AS e
-       JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
-       WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
-       AND e ->> 'to_host' = (h.host_id)::text
-       AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
-       AND rv.primary_host_id IS DISTINCT FROM h.host_id), 0))::BIGINT AS committed_bytes
+-- Joined rather than read as a scalar subquery: both plans push the host filter
+-- into the derivation, but the join lets the planner visit `hosts` once for the
+-- whole listing below instead of once per row.
+SELECT sqlc.embed(h), COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
+  JOIN host_committed_bytes c ON c.host_id = h.host_id
  WHERE h.host_id = $1;
 
 -- name: ListHosts :many
 -- Deterministic order: placement decisions must not depend on row order (INV-02).
--- The committed-bytes expression is GetHost's; see the comment there.
-SELECT sqlc.embed(h), (
-       COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
-       WHERE v.primary_host_id = h.host_id), 0)
-       + COALESCE((SELECT SUM(rv.size_bytes)
-       FROM operations o
-       CROSS JOIN LATERAL jsonb_array_elements(
-       CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
-       THEN o.current_state -> 'volumes'
-       ELSE '[]'::jsonb END) AS e
-       JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
-       WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
-       AND e ->> 'to_host' = (h.host_id)::text
-       AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
-       AND rv.primary_host_id IS DISTINCT FROM h.host_id), 0))::BIGINT AS committed_bytes
+SELECT sqlc.embed(h), COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
+  JOIN host_committed_bytes c ON c.host_id = h.host_id
  ORDER BY h.host_id;
 
 -- name: SetHostState :execrows

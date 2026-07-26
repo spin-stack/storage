@@ -39,21 +39,11 @@ UPDATE operations
  WHERE operations.operation_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
    AND operations.phase = ANY(sqlc.arg(allowed_phases)::text[])
-   -- The derived value is hosts.sql's GetHost expression; see the comment there.
+   -- The derived value is the host_committed_bytes view; schema.sql says why it is
+   -- a view and what it sums. A bound naming a host nobody registered admits
+   -- nothing: no row in the view, a NULL comparison, no write.
    AND (sqlc.narg(bound_host)::uuid IS NULL
        OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = sqlc.narg(bound_host)::uuid)
-           AND (
-               COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
-               WHERE v.primary_host_id = sqlc.narg(bound_host)::uuid), 0)
-               + COALESCE((SELECT SUM(rv.size_bytes)
-               FROM operations plans
-               CROSS JOIN LATERAL jsonb_array_elements(
-               CASE WHEN jsonb_typeof(plans.current_state -> 'volumes') = 'array'
-               THEN plans.current_state -> 'volumes'
-               ELSE '[]'::jsonb END) AS e
-               JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
-               WHERE plans.phase NOT IN ('SUCCEEDED', 'CANCELED')
-               AND e ->> 'to_host' = (sqlc.narg(bound_host)::uuid)::text
-               AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
-               AND rv.primary_host_id IS DISTINCT FROM sqlc.narg(bound_host)::uuid), 0))::BIGINT
+           AND (SELECT c.committed_bytes FROM host_committed_bytes c
+                 WHERE c.host_id = sqlc.narg(bound_host)::uuid)
                + sqlc.arg(bound_add_bytes)::bigint <= sqlc.arg(bound_limit)::bigint));

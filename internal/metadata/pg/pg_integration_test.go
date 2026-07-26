@@ -789,6 +789,7 @@ func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
 	if one == 0 || all == 0 {
 		t.Fatalf("no buffer counts in the plans (one=%d all=%d): the assertion is empty", one, all)
 	}
+	t.Logf("committed bytes: %d buffers for one host, %d for all %d", one, all, fleetHosts)
 	// A tenth is a wide margin on a fleet of fleetHosts: if the filter reaches the
 	// derivation the ratio is about 1/fleetHosts, and if it does not it is 1.
 	if one*10 >= all {
