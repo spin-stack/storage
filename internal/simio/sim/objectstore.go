@@ -44,6 +44,7 @@ type ObjectStore struct {
 	// one-shot faults
 	lostResponse map[string]bool
 	throttle     int
+	keyThrottle  map[string]int
 }
 
 type simObject struct {
@@ -73,6 +74,7 @@ func NewObjectStore() *ObjectStore {
 	return &ObjectStore{
 		objs:         map[string]*simObject{},
 		lostResponse: map[string]bool{},
+		keyThrottle:  map[string]int{},
 	}
 }
 
@@ -155,12 +157,41 @@ func (s *ObjectStore) InjectThrottle(n int) {
 	s.throttle = n
 }
 
+// InjectThrottleKey makes the next n operations that name key return ErrThrottled,
+// leaving every other key alone. It is what lets a scenario aim a fault at one step
+// of a protocol — the epoch object's CAS, the boundary PUT — instead of counting how
+// many unrelated reads the production code happens to make first, a coupling that
+// silently relocates the fault as soon as that code adds a HEAD.
+//
+// List is not covered: a listing names a prefix, not a key, and a whole-store refusal
+// is what InjectThrottle is for.
+func (s *ObjectStore) InjectThrottleKey(key string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keyThrottle[key] = n
+}
+
 func (s *ObjectStore) throttled() bool {
 	if s.throttle > 0 {
 		s.throttle--
 		return true
 	}
 	return false
+}
+
+// throttledKey consumes one refusal budgeted for key. A refusal happens before any
+// state changes, so a throttled PUT leaves nothing behind.
+func (s *ObjectStore) throttledKey(key string) bool {
+	n, ok := s.keyThrottle[key]
+	if !ok || n <= 0 {
+		return false
+	}
+	if n == 1 {
+		delete(s.keyThrottle, key)
+	} else {
+		s.keyThrottle[key] = n - 1
+	}
+	return true
 }
 
 func simEtag(data []byte) string {
@@ -172,7 +203,7 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.begin()
-	if s.throttled() {
+	if s.throttled() || s.throttledKey(key) {
 		return objectstore.PutResult{}, ErrThrottled
 	}
 	existing, exists := s.objs[key]
@@ -213,7 +244,7 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.begin()
-	if s.throttled() {
+	if s.throttled() || s.throttledKey(key) {
 		return nil, ErrThrottled
 	}
 	o, ok := s.objs[key]
@@ -227,7 +258,7 @@ func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInf
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.begin()
-	if s.throttled() {
+	if s.throttled() || s.throttledKey(key) {
 		return objectstore.ObjectInfo{}, ErrThrottled
 	}
 	o, ok := s.objs[key]
@@ -266,7 +297,7 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.begin()
-	if s.throttled() {
+	if s.throttled() || s.throttledKey(key) {
 		return ErrThrottled
 	}
 	o, ok := s.objs[key]

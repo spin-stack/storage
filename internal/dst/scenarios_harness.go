@@ -433,8 +433,11 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 		return err
 	}
 
-	// The host may die with one record written and never FLUSHed. It was never ACKed,
-	// so nothing may claim it — but nothing may lose the prefix under it either.
+	// The host may die with one record appended and never FLUSHed: the crash discards
+	// the local bytes the fdatasync never covered, while the batch still holds the
+	// record, so W1's last (self-fenced) FLUSH lands it in S3 without ever ACKing it.
+	// That late object is a harmless superset (§12.5) — the boundary may include it,
+	// and must never fall below what W1 did ACK.
 	if plan.unflushedTail {
 		if _, err := w1.Write(uint64(plan.records)*4096, []byte("never-acked"), 0); err != nil {
 			return err
@@ -462,8 +465,9 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 	if plan.throttleEpoch > 0 {
 		s.Store.InjectThrottleKey(epoch.Key(vid), plan.throttleEpoch)
 	}
-	granted := uint64(0)
-	for attempt := range plan.promoteRetries + plan.throttleEpoch + 1 {
+	granted, redrives := uint64(0), 0
+	budget := plan.promoteRetries + plan.throttleEpoch + 4
+	for attempt := 0; attempt < budget && redrives < plan.promoteRetries; attempt++ {
 		newEpoch, err := p.Promote(ctx, term, vid, renewedAt, seededHost2)
 		switch {
 		case errors.Is(err, sim.ErrThrottled):
@@ -472,14 +476,15 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 		case err != nil:
 			return fmt.Errorf("promote attempt %d: %w", attempt, err)
 		}
+		redrives++
 		s.Emit(Event{Kind: EventPromotion, EarlyGrant: s.Clock.Wall().Before(deadline), Msg: fmt.Sprintf("epoch=%d attempt=%d", newEpoch, attempt)})
 		if granted != 0 && newEpoch != granted {
 			return fmt.Errorf("re-driving the promotion granted %d after %d: two writers now share one namespace (INV-10)", newEpoch, granted)
 		}
 		granted = newEpoch
-		if attempt >= plan.promoteRetries-1 {
-			break
-		}
+	}
+	if redrives != plan.promoteRetries {
+		return fmt.Errorf("the promotion completed %d of the %d re-drives the plan calls for", redrives, plan.promoteRetries)
 	}
 	if granted != 2 {
 		return fmt.Errorf("promotion granted epoch %d, want 2", granted)
