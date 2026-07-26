@@ -331,6 +331,17 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 	return nil
 }
 
+// Whether the background consumer is handed the scheduler the data path is using.
+// unscheduledMaterializer is how INV-17 is actually lost in practice: not by the
+// arbitration deciding wrongly — ioclass.Scheduler is a few lines of counter — but by
+// a consumer that was never wired to it, at which point the class system is advisory
+// and the first hint is a latency graph. materialize.New takes the scheduler as a
+// nil-able argument, so the mistake is one omitted parameter and no error anywhere.
+const (
+	scheduledMaterializer   = true
+	unscheduledMaterializer = false
+)
+
 // scenarioCrossHostMaterialization is §20 / §22.3 cold: a destination host that
 // never had the volume rebuilds it from the object store alone. The source host is
 // partitioned away for the whole materialization — there is no host-to-host path to
@@ -338,6 +349,10 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 // and the work yields to foreground I/O (INV-17). A missing referenced object is a
 // hard failure, never a half-materialized volume.
 func scenarioCrossHostMaterialization(s *Sim) error {
+	return crossHostMaterialization(s, scheduledMaterializer)
+}
+
+func crossHostMaterialization(s *Sim, scheduled bool) error {
 	ctx := context.Background()
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
@@ -370,7 +385,11 @@ func scenarioCrossHostMaterialization(s *Sim) error {
 	s.Notef("source host partitioned; destination materializes from S3 alone")
 
 	sched := ioclass.NewScheduler(64)
-	mat := materialize.New(s.Store, sched, nil)
+	var consumerSched *ioclass.Scheduler
+	if scheduled {
+		consumerSched = sched
+	}
+	mat := materialize.New(s.Store, consumerSched, nil)
 
 	// Under data-path contention the materialization yields (INV-17).
 	sched.Begin(ioclass.Foreground)

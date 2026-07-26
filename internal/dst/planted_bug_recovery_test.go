@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // Planted-bug proofs for the checkers scenarios_recovery.go contributes. A checker
@@ -15,7 +18,10 @@ import (
 const plantedVol = "00000000-0000-7000-8000-000000000051"
 
 // Planted-bug outcomes for this area.
-var errDurablePointFellBack = errors.New("planted: the durable point fell below a value already observed")
+var (
+	errBoundaryRegressed    = errors.New("planted: a boundary was written below its predecessor")
+	errDurablePointFellBack = errors.New("planted: the durable point fell below a value already observed")
+)
 
 // §12.5 / INV-12: the recovered_up_to of successive epochs never goes down. The
 // recovery-point object is create-only and the next epoch's floor is derived from it,
@@ -38,15 +44,68 @@ func TestPlantedBugBoundaryRewritten(t *testing.T) {
 	})
 }
 
+// boundaryChainUnderAStaleRead writes the boundary of a second epoch and then attempts
+// the boundary of a third, below it. recovery.WriteRecoveryPoint refuses that — and it
+// establishes what "below" means by *reading* the previous epoch's boundary: one GET of
+// a small create-only object, the same shape of read §12.4's epoch fence depends on.
+//
+// blind serves that GET from a replica that does not have the object yet. The floor
+// collapses to zero, the regressing boundary is written, and it is create-only: from
+// then on the volume's epoch chain says every sequence between 12 and 40 was never
+// recovered, and no in-band action can walk it back. The checker has to see it in the
+// values the objects themselves report.
+func boundaryChainUnderAStaleRead(blind bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		vol := recVol()
+
+		if err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, 40); err != nil {
+			return fmt.Errorf("boundary of epoch 2: %w", err)
+		}
+		if err := observeBoundary(s, vol, 2); err != nil {
+			return err
+		}
+
+		if blind {
+			s.Store.InjectStaleRead(fmt.Sprintf("wal/%s/2/recovery-point.json", format.UUIDString(vol)))
+			s.Emit(Event{Kind: EventFault, Msg: "the epoch-2 boundary object reads as absent"})
+		}
+		// Epoch 3 recovered far less than epoch 2 recorded — a shortened listing, a
+		// GC-trimmed prefix, a promoter that started from the wrong floor.
+		err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 3, 2, 12)
+		if !blind {
+			if !errors.Is(err, recovery.ErrBoundaryRegression) {
+				return fmt.Errorf("a boundary below its predecessor was not refused: %v", err)
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("the blinded guard still refused the write: %w", err)
+		}
+		if err := observeBoundary(s, vol, 3); err != nil {
+			return err
+		}
+		return errBoundaryRegressed
+	}
+}
+
+// §12.5 / INV-12 behaviourally: the write-time guard is one GET away from blind, and
+// the object it would have refused cannot be rewritten afterwards.
+func TestPlantedBugBoundaryRegressedBehindAStaleRead(t *testing.T) {
+	requirePasses(t, 24, NewBoundaryMonotonicChecker(), boundaryChainUnderAStaleRead(false))
+	plantedBug(t, 24, NewBoundaryMonotonicChecker(), "boundary-monotonic", boundaryChainUnderAStaleRead(true))
+}
+
 // durablePointUnderARegressingList observes one epoch's durable point twice with
 // nothing written in between. recovery.DurablePrefix derives it from a LIST, so the
 // second answer is the backend's, not the harness's: if the listing serves less than
 // it did a moment ago the number falls, with no error anywhere, and that number is
 // what a promotion writes into a create-only boundary.
 //
-// SetEventualList is the closest fault the store has today and it is the wrong
-// direction: it withholds keys that were never listed and lets them catch up, so a
-// point already observed can never fall.
+// regress serves the second listing from an index replica that is behind the data. It
+// is the only fault in this file that needs no crash, no partition and no second
+// writer: one backend answering an ordinary LIST from a stale shard is enough to move
+// the number recovery would carve into stone.
 func durablePointUnderARegressingList(regress bool) Scenario {
 	return func(s *Sim) error {
 		ctx := context.Background()
@@ -74,7 +133,7 @@ func durablePointUnderARegressingList(regress bool) Scenario {
 		}
 
 		if regress {
-			s.Store.SetEventualList(true)
+			s.Store.InjectStaleListing(s.Rand, 1)
 			s.Emit(Event{Kind: EventFault, Msg: "the listing serves less than it already has"})
 		}
 		again, err := observeDurablePoint(s, vol, 1)
@@ -92,8 +151,9 @@ func durablePointUnderARegressingList(regress bool) Scenario {
 // with no error at all — and it is the number a promotion writes into a create-only
 // boundary.
 //
-// FAILS: sim.ObjectStore cannot un-list a key it has already served, so the second
-// observation equals the first and there is no regression to catch.
+// Planted by one listing served from behind the data: recovery.DurablePrefix walks the
+// same objects and answers a smaller number, with no error, from a bucket that has lost
+// nothing.
 func TestPlantedBugDurablePointRegressed(t *testing.T) {
 	requirePasses(t, 23, NewDurablePointMonotonicChecker(), durablePointUnderARegressingList(false))
 	plantedBug(t, 23, NewDurablePointMonotonicChecker(), "durable-point-monotonic", durablePointUnderARegressingList(true))

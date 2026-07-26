@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -51,12 +52,20 @@ type ObjectStore struct {
 	permanentDelete     bool
 	ignorePreconditions bool
 	staleRead           map[string]bool
+	// A listing that goes *backwards*: the remaining budget of stale listings and the
+	// PRNG that decides how far behind each of them is (InjectStaleListing).
+	staleListings int
+	staleListRand *rand.Rand
 }
 
 type simObject struct {
 	data      []byte
 	etag      string
 	listReady bool
+	// wroteAt is the operation count at which this version was written. It orders the
+	// objects by age for a listing that is behind the data, which loses the newest
+	// writes first whatever their keys sort like.
+	wroteAt uint64
 	// visibleAt is the operation count from which List reports this version, when the
 	// store was configured with a finite lag. 0 means "not on a lag" — either already
 	// listable (listReady) or waiting for Settle (eventualList).
@@ -217,6 +226,62 @@ func (s *ObjectStore) InjectStaleRead(key string) {
 	s.staleRead[key] = true
 }
 
+// InjectStaleListing makes the next n listings that would return something answer from
+// an index replica that is *behind the data*: each of them omits a non-empty set of
+// the most recently written keys it would otherwise report, r deciding how far behind
+// each one is.
+//
+// This is the fault SetEventualList and SetListLag cannot express, and the direction
+// that matters. Both of those withhold a key that no listing has served yet and then
+// let it catch up, so every number derived from a listing only ever grows. A real
+// eventually consistent LIST offers no monotonic-read guarantee at all: two listings a
+// moment apart can be served by different index replicas, and the second can be the
+// older one. Everything the system derives from a listing is a *number* —
+// recovery.DurablePrefix's contiguous prefix, the checkpointer's published point, the
+// boundary a promotion writes into a create-only object — and a listing that goes
+// backwards makes that number smaller with no error anywhere.
+//
+// Determinism (INV-02): the draw is taken once per affected listing, after the keys
+// have been sorted, and orders them by write order with the key as a total tie-break,
+// so it never depends on map iteration. Listings that would return nothing do not
+// consume the budget — a fault nobody can observe should not be spent. n <= 0 or a nil
+// r is a no-op.
+func (s *ObjectStore) InjectStaleListing(r *rand.Rand, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r == nil || n <= 0 {
+		return
+	}
+	s.staleListings = n
+	s.staleListRand = r
+}
+
+// dropRecentWrites removes the keys a listing served by a lagging index replica would
+// not have yet. out must already be sorted by key. Callers hold s.mu.
+func (s *ObjectStore) dropRecentWrites(out []objectstore.ObjectInfo) []objectstore.ObjectInfo {
+	if s.staleListings <= 0 || len(out) == 0 {
+		return out
+	}
+	s.staleListings--
+	behind := 1 + s.staleListRand.Intn(len(out))
+
+	byAge := append([]objectstore.ObjectInfo(nil), out...)
+	sort.SliceStable(byAge, func(i, j int) bool {
+		return s.objs[byAge[i].Key].wroteAt > s.objs[byAge[j].Key].wroteAt
+	})
+	missing := make(map[string]bool, behind)
+	for _, o := range byAge[:behind] {
+		missing[o.Key] = true
+	}
+	kept := make([]objectstore.ObjectInfo, 0, len(out)-behind)
+	for _, o := range out {
+		if !missing[o.Key] {
+			kept = append(kept, o)
+		}
+	}
+	return kept
+}
+
 // ClearStaleRead lets key catch up.
 func (s *ObjectStore) ClearStaleRead(key string) {
 	s.mu.Lock()
@@ -298,6 +363,7 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 		data:       append([]byte(nil), data...),
 		etag:       simEtag(data),
 		listReady:  !s.eventualList && s.listLag == 0,
+		wroteAt:    s.ops,
 		superseded: rewroteAMarkedKey,
 		createdAt:  s.now(),
 	}
@@ -367,7 +433,7 @@ func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.Obje
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out, nil
+	return s.dropRecentWrites(out), nil
 }
 
 // Delete places a delete marker over the object (§21.3). It never destroys data: the
