@@ -701,6 +701,33 @@ func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.
 	if err != nil {
 		return metadata.Operation{}, notFound(err)
 	}
+	return operationFromRow(op)
+}
+
+func (s *Store) ListOperationsByHost(ctx context.Context, hostID string) ([]metadata.Operation, error) {
+	id, err := requireUUID("host", hostID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListOperationsByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	ops := make([]metadata.Operation, 0, len(rows))
+	for _, row := range rows {
+		op, err := operationFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
+// operationFromRow converts a generated row to the interface type, parsing the kind
+// and the phase rather than trusting the columns (the CHECKs make this unreachable
+// in practice — this is the second line of defence).
+func operationFromRow(op *db.Operation) (metadata.Operation, error) {
 	kind, err := lifecycle.ParseOperationKind(op.Kind)
 	if err != nil {
 		return metadata.Operation{}, fmt.Errorf("operation %s: %w", op.OperationID, err)

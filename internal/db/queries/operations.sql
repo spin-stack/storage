@@ -13,6 +13,13 @@ ON CONFLICT (operation_id) DO NOTHING;
 -- name: GetOperation :one
 SELECT * FROM operations WHERE operation_id = $1;
 
+-- name: ListOperationsByHost :many
+-- Every operation recorded against a host, so a reconciler can ask what is already
+-- happening to it before starting something else (§7, §28.1). Deterministic order:
+-- the answer must not depend on row order (INV-02), and the composite index
+-- operations (host_id, operation_id) satisfies both the filter and the sort.
+SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id;
+
 -- name: UpdateOperationPhase :execrows
 -- Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
 -- terminal operation cannot be resurrected even by a buggy caller.

@@ -294,6 +294,12 @@ type Store interface {
 	RecordOperation(ctx context.Context, term int64, op Operation) (recorded bool, err error)
 	// GetOperation returns a recorded operation.
 	GetOperation(ctx context.Context, operationID string) (Operation, error)
+	// ListOperationsByHost returns every operation recorded against hostID, ordered
+	// by operation id (deterministic, INV-02). It is how a reconciler asks what is
+	// already happening to a host before starting something else: an operation id is
+	// the only handle GetOperation offers, and a second drain arrives with a new one
+	// (§7, §28.1).
+	ListOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
 	// UpdateOperation stores an operation's phase, current state, and error — the
 	// visible progress of a long-running reconciled operation (§7, §28.1). It is
 	// term-guarded, and the phase move is guarded by the lifecycle table, so a

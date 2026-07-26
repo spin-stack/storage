@@ -118,7 +118,8 @@ CREATE TABLE operations (
 --    future FK arrives without one.
 -- 2. A query with a filter + ORDER BY gets a composite index in that order, so the
 --    planner can skip the sort. Today that is ListVolumesByHost, the loop a drain
---    iterates (§28.1).
+--    iterates, and ListOperationsByHost, the lookup that stops a second drain of a
+--    host that already has one (§28.1).
 --
 -- Deliberately NOT added yet (no query uses them; each has a named trigger so the
 -- index lands with its query rather than on speculation):
@@ -137,10 +138,14 @@ CREATE TABLE operations (
 -- as the FK index for primary_host_id.
 CREATE INDEX volumes_primary_host_id_volume_id_idx ON volumes (primary_host_id, volume_id);
 
+-- ListOperationsByHost: WHERE host_id = $1 ORDER BY operation_id (§28.1, the drain's
+-- exclusion check). Composite for the same reason as the volumes one above, and it
+-- doubles as the FK index for host_id.
+CREATE INDEX operations_host_id_operation_id_idx ON operations (host_id, operation_id);
+
 -- FK indexes (rule 1).
 CREATE INDEX volumes_standby_host_id_idx ON volumes (standby_host_id);
 CREATE INDEX snapshots_volume_id_idx ON snapshots (volume_id);
 CREATE INDEX snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 CREATE INDEX operations_volume_id_idx ON operations (volume_id);
-CREATE INDEX operations_host_id_idx ON operations (host_id);

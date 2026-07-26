@@ -526,6 +526,25 @@ func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Opera
 	return nil
 }
 
+func (s *Store) ListOperationsByHost(_ context.Context, hostID string) ([]metadata.Operation, error) {
+	// An empty id would match every operation recorded with no host at all, which is
+	// the opposite of what any caller of this means (in Postgres host_id is NULL for
+	// those, and NULL matches nothing).
+	if err := requireID("host", hostID); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ops []metadata.Operation
+	for _, op := range s.ops {
+		if op.HostID == hostID {
+			ops = append(ops, op)
+		}
+	}
+	sort.Slice(ops, func(i, j int) bool { return ops[i].OperationID < ops[j].OperationID })
+	return ops, nil
+}
+
 func (s *Store) GetOperation(_ context.Context, operationID string) (metadata.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -43,6 +43,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -78,6 +79,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
 		{"CapacityIsBoundedAndConditional", capacity},
+		{"OperationsAreListableByHost", operationsByHost},
 		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
 	for _, tc := range cases {
@@ -1009,6 +1011,72 @@ func capacity(t *testing.T, s metadata.Store) {
 			}
 		})
 	}
+}
+
+// operationsByHost: an operation id is the only handle GetOperation offers, and the
+// question a reconciler has to answer before it starts work on a host — "is anything
+// already happening here?" — arrives with a *different* id every time. The listing is
+// what a second drain of one host is refused by, so its filter has to be exact: an
+// operation belonging to another host, or to no host at all, must never be counted
+// as work in progress here.
+func operationsByHost(t *testing.T, s metadata.Store) {
+	ctx := context.Background()
+	w := newWorld(t, s) // records one drain operation for w.host
+
+	other := id()
+	if err := s.UpsertHost(ctx, w.term, metadata.Host{
+		HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A second operation on the same host, one on another host, and one recorded
+	// with no host at all (a cancellation that arrived before the drain started).
+	mine := id()
+	for _, op := range []metadata.Operation{
+		{OperationID: mine, Kind: lifecycle.OpDrain, HostID: w.host, Phase: lifecycle.OpRunning},
+		{OperationID: id(), Kind: lifecycle.OpDrain, HostID: other, Phase: lifecycle.OpPending},
+		{OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpCanceling},
+	} {
+		op.DesiredState, op.CurrentState = []byte(`{}`), []byte(`{}`)
+		if _, err := s.RecordOperation(ctx, w.term, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ops, err := s.ListOperationsByHost(ctx, w.host)
+	if err != nil {
+		t.Fatalf("ListOperationsByHost: %v", err)
+	}
+	got := make([]string, 0, len(ops))
+	for _, op := range ops {
+		if op.HostID != w.host {
+			t.Fatalf("operation %s belongs to host %q", op.OperationID, op.HostID)
+		}
+		got = append(got, op.OperationID)
+	}
+	want := []string{w.op, mine}
+	sort.Strings(want) // the listing is ordered by operation id (INV-02)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("operations for the host = %v, want %v", got, want)
+	}
+	if ops[0].Kind != lifecycle.OpDrain || ops[0].Phase == "" {
+		t.Fatalf("the listing must round-trip kind and phase: %+v", ops[0])
+	}
+
+	t.Run("a host with no operations lists none", func(t *testing.T) {
+		ops, err := s.ListOperationsByHost(ctx, id())
+		if err != nil || len(ops) != 0 {
+			t.Fatalf("unknown host: %d operations, err=%v", len(ops), err)
+		}
+	})
+
+	t.Run("an empty host id is rejected", func(t *testing.T) {
+		// Not "every operation nobody attached to a host": that set is exactly the
+		// one a caller of this must never be handed.
+		if _, err := s.ListOperationsByHost(ctx, ""); !errors.Is(err, metadata.ErrInvalidID) {
+			t.Fatalf("empty host id: want ErrInvalidID, got %v", err)
+		}
+	})
 }
 
 // authorityClock: `last_renewal` is stamped by the store's clock, and the fencing

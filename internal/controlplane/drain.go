@@ -257,6 +257,11 @@ func (d *Drainer) Drain(ctx context.Context, term int64, hostID, operationID str
 		return DrainResult{Phase: op.Phase, Remaining: prog.remaining()}, nil
 	}
 
+	// One live evacuation per host, decided before anything is written.
+	if err := d.exclusive(ctx, hostID, operationID); err != nil {
+		return DrainResult{}, err
+	}
+
 	// Cordon first: even if this pass aborts immediately, nothing new lands here.
 	if err := d.md.SetHostState(ctx, term, hostID, lifecycle.HostCordoned); err != nil {
 		return DrainResult{}, err
@@ -381,6 +386,42 @@ func (d *Drainer) operation(ctx context.Context, hostID, operationID string) (pl
 		}
 	}
 	return p, prog, &op, nil
+}
+
+// exclusive refuses to start a second evacuation of a host that already has one.
+// Two drains of one host are not two halves of the same work: each captures its own
+// plan, each promotes the same volumes, and whichever loses a race is left holding a
+// destination reservation nobody will release, because releasing it is the losing
+// operation's own next step and that step now fails forever (§28.2). The volumes are
+// safe either way — the promotion protocol serializes them — but the accounting is
+// not, and a host that placement believes is full is a host that stays empty.
+//
+// "Live" is the operation lifecycle's own answer: not Terminal. FAILED counts as
+// live deliberately, because FAILED -> RUNNING is a legal move and the reconciler
+// will resume it; an operator who really wants a different operation id cancels the
+// first one. A drain never blocks itself, so its own later passes are unaffected.
+//
+// This is a read followed by a write rather than a database constraint. The
+// alternative — a unique partial index over live drain operations per host — would
+// make it atomic, but it puts "live" in a migration instead of in the lifecycle
+// table, and it surfaces as a constraint violation through an INSERT whose ON
+// CONFLICT clause already belongs to operation_id, which the caller cannot tell from
+// any other integrity error. The Control Plane is single-active and every write here
+// is term-guarded, so the window this leaves is two goroutines inside one leader,
+// not two leaders; if that ever becomes real, the index is the answer.
+func (d *Drainer) exclusive(ctx context.Context, hostID, operationID string) error {
+	ops, err := d.md.ListOperationsByHost(ctx, hostID)
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		if op.Kind != lifecycle.OpDrain || op.OperationID == operationID || op.Phase.Terminal() {
+			continue
+		}
+		return fmt.Errorf("%w: %s is already being drained by operation %s (%s)",
+			ErrHostAlreadyDraining, hostID, op.OperationID, op.Phase)
+	}
+	return nil
 }
 
 // move evacuates one volume: place → reserve → bulk materialize → fence → final

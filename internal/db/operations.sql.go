@@ -34,6 +34,45 @@ func (q *Queries) GetOperation(ctx context.Context, operationID uuid.UUID) (*Ope
 	return &i, err
 }
 
+const listOperationsByHost = `-- name: ListOperationsByHost :many
+SELECT operation_id, kind, volume_id, host_id, desired_state, current_state, phase, error, created_at, updated_at FROM operations WHERE host_id = $1 ORDER BY operation_id
+`
+
+// Every operation recorded against a host, so a reconciler can ask what is already
+// happening to it before starting something else (§7, §28.1). Deterministic order:
+// the answer must not depend on row order (INV-02), and the composite index
+// operations (host_id, operation_id) satisfies both the filter and the sort.
+func (q *Queries) ListOperationsByHost(ctx context.Context, hostID pgtype.UUID) ([]*Operation, error) {
+	rows, err := q.db.Query(ctx, listOperationsByHost, hostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*Operation{}
+	for rows.Next() {
+		var i Operation
+		if err := rows.Scan(
+			&i.OperationID,
+			&i.Kind,
+			&i.VolumeID,
+			&i.HostID,
+			&i.DesiredState,
+			&i.CurrentState,
+			&i.Phase,
+			&i.Error,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordOperation = `-- name: RecordOperation :execrows
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
