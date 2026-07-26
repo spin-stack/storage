@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -16,6 +18,7 @@ import (
 func harnessScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "disk-fills-under-sustained-write-with-s3-down", Run: scenarioDiskFillsWithS3Down},
+		{Name: "lagging-list-never-lowers-the-boundary", Run: scenarioLaggingListNeverLowersTheBoundary},
 	}
 }
 
@@ -206,5 +209,108 @@ func enospcTailReplaysClean(s *Sim) error {
 		return fmt.Errorf("the WRITE after ENOSPC took sequence %d, want %d", seq, accepted+1)
 	}
 	s.Notef("device filled after %d records: backpressure first, no phantom record, clean replay", accepted)
+	return nil
+}
+
+// scenarioLaggingListNeverLowersTheBoundary drives the one object-store behaviour the
+// design tolerates but recovery must never trust: an eventually consistent LIST
+// (§6.1). GET and HEAD are read-after-write in every accepted backend; LIST is not,
+// and it answers a short listing with no error at all. The durable point is computed
+// from a LIST (INV-08) and the epoch boundary is immutable (§12.5), so a listing that
+// has not caught up is one PUT away from recording a floor below what the previous
+// writer ACKed — every FLUSH under it lost for good.
+//
+// The lag is seed-driven: sometimes the listing catches up on its own before the
+// boundary is written, sometimes not until Settle. Both must be safe, and safe means
+// the same thing either way — the boundary is either refused or honest, never low.
+func scenarioLaggingListNeverLowersTheBoundary(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+	vol[15] = 0xf3
+
+	// A lag measured in store operations: with the smallest lags the listing catches
+	// up mid-scenario, with the largest it never does before Settle.
+	lag := 1 + s.Rand.Intn(24)
+	s.Store.SetListLag(lag)
+	s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("LIST lags %d operations behind", lag)})
+
+	f, err := s.Disk.Create("wal/lagging.wal")
+	if err != nil {
+		return err
+	}
+	l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
+
+	for i := range 3 {
+		if _, err := l.Write(uint64(i)*4096, []byte("acked"), 0); err != nil {
+			return err
+		}
+		if err := l.Flush(ctx); err != nil {
+			return fmt.Errorf("flush %d: %w", i, err)
+		}
+	}
+	// The summary is a strongly consistent record of what the writer ACKed; it is the
+	// only thing that can contradict a short listing.
+	if err := l.WriteSummary(ctx); err != nil {
+		return err
+	}
+	acked := l.Watermarks().Durable
+	if acked != 3 {
+		return fmt.Errorf("setup: ACKed durable = %d, want 3", acked)
+	}
+
+	// What the lagging listing can prove. It may be anything from 0 to the truth, but
+	// never more — a LIST that over-reports is a different fault entirely.
+	stale, err := recovery.DurablePrefix(ctx, s.Store, vol, 1)
+	if err != nil {
+		return fmt.Errorf("durable prefix under a lagging LIST: %w", err)
+	}
+	if stale > acked {
+		return fmt.Errorf("a lagging LIST reported %d, above the ACKed %d", stale, acked)
+	}
+	s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("lagging LIST proves %d of %d ACKed", stale, acked)})
+
+	if stale < acked {
+		// The cross-check must notice rather than smooth it over: the summary claims
+		// more than the listing can produce (§22.1).
+		var over *recovery.SummaryOverclaim
+		if _, err := recovery.DurablePoint(ctx, s.Store, vol, 1); !errors.As(err, &over) {
+			return fmt.Errorf("a listing short of the summary must be reported as an overclaim, got %v", err)
+		}
+		if over.Claimed != acked || over.Contiguous != stale {
+			return fmt.Errorf("overclaim reported %+v, want claimed=%d contiguous=%d", over, acked, stale)
+		}
+		// And the boundary write must refuse the short number outright.
+		err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, stale)
+		if !errors.Is(err, recovery.ErrBoundaryRegression) {
+			return fmt.Errorf("a boundary of %d was accepted while the writer ACKed %d: want ErrBoundaryRegression, got %v", stale, acked, err)
+		}
+		if _, err := recovery.ReadRecoveryPoint(ctx, s.Store, vol, 2); !errors.Is(err, objectstore.ErrNotFound) {
+			return fmt.Errorf("a refused boundary must leave no object behind, got %v", err)
+		}
+	}
+
+	// The listing catches up; the honest boundary is writable and covers every ACK.
+	s.Store.Settle()
+	settled, err := recovery.DurablePrefix(ctx, s.Store, vol, 1)
+	if err != nil {
+		return err
+	}
+	if settled != acked {
+		return fmt.Errorf("after the listing caught up DurablePrefix = %d, want %d", settled, acked)
+	}
+	if err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, settled); err != nil {
+		return fmt.Errorf("the honest boundary must be writable: %w", err)
+	}
+	rp, err := recovery.ReadRecoveryPoint(ctx, s.Store, vol, 2)
+	if err != nil {
+		return err
+	}
+	s.Emit(Event{Kind: EventFailover, AckedDurable: acked, Recovered: rp.RecoveredUpTo})
+	if rp.RecoveredUpTo < acked {
+		return fmt.Errorf("the epoch boundary settled at %d, below the ACKed %d (INV-09)", rp.RecoveredUpTo, acked)
+	}
+	s.Notef("LIST lagging %d ops: proved %d of %d, boundary refused until honest", lag, stale, acked)
 	return nil
 }
