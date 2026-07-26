@@ -402,7 +402,7 @@ func (d *Drainer) operation(ctx context.Context, hostID, operationID string) (pl
 // is term-guarded, so the window this leaves is two goroutines inside one leader,
 // not two leaders; if that ever becomes real, the index is the answer.
 func (d *Drainer) exclusive(ctx context.Context, hostID, operationID string) error {
-	ops, err := d.md.ListOperationsByHost(ctx, hostID)
+	ops, err := d.md.ListLiveOperationsByHost(ctx, hostID)
 	if err != nil {
 		return err
 	}

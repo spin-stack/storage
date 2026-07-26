@@ -34,7 +34,7 @@ func (q *Queries) GetOperation(ctx context.Context, operationID uuid.UUID) (*Ope
 	return &i, err
 }
 
-const listOperationsByHost = `-- name: ListOperationsByHost :many
+const listLiveOperationsByHost = `-- name: ListLiveOperationsByHost :many
 SELECT operation_id, kind, volume_id, host_id, desired_state, current_state, phase, error, created_at, updated_at FROM operations WHERE host_id = $1 ORDER BY operation_id
 `
 
@@ -42,8 +42,8 @@ SELECT operation_id, kind, volume_id, host_id, desired_state, current_state, pha
 // happening to it before starting something else (§7, §28.1). Deterministic order:
 // the answer must not depend on row order (INV-02), and the composite index
 // operations (host_id, operation_id) satisfies both the filter and the sort.
-func (q *Queries) ListOperationsByHost(ctx context.Context, hostID pgtype.UUID) ([]*Operation, error) {
-	rows, err := q.db.Query(ctx, listOperationsByHost, hostID)
+func (q *Queries) ListLiveOperationsByHost(ctx context.Context, hostID pgtype.UUID) ([]*Operation, error) {
+	rows, err := q.db.Query(ctx, listLiveOperationsByHost, hostID)
 	if err != nil {
 		return nil, err
 	}

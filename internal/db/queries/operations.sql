@@ -13,7 +13,7 @@ ON CONFLICT (operation_id) DO NOTHING;
 -- name: GetOperation :one
 SELECT * FROM operations WHERE operation_id = $1;
 
--- name: ListOperationsByHost :many
+-- name: ListLiveOperationsByHost :many
 -- Every operation recorded against a host, so a reconciler can ask what is already
 -- happening to it before starting something else (§7, §28.1). Deterministic order:
 -- the answer must not depend on row order (INV-02), and the composite index

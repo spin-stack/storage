@@ -611,6 +611,11 @@ SELECT c.conrelid::regclass::text AS child_table, a.attname AS column_name, c.co
        SELECT 1 FROM pg_index i
         WHERE i.indrelid = c.conrelid
           AND i.indkey[0] = c.conkey[1]
+          -- A partial index does not do this job: the parent DELETE has to find
+          -- *every* child row, and rows outside the predicate are not in it. Since
+          -- the schema now carries partial indexes over the same leading columns
+          -- (the live-operation ones), saying so is no longer hypothetical.
+          AND i.indpred IS NULL
    )
  ORDER BY 1, 2`
 	rows, err := pool.Query(ctx, q)
@@ -671,11 +676,12 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 		`EXPLAIN SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id`, hotHost)
 }
 
-// TestPGListOperationsByHostUsesItsIndex is the same rule for the other filter +
-// ORDER BY query. It runs before every pass of every drain, against a table that
-// only grows: completed operations are history and nothing deletes them, so a
-// sequential scan here gets slower for the rest of the cluster's life.
-func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
+// TestPGListLiveOperationsByHostUsesItsPartialIndex is the same rule as the volumes
+// one, for the query that runs before every pass of every drain. The table it reads
+// only grows — completed operations are history and nothing deletes them — so the
+// index that matters is the one over the live ones: a full index on (host_id,
+// operation_id) still walks every operation the host has ever had.
+func TestPGListLiveOperationsByHostUsesItsPartialIndex(t *testing.T) {
 	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
@@ -687,15 +693,21 @@ func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := range 2000 {
+	// History, plus a couple of live operations on the hot host: the shape the drain
+	// actually meets, where "what is happening here" is two rows inside thousands.
+	for i := range fleetOperations {
 		host := coldHost
 		if i%400 == 0 {
 			host = hotHost
 		}
-		if _, err := store.RecordOperation(ctx, term, metadata.Operation{
-			OperationID: ids.New().String(), Kind: lifecycle.OpDrain, HostID: host,
+		op := metadata.Operation{
+			OperationID: ids.New().String(), Kind: lifecycle.OpAttach, HostID: host,
 			Phase: lifecycle.OpSucceeded, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-		}); err != nil {
+		}
+		if i == 0 || i == 400 {
+			op.Phase = lifecycle.OpPending
+		}
+		if _, err := store.RecordOperation(ctx, term, op); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -703,8 +715,116 @@ func TestPGListOperationsByHostUsesItsIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertIndexed(t, pool, "operations_host_id_operation_id_idx", "operations",
-		`EXPLAIN SELECT * FROM operations WHERE host_id = $1 ORDER BY operation_id`, hotHost)
+	assertIndexed(t, pool, "operations_live_by_host_idx", "operations",
+		`EXPLAIN SELECT * FROM operations
+		  WHERE host_id = $1 AND phase NOT IN ('SUCCEEDED', 'CANCELED')
+		  ORDER BY operation_id`, hotHost)
+}
+
+// TestPGLivePhaseSetsAgreeWithTheLifecycle is the price of the two partial indexes,
+// paid in a test. "Live" is now written in two places — the transition table in
+// internal/lifecycle, which is the authority, and the predicates of the indexes —
+// and a schema that disagrees with the vocabulary is worse than no index at all: the
+// planner would silently stop using it (an operation whose phase the predicate does
+// not cover is invisible to the index), and the uniqueness that stops a second drain
+// would stop applying to exactly the phase that drifted.
+//
+// It does not parse the predicate: it asks PostgreSQL to *evaluate* the real one,
+// once per value of the vocabulary, and compares the answer with lifecycle's own.
+func TestPGLivePhaseSetsAgreeWithTheLifecycle(t *testing.T) {
+	ctx := t.Context()
+	pool := startPostgres(t)
+
+	predicate := func(index string) string {
+		var expr string
+		if err := pool.QueryRow(ctx,
+			`SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = $1::regclass`,
+			index).Scan(&expr); err != nil {
+			t.Fatalf("%s has no partial predicate to read: %v", index, err)
+		}
+		return expr
+	}
+	// Evaluating the predicate against a one-row relation that supplies the columns
+	// it names is what makes this an agreement test rather than a spelling test.
+	holds := func(expr, kind string, phase lifecycle.OperationPhase) bool {
+		var ok bool
+		q := `SELECT ` + expr + ` FROM (SELECT $1::text AS kind, $2::text AS phase) o`
+		if err := pool.QueryRow(ctx, q, kind, phase.String()).Scan(&ok); err != nil {
+			t.Fatalf("evaluating %q: %v", expr, err)
+		}
+		return ok
+	}
+
+	live := predicate("operations_live_by_host_idx")
+	drain := predicate("operations_one_live_drain_per_host_idx")
+	for _, phase := range lifecycle.OperationPhases() {
+		for _, kind := range lifecycle.OperationKinds() {
+			if got, want := holds(live, kind.String(), phase), !phase.Terminal(); got != want {
+				t.Errorf("%s covers phase %s = %v, lifecycle says live = %v\n  %s",
+					"operations_live_by_host_idx", phase, got, want, live)
+			}
+			want := !phase.Terminal() && kind == lifecycle.OpDrain
+			if got := holds(drain, kind.String(), phase); got != want {
+				t.Errorf("one-live-drain covers (%s, %s) = %v, want %v\n  %s",
+					kind, phase, got, want, drain)
+			}
+		}
+	}
+}
+
+// TestPGOneLiveDrainPerHostUnderConcurrency is the race the Control Plane's own
+// check cannot close. Wave 3 read the host's operations and then wrote, which is not
+// exclusion: two goroutines inside one leader can both pass the read. Here they
+// both write, at once, and the database has to make exactly one of them win — with
+// an error the loser can act on rather than an integrity code it can only log.
+func TestPGOneLiveDrainPerHostUnderConcurrency(t *testing.T) {
+	ctx := t.Context()
+	store := pg.New(startPostgres(t))
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	host := ids.New().String()
+	if err := store.UpsertHost(ctx, term, metadata.Host{HostID: host, State: lifecycle.HostActive}); err != nil {
+		t.Fatal(err)
+	}
+
+	const racers = 8
+	start := make(chan struct{})
+	errs := make(chan error, racers)
+	ids_ := make([]string, racers)
+	for i := range racers {
+		ids_[i] = ids.New().String()
+		go func() {
+			<-start
+			_, err := store.RecordOperation(ctx, term, metadata.Operation{
+				OperationID: ids_[i], Kind: lifecycle.OpDrain, HostID: host,
+				Phase: lifecycle.OpPending, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+			})
+			errs <- err
+		}()
+	}
+	close(start)
+
+	var won int
+	for range racers {
+		switch err := <-errs; {
+		case err == nil:
+			won++
+		case errors.Is(err, metadata.ErrDrainInProgress):
+		default:
+			t.Errorf("the loser must be told why, not handed an opaque error: %v", err)
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d of %d concurrent drains were recorded, want exactly 1", won, racers)
+	}
+
+	live, err := store.ListLiveOperationsByHost(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("the host holds %d live operations, want 1", len(live))
+	}
 }
 
 // TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet is the plan assertion the

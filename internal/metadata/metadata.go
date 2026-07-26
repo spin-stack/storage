@@ -61,6 +61,19 @@ var (
 	// waits is the durable ACK, for at most one lease_ttl + max_clock_skew per volume
 	// moved. A caller that reads this should retry, not conclude the host is gone.
 	ErrRenewalsBlocked = errors.New("metadata: host lease renewals are blocked by a revocation window")
+	// ErrDrainInProgress means the host already has a live drain operation and this
+	// one was not recorded (§28.1). Two evacuations of one host each capture their
+	// own plan and promote the same volumes; whichever loses a race is left holding
+	// a destination reservation nobody will release, because releasing it is the
+	// losing operation's own next step and that step now fails for ever (§28.2).
+	//
+	// The Control Plane refuses this before it writes, and that check is where the
+	// useful message comes from — it names the operation that owns the host. This
+	// sentinel is the store closing the window the check leaves: a read followed by
+	// a write is not exclusion, and two goroutines inside one leader can both pass
+	// it. A caller that sees it should reconcile the drain that already exists, not
+	// retry its own.
+	ErrDrainInProgress = errors.New("metadata: the host already has a live drain operation")
 	// ErrHostNotServing means the operation needs a host the fleet still considers a
 	// writer, and this one is DEAD (§28.1). Marking a host dead is the Control Plane
 	// asserting that its writer is gone; handing it a fresh lease afterwards
@@ -391,12 +404,12 @@ type Store interface {
 	RecordOperation(ctx context.Context, term int64, op Operation) (recorded bool, err error)
 	// GetOperation returns a recorded operation.
 	GetOperation(ctx context.Context, operationID string) (Operation, error)
-	// ListOperationsByHost returns every operation recorded against hostID, ordered
+	// ListLiveOperationsByHost returns every operation recorded against hostID, ordered
 	// by operation id (deterministic, INV-02). It is how a reconciler asks what is
 	// already happening to a host before starting something else: an operation id is
 	// the only handle GetOperation offers, and a second drain arrives with a new one
 	// (§7, §28.1).
-	ListOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
+	ListLiveOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
 	// UpdateOperation stores an operation's phase, current state, and error — the
 	// visible progress of a long-running reconciled operation (§7, §28.1). It is
 	// term-guarded, and the phase move is guarded by the lifecycle table, so a

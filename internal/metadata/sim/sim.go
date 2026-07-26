@@ -606,7 +606,7 @@ func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Opera
 	return nil
 }
 
-func (s *Store) ListOperationsByHost(_ context.Context, hostID string) ([]metadata.Operation, error) {
+func (s *Store) ListLiveOperationsByHost(_ context.Context, hostID string) ([]metadata.Operation, error) {
 	// An empty id would match every operation recorded with no host at all, which is
 	// the opposite of what any caller of this means (in Postgres host_id is NULL for
 	// those, and NULL matches nothing).

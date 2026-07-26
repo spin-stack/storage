@@ -765,12 +765,12 @@ func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.
 	return operationFromRow(op)
 }
 
-func (s *Store) ListOperationsByHost(ctx context.Context, hostID string) ([]metadata.Operation, error) {
+func (s *Store) ListLiveOperationsByHost(ctx context.Context, hostID string) ([]metadata.Operation, error) {
 	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.q.ListOperationsByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
+	rows, err := s.q.ListLiveOperationsByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
 	if err != nil {
 		return nil, err
 	}

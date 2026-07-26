@@ -19,7 +19,7 @@ import (
 //
 // The tests below state that identity and nothing else. They are deliberately
 // written against the *interface* — ListHosts / ListVolumesByHost /
-// ListOperationsByHost — and recompute the right-hand side with a decoder of their
+// ListLiveOperationsByHost — and recompute the right-hand side with a decoder of their
 // own, so they cannot agree with the implementation by sharing it.
 //
 // A ledger cannot satisfy this: its value is the sum of the deltas that happened to
@@ -67,7 +67,7 @@ func derivedCommitted(ctx context.Context, md metadata.Store, hostID string) (in
 	}
 	seen := map[string]bool{}
 	for _, h := range hosts {
-		ops, err := md.ListOperationsByHost(ctx, h.HostID)
+		ops, err := md.ListLiveOperationsByHost(ctx, h.HostID)
 		if err != nil {
 			return 0, fmt.Errorf("list operations on %s: %w", h.HostID, err)
 		}
