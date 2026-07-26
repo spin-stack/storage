@@ -238,10 +238,25 @@ tasks:
       - "{{.TOOLS_BIN}}/golangci-lint fmt --diff ./..."
 
   ci:
-    desc: Aggregate gate — format, build, lint, test, dst. Matches the standard gate.
+    desc: Fast local gate — format, build, lint, test, dst. No Docker required.
     cmds:
       - task: fmt:check
       - task: build
       - task: lint
       - task: test
       - task: dst
+
+  ci:full:
+    desc: >-
+      Everything CI runs, including the Docker-gated lanes. `task ci` is the fast
+      local loop; this is the gate that must be green before a merge. The
+      Docker-gated tasks live here because a task nobody runs is a task nobody
+      notices going red: backend:conformance was broken on main for a whole
+      increment because it was documented but not gated.
+    cmds:
+      - task: ci
+      - task: generate:check
+      - task: db:migrate:validate
+      - task: cover
+      - task: test:integration
+      - task: backend:conformance

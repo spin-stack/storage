@@ -58,6 +58,17 @@ jobs:
       - name: DST (mandatory scenario set)
         run: task dst
 
+      # Migrations are checksummed (atlas.sum) and must match the files.
+      - name: Migrations validate (Atlas, ADR-0007)
+        run: task db:migrate:validate
+
       # TestContainers Postgres integration (ADR-0006); ubuntu runners have Docker.
       - name: Integration (TestContainers Postgres)
         run: task test:integration
+
+      # §6.1: the object-store conformance suite against the pinned RustFS image.
+      # Blocking per backend version — every durability proof in this repo assumes
+      # the properties this suite certifies (conditional writes, versioning, a
+      # strongly consistent LIST), so a backend that loses one must not merge.
+      - name: Object-store conformance (RustFS, §6.1)
+        run: task backend:conformance

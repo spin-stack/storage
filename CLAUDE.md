@@ -27,7 +27,8 @@ golangci-lint) are pinned in `Taskfile.yml` and installed into `./.tools/bin` by
 
 ```
 task tools              # install the pinned toolchain into ./.tools/bin
-task ci                 # the gate: fmt + build + lint + test(-race) + dst
+task ci                 # fast local gate: fmt + build + lint + test(-race) + dst
+task ci:full            # everything CI runs, incl. the Docker-gated lanes (the merge gate)
 task test               # unit/property tests, race detector
 task test:integration   # Docker-gated TestContainers tests (-tags integration)
 task lint               # golangci-lint + the custom simulable analyzer
