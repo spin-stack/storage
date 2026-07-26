@@ -1026,3 +1026,193 @@ func TestDrainResumeWhenTheVolumeWasPromotedTwice(t *testing.T) {
 	// Nothing may be written for the epoch this drain did not grant.
 	w.noBoundary(t, w.vols[0], 3)
 }
+
+// TestDrainRefusesAnOperationIdRecordedForAnotherHost: an operator retry with a
+// copy-pasted id, a replayed request, or a UI keyed on the wrong entity must not
+// make host B pay for host A's volumes — reservations decremented for volumes it
+// never held, create-only boundary keys burned on the volumes' live epoch, and
+// SUCCEEDED reported over fabricated moves.
+func TestDrainRefusesAnOperationIdRecordedForAnotherHost(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+
+	// The operation is recorded for the source host and stops on the fencing wait.
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("setup: %v", err)
+	}
+	w.pastFencingWait()
+
+	_, err := w.drainer.Drain(ctx, w.term, destHost, drainOpID)
+	if !errors.Is(err, controlplane.ErrOperationMismatch) {
+		t.Fatalf("want ErrOperationMismatch, got %v", err)
+	}
+	if got := w.committed(t, destHost); got != 0 {
+		t.Fatalf("host %s was billed %d bytes for another host's volumes", destHost, got)
+	}
+	// The mismatch is diagnosed before anything is written, cordon included.
+	if h, _ := w.md.GetHost(ctx, destHost); h.State != lifecycle.HostActive {
+		t.Fatalf("the mismatched request moved %s to %s", destHost, h.State)
+	}
+	for _, vol := range w.vols {
+		w.noBoundary(t, vol, 1) // the live epoch: a boundary here is unrecoverable
+		w.noBoundary(t, vol, 2)
+		if v, _ := w.md.GetVolume(ctx, format.UUIDString(vol)); v.PrimaryHostID != cloneHostA {
+			t.Fatalf("a volume moved under the mismatched id: %+v", v)
+		}
+	}
+}
+
+// TestDuplicateDrainDoesNotReCordonARepairedHost: a replayed request for a finished
+// drain must perform no host-state transition. A host an operator repaired and
+// returned to ACTIVE would otherwise leave placement again, silently, while the call
+// reports success. (The DEAD arm is by design: a dead host is still evacuated.)
+func TestDuplicateDrainDoesNotReCordonARepairedHost(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.base.SetHostState(ctx, w.term, cloneHostA, lifecycle.HostActive); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if err != nil || res.Phase != lifecycle.OpSucceeded || res.Remaining != 0 {
+		t.Fatalf("duplicate of a finished drain: %+v err=%v", res, err)
+	}
+	if h, _ := w.md.GetHost(ctx, cloneHostA); h.State != lifecycle.HostActive {
+		t.Fatalf("the duplicate request cordoned a repaired host: state = %q", h.State)
+	}
+}
+
+// TestDrainAbortsWhenTheDestinationDiesBeforeThePromotion: the chosen destination
+// dies during the (potentially long) materialization. Promoting anyway would set the
+// volume's primary to a dead host, commit its capacity there and release the
+// source's — a volume stranded with no writer.
+func TestDrainAbortsWhenTheDestinationDiesBeforeThePromotion(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	var killed bool
+	w.hooks.afterCommit = func(hostID string, delta int64) {
+		if killed || hostID != destHost || delta <= 0 {
+			return
+		}
+		killed = true
+		if err := w.base.SetHostState(ctx, w.term, destHost, lifecycle.HostDead); err != nil {
+			t.Errorf("kill destination: %v", err)
+		}
+	}
+
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if !errors.Is(err, controlplane.ErrDestinationHostUnusable) {
+		t.Fatalf("want ErrDestinationHostUnusable, got %v", err)
+	}
+	first, _ := w.md.GetVolume(ctx, format.UUIDString(w.vols[0]))
+	if first.PrimaryHostID != cloneHostA || first.CurrentEpoch != 1 {
+		t.Fatalf("the volume was moved onto a dead host: %+v", first)
+	}
+	if got := w.committed(t, destHost); got != 0 {
+		t.Fatalf("destination committed = %d, want 0 — the aborted move leaked its reservation", got)
+	}
+	if got := w.committed(t, cloneHostA); got != 2*volSize {
+		t.Fatalf("source committed = %d, want %d — capacity was released for a move that never happened", got, 2*volSize)
+	}
+}
+
+// TestDrainWithAStaleTermMutatesNothing: a zombie Control Plane must learn it is a
+// zombie before it cordons a host or reserves anything (§7).
+func TestDrainWithAStaleTermMutatesNothing(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	if _, err := w.drainer.Drain(ctx, w.term-1, cloneHostA, drainOpID); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("want ErrStaleTerm, got %v", err)
+	}
+	if h, _ := w.md.GetHost(ctx, cloneHostA); h.State != lifecycle.HostActive {
+		t.Fatalf("a stale-term drain cordoned the host: %q", h.State)
+	}
+	if _, err := w.md.GetOperation(ctx, drainOpID); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("a stale-term drain recorded an operation: %v", err)
+	}
+	if got := w.committed(t, destHost); got != 0 {
+		t.Fatalf("a stale-term drain reserved %d bytes", got)
+	}
+	for _, vol := range w.vols {
+		w.noBoundary(t, vol, 2)
+	}
+}
+
+// TestDrainSurfacesAReservationItCouldNotRelease: leadership changes between the
+// destination reservation and the promotion. The move cannot proceed and the
+// reservation cannot be released either — the stale term is refused by both writes —
+// so the drain must say so. A phantom reservation nobody reconciles makes placement
+// under-use, and eventually refuse, a host that is actually empty (§28.2).
+func TestDrainSurfacesAReservationItCouldNotRelease(t *testing.T) {
+	ctx := context.Background()
+	w := newDrainWorld(t, 10*volSize)
+	w.pastFencingWait()
+
+	var lost bool
+	w.hooks.afterCommit = func(hostID string, delta int64) {
+		if lost || hostID != destHost || delta <= 0 {
+			return
+		}
+		lost = true
+		if _, err := w.base.AcquireLeadership(ctx, "cp-2"); err != nil {
+			t.Errorf("new leader: %v", err)
+		}
+	}
+
+	_, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID)
+	if !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("want the stale term reported, got %v", err)
+	}
+	if !errors.Is(err, controlplane.ErrReservationNotReleased) {
+		t.Fatalf("the leaked reservation must be surfaced, not swallowed: %v", err)
+	}
+	if !strings.Contains(err.Error(), destHost) {
+		t.Fatalf("the error must name the host holding the reservation: %v", err)
+	}
+}
+
+// TestDrainRefusesToPromoteASourceThatRenewedItsLease: a renewal that lands between
+// two passes of a drain must not slip under the promotion. The source's lease is
+// monotonic and per host: if it is valid past the promotion, the source keeps ACKing
+// FLUSHes into the old epoch while the destination writes the new one, and
+// everything ACKed above the recorded boundary is discarded at recovery.
+func TestDrainRefusesToPromoteASourceThatRenewedItsLease(t *testing.T) {
+	ctx := context.Background()
+	// Room for exactly one volume, so the first pass stops after moving one.
+	w := newDrainWorld(t, volSize/2)
+	w.pastFencingWait()
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, placement.ErrNoCapacity) {
+		t.Fatalf("setup: want ErrNoCapacity, got %v", err)
+	}
+
+	// The source is alive after all: its heartbeat renews the lease mid-evacuation.
+	if err := w.base.RenewHostLease(ctx, w.term, cloneHostA, int(leaseTTL/time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.base.UpsertHost(ctx, w.term, metadata.Host{
+		HostID: destHost, State: lifecycle.HostActive, NVMeTotalBytes: 10 * volSize,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// UpsertHost rewrites the row, so restore the committed bytes of the first move.
+	if err := w.base.CommitHostCapacity(ctx, w.term, destHost, volSize); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.drainer.Drain(ctx, w.term, cloneHostA, drainOpID); !errors.Is(err, controlplane.ErrFencingWaitNotElapsed) {
+		t.Fatalf("want ErrFencingWaitNotElapsed, got %v", err)
+	}
+	second, _ := w.md.GetVolume(ctx, format.UUIDString(w.vols[1]))
+	if second.PrimaryHostID != cloneHostA || second.CurrentEpoch != 1 {
+		t.Fatalf("a volume was promoted away from a host holding a live lease: %+v", second)
+	}
+	w.noBoundary(t, w.vols[1], 2)
+}
