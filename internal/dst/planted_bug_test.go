@@ -525,6 +525,12 @@ func truncateAfterListingRegresses(regress bool) Scenario {
 		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: l.TruncatedUpTo(), Published: published})
 
 		if regress {
+			// The stale listing is still what makes a *republication* claim less than
+			// the last one did; what it can no longer do by itself is move published
+			// down, because StrictOrder now refuses a value below its own past. So the
+			// plant relaxes exactly that rule and leaves the other two strict: this is
+			// the invariant under test, and the fault has to reach it.
+			l.SetOrderPolicy(publishedMayRegress{})
 			s.Store.InjectStaleListing(s.Rand, 1)
 			s.Emit(Event{Kind: EventFault, Msg: "the listing that proves the durable point goes backwards"})
 		}
@@ -540,10 +546,23 @@ func truncateAfterListingRegresses(regress bool) Scenario {
 	}
 }
 
+// publishedMayRegress is StrictOrder with the monotonic floor on the published point
+// removed and nothing else touched — the shape wal.Log actually had until the floor
+// was added, which this proof is what found.
+type publishedMayRegress struct{ wal.StrictOrder }
+
+func (publishedMayRegress) AllowPublished(seq uint64, w wal.Watermarks) error {
+	if seq > w.Durable {
+		return wal.ErrWatermarkOrder
+	}
+	return nil
+}
+
 // INV-13: local WAL is never truncated above the verified published point. Planted by
-// one listing served from behind the data, which is enough for checkpoint.Create to
-// republish at a lower sequence and for Log.AdvancePublished — which guards the
-// ordering against durable but not against its own past — to accept it.
+// one listing served from behind the data — enough for checkpoint.Create to republish
+// at a lower sequence — over a Log whose published point is allowed to move backwards.
+// Both halves are needed now: the listing is the real-world fault, and the relaxed
+// rule is the defect it used to exploit, kept here as the thing under test.
 func TestPlantedBugTruncateAbovePublished(t *testing.T) {
 	requirePasses(t, 18, NewTruncateBelowPublishedChecker(), truncateAfterListingRegresses(false))
 	plantedBug(t, 18, NewTruncateBelowPublishedChecker(), "no-truncate-above-published", truncateAfterListingRegresses(true))

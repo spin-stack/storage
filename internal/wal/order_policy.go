@@ -45,10 +45,18 @@ func (StrictOrder) AllowDurable(seq uint64, w Watermarks) error {
 	return nil
 }
 
-// AllowPublished enforces published <= durable (§5.6). The published point is what a
-// verified checkpoint proves, so it can never lead the durable point.
+// AllowPublished enforces published <= durable (§5.6) and, just as load-bearing,
+// that published never moves backwards.
+//
+// The floor is not bookkeeping. TruncateLocal has already discarded the records below
+// the published point: they live in a verified checkpoint and nowhere else on this
+// host (INV-13). A publisher that recomputes the point from a listing — which is what
+// checkpoint.Create does — gets a smaller answer whenever that listing is momentarily
+// behind (§24), and accepting it re-opens a range whose bytes are gone, with no error
+// anywhere. Refusing it costs nothing: the checkpoint that proved the higher point is
+// immutable, so a lower reading is never news.
 func (StrictOrder) AllowPublished(seq uint64, w Watermarks) error {
-	if seq > w.Durable {
+	if seq > w.Durable || seq < w.Published {
 		return ErrWatermarkOrder
 	}
 	return nil
