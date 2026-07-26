@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"math/rand/v2"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/cpserver"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -114,5 +116,77 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	fenced := loop.Fenced()
 	if len(fenced) != 1 || fenced[0] != "vol-stolen" {
 		t.Fatalf("the Agent did not learn it was fenced for vol-stolen: %v", fenced)
+	}
+}
+
+// TestTheAgentCanOpenAVolume closes the last of the three holes the spine left: the
+// desired state told the Agent a volume's geometry and epoch and nothing about how
+// to read a byte of it. Every payload on this path is sealed with the volume's DEK
+// (§15.1), so "attach this volume" without key material is an instruction the Agent
+// cannot carry out.
+//
+// It runs the whole way round — the Agent asks the real handler over HTTP, and what
+// comes back is unwrapped with the KEK a host's KMS holds — because the property is
+// not "a field arrived" but "the material is usable". A wrapped DEK that unwraps to
+// the wrong bytes, or that the Control Plane truncated on the way through, would
+// pass a field-by-field assertion and fail here.
+func TestTheAgentCanOpenAVolume(t *testing.T) {
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	md := metasim.New(clk.Wall)
+	term, err := md.AcquireLeadership(t.Context(), "cp-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The KEK is the host's; the Control Plane never sees it. keyID 1 is the
+	// volume's first DEK version — 0 is reserved for plaintext records (§14.1).
+	var kek [crypto.DEKSize]byte
+	for i := range kek {
+		kek[i] = byte(i)
+	}
+	kms := crypto.NewDevKMS(kek, "kek-host-a")
+	dek, err := crypto.GenerateDEK(rand.New(rand.NewPCG(1, 2)), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped, err := kms.WrapDEK(rand.New(rand.NewPCG(3, 4)), dek)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := md.CreateVolume(t.Context(), term, metadata.Volume{
+		VolumeID: "vol-mine", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4,
+		PrimaryHostID: testHost, State: lifecycle.VolumeActive, Durability: lifecycle.DurabilityRemote,
+		DEKWrapped: wrapped, KEKID: kms.KEKID(),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	httpSrv := httptest.NewServer(cpserver.Handler(cpserver.New(md, func() int64 { return term }, 30*time.Second)))
+	defer httpSrv.Close()
+
+	loop, err := agent.New(testConfig(), agent.Deps{
+		Clock:        clk,
+		ControlPlane: storagev1connect.NewControlPlaneServiceClient(httpSrv.Client(), httpSrv.URL),
+		Device:       fakeDevice{usage: disk.Usage{TotalBytes: 1 << 40, UsedBytes: 1 << 30}},
+		Volumes:      agent.NewVolumeSet(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := loop.VolumeKeys(t.Context(), "vol-mine")
+	if err != nil {
+		t.Fatalf("VolumeKeys: %v", err)
+	}
+	if keys.KEKID != kms.KEKID() {
+		t.Fatalf("kek_id = %q, want %q — the Agent cannot tell which KEK to use", keys.KEKID, kms.KEKID())
+	}
+	got, err := kms.UnwrapDEK(keys.DEKWrapped, dek.KeyID)
+	if err != nil {
+		t.Fatalf("the material the Control Plane served does not unwrap: %v", err)
+	}
+	if got.Key != dek.Key {
+		t.Fatal("the unwrapped DEK is not the volume's key")
 	}
 }

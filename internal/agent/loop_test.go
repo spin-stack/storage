@@ -35,6 +35,8 @@ type fakeCP struct {
 	state     storagev1.HostState
 	term      int64
 	desired   []*storagev1.DesiredVolume
+	keys      map[string]*storagev1.GetVolumeKeysResponse
+	keyCalls  map[string]int
 	outcomes  map[string]storagev1.ReportOutcome
 	beats     []*storagev1.HeartbeatRequest
 	beatAt    []clock.Instant
@@ -52,6 +54,8 @@ func newFakeCP(clk *sim.Clock) *fakeCP {
 		leaseTTL: 30,
 		state:    storagev1.HostState_HOST_STATE_ACTIVE,
 		term:     7,
+		keys:     map[string]*storagev1.GetVolumeKeysResponse{},
+		keyCalls: map[string]int{},
 		outcomes: map[string]storagev1.ReportOutcome{},
 		beatCh:   make(chan struct{}, 1024),
 	}
@@ -109,6 +113,35 @@ func (f *fakeCP) ReportVolumeState(_ context.Context, req *connect.Request[stora
 		results = append(results, &storagev1.VolumeReportResult{VolumeId: v.GetVolumeId(), Outcome: outcome})
 	}
 	return connect.NewResponse(&storagev1.ReportVolumeStateResponse{Results: results}), nil
+}
+
+// GetVolumeKeys counts its calls: whether the Agent asks once per volume or once
+// per cycle is the difference between a key fetch and a key broadcast.
+func (f *fakeCP) GetVolumeKeys(_ context.Context, req *connect.Request[storagev1.GetVolumeKeysRequest]) (*connect.Response[storagev1.GetVolumeKeysResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	id := req.Msg.GetVolumeId()
+	f.keyCalls[id]++
+	keys, ok := f.keys[id]
+	if !ok {
+		return nil, connect.NewError(connect.CodeNotFound, errors.New("no such volume"))
+	}
+	return connect.NewResponse(keys), nil
+}
+
+func (f *fakeCP) setDesired(vols []*storagev1.DesiredVolume) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.desired = vols
+}
+
+func (f *fakeCP) keyCallsFor(volumeID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keyCalls[volumeID]
 }
 
 func (f *fakeCP) lastHeartbeat(t *testing.T) *storagev1.HeartbeatRequest {
