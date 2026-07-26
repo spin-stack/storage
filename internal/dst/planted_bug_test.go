@@ -3,12 +3,19 @@ package dst
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/checkpoint"
+	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/lifecycle"
+	"github.com/spin-stack/storage/internal/metadata"
+	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/wal"
 )
 
 // A checker that cannot fail is decoration — but a checker proven against a
@@ -32,9 +39,11 @@ import (
 // Planted-bug outcomes. A behavioural planted bug also trips the scenario's own
 // assertions; these name what went wrong for a reader of a failing run.
 var (
-	errNotYetExpired        = errors.New("planted: the lease should already have expired")
-	errLeaseResurrected     = errors.New("planted: a monotonic regression revalidated an expired lease")
-	errStaleWriterPublished = errors.New("planted: a fenced writer verified its own epoch")
+	errNotYetExpired           = errors.New("planted: the lease should already have expired")
+	errLeaseResurrected        = errors.New("planted: a monotonic regression revalidated an expired lease")
+	errStaleWriterPublished    = errors.New("planted: a fenced writer verified its own epoch")
+	errPromotedOverLiveLease   = errors.New("planted: an epoch was granted while the fenced writer's lease was still valid")
+	errTruncatedAbovePublished = errors.New("planted: local WAL was reclaimed above the verified published point")
 )
 
 // plantedBug runs sc and requires checker to reject it, naming itself and printing the
@@ -210,32 +219,224 @@ func TestPlantedBugWatermarkOrder(t *testing.T) {
 	})
 }
 
-// INV-11: no epoch granted before FENCING_WAIT. The promoter and the scenario read the
-// same wall clock, so skewing it moves the deadline along with the observation. Needs
-// a fault double for metadata.Store (the lease row the promoter reads), which lives in
-// internal/metadata/sim.
+// ---------------------------------------------------------------------------
+// Behavioural proofs under construction: the scenario below drives real production
+// code and derives the event from what that code did, but the fault it injects does
+// not (yet) invert the behaviour, so the checker sees nothing. Each states the mode.
+// ---------------------------------------------------------------------------
+
+// Ids for the fencing-wait plant, kept apart from the mandatory scenario's so the two
+// never share an epoch object.
+const (
+	fencedVol   = "00000000-0000-7000-8000-0000000000c0"
+	fencedHost1 = "00000000-0000-7000-8000-0000000000c1"
+	fencedHost2 = "00000000-0000-7000-8000-0000000000c2"
+)
+
+// The §12 parameters this plant runs with.
+const (
+	fencingLeaseTTL = 10 * time.Second
+	fencingSkew     = 2 * time.Second
+)
+
+// earlyPromotion drives a real controlplane.Promoter against a volume whose primary
+// still holds a valid lease on its own monotonic clock, and reports whether the epoch
+// was granted anyway. Both halves of that question are answered by production code:
+// the grant is Promote's return, and the liveness of the writer being fenced is a real
+// lease.Manager counting down the same TTL the Control Plane recorded.
+//
+// jump steps the wall clock forward before the attempt — an NTP correction, a VM
+// restored from a snapshot, a bad RTC. It is the one fault the simulation can aim at
+// FENCING_WAIT today, and it does not work: the promoter and the Agent's lease read
+// the same clock, so a jump that carries the CP past the deadline carries the writer
+// past the end of its lease too. Nobody is fenced early; there is no violation to
+// catch. The seed is what the harness reproduces from, so the fault has to live
+// somewhere a seed can reach it.
+func earlyPromotion(jump time.Duration) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		md := metasim.New(s.Clock.Wall)
+		epochs := epoch.NewStore(s.Store)
+		p := controlplane.NewPromoter(md, epochs, s.Clock, fencingLeaseTTL, fencingSkew)
+
+		term, err := md.AcquireLeadership(ctx, "cp")
+		if err != nil {
+			return err
+		}
+		for _, h := range []string{fencedHost1, fencedHost2} {
+			if err := md.UpsertHost(ctx, term, metadata.Host{HostID: h, State: lifecycle.HostActive}); err != nil {
+				return err
+			}
+		}
+		if err := md.CreateVolume(ctx, term, metadata.Volume{
+			VolumeID: fencedVol, State: lifecycle.VolumeActive,
+			PrimaryHostID: fencedHost1, DEKWrapped: []byte{1}, KEKID: "k",
+		}); err != nil {
+			return err
+		}
+		if _, err := epochs.Init(ctx, fencedVol, 0); err != nil {
+			return err
+		}
+
+		// W1 takes the lease the Control Plane records. The row and the Agent's own
+		// monotonic countdown start at the same instant, which is the only condition
+		// under which the CP's deadline says anything about the writer (§12.1).
+		if err := md.RenewHostLease(ctx, term, fencedHost1, int(fencingLeaseTTL/time.Second)); err != nil {
+			return err
+		}
+		w1 := lease.NewManager(s.Clock, fencingLeaseTTL)
+		w1.Grant()
+		renewedAt := s.Clock.Wall()
+
+		// Half a TTL in: the reconciler has seen missed heartbeats and carries no
+		// instant of its own, so the lease row is the whole authority (§12.3).
+		s.Tick(fencingLeaseTTL / 2)
+		if jump > 0 {
+			s.Clock.Advance(jump)
+			s.Emit(Event{Kind: EventFault, Msg: "the Control Plane's wall clock stepped forward"})
+		}
+		newEpoch, err := p.Promote(ctx, term, fencedVol, time.Time{}, fencedHost2)
+		granted := err == nil
+		s.Emit(Event{
+			Kind: EventPromotion, EarlyGrant: granted && w1.Valid(),
+			Msg: fmt.Sprintf("epoch=%d granted=%t w1_lease_valid=%t deadline=%s",
+				newEpoch, granted, w1.Valid(), p.FencingDeadline(renewedAt).UTC()),
+		})
+		switch {
+		case granted && w1.Valid():
+			return errPromotedOverLiveLease
+		case !granted && !errors.Is(err, controlplane.ErrFencingWaitNotElapsed):
+			return fmt.Errorf("promotion before the wait: want ErrFencingWaitNotElapsed, got %w", err)
+		}
+
+		// Past the deadline the same promotion must succeed: a checker that fires on
+		// every promotion would say nothing about the early ones.
+		s.Tick(fencingLeaseTTL)
+		newEpoch, err = p.Promote(ctx, term, fencedVol, time.Time{}, fencedHost2)
+		if err != nil {
+			return fmt.Errorf("promotion after the wait: %w", err)
+		}
+		s.Emit(Event{
+			Kind: EventPromotion, EarlyGrant: w1.Valid(),
+			Msg: fmt.Sprintf("epoch=%d after the wait w1_lease_valid=%t", newEpoch, w1.Valid()),
+		})
+		if newEpoch != 1 {
+			return fmt.Errorf("new epoch = %d, want 1", newEpoch)
+		}
+		return nil
+	}
+}
+
+// INV-11: no epoch is granted before FENCING_WAIT elapses.
+//
+// FAILS: the clock jump moves the observer and the observed together, so the promotion
+// it lets through is not an early one — w1's lease has expired by then and the checker
+// is right to stay quiet. The fault has to reach the *deadline* rather than the clock.
 func TestPlantedBugEarlyPromotion(t *testing.T) {
-	plantedBug(t, 14, NewPromotionWaitChecker(), "promotion-fencing-wait", func(s *Sim) error {
-		s.Emit(Event{Kind: EventPromotion, EarlyGrant: true, Msg: "granted on a missed heartbeat"})
-		return nil
-	})
+	requirePasses(t, 14, NewPromotionWaitChecker(), earlyPromotion(0))
+	plantedBug(t, 14, NewPromotionWaitChecker(), "promotion-fencing-wait", earlyPromotion(fencingLeaseTTL))
 }
 
-// INV-13: never truncate above the verified published point. Needs Log.TruncateLocal
-// to be made to accept an upTo above published; no I/O fault reaches that decision.
+// truncateAfterListingRegresses is INV-13 end to end: a checkpoint publishes a durable
+// point, local WAL is reclaimed up to it, and then the volume is checkpointed again.
+//
+// Both numbers in the event come from the log itself — what it reclaimed and what it
+// has verified as published — so the only way to make them disagree is to make real
+// code move one of them. checkpoint.Create recomputes the published point from what
+// the object store can prove *now* (a LIST) and hands it to Log.AdvancePublished, which
+// guards the ordering against durable but not against its own past: a listing that
+// went backwards would walk the published point back under WAL that no longer exists.
+//
+// regress asks the store for that listing. SetEventualList is the closest it can do
+// today, and it is the wrong shape: it delays keys that are not yet visible and never
+// takes back one it has already served, so the second checkpoint proves exactly what
+// the first did, adopts it, and nothing moves.
+func truncateAfterListingRegresses(regress bool) Scenario {
+	return func(s *Sim) error {
+		ctx := context.Background()
+		var vol [16]byte
+		vol[6], vol[8] = 0x70, 0x80
+		vol[15] = 0xd1
+
+		f, err := s.Disk.Create("wal/active.wal")
+		if err != nil {
+			return err
+		}
+		l := wal.NewLog(f, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+		l.EnableRemote(
+			wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+			wal.NewUploader(s.Store, 5),
+			alwaysValidLease{},
+		)
+		// Two objects, so a listing can lose the newer one and still answer.
+		for i, payload := range []string{"a", "b", "c"} {
+			if _, err := l.Write(uint64(i)*8, []byte(payload), 0); err != nil {
+				return err
+			}
+			if i == 1 {
+				if err := l.Flush(ctx); err != nil {
+					return fmt.Errorf("flush %d: %w", i, err)
+				}
+			}
+		}
+		if err := l.Flush(ctx); err != nil {
+			return err
+		}
+
+		cp := checkpoint.NewCheckpointer(s.Store)
+		if _, err := cp.Create(ctx, l, vol, 1); err != nil {
+			return fmt.Errorf("first checkpoint: %w", err)
+		}
+		published := l.Watermarks().Published
+		if published != l.Watermarks().Durable {
+			return fmt.Errorf("the checkpoint published %d of %d durable", published, l.Watermarks().Durable)
+		}
+		// §21.1: published, verified, and only then is the local copy disposable.
+		if err := l.TruncateLocal(published); err != nil {
+			return fmt.Errorf("truncate to the published point: %w", err)
+		}
+		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: l.TruncatedUpTo(), Published: published})
+
+		if regress {
+			s.Store.SetEventualList(true)
+			s.Emit(Event{Kind: EventFault, Msg: "the listing that proves the durable point goes backwards"})
+		}
+		// The next checkpoint recomputes the published point from the backend.
+		if _, err := cp.Create(ctx, l, vol, 1); err != nil {
+			return fmt.Errorf("second checkpoint: %w", err)
+		}
+		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: l.TruncatedUpTo(), Published: l.Watermarks().Published})
+		if l.TruncatedUpTo() > l.Watermarks().Published {
+			return errTruncatedAbovePublished
+		}
+		return nil
+	}
+}
+
+// INV-13: local WAL is never truncated above the verified published point.
+//
+// FAILS: nothing in the object store can un-list a key it has already served, so the
+// second checkpoint proves the same durable point as the first, adopts the checkpoint
+// that is already there, and the published point never moves. The listing needs to be
+// able to go backwards.
 func TestPlantedBugTruncateAbovePublished(t *testing.T) {
-	plantedBug(t, 18, NewTruncateBelowPublishedChecker(), "no-truncate-above-published", func(s *Sim) error {
-		s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: 50, Published: 20})
-		return nil
-	})
+	requirePasses(t, 18, NewTruncateBelowPublishedChecker(), truncateAfterListingRegresses(false))
+	plantedBug(t, 18, NewTruncateBelowPublishedChecker(), "no-truncate-above-published", truncateAfterListingRegresses(true))
 }
 
-// INV-17: background I/O yields. The ioclass scheduler is pure in-process arbitration
-// with no simulated I/O in it, so inverting it means a seam in internal/ioclass.
+// INV-17: background I/O yields.
+//
+// FAILS: ioclass.Scheduler is pure in-process arbitration — no clock, no disk, no
+// network, no object store — so none of the faults the simulation can produce reaches
+// the decision it makes. Throttling the backend and breaking the clock under a real
+// background consumer changes what materialization *achieves* and nothing about
+// whether it was allowed to run.
 func TestPlantedBugBackgroundDidNotYield(t *testing.T) {
+	requirePasses(t, 19, NewBackgroundYieldsChecker(), scenarioCrossHostMaterialization)
 	plantedBug(t, 19, NewBackgroundYieldsChecker(), "background-yields", func(s *Sim) error {
-		s.Emit(Event{Kind: EventIOClass, BgGranted: true, HighInFlight: true})
-		return nil
+		s.Store.InjectThrottle(3)
+		s.Clock.InjectMonotonicRegression(time.Second)
+		return scenarioCrossHostMaterialization(s)
 	})
 }
 
