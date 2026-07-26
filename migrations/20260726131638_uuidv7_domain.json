@@ -1,0 +1,92 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-07-26T10:16:38-03:00",
+  "source_fingerprint": {
+    "hash": "c1810a765d4a73eeb36fca3ab91640f1ff70edb5c50a8fbc2f25c2d41f4ba240"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "CREATE DOMAIN uuidv7 AS uuid\n  CONSTRAINT uuidv7_check CHECK ((get_byte(uuid_send(VALUE), 6) >> 4) = 7);",
+          "type": "domain",
+          "operation": "create",
+          "path": "public.uuidv7"
+        },
+        {
+          "sql": "ALTER TABLE hosts DROP CONSTRAINT hosts_host_id_check;",
+          "type": "table.constraint",
+          "operation": "drop",
+          "path": "public.hosts.hosts_host_id_check"
+        },
+        {
+          "sql": "ALTER TABLE hosts ALTER COLUMN host_id TYPE uuidv7 USING host_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.hosts.host_id"
+        },
+        {
+          "sql": "ALTER TABLE operations DROP CONSTRAINT operations_operation_id_check;",
+          "type": "table.constraint",
+          "operation": "drop",
+          "path": "public.operations.operations_operation_id_check"
+        },
+        {
+          "sql": "ALTER TABLE operations ALTER COLUMN operation_id TYPE uuidv7 USING operation_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.operations.operation_id"
+        },
+        {
+          "sql": "ALTER TABLE snapshots DROP CONSTRAINT snapshots_request_id_check;",
+          "type": "table.constraint",
+          "operation": "drop",
+          "path": "public.snapshots.snapshots_request_id_check"
+        },
+        {
+          "sql": "ALTER TABLE snapshots DROP CONSTRAINT snapshots_snapshot_id_check;",
+          "type": "table.constraint",
+          "operation": "drop",
+          "path": "public.snapshots.snapshots_snapshot_id_check"
+        },
+        {
+          "sql": "ALTER TABLE snapshots ALTER COLUMN snapshot_id TYPE uuidv7 USING snapshot_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.snapshots.snapshot_id"
+        },
+        {
+          "sql": "ALTER TABLE snapshots ALTER COLUMN request_id TYPE uuidv7 USING request_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.snapshots.request_id"
+        },
+        {
+          "sql": "ALTER TABLE volumes DROP CONSTRAINT volumes_volume_id_check;",
+          "type": "table.constraint",
+          "operation": "drop",
+          "path": "public.volumes.volumes_volume_id_check"
+        },
+        {
+          "sql": "ALTER TABLE volumes ALTER COLUMN volume_id TYPE uuidv7 USING volume_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.volumes.volume_id"
+        },
+        {
+          "sql": "ALTER TABLE volumes ALTER COLUMN active_root_id TYPE uuidv7 USING active_root_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.volumes.active_root_id"
+        },
+        {
+          "sql": "ALTER TABLE volumes ALTER COLUMN published_root_id TYPE uuidv7 USING published_root_id::uuidv7;",
+          "type": "table.column",
+          "operation": "alter",
+          "path": "public.volumes.published_root_id"
+        }
+      ]
+    }
+  ]
+}

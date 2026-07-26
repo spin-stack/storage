@@ -3,7 +3,8 @@
 -- and Control Plane terms. NOT the authority for the durable point of data (that is
 -- S3, §5.8). Reconstructible from S3 via rebuild-metadata (§22.5).
 --
--- Identity columns are `uuid` (not text): volume_id in particular is the same 16-byte
+-- Identity columns are `uuidv7` (a domain over uuid, not text): volume_id in
+-- particular is the same 16-byte
 -- UUID the on-disk WAL format carries (RecordHeader.VolumeID [16]byte). IDs are
 -- generated as UUIDv7 (time-ordered, better index locality) — app-side via
 -- google/uuid.NewV7 for values that must match the durable format, and the DB runs
@@ -11,6 +12,19 @@
 -- source of truth: pgschema plans against it (ADR-0019), sqlc generates from it
 -- (ADR-0006), and the integration lane builds its database from it. migrations/
 -- holds the reviewed plans, not the apply path.
+
+-- UUIDv7 enforcement (INV-22, ADR-0007) as a type. The version nibble is the high
+-- 4 bits of the 7th byte of the UUID; requiring it to equal 7 rejects any non-v7 id
+-- at insert, whatever the client. It is a domain rather than a predicate copied onto
+-- every identity column because a copied rule holds where somebody remembered to
+-- copy it: active_root_id and published_root_id went without one from the start, and
+-- nothing said so. A new table gets the rule by declaring the type — the same move
+-- internal/lifecycle made in Go for the state vocabularies (ADR-0009).
+--
+-- Foreign-key referencing columns stay plain `uuid`: they can only hold a value that
+-- is already in a v7-checked primary key, so the rule reaches them transitively, and
+-- TestPGIdentityColumnsUseTheUUIDv7Domain exempts exactly those.
+CREATE DOMAIN uuidv7 AS uuid CHECK ((get_byte(uuid_send(VALUE), 6) >> 4) = 7);
 
 -- Single-active Control Plane leadership with a verified term (§7). Every CP write
 -- transaction validates term = the holder's term; a zombie CP affects 0 rows.
@@ -21,16 +35,12 @@ CREATE TABLE control_plane_leader (
     renewed_at TIMESTAMPTZ NOT NULL
 );
 
--- UUIDv7 enforcement (INV-22, ADR-0007): the version nibble is the high 4 bits of
--- the 7th byte of the UUID; requiring it to equal 7 rejects any non-v7 id at insert,
--- regardless of the client. Foreign-key columns are covered transitively (they must
--- reference a v7-checked primary key).
 -- Lifecycle vocabularies are CHECK-constrained (the third enforcement layer next to
 -- the Go types in internal/lifecycle and the transition-guarded UPDATEs): no client,
 -- script, or manual psql can persist a state that does not exist. Adding a state
--- means editing internal/lifecycle *and* a migration — deliberately, not by accident.
+-- means editing internal/lifecycle *and* the schema — deliberately, not by accident.
 CREATE TABLE hosts (
-    host_id              UUID PRIMARY KEY CHECK ((get_byte(uuid_send(host_id), 6) >> 4) = 7),
+    host_id              UUIDV7 PRIMARY KEY,
     state                TEXT NOT NULL CHECK (state IN ('ACTIVE', 'CORDONED', 'DRAINING', 'DEAD')),
     agent_version        TEXT NOT NULL DEFAULT '',
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
@@ -69,8 +79,7 @@ CREATE TABLE host_leases (
 );
 
 CREATE TABLE volumes (
-    volume_id          UUID PRIMARY KEY                 -- = on-disk VolumeID [16]byte
-                         CHECK ((get_byte(uuid_send(volume_id), 6) >> 4) = 7),
+    volume_id          UUIDV7 PRIMARY KEY,              -- = on-disk VolumeID [16]byte
     size_bytes         BIGINT NOT NULL,                 -- mutable: resize grow
     durability         TEXT NOT NULL DEFAULT 'remote'
                          CHECK (durability IN ('remote', 'local')),   -- §14.8
@@ -81,8 +90,8 @@ CREATE TABLE volumes (
                                           'RECOVERY_REQUIRED', 'RECOVERING', 'DETACHED')),
     primary_host_id    UUID REFERENCES hosts(host_id),
     standby_host_id    UUID REFERENCES hosts(host_id),
-    active_root_id     UUID,
-    published_root_id  UUID,
+    active_root_id     UUIDV7,
+    published_root_id  UUIDV7,
     chain_depth        INTEGER NOT NULL DEFAULT 0,
     dek_wrapped        BYTEA NOT NULL,                  -- DEK wrapped with the KEK
     kek_id             TEXT NOT NULL,
@@ -125,7 +134,7 @@ CREATE TABLE volumes (
 );
 
 CREATE TABLE snapshots (
-    snapshot_id        UUID PRIMARY KEY CHECK ((get_byte(uuid_send(snapshot_id), 6) >> 4) = 7),
+    snapshot_id        UUIDV7 PRIMARY KEY,
     volume_id          UUID NOT NULL REFERENCES volumes(volume_id),
     parent_snapshot_id UUID REFERENCES snapshots(snapshot_id),
     epoch              BIGINT NOT NULL,
@@ -136,14 +145,14 @@ CREATE TABLE snapshots (
                          CHECK (state IN ('CREATING', 'PUBLISHED', 'FAILED', 'DELETING')),
     portable           BOOLEAN NOT NULL DEFAULT false,
     manifest_key       TEXT,
-    request_id         UUID UNIQUE NOT NULL CHECK ((get_byte(uuid_send(request_id), 6) >> 4) = 7),
+    request_id         UUIDV7 UNIQUE NOT NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Reconciliation operations (§7): desired/current state converge idempotently. The
 -- operation_id is the client request_id (a UUIDv7).
 CREATE TABLE operations (
-    operation_id  UUID PRIMARY KEY CHECK ((get_byte(uuid_send(operation_id), 6) >> 4) = 7),
+    operation_id  UUIDV7 PRIMARY KEY,
     kind          TEXT NOT NULL CHECK (kind IN ('attach', 'detach', 'clone', 'resize',
                                                 'drain', 'recovery', 'flatten', 'gc')),
     volume_id     UUID REFERENCES volumes(volume_id),
