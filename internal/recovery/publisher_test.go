@@ -73,42 +73,53 @@ func grantEpoch(t *testing.T, store objectstore.Store, vol [16]byte, ep uint64, 
 func TestOnlyTheEpochHolderMayRecordItsBoundary(t *testing.T) {
 	tests := []struct {
 		name    string
-		arrange func(t *testing.T, store objectstore.Store, vol [16]byte)
+		arrange func(t *testing.T, store *sim.ObjectStore, vol [16]byte)
 		author  string
 		want    error
 	}{
 		{
 			name:    "the host epoch 2 was granted to",
-			arrange: func(t *testing.T, s objectstore.Store, v [16]byte) { grantEpoch(t, s, v, 2, boundaryHolder) },
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) { grantEpoch(t, s, v, 2, boundaryHolder) },
 			author:  boundaryHolder,
 		},
 		{
 			name:    "the host a stale PostgreSQL row names, at the very same epoch",
-			arrange: func(t *testing.T, s objectstore.Store, v [16]byte) { grantEpoch(t, s, v, 2, boundaryHolder) },
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) { grantEpoch(t, s, v, 2, boundaryHolder) },
 			author:  boundaryOther,
 			want:    epoch.ErrNotHolder,
 		},
 		{
 			name:    "an author that will not name itself",
-			arrange: func(t *testing.T, s objectstore.Store, v [16]byte) { grantEpoch(t, s, v, 2, boundaryHolder) },
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) { grantEpoch(t, s, v, 2, boundaryHolder) },
 			author:  "",
 			want:    epoch.ErrNotHolder,
 		},
 		{
 			name:    "the holder, after a third promotion overtook it",
-			arrange: func(t *testing.T, s objectstore.Store, v [16]byte) { grantEpoch(t, s, v, 3, boundaryHolder) },
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) { grantEpoch(t, s, v, 3, boundaryHolder) },
 			author:  boundaryHolder,
 			want:    epoch.ErrEpochChanged,
 		},
 		{
 			name:    "an epoch nobody was granted (a fresh or rebuilt volume, §22.5)",
-			arrange: func(t *testing.T, s objectstore.Store, v [16]byte) { grantEpoch(t, s, v, 2, "") },
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) { grantEpoch(t, s, v, 2, "") },
 			author:  boundaryHolder,
 		},
 		{
 			name:    "no epoch object at all (§12.4: defence in depth, not a precondition)",
-			arrange: func(t *testing.T, s objectstore.Store, v [16]byte) {},
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) {},
 			author:  boundaryHolder,
+		},
+		{
+			// A throttled GET (§24) is "I cannot establish who holds this epoch",
+			// which is not "it is mine": the immutable boundary waits for a retry.
+			name: "an epoch object the backend will not serve",
+			arrange: func(t *testing.T, s *sim.ObjectStore, v [16]byte) {
+				grantEpoch(t, s, v, 2, boundaryHolder)
+				s.InjectThrottleKey(epoch.Key(format.UUIDString(v)), 1)
+			},
+			author: boundaryHolder,
+			want:   sim.ErrThrottled,
 		},
 	}
 

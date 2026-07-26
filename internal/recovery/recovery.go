@@ -721,6 +721,28 @@ func boundaryFloor(ctx context.Context, store objectstore.Store, volumeID [16]by
 	return floor, nil
 }
 
+// WriteAs records the boundary of newEpoch on behalf of hostID — the host newEpoch was
+// granted to, which §12.5 makes the rightful author of it.
+//
+// It is the entry point every caller that knows which host it speaks for should use.
+// The boundary is create-only and immutable, so a boundary written by a host that was
+// never granted the epoch is not a mistake anybody can correct afterwards: the epoch's
+// real holder inherits a floor it did not choose, and every sequence beneath it is
+// unreachable for good. VerifyPublisher is what separates that from an ordinary
+// promotion — see there for the cases it deliberately lets through, and why an empty
+// hostID is refused for any epoch that has a holder.
+//
+// The check is made before the PUT and not repeated after it. Unlike a checkpoint,
+// which authorises a local truncation once it is published, this function's PUT is the
+// last thing it does: there is no later step a second read could still refuse, and the
+// object it just wrote cannot be unwritten.
+func (rp RecoveryPoint) WriteAs(ctx context.Context, store objectstore.Store, volumeID [16]byte, newEpoch uint64, hostID string) error {
+	if err := VerifyPublisher(ctx, store, format.UUIDString(volumeID), newEpoch, hostID); err != nil {
+		return fmt.Errorf("recovery: epoch %d boundary of %s: %w", newEpoch, format.UUIDString(volumeID), err)
+	}
+	return WriteRecoveryPoint(ctx, store, volumeID, newEpoch, rp.PrevEpoch, rp.RecoveredUpTo)
+}
+
 // WriteRecoveryPoint records the epoch boundary at the start of newEpoch (§12.5):
 // which prior epoch was recovered and up to which sequence. Create-only.
 //
@@ -730,6 +752,13 @@ func boundaryFloor(ctx context.Context, store objectstore.Store, volumeID [16]by
 // below what that epoch's writer already ACKed. Every way of computing a
 // too-low value (a stale LIST, an unreadable floor, a GC-shortened prefix) is caught
 // here, at the write, instead of being discovered as missing data long afterwards.
+//
+// This form does not name its author, so it cannot be checked against the grant: it
+// enforces the *value* of the boundary, never the right to record one. Prefer
+// RecoveryPoint.WriteAs. The remaining unnamed caller is controlplane.Drainer, which
+// writes the boundary immediately after Promote granted newEpoch to its destination
+// and has that host id in hand; until it passes it, that write is fenced by §12.3's
+// own CAS alone.
 func WriteRecoveryPoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, newEpoch, prevEpoch, recoveredUpTo uint64) error {
 	floor, err := boundaryFloor(ctx, store, volumeID, prevEpoch)
 	if err != nil {

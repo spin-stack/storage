@@ -3,6 +3,11 @@
 // a checkpoint is published (create-only) only after its WAL objects are durable in
 // S3, and only then may local WAL up to that sequence be truncated (INV-13). Local
 // WAL is never truncated above a verified published point.
+//
+// Publishing is also exclusive: checkpoints/<vol>/<epoch>/ belongs to the host the
+// epoch was *granted* to, not to every host that happens to hold the same epoch number
+// (§12.4). Create gates on that with recovery.VerifyPublisher, so a Checkpointer has to
+// say which host it speaks for — see HeldBy.
 package checkpoint
 
 import (
@@ -85,13 +90,29 @@ func Read(ctx context.Context, store objectstore.Store, volumeID string, epoch, 
 	return cp, nil
 }
 
-// Checkpointer publishes checkpoints against an object store.
+// Checkpointer publishes checkpoints against an object store, on behalf of one host.
 type Checkpointer struct {
 	store objectstore.Store
+	// hostID is the host this checkpointer publishes for, checked against the epoch's
+	// holder. Empty means "would not say", which cannot be reconciled with any grant
+	// and is refused for every epoch that has one.
+	hostID string
 }
 
-// NewCheckpointer returns a Checkpointer.
+// NewCheckpointer returns a Checkpointer that does not name the host it publishes for.
+// It can only publish into an epoch nobody was granted, or into a volume with no epoch
+// object at all (§12.4, §22.5) — see recovery.VerifyPublisher. Anything that publishes
+// for a live volume knows which host it is: use HeldBy.
 func NewCheckpointer(store objectstore.Store) *Checkpointer { return &Checkpointer{store: store} }
+
+// HeldBy returns a Checkpointer that publishes as hostID, which the epoch object must
+// name as the holder of the epoch being checkpointed. The receiver is left alone, so a
+// single Checkpointer can be scoped per volume without sharing mutable state.
+func (c *Checkpointer) HeldBy(hostID string) *Checkpointer {
+	scoped := *c
+	scoped.hostID = hostID
+	return &scoped
+}
 
 // Create publishes a checkpoint and then advances published_sequence — the strict
 // §21.1 order. After this the caller may TruncateLocal up to the published point,
@@ -103,7 +124,26 @@ func NewCheckpointer(store objectstore.Store) *Checkpointer { return &Checkpoint
 // corrupt upload). Publishing the higher number would authorise discarding local WAL
 // whose only remaining copy was local — and the root digest cannot catch it, because
 // it hashes key strings and cannot express a hole.
+//
+// The epoch is verified twice, and the two checks stop different things.
+//
+// Before: checkpoints/<vol>/<epoch>/ is a namespace exactly one host may claim, and
+// two hosts can hold the same epoch *number* while only one was granted the epoch
+// (§12.3–12.4). This is the check that keeps the second one out.
+//
+// After the publish and before AdvancePublished: the epoch object can be CASed while
+// the PUT is in flight. The published object cannot be unwritten — it is create-only —
+// but advancing published is a separate, later, and far more expensive act: it is what
+// lets local WAL be truncated (INV-13, §21.1), and a writer fenced mid-publish would
+// otherwise discard the last local copy of data on the strength of a publication it no
+// longer owns. Refusing there leaves the checkpoint object in S3, which is harmless —
+// it is byte-identical to what the epoch's real holder recomputes, and publishOrAdopt
+// treats it as its own retry.
 func (c *Checkpointer) Create(ctx context.Context, log *wal.Log, volumeID [16]byte, epoch uint64) (Checkpoint, error) {
+	vid := format.UUIDString(volumeID)
+	if err := recovery.VerifyPublisher(ctx, c.store, vid, epoch, c.hostID); err != nil {
+		return Checkpoint{}, fmt.Errorf("checkpoint: %s may not publish into epoch %d: %w", vid, epoch, err)
+	}
 	claimed := log.Watermarks().Durable
 	durable, err := recovery.DurablePoint(ctx, c.store, volumeID, epoch)
 	if err != nil {
@@ -120,7 +160,7 @@ func (c *Checkpointer) Create(ctx context.Context, log *wal.Log, volumeID [16]by
 		return Checkpoint{}, err
 	}
 	cp := Checkpoint{
-		VolumeID:        format.UUIDString(volumeID),
+		VolumeID:        vid,
 		Epoch:           epoch,
 		DurableSequence: durable,
 		Objects:         objects,
@@ -129,6 +169,11 @@ func (c *Checkpointer) Create(ctx context.Context, log *wal.Log, volumeID [16]by
 	// Publish (verified: create-only) BEFORE advancing published (§21.1).
 	if err := c.publishOrAdopt(ctx, cp); err != nil {
 		return Checkpoint{}, err
+	}
+	if err := recovery.VerifyPublisher(ctx, c.store, vid, epoch, c.hostID); err != nil {
+		return Checkpoint{}, fmt.Errorf(
+			"checkpoint: %s/%d/%d was published but the epoch moved before it could authorise truncation: %w",
+			vid, epoch, durable, err)
 	}
 	if err := log.AdvancePublished(durable); err != nil {
 		return Checkpoint{}, err
