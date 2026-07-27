@@ -15,6 +15,10 @@ tracks state.
   downloads QEMU while `test:integration:qemu` depends on `qemu:verify`, which fails
   without `_output`. Treat every green claim here as reproducible-by-you, not as
   defended by a gate (`BUILD-INVENTORY.md`, increment 8).
+- **Where this is going:** storage integrates into **spin** (`github.com/aledbf/spin`),
+  which already has a control plane and a per-host runner — **ADR-0021**. spin imports
+  storage, never the reverse; `cmd/control-plane` and `cmd/volume-agent` are test
+  harnesses that must stay runnable end to end and will not be deployed.
 - **The road to something finished:** `BUILD-INVENTORY.md` — nine increments from here
   to one volume served end to end by real binaries, ordered by dependency, from an
   eleven-agent audit of what exists versus what does not.

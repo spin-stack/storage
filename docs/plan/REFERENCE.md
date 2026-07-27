@@ -154,6 +154,7 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0018 | The spine: Agent first, Connect RPC in `api/`, the Agent pulls and the CP never pushes. | Accepted |
 | ADR-0019 | Schema tooling is **pgschema**, not Atlas; `schema.sql` is the declared state. | Accepted |
 | ADR-0020 | `internal/vhost/hostio` is the one documented INV-01 exception (SCM_RIGHTS + mmap). | Accepted |
+| ADR-0021 | storage integrates into **spin**; spin imports storage and never the reverse. The two binaries are test harnesses that must stay runnable end to end. spin migrates to pgschema. | Accepted |
 
 ## `DEV-` — doc↔code divergences
 
