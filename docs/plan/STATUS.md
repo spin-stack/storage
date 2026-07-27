@@ -4,14 +4,15 @@ Short snapshot + resume-from-here handoff. **Read this first** when picking up t
 work, then `REBASELINE.md` — a human review on 2026-07-25 found this file claiming
 more than the repository does, and the maturity model below is the correction.
 
-- **Date:** 2026-07-26. The spine exists and **a guest now boots against it**:
-  increment 3.1 serves `vhost-user-blk` to the pinned QEMU 11.0.2, verified by
-  execution, not by simulation. 76 of the 78 audit findings are closed; the two left
-  wait on formats. Schema tooling moved from Atlas to pgschema (ADR-0019).
+- **Date:** 2026-07-26. The spine exists and **a guest write now reaches the WAL**:
+  increment 3.1 serves `vhost-user-blk` to the pinned QEMU 11.0.2 and `internal/blockdev`
+  puts `wal.Log` behind that seam, both verified by execution rather than by simulation.
+  All 78 audit findings are closed; the two entries left in `TEST-GAPS.md` came from
+  elsewhere. Schema tooling moved from Atlas to pgschema (ADR-0019).
 - **Where the work is:** everything is on **`main`**, pushed to `origin`
   (`/home/aledbf/spin-storage.git`, a bare repo — the old bundle remote is gone).
 - **Gate on `main`:** `task ci:full` green — that is now the merge gate and it includes
-  the Docker lanes (`task ci` stays the fast local loop). `task cover` 91.9% (>= 90);
+  the Docker lanes (`task ci` stays the fast local loop). `task cover` 92.1% (>= 90);
   `task test:integration` green on Postgres 18; `task backend:conformance` green
   against the pinned RustFS; `task build:qemu` + `task qemu:verify` green.
 
@@ -23,9 +24,13 @@ more than the repository does, and the maturity model below is the correction.
 | **integrated** | Wired into a running binary through the real interfaces, exercised end to end. |
 | **production-verified** | Real hardware/backends under fault injection, telemetry recorded, runbook times measured. |
 
-**Nothing here is `integrated` or `production-verified` yet.** There is no `cmd/`, no
-`api/`, no Agent, no vhost-user path, no deployment: no VM is served by this code.
-Nine roadmap phases have merged increments — as models.
+**One path is now `integrated`; nothing is `production-verified`.** The spine exists —
+`api/` over Connect, an Agent that pulls, two `cmd/` binaries — and a real QEMU guest
+boots off a device whose bytes come from a `wal.Log`, writing records through the same
+interfaces production would use. That is the *write* half of one volume on one host.
+Everything downstream of it — FLUSH's ACK path, the uploader, checkpoints, truncation —
+is still exercised only by tests, and there is no deployment. The other phases remain
+models.
 
 | Phase | State | Notes |
 |---|---|---|
@@ -33,7 +38,7 @@ Nine roadmap phases have merged increments — as models.
 | 01 skeleton (simio + DST harness + obs) | **model** | metrics are recorded by the paths that own them (DEV-0010 closed); wiring continues with each new path |
 | 02 guest layout | **not started** | needs guest mounts / a VM; nothing in the durability chain depends on it |
 | 03 vhost-user | **3.1 integrated** | a real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). FLUSH is *not* exercised by a guest (no kernel in the lane) and 3.2 reconnection / 3.3 inflight-shmfd are untouched — RISK-10 stays open |
-| 04 WAL/CoW format + property tests | **model** | format review still pending (human-review zone) |
+| 04 WAL/CoW format + property tests | **write path integrated**, rest model | a guest's WRITE lands as a WAL record with 0 PUTs (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims. FLUSH/uploader/checkpoint are still model-only. Format review still pending (human-review zone) |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
 | 06 remote WAL (batching, idempotent PUT, summary) | **model** | — |
 | 07 Control Plane + leases + fencing | **model** | fail-closed lease + resumable promotion + term guards (DEV-0004/0005 closed) |
@@ -79,10 +84,10 @@ barely at all.
 
 ## What happened since the rebaseline
 
-Three waves of parallel increments closed 65 of the 78 audit findings (`TEST-GAPS.md`
-records each with the commit that closed it, and the seven that remain with what they
-are waiting on). The ones worth carrying in your head, because they were real data-loss
-paths and not tidying:
+Four waves of parallel increments closed all 78 audit findings (`TEST-GAPS.md` records
+each with the commit that closed it, plus the two later entries that did not come from
+the audit and what each is waiting on). The ones worth carrying in your head, because
+they were real data-loss paths and not tidying:
 
 - a reopened WAL restarted at sequence 1 — duplicate sequences and reused GCM nonces;
 - the publishers never consulted the epoch object at all, so a fenced host could
@@ -101,10 +106,11 @@ snapshots, squash), 0015 (fencing wait is a monotonic dwell), 0016 (fencing
 granularity), 0017 (capacity is derived, not a ledger), 0018 (the spine: Agent first,
 Connect RPC in `api/`, Agent pulls).
 
-## What to do next — three tracks, in this order
+## What to do next
 
-**DEV-0007 is the only open deviation**, and everything below either builds it or
-clears its path. The tracks are split so no two share a hot file.
+Tracks A and C are done; **Track B is the live one**, and it is down to its last step.
+Three deviations are open — **DEV-0007** (the spine's second half, below), **DEV-0011**
+and **DEV-0012** — and the two latter both wait on a human decision rather than on code.
 
 ### ~~Track A — Control Plane~~ **done** (wave 4)
 ADR-0015/0016/0017 landed. Two consequences to carry forward: a drain now costs one
@@ -125,19 +131,46 @@ converging — it corrupts nothing, it just does not finish.
    express. Known gap recorded there: the response carries no DEK **version**, because
    no column holds one and `0` means plaintext in the WAL.
 4. ~~vhost-user-blk~~ **done for 3.1** — see the phase table.
-5. **Next — put `wal.Log` behind the `Backend` seam.** The interface does not change;
-   what is missing is an offset-addressed adapter over the CoW view (Phase 04 work).
-   Then FLUSH stops being an `fsync` and becomes the §14.4 ACK path, DISCARD /
-   WRITE_ZEROES can be offered, and the slice of ADR-0018 is closed end to end.
+5. ~~Put `wal.Log` behind the `Backend` seam~~ **done** (`internal/blockdev`, `047ed37`).
+   Three things it settled, all of them things the specification did not say:
+   **virtio-blk cannot express FUA** (a Linux guest gets WRITE+FLUSH instead, which is
+   the same contract `Log.WriteFUA` implements, so that entry point is unreachable from
+   this transport); **`VIRTIO_BLK_F_CONFIG_WCE` must stay unoffered**, or a guest
+   switches the device to write-through and stops sending FLUSH while believing every
+   WRITE is durable — which under §14.4 it is not; and **the wire has no ENOSPC**, so all
+   three refusals complete as `VIRTIO_BLK_S_IOERR` with the distinction carried in
+   wrapped sentinels, because a lapsed lease, a backpressure bound and a full device have
+   different remedies.
+6. **Next — the second half of the chain: FLUSH → verified object → checkpoint →
+   truncate, driven by a guest.** None of it has ever been driven by one. Two blockers,
+   both separable and neither deep:
+   - **No guest in the lane can emit a FLUSH.** SeaBIOS's INT 13h has no flush verb, and
+     `-kernel` direct boot is unavailable: `task build:qemu` extracts no
+     `linuxboot_dma.bin`, and no kernel image is pinned. The fix is a Taskfile change plus
+     a kernel pinned by digest, the way RustFS already is.
+   - **`wal.Log` has no mutex** (`TEST-GAPS.md`). Today that is harmless — one virtqueue,
+     one `queueLoop` goroutine, every `Backend` call serialized. Putting the checkpoint in
+     the lane is exactly what makes it concurrent for the first time, so this is a
+     prerequisite and not a follow-up.
 
-**That slice is the definition of done for "integrated"** — the first time any phase
-stops being a model.
+**That second half is the definition of done for DEV-0007** — and what turns Phases 06
+and 10 from models into something a guest has exercised.
 
-### Track C — WAL segmentation (ADR-0013 §4, and the reclaim gap)
-`TruncateLocal` frees bytes only when the checkpoint reached the end of the log, so on
-an active volume it reclaims nothing. Segmenting the WAL is the fix and it is an
-on-disk format change: **the format spec gets a human review before the code**, per
-CLAUDE.md. Owns `internal/wal`, so it runs alongside A and B1/B2 without collision.
+### ~~Track C — WAL segmentation~~ **done** (`f7f68b3`)
+The WAL is a directory of segments (`WAL-SEGMENTS-SPEC.md`, human-reviewed before the
+code), so `TruncateLocal` reclaims on an active volume instead of freeing bytes only
+when the checkpoint had reached the end of the log. One deviation came out of it:
+**DEV-0011** — a segment's space is charged as it is used, not reserved at creation, so
+the out-of-space state is still reached mid-record rather than at a segment boundary.
+It waits on ADR-0013's device budget.
+
+### Two decisions waiting on a human, both in review zones
+- **ADR-0013 (device pressure) is still `Proposed`.** It carries DEV-0011 and the
+  `SetLimits` the segment code has no way to receive today.
+- **DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads.** §16
+  scopes SELF_FENCED to durable ACKs and the code implements exactly that; refusing more
+  would extend the doc, which is a fencing-zone ADR. Worth deciding before increment 3.2,
+  since a reconnecting front-end is the first caller that can observe a fenced log.
 
 ### After those
 Quota/lineage accounting (ADR-0014, CP-side: `lineages`, `charged_bytes`), then Phase 12
@@ -154,13 +187,14 @@ which becomes binding as soon as two Agents can differ).
    (formats, fencing, durability, GC); merge `--ff-only`.
 4. Commands: `task tools` first, then `task ci`, `task cover`, `task test:integration`,
    `task backend:conformance`, `task dst`, `task generate`/`generate:check`,
-   `task db:migrate:diff -- <name>`, `task build:qemu`. Tools are never invoked
-   directly — versions live in `Taskfile.yml`.
+   `task db:plan -- <name>` / `task db:apply` / `task db:verify`, `task build:qemu`.
+   Tools are never invoked directly — versions live in `Taskfile.yml`.
 
 ## Session gotchas worth remembering (also in AGENT-MEMORY.md)
 - **ADR-0005:** WAL headers are **104 bytes**, not the doc's "96".
-- **ADR-0006/0007:** all SQL via sqlc; Atlas migrations; Postgres 18; UUIDv7 enforced
-  in code and by DB CHECK.
+- **ADR-0006/0007/0019:** all SQL via sqlc; **pgschema**, not Atlas — `schema.sql` is the
+  declared state, `migrations/` is the record of reviewed plans and nothing replays it;
+  Postgres 18; UUIDv7 enforced in code, by a `uuidv7` domain, and by DB CHECK.
 - **ADR-0008:** drain moves a volume from its durable prefix in S3, fencing first.
 - **ADR-0009:** lifecycles are typed (`internal/lifecycle`), enforced by Go types,
   transition-guarded UPDATEs, and DB CHECKs.

@@ -11,11 +11,12 @@ disk tears a write, a response is lost twice, an operator runs two things at onc
 backend throttles mid-sweep, or a clock moves backwards.
 
 Worked in two waves under `TEST-GAPS-PLAN.md` (packages A–E, then F1–F5), each in its
-own worktree over a disjoint set of files, then wave 3 (G1–G5). **One entry is
-still open**, and every one of them is listed below with what it is waiting on.
+own worktree over a disjoint set of files, then wave 3 (G1–G5). **All 78 are closed.**
+Two entries remain open below and neither came from the audit: one was narrowed to a
+format Phase 12 will introduce, and one was found by integration — the audit could not
+have seen it, because it only becomes reachable when a second goroutine exists.
 Findings that turned out to be already covered are recorded as such rather than
-counted as work; two of the open entries are new, found by the harness while proving
-that a checker could catch a real bug.
+counted as work.
 
 ## Closed — wave 1 (packages A–E)
 
@@ -105,7 +106,30 @@ that a checker could catch a real bug.
 
 ## Open
 
-One entry, named with what it is waiting on.
+Two entries, named with what each is waiting on.
+
+### Found by integration, not by the audit (1)
+
+- **`wal.Log` has no mutex, and the Agent is about to call it from a second goroutine**
+  _(wal)_
+  - `Log` carries no lock of any kind: `Write`, `Flush`, `AdvanceDurable`,
+    `AdvancePublished` and `TruncateLocal` all mutate the watermarks, the segment set and
+    the read view unguarded. Nothing has caught this because nothing has been concurrent:
+    `vhost.queueLoop` is one goroutine per virtqueue and the device offers one queue, so
+    every `Backend` call — and therefore every `Log` call — is serialized by construction.
+  - **The bad sequence, once the Agent drives a real volume:** the guest's queue loop is
+    inside `Log.Write` appending to the tail segment while the Agent's reconciliation runs
+    `checkpoint.Create` → `AdvancePublished` → `TruncateLocal` on the same `Log`. The
+    truncation unlinks segments and rewrites `truncatedUpTo`/`reclaimedBytes` under an
+    append that is extending the newest one. Torn watermarks are the mild outcome; a
+    segment set mutated mid-append is the other.
+  - **Waiting on:** a decision recorded with the fix — either `Log` grows its own lock
+    (it is the thing that owns the invariant, and Cheney's rule is to guard the shared
+    state where it lives) or the Agent is declared the single owner and serializes every
+    caller. The DST harness is single-goroutine by design and will not catch either way,
+    so the proof has to be a race-detector test with a concurrent checkpoint.
+  - Blocks the second half of DEV-0007: putting the checkpoint into the QEMU lane is
+    exactly what makes this concurrent for the first time.
 
 ### Waiting on a format that Phase 12 will introduce (1)
 

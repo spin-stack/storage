@@ -18,6 +18,29 @@ gate** (PLAN §2).
 
 ## Open
 
+### DEV-0012 — A self-fenced log still accepts WRITEs and still serves reads
+- Detected: 2026-07-26 by implementer agent in the `internal/blockdev` increment
+- Doc section(s): §16 (ACTIVE → SELF_FENCED), §12.4 (effective single writer)
+- Divergence: §16 scopes SELF_FENCED to *durable ACKs*, and the code implements exactly
+  that — `Log.Flush` refuses once `l.fenced` is set (`internal/wal/log.go:492`), while
+  `Log.Write` never consults it and `Log.Read` has no gate at all. Two consequences the
+  section does not address:
+  - a fenced host **keeps consuming local device space** for writes that no FLUSH can
+    ever cover, so the device fills with records that will be discarded;
+  - a fenced host **can still serve a read** after another writer was promoted into the
+    next epoch — a split-brain read, invisible to the guest.
+- Severity: medium (no ACKed data is lost — INV-06/INV-09/INV-10 all hold, since nothing
+  the fenced host writes is ever acknowledged as durable or published; the exposure is a
+  stale read reaching a guest, and device pressure)
+- Resolution: **open — deliberately not decided in code.** Refusing writes or reads on a
+  fenced log *extends* §16 rather than implementing it, which under CLAUDE.md makes it a
+  fencing-zone ADR, not an implementation detail. The alternative reading is that this is
+  not the WAL's job at all: the **Agent** is what should tear the device down when the
+  lease lapses, and a log that refuses I/O to a guest still attached is a worse failure
+  than one that writes bytes nobody will read. Decide which of the two before Phase 03's
+  reconnection work (increment 3.2), since a reconnecting front-end is the first caller
+  that can observe a fenced log across a gap.
+
 ### DEV-0011 — A segment's space is charged as it is used, not reserved when it is created
 - Detected: 2026-07-26 by implementer agent in the WAL-segmentation increment
 - Doc section(s): WAL-SEGMENTS-SPEC §"The failure cases" case 4, ADR-0013 §4
@@ -54,12 +77,18 @@ gate** (PLAN §2).
   Agent first, Connect RPC (`connectrpc/connect-go`) with the schema in `api/`, the
   Agent pulls and the Control Plane never pushes, and "done" is one volume on one host
   under a real QEMU guest over vhost-user-blk running write → FLUSH → verified object →
-  checkpoint → truncate. **Status: open — partially built.** `api/` (Connect),
+  checkpoint → truncate. **Status: open — the first half is built.** `api/` (Connect),
   `internal/agent`, `internal/cpserver`, `cmd/volume-agent` and `cmd/control-plane`
   exist and are exercised end to end over real HTTP; `internal/vhost` serves a block
-  device to a real QEMU 11.0.2 guest (increment 3.1) with its own integration lane.
-  What is missing is the join: a `wal.Log`-backed `vhost.Backend`, so a guest write
-  reaches the WAL rather than a raw file.
+  device to a real QEMU 11.0.2 guest (increment 3.1) with its own integration lane; and
+  `internal/blockdev` (2026-07-26) puts `wal.Log` behind that seam, so **a guest write
+  now lands as a replayable WAL record with 0 PUTs**.
+  What is missing is the second half of the chain — **FLUSH → verified object →
+  checkpoint → truncate** — none of which any guest has ever driven. The blocker is
+  named and separable: no guest in the lane can *emit* a FLUSH, because SeaBIOS's INT 13h
+  has no flush verb and `-kernel` direct boot is unavailable (`task build:qemu` extracts
+  no `linuxboot_dma.bin`, and no kernel image is pinned). Until a Linux guest issues one,
+  the §14.4 ACK path is exercised only against the simulated front-end.
 
 ## Resolved
 
