@@ -3,7 +3,7 @@ package dst
 import "testing"
 
 // Planted-bug proof for the local-WAL segmentation scenario. A scenario that has never
-// been seen to reject anything is decoration (PLAN.md §3), so this plants the exact
+// been seen to reject anything is decoration (a CLAUDE.md stop signal), so this plants the exact
 // violation the seal/publish/unlink ordering exists to prevent — as a change to how
 // production code behaves, never as a fabricated event.
 //

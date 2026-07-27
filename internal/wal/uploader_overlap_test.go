@@ -8,7 +8,7 @@ import (
 	"github.com/spin-stack/storage/internal/wal"
 )
 
-// TEST-GAPS (Open, known-weaker): "The uploader detects an identical span, not a
+// Audit finding, 2026-07-25: "The uploader detects an identical span, not a
 // partial overlap ({1-3} vs {2-5}), and its check is a LIST, so a lagging listing
 // blinds it."
 //

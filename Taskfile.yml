@@ -2,7 +2,7 @@ version: "3"
 
 # Build/test/lint/dst orchestration for github.com/spin-stack/storage.
 # Mirrors the sibling spin-stack projects (go-task). The `ci` target is the
-# aggregate gate wired into GitHub Actions (docs/plan/PLAN.md §2).
+# aggregate gate wired into GitHub Actions (CLAUDE.md, "The gate").
 #
 # Reproducibility rule: every tool this project needs is pinned here and installed
 # into ./.tools/bin by `task tools`. Nothing depends on what happens to be on the

@@ -110,7 +110,7 @@ message DeviceStatus {
 message HeartbeatRequest {
   // host_id is the fleet identity of this host.
   string host_id = 1;
-  // agent_version is the build the Agent is running (fleet-mixed, §13.4).
+  // agent_version is the build the Agent is running (fleet-mixed, §27 — INV-19).
   string agent_version = 2;
   // max_format_version is the highest on-disk/on-S3 format this Agent can read
   // and write. The Control Plane never places a volume on a host that cannot

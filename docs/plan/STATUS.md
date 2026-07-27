@@ -1,206 +1,216 @@
-# STATUS
+# STATUS — what is true right now
 
-Short snapshot + resume-from-here handoff. **Read this first** when picking up the
-work, then `REBASELINE.md` — a human review on 2026-07-25 found this file claiming
-more than the repository does, and the maturity model below is the correction.
+**The single answer to "what is done, what is partial, what is missing."** If another
+file disagrees with this one, this one is wrong and should be fixed — nothing else
+tracks state.
 
-- **Date:** 2026-07-26. The spine exists and **a guest write now reaches the WAL**:
-  increment 3.1 serves `vhost-user-blk` to the pinned QEMU 11.0.2 and `internal/blockdev`
-  puts `wal.Log` behind that seam, both verified by execution rather than by simulation.
-  All 78 audit findings are closed; the two entries left in `TEST-GAPS.md` came from
-  elsewhere. Schema tooling moved from Atlas to pgschema (ADR-0019).
-- **Where the work is:** everything is on **`main`**, pushed to `origin`
-  (`/home/aledbf/spin-storage.git`, a bare repo — the old bundle remote is gone).
-- **Gate on `main`:** `task ci:full` green — that is now the merge gate and it includes
-  the Docker lanes (`task ci` stays the fast local loop). `task cover` 92.1% (>= 90);
-  `task test:integration` green on Postgres 18; `task backend:conformance` green
-  against the pinned RustFS; `task build:qemu` + `task qemu:verify` green.
+- **Date:** 2026-07-26 · **Branch:** everything is on `main`, pushed to `origin`
+  (`/home/aledbf/spin-storage.git`, bare).
+- **Gate:** `task ci:full` green — the merge gate, Docker lanes included (`task ci` is
+  the fast local loop). `task cover` 92.1% (floor 90). `task test:integration` green on
+  PostgreSQL 18, `task backend:conformance` green against the pinned RustFS,
+  `task build:qemu` + `task qemu:verify` green.
 
 ## Maturity, not "done"
 
 | State | Meaning |
 |---|---|
-| **model** | Library logic with unit/property/DST coverage. No integrated caller, no real I/O path. |
+| **model** | Library logic with unit/property/DST coverage. No integrated caller, no real I/O. |
 | **integrated** | Wired into a running binary through the real interfaces, exercised end to end. |
 | **production-verified** | Real hardware/backends under fault injection, telemetry recorded, runbook times measured. |
 
-**One path is now `integrated`; nothing is `production-verified`.** The spine exists —
-`api/` over Connect, an Agent that pulls, two `cmd/` binaries — and a real QEMU guest
+**One path is integrated; nothing is production-verified.** The spine exists — `api/`
+over Connect, an Agent that pulls, two `cmd/` binaries — and a real QEMU 11.0.2 guest
 boots off a device whose bytes come from a `wal.Log`, writing records through the same
-interfaces production would use. That is the *write* half of one volume on one host.
-Everything downstream of it — FLUSH's ACK path, the uploader, checkpoints, truncation —
-is still exercised only by tests, and there is no deployment. The other phases remain
-models.
+interfaces production would use. That is the **write** half of one volume on one host.
+Everything downstream — FLUSH's ACK path, the uploader, checkpoints, truncation — is
+still exercised only by tests, and there is no deployment.
 
-| Phase | State | Notes |
+## Where each phase actually is
+
+| Phase | State | What is true, and what is not |
 |---|---|---|
-| 0 planning | done | — |
-| 01 skeleton (simio + DST harness + obs) | **model** | metrics are recorded by the paths that own them (DEV-0010 closed); wiring continues with each new path |
-| 02 guest layout | **not started** | needs guest mounts / a VM; nothing in the durability chain depends on it |
-| 03 vhost-user | **3.1 integrated** | a real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). FLUSH is *not* exercised by a guest (no kernel in the lane) and 3.2 reconnection / 3.3 inflight-shmfd are untouched — RISK-10 stays open |
-| 04 WAL/CoW format + property tests | **write path integrated**, rest model | a guest's WRITE lands as a WAL record with 0 PUTs (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims. FLUSH/uploader/checkpoint are still model-only. Format review still pending (human-review zone) |
+| 01 skeleton (simio + DST + obs) | **model** | Simulable interfaces, the DST harness and the metric catalog all exist and are enforced by lint. Metrics are recorded by the paths that own them; wiring continues with each new path. |
+| 02 guest layout (3 devices + OverlayFS) | **not started** | Needs guest mounts / a VM. Nothing in the durability chain depends on it. Spec below. |
+| 03 vhost-user | **3.1 integrated** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). **FLUSH is not exercised by a guest** (no kernel in the lane); 3.2 reconnection and 3.3 inflight-shmfd are untouched — RISK-10 stays open. |
+| 04 WAL/CoW format | **write path integrated**, rest model | A guest's WRITE lands as a replayable WAL record with **0 PUTs** (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims (`WAL-SEGMENTS-SPEC.md`). FLUSH / uploader / checkpoint are model-only. Format review still pending (human-review zone). |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
-| 06 remote WAL (batching, idempotent PUT, summary) | **model** | — |
-| 07 Control Plane + leases + fencing | **model** | fail-closed lease + resumable promotion + term guards (DEV-0004/0005 closed) |
-| 08 recovery (S3 authority) + rebuild-metadata | **model** | objects validated before they count as durable; rebuild includes the catalog (DEV-0003/0009 closed) |
-| 09 snapshots + clone + resize | **partial model** | synchronous sealing, no chain link persisted (DEV-0007 — needs the spine) |
-| 10 objectization + checkpoints + GC + I/O classes | **partial model** | GC now marks reversibly (DEV-0006 closed); still no segment objects (DEV-0007) |
-| 11 cross-host + cordon/drain + capacity | **partial model** | drain is idempotent across crash boundaries (DEV-0008 closed); the materialized view is still not persisted (DEV-0007) |
-| 12 warm standby + compaction + flatten | **not started** | paused by the rebaseline |
-| 13 hardening + fleet-mixed | **13.1 model** (typed lifecycles, ADR-0009) | 13.2–13.4 need infra; INV-19 still pending |
+| 06 remote WAL (batching, idempotent PUT, summary) | **model** | No guest has ever driven a PUT. |
+| 07 Control Plane + leases + fencing | **model** | Fail-closed lease, resumable promotion, term guards. |
+| 08 recovery (S3 authority) + rebuild-metadata | **model** | Objects are validated before they count as durable; the rebuild includes the snapshot catalog. |
+| 09 snapshots + clone + resize | **partial model** | Sealing is synchronous and no chain link is persisted (DEV-0007). |
+| 10 objectization + checkpoints + GC + I/O classes | **partial model** | The GC marks reversibly; there are still no segment objects (DEV-0007). |
+| 11 cross-host + cordon/drain + capacity | **partial model** | The drain is idempotent across crash boundaries; the materialized view is still not persisted (DEV-0007). |
+| 12 warm standby + compaction + flatten | **not started** | Born with the by-key index ADR-0012 and ADR-0014 both need. |
+| 13 hardening | **13.1 model** | Typed lifecycles (ADR-0009). 13.2 (real-hardware fault injection + measured runbooks), 13.3 (backend conformance per version) and 13.4 (**INV-19**, the last pending invariant) need infra. |
 
-## Invariants: 21 checkers run; the rebaseline caveats are closed
+**Invariants:** 21 of 22 active, each with a checker proven to catch a planted bug.
+INV-19 is pending and becomes binding the moment two Agents can run different formats.
+See `INVARIANTS.md`.
 
-The four claims the review narrowed — INV-06 (fencing was opt-in), INV-08/09 (durable
-point from unvalidated headers), INV-14 (permanent deletion was reachable, GC did not
-mark) — are now true in code, and INV-20 covers volumes *and* the snapshot catalog.
-What stays true regardless: these are proofs about libraries, not about a system that
-serves a block device.
+**Test backlog:** the 2026-07-25 six-way audit found 78 gaps (7 critical); **all 78 are
+closed**, each naming the commit. The two items still open are below and neither came
+from that audit.
 
-## Infrastructure available (2026-07-25)
-- **QEMU 11.0.2** — `task build:qemu` -> `_output/bin/` + firmware; `task qemu:verify`
-  asserts the version and `vhost-user-blk-pci`. Unblocks the tooling half of 02/03.
-- **Object store** — RustFS pinned by digest via TestContainers (`internal/testinfra`);
-  `task backend:conformance` runs the §6.1 suite (ADR-0010). Every requirement passes
-  except throttling, which is not exercisable on demand.
-- **One S3 client** — `internal/simio/real.NewS3Store`, the only place the AWS SDK is
-  configured, proven by the shared `objectstore` contract (`storetest`) against the
-  real backend.
+---
 
-## Test coverage of failure modes
+# Open work
 
-`TEST-GAPS.md` is the backlog from a six-way audit of the suite (2026-07-25), each
-finding checked by an adversary before it was accepted: 78 gaps confirmed, 7 of them
-critical. **All seven criticals are closed**; eight fixes in total — a rejected WAL append that left its bytes behind,
-the uploader comparing an ETag against a SHA-256, the GC not treating the durable
-prefix as a root, a drain recording an epoch boundary below the durable point, nine of
-eleven DST checkers that had never been shown to catch anything, recovery not chaining
-across epochs, a checkpoint publishing more than S3 could prove, and logs that
-restarted at sequence 1 after a promotion. The rest are listed there by severity.
+Three deviations and two gaps. Nothing else is outstanding.
 
-Three of the seven criticals were one root cause (the GC), which is the shape to
-expect: the suite covered the happy path thoroughly and the operational worst case
-barely at all.
+## DEV-0007 — the spine's second half *(the only thing on the critical path)*
 
-## What happened since the rebaseline
+ADR-0018's definition of done is one volume, one host, a real QEMU guest running
+**write → FLUSH → verified object → checkpoint → truncate**. The write is done. The rest
+has never been driven by a guest, and two blockers stand in front of it — both separable,
+neither deep:
 
-Four waves of parallel increments closed all 78 audit findings (`TEST-GAPS.md` records
-each with the commit that closed it, plus the two later entries that did not come from
-the audit and what each is waiting on). The ones worth carrying in your head, because
-they were real data-loss paths and not tidying:
+1. **No guest in the lane can emit a FLUSH.** SeaBIOS's INT 13h has no flush verb, and
+   `-kernel` direct boot is unavailable: `task build:qemu` extracts no
+   `linuxboot_dma.bin`, and no kernel image is pinned. Fix: a Taskfile change plus a
+   kernel pinned by digest, the way RustFS already is.
+2. **`wal.Log` has no mutex** (gap 1 below) — a prerequisite, not a follow-up.
 
-- a reopened WAL restarted at sequence 1 — duplicate sequences and reused GCM nonces;
-- the publishers never consulted the epoch object at all, so a fenced host could
-  publish a checkpoint into another host's epoch and advance `published`;
-- `AdvancePublished` accepted a value below its own past, so one stale listing walked
-  the published point backwards under WAL that had already been discarded;
-- a drain finished volumes it never moved, writing create-only boundaries for them;
-- `BumpVolumeEpoch` was a blind increment, so n promoters each got an epoch;
-- the GC's epoch ceiling licensed destroying a superseded epoch's objects that a
-  pre-promotion manifest still named (ADR-0012).
+Also part of DEV-0007, and untouched: snapshot sealing is synchronous rather than a
+background lifecycle, clone persists no parent/read-chain link, objectization publishes
+no segment objects, and cross-host materialization returns a view the caller discards.
 
-**Every design decision that was blocking the spine is now taken:** ADR-0011 (term
-claimed in S3), 0012 + amendment (GC anchors; Phase 12 is born with a by-key index),
-0013 (device pressure, Proposed), 0014 (soft per-lineage quota, content-addressed
-snapshots, squash), 0015 (fencing wait is a monotonic dwell), 0016 (fencing
-granularity), 0017 (capacity is derived, not a ledger), 0018 (the spine: Agent first,
-Connect RPC in `api/`, Agent pulls).
+## DEV-0011 — a segment's space is charged as used, not reserved at creation
 
-## What to do next
+`WAL-SEGMENTS-SPEC.md` asks that creating a segment be charged against the device budget
+*before* the first append, so out-of-space is reached at a segment boundary rather than
+mid-record. `segments.create` charges only the 64-byte header; the rest is charged append
+by append. Reserving the whole segment means growing the file to full size, and a segment
+whose tail is zero-filled cannot be replayed by reading to the end — the zeros decode as
+a bad magic. That needs `fallocate` in `simio/disk` plus a durable write offset in the
+segment: a format change of its own.
 
-Tracks A and C are done; **Track B is the live one**, and it is down to its last step.
-Three deviations are open — **DEV-0007** (the spine's second half, below), **DEV-0011**
-and **DEV-0012** — and the two latter both wait on a human decision rather than on code.
+**Not data loss** — a refused append already leaves no partial record, and ENOSPC at
+segment creation is latched exactly like ENOSPC while appending
+(`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
+knows a volume's share of the device budget.
 
-### ~~Track A — Control Plane~~ **done** (wave 4)
-ADR-0015/0016/0017 landed. Two consequences to carry forward: a drain now costs one
-dwell **per volume** (ADR-0016's own bound; stage 2 removes it), and stage 1 needs the
-reconciler to poll faster than the revocation window or the drain retries without
-converging — it corrupts nothing, it just does not finish.
+## DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads
 
-### Track B — the spine (ADR-0018), Agent first
-1. ~~`api/` + toolchain~~ **done**: protobuf served over Connect, `buf` pinned,
-   `generate:proto:check` in the gate.
-2. ~~`cmd/volume-agent` skeleton~~ **done**: pull reconciliation, heartbeat carrying
-   device total/used/backlog, epoch-qualified watermark reports, a lease armed only by
-   a successful heartbeat and anchored to the instant the request left.
-3. ~~The three gaps that blocked the data path~~ **done**: `disk.Usage()` with statfs
-   (and a device budget in the simulator, the knob ADR-0013 needs), the aggregate
-   remote backlog on `metadata.Host`, and `GetVolumeKeys` as its own RPC — authorised
-   per request against the volume's current primary, which a list response could not
-   express. Known gap recorded there: the response carries no DEK **version**, because
-   no column holds one and `0` means plaintext in the WAL.
-4. ~~vhost-user-blk~~ **done for 3.1** — see the phase table.
-5. ~~Put `wal.Log` behind the `Backend` seam~~ **done** (`internal/blockdev`, `047ed37`).
-   Three things it settled, all of them things the specification did not say:
-   **virtio-blk cannot express FUA** (a Linux guest gets WRITE+FLUSH instead, which is
-   the same contract `Log.WriteFUA` implements, so that entry point is unreachable from
-   this transport); **`VIRTIO_BLK_F_CONFIG_WCE` must stay unoffered**, or a guest
-   switches the device to write-through and stops sending FLUSH while believing every
-   WRITE is durable — which under §14.4 it is not; and **the wire has no ENOSPC**, so all
-   three refusals complete as `VIRTIO_BLK_S_IOERR` with the distinction carried in
-   wrapped sentinels, because a lapsed lease, a backpressure bound and a full device have
-   different remedies.
-6. **Next — the second half of the chain: FLUSH → verified object → checkpoint →
-   truncate, driven by a guest.** None of it has ever been driven by one. Two blockers,
-   both separable and neither deep:
-   - **No guest in the lane can emit a FLUSH.** SeaBIOS's INT 13h has no flush verb, and
-     `-kernel` direct boot is unavailable: `task build:qemu` extracts no
-     `linuxboot_dma.bin`, and no kernel image is pinned. The fix is a Taskfile change plus
-     a kernel pinned by digest, the way RustFS already is.
-   - **`wal.Log` has no mutex** (`TEST-GAPS.md`). Today that is harmless — one virtqueue,
-     one `queueLoop` goroutine, every `Backend` call serialized. Putting the checkpoint in
-     the lane is exactly what makes it concurrent for the first time, so this is a
-     prerequisite and not a follow-up.
+§16 scopes SELF_FENCED to *durable ACKs*, and the code implements exactly that:
+`Log.Flush` refuses once fenced, `Log.Write` never consults the flag and `Log.Read` has
+no gate. So a fenced host keeps consuming device space for writes no FLUSH can cover, and
+can serve a read after another writer was promoted — a split-brain read.
 
-**That second half is the definition of done for DEV-0007** — and what turns Phases 06
-and 10 from models into something a guest has exercised.
+**No ACKed data is at risk** (INV-06/09/10 all hold: nothing a fenced host writes is ever
+acknowledged durable or published); the exposure is a stale read reaching a guest, plus
+device pressure. **Deliberately not decided in code:** refusing writes or reads *extends*
+§16, which makes it a fencing-zone ADR. The counter-argument is that this is not the
+WAL's job — the **Agent** should tear the device down when the lease lapses, and a log
+that refuses I/O to a guest still attached is the worse failure. Decide before increment
+3.2, since a reconnecting front-end is the first caller that can observe a fenced log
+across a gap.
 
-### ~~Track C — WAL segmentation~~ **done** (`f7f68b3`)
-The WAL is a directory of segments (`WAL-SEGMENTS-SPEC.md`, human-reviewed before the
-code), so `TruncateLocal` reclaims on an active volume instead of freeing bytes only
-when the checkpoint had reached the end of the log. One deviation came out of it:
-**DEV-0011** — a segment's space is charged as it is used, not reserved at creation, so
-the out-of-space state is still reached mid-record rather than at a segment boundary.
-It waits on ADR-0013's device budget.
+## Gap 1 — `wal.Log` has no mutex, and the Agent is about to call it from a second goroutine
 
-### Two decisions waiting on a human, both in review zones
+`Log` carries no lock: `Write`, `Flush`, `AdvanceDurable`, `AdvancePublished` and
+`TruncateLocal` all mutate the watermarks, the segment set and the read view unguarded.
+Nothing has caught it because nothing has been concurrent — `vhost.queueLoop` is one
+goroutine per virtqueue and the device offers one queue, so every `Backend` call is
+serialized by construction.
+
+**The sequence that breaks it:** the guest's queue loop is inside `Log.Write` appending to
+the tail segment while the Agent's reconciliation runs `checkpoint.Create` →
+`AdvancePublished` → `TruncateLocal` on the same `Log`, unlinking segments under an
+append that is extending the newest one. Torn watermarks are the mild outcome.
+
+**Needs a decision recorded with the fix:** either `Log` grows its own lock (it owns the
+invariant, and the rule is to guard shared state where it lives) or the Agent is declared
+the single owner and serializes every caller. **The DST harness is single-goroutine by
+design and will not catch either way** — the proof has to be a race-detector test with a
+concurrent checkpoint.
+
+## Gap 2 — a GC sweep cannot see an anchor its listing has not caught up to
+
+Narrowed, not closed, by ADR-0012: the epoch ceiling no longer licenses destruction, and
+the reproduction that decided it — a hole in the listing *below* a durable point marks
+ACKed data with no manifest involved — showed no index would have helped. Strongly
+consistent LIST stays a precondition, certified per backend by `TestListSeesAFreshPut`
+(§6.1, blocking). **Waits on Phase 12's segment format**, which is born with a per-volume
+index readable by deterministic key.
+
+## Decisions waiting on a human
+
 - **ADR-0013 (device pressure) is still `Proposed`.** It carries DEV-0011 and the
   `SetLimits` the segment code has no way to receive today.
-- **DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads.** §16
-  scopes SELF_FENCED to durable ACKs and the code implements exactly that; refusing more
-  would extend the doc, which is a fencing-zone ADR. Worth deciding before increment 3.2,
-  since a reconnecting front-end is the first caller that can observe a fenced log.
+- **DEV-0012**, above.
+- **The Phase 04 format review** (human-review zone) has never been signed off.
 
-### After those
-Quota/lineage accounting (ADR-0014, CP-side: `lineages`, `charged_bytes`), then Phase 12
-— segments, the by-key index all three of ADR-0012/0014 need, and squash — then the
-rest of Phase 13 (real-hardware fault injection, runbooks with measured times, INV-19,
-which becomes binding as soon as two Agents can differ).
+---
 
-## How to resume
-1. Read `REBASELINE.md`, then `PLAN.md` (phase map), `INVARIANTS.md`, `CLAUDE.md`.
-2. Ritual per increment: failing tests/DST/checkers **in their own commit**, then the
-   implementation, then the doc update — the three-in-one commits are what let the
-   documentation drift from the code.
-3. Branch per phase off `main`; human review before merge for data-loss zones
+# Specs for work not started
+
+Kept because they are the only record of the intended shape; everything else that was
+planning-only has been deleted (git has it).
+
+## Phase 02 — guest layout (§9, §5.5)
+
+Boot a guest with three devices — `/dev/vda` EROFS read-only (shared base image),
+`/dev/vdb` ext4 persistent, `/dev/vdc` ext4 ephemeral — assembled with OverlayFS
+(`lowerdir=EROFS`, `upperdir=persistent/root-upper`, `workdir=persistent/root-work`), the
+ephemeral mounted at `/var/lib/ephemeral` with binds for `/var/lib/docker` and
+`/var/lib/containerd`.
+
+**The safety-relevant part is fail-closed:** if the ephemeral mount fails, Docker and
+containerd do **not** start and the persistent device is **not** used as a silent
+fallback. That is what makes §5.5 ("the ephemeral may be lost") true. Its test is a fault
+test that removes the ephemeral device and asserts they fail to start rather than fall
+back.
+
+Device features on `/dev/vdb`: `VIRTIO_BLK_F_FLUSH`, `VIRTIO_BLK_F_DISCARD`,
+`VIRTIO_BLK_F_WRITE_ZEROES`, and resize via config-space update plus notification. Note
+`VIRTIO_BLK_F_CONFIG_WCE` is **deliberately absent** — see the gotchas below.
+
+## Phase 03 — the two remaining increments
+
+- **3.2 Reconnection.** An Agent restart (deploy) must be a pause of seconds, not a VM
+  restart: QEMU reconnects to the socket and the device resumes (§28.3). Note that **QEMU
+  11.0.2 already reconnects on its own** after a backend protocol error, with no
+  `reconnect=` on the chardev — this increment builds on that rather than adding it.
+  Activates `vhost_reconnects_total`.
+- **3.3 Inflight tracking via shmfd** ⚠️ *durability review zone.* In-flight requests live
+  in the inflight shared-memory region so an Agent crash recovers them exactly once
+  (§16). Needs a DST arm that kills the Agent with requests in flight, plus a real
+  QEMU + real kill verified by checksums. **This is what RISK-10 is waiting for:** the
+  backend does not advertise `INFLIGHT_SHMFD`, QEMU therefore never sends
+  `GET_INFLIGHT_FD`/`SET_INFLIGHT_FD` (asserted in the lane), and nothing yet says how
+  QEMU behaves when it does.
+
+---
+
+# How to resume
+
+1. Read this file, then `CLAUDE.md` (conventions + the gate), `REFERENCE.md` (to resolve
+   any `§`/`INV`/`ADR`/`DEV` the code cites) and `INVARIANTS.md`.
+2. **Ritual per increment:** failing tests / DST scenarios / checkers **in their own
+   commit**, then the implementation, then the doc update. Three-in-one commits are what
+   let documentation drift from code.
+3. Branch per phase off `main`; human review before merge for the data-loss zones
    (formats, fencing, durability, GC); merge `--ff-only`.
-4. Commands: `task tools` first, then `task ci`, `task cover`, `task test:integration`,
-   `task backend:conformance`, `task dst`, `task generate`/`generate:check`,
-   `task db:plan -- <name>` / `task db:apply` / `task db:verify`, `task build:qemu`.
-   Tools are never invoked directly — versions live in `Taskfile.yml`.
+4. `task tools` first. Tools are never invoked directly — versions live in `Taskfile.yml`.
 
-## Session gotchas worth remembering (also in AGENT-MEMORY.md)
-- **ADR-0005:** WAL headers are **104 bytes**, not the doc's "96".
-- **ADR-0006/0007/0019:** all SQL via sqlc; **pgschema**, not Atlas — `schema.sql` is the
-  declared state, `migrations/` is the record of reviewed plans and nothing replays it;
-  Postgres 18; UUIDv7 enforced in code, by a `uuidv7` domain, and by DB CHECK.
-- **ADR-0008:** drain moves a volume from its durable prefix in S3, fencing first.
-- **ADR-0009:** lifecycles are typed (`internal/lifecycle`), enforced by Go types,
-  transition-guarded UPDATEs, and DB CHECKs.
-- **ADR-0010:** one S3 wrapper; RustFS answers `If-Match` on a missing key with
-  `NoSuchKey` (not 412); multipart ETags carry `-N`; LIST pages cap at 1000 keys.
-- Do not re-add spinbox's `CONFIG_CXL=n` QEMU debloat (breaks the 11.0.2 link); bump
+## Gotchas that cost time to rediscover
+
+- **ADR-0005:** WAL headers are **104 bytes**, not the doc's 96.
+- **ADR-0019:** pgschema, not Atlas. `schema.sql` is the declared state; `migrations/`
+  is the record of reviewed plans and **nothing replays it**.
+- **ADR-0010:** RustFS answers `If-Match` on a missing key with `NoSuchKey`, not 412;
+  multipart ETags carry `-N`; LIST pages cap at 1000 keys.
+- **virtio-blk cannot express FUA.** A Linux guest gets WRITE+FLUSH instead, which is the
+  contract `Log.WriteFUA` implements — so that entry point is unreachable from this
+  transport.
+- **`VIRTIO_BLK_F_CONFIG_WCE` must stay unoffered**, or a guest switches the device to
+  write-through and stops sending FLUSH while believing every WRITE is durable, which
+  under §14.4 it is not.
+- **The virtio wire has no ENOSPC** — three status values, one of them IOERR. All three
+  refusals complete as IOERR with the distinction carried in wrapped sentinels, because a
+  lapsed lease, a backpressure bound and a full device have different remedies.
+- Do not re-add spinbox's `CONFIG_CXL=n` QEMU debloat (it breaks the 11.0.2 link); bump
   `QEMU_CONFIG_REV` when configure flags change.
 - Coverage excludes generated `internal/db`, integration-only `metadata/pg`,
-  `simio/real/s3.go`, `testinfra`, `migrations`, `cmd`, and the `dst` harness.
+  `simio/real/s3.go`, `testinfra`, `cmd/`, and the `dst` harness.

@@ -2,18 +2,18 @@
 
 Invariants extracted from the architecture doc (§4/§5/§12/§14/§21/§27). Each is a
 property a **checker** verifies inside the DST harness. An invariant is born
-`pending` and becomes `active` when its checker runs in CI. The **standard gate**
-(PLAN §2) requires all `active` checkers green.
+`pending` and becomes `active` when its checker runs in CI. The gate (`CLAUDE.md`)
+requires all `active` checkers green.
 
 **Checker states:** `pending` (no checker yet) · `active` (checker runs in CI) ·
 `n/a-until` (subject does not exist yet; activated by the named phase).
 
-> **Rebaseline (2026-07-25).** A checker that passes against a library model is not a
-> proof about a running system: nothing here is integrated yet (`REBASELINE.md`). The
-> caveats raised by the review on INV-06, INV-08, INV-09 and INV-14 are now closed in
-> code (DEV-0003/0004/0006/0008), and INV-20 covers volumes *and* the snapshot catalog
-> (DEV-0009). What remains true regardless: these are proofs about libraries, not about
-> a system that serves a block device.
+> **What an active checker does and does not prove.** Every checker here has been shown
+> to catch a *planted bug in production behaviour*, not merely to run — that was the
+> point of the 2026-07-25 audit. But with one exception these are proofs about
+> **libraries**: only the write path has a guest in the loop (`STATUS.md`). A checker
+> green against a model says the model is right, not that a system serving a block
+> device is.
 
 | ID | State | Statement | Checker (how the harness verifies it) | Activated by | § |
 |---|---|---|---|---|---|

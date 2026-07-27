@@ -7,7 +7,7 @@ import (
 	"github.com/spin-stack/storage/internal/wal"
 )
 
-// TEST-GAPS (Open, known-weaker): "`watermark-order` and `no-truncate-above-published`
+// Audit finding, 2026-07-25: "`watermark-order` and `no-truncate-above-published`
 // need a fault seam in internal/wal (`Log` enforces both internally and no simulated
 // I/O reaches the check)."
 //

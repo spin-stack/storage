@@ -341,7 +341,7 @@ type HeartbeatRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// host_id is the fleet identity of this host.
 	HostId string `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
-	// agent_version is the build the Agent is running (fleet-mixed, §13.4).
+	// agent_version is the build the Agent is running (fleet-mixed, §27 — INV-19).
 	AgentVersion string `protobuf:"bytes,2,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
 	// max_format_version is the highest on-disk/on-S3 format this Agent can read
 	// and write. The Control Plane never places a volume on a host that cannot

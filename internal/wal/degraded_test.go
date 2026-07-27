@@ -13,7 +13,7 @@ import (
 	"github.com/spin-stack/storage/internal/wal"
 )
 
-// TEST-GAPS (Open, wal-durability): "wal.Log has no out-of-space state".
+// Audit finding, 2026-07-25 (wal-durability): "wal.Log has no out-of-space state".
 //
 // The operational sequence is the one `disk-fills-under-sustained-write-with-s3-down`
 // already drives: S3 has been unreachable long enough that nothing closed the remote

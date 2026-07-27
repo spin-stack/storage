@@ -11,7 +11,7 @@ import (
 )
 
 // Planted-bug proofs for the checkers scenarios_recovery.go contributes. A checker
-// that has never been seen to reject anything is decoration (PLAN.md §3), so each
+// that has never been seen to reject anything is decoration (a CLAUDE.md stop signal), so each
 // case below plants the exact violation its invariant forbids and requires the
 // checker to fail, name itself, and print the reproducing seed.
 

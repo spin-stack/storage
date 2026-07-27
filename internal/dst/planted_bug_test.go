@@ -671,7 +671,7 @@ var plantedProofs = map[string]proofKind{
 func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 	for _, c := range DefaultCheckers() {
 		if _, ok := plantedProofs[c.Name()]; !ok {
-			t.Fatalf("checker %q has no planted-bug proof: add one in this file (PLAN.md §3 stop signals)", c.Name())
+			t.Fatalf("checker %q has no planted-bug proof: add one in this file (a CLAUDE.md stop signal)", c.Name())
 		}
 	}
 	if len(plantedProofs) != len(DefaultCheckers()) {

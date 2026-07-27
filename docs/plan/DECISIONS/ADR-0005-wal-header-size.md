@@ -4,7 +4,7 @@
   104 approved, and §14.1/§14.2 of the architecture doc corrected to match.
 - **Date:** 2026-07-25
 - **Deciders:** tech-lead agent
-- **Implements/Extends:** §14.1, §14.2. Recorded in DEVIATIONS.md as DEV-0001.
+- **Implements/Extends:** §14.1, §14.2. Recorded as DEV-0001 (resolved; see REFERENCE.md).
 
 ## Context
 

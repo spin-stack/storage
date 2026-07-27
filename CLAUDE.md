@@ -1,13 +1,34 @@
 # CLAUDE.md — Remote Volumes (storage)
 
 Engineering conventions for this module. The **design source of truth** is
-`arquitectura_mvp_volumenes_remotos_v5.md` (v5.1); the **plan, invariants, and ADRs**
-live in `docs/plan/` (`PLAN.md`, `INVARIANTS.md`, `PHASE-0N.md`, `DECISIONS/ADR-*`,
-`STATUS.md`). Read `docs/plan/STATUS.md` first to see where the work is.
+`arquitectura_mvp_volumenes_remotos_v5.md` (v5.1).
+
+**Three files answer everything else** (`docs/plan/README.md` is the map):
+
+- **`docs/plan/STATUS.md`** — read it first. What is done, what is partial, what is
+  missing, what to do next. It is the *only* file that tracks state.
+- **`docs/plan/REFERENCE.md`** — the code carries ~1.800 `§`/`INV`/`ADR`/`DEV`
+  references; this resolves any of them in one line without opening another file.
+- **`docs/plan/INVARIANTS.md`** — each invariant, its checker, and where it activated.
 
 Do not re-design against the doc. Any implementation decision that contradicts,
-extends, or interprets it needs an ADR before merge; observed doc↔code divergences go
-in `docs/plan/DEVIATIONS.md`.
+extends, or interprets it needs an ADR (`docs/plan/DECISIONS/`) before merge; an
+observed doc↔code divergence is a **DEV entry in `STATUS.md`**, and an open one blocks
+the gate.
+
+## The gate (definition of done for every increment)
+
+- [ ] New tests green, full suite green, `task ci:full` green.
+- [ ] Mandatory DST set green; active invariant checkers green.
+- [ ] `STATUS.md` updated (and `INVARIANTS.md` if an invariant moved).
+- [ ] No open DEV entry that this increment introduced.
+- [ ] **Touching an on-disk / on-S3 format:** a serialize/replay property test with
+      arbitrary truncations and bit corruptions (§25.2).
+
+**Stop signals** — halt, record in `STATUS.md`, escalate to a human: a test weakened or
+deleted to make a change pass; a `sleep`/magic timeout/infinite retry instead of a
+simulable interface; code touching durability, fencing or GC with no DST scenario;
+"I did it differently from the doc because it was simpler" with no ADR.
 
 ## Stack
 

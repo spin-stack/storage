@@ -12,7 +12,7 @@ import (
 	"github.com/spin-stack/storage/internal/wal"
 )
 
-// TEST-GAPS (Open, known-weaker): "The uploader has no backoff between retries, so a
+// Audit finding, 2026-07-25: "The uploader has no backoff between retries, so a
 // coordinated throttle exhausts the budget faster than the backend recovers."
 //
 // A retry loop with no wait is not a retry loop: every attempt lands inside the same

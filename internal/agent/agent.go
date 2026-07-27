@@ -136,7 +136,7 @@ func (u *DiskUsage) Usage(context.Context) (disk.Usage, error) {
 type Config struct {
 	// HostID is this host's fleet identity.
 	HostID string
-	// AgentVersion is the build being run (§13.4, fleet-mixed).
+	// AgentVersion is the build being run (§27, fleet-mixed — INV-19).
 	AgentVersion string
 	// MaxFormatVersion is the highest on-disk/on-S3 format this build can read and
 	// write. The Control Plane will not place a volume this Agent cannot read.

@@ -35,7 +35,7 @@ jobs:
       - name: Install pinned tools
         run: task tools
 
-      # The standard gate (docs/plan/PLAN.md §2): format, generated-code freshness,
+      # The standard gate (CLAUDE.md, "The gate"): format, generated-code freshness,
       # build, lint (incl. the custom simulable analyzer / INV-01), test, DST.
       - name: Format check
         run: task fmt:check

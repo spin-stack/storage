@@ -3,7 +3,7 @@ package dst
 import "testing"
 
 // Planted-bug proofs for the checkers scenarios_drain.go contributes. A checker that
-// has never been seen to reject anything is decoration (PLAN.md §3), so each case
+// has never been seen to reject anything is decoration (a CLAUDE.md stop signal), so each case
 // below plants the exact violation its invariant forbids — as a change to how
 // production code behaves, never as a fabricated event — and requires the checker to
 // fail, name itself, and print the reproducing seed.

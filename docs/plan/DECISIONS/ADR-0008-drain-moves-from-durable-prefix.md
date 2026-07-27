@@ -8,8 +8,8 @@
 - **Date:** 2026-07-25
 - **Deciders:** implementer agent, with the human review of the Phase 11 spec
 - **Implements/Extends:** §28.1 (cordon/drain), §20 (cross-host), §22.1/§22.3
-  (recovery authority, cold materialization), §12.3–12.5 (fencing). Recorded in
-  DEVIATIONS.md as DEV-0002.
+  (recovery authority, cold materialization), §12.3–12.5 (fencing). Recorded as
+  DEV-0002 (resolved; see REFERENCE.md).
 
 ## Context
 
