@@ -4,10 +4,11 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-07-26 · **Branch:** everything is on `main`, pushed to `origin`
-  (`/home/aledbf/spin-storage.git`, bare).
+- **Date:** 2026-07-27 · **Branch:** everything is on `main`, pushed to `origin`
+  (`/home/aledbf/spin-storage.git`, bare). HEAD is `cef9881`.
 - **Gate:** `task ci:full` green **on a developer machine, and nowhere else**.
-  `task cover` 92.2% (floor 90), `task test:integration` green on PostgreSQL 18,
+  `task cover` 90.6% (floor 90 — the margin is thin because increments 0 and 1 added
+  binary wiring that unit tests do not reach), `task test:integration` green on PostgreSQL 18,
   `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
   `task qemu:verify` green — all of that is one machine's word.
   **CI has never run.** `origin` is a local bare repo, so the GitHub workflows have
@@ -21,7 +22,37 @@ tracks state.
   harnesses that must stay runnable end to end and will not be deployed.
 - **The road to something finished:** `BUILD-INVENTORY.md` — nine increments from here
   to one volume served end to end by real binaries, ordered by dependency, from an
-  eleven-agent audit of what exists versus what does not.
+  eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
+  done**; the next one is the keystone.
+
+## Pick up here
+
+The next increment is **BUILD-INVENTORY increment 2, the keystone**: a per-volume
+runtime in `internal/agent/volume.go` owning `{wal.Log, blockdev.Device, vhost.Server}`,
+started and stopped by diffing the desired state in `loop.go`'s `readDesiredState`
+(which today assigns `l.desired` and is read by nothing but a test accessor).
+
+**Write it as a self-contained type the loop *uses*, never as a method on the loop.**
+That is ADR-0021: spin's runner has to be able to take the same type without the loop,
+its heartbeat, or its Control Plane client. Same work, different shape — free now, a
+refactor later.
+
+Three things are ready and waiting for it, all verified by execution today:
+
+- **A volume exists.** `control-plane -seed-volume -kek-file … -seed-host <uuidv7>`
+  writes the row, the wrapped DEK and the descriptor, so `GetDesiredState` finally
+  answers with something. Run against Postgres 18 and a filesystem store.
+- **The Agent can reach an object store** (`-s3-bucket`/`-object-store-dir`), and it
+  says why when it cannot.
+- **A real Linux guest boots and can issue FLUSH.** `task build:guest` produces the
+  initramfs; `task guest:verify` checks it plus the kernel. What is missing is only
+  attaching a `vhost-user-blk` device backed by `blockdev.Device` over `wal.Log` — which
+  is what the keystone provides.
+
+A useful first command tonight: `task guest:verify` (it will tell you if the kernel
+artefact moved), then read `internal/agent/loop.go:readDesiredState` and
+`integration/vhost/wal_test.go:74-111` — the latter is roughly the first half of the
+keystone, already written out by hand in a test.
 
 ## Maturity, not "done"
 
@@ -44,11 +75,11 @@ still exercised only by tests, and there is no deployment.
 |---|---|---|
 | 01 skeleton (simio + DST + obs) | **model** | Simulable interfaces, the DST harness and the metric catalog all exist and are enforced by lint. Metrics are recorded by the paths that own them; wiring continues with each new path. |
 | 02 guest layout (3 devices + OverlayFS) | **not started** | Needs guest mounts / a VM. Nothing in the durability chain depends on it. Spec below. |
-| 03 vhost-user | **3.1 integrated** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). **FLUSH is not exercised by a guest** (no kernel in the lane); 3.2 reconnection and 3.3 inflight-shmfd are untouched — RISK-10 stays open. |
+| 03 vhost-user | **3.1 integrated** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). A **Linux** guest now boots the lane too (`task build:guest`) and is ready to issue FLUSH — it just has no device to issue it against until the keystone lands. 3.2 reconnection and 3.3 inflight-shmfd untouched; RISK-10 open. |
 | 04 WAL/CoW format | **write path integrated**, rest model | A guest's WRITE lands as a replayable WAL record with **0 PUTs** (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims (`WAL-SEGMENTS-SPEC.md`). FLUSH / uploader / checkpoint are model-only. Format review still pending (human-review zone). |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
 | 06 remote WAL (batching, idempotent PUT, summary) | **model** | No guest has ever driven a PUT. |
-| 07 Control Plane + leases + fencing | **model** | Fail-closed lease, resumable promotion, term guards. |
+| 07 Control Plane + leases + fencing | **model**, provisioning integrated | Fail-closed lease, resumable promotion, term guards. **A volume can now be created** (`controlplane.Provisioner`, `control-plane -seed-volume`): row + wrapped DEK + descriptor, verified against Postgres 18. |
 | 08 recovery (S3 authority) + rebuild-metadata | **model** | Objects are validated before they count as durable; the rebuild includes the snapshot catalog. |
 | 09 snapshots + clone + resize | **partial model** | Sealing is synchronous and no chain link is persisted (DEV-0007). |
 | 10 objectization + checkpoints + GC + I/O classes | **partial model** | The GC marks reversibly; there are still no segment objects (DEV-0007). |
@@ -70,6 +101,13 @@ from that audit.
 
 Three deviations, one gap, and one latent correctness hole found by the 2026-07-26
 audit. The build order for all of it is `BUILD-INVENTORY.md`.
+
+**Landed 2026-07-27** (increments 0 and 1, plus the guest lane): the object store is
+reachable from both binaries and signs its requests — it never did, `s3.New` resolves no
+credential chain, so every request had been going out unsigned; a bad `-host-id` fails on
+the flag instead of writing zero rows forever; a failing reconciliation cycle now says so
+with its backoff; a volume can be provisioned; and a Linux guest boots the lane. See
+`BUILD-INVENTORY.md` for what each increment covered.
 
 ## The hole: truncation makes a restart serve zeros
 
@@ -93,10 +131,19 @@ ADR-0018's definition of done is one volume, one host, a real QEMU guest running
 has never been driven by a guest, and two blockers stand in front of it — both separable,
 neither deep:
 
-1. **No guest in the lane can emit a FLUSH.** SeaBIOS's INT 13h has no flush verb, and
-   `-kernel` direct boot is unavailable: `task build:qemu` extracts no
-   `linuxboot_dma.bin`, and no kernel image is pinned. Fix: a Taskfile change plus a
-   kernel pinned by digest, the way RustFS already is.
+1. ~~No guest in the lane can emit a FLUSH~~ **cleared 2026-07-27** (`e8bbdab`,
+   `cef9881`). A real Linux guest boots the lane in ~1.1 s under TCG, runs a static Go
+   `/init`, and reports a verdict before powering itself off. `task build:guest` builds
+   the initramfs; `task guest:verify` checks it and the kernel.
+   **The blocker was never the firmware.** The audit said `-kernel` was impossible
+   because the extract stage omits `linuxboot_dma.bin`; it does, and it does not matter —
+   spinbox's kernel is an ELF with Xen PVH notes (`CONFIG_PVH=y`) and QEMU enters it
+   through `pvh.bin`, which was being extracted all along. Proven by booting with the
+   blob deleted. The real reason was simply that no kernel image existed.
+   **What is left is the other side of the socket:** attaching a `vhost-user-blk` device
+   backed by `blockdev.Device` over `wal.Log` — which the keystone provides. The guest
+   currently fails with `GUESTINIT-FAIL opening /dev/vda: no such file or directory`,
+   which is the init working as designed.
 2. ~~`wal.Log` has no mutex~~ **cleared 2026-07-26** (`7afff77`). `Log` grew its own
    lock rather than the Agent being declared its single owner: `Log` is what owns the
    invariants, so that is where the guard belongs. Two mutexes — `mu` for state, held
@@ -229,5 +276,15 @@ Device features on `/dev/vdb`: `VIRTIO_BLK_F_FLUSH`, `VIRTIO_BLK_F_DISCARD`,
   lapsed lease, a backpressure bound and a full device have different remedies.
 - Do not re-add spinbox's `CONFIG_CXL=n` QEMU debloat (it breaks the 11.0.2 link); bump
   `QEMU_CONFIG_REV` when configure flags change.
+- **The guest kernel is spinbox's, and it is an ELF with Xen PVH notes — not a bzImage.**
+  QEMU enters it through `pvh.bin`. Do not go looking for `linuxboot_dma.bin`: that is
+  the bzImage option ROM, this tree deliberately does not extract it, and a guest boots
+  fine without it. `SPINBOX_KERNEL` in `Taskfile.yml` points at the artefact
+  (`../spinbox/_output/spinbox-kernel-x86_64`); storage never builds a kernel (ADR-0021).
+- **`cd ../spinbox && task build:kernel` exits non-zero on this machine** — it fails
+  writing the BuildKit cache under `/var/lib/spin-stack-buildkit-cache` (permissions) —
+  **but it emits the artefact anyway**. Check for the file before believing the exit code.
+- The guest init writes at **1 MiB**, not offset 0: anything that probes a block device
+  writes to the first sector, so a pattern found at 0 proves nothing.
 - Coverage excludes generated `internal/db`, integration-only `metadata/pg`,
   `simio/real/s3.go`, `testinfra`, `cmd/`, and the `dst` harness.

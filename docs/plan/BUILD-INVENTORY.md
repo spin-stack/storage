@@ -57,7 +57,11 @@ The libraries are not the problem. **Every single gap below is assembly, configu
 
 ---
 
-## Increment 1 — A volume can exist (1 day) — REVIEW ZONE (keys)
+## ~~Increment 1 — A volume can exist~~ **DONE 2026-07-27** (`5953c73`)
+
+> `controlplane.Provisioner` + `control-plane -seed-volume`. Verified against Postgres 18
+> and a filesystem store: row, wrapped DEK that unwraps with its KEK, descriptor. Epoch
+> starts at 1, and the epoch object is **not** written — exactly as the table below warns.
 
 | Piece | Where | Why | Size | RZ |
 |---|---|---|---|---|
@@ -137,7 +141,20 @@ This also unblocks every drain destination and cross-host move.
 
 ---
 
-## Increment 7 — A guest that can issue FLUSH (2 days)
+## ~~Increment 7 — A guest that can issue FLUSH~~ **MOSTLY DONE 2026-07-27** (`e8bbdab`, `cef9881`)
+
+> Pulled forward, because spinbox already builds a kernel and already demonstrates a
+> static Go init (`cmd/vminitd`) — the estimate below assumed both had to be built.
+> `task build:guest` + `task guest:verify` exist and a Linux guest boots the lane in
+> ~1.1 s under TCG, reports a verdict and powers off.
+>
+> **The firmware row below is wrong and was reverted.** `-kernel` never needed
+> `linuxboot_dma.bin`: spinbox's kernel is an ELF with Xen PVH notes and QEMU enters it
+> through `pvh.bin`, which the extract stage already copied. Proven by booting with the
+> blob deleted. The blocker was only ever the missing kernel image.
+>
+> What is left: the timeout row (a TCG kernel boot is slow), and attaching the
+> `vhost-user-blk` device — which is increment 2's job, not this one's.
 
 | Piece | Where | Why | Size | RZ |
 |---|---|---|---|---|
