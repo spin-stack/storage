@@ -77,6 +77,8 @@ func (l *Log) SetOutOfSpace(f OutOfSpaceFunc) {
 	if f == nil {
 		f = DefaultOutOfSpace
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.outOfSpace = f
 }
 
@@ -90,6 +92,12 @@ func (l *Log) SetOutOfSpace(f OutOfSpaceFunc) {
 // ENOSPC never self-fences — handing a volume to another host because a disk filled
 // would turn a local, recoverable condition into a failover.
 func (l *Log) Degraded() Degradation {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.degradedLocked()
+}
+
+func (l *Log) degradedLocked() Degradation {
 	if l.degraded == "" {
 		return DegradedNone
 	}
@@ -109,7 +117,7 @@ func (l *Log) Degraded() Degradation {
 // The gauge is published only on a transition, so a healthy volume pays nothing per
 // WRITE for a value that has not moved.
 func (l *Log) noteAppendResult(err error) {
-	was := l.Degraded()
+	was := l.degradedLocked()
 	switch {
 	case err == nil:
 		l.degraded = DegradedNone
@@ -118,7 +126,7 @@ func (l *Log) noteAppendResult(err error) {
 	}
 	// Any other error leaves the state as it was: a transient fault neither proves
 	// the device is full nor proves it has room.
-	if l.Degraded() != was {
+	if l.degradedLocked() != was {
 		// The append path carries no context — Write is the guest's data path, not
 		// an RPC — so a transition is recorded against a background context.
 		l.recordDegraded(context.Background())
@@ -137,7 +145,7 @@ func (l *Log) recordDegraded(ctx context.Context) {
 		return
 	}
 	full := 0.0
-	if l.Degraded() == DegradedOutOfSpace {
+	if l.degradedLocked() == DegradedOutOfSpace {
 		full = 1
 	}
 	l.rec.Gauge(ctx, "wal_out_of_space", full, obs.String("volume", l.volLabel))

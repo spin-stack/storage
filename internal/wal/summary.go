@@ -33,8 +33,13 @@ func SummaryKey(volumeID [16]byte, epoch uint64) string {
 
 // WriteSummary persists the current summary (last durable sequence + the objects
 // uploaded so far). It overwrites the previous summary (latest wins).
+// The summary is built under the lock and PUT without it, for the reason the durable
+// step gives: mu is never held across an object-store round trip. The snapshot is
+// consistent as of the moment it was taken, which is all "latest wins" needs.
 func (l *Log) WriteSummary(ctx context.Context) error {
+	l.mu.Lock()
 	if l.uploader == nil {
+		l.mu.Unlock()
 		return nil
 	}
 	s := Summary{
@@ -43,11 +48,14 @@ func (l *Log) WriteSummary(ctx context.Context) error {
 		DurableSequence: l.durable,
 		Objects:         append([]SummaryObject(nil), l.uploaded...),
 	}
+	store := l.uploader.store
+	l.mu.Unlock()
+
 	data, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
-	_, err = l.uploader.store.Put(ctx, SummaryKey(l.volumeID, l.epoch), data, objectstore.PutOptions{})
+	_, err = store.Put(ctx, SummaryKey(l.volumeID, l.epoch), data, objectstore.PutOptions{})
 	return err
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/spin-stack/storage/internal/cow"
@@ -76,7 +77,37 @@ type Limits struct {
 // not-yet-objectized extents. It never issues an object-store PUT on a normal
 // WRITE (§5.3, INV-18) — it has no object store at all; durability is a later
 // phase's concern.
+//
+// # Concurrency
+//
+// A Log is safe for concurrent use. It has to be: the guest's virtqueue loop writes
+// and reads while the Agent's reconciliation flushes, checkpoints and truncates, and
+// those are different goroutines. The lock lives here, on the type that owns the
+// invariants, rather than in a rule the Agent has to remember.
+//
+// Two mutexes, and the split is the whole design:
+//
+//   - mu guards every field. It is held only for local work — appends, watermark
+//     arithmetic, the read view, the segment set — and is **never held across an
+//     object-store PUT**. That is not a performance preference: holding it across the
+//     upload would put S3 latency in the guest's WRITE path (§5.3, INV-18) through
+//     the back door, and would stop the Agent reading the watermarks during an S3
+//     stall — exactly when the backlog they report is the RPO that is growing.
+//   - flushMu serializes durable steps (Flush, WriteFUA). Releasing mu around the
+//     upload means two flushes could otherwise read the same pending batches and each
+//     account for having drained them; the pending list is consumed by position, so a
+//     double removal discards records that exist on this host alone. Idempotent PUT
+//     (§14.5) makes the duplicate upload harmless in the store, not the double
+//     removal harmless in the batcher.
+//
+// Lock order is flushMu then mu, never the reverse. A method that takes mu must not
+// call one that takes flushMu.
 type Log struct {
+	// mu guards every field below; flushMu serializes durable steps. See the type
+	// comment for why they are separate and what mu may not be held across.
+	mu      sync.Mutex
+	flushMu sync.Mutex
+
 	segs     *segments
 	clk      clock.Clock
 	volumeID [16]byte
@@ -133,21 +164,37 @@ type Log struct {
 }
 
 // TruncatedUpTo reports the sequence below which local WAL has been reclaimed.
-func (l *Log) TruncatedUpTo() uint64 { return l.truncatedUpTo }
+func (l *Log) TruncatedUpTo() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.truncatedUpTo
+}
 
 // ReclaimedBytes reports the local bytes truncation has given back over this log's
 // life. It is the number ADR-0013's device pressure is measured against, and the one
 // the pre-segment WAL could not produce: it truncated the file only when the
 // checkpoint had reached the very end of the log, so on a volume under continuous
 // write it reclaimed nothing, ever.
-func (l *Log) ReclaimedBytes() int64 { return l.reclaimedBytes }
+func (l *Log) ReclaimedBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reclaimedBytes
+}
 
 // LocalBytes reports what this log occupies on the device right now, across every
 // retained segment.
-func (l *Log) LocalBytes() (int64, error) { return l.segs.bytes() }
+func (l *Log) LocalBytes() (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segs.bytes()
+}
 
 // SegmentNames returns the disk names of the retained segments, oldest first.
-func (l *Log) SegmentNames() []string { return l.segs.names() }
+func (l *Log) SegmentNames() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segs.names()
+}
 
 // TruncateLocal reclaims local WAL up to and including upTo by unlinking the segments
 // whose records are all at or below it. It refuses to truncate above the verified
@@ -160,7 +207,9 @@ func (l *Log) SegmentNames() []string { return l.segs.names() }
 // segments a later truncation removes, where the reverse order would remove data the
 // published point does not yet cover.
 func (l *Log) TruncateLocal(upTo uint64) error {
-	if err := l.orderPolicy().AllowTruncate(upTo, l.Watermarks()); err != nil {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.orderPolicy().AllowTruncate(upTo, l.watermarksLocked()); err != nil {
 		return err
 	}
 	l.truncatedUpTo = upTo
@@ -170,12 +219,18 @@ func (l *Log) TruncateLocal(upTo uint64) error {
 }
 
 // SetDurabilityMode selects the FLUSH/FUA ACK contract (§14.8). Default is remote.
-func (l *Log) SetDurabilityMode(m DurabilityMode) { l.mode = m }
+func (l *Log) SetDurabilityMode(m DurabilityMode) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.mode = m
+}
 
 // SetRecorder wires the §26.2 metrics this log owns: the watermarks, the unflushed
 // backlog, and the self-fencing counter. A nil recorder is a no-op, so the DST
 // harness and unit tests run without an exporter (DEV-0010).
 func (l *Log) SetRecorder(r *obs.Recorder, volumeLabel string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.rec = r
 	l.volLabel = volumeLabel
 }
@@ -213,14 +268,24 @@ func (l *Log) gapAge() time.Duration {
 }
 
 // RemoteGapBytes reports the bytes appended that no verified object covers yet.
-func (l *Log) RemoteGapBytes() int64 { return l.gapBytes }
+func (l *Log) RemoteGapBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.gapBytes
+}
 
 // Fenced reports whether the log has self-fenced (a FLUSH found the lease invalid).
-func (l *Log) Fenced() bool { return l.fenced }
+func (l *Log) Fenced() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fenced
+}
 
 // EnableEncryption binds an Encryption context so subsequent WRITEs seal their
 // payloads (§15). Must be set before the first WRITE.
 func (l *Log) EnableEncryption(e *Encryption) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.enc = e
 	l.alignKeyID()
 }
@@ -243,6 +308,8 @@ func (l *Log) alignKeyID() {
 // writer?" — nil is legal only for `local` durability (§14.8 rule 3), and a remote
 // FLUSH with a nil lease fails closed with ErrNoLease (DEV-0004).
 func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.batcher = b
 	l.uploader = u
 	if lease != nil {
@@ -359,6 +426,8 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	if flags&format.FlagFUA != 0 {
 		return 0, ErrFUAOnWrite
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.write(offset, data, flags)
 }
 
@@ -368,8 +437,14 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 // ACK, in `local` mode it is on the host's stable media. On any failure the record
 // stays in the local WAL — as an un-ACKed FLUSH's records do — and the caller gets
 // the error instead of a completion the guest would trust.
+// The append and the durable step are two critical sections, not one: the durable
+// step uploads, and mu may not be held across a PUT. The FUA record's sequence is
+// captured under the first, so a write that races in between raises `local` without
+// widening what this ACK confirms.
 func (l *Log) WriteFUA(ctx context.Context, offset uint64, data []byte) (uint64, error) {
+	l.mu.Lock()
 	seq, err := l.write(offset, data, format.FlagFUA)
+	l.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
@@ -408,11 +483,15 @@ func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 
 // Discard appends a DISCARD of [offset, offset+length); the range reads as zero.
 func (l *Log) Discard(offset uint64, length uint32) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.appendClear(format.RecordDiscard, offset, length)
 }
 
 // WriteZeroes appends a WRITE_ZEROES of [offset, offset+length); reads as zero.
 func (l *Log) WriteZeroes(offset uint64, length uint32) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.appendClear(format.RecordWriteZeroes, offset, length)
 }
 
@@ -437,15 +516,27 @@ func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (ui
 }
 
 // DiscardedBytes reports the cumulative bytes DISCARDed/zeroed (discarded_bytes_total).
-func (l *Log) DiscardedBytes() int64 { return l.discardedBytes }
+func (l *Log) DiscardedBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.discardedBytes
+}
 
-// Read fills buf from the read view starting at offset (zero where unwritten).
-func (l *Log) Read(offset uint64, buf []byte) { l.view.Read(offset, buf) }
+// Read fills buf from the read view starting at offset (zero where unwritten). It
+// takes the same lock the write path does: the interval map is one structure, and a
+// read racing an Overwrite would see a partly-updated extent, not an older one.
+func (l *Log) Read(offset uint64, buf []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.view.Read(offset, buf)
+}
 
 // Sync makes prior appends durable locally (fdatasync) and clears the unflushed
 // accounting. It does not advance the durable watermark — that requires remote
 // durability via Flush.
 func (l *Log) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if err := l.segs.sync(); err != nil {
 		return err
 	}
@@ -456,7 +547,11 @@ func (l *Log) Sync() error {
 // Close releases the segment this log holds open. It is not a durability step — Sync
 // and Flush are — and it seals nothing: a log that is closed and rebuilt goes through
 // Resume, which reopens the newest segment for append.
-func (l *Log) Close() error { return l.segs.close() }
+func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segs.close()
+}
 
 // Seal makes the newest segment durable and closes it for append; the next record
 // starts a new file. It writes nothing to the segment being sealed — that is what
@@ -466,7 +561,11 @@ func (l *Log) Close() error { return l.segs.close() }
 // The data path seals through AdvancePublished, at the moment reclamation becomes
 // possible, and through the size rotation inside the append path. This exposes the
 // same act on its own so a caller can rotate deliberately.
-func (l *Log) Seal() error { return l.segs.seal() }
+func (l *Log) Seal() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.segs.seal()
+}
 
 // Flush makes a FLUSH/FUA durable and ACKs it, following §14.4. Order: capture
 // target, close the batch, fdatasync, then per durability mode (§14.8):
@@ -482,20 +581,34 @@ func (l *Log) Seal() error { return l.segs.seal() }
 // A failed upload retains the un-uploaded batches for the next Flush and does not
 // advance durable.
 func (l *Log) Flush(ctx context.Context) error {
-	return l.durableStep(ctx, l.local)
+	l.mu.Lock()
+	target := l.local
+	l.mu.Unlock()
+	return l.durableStep(ctx, target)
 }
 
 // durableStep is the §14.4 sequence shared by FLUSH and FUA — they carry the same
 // ACK contract, so they must not have two implementations of it. target is the
 // sequence the ACK would confirm, captured before the batch is closed.
+//
+// It runs under flushMu, so only one durable step is in flight at a time, and it takes
+// mu in short stretches around the upload rather than across it. See the Log type
+// comment: mu held across a PUT would put the object store in the guest's write path
+// and blind the Agent's reporting for the length of an S3 stall.
 func (l *Log) durableStep(ctx context.Context, target uint64) error {
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+
+	l.mu.Lock()
 	if l.fenced {
+		l.mu.Unlock()
 		return ErrSelfFenced
 	}
 	if l.batcher != nil {
 		l.batcher.Flush() // step 2: close current batch
 	}
 	if err := l.segs.sync(); err != nil { // step 3: fdatasync local
+		l.mu.Unlock()
 		return err
 	}
 
@@ -505,6 +618,7 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 		// cover, and it is the RPO an operator reads.
 		l.clearUnflushed()
 		l.recordWatermarks(ctx)
+		l.mu.Unlock()
 		return nil
 	}
 
@@ -512,23 +626,43 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	// durability claim with no backing. Refuse it here rather than let step 6 move
 	// durable_sequence past what S3 can produce (INV-07).
 	if l.batcher == nil || l.uploader == nil {
+		l.mu.Unlock()
 		return ErrNoUploader
 	}
 
-	pending := l.batcher.Pending()
+	// A snapshot, because the list is about to be read without the lock and a
+	// concurrent WRITE may close a further batch onto the end of it. Those extra
+	// batches are not this ACK's business — they are above target — and dropping the
+	// first `done` entries still drops exactly the ones uploaded here.
+	pending := append([]*ClosedBatch(nil), l.batcher.Pending()...)
+	uploader := l.uploader
+	l.mu.Unlock()
+
 	done := 0
 	for _, cb := range pending { // step 4: upload + verify (covering <= target)
-		key, err := l.uploader.Upload(ctx, cb)
+		key, err := uploader.Upload(ctx, cb) // no lock held: this is the network
+		l.mu.Lock()
 		if err != nil {
 			l.batcher.RemoveUploaded(done)
 			l.recordWatermarks(ctx) // a growing gap is what an operator needs here
-			return err              // durable NOT advanced
+			l.mu.Unlock()
+			return err // durable NOT advanced
 		}
 		l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
 		l.closeGap(int64(len(cb.Records)))
+		l.mu.Unlock()
 		done++
 	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.batcher.RemoveUploaded(done)
+
+	// The log is not re-checked for self-fencing here, and that is deliberate: the
+	// only path that sets it while this one holds flushMu is a failed rollback in
+	// appendEncoded, which leaves the tail *above* target unknown. The records this
+	// step uploaded were appended and verified before that, so confirming them is
+	// true. Fencing stops the next durable step, at the top.
 
 	// step 5: verify the lease on the monotonic clock (§12.2, INV-06). If it is not
 	// valid, do NOT advance durable and do NOT ACK — self-fence. In remote mode the
@@ -542,7 +676,7 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 		l.rec.Count(ctx, "self_fenced_total", 1, obs.String("volume", l.volLabel))
 		return ErrSelfFenced
 	}
-	if err := l.AdvanceDurable(target); err != nil { // step 6
+	if err := l.advanceDurableLocked(target); err != nil { // step 6
 		return err
 	}
 	l.clearUnflushed()
@@ -582,20 +716,42 @@ func (l *Log) closeGap(n int64) {
 	}
 }
 
-// Watermarks returns the current watermarks.
+// Watermarks returns the current watermarks. The trio is read under one lock so a
+// caller cannot observe a torn set — published above durable, say — that no single
+// moment of this log ever had (INV-03).
 func (l *Log) Watermarks() Watermarks {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.watermarksLocked()
+}
+
+func (l *Log) watermarksLocked() Watermarks {
 	return Watermarks{Local: l.local, Durable: l.durable, Published: l.published}
 }
 
 // UnflushedBytes reports the bytes appended since the last Sync.
-func (l *Log) UnflushedBytes() int64 { return l.unflushedBytes }
+func (l *Log) UnflushedBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.unflushedBytes
+}
 
 // ViewBytes reports the read-view memory (active_map_bytes proxy for Phase 04).
-func (l *Log) ViewBytes() int { return l.view.Bytes() }
+func (l *Log) ViewBytes() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.view.Bytes()
+}
 
 // AdvanceDurable advances the durable watermark, enforcing durable <= local (§5.6).
 func (l *Log) AdvanceDurable(seq uint64) error {
-	if err := l.orderPolicy().AllowDurable(seq, l.Watermarks()); err != nil {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.advanceDurableLocked(seq)
+}
+
+func (l *Log) advanceDurableLocked(seq uint64) error {
+	if err := l.orderPolicy().AllowDurable(seq, l.watermarksLocked()); err != nil {
 		return err
 	}
 	l.durable = seq
@@ -615,7 +771,9 @@ func (l *Log) AdvanceDurable(seq uint64) error {
 // is already in S3 — and AllowPublished refuses to move the watermark backwards, so
 // pretending the publication had not happened is not available even if it were right.
 func (l *Log) AdvancePublished(seq uint64) error {
-	if err := l.orderPolicy().AllowPublished(seq, l.Watermarks()); err != nil {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.orderPolicy().AllowPublished(seq, l.watermarksLocked()); err != nil {
 		return err
 	}
 	l.published = seq

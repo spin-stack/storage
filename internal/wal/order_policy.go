@@ -80,6 +80,8 @@ func (l *Log) SetOrderPolicy(p OrderPolicy) {
 	if p == nil {
 		p = StrictOrder{}
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.order = p
 }
 
