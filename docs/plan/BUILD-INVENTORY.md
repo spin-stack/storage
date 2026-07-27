@@ -34,7 +34,14 @@ The libraries are not the problem. **Every single gap below is assembly, configu
 
 ---
 
-## Increment 0 — Make the binaries runnable and debuggable (0.5–1 day)
+## ~~Increment 0 — Make the binaries runnable and debuggable~~ **DONE 2026-07-26** (`5bf31d4`)
+
+> All seven items landed. Two notes for whoever reads the table below: bucket creation
+> is behind `-s3-create-bucket`, **off by default**, because silent creation on a
+> typo'd name invents an empty deployment and reports success; and the versioning
+> check still fails closed on every bucket it cannot verify — the audit called that
+> classification wrong and it is not, `TestRequireVersioning` pins it on purpose. Only
+> the error's wording changed.
 
 | Piece | Where | Why the slice fails without it | Size | Review zone |
 |---|---|---|---|---|
