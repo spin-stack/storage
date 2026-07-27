@@ -179,7 +179,7 @@ type fakeDevice struct {
 func (d fakeDevice) Usage(context.Context) (disk.Usage, error) { return d.usage, d.err }
 
 const (
-	testHost     = "host-a"
+	testHost     = "0197b5c2-8f00-7a1b-9c3d-4e5f60718293"
 	testVersion  = "0.1.0-test"
 	testInterval = 5 * time.Second
 	testBackoff  = time.Second

@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -78,13 +79,37 @@ func requireVersioning(ctx context.Context, api bucketVersioningAPI, bucket stri
 	out, err := api.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
 	if err != nil {
 		// Cannot establish it (missing bucket, no permission, backend error) is the
-		// same answer as "not versioned": we may not place a delete marker here.
-		return fmt.Errorf("%w: %s: %w", ErrBucketNotVersioned, bucket, err)
+		// same answer as "not versioned": we may not place a delete marker here. The
+		// verdict is the same; the sentence is not. This runs inside NewS3Store, so
+		// it is the first error a misconfigured deployment sees, and leading with
+		// "versioning is not Enabled" when the truth is "your credentials were
+		// refused" costs an operator the hour it takes to stop reading bucket
+		// policies. Lead with what happened, keep the sentinel for the caller.
+		return fmt.Errorf("could not determine versioning for %s (refusing it: %w): %w", bucket, ErrBucketNotVersioned, err)
 	}
 	if out.Status != types.BucketVersioningStatusEnabled {
-		return fmt.Errorf("%w: %s has status %q", ErrBucketNotVersioned, bucket, out.Status)
+		return fmt.Errorf("%w: %s has versioning status %q", ErrBucketNotVersioned, bucket, out.Status)
 	}
 	return nil
+}
+
+// resolveCredentials answers what will sign this store's requests.
+//
+// Static credentials win when configured. Otherwise the SDK's default chain is loaded
+// explicitly — which is the part that was missing: s3.New takes an Options and resolves
+// nothing on its own, so an Options with no Credentials provider produces a client that
+// signs nothing and sends every request unsigned. Both realistic deployments go through
+// the chain (an instance role in AWS, AWS_* in the environment for a local backend), so
+// this makes S3Config's documented behaviour true rather than refusing the case.
+func resolveCredentials(ctx context.Context, cfg S3Config) (aws.CredentialsProvider, error) {
+	if cfg.AccessKey != "" || cfg.SecretKey != "" {
+		return credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""), nil
+	}
+	loaded, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("simio/real: loading the default AWS credential chain: %w", err)
+	}
+	return loaded.Credentials, nil
 }
 
 // NewS3Store builds the client from cfg and refuses a bucket the GC could not undo a
@@ -93,20 +118,18 @@ func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("simio/real: S3Config.Bucket is required")
 	}
-	region := cfg.Region
-	if region == "" {
-		region = "us-east-1"
-	}
 	opts := s3.Options{
-		Region:       region,
+		Region:       regionOrDefault(cfg.Region),
 		UsePathStyle: cfg.UsePathStyle || cfg.Endpoint != "",
 	}
 	if cfg.Endpoint != "" {
 		opts.BaseEndpoint = aws.String(cfg.Endpoint)
 	}
-	if cfg.AccessKey != "" || cfg.SecretKey != "" {
-		opts.Credentials = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
+	creds, err := resolveCredentials(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
+	opts.Credentials = creds
 	if cfg.ChecksumWhenRequired {
 		opts.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		opts.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired

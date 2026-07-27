@@ -24,6 +24,7 @@ import (
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/internal/storecfg"
 )
 
 // version is the build identity the Agent reports. Overridden at link time with
@@ -43,7 +44,7 @@ func main() {
 
 func run() error {
 	var (
-		hostID       = flag.String("host-id", "", "fleet identity of this host (required)")
+		hostID       = flag.String("host-id", "", "fleet identity of this host: a UUIDv7 (required; mint one with `uuidgen` only if it is v7)")
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
 		dataDir      = flag.String("data-dir", "", "directory holding this Agent's WAL and checkpoints (required)")
 		interval     = flag.Duration("heartbeat-interval", 5*time.Second, "reconciliation cadence")
@@ -51,6 +52,8 @@ func run() error {
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
 	)
+	var storeFlags storecfg.Flags
+	storeFlags.Register(flag.CommandLine)
 	flag.Parse()
 
 	switch {
@@ -71,10 +74,30 @@ func run() error {
 		LeaseTTL:          *leaseTTL,
 	}
 
+	// Validated before anything is opened: a typo'd flag should fail on the flag, not
+	// behind a connection error from whichever of the disk and the object store
+	// happened to be tried first.
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	disk, err := real.NewDisk(*dataDir)
 	if err != nil {
 		return fmt.Errorf("opening the data directory: %w", err)
 	}
+
+	// The object store is what FLUSH makes a write durable in (§14.4) and what a
+	// restart recovers from (§5.8). The Agent has never had one — which is why it
+	// could heartbeat and never upload a byte — so it is opened here, at startup,
+	// rather than discovered to be missing on the first FLUSH.
+	store, err := storeFlags.Open(ctx)
+	if err != nil {
+		return err
+	}
+	_ = store // the per-volume data path that uses it is the next increment
 
 	loop, err := agent.New(cfg, agent.Deps{
 		Clock: real.NewClock(),
@@ -95,9 +118,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	slog.Info("volume-agent starting",
 		"host_id", cfg.HostID, "version", version, "control_plane", *cpURL,

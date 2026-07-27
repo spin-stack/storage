@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,8 +30,7 @@ import (
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/cpserver"
 	"github.com/spin-stack/storage/internal/metadata/pg"
-	"github.com/spin-stack/storage/internal/simio/objectstore"
-	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/internal/storecfg"
 )
 
 // version is the build identity. Overridden at link time with -ldflags.
@@ -53,13 +53,11 @@ func run() error {
 
 		// The Elector needs an object store to witness the term (ADR-0011). Either
 		// a bucket or, for a single-machine dev run, a directory.
-		s3Bucket   = flag.String("s3-bucket", "", "bucket holding this deployment's objects")
-		s3Endpoint = flag.String("s3-endpoint", "", "S3-compatible endpoint (empty means AWS)")
-		s3Region   = flag.String("s3-region", "", "region (required by SigV4 even where ignored)")
-		storeDir   = flag.String("object-store-dir", "", "filesystem object store, for a dev run without S3")
 
 		shutdownGrace = flag.Duration("shutdown-grace", 10*time.Second, "how long to let in-flight requests finish")
 	)
+	var storeFlags storecfg.Flags
+	storeFlags.Register(flag.CommandLine)
 	flag.Parse()
 
 	switch {
@@ -67,13 +65,9 @@ func run() error {
 		return errors.New("-holder-id is required")
 	case *databaseDSN == "":
 		return errors.New("-database-url (or $DATABASE_URL) is required")
-	case *s3Bucket == "" && *storeDir == "":
-		// Fail closed: without a witness the Elector cannot prove a term has never
-		// been issued, and issuing one anyway is the failure ADR-0011 exists for.
-		return errors.New("one of -s3-bucket or -object-store-dir is required: a term needs a witness (ADR-0011)")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	pool, err := pgxpool.New(ctx, *databaseDSN)
@@ -82,7 +76,10 @@ func run() error {
 	}
 	defer pool.Close()
 
-	store, err := openObjectStore(ctx, *s3Bucket, *s3Endpoint, *s3Region, *storeDir)
+	// Fail closed on a missing store: without a witness outside PostgreSQL the
+	// Elector cannot prove a term has never been issued, and issuing one anyway is
+	// the failure ADR-0011 exists for. storeFlags.Open refuses the empty case.
+	store, err := storeFlags.Open(ctx)
 	if err != nil {
 		return err
 	}
@@ -122,26 +119,4 @@ func run() error {
 		slog.Info("control-plane stopped")
 		return nil
 	}
-}
-
-// openObjectStore builds the term witness: S3 when a bucket is named, a directory
-// otherwise. Both come from internal/simio/real — the only place a real backend is
-// constructed (INV-01).
-func openObjectStore(ctx context.Context, bucket, endpoint, region, dir string) (objectstore.Store, error) {
-	if bucket == "" {
-		store, err := real.NewObjectStore(dir)
-		if err != nil {
-			return nil, fmt.Errorf("opening the filesystem object store %q: %w", dir, err)
-		}
-		return store, nil
-	}
-	store, err := real.NewS3Store(ctx, real.S3Config{
-		Bucket:   bucket,
-		Endpoint: endpoint,
-		Region:   region,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("opening the S3 object store %q: %w", bucket, err)
-	}
-	return store, nil
 }

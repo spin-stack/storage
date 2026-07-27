@@ -104,7 +104,7 @@ func TestVolumeSetIsOrderedAndCopied(t *testing.T) {
 // nonsense the Control Plane will act on.
 func TestConfigValidate(t *testing.T) {
 	valid := agent.Config{
-		HostID:            "host-a",
+		HostID:            testHost,
 		AgentVersion:      "0.1.0",
 		MaxFormatVersion:  1,
 		HeartbeatInterval: 5 * time.Second,

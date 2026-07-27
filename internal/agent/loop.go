@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -97,6 +98,21 @@ func (l *Loop) Run(ctx context.Context) error {
 			return ctxErr
 		}
 		delay = l.nextDelay(err)
+		if err != nil {
+			// The backoff above keeps the Agent trying, which is right; saying nothing
+			// is not. An Agent that can never succeed — wrong Control Plane URL, a host
+			// id the database refuses, expired credentials — otherwise behaves exactly
+			// like a healthy one from the outside: it logs a line at startup and then
+			// heartbeats into nothing forever. Every increment on top of this loop is
+			// debugged through it.
+			//
+			// One line per failed cycle, not per retry, and it carries the delay: "it
+			// failed" without "and I retry in 1s" reads as fatal to whoever is watching.
+			slog.Warn("reconciliation cycle failed",
+				"error", err,
+				"retry_in", delay,
+				"host_id", l.cfg.HostID)
+		}
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
@@ -161,6 +162,13 @@ func (c Config) Validate() error {
 	switch {
 	case c.HostID == "":
 		return errors.New("agent: host id is required")
+	case !isHostID(c.HostID):
+		// hosts.host_id is the `uuidv7` domain (INV-22) and the pg adapter parses the
+		// string before it reaches SQL, so anything else writes zero rows on every
+		// heartbeat — forever, since Run retries. Refusing it here is the difference
+		// between a startup error and a process that looks alive while the fleet never
+		// learns the host exists. Use internal/ids to mint one.
+		return fmt.Errorf("agent: host id %q is not a UUIDv7 (INV-22): every heartbeat would match no row", c.HostID)
 	case c.AgentVersion == "":
 		return errors.New("agent: agent version is required")
 	case c.MaxFormatVersion <= 0:
@@ -179,4 +187,15 @@ func (c Config) Validate() error {
 		return errors.New("agent: lease TTL must exceed the heartbeat interval")
 	}
 	return nil
+}
+
+// isHostID reports whether s is exactly a UUIDv7 in canonical form. It is deliberately
+// stricter than ids.Parse, which accepts the braced and urn: spellings and would let a
+// value through that the database's own comparison then misses.
+func isHostID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	u, err := ids.Parse(s)
+	return err == nil && ids.IsV7(u) && u.String() == s
 }
