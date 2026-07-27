@@ -7,7 +7,7 @@ tracks state.
 - **Date:** 2026-07-26 · **Branch:** everything is on `main`, pushed to `origin`
   (`/home/aledbf/spin-storage.git`, bare).
 - **Gate:** `task ci:full` green — the merge gate, Docker lanes included (`task ci` is
-  the fast local loop). `task cover` 92.1% (floor 90). `task test:integration` green on
+  the fast local loop). `task cover` 92.2% (floor 90). `task test:integration` green on
   PostgreSQL 18, `task backend:conformance` green against the pinned RustFS,
   `task build:qemu` + `task qemu:verify` green.
 
@@ -49,14 +49,14 @@ INV-19 is pending and becomes binding the moment two Agents can run different fo
 See `INVARIANTS.md`.
 
 **Test backlog:** the 2026-07-25 six-way audit found 78 gaps (7 critical); **all 78 are
-closed**, each naming the commit. The two items still open are below and neither came
+closed**, each naming the commit. The one item still open is below and did not come
 from that audit.
 
 ---
 
 # Open work
 
-Three deviations and two gaps. Nothing else is outstanding.
+Three deviations and one gap. Nothing else is outstanding.
 
 ## DEV-0007 — the spine's second half *(the only thing on the critical path)*
 
@@ -69,7 +69,15 @@ neither deep:
    `-kernel` direct boot is unavailable: `task build:qemu` extracts no
    `linuxboot_dma.bin`, and no kernel image is pinned. Fix: a Taskfile change plus a
    kernel pinned by digest, the way RustFS already is.
-2. **`wal.Log` has no mutex** (gap 1 below) — a prerequisite, not a follow-up.
+2. ~~`wal.Log` has no mutex~~ **cleared 2026-07-26** (`7afff77`). `Log` grew its own
+   lock rather than the Agent being declared its single owner: `Log` is what owns the
+   invariants, so that is where the guard belongs. Two mutexes — `mu` for state, held
+   only for local work and **never across an object-store PUT**, and `flushMu`
+   serializing durable steps. The constraint on `mu` is load-bearing: holding it across
+   the upload would put S3 latency in the guest's WRITE path (§5.3, INV-18) by the back
+   door and blind the Agent's reporting for the length of an S3 stall — when the gap
+   those accessors report is the RPO that is growing. Both halves are pinned by tests
+   proven against that planted bug.
 
 Also part of DEV-0007, and untouched: snapshot sealing is synchronous rather than a
 background lifecycle, clone persists no parent/read-chain link, objectization publishes
@@ -106,26 +114,7 @@ that refuses I/O to a guest still attached is the worse failure. Decide before i
 3.2, since a reconnecting front-end is the first caller that can observe a fenced log
 across a gap.
 
-## Gap 1 — `wal.Log` has no mutex, and the Agent is about to call it from a second goroutine
-
-`Log` carries no lock: `Write`, `Flush`, `AdvanceDurable`, `AdvancePublished` and
-`TruncateLocal` all mutate the watermarks, the segment set and the read view unguarded.
-Nothing has caught it because nothing has been concurrent — `vhost.queueLoop` is one
-goroutine per virtqueue and the device offers one queue, so every `Backend` call is
-serialized by construction.
-
-**The sequence that breaks it:** the guest's queue loop is inside `Log.Write` appending to
-the tail segment while the Agent's reconciliation runs `checkpoint.Create` →
-`AdvancePublished` → `TruncateLocal` on the same `Log`, unlinking segments under an
-append that is extending the newest one. Torn watermarks are the mild outcome.
-
-**Needs a decision recorded with the fix:** either `Log` grows its own lock (it owns the
-invariant, and the rule is to guard shared state where it lives) or the Agent is declared
-the single owner and serializes every caller. **The DST harness is single-goroutine by
-design and will not catch either way** — the proof has to be a race-detector test with a
-concurrent checkpoint.
-
-## Gap 2 — a GC sweep cannot see an anchor its listing has not caught up to
+## Gap 1 — a GC sweep cannot see an anchor its listing has not caught up to
 
 Narrowed, not closed, by ADR-0012: the epoch ceiling no longer licenses destruction, and
 the reproduction that decided it — a hole in the listing *below* a durable point marks
