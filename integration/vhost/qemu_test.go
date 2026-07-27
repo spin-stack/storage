@@ -181,9 +181,12 @@ func (tr *trace) saw(r vhost.Request) bool {
 	return false
 }
 
-// lane is one backend serving one QEMU.
+// lane is one backend serving one QEMU. dev is a vhost.Backend and not a concrete
+// type because the point of the seam is that the front-end cannot tell which one it
+// is served from: the raw file below, and the WAL-backed device in wal_test.go, boot
+// the same guest through the same socket.
 type lane struct {
-	dev   *hostio.RawFile
+	dev   vhost.Backend
 	srv   *vhost.Server
 	trace *trace
 	sock  string
@@ -191,35 +194,23 @@ type lane struct {
 	serve chan error
 }
 
-// start seeds a raw device file, serves it on a Unix socket, and returns before
-// any front-end has connected.
-func start(t *testing.T, ctx context.Context, seed func([]byte)) *lane {
+// laneDir returns a short private directory. sun_path is 108 bytes and t.TempDir()
+// spends most of them on the test's name.
+func laneDir(t *testing.T) string {
 	t.Helper()
-
-	// A short directory: sun_path is 108 bytes and t.TempDir() spends most of
-	// them on the test's name.
 	dir, err := os.MkdirTemp("", "vhostlane") //nolint:usetesting // see above
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
-	path := filepath.Join(dir, "device.raw")
-	dev, err := hostio.CreateRawFile(path, deviceSize)
-	if err != nil {
-		t.Fatalf("CreateRawFile: %v", err)
-	}
-	t.Cleanup(func() { _ = dev.Close() })
-
-	img := make([]byte, deviceSize)
-	seed(img)
-	if _, err := dev.WriteAt(img, 0); err != nil {
-		t.Fatalf("seeding the device: %v", err)
-	}
-	if err := dev.Flush(ctx); err != nil {
-		t.Fatalf("flushing the seed: %v", err)
-	}
-
+// serveLane puts b on a Unix socket in dir and returns before any front-end has
+// connected. It is everything about a lane that does not depend on which Backend is
+// underneath, which is the whole of the vhost-user side.
+func serveLane(t *testing.T, ctx context.Context, dir string, b vhost.Backend) *lane {
+	t.Helper()
 	sock := filepath.Join(dir, "vhost.sock")
 	ln, err := hostio.Listen(sock)
 	if err != nil {
@@ -228,7 +219,7 @@ func start(t *testing.T, ctx context.Context, seed func([]byte)) *lane {
 
 	tr := newTrace()
 	srv, err := vhost.NewServer(ln, vhost.Config{
-		Backend:   dev,
+		Backend:   b,
 		Mapper:    hostio.NewMapper(),
 		Serial:    "spin-vhost-0",
 		OnRequest: tr.onRequest,
@@ -242,9 +233,31 @@ func start(t *testing.T, ctx context.Context, seed func([]byte)) *lane {
 	tr.ready = func() bool { d := srv.Device(); return d != nil && d.Ready() }
 	tr.mu.Unlock()
 
-	l := &lane{dev: dev, srv: srv, trace: tr, sock: sock, path: path, serve: make(chan error, 1)}
+	l := &lane{dev: b, srv: srv, trace: tr, sock: sock, path: dir, serve: make(chan error, 1)}
 	go func() { l.serve <- srv.Serve(ctx) }()
 	return l
+}
+
+// start seeds a raw device file and serves it.
+func start(t *testing.T, ctx context.Context, seed func([]byte)) *lane {
+	t.Helper()
+	dir := laneDir(t)
+
+	dev, err := hostio.CreateRawFile(filepath.Join(dir, "device.raw"), deviceSize)
+	if err != nil {
+		t.Fatalf("CreateRawFile: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Close() })
+
+	img := make([]byte, deviceSize)
+	seed(img)
+	if _, err := dev.WriteAt(img, 0); err != nil {
+		t.Fatalf("seeding the device: %v", err)
+	}
+	if err := dev.Flush(ctx); err != nil {
+		t.Fatalf("flushing the seed: %v", err)
+	}
+	return serveLane(t, ctx, dir, dev)
 }
 
 // runQEMU boots the guest against the lane's socket and returns QEMU's exit

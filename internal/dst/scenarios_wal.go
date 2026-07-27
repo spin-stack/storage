@@ -4,10 +4,15 @@ package dst
 // for why the list is split by area.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/spin-stack/storage/internal/blockdev"
+	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
 )
@@ -15,10 +20,143 @@ import (
 func walScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "wal-segments-survive-a-crash-at-every-boundary", Run: walSegmentCrashBoundaries(false)},
+		{Name: "guest-device-acks-durability-only-on-flush", Run: scenarioGuestDeviceDurability},
 	}
 }
 
 func walCheckers() []Checker { return nil }
+
+// scenarioGuestDeviceDurability drives the guest-facing seam — blockdev.Device behind
+// vhost.Backend — rather than wal.Log directly, and asserts the three rules that seam
+// is responsible for:
+//
+//   - INV-18: a WRITE completes on local persistence and issues no PUT. Everything
+//     above it in the tree tests this against wal.Log; here it is tested against the
+//     object a guest's virtqueue actually reaches, which is where a helpful "sync on
+//     every write" would be added.
+//   - Read-your-writes without a FLUSH: the device serves reads from the WAL's read
+//     view, so a guest never sees a hole where it just wrote.
+//   - INV-06/INV-07: FLUSH is the ACK path. With a valid lease it ACKs only after the
+//     covering objects are verified in S3; with an expired one it fails, durable does
+//     not move, and the guest is told so.
+//
+// The lease here is a real lease.Manager on the simulated monotonic clock, not
+// alwaysValidLease: the scenario's second half is precisely the case where it stops
+// being valid.
+func scenarioGuestDeviceDurability(s *Sim) error {
+	ctx := context.Background()
+	var vol [16]byte
+	vol[6], vol[8] = 0x70, 0x80
+	vol[15] = 0xbd
+	const (
+		root     = "wal-guest-device"
+		capacity = 1 << 20
+		sector   = 512
+		ttl      = 10 * time.Second
+	)
+
+	lm := lease.NewManager(s.Clock, ttl)
+	lm.Grant()
+	l := wal.NewLog(s.Disk, root, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 5), lm)
+	dev, err := blockdev.New(l, capacity)
+	if err != nil {
+		return err
+	}
+	// The scenario talks to the interface, not to the implementation: what is under
+	// test is what QEMU's virtqueue can reach.
+	var guest vhost.Backend = dev
+
+	// (1) The write path. Sector count and contents are seed-driven; that no PUT
+	// happens is not.
+	n := 3 + s.Rand.Intn(6)
+	written := map[int64][]byte{}
+	for i := range n {
+		off := int64(s.Rand.Intn(64)) * sector
+		payload := make([]byte, sector)
+		for j := range payload {
+			payload[j] = byte(i + 1)
+		}
+		if _, err := guest.WriteAt(payload, off); err != nil {
+			return fmt.Errorf("guest WRITE %d at %d: %w", i, off, err)
+		}
+		written[off] = payload
+		emitWatermarks(s, l)
+	}
+	objs, err := s.Store.List(ctx, "")
+	if err != nil {
+		return err
+	}
+	if len(objs) != 0 {
+		return fmt.Errorf("the guest write path issued %d PUT(s); a normal WRITE must not PUT (§5.3, INV-18)", len(objs))
+	}
+	if w := l.Watermarks(); w.Durable != 0 {
+		return fmt.Errorf("a plain WRITE advanced durable to %d", w.Durable)
+	}
+
+	// (2) Read-your-writes, with nothing flushed.
+	for off, want := range written {
+		got := make([]byte, len(want))
+		if _, err := guest.ReadAt(got, off); err != nil {
+			return fmt.Errorf("guest READ at %d: %w", off, err)
+		}
+		if !bytes.Equal(got, want) {
+			return fmt.Errorf("read-your-writes at %d returned %x…, want %x…", off, got[:4], want[:4])
+		}
+	}
+	s.Notef("guest wrote %d sectors through the WAL, 0 PUTs, read-your-writes intact", n)
+
+	// (3) FLUSH with a valid lease: the ACK path runs and durable catches up to what
+	// S3 now holds.
+	if err := guest.Flush(ctx); err != nil {
+		return fmt.Errorf("FLUSH under a valid lease: %w", err)
+	}
+	emitWatermarks(s, l)
+	w := l.Watermarks()
+	if w.Durable != w.Local {
+		return fmt.Errorf("after a successful FLUSH durable=%d, local=%d", w.Durable, w.Local)
+	}
+	objs, err = s.Store.List(ctx, "")
+	if err != nil {
+		return err
+	}
+	if len(objs) == 0 {
+		return errors.New("FLUSH ACKed with nothing in the object store (INV-07)")
+	}
+	acked := w.Durable
+
+	// (4) The lease lapses. The next guest WRITE still lands locally — fencing is
+	// about ACKs, not about the local append — but the FLUSH that would ACK it must
+	// fail, and durable must stay exactly where the last valid ACK left it.
+	if _, err := guest.WriteAt(make([]byte, sector), 0); err != nil {
+		return fmt.Errorf("WRITE before the lease lapsed: %w", err)
+	}
+	s.Tick(ttl + time.Second)
+	s.Emit(Event{Kind: EventFault, Msg: "the lease lapsed on the monotonic clock"})
+
+	err = guest.Flush(ctx)
+	if err == nil {
+		return errors.New("FLUSH ACKed after the lease lapsed (INV-06)")
+	}
+	if !errors.Is(err, wal.ErrSelfFenced) {
+		return fmt.Errorf("FLUSH after the lease lapsed: %w, want ErrSelfFenced", err)
+	}
+	if !l.Fenced() {
+		return errors.New("the log did not self-fence")
+	}
+	emitWatermarks(s, l)
+	if got := l.Watermarks().Durable; got != acked {
+		return fmt.Errorf("durable moved from %d to %d on a FLUSH that was never ACKed", acked, got)
+	}
+	// Fencing is not transient: every later FLUSH fails at once. A guest can act on
+	// an error; it cannot act on a device that stops answering.
+	if err := guest.Flush(ctx); !errors.Is(err, wal.ErrSelfFenced) {
+		return fmt.Errorf("a second FLUSH on a fenced device: %w, want ErrSelfFenced", err)
+	}
+	s.Notef("lease lapsed: FLUSH refused, durable held at %d, device still answering", acked)
+	return l.Close()
+}
 
 // reclaimAnything is StrictOrder with INV-13's truncation floor removed and the other
 // two rules untouched — one rule missing, not a Log with no rules at all, so the

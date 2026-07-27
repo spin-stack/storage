@@ -13,9 +13,10 @@ import (
 //
 // It is small on purpose, and it is defined here because here is where it is
 // consumed. virtio-blk needs exactly these four things, so this is the whole
-// seam between the transport and the storage engine: Increment 3.1 satisfies it
-// with a raw device, and Phase 04's wal.Log satisfies it later without the
-// protocol code learning anything about WALs, epochs or object stores.
+// seam between the transport and the storage engine: Increment 3.1 satisfied it
+// with a raw device, and internal/blockdev now satisfies it over wal.Log
+// without the protocol code learning anything about WALs, epochs or object
+// stores — and without wal learning anything about descriptor chains.
 //
 // The contract is deliberately stricter than io.ReaderAt/io.WriterAt: a short
 // read or short write is an error, never a partial success. A guest that is told
@@ -29,7 +30,9 @@ type Backend interface {
 	WriteAt(p []byte, off int64) (int, error)
 	// Flush makes every previously completed WriteAt durable. This is the
 	// guest's VIRTIO_BLK_T_FLUSH, and it is the request the §14.4 ACK rules
-	// hang off once the WAL is behind this interface.
+	// hang off now that the WAL is behind this interface: an implementation
+	// that cannot establish durability must return an error, because the only
+	// alternative is telling the guest its data is safe when it is not.
 	Flush(ctx context.Context) error
 	// Size is the capacity in bytes. The guest is told Size/512 sectors, so a
 	// capacity that is not a whole number of sectors is truncated, never
