@@ -51,14 +51,30 @@ func has(mask uint64, n uint) bool { return mask&bit(n) != 0 }
 //   - VIRTIO_BLK_F_MQ is not offered. §30.3 is explicit about a single queue at
 //     depth 128; a queue count the backend does not serve is a lie the guest
 //     acts on.
-//   - VIRTIO_BLK_F_DISCARD / WRITE_ZEROES are not offered *yet*: wal.Log has
-//     Discard and WriteZeroes, so they arrive with the WAL wiring, and offering
-//     them over a raw device that would emulate them with a write of zeros
-//     would make the guest pay for a trim that reclaims nothing.
+//   - VIRTIO_BLK_F_DISCARD / WRITE_ZEROES are still not offered, and the WAL
+//     wiring (internal/blockdev) did not change that. wal.Log has Discard and
+//     WriteZeroes, so the storage half exists — but each bit is a wire feature
+//     with its own request payload (struct virtio_blk_discard_write_zeroes),
+//     its own configuration-space fields, and, for WRITE_ZEROES, a may_unmap
+//     flag whose two readings differ in whether the range is reclaimed.
+//     Advertising a bit whose semantics are not implemented and tested is worse
+//     than not advertising it; they arrive with their negotiation and their
+//     tests, together, or not at all.
+//   - VIRTIO_BLK_F_CONFIG_WCE is not offered, and that is a durability
+//     decision, not an omission. It lets the guest switch the device to
+//     write-through, after which Linux stops sending FLUSH because it believes
+//     every WRITE is already durable. Under §14.4 it would not be: durability
+//     comes from the FLUSH that is no longer arriving. Without the bit the
+//     cache stays write-back, which is what §2 says we advertise and what the
+//     guest is told the truth about.
 //
 // VIRTIO_BLK_F_FLUSH is offered, and it is the important one: without it the
 // guest has no way to ask for durability, and every FLUSH-based ACK rule in
-// §14.4 has no counterpart on the wire.
+// §14.4 has no counterpart on the wire. It is also how a guest asks for FUA:
+// virtio-blk has no FUA bit at all — `struct virtio_blk_outhdr` is type,
+// ioprio, sector, and the type space defines no such flag — so the Linux block
+// layer decomposes REQ_FUA into the WRITE followed by a FLUSH, which lands on
+// the same ACK contract wal.Log.WriteFUA carries. See internal/blockdev.
 const DeviceFeatures uint64 = 1<<featureBlkSegMax |
 	1<<featureBlkBlkSize |
 	1<<featureBlkFlush |

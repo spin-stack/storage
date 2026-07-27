@@ -89,7 +89,6 @@ func withLimits(l wal.Limits) rigOption { return func(c *rigConfig) { c.limits =
 func withRoot(r string) rigOption       { return func(c *rigConfig) { c.root = r } }
 func localOnly() rigOption              { return func(c *rigConfig) { c.remote = false } }
 func withoutLease() rigOption           { return func(c *rigConfig) { c.leaseOn = false } }
-func withCapacity(n int64) rigOption    { return func(c *rigConfig) { c.cap = n } }
 func withENOSPC(bytes int64) rigOption {
 	return func(c *rigConfig) {
 		c.inject = func(d *sim.Disk, root string) { d.InjectENOSPC(root, bytes) }

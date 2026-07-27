@@ -83,6 +83,16 @@ func parseRequest(c chain) (blkRequest, error) {
 // the guest waiting on a completion that will never come, which looks like a
 // hung disk and is far harder to diagnose than an I/O error. Only a malformed
 // *ring* is fatal, and that is caught before we get here.
+//
+// Every Backend error becomes IOERR, and that is not laziness about the ones
+// that differ. The status byte has three values (virtio 1.2 §5.2.6): OK, IOERR
+// and UNSUPP, of which Linux maps UNSUPP to ENOTSUPP and everything else to
+// EIO. So a backend that is fenced, one whose backlog is at its bound, and one
+// whose device is full are indistinguishable *on this wire* — there is no
+// ENOSPC to send, and inventing a status the front-end does not know would be
+// worse than the loss of detail. The distinction is carried where it can be
+// acted on: in the error, which OnError reports to the host side, and which
+// internal/blockdev classifies for exactly this reason.
 func (d *Device) serve(ctx context.Context, r blkRequest) uint32 {
 	switch r.typ {
 	case blkTypeIn:
@@ -123,7 +133,9 @@ func (d *Device) serve(ctx context.Context, r blkRequest) uint32 {
 		// driver never sends these. Answering UNSUPP is what the spec says to
 		// do with the ones that do anyway, and it is strictly better than
 		// silently writing zeros over a range the guest expected to be
-		// reclaimed.
+		// reclaimed. UNSUPP is also the one place the wire is more specific
+		// than IOERR: the guest's block layer reads it as ENOTSUPP and stops
+		// asking, which is exactly right for a feature we never advertised.
 		r.status[0] = blkStatusUnsupp
 		return 1
 
