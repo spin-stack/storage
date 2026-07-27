@@ -14,7 +14,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,9 +31,17 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"path/filepath"
+
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/cpserver"
+
+	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/lifecycle"
+	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/pg"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
 )
 
@@ -55,6 +67,17 @@ func run() error {
 		// a bucket or, for a single-machine dev run, a directory.
 
 		shutdownGrace = flag.Duration("shutdown-grace", 10*time.Second, "how long to let in-flight requests finish")
+
+		// seed-volume: provision one volume and exit. It is not an admin API — that
+		// arrives with volctl — but without it GetDesiredState answers every Agent
+		// with an empty list forever, so nothing downstream of this binary can be
+		// exercised at all.
+		seedVolume = flag.Bool("seed-volume", false, "provision one volume and exit, instead of serving")
+		seedHost   = flag.String("seed-host", "", "with -seed-volume: the host that will serve it (a UUIDv7)")
+		seedSize   = flag.Int64("seed-size", 1<<30, "with -seed-volume: capacity in bytes (a whole number of 512-byte sectors)")
+		seedBlock  = flag.Int("seed-block-size", 4096, "with -seed-volume: logical block size")
+		seedLocal  = flag.Bool("seed-local-durability", false, "with -seed-volume: ACK FLUSH on fdatasync instead of on a verified object (§14.8)")
+		kekFile    = flag.String("kek-file", "", "file holding the 32-byte key-encryption key (required for -seed-volume)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -91,6 +114,19 @@ func run() error {
 	}
 	slog.Info("control-plane elected", "holder_id", *holderID, "term", term, "version", version)
 
+	if *seedVolume {
+		durability := lifecycle.DurabilityRemote
+		if *seedLocal {
+			durability = lifecycle.DurabilityLocal
+		}
+		return seed(ctx, md, store, *kekFile, controlplane.VolumeSpec{
+			SizeBytes:  *seedSize,
+			BlockSize:  int32(*seedBlock),
+			HostID:     *seedHost,
+			Durability: durability,
+		}, term)
+	}
+
 	// The term is fixed for the life of the process. A process that loses it does
 	// not "renew" into a new one: every write it attempts fails with ErrStaleTerm,
 	// which the handler answers as Aborted, and an operator restarts it.
@@ -119,4 +155,79 @@ func run() error {
 		slog.Info("control-plane stopped")
 		return nil
 	}
+}
+
+// seed provisions one volume and reports what it made. It runs after the election, so
+// it holds a real term and a stale process is refused by the same guard every other
+// mutation goes through (§7).
+func seed(ctx context.Context, md metadata.Store, store objectstore.Store, kekFile string, spec controlplane.VolumeSpec, term int64) error {
+	if kekFile == "" {
+		return errors.New("-kek-file is required with -seed-volume: the DEK is wrapped under it, and the Agent must be given the same one")
+	}
+	kek, err := readKEK(kekFile)
+	if err != nil {
+		return err
+	}
+	// crypto/rand, passed explicitly: the Provisioner takes its randomness as a
+	// parameter so a DST run is reproducible, which means production has to say out
+	// loud that it wants the real thing.
+	p := controlplane.NewProvisioner(md, store, crypto.NewDevKMS(kek, kekIDFor(kek)), rand.Reader)
+	vol, err := p.Provision(ctx, term, spec)
+	if err != nil {
+		return err
+	}
+	slog.Info("volume provisioned",
+		"volume_id", vol.VolumeID, "host_id", spec.HostID,
+		"size_bytes", spec.SizeBytes, "durability", spec.Durability, "dek_key_id", vol.KeyID)
+	return nil
+}
+
+// readKEK loads the 32-byte key-encryption key. It is a file rather than a flag
+// because a key on a command line is in `ps`, in shell history and in the unit file.
+//
+// It reads through simio/disk rather than os (INV-01): every file this tree opens goes
+// through the injected interface, and a key file is not an exception worth carving.
+func readKEK(path string) ([crypto.DEKSize]byte, error) {
+	var kek [crypto.DEKSize]byte
+	d, err := real.NewDisk(filepath.Dir(path))
+	if err != nil {
+		return kek, fmt.Errorf("opening the KEK's directory: %w", err)
+	}
+	f, err := d.Open(filepath.Base(path))
+	if err != nil {
+		return kek, fmt.Errorf("reading the KEK: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	size, err := f.Size()
+	if err != nil {
+		return kek, fmt.Errorf("sizing the KEK: %w", err)
+	}
+	// A key file is small; anything large is not one, and reading it whole would be
+	// the only unbounded allocation in this binary.
+	if size > 1024 {
+		return kek, fmt.Errorf("the KEK file is %d bytes: that is not a key", size)
+	}
+	raw := make([]byte, size)
+	if _, err := f.ReadAt(raw, 0); err != nil {
+		return kek, fmt.Errorf("reading the KEK: %w", err)
+	}
+	raw = bytes.TrimSpace(raw)
+	// Hex is accepted so the file survives a copy-paste; raw bytes are accepted so
+	// `head -c 32 /dev/urandom > kek` works.
+	if decoded, derr := hex.DecodeString(string(raw)); derr == nil && len(decoded) == crypto.DEKSize {
+		copy(kek[:], decoded)
+		return kek, nil
+	}
+	if len(raw) != crypto.DEKSize {
+		return kek, fmt.Errorf("the KEK must be %d bytes (raw) or %d hex characters, got %d bytes", crypto.DEKSize, crypto.DEKSize*2, len(raw))
+	}
+	copy(kek[:], raw)
+	return kek, nil
+}
+
+// kekIDFor names a KEK by a hash of itself, so the id cannot drift from the material
+// and two deployments do not both call theirs "default".
+func kekIDFor(kek [crypto.DEKSize]byte) string {
+	sum := sha256.Sum256(kek[:])
+	return "kek-" + hex.EncodeToString(sum[:8])
 }
