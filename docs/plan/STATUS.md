@@ -6,10 +6,18 @@ tracks state.
 
 - **Date:** 2026-07-26 · **Branch:** everything is on `main`, pushed to `origin`
   (`/home/aledbf/spin-storage.git`, bare).
-- **Gate:** `task ci:full` green — the merge gate, Docker lanes included (`task ci` is
-  the fast local loop). `task cover` 92.2% (floor 90). `task test:integration` green on
-  PostgreSQL 18, `task backend:conformance` green against the pinned RustFS,
-  `task build:qemu` + `task qemu:verify` green.
+- **Gate:** `task ci:full` green **on a developer machine, and nowhere else**.
+  `task cover` 92.2% (floor 90), `task test:integration` green on PostgreSQL 18,
+  `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
+  `task qemu:verify` green — all of that is one machine's word.
+  **CI has never run.** `origin` is a local bare repo, so the GitHub workflows have
+  never executed on a runner; and `.github/workflows/ci.yml` neither builds nor
+  downloads QEMU while `test:integration:qemu` depends on `qemu:verify`, which fails
+  without `_output`. Treat every green claim here as reproducible-by-you, not as
+  defended by a gate (`BUILD-INVENTORY.md`, increment 8).
+- **The road to something finished:** `BUILD-INVENTORY.md` — nine increments from here
+  to one volume served end to end by real binaries, ordered by dependency, from an
+  eleven-agent audit of what exists versus what does not.
 
 ## Maturity, not "done"
 
@@ -56,7 +64,23 @@ from that audit.
 
 # Open work
 
-Three deviations and one gap. Nothing else is outstanding.
+Three deviations, one gap, and one latent correctness hole found by the 2026-07-26
+audit. The build order for all of it is `BUILD-INVENTORY.md`.
+
+## The hole: truncation makes a restart serve zeros
+
+`Log.view` — the read view a guest is answered from — is rebuilt **only from local
+segments**, and `TruncateLocal` unlinks exactly those. `view` is unexported and assigned
+in one place (`NewLogAfter`); there is no setter, so `recovery.Recover` and
+`materialize.From*` produce precisely the right object and **nothing can install it**.
+
+Today this is latent, because nothing calls `TruncateLocal` in a running system. It stops
+being latent the moment a durability scheduler exists: **a restart would then silently
+serve zeros for every truncated range, with no error anywhere.** None of the nine
+`Resume` tests truncates first, which is why the suite is green.
+
+**Consequence for the build order: the checkpoint/truncate increment must not merge
+without the view-adoption increment** (`BUILD-INVENTORY.md`, increments 3 and 5).
 
 ## DEV-0007 — the spine's second half *(the only thing on the critical path)*
 

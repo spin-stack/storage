@@ -1,10 +1,11 @@
 # docs/plan — the map
 
-Seven entries. Each answers one question, and no two answer the same one.
+Eight entries. Each answers one question, and no two answer the same one.
 
 | I want to know… | Read |
 |---|---|
 | What is done, what is partial, what is missing, what to do next | **`STATUS.md`** |
+| What has to be built, in what order, to serve one volume end to end | **`BUILD-INVENTORY.md`** |
 | What does `§14.4` / `INV-13` / `ADR-0017` / `DEV-0007` in this comment mean? | **`REFERENCE.md`** — one line each, no other file needed |
 | What property must hold, and which checker proves it | `INVARIANTS.md` |
 | Why was this decided, and what was rejected | `DECISIONS/ADR-NNNN-*.md` |
