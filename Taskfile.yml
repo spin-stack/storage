@@ -268,11 +268,12 @@ tasks:
           echo "this QEMU has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
         test -x {{.OUTPUT_DIR}}/bin/qemu-storage-daemon
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
-        # The option ROM `-kernel` boots a Linux guest through. Asserted because its
-        # absence fails at run time as a rom-open error, which reads as a backend bug.
-        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/linuxboot_dma.bin || {
-          echo "missing linuxboot_dma.bin — a direct kernel boot (-kernel) cannot work; rebuild with: task build:qemu"; exit 1; }
-        echo "OK: $("$bin" --version | head -1), vhost-user-blk-pci present, storage daemon + firmware (incl. linuxboot_dma) in place"
+        # pvh.bin is how -kernel enters a PVH ELF kernel, which is the guest lane's
+        # only boot path. Its absence fails at run time as a rom-open error, which
+        # reads like a backend bug.
+        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin || {
+          echo "missing pvh.bin — a direct kernel boot (-kernel) cannot work; rebuild with: task build:qemu"; exit 1; }
+        echo "OK: $("$bin" --version | head -1), vhost-user-blk-pci present, storage daemon + firmware (incl. pvh) in place"
 
   build:guest:
     desc: Build the initramfs the QEMU lane boots (a static Go /init). Needs the kernel from spinbox — see SPINBOX_KERNEL.
@@ -298,10 +299,18 @@ tasks:
           echo "  cd ../spinbox && task build:kernel"
           echo "or point SPINBOX_KERNEL at a bzImage with CONFIG_VIRTIO_BLK=y built in."
           exit 1; }
-        # A bzImage starts with the 'MZ' PE stub on x86_64. Cheap, and it catches the
-        # common mistake of pointing this at a vmlinux or a compressed tarball.
-        head -c2 "$kernel" | grep -q 'MZ' || { echo "$kernel does not look like a bzImage"; exit 1; }
-        echo "OK: initramfs + kernel ($kernel) ready for the guest lane"
+        # The kernel must be an ELF carrying the Xen PVH notes, because that is the
+        # entry point QEMU uses for it (spinbox builds with CONFIG_PVH=y). A bzImage
+        # would need linuxboot_dma.bin, which this tree deliberately does not extract,
+        # and QEMU's failure for either mistake is a rom-open error that reads like a
+        # backend bug.
+        head -c4 "$kernel" | grep -q 'ELF' || {
+          echo "$kernel is not an ELF: the lane boots a PVH kernel, not a bzImage"; exit 1; }
+        if command -v readelf >/dev/null; then
+          readelf -n "$kernel" 2>/dev/null | grep -q 'Xen' || {
+            echo "$kernel has no Xen PVH note: QEMU has no entry point for it (needs CONFIG_PVH=y)"; exit 1; }
+        fi
+        echo "OK: initramfs + PVH kernel ($kernel) ready for the guest lane"
 
   build:qemu:image:
     desc: Build the QEMU runtime image (used by the integration lane, not extracted).

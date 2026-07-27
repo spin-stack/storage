@@ -130,8 +130,7 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
     test -f /opt/qemu/share/qemu/bios-256k.bin && \
     mkdir -p /build/pc-bios && \
     cp /var/cache/qemu/qemu-${QEMU_VERSION}/pc-bios/kvmvapic.bin /build/pc-bios/ && \
-    cp /var/cache/qemu/qemu-${QEMU_VERSION}/pc-bios/vgabios-stdvga.bin /build/pc-bios/ && \
-    cp /var/cache/qemu/qemu-${QEMU_VERSION}/pc-bios/linuxboot_dma.bin /build/pc-bios/
+    cp /var/cache/qemu/qemu-${QEMU_VERSION}/pc-bios/vgabios-stdvga.bin /build/pc-bios/
 
 # Fail the build here, not in a test three phases later, if the device we depend on
 # is missing from this configuration (§3: vhost-user-blk is the guest data path).
@@ -185,8 +184,8 @@ COPY --from=builder /opt/qemu/share/qemu/bios-256k.bin /share/spin-stack/qemu/bi
 COPY --from=builder /opt/qemu/share/qemu/pvh.bin /share/spin-stack/qemu/pvh.bin
 COPY --from=builder /build/pc-bios/kvmvapic.bin /share/spin-stack/qemu/kvmvapic.bin
 COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /share/spin-stack/qemu/vgabios-stdvga.bin
-# linuxboot_dma.bin is the option ROM `-kernel` loads the guest through. Without it a
-# direct kernel boot dies at `rom: file linuxboot_dma.bin : error Failed to open file`
-# before the guest runs a single instruction — which is why no guest in this lane could
-# ever issue a FLUSH.
-COPY --from=builder /build/pc-bios/linuxboot_dma.bin /share/spin-stack/qemu/linuxboot_dma.bin
+# pvh.bin above is the one that matters for the guest lane: the kernel we boot is an ELF
+# with Xen PVH notes (CONFIG_PVH=y), and QEMU enters it through this ROM — no real mode,
+# no bzImage boot protocol. linuxboot_dma.bin is deliberately NOT extracted: it is the
+# option ROM for a *bzImage* boot, which nothing here does. Verified by execution: the
+# guest boots with this exact set and boots identically with linuxboot_dma.bin removed.
