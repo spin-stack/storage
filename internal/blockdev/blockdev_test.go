@@ -609,6 +609,86 @@ func TestLocalDurabilityModeStillNeedsNoPutOnTheWritePath(t *testing.T) {
 // TestConcurrentRequestsDoNotRaceTheLog: wal.Log is not safe for concurrent use, and
 // vhost.Device serves one queue from one goroutine — but the Backend contract does
 // not say so, and the device is what stands between the two. Run under -race.
+// gatedStore holds every Put until it is released, so a test can stand inside a FLUSH
+// that is talking to the object store and ask what the device will still answer.
+type gatedStore struct {
+	objectstore.Store
+	arrived chan struct{}
+	release chan struct{}
+}
+
+func newGatedStore() *gatedStore {
+	return &gatedStore{Store: sim.NewObjectStore(), arrived: make(chan struct{}, 8), release: make(chan struct{})}
+}
+
+func (s *gatedStore) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	s.arrived <- struct{}{}
+	<-s.release
+	return s.Store.Put(ctx, key, data, opts)
+}
+
+// TestAReadIsAnsweredWhileAFlushIsUploading is the regression this device's lack of a
+// lock exists for. It used to hold one mutex for the whole of every request, FLUSH
+// included, so a guest READ waited on an S3 round trip — the exact coupling wal's
+// two-mutex design was built to remove, reintroduced one layer up.
+//
+// Nothing about the Log's safety changed when that mutex went: the Log serializes its
+// own state and captures a FLUSH's target sequence under the same lock a WRITE appends
+// under. This test is what would fail if the mutex came back, since no correctness
+// assertion would notice it.
+func TestAReadIsAnsweredWhileAFlushIsUploading(t *testing.T) {
+	ctx := t.Context()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	d := sim.NewDisk()
+	store := newGatedStore()
+	l := wal.NewLog(d, "wal", clk, volume, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	lm := lease.NewManager(clk, 10*time.Second)
+	lm.Grant()
+	l.EnableRemote(wal.NewBatcher(clk, volume, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), lm)
+	t.Cleanup(func() { _ = l.Close() })
+
+	dev, err := blockdev.New(l, capacity)
+	if err != nil {
+		t.Fatalf("blockdev.New: %v", err)
+	}
+	want := pattern(0xab, vhost.SectorSize)
+	if _, err := dev.WriteAt(want, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- dev.Flush(ctx) }()
+	<-store.arrived // the FLUSH is now inside the object store
+
+	read := make(chan error, 1)
+	go func() {
+		got := make([]byte, vhost.SectorSize)
+		if _, err := dev.ReadAt(got, 0); err != nil {
+			read <- err
+			return
+		}
+		if string(got) != string(want) {
+			read <- fmt.Errorf("read %x, want %x", got[:8], want[:8])
+			return
+		}
+		read <- nil
+	}()
+
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("the read during an upload: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("a guest READ was still waiting on the object store when the test ended")
+	}
+
+	close(store.release)
+	if err := <-flushed; err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+
 func TestConcurrentRequestsDoNotRaceTheLog(t *testing.T) {
 	ctx := t.Context()
 	r := newRig(t)

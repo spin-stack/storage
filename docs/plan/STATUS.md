@@ -50,17 +50,37 @@ cannot append into the segments of the epoch it replaced) and the socket is
 `<socket-dir>/<volume-id>.sock` (no epoch — it is the guest's attachment point and
 survives promotion).
 
-**Next: the three review-zone pieces, specified and waiting for a human in
-`RUNTIME-FENCING-SPEC.md`.** Until they land the runtime is local-only: it takes writes
-and serves reads, and `durable_sequence` stays where a WRITE leaves it. In order:
+**The three review-zone pieces were reviewed and answered on 2026-07-29 and are now
+implemented** (`RUNTIME-FENCING-SPEC.md` records each decision next to the question it
+answers):
 
-1. **The lease adapter** (fencing) — without it `EnableRemote` is never called, so there
-   is no uploader and no §14.4 ACK path. `main` opens the object store and deliberately
-   does not hand it over.
-2. **`Fenced()` tears the runtime down** (fencing) — resolves DEV-0012. Two decisions in
-   the spec, both about what a guest sees.
-3. **`blockdev.Device.mu` across the S3 PUT** (durability) — today every guest READ
-   blocks on the object store.
+1. **The lease adapter** — the host lease gates every volume's durable ACK. It is a
+   function resolved per call, never a captured `*lease.Manager`, because `applyLease`
+   allocates a new manager on a TTL change and a Log holding the old one would self-fence
+   a healthy host and never recover. A store with no lease is refused at construction.
+   `EnableRemote` is now called, so a FLUSH is the §14.4 path.
+2. **Fencing tears the runtime down** — the safe side, throughout: log, socket and device
+   all go, so neither reads nor writes are answered and the guest's I/O stalls rather
+   than being served by a host with no authority. **Resolves DEV-0012.** The half that is
+   easy to miss: the Control Plane refuses the *report* while `GetDesiredState` may keep
+   listing the volume, so a fenced epoch is remembered and only a *higher* epoch — the
+   Control Plane granting the volume again — restarts it.
+3. **The blockdev mutex is gone.** `Log.Flush` captures its target under the same lock
+   `Log.Write` appends under, which is the property that made the mutex redundant rather
+   than load-bearing.
+
+**Two things are open, and both are named in that spec rather than implied:**
+
+- **The fencing teardown has no DST arm.** CLAUDE.md makes fencing code without one a
+  stop signal, and this is it: `internal/dst` models leases, logs and the Control Plane
+  but has no notion of `agent.VolumeManager`. Unit tests cover the behaviour; INV-10 is
+  proven at the `wal` level and only asserted at the Agent's. **Giving the harness an
+  Agent model is the next thing to build.**
+- **A FLUSH still blocks a guest's READs**, and the spec had named the wrong cause. It is
+  not the blockdev mutex (removed, with a regression test): `vhost.Device.ProcessQueue`
+  serves the ring serially under its own mutex, one request at a time. Concurrent
+  dispatch means out-of-order used-ring completion and collides with increment 3.3's
+  inflight tracking and RISK-10 — its own spec, its own review.
 
 One thing the keystone's first test found and fixed on the way: `Reconcile` reported the
 volume set it had read *before* reconciling, so every volume was one cycle late in the

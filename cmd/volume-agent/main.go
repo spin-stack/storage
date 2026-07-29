@@ -102,16 +102,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// The store is opened here and not yet handed to the volumes: wal.Log.EnableRemote
-	// needs a LeaseChecker with it, and a Log given an uploader but no lease it can
-	// trust would ACK a FLUSH it has no authority to ACK. Remote mode arrives with the
-	// fencing increment; failing to open the store now still beats discovering it on
-	// the first FLUSH.
-	_ = store
-
 	// One runtime per volume, each with its own WAL, block device and vhost-user
 	// socket. This is what the Agent serves from — before it, the binary heartbeated
 	// about an empty set forever.
+	//
+	// The lease is passed as a call through to the loop, not as the loop's
+	// *lease.Manager: applyLease allocates a new manager whenever the Control Plane
+	// changes the TTL, and a Log holding the old one would be gated by something nobody
+	// renews — it would self-fence a perfectly healthy host and never recover. The
+	// closure reads `loop` after it is assigned below; until then it answers false,
+	// which is the safe direction (no lease, no durable ACK).
+	var loop *agent.Loop
 	volumes, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir:   *dataDir,
 		SocketDir: *socketDir,
@@ -121,6 +122,8 @@ func run() error {
 		Listen:  hostio.Listen,
 		Mapper:  hostio.NewMapper(),
 		EventFD: hostio.NewEventFD,
+		Store:   store,
+		Lease:   func() bool { return loop != nil && loop.LeaseValid() },
 	})
 	if err != nil {
 		return err
@@ -131,7 +134,7 @@ func run() error {
 		}
 	}()
 
-	loop, err := agent.New(cfg, agent.Deps{
+	loop, err = agent.New(cfg, agent.Deps{
 		Clock: real.NewClock(),
 		ControlPlane: storagev1connect.NewControlPlaneServiceClient(
 			&http.Client{Timeout: *httpTimeout}, *cpURL),

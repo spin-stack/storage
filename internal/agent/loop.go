@@ -181,7 +181,31 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("agent: reading the served volumes: %w", err)
 	}
-	return l.report(ctx, served)
+	if err := l.report(ctx, served); err != nil {
+		return err
+	}
+	return l.fence(ctx)
+}
+
+// fence stops serving whatever the Control Plane refused a report for. Until this
+// existed the refusal was recorded in l.fenced and read by nothing, so a host that had
+// lost a volume kept serving it — DEV-0012.
+//
+// It runs after the report and not inside it because tearing a runtime down closes a
+// WAL, and l.mu must not be held across that.
+func (l *Loop) fence(ctx context.Context) error {
+	l.mu.Lock()
+	fenced := append([]string(nil), l.fenced...)
+	reconcile := l.reconcile
+	l.mu.Unlock()
+
+	if reconcile == nil || len(fenced) == 0 {
+		return nil
+	}
+	if err := reconcile.Fence(ctx, fenced); err != nil {
+		return fmt.Errorf("agent: fencing refused volumes: %w", err)
+	}
+	return nil
 }
 
 func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeStatus) error {

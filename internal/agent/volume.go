@@ -15,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -28,11 +29,11 @@ import (
 // host's lifecycle; when storage lands there it must be able to take this type and the
 // manager below without taking the reconciliation loop with them.
 //
-// What it does *not* do yet is the remote half. wal.Log.EnableRemote needs a
-// LeaseChecker, and passing one that nobody renews would give the volume a durability
-// claim it cannot honour — so remote mode, and with it the uploader and the §14.4 ACK
-// path, arrives with the fencing increment. Until then a volume serves reads and takes
-// writes locally, and its durable watermark stays where a WRITE leaves it: 0.
+// With an object store and a lease it runs in remote mode: a FLUSH is the §14.4 ACK
+// path, and it returns only once every covering object is verified and the lease is
+// still valid on the monotonic clock (INV-06, INV-07). Without a store it is local-only
+// — writes are taken, reads are served, and a FLUSH ACKs on fdatasync alone (§14.8)
+// rather than claiming a durability nothing backs.
 type Volume struct {
 	id    string
 	epoch int64
@@ -86,6 +87,19 @@ func (v *Volume) stop() error {
 // something it can close.
 type ListenFunc func(socket string) (vhost.Listener, error)
 
+// leaseFunc adapts the Agent's lease question into the wal.LeaseChecker the Log gates
+// its durable ACK on (§12.2, INV-06).
+//
+// It is a *function*, resolved on every call, and that is the whole point. Loop's
+// applyLease allocates a new lease.Manager whenever the Control Plane changes the TTL,
+// so a Log holding a captured *lease.Manager would be gated by an object nobody renews:
+// it would go invalid at the old TTL and never recover, and the volume would self-fence
+// while the host is perfectly healthy. Calling through Loop.LeaseValid resolves the
+// current manager every time.
+type leaseFunc func() bool
+
+func (f leaseFunc) Valid() bool { return f() }
+
 // VolumeManagerConfig is where this host keeps things.
 type VolumeManagerConfig struct {
 	// DataDir holds the WALs: <data-dir>/wal/<volume-id>/<epoch>.
@@ -94,6 +108,9 @@ type VolumeManagerConfig struct {
 	SocketDir string
 	// Limits bound the local WAL (§5.7). The zero value is legal and unbounded.
 	Limits wal.Limits
+	// UploadAttempts is how many times an object PUT is retried before the FLUSH that
+	// needed it fails. Zero means 3.
+	UploadAttempts int
 }
 
 // VolumeManagerDeps are the injected collaborators (INV-01).
@@ -109,6 +126,13 @@ type VolumeManagerDeps struct {
 	// goroutine has already told Apply the volume started.
 	Mapper  vhost.Mapper
 	EventFD vhost.EventFDFunc
+	// Store is where FLUSH makes a write durable (§14.4). Nil is local-only mode: the
+	// device serves and takes writes, and no FLUSH ever claims remote durability.
+	Store objectstore.Store
+	// Lease answers "does this host still hold its lease, on the monotonic clock?".
+	// It is required whenever Store is set, and it must be a call through to the
+	// current lease — see leaseFunc.
+	Lease func() bool
 }
 
 // VolumeManager owns the live runtimes and is the Agent's VolumeSource. Apply is the
@@ -119,7 +143,14 @@ type VolumeManager struct {
 
 	mu      sync.Mutex
 	volumes map[string]*Volume
-	closed  bool
+	// fencedEpoch is the highest epoch this host has been fenced out of, per volume.
+	// Without it a fenced volume would come straight back: the Control Plane refuses
+	// the *report* while GetDesiredState may still list the volume for this host, so
+	// the next Apply would find no runtime and start one — serving a volume this host
+	// has just been told it does not own. Only a higher epoch clears it, because a
+	// higher epoch is the Control Plane granting the volume again.
+	fencedEpoch map[string]int64
+	closed      bool
 }
 
 // NewVolumeManager validates the wiring and returns a manager with nothing running.
@@ -139,8 +170,18 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		return nil, errors.New("agent: a memory mapper must be injected (ADR-0020)")
 	case deps.EventFD == nil:
 		return nil, errors.New("agent: an EventFD adapter must be injected (ADR-0020)")
+	case deps.Store != nil && deps.Lease == nil:
+		// wal.EnableRemote accepts a nil lease without complaining and the failure
+		// surfaces much later, as ErrNoLease inside durableStep — at the first FLUSH,
+		// in the guest's I/O path. A store with nothing fencing the writer is not a
+		// configuration worth starting.
+		return nil, errors.New("agent: an object store needs a lease to gate its durable ACKs (§12.2, INV-06)")
 	}
-	return &VolumeManager{cfg: cfg, deps: deps, volumes: map[string]*Volume{}}, nil
+	return &VolumeManager{
+		cfg: cfg, deps: deps,
+		volumes:     map[string]*Volume{},
+		fencedEpoch: map[string]int64{},
+	}, nil
 }
 
 // Apply makes the running set match desired: start what is new, stop what left, and
@@ -171,7 +212,16 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 
 		m.mu.Lock()
 		existing, running := m.volumes[id]
+		fencedAt, wasFenced := m.fencedEpoch[id]
 		m.mu.Unlock()
+
+		if wasFenced && d.GetEpoch() <= fencedAt {
+			// Fenced out of this epoch and the Control Plane has not granted a newer
+			// one. Silently, because the desired state repeats every few seconds and
+			// this is the steady state until the volume is either re-granted or
+			// dropped from the list.
+			continue
+		}
 
 		if running {
 			if existing.epoch == d.GetEpoch() {
@@ -243,6 +293,21 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 
 	root := path.Join(m.cfg.DataDir, "wal", id, strconv.FormatInt(d.GetEpoch(), 10))
 	log := wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits)
+
+	// Remote mode, and with it the uploader and the §14.4 ACK path. Without a store
+	// the Log stays local: it takes writes and serves reads, and a FLUSH ACKs on
+	// fdatasync alone (§14.8) rather than claiming a durability it cannot back.
+	if m.deps.Store != nil {
+		attempts := m.cfg.UploadAttempts
+		if attempts <= 0 {
+			attempts = 3
+		}
+		log.EnableRemote(
+			wal.NewBatcher(m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), 0, wal.DefaultBatchConfig()),
+			wal.NewUploader(m.deps.Store, attempts),
+			leaseFunc(m.deps.Lease),
+		)
+	}
 
 	dev, err := blockdev.New(log, d.GetSizeBytes())
 	if err != nil {
@@ -319,6 +384,40 @@ func (m *VolumeManager) supervise(ctx context.Context, v *Volume, first vhost.Li
 			return
 		}
 	}
+}
+
+// Fence stops serving the named volumes, because the Control Plane has refused their
+// reports: this host is not their writer anymore — the epoch moved on, the primary
+// changed, or the volume is unknown to the fleet (§12.3, §16). Resolves DEV-0012.
+//
+// **It stops reads as well as writes, and it takes the socket with it.** That is the
+// safe side of a choice with no comfortable option. A read of already-written bytes
+// breaks no durability rule, but it is a stale read handed to a guest whose volume now
+// has a different writer somewhere else, and the guest has no way to tell. The cost is
+// paid by that guest: QEMU reconnects on its own, finds nothing listening, and its I/O
+// stalls rather than being answered by a host with no authority to answer it.
+//
+// A volume re-granted to this host at a higher epoch starts a fresh runtime on the next
+// Apply, under the new epoch's WAL root, and the guest's pending reconnect succeeds.
+func (m *VolumeManager) Fence(_ context.Context, volumeIDs []string) error {
+	var errs []error
+	for _, id := range volumeIDs {
+		m.mu.Lock()
+		v, running := m.volumes[id]
+		if running && v.epoch > m.fencedEpoch[id] {
+			m.fencedEpoch[id] = v.epoch
+		}
+		m.mu.Unlock()
+		if !running {
+			continue
+		}
+		slog.Warn("volume fenced; tearing its runtime down",
+			"volume_id", id, "epoch", v.epoch)
+		if err := m.remove(id); err != nil {
+			errs = append(errs, fmt.Errorf("agent: fencing volume %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // remove stops one runtime and drops it. It is safe to call for a volume that is not

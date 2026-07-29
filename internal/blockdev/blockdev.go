@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
@@ -27,12 +26,20 @@ var ErrDeviceFull = errors.New("the local WAL device is out of space")
 //
 // The zero value is not usable: a device with no log and no capacity has nothing to
 // tell a guest. Use New.
+//
+// It holds no lock of its own. That is a statement about where the invariants live,
+// not an omission: wal.Log owns them and is safe for concurrent use, with two mutexes
+// and a documented rule that neither is held across an object-store PUT. A mutex here
+// could only re-serialize what the Log already serializes correctly — and, held across
+// Flush, it would put S3 latency back into the guest's read path through the door the
+// Log's design exists to close.
+//
+// The hazard a lock here would have been for is real and is handled in wal: a WRITE
+// arriving in the middle of a FLUSH must not be ACKed by that FLUSH. Log.Flush captures
+// its target sequence under the same mutex Log.Write appends under, so a WRITE that
+// returns afterwards has a strictly higher sequence and advanceDurable(target) cannot
+// reach it (`TestAGuestWriteCompletesWhileAFlushIsUploading`).
 type Device struct {
-	// mu serializes requests against the Log, which is not safe for concurrent use.
-	// It is held for the whole request, including the object-store round trip inside
-	// Flush: a WRITE that slipped past a FLUSH would be ACKed by that FLUSH's target
-	// sequence without having been uploaded.
-	mu  sync.Mutex
 	log *wal.Log
 	cap int64
 }
@@ -74,8 +81,6 @@ func (d *Device) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.log.Read(uint64(off), p)
 	return len(p), nil
 }
@@ -95,8 +100,6 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 		// and a header to describe nothing, and replay would have to carry it forever.
 		return 0, nil
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	if _, err := d.log.Write(uint64(off), p, 0); err != nil {
 		return 0, d.refuse("WRITE", len(p), off, err)
 	}
@@ -112,8 +115,6 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 // and knows its writes are not safe; a Flush that reported success on a lapsed lease
 // or an unreachable store would be the one lie this whole design exists to prevent.
 func (d *Device) Flush(ctx context.Context) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	if err := d.log.Flush(ctx); err != nil {
 		return d.refuse("FLUSH", 0, 0, err)
 	}

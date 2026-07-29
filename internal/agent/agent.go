@@ -79,6 +79,10 @@ type VolumeSource interface {
 type VolumeReconciler interface {
 	VolumeSource
 	Apply(ctx context.Context, desired []*storagev1.DesiredVolume) error
+	// Fence stops serving the volumes whose reports the Control Plane refused. This
+	// host is not their writer any more, and the data path is where that has to take
+	// effect (§16) — recording it was all the loop could ever do on its own.
+	Fence(ctx context.Context, volumeIDs []string) error
 }
 
 // VolumeSet is an in-memory VolumeSource. It is what the Agent runs against until
