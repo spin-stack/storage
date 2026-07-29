@@ -72,6 +72,19 @@ linters:
         linters:
           - depguard
           - forbidigo
+      # integration/guestinit is PID 1 inside the guest VM (DEV-0013). It is not
+      # host code: it is on the far side of the interface INV-01 governs, it is
+      # never linked into any binary this repository ships, and it exists to be
+      # the real world simio models — it opens /dev/vda and calls fsync so that a
+      # real kernel, not a simulation, decides the write must be durable. Narrow
+      # on purpose: the sibling host-side lane under integration/ that drives
+      # QEMU is ordinary code and stays subject to INV-01, and the authoritative
+      # analyzer carries the same exemption with a fixture proving it did not
+      # widen to the directory.
+      - path: integration/guestinit
+        linters:
+          - depguard
+          - forbidigo
       # analyzer golden fixtures deliberately contain violations.
       - path: hack/analyzers/.*/testdata/
         linters:

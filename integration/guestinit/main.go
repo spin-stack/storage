@@ -128,7 +128,9 @@ func powerOff() {
 	// If that returned, the machine is not going down on its own. Spin rather than
 	// return: a panic here would be reported as a guest crash.
 	for {
-		syscall.Pause()
+		// Nothing to do with the error: Pause returns only when a signal arrives, and
+		// there is no handler and nowhere left to report to.
+		_ = syscall.Pause()
 	}
 }
 

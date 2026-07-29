@@ -64,9 +64,19 @@ var forbidden = map[string]map[string]bool{
 //     be a fiction. The exception is this leaf package only — internal/vhost
 //     itself is *not* exempt, and that narrowness is what keeps the protocol,
 //     the ring and the request handling simulable.
+//   - integration/guestinit is exempt for a different reason than either of the
+//     above (DEV-0013): it is not host code. It is PID 1 *inside the guest VM*,
+//     on the far side of the interface INV-01 governs, and it is never linked
+//     into any binary this repository ships. Its purpose is to be the real world
+//     simio models — a block-device open it could simulate would prove nothing
+//     about a kernel deciding a write must be made durable, which is the one
+//     thing no test here can otherwise reach. "Under integration/" is not what
+//     earned it: the host-side lane that drives QEMU is ordinary code, is not
+//     exempt, and has a fixture proving it.
 var exemptPathFragments = []string{
 	"internal/simio",
 	"internal/vhost/hostio",
+	"integration/guestinit",
 }
 
 func run(pass *analysis.Pass) (any, error) {
