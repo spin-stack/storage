@@ -104,7 +104,7 @@ Full statement, checker, and activation increment: **`INVARIANTS.md`**. State as
 
 | INV | One line | State |
 |---|---|---|
-| INV-01 | Simulable interfaces only — no `time.Now()`/sockets/syscalls outside `simio` (one exception: `internal/vhost/hostio`, ADR-0020). | active |
+| INV-01 | Simulable interfaces only — no `time.Now()`/sockets/syscalls outside `simio`. Two exemptions: `internal/vhost/hostio` (host code, ADR-0020) and `integration/guestinit` (not host code — PID 1 inside the guest, DEV-0013). | active |
 | INV-02 | Deterministic replay: same seed ⇒ identical trace. | active |
 | INV-03 | Ordered watermarks: `published ≤ durable ≤ local`. | active |
 | INV-04 | Unflushed bounds: backpressure rather than a silent NVMe fill. | active |
@@ -155,6 +155,7 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0019 | Schema tooling is **pgschema**, not Atlas; `schema.sql` is the declared state. | Accepted |
 | ADR-0020 | `internal/vhost/hostio` is the one documented INV-01 exception (SCM_RIGHTS + mmap). | Accepted |
 | ADR-0021 | storage integrates into **spin**; spin imports storage and never the reverse. The two binaries are test harnesses that must stay runnable end to end. spin migrates to pgschema. | Accepted |
+| ADR-0022 | The guest kernel is pinned by sha256 and obtained by `task fetch:kernel` into `_output/guest/vmlinux` — never resolved from a sibling checkout's path. storage may *mirror* spinbox's artefact into a registry; mirroring is not building (ADR-0021 stands). | Accepted |
 
 ## `DEV-` — doc↔code divergences
 
@@ -176,6 +177,7 @@ commit named is where the fix landed.
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |
 | DEV-0011 | A segment's space is charged as used, not reserved at creation. | **open** → STATUS.md |
 | DEV-0012 | A self-fenced log still accepts WRITEs and still serves reads. | **open** → STATUS.md |
+| DEV-0013 | `task lint` red since `e8bbdab`: the guest-side `integration/guestinit` tripped the INV-01 lint layer. | resolved 2026-07-28 — third INV-01 exemption, narrowness fixture |
 
 ## `RISK-`
 

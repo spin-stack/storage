@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+
+# The guest kernel, mirrored (ADR-0022).
+#
+# storage does not build a kernel; it consumes spinbox's (ADR-0021). This file does not
+# build one either — it moves an artefact that already exists into a registry and back
+# out again, so the lane's kernel can be named by digest instead of by a relative path
+# into someone's home directory.
+#
+# Two directions, one file:
+#
+#   --target package   context holds `vmlinux` → an image carrying just that file.
+#                      `task guest:kernel:push` publishes it.
+#   --target extract   pull GUEST_KERNEL_REF and write /vmlinux onto the host.
+#                      `task fetch:kernel` uses it, the same way `task build:qemu`
+#                      gets binaries out of an image with `--output type=local`.
+#
+# The image is a single file on `scratch` on purpose: nothing in it can be executed,
+# nothing needs updating for CVEs, and its digest is a hash of the kernel and nothing
+# else.
+
+# Declared before the first FROM so it is a *global* arg — one below a FROM belongs to
+# that stage only, and the `FROM ${GUEST_KERNEL_REF}` line then resolves to blank and
+# fails the parse even when the target that uses it was not requested. The default is
+# kept resolvable for the same reason: every stage is parsed, whichever one is built.
+# The extract path always passes a real reference, and it should be a digest — a tag can
+# be moved, and then the pin in Taskfile.yml is the only thing that would notice.
+ARG GUEST_KERNEL_REF=scratch
+
+FROM scratch AS package
+COPY vmlinux /vmlinux
+
+FROM ${GUEST_KERNEL_REF} AS published
+
+FROM scratch AS extract
+COPY --from=published /vmlinux /vmlinux

@@ -4,18 +4,24 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-07-27 · **Branch:** everything is on `main`, pushed to `origin`
-  (`/home/aledbf/spin-storage.git`, bare). HEAD is `cef9881`.
-- **Gate:** `task ci:full` green **on a developer machine, and nowhere else**.
-  `task cover` 90.6% (floor 90 — the margin is thin because increments 0 and 1 added
-  binary wiring that unit tests do not reach), `task test:integration` green on PostgreSQL 18,
+- **Date:** 2026-07-28 · **Branch:** everything is on `main`, pushed to `origin`
+  (`/home/aledbf/spin-storage.git`, bare).
+- **Gate:** `task ci` green again on 2026-07-28 — it had been red since `e8bbdab`
+  (DEV-0013, resolved below), which nothing had noticed because nobody had run it.
+  Green *on a developer machine, and nowhere else*: `task cover` 90.6%
+  (floor 90 — the margin is thin because increments 0 and 1 added binary wiring that unit
+  tests do not reach), `task test:integration` green on PostgreSQL 18,
   `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
-  `task qemu:verify` green — all of that is one machine's word.
+  `task qemu:verify` + `task guest:verify` green — all of that is one machine's word.
   **CI has never run.** `origin` is a local bare repo, so the GitHub workflows have
-  never executed on a runner; and `.github/workflows/ci.yml` neither builds nor
-  downloads QEMU while `test:integration:qemu` depends on `qemu:verify`, which fails
-  without `_output`. Treat every green claim here as reproducible-by-you, not as
-  defended by a gate (`BUILD-INVENTORY.md`, increment 8).
+  never executed on a runner. Treat every green claim here as reproducible-by-you, not
+  as defended by a gate (`BUILD-INVENTORY.md`, increment 8). Two of the three reasons
+  the guest lane could not run there are now gone (2026-07-28): the kernel is fetched
+  and pinned rather than read out of a sibling checkout (**ADR-0022**), and
+  `test:integration:qemu` skips loudly instead of hard-failing when `_output` has no
+  QEMU — it used to `deps: [qemu:verify]`, which made `task test:integration`
+  unrunnable anywhere QEMU had not been built by hand, contradicting the task's own
+  description. **What remains is QEMU itself**, below.
 - **Where this is going:** storage integrates into **spin** (`github.com/aledbf/spin`),
   which already has a control plane and a per-host runner — **ADR-0021**. spin imports
   storage, never the reverse; `cmd/control-plane` and `cmd/volume-agent` are test
@@ -45,12 +51,14 @@ Three things are ready and waiting for it, all verified by execution today:
 - **The Agent can reach an object store** (`-s3-bucket`/`-object-store-dir`), and it
   says why when it cannot.
 - **A real Linux guest boots and can issue FLUSH.** `task build:guest` produces the
-  initramfs; `task guest:verify` checks it plus the kernel. What is missing is only
-  attaching a `vhost-user-blk` device backed by `blockdev.Device` over `wal.Log` — which
-  is what the keystone provides.
+  initramfs; `task fetch:kernel` puts the pinned kernel at `_output/guest/vmlinux` and
+  `task guest:verify` checks both. What is missing is only attaching a `vhost-user-blk`
+  device backed by `blockdev.Device` over `wal.Log` — which is what the keystone
+  provides.
 
-A useful first command tonight: `task guest:verify` (it will tell you if the kernel
-artefact moved), then read `internal/agent/loop.go:readDesiredState` and
+A useful first command tonight: `task guest:verify` (it fetches the kernel and says so
+if the artefact no longer matches the pin), then read
+`internal/agent/loop.go:readDesiredState` and
 `integration/vhost/wal_test.go:74-111` — the latter is roughly the first half of the
 keystone, already written out by hand in a test.
 
@@ -108,6 +116,70 @@ credential chain, so every request had been going out unsigned; a bad `-host-id`
 the flag instead of writing zero rows forever; a failing reconciliation cycle now says so
 with its backoff; a volume can be provisioned; and a Linux guest boots the lane. See
 `BUILD-INVENTORY.md` for what each increment covered.
+
+**Landed 2026-07-28** (ADR-0022): the guest kernel is fetched into
+`_output/guest/vmlinux` and pinned by sha256, instead of being read out of
+`../spinbox/_output/`. It can come from a sibling checkout or from a mirrored image, and
+either way it is rejected unless it hashes to the pin. `guest:verify` now also asserts
+`CONFIG_VIRTIO_BLK`/`PVH`/`BLK_DEV_INITRD`/`SERIAL_8250_CONSOLE` by reading the config
+the kernel embeds — all four proven to fail by planting them, along with a wrong hash, a
+non-ELF, and every source missing. Running the gate for it surfaced **DEV-0013** (below),
+which had been red since the day before; that is fixed too, so `task ci:full` is green
+end to end again.
+
+## ~~DEV-0013~~ — `task lint` was red from `e8bbdab` to 2026-07-28 *(resolved)*
+
+**The gate had not been green since the guest init landed on 2026-07-27**, and the claim
+at the top of this file said it was. `integration/guestinit/main.go` tripped the INV-01
+lint layer four times: `syscall` (depguard), `os.OpenFile` and `os.Open` (forbidigo), and
+an unchecked `syscall.Pause()` (errcheck) — plus the authoritative analyzer, twice. It
+surfaced on 2026-07-28 on the first `task ci` run since; nothing in the kernel increment
+touches Go, so it was not its doing.
+
+**INV-01 was never violated — the rule just did not say what it meant.** `guestinit` runs
+as PID 1 *inside the guest VM*: it is on the far side of the interface INV-01 governs, it
+is never linked into any binary this repository ships, and its purpose is to be the real
+world `simio` models. A block-device open it could simulate would prove nothing about a
+kernel deciding a write must be durable, which is the one thing no other test here
+reaches. That is a different reason from `internal/vhost/hostio`'s (ADR-0020), which is
+host code that *could* be simulated and deliberately is not — so it is recorded as its
+own exemption rather than folded into that one.
+
+**Fixed (human-approved) in both enforcement layers**, since either alone would leave the
+gate red: `exemptPathFragments` in `hack/analyzers/simulable/simulable.go`, and the
+`exclusions` in `.golangci.yml`. `syscall.Pause()`'s result is now explicitly discarded
+in the source rather than excluded in config.
+
+**The exemption is narrow, and there is a fixture that proves it.**
+`TestExemptGuestInit` asserts the guest program is clean; `TestIntegrationItselfIsNotExempt`
+asserts a host-side package under `integration/` is still flagged — because what earned
+the exemption is *"runs inside the guest"*, not *"lives under `integration/`"*, and an
+exemption that widened to the directory would quietly unsimulate the lane that drives
+QEMU.
+
+## The guest lane in CI: QEMU is the input that is still missing
+
+The kernel is solved (ADR-0022) and `task test:integration` no longer dies where QEMU is
+absent, so the remaining reason CI cannot run the guest lane is QEMU itself, and it is
+**not** the same problem the kernel had. `qemu.yml` already publishes both a runtime
+image and the extracted binaries, so obtaining them is easy; the difficulty is that the
+binaries are dynamically linked against what the runtime image provides
+(`libglib2.0-0`, `libpixman-1-0`, `libcap-ng0`, `libseccomp2`, `libaio1`, `liburing2`,
+`zlib1g` — the `runtime` stage of `Dockerfile.qemu`). Extracting them onto a bare runner
+and executing them is therefore not enough.
+
+Two shapes, and the choice has not been made:
+
+- **Run the lane's tests inside the published runtime image** (Go toolchain added to it).
+  One definition of the dependency set, which stays in `Dockerfile.qemu` where it
+  already is.
+- **Install the runtime libraries on the runner** and use `_output` as today. Smaller
+  change, but the list above then exists in two places and drifts silently — the failure
+  being a QEMU that will not start, in a lane whose whole purpose is to tell us something
+  else.
+
+Nothing here is a blocker for the keystone: the lane runs on a developer machine, which
+is where it has always run.
 
 ## The hole: truncation makes a restart serve zeros
 
@@ -279,11 +351,19 @@ Device features on `/dev/vdb`: `VIRTIO_BLK_F_FLUSH`, `VIRTIO_BLK_F_DISCARD`,
 - **The guest kernel is spinbox's, and it is an ELF with Xen PVH notes — not a bzImage.**
   QEMU enters it through `pvh.bin`. Do not go looking for `linuxboot_dma.bin`: that is
   the bzImage option ROM, this tree deliberately does not extract it, and a guest boots
-  fine without it. `SPINBOX_KERNEL` in `Taskfile.yml` points at the artefact
-  (`../spinbox/_output/spinbox-kernel-x86_64`); storage never builds a kernel (ADR-0021).
+  fine without it. storage never builds a kernel (ADR-0021).
+- **The kernel lives at `_output/guest/vmlinux` and nowhere else** (ADR-0022). `task
+  fetch:kernel` puts it there — from a sibling spinbox checkout, or from a mirrored
+  image — and every source must match `GUEST_KERNEL_SHA256`. Do not add a second path:
+  `SPINBOX_KERNEL` is a *source to copy from*, not the place anything looks.
 - **`cd ../spinbox && task build:kernel` exits non-zero on this machine** — it fails
   writing the BuildKit cache under `/var/lib/spin-stack-buildkit-cache` (permissions) —
   **but it emits the artefact anyway**. Check for the file before believing the exit code.
+- **A kernel is verified from itself, not from a config file next to it.** It carries its
+  `.config` (`CONFIG_IKCONFIG=y`, gzipped after the `IKCFG_ST` marker), and
+  `hack/guest-kernel.sh verify` reads it there. Note that `gzip -dc` on that stream exits
+  non-zero on the kernel bytes trailing the config, so under `set -o pipefail` the
+  extraction "fails" while having produced the whole config — judge it by its output.
 - The guest init writes at **1 MiB**, not offset 0: anything that probes a block device
   writes to the first sector, so a pattern found at 0 proves nothing.
 - Coverage excludes generated `internal/db`, integration-only `metadata/pg`,

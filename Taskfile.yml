@@ -41,10 +41,22 @@ vars:
   POSTGRES_IMAGE: postgres:18-alpine
   DEVDB_CONTAINER: spin-storage-devdb
   DEVDB_PORT: '{{.DEVDB_PORT | default "55432"}}'
-  # The guest kernel is spinbox's, consumed as a built artefact and never as code
-  # (ADR-0021). Override to point somewhere else; storage deliberately does not build
-  # a kernel of its own.
+  # --- the guest kernel (ADR-0021, ADR-0022) ---
+  # storage does not build a kernel: it consumes spinbox's artefact, never its code.
+  # The lane reads it from ONE canonical path, and `task fetch:kernel` puts it there
+  # from whichever source is available. Nothing else resolves a kernel path.
+  GUEST_KERNEL: '{{.OUTPUT_DIR}}/guest/vmlinux'
+  # Pinned by content, the same rule as RUSTFS_IMAGE: "which kernel did the lane
+  # certify" has to have an answer that is not "whatever was in _output that day".
+  # Bump deliberately with `task guest:kernel:pin` and say in the commit why it moved.
+  GUEST_KERNEL_VERSION: 7.1.0
+  GUEST_KERNEL_SHA256: 76524fa7fd541f725265a1721e1a602be3bdb943e793950b76dec2f8e56848e2
+  # Source 1: a sibling spinbox checkout that has already built one (no network).
   SPINBOX_KERNEL: '{{.SPINBOX_KERNEL | default "../spinbox/_output/spinbox-kernel-x86_64"}}'
+  # Source 2: the mirror. Unset by default — nothing is published yet — so the failure
+  # of `task fetch:kernel` on a machine with no spinbox checkout names it as missing
+  # rather than pointing at a registry path that answers 404.
+  GUEST_KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE | default ""}}'
   # Target database for db:plan / db:apply — the local development database by
   # default. Point DB_* at a real one to plan or apply against it; the password
   # comes from the environment (PGPASSWORD), never from a var in this file.
@@ -276,7 +288,7 @@ tasks:
         echo "OK: $("$bin" --version | head -1), vhost-user-blk-pci present, storage daemon + firmware (incl. pvh) in place"
 
   build:guest:
-    desc: Build the initramfs the QEMU lane boots (a static Go /init). Needs the kernel from spinbox — see SPINBOX_KERNEL.
+    desc: Build the initramfs the QEMU lane boots (a static Go /init). The kernel comes from `task fetch:kernel`.
     sources:
       - integration/guestinit/**/*.go
       - hack/build-guest-initramfs.sh
@@ -285,32 +297,60 @@ tasks:
     cmds:
       - OUT_DIR={{.OUTPUT_DIR}}/guest bash hack/build-guest-initramfs.sh
 
+  fetch:kernel:
+    desc: >-
+      Put the pinned guest kernel at _output/guest/vmlinux, from a sibling spinbox
+      checkout or from the mirrored image (ADR-0022). Idempotent; storage never builds one.
+    env: &guest_kernel_env
+      KERNEL: '{{.GUEST_KERNEL}}'
+      KERNEL_SHA256: '{{.GUEST_KERNEL_SHA256}}'
+      KERNEL_VERSION: '{{.GUEST_KERNEL_VERSION}}'
+      SPINBOX_KERNEL: '{{.SPINBOX_KERNEL}}'
+      KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE}}'
+    cmds:
+      - bash hack/guest-kernel.sh fetch
+
   guest:verify:
-    desc: Assert the guest lane's inputs are present — the initramfs we build and the kernel we borrow.
-    deps: [build:guest]
+    desc: Assert the guest lane's inputs — the initramfs we build, and that the kernel is the one we pinned.
+    deps: [build:guest, fetch:kernel]
+    env: *guest_kernel_env
+    cmds:
+      - test -f {{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
+      - bash hack/guest-kernel.sh verify
+
+  guest:kernel:pin:
+    desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
+    env: *guest_kernel_env
+    cmds:
+      - bash hack/guest-kernel.sh pin {{.CLI_ARGS}}
+
+  guest:kernel:push:
+    desc: >-
+      Mirror the pinned kernel into a registry so machines with no spinbox checkout can
+      run the lane (ADR-0022). Usage:
+      task guest:kernel:push GUEST_KERNEL_IMAGE=ghcr.io/<owner>/<repo>/guest-kernel
+      Requires a `docker login` to that registry.
+    deps: [fetch:kernel]
     cmds:
       - |
         set -euo pipefail
-        test -f {{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
-        kernel="{{.SPINBOX_KERNEL}}"
-        test -f "$kernel" || {
-          echo "no kernel at $kernel"
-          echo "storage does not build one (ADR-0021): it consumes spinbox's artefact."
-          echo "  cd ../spinbox && task build:kernel"
-          echo "or point SPINBOX_KERNEL at a bzImage with CONFIG_VIRTIO_BLK=y built in."
-          exit 1; }
-        # The kernel must be an ELF carrying the Xen PVH notes, because that is the
-        # entry point QEMU uses for it (spinbox builds with CONFIG_PVH=y). A bzImage
-        # would need linuxboot_dma.bin, which this tree deliberately does not extract,
-        # and QEMU's failure for either mistake is a rom-open error that reads like a
-        # backend bug.
-        head -c4 "$kernel" | grep -q 'ELF' || {
-          echo "$kernel is not an ELF: the lane boots a PVH kernel, not a bzImage"; exit 1; }
-        if command -v readelf >/dev/null; then
-          readelf -n "$kernel" 2>/dev/null | grep -q 'Xen' || {
-            echo "$kernel has no Xen PVH note: QEMU has no entry point for it (needs CONFIG_PVH=y)"; exit 1; }
-        fi
-        echo "OK: initramfs + PVH kernel ($kernel) ready for the guest lane"
+        test -n "{{.GUEST_KERNEL_IMAGE}}" || {
+          echo "set GUEST_KERNEL_IMAGE=<registry>/<path>/guest-kernel"; exit 1; }
+        # A build context holding exactly the artefact: the image is one file on
+        # scratch, so its digest is a hash of the kernel and of nothing else.
+        ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
+        cp {{.GUEST_KERNEL}} "$ctx/vmlinux"
+        docker buildx build \
+          --file Dockerfile.guest-kernel \
+          --target package \
+          --platform linux/amd64 \
+          --tag {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}} \
+          --tag {{.GUEST_KERNEL_IMAGE}}:sha256-{{.GUEST_KERNEL_SHA256}} \
+          --push \
+          "$ctx"
+        echo
+        echo "pull it back with the digest, not the tag:"
+        echo "  task fetch:kernel GUEST_KERNEL_IMAGE={{.GUEST_KERNEL_IMAGE}}@\$(docker buildx imagetools inspect --format '{{`{{.Manifest.Digest}}`}}' {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}})"
 
   build:qemu:image:
     desc: Build the QEMU runtime image (used by the integration lane, not extracted).
@@ -394,8 +434,20 @@ tasks:
       Boot a real QEMU {{.QEMU_VERSION}} guest against the vhost-user-blk backend
       (Phase 03, increment 3.1; the [Verify] step of RISK-10). Skips with a
       pointer to `task build:qemu` if the pinned QEMU has not been built.
-    deps: [qemu:verify]
     cmds:
+      # The Go tests skip themselves when _output has no QEMU, so this task must not
+      # hard-fail there — `deps: [qemu:verify]` used to, which made `task
+      # test:integration` unrunnable anywhere QEMU had not been built by hand, CI
+      # included. When it *is* built, verifying it is still mandatory: a QEMU that is
+      # present but not the pinned one is the failure this lane exists to notice.
+      - |
+        set -euo pipefail
+        if [ -x {{.OUTPUT_DIR}}/bin/qemu-system-x86_64 ]; then
+          {{.TASK_EXE}} qemu:verify
+        else
+          echo "SKIP: no QEMU in {{.OUTPUT_DIR}} — the lane's tests will skip themselves."
+          echo "      to run them for real: task build:qemu (or pull the published image)"
+        fi
       # -count=1 because the result depends on a binary outside the module: a
       # cached PASS would survive a QEMU rebuild, which is the one thing this
       # lane exists to notice.

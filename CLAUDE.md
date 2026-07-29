@@ -67,6 +67,9 @@ task build:qemu         # build the pinned QEMU (vhost-user-blk) into _output/
 task qemu:verify        # assert the built QEMU is pinned + has vhost-user-blk-pci
 task build:qemu:push    # publish the runtime image (CI does this into GitHub Packages)
 task qemu:version       # print the pinned version — the single source CI tags from
+task fetch:kernel       # put the pinned guest kernel at _output/guest/vmlinux (ADR-0022)
+task build:guest        # build the initramfs the guest lane boots (a static Go /init)
+task guest:verify       # assert the lane's inputs: the initramfs + the pinned kernel
 task backend:conformance # §6.1 object-store conformance suite (blocking per backend)
 ```
 
