@@ -4,9 +4,10 @@
 // client and hand them over — main is the only place in the tree where a real
 // implementation is constructed (INV-01).
 //
-// There is no data path yet. This binary heartbeats, learns what it should be
-// serving, and reports what it observes; attaching a volume to a guest over
-// vhost-user-blk arrives with the next increment.
+// It now carries a data path: one runtime per volume the Control Plane lists for this
+// host, each with its own WAL, block device and vhost-user socket a guest attaches to.
+// What it does not carry yet is the remote half — remote mode needs a lease the Log can
+// trust, and that arrives with the fencing increment.
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
+	"github.com/spin-stack/storage/internal/vhost/hostio"
 )
 
 // version is the build identity the Agent reports. Overridden at link time with
@@ -47,6 +49,7 @@ func run() error {
 		hostID       = flag.String("host-id", "", "fleet identity of this host: a UUIDv7 (required; mint one with `uuidgen` only if it is v7)")
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
 		dataDir      = flag.String("data-dir", "", "directory holding this Agent's WAL and checkpoints (required)")
+		socketDir    = flag.String("vhost-socket-dir", "", "directory this Agent binds one vhost-user socket per volume in (required)")
 		interval     = flag.Duration("heartbeat-interval", 5*time.Second, "reconciliation cadence")
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
@@ -63,6 +66,8 @@ func run() error {
 		return errors.New("-control-plane is required")
 	case *dataDir == "":
 		return errors.New("-data-dir is required")
+	case *socketDir == "":
+		return errors.New("-vhost-socket-dir is required")
 	}
 
 	cfg := agent.Config{
@@ -97,7 +102,34 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	_ = store // the per-volume data path that uses it is the next increment
+	// The store is opened here and not yet handed to the volumes: wal.Log.EnableRemote
+	// needs a LeaseChecker with it, and a Log given an uploader but no lease it can
+	// trust would ACK a FLUSH it has no authority to ACK. Remote mode arrives with the
+	// fencing increment; failing to open the store now still beats discovering it on
+	// the first FLUSH.
+	_ = store
+
+	// One runtime per volume, each with its own WAL, block device and vhost-user
+	// socket. This is what the Agent serves from — before it, the binary heartbeated
+	// about an empty set forever.
+	volumes, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir:   *dataDir,
+		SocketDir: *socketDir,
+	}, agent.VolumeManagerDeps{
+		Clock:   real.NewClock(),
+		Disk:    disk,
+		Listen:  hostio.Listen,
+		Mapper:  hostio.NewMapper(),
+		EventFD: hostio.NewEventFD,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := volumes.Close(); err != nil {
+			slog.Error("stopping the volume runtimes", "error", err)
+		}
+	}()
 
 	loop, err := agent.New(cfg, agent.Deps{
 		Clock: real.NewClock(),
@@ -108,7 +140,7 @@ func run() error {
 		// divide by is the disk's own answer and includes what other tenants of
 		// that filesystem occupy.
 		Device:  agent.NewDiskUsage(disk),
-		Volumes: agent.NewVolumeSet(),
+		Volumes: volumes,
 		// No Recorder: obs has no production exporter yet (the OTLP wiring is a
 		// deploy concern nobody has landed), and a nil Recorder is a working no-op.
 		// Passing obs.NewTestProvider here would export the metrics to memory and
@@ -121,7 +153,8 @@ func run() error {
 
 	slog.Info("volume-agent starting",
 		"host_id", cfg.HostID, "version", version, "control_plane", *cpURL,
-		"data_dir", *dataDir, "heartbeat_interval", cfg.HeartbeatInterval)
+		"data_dir", *dataDir, "vhost_socket_dir", *socketDir,
+		"heartbeat_interval", cfg.HeartbeatInterval)
 
 	if err := loop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err

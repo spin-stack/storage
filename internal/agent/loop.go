@@ -28,10 +28,10 @@ type Deps struct {
 	Recorder     *obs.Recorder
 }
 
-// Loop is the Agent's reconciliation loop: heartbeat, read the desired state,
-// report. It holds no data path — attaching a volume to a guest arrives with the
-// vhost-user increment — so what it does with the desired state is record it, and
-// what it reports is what its VolumeSource observes.
+// Loop is the Agent's reconciliation loop: heartbeat, read the desired state, serve
+// it, report. It owns no data path of its own — a VolumeManager does, and the loop
+// hands it the desired state and reports what it observes afterwards. That split is
+// ADR-0021: spin's runner must be able to take the manager without taking this loop.
 type Loop struct {
 	cfg  Config
 	clk  clock.Clock
@@ -39,6 +39,14 @@ type Loop struct {
 	dev  Device
 	vols VolumeSource
 	rec  *obs.Recorder
+
+	// reconcile is the volume source when it can also be *told* what to serve — a
+	// VolumeManager. It is discovered from Deps.Volumes rather than configured
+	// separately, because the thing that reports what is being served and the thing
+	// that decides what is being served must be the same object or they will disagree.
+	// A plain VolumeSource (agent.VolumeSet, and every test that drives one) leaves it
+	// nil, and the loop then records the desired state without acting on it.
+	reconcile VolumeReconciler
 
 	mu       sync.Mutex
 	lease    *lease.Manager
@@ -71,7 +79,7 @@ func New(cfg Config, deps Deps) (*Loop, error) {
 	case deps.Volumes == nil:
 		return nil, errors.New("agent: a volume source must be injected")
 	}
-	return &Loop{
+	l := &Loop{
 		cfg:  cfg,
 		clk:  deps.Clock,
 		cp:   deps.ControlPlane,
@@ -79,7 +87,11 @@ func New(cfg Config, deps Deps) (*Loop, error) {
 		vols: deps.Volumes,
 		rec:  deps.Recorder,
 		keys: map[string]VolumeKeys{},
-	}, nil
+	}
+	if r, ok := deps.Volumes.(VolumeReconciler); ok {
+		l.reconcile = r
+	}
+	return l, nil
 }
 
 // Run reconciles until ctx is done, returning ctx's error. The first cycle runs
@@ -158,7 +170,18 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 	if err := l.readDesiredState(ctx); err != nil {
 		return err
 	}
-	return l.report(ctx, vols)
+
+	// Re-read before reporting. The set above is what the cycle *started* with, and
+	// readDesiredState has since started and stopped runtimes: reporting the old set
+	// would put every volume one cycle behind, and a volume started and stopped within
+	// a single cycle would never be reported at all. The heartbeat still uses the
+	// earlier picture, and must — it renews the lease, and nothing may come between
+	// that and the instant it was anchored to (§12.2).
+	served, err := l.vols.Volumes(ctx)
+	if err != nil {
+		return fmt.Errorf("agent: reading the served volumes: %w", err)
+	}
+	return l.report(ctx, served)
 }
 
 func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeStatus) error {
@@ -201,10 +224,26 @@ func (l *Loop) readDesiredState(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("agent: reading the desired state: %w", err)
 	}
+	desired := resp.Msg.GetVolumes()
+
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.desired = resp.Msg.GetVolumes()
-	l.forgetKeysOutsideLocked(l.desired)
+	l.desired = desired
+	l.forgetKeysOutsideLocked(desired)
+	reconcile := l.reconcile
+	l.mu.Unlock()
+
+	// Handing the desired state to whatever serves volumes is where this loop stops
+	// being a reporter. It is a separate call and not part of the assignment above
+	// because the lock must not be held across starting a runtime: Apply opens a WAL
+	// and binds a socket, and a heartbeat blocked behind that is a lease not renewed.
+	if reconcile == nil {
+		return nil
+	}
+	if err := reconcile.Apply(ctx, desired); err != nil {
+		// Returned, not swallowed: a volume that could not be started is the whole
+		// reason this Agent exists, and the cycle's backoff is what retries it.
+		return fmt.Errorf("agent: applying the desired state: %w", err)
+	}
 	return nil
 }
 

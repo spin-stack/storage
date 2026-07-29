@@ -6,8 +6,8 @@
 //
 // Everything the loop touches is injected (INV-01): the clock, the RPC client, the
 // device, and the set of volumes this host is serving. cmd/volume-agent is the only
-// place the real implementations are constructed. There is no data path here yet;
-// the vhost-user increment supplies the VolumeSource that a WAL actually backs.
+// place the real implementations are constructed. VolumeManager (volume.go) is the
+// VolumeSource a WAL actually backs, and the loop hands it the desired state.
 package agent
 
 import (
@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
@@ -61,10 +62,23 @@ type VolumeKeys struct {
 	KEKID string
 }
 
-// VolumeSource is the set of volumes this host is serving right now. The data path
-// will implement it over the live WAL; until then VolumeSet stands in.
+// VolumeSource is the set of volumes this host is serving right now. VolumeManager
+// implements it over the live WALs; VolumeSet stands in where there is no data path.
 type VolumeSource interface {
 	Volumes(ctx context.Context) ([]VolumeStatus, error)
+}
+
+// VolumeReconciler is a VolumeSource that can also be told what this host *should* be
+// serving. The Loop uses it when its VolumeSource happens to be one; a plain source
+// leaves the desired state recorded and unacted-on, which is what a test driving
+// VolumeSet wants.
+//
+// It is deliberately the same object as the source. What is reported and what is served
+// must come from one place: two would drift, and the report is what the Control Plane
+// makes fencing decisions from.
+type VolumeReconciler interface {
+	VolumeSource
+	Apply(ctx context.Context, desired []*storagev1.DesiredVolume) error
 }
 
 // VolumeSet is an in-memory VolumeSource. It is what the Agent runs against until

@@ -4,11 +4,13 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-07-28 · **Branch:** everything is on `main`, pushed to `origin`
-  (`/home/aledbf/spin-storage.git`, bare).
-- **Gate:** `task ci` green again on 2026-07-28 — it had been red since `e8bbdab`
-  (DEV-0013, resolved below), which nothing had noticed because nobody had run it.
-  Green *on a developer machine, and nowhere else*: `task cover` 90.6%
+- **Date:** 2026-07-29 · **Branch:** the kernel work and the keystone are on
+  `guest-kernel-pinning`, off `main`; everything before them is on `main`, pushed to
+  `origin` (`/home/aledbf/spin-storage.git`, bare).
+- **Gate:** `task ci` green (2026-07-29, with the keystone in). It had been red since
+  `e8bbdab` until DEV-0013 was resolved on 2026-07-28, which nothing had noticed
+  because nobody had run it.
+  Green *on a developer machine, and nowhere else*: `task cover` 90.4%
   (floor 90 — the margin is thin because increments 0 and 1 added binary wiring that unit
   tests do not reach), `task test:integration` green on PostgreSQL 18,
   `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
@@ -29,38 +31,43 @@ tracks state.
 - **The road to something finished:** `BUILD-INVENTORY.md` — nine increments from here
   to one volume served end to end by real binaries, ordered by dependency, from an
   eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
-  done**; the next one is the keystone.
+  done, and increment 2 — the keystone — is done apart from the three pieces that need
+  a human review first** (`RUNTIME-FENCING-SPEC.md`).
 
 ## Pick up here
 
-The next increment is **BUILD-INVENTORY increment 2, the keystone**: a per-volume
-runtime in `internal/agent/volume.go` owning `{wal.Log, blockdev.Device, vhost.Server}`,
-started and stopped by diffing the desired state in `loop.go`'s `readDesiredState`
-(which today assigns `l.desired` and is read by nothing but a test accessor).
+**The keystone landed on 2026-07-29, minus its review-zone half.**
+`internal/agent/volume.go` holds a `Volume` runtime per volume — `{wal.Log,
+blockdev.Device, vhost.Server}` on its own socket — and a `VolumeManager` that diffs the
+desired state and owns them. `readDesiredState` no longer assigns a field nothing reads:
+it hands the desired state to the manager, and the report that goes back carries what the
+live logs actually observe. `cmd/volume-agent` grew `-vhost-socket-dir` and serves from
+the manager instead of an empty `VolumeSet`.
 
-**Write it as a self-contained type the loop *uses*, never as a method on the loop.**
-That is ADR-0021: spin's runner has to be able to take the same type without the loop,
-its heartbeat, or its Control Plane client. Same work, different shape — free now, a
-refactor later.
+Conventions fixed by it, both asserted by tests: the WAL root is
+`<data-dir>/wal/<volume-id>/<epoch>` (the epoch is in the path so a promoted writer
+cannot append into the segments of the epoch it replaced) and the socket is
+`<socket-dir>/<volume-id>.sock` (no epoch — it is the guest's attachment point and
+survives promotion).
 
-Three things are ready and waiting for it, all verified by execution today:
+**Next: the three review-zone pieces, specified and waiting for a human in
+`RUNTIME-FENCING-SPEC.md`.** Until they land the runtime is local-only: it takes writes
+and serves reads, and `durable_sequence` stays where a WRITE leaves it. In order:
 
-- **A volume exists.** `control-plane -seed-volume -kek-file … -seed-host <uuidv7>`
-  writes the row, the wrapped DEK and the descriptor, so `GetDesiredState` finally
-  answers with something. Run against Postgres 18 and a filesystem store.
-- **The Agent can reach an object store** (`-s3-bucket`/`-object-store-dir`), and it
-  says why when it cannot.
-- **A real Linux guest boots and can issue FLUSH.** `task build:guest` produces the
-  initramfs; `task fetch:kernel` puts the pinned kernel at `_output/guest/vmlinux` and
-  `task guest:verify` checks both. What is missing is only attaching a `vhost-user-blk`
-  device backed by `blockdev.Device` over `wal.Log` — which is what the keystone
-  provides.
+1. **The lease adapter** (fencing) — without it `EnableRemote` is never called, so there
+   is no uploader and no §14.4 ACK path. `main` opens the object store and deliberately
+   does not hand it over.
+2. **`Fenced()` tears the runtime down** (fencing) — resolves DEV-0012. Two decisions in
+   the spec, both about what a guest sees.
+3. **`blockdev.Device.mu` across the S3 PUT** (durability) — today every guest READ
+   blocks on the object store.
 
-A useful first command tonight: `task guest:verify` (it fetches the kernel and says so
-if the artefact no longer matches the pin), then read
-`internal/agent/loop.go:readDesiredState` and
-`integration/vhost/wal_test.go:74-111` — the latter is roughly the first half of the
-keystone, already written out by hand in a test.
+One thing the keystone's first test found and fixed on the way: `Reconcile` reported the
+volume set it had read *before* reconciling, so every volume was one cycle late in the
+Control Plane's view and a volume started and stopped inside one cycle was never reported
+at all. The report now re-reads after `readDesiredState`; the heartbeat still uses the
+earlier picture, and must, because it is anchored to the instant the lease was renewed
+at (§12.2).
 
 ## Maturity, not "done"
 
@@ -73,7 +80,9 @@ keystone, already written out by hand in a test.
 **One path is integrated; nothing is production-verified.** The spine exists — `api/`
 over Connect, an Agent that pulls, two `cmd/` binaries — and a real QEMU 11.0.2 guest
 boots off a device whose bytes come from a `wal.Log`, writing records through the same
-interfaces production would use. That is the **write** half of one volume on one host.
+interfaces production would use, and since the keystone that device is one the *Agent*
+binds and owns rather than one a test assembled. That is the **write** half of one volume
+on one host.
 Everything downstream — FLUSH's ACK path, the uploader, checkpoints, truncation — is
 still exercised only by tests, and there is no deployment.
 
@@ -83,7 +92,7 @@ still exercised only by tests, and there is no deployment.
 |---|---|---|
 | 01 skeleton (simio + DST + obs) | **model** | Simulable interfaces, the DST harness and the metric catalog all exist and are enforced by lint. Metrics are recorded by the paths that own them; wiring continues with each new path. |
 | 02 guest layout (3 devices + OverlayFS) | **not started** | Needs guest mounts / a VM. Nothing in the durability chain depends on it. Spec below. |
-| 03 vhost-user | **3.1 integrated** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). A **Linux** guest now boots the lane too (`task build:guest`) and is ready to issue FLUSH — it just has no device to issue it against until the keystone lands. 3.2 reconnection and 3.3 inflight-shmfd untouched; RISK-10 open. |
+| 03 vhost-user | **3.1 integrated + served by the Agent** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). A **Linux** guest boots the lane too (`task build:guest`). Since the keystone the *Agent* binds a socket per volume and serves `blockdev.Device` behind it, so there is now a device to issue FLUSH against — but only local-mode FLUSH until the lease adapter lands (`RUNTIME-FENCING-SPEC.md`). 3.2 reconnection and 3.3 inflight-shmfd untouched; RISK-10 open. |
 | 04 WAL/CoW format | **write path integrated**, rest model | A guest's WRITE lands as a replayable WAL record with **0 PUTs** (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims (`WAL-SEGMENTS-SPEC.md`). FLUSH / uploader / checkpoint are model-only. Format review still pending (human-review zone). |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
 | 06 remote WAL (batching, idempotent PUT, summary) | **model** | No guest has ever driven a PUT. |
