@@ -35,6 +35,21 @@ func TestExemptVHostHostIO(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/internal/vhost/hostio")
 }
 
+// TestExemptGuestInit asserts the third exemption (DEV-0013): integration/guestinit
+// is PID 1 inside the guest VM, not host code, and it must be able to open a block
+// device and mount /proc. Simulating those would make the one test that proves a real
+// kernel issues FLUSH prove nothing at all.
+func TestExemptGuestInit(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/integration/guestinit")
+}
+
+// TestIntegrationItselfIsNotExempt is the narrowness proof for that third exemption.
+// What earned it is "runs inside the guest", not "lives under integration/" — the
+// host-side lane that drives QEMU is ordinary code and stays simulable.
+func TestIntegrationItselfIsNotExempt(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "notexempt/integration/vhost")
+}
+
 // TestVHostItselfIsNotExempt is the narrowness proof. An exemption that leaked
 // to the parent package would make the whole vhost-user backend — protocol,
 // virtqueue, request handling — unsimulable without anything failing, which is
