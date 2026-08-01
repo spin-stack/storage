@@ -250,6 +250,7 @@ func DefaultCheckers() []Checker {
 	all = append(all, harnessCheckers()...)
 	all = append(all, gcCheckers()...)
 	all = append(all, walCheckers()...)
+	all = append(all, agentCheckers()...)
 	return all
 }
 

@@ -664,6 +664,8 @@ var plantedProofs = map[string]proofKind{
 	// Contributed by scenarios_recovery.go; proofs in planted_bug_recovery_test.go.
 	"boundary-monotonic":      proofBehavioural,
 	"durable-point-monotonic": proofBehavioural,
+	// Contributed by scenarios_agent.go; proof in planted_bug_agent_test.go.
+	"fenced-volume-not-served": proofBehavioural,
 }
 
 // TestEveryCheckerHasAPlantedBugProof fails when a checker is added without one, so
@@ -683,7 +685,7 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 // Converting a literal proof to a behavioural one is progress and raises this number;
 // a checker quietly downgraded to a hand-written Emit is not, and fails here.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 13
+	const wantBehavioural = 14
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {

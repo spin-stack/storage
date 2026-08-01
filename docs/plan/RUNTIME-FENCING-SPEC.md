@@ -149,13 +149,13 @@ round trip stalls every request behind it whatever `blockdev` does. See "Outstan
 
 Two things this increment did not close, both named rather than left implicit.
 
-**A DST arm for item 2 (fencing).** CLAUDE.md makes "code touching durability, fencing or
-GC with no DST scenario" a stop signal. The teardown is covered by unit tests
-(`TestFencedVolumesStopBeingServed`, `TestAFencedVolumeDoesNotComeBackAtTheSameEpoch`) and
-by nothing in `internal/dst`, because the harness models leases, logs and the Control
-Plane but has no notion of `agent.VolumeManager`. Giving it one is its own increment, and
-until it exists the INV-10 single-writer property is proven at the `wal` level and
-asserted — not proven — at the Agent's.
+**~~A DST arm for item 2 (fencing).~~ Closed 2026-08-01.** `internal/dst/scenarios_agent.go`
+drives the real `agent.VolumeManager` on the simulated clock, disk and socket through the
+three moments that decide whether fencing means anything: a volume is served and takes a
+write; its report is refused and the runtime must be gone; the desired state has *not*
+caught up and repeating it must not bring the volume back, while a higher epoch must.
+`FencedVolumeChecker` watches every seed, and its planted bug is the Agent not acting on
+the refusal — DEV-0012 exactly as it stood. INV-10 is now proven at both levels.
 
 **Concurrent request dispatch in `vhost` (durability review zone).** Making a FLUSH stop
 blocking reads means `ProcessQueue` dispatching requests concurrently and completing them

@@ -47,6 +47,7 @@ const (
 	EventSnapshot    EventKind = "snapshot"
 	EventTruncate    EventKind = "truncate"
 	EventIOClass     EventKind = "io-class"
+	EventVolumeServe EventKind = "volume-serve"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -90,6 +91,9 @@ type Event struct {
 	// foreground/flush op was in flight. Granted-while-high must never be true (INV-17).
 	BgGranted    bool
 	HighInFlight bool
+	// VolumeServe events (§16, §12.3): whether the Agent still had something to answer
+	// a fenced volume's requests with. Must always be false (INV-10's Agent half).
+	ServedAfterFence bool
 }
 
 // String renders an event deterministically for the trace.
@@ -115,6 +119,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d snapshot mutated=%t %s", e.Step, e.SnapshotMutated, e.Msg)
 	case EventTruncate:
 		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
+	case EventVolumeServe:
+		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
 	case EventIOClass:
 		return fmt.Sprintf("%04d io-class bg_granted=%t high_in_flight=%t", e.Step, e.BgGranted, e.HighInFlight)
 	case EventObject:

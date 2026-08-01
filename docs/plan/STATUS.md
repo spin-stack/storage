@@ -4,13 +4,13 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-07-29 · **Branch:** the kernel work and the keystone are on
+- **Date:** 2026-08-01 · **Branch:** the kernel work and the keystone are on
   `guest-kernel-pinning`, off `main`; everything before them is on `main`, pushed to
   `origin` (`/home/aledbf/spin-storage.git`, bare).
-- **Gate:** `task ci` green (2026-07-29, with the keystone in). It had been red since
+- **Gate:** `task ci` green (2026-08-01, with the keystone and its review-zone half in). It had been red since
   `e8bbdab` until DEV-0013 was resolved on 2026-07-28, which nothing had noticed
   because nobody had run it.
-  Green *on a developer machine, and nowhere else*: `task cover` 90.4%
+  Green *on a developer machine, and nowhere else*: `task cover` 90.3%
   (floor 90 — the margin is thin because increments 0 and 1 added binary wiring that unit
   tests do not reach), `task test:integration` green on PostgreSQL 18,
   `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
@@ -31,8 +31,10 @@ tracks state.
 - **The road to something finished:** `BUILD-INVENTORY.md` — nine increments from here
   to one volume served end to end by real binaries, ordered by dependency, from an
   eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
-  done, and increment 2 — the keystone — is done apart from the three pieces that need
-  a human review first** (`RUNTIME-FENCING-SPEC.md`).
+  done, and increment 2 — the keystone — is done, review-zone half included**
+  (`RUNTIME-FENCING-SPEC.md` records each decision). Next is increment 3, checkpoint and
+  truncate, which **must not merge before the view-adoption increment** — see the
+  truncation hole below.
 
 ## Pick up here
 
@@ -69,13 +71,14 @@ answers):
    `Log.Write` appends under, which is the property that made the mutex redundant rather
    than load-bearing.
 
-**Two things are open, and both are named in that spec rather than implied:**
+**One is closed, one is open, and both were named in that spec rather than implied:**
 
-- **The fencing teardown has no DST arm.** CLAUDE.md makes fencing code without one a
-  stop signal, and this is it: `internal/dst` models leases, logs and the Control Plane
-  but has no notion of `agent.VolumeManager`. Unit tests cover the behaviour; INV-10 is
-  proven at the `wal` level and only asserted at the Agent's. **Giving the harness an
-  Agent model is the next thing to build.**
+- ~~The fencing teardown has no DST arm.~~ **Closed 2026-08-01.** `internal/dst` now
+  models the Agent: `scenarios_agent.go` drives the real `agent.VolumeManager` on the
+  simulated clock, disk and socket, and `FencedVolumeChecker` watches every seed. Its
+  planted bug is the Agent not acting on the refusal — DEV-0012 as it actually stood —
+  and the event the checker reads is the manager's own answer to "do you still have a
+  device for this volume?", not a hand-written one. INV-10 is now proven at both levels.
 - **A FLUSH still blocks a guest's READs**, and the spec had named the wrong cause. It is
   not the blockdev mutex (removed, with a regression test): `vhost.Device.ProcessQueue`
   serves the ring serially under its own mutex, one request at a time. Concurrent
