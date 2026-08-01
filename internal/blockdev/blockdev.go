@@ -81,7 +81,11 @@ func (d *Device) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	d.log.Read(uint64(off), p)
+	if err := d.log.Read(uint64(off), p); err != nil {
+		// A read that cannot be answered must fail, never return the zeros it happens
+		// to hold: the guest cannot tell those from a range it never wrote.
+		return 0, d.refuse("READ", len(p), off, err)
+	}
 	return len(p), nil
 }
 

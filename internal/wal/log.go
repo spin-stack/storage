@@ -143,6 +143,16 @@ type Log struct {
 	// strict; see OrderPolicy for why the rules sit behind an interface.
 	order OrderPolicy
 
+	// baseWait is non-nil on a log resumed with ResumeAwaitingBase: the read view's
+	// base — everything up to the durable point, recovered from the object store — is
+	// being fetched, and until it arrives this log's view holds only what the local
+	// segments still had. Reads wait on it rather than answering out of a half-built
+	// view, because the wrong answer is *zeros*, indistinguishable from a range nobody
+	// wrote (BUILD-INVENTORY increment 5). Closed exactly once, by InstallBase or
+	// FailBase; baseErr is set by the latter.
+	baseWait chan struct{}
+	baseErr  error
+
 	unflushedBytes    int64
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
@@ -525,10 +535,73 @@ func (l *Log) DiscardedBytes() int64 {
 // Read fills buf from the read view starting at offset (zero where unwritten). It
 // takes the same lock the write path does: the interval map is one structure, and a
 // read racing an Overwrite would see a partly-updated extent, not an older one.
-func (l *Log) Read(offset uint64, buf []byte) {
+// Read fills buf from the volume's read view. Ranges nothing has written read as zero.
+//
+// On a log resumed with ResumeAwaitingBase it blocks until the base has been installed
+// or the attempt has failed, and returns ErrBaseUnavailable in the latter case. That is
+// the whole point of the base: a read answered before it arrives would return zeros for
+// every range whose local segments truncation reclaimed, and a guest cannot tell those
+// zeros from a range it never wrote. Whoever resumes the log owes it exactly one call to
+// InstallBase or FailBase — a log that gets neither leaves its reads waiting forever.
+func (l *Log) Read(offset uint64, buf []byte) error {
+	l.mu.Lock()
+	wait := l.baseWait
+	l.mu.Unlock()
+
+	if wait != nil {
+		<-wait
+		l.mu.Lock()
+		err := l.baseErr
+		l.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("wal: %w: %w", ErrBaseUnavailable, err)
+		}
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.view.Read(offset, buf)
+	return nil
+}
+
+// InstallBase adopts the read view recovered from the object store, under everything the
+// local segments replayed. It is the seam BUILD-INVENTORY increment 5 exists to add:
+// recovery.Recover and materialize.From* have always produced exactly this object and
+// nothing could consume it.
+func (l *Log) InstallBase(base *cow.IntervalMap) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.baseWait == nil {
+		return errors.New("wal: this log was not resumed awaiting a base")
+	}
+	select {
+	case <-l.baseWait:
+		return errors.New("wal: the base has already been resolved")
+	default:
+	}
+	if err := l.view.SetBase(base); err != nil {
+		return fmt.Errorf("wal: installing the base: %w", err)
+	}
+	close(l.baseWait)
+	return nil
+}
+
+// FailBase records that the base could not be recovered. Every subsequent read fails
+// with ErrBaseUnavailable rather than answering zeros — the volume refuses to serve
+// rather than quietly serving a hole where its data is.
+func (l *Log) FailBase(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.baseWait == nil {
+		return
+	}
+	select {
+	case <-l.baseWait:
+		return
+	default:
+	}
+	l.baseErr = err
+	close(l.baseWait)
 }
 
 // Sync makes prior appends durable locally (fdatasync) and clears the unflushed

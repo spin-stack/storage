@@ -1,9 +1,21 @@
 # Spec — a rebuilt read view has no way in (BUILD-INVENTORY increment 5)
 
-**Status: awaiting human review. Not implemented.** Durability *and* format review zone,
-so this is reviewed before the code exists. It is the increment that must land before
-increment 3 (checkpoint and truncate), and `STATUS.md` has said so since the 2026-07-26
-audit — what it did not have until now is a reproduction.
+**Status: reviewed 2026-08-01; the `cow` + `wal` half is implemented, the Agent half is
+not — see "What is left" at the bottom.** Durability *and* format review zone, so it was
+reviewed before the code existed.
+
+**Decisions taken:** (1) the seam goes in `cow.IntervalMap` — the type that owns the
+extents learns about a base layer, so `wal` only needs a way to install one and
+`blockdev` needs no change at all; (2) the base is fetched **lazily**, behind the first
+read; (3) a base that cannot be built makes the volume **refuse loudly** rather than
+answer; (4) *(not asked, taken with reasoning)* a resumed log starts `published` at the
+durable point, because the base's objects are verified — which is what made the
+truncation legal — and INV-13 would otherwise refuse to reclaim ranges the store already
+holds.
+
+This is the increment that must land before increment 3 (checkpoint and truncate), and
+`STATUS.md` has said so since the 2026-07-26 audit — what it did not have until now is a
+reproduction.
 
 ## The hole is real. Here is it happening.
 
@@ -23,9 +35,9 @@ object store. After the restart the volume serves **zeros, with no error anywher
 not a read failure, not a degraded flag, not a log line. A guest sees a hole where its
 data was.
 
-The exact reproduction is at the bottom of this file; it is not committed, because a
-red test in the tree is a broken gate for everyone else. Paste it back as the first
-commit of the implementation.
+The reproduction is at the bottom of this file. It landed as
+`internal/wal/base_adoption_test.go`, inverted: same setup, and now it asserts the data
+comes back.
 
 **Why it did not reproduce on the first try, which matters for the test that lands.**
 With a single record nothing is reclaimed: `segments.reclaim` unlinks only *sealed*
@@ -61,7 +73,7 @@ whole increment: a way in.
 
 ## The decisions this needs
 
-### 1. Where the seam goes
+### 1. Where the seam goes — **DECIDED: in `cow.IntervalMap`**
 
 - **A. A `wal` constructor that adopts a view** — `ResumeWithView(..., base *cow.IntervalMap)`,
   or an option on `Resume`. The Log keeps owning the read view and its locking, which is
@@ -74,11 +86,28 @@ whole increment: a way in.
   range?" query today (`Read` fills zeros for gaps, indistinguishably from written
   zeros — which is the very confusion that produced this bug).
 
-**Recommendation: A.** B cannot tell an unwritten range from a range written as zeros
-without adding that distinction to `IntervalMap`, and adding it is a bigger change than
-A, in a type the format depends on.
+**DECIDED: neither A nor B as written — put the layering in `cow.IntervalMap` itself.**
+That is better than my recommendation of A, and it dissolves the objection to B: the
+distinction between "I hold nothing here" and "this was discarded" belongs to the type
+that owns the extents, and once it exists `wal` needs only a setter and `blockdev` needs
+nothing.
 
-### 2. Who fetches the base, and when
+Implemented as `NewIntervalMapOver` + `SetBase`. `Read` paints the base first and
+overlays this layer on top. `Clear` records a **tombstone** — a span with no data, so
+discarding a terabyte costs one entry — because dropping the layer's extents would
+otherwise uncover the base's older bytes, turning a DISCARD into a resurrection (§14.6).
+Tombstones are recorded from construction, not from the moment a base arrives: a layer
+that replayed a DISCARD before its base was installed would otherwise have recorded
+nothing.
+
+`TestLayeringEqualsFlattening` (rapid) states the whole contract — a layered map answers
+exactly what one map would, had the base's operations and the layer's been applied in
+that order — and it earned its place immediately by finding a real bug: `uncover` built
+its result into `m.cleared[:0]`, and the split case appends two spans for one input, so
+it overwrote the next element of the backing array before reading it. A tombstone
+vanished, and the discarded range read back as the base's data.
+
+### 2. Who fetches the base, and when — **DECIDED: lazy**
 
 Resuming a volume means an object-store walk before the first guest read can be
 answered. Two shapes:
@@ -91,18 +120,22 @@ answered. Two shapes:
   Faster to attach, and it puts object-store latency in the guest's read path — the thing
   §5.3/INV-18 keeps out of the write path.
 
-**Recommendation: eager**, with the recovery time reported. A volume that attaches fast
-and then stalls on a read is harder to operate than one that takes longer to attach.
+**DECIDED: lazy.** The volume is served immediately and only its *reads* wait.
+`wal.ResumeAwaitingBase` returns a log whose `Read` blocks until `InstallBase` or
+`FailBase`, both safe to call from another goroutine. The caller owes it exactly one of
+the two; a log that gets neither leaves its reads waiting for ever, and that is
+documented on the method rather than left to be discovered.
 
-### 3. What happens when the base cannot be built
+### 3. What happens when the base cannot be built — **DECIDED: refuse, loudly**
 
 The object store is unreachable, or an object fails validation. The choices are: refuse
 to start the volume (the guest gets no device), or start it with an empty view (the guest
 gets zeros — today's behaviour, silently).
 
-**Recommendation: refuse, loudly.** This is the whole point of the increment: an empty
-view where data should be is indistinguishable from a fresh volume, and that is what has
-to stop being possible. `Apply` already collects per-volume failures and retries on the
+**DECIDED: refuse, loudly.** `Log.Read` now returns an error, and `FailBase` makes every
+subsequent read fail with `ErrBaseUnavailable`; `blockdev.Device.ReadAt` passes it to the
+guest as IOERR. This is the whole point of the increment: an empty view where data should
+be is indistinguishable from a fresh volume, and that is what has to stop being possible. `Apply` already collects per-volume failures and retries on the
 next cycle, so a store that comes back cures it.
 
 ### 4. Does a resumed Log know it must not truncate below its base?
@@ -111,6 +144,25 @@ next cycle, so a store that comes back cures it.
 sequence N, `published` should start at N rather than 0 — otherwise the first checkpoint
 after a restart re-publishes work already published, and `TruncateLocal` refuses ranges
 it should allow. Needs deciding as part of the constructor's contract.
+
+## What is left: the Agent half
+
+The `cow` and `wal` work is done and green. The Agent's is not, and it is **larger than
+this spec assumed**, because of something found while wiring it:
+
+**`internal/agent/volume.go` calls `wal.NewLog`, never `wal.Resume`. The Agent has never
+resumed a WAL at all.** On a restart it builds an empty log over a root that already has
+segments, leaves them unread, and starts appending at sequence 1. So the Agent half is
+not "fetch a base and install it" — it is:
+
+1. resume rather than create, when the root already holds segments;
+2. use `ResumeAwaitingBase` and kick off `recovery.Recover` in a goroutine;
+3. `InstallBase` on success, `FailBase` on failure — exactly one of the two, always,
+   including on the paths that return early;
+4. decide what a *fresh* volume does, since it has no objects to recover and must not
+   wait for a base that will never come.
+
+That is its own increment and its own review.
 
 ## Tests that must land with it
 

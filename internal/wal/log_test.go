@@ -25,7 +25,9 @@ func TestLogWriteReadBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 13)
-	l.Read(0, buf)
+	if err := l.Read(0, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
 	if !bytes.Equal(buf, []byte("hello\x00\x00\x00world")) {
 		t.Fatalf("read-back mismatch: %q", buf)
 	}
@@ -41,7 +43,9 @@ func TestLogDiscardReadsZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 4)
-	l.Read(0, buf)
+	if err := l.Read(0, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
 	if !bytes.Equal(buf, []byte{1, 0, 0, 4}) {
 		t.Fatalf("discard read-back: %v", buf)
 	}

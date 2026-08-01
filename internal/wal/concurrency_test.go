@@ -159,7 +159,7 @@ func TestConcurrentGuestIOAndAgentCheckpointDoNotRace(t *testing.T) {
 		buf := make([]byte, 512)
 		for i := range 300 {
 			_, _ = l.Write(uint64(i%64)*512, []byte("payload-from-the-guest"), 0)
-			l.Read(uint64(i%64)*512, buf)
+			_ = l.Read(uint64(i%64)*512, buf) // an unlayered log never fails a read
 		}
 	}()
 

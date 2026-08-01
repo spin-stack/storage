@@ -32,9 +32,10 @@ tracks state.
   to one volume served end to end by real binaries, ordered by dependency, from an
   eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
   done, and increment 2 — the keystone — is done, review-zone half included**
-  (`RUNTIME-FENCING-SPEC.md` records each decision). **Next is increment 5, view
-  adoption** — not increment 3: checkpoint/truncate must not merge before it, and the
-  hole it fixes is now reproduced rather than argued (`VIEW-ADOPTION-SPEC.md`).
+  (`RUNTIME-FENCING-SPEC.md` records each decision). **Increment 5, view adoption, is
+  half done** (2026-08-01): the `cow` + `wal` seam exists and the hole is closed at that
+  level; the Agent half is specified and not built (`VIEW-ADOPTION-SPEC.md`). Increment 3
+  still must not merge before it.
 
 ## Pick up here
 
@@ -224,6 +225,14 @@ Today this is latent, because nothing calls `TruncateLocal` in a running system.
 being latent the moment a durability scheduler exists: **a restart would then silently
 serve zeros for every truncated range, with no error anywhere.** None of the nine
 `Resume` tests truncates first, which is why the suite is green.
+
+**Closed in `cow` and `wal` on 2026-08-01; still open in the Agent.** A layered
+`cow.IntervalMap` gives the read view a base, `wal.ResumeAwaitingBase` installs one
+lazily, and a read with no base fails with `ErrBaseUnavailable` instead of answering
+zeros. What is not done is the Agent using any of it — and wiring it turned up that
+**`internal/agent/volume.go` calls `wal.NewLog` and never `wal.Resume`, so the Agent has
+never resumed a WAL at all**: a restart builds an empty log over a root that already
+holds segments and starts appending at sequence 1. See `VIEW-ADOPTION-SPEC.md`.
 
 **Reproduced 2026-08-01**, and it behaves exactly as described: six segments, flush,
 publish, truncate (five files unlinked), restart — and `Read` at offset 0 returns zeros

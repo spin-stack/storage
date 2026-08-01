@@ -423,7 +423,9 @@ func walCrashArm(s *Sim, boundary walCrashBoundary, reclaimAboveThePoint bool) e
 		}
 		want := payload(int(rec.Sequence) - 1)
 		got := make([]byte, len(want))
-		resumed.Read(rec.Offset, got)
+		if err := resumed.Read(rec.Offset, got); err != nil {
+			return err
+		}
 		if string(got) != string(want) {
 			return fmt.Errorf("crash %s: the read view at offset %d returned %q, want %q",
 				boundary, rec.Offset, got, want)

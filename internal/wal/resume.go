@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -14,6 +15,13 @@ import (
 // reused volume directory, a path bug — would apply another writer's records to this
 // volume's extents and count them in this epoch's sequence space.
 var ErrForeignEpoch = errors.New("wal: the WAL holds records from another epoch")
+
+// ErrBaseUnavailable is returned by every Read on a log whose base — the read view
+// recovered from the object store — could not be built. The volume refuses to answer
+// rather than serving zeros for ranges truncation has reclaimed locally: a guest cannot
+// tell those zeros from a range it never wrote, which is the failure BUILD-INVENTORY
+// increment 5 exists to make impossible.
+var ErrBaseUnavailable = errors.New("wal: the read view's base could not be recovered")
 
 // ErrForeignVolume means the WAL holds records or segments belonging to another
 // volume. It is the check that has no fallback: an encrypted volume's payloads are
@@ -53,7 +61,36 @@ type resumedRecord struct {
 // after it cannot be read, and silently resuming at that point would drop them without
 // saying so.
 func Resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption) (*Log, error) {
+	return resume(d, root, clk, volumeID, epoch, durableInS3, limits, enc, false)
+}
+
+// ResumeAwaitingBase is Resume for a WAL whose local segments may have been truncated:
+// the log's read view is layered, its reads block until InstallBase or FailBase, and
+// `published` starts at the durable point rather than 0.
+//
+// That last part is a durability rule, not bookkeeping. The base covers everything up to
+// durableInS3 and those objects are verified — that is what made the truncation legal in
+// the first place — so `published` must say so, or StrictOrder.AllowTruncate (INV-13)
+// would refuse to reclaim ranges the object store already holds and the first checkpoint
+// after a restart would republish work already published.
+//
+// The caller owes the returned log exactly one InstallBase or FailBase. Both are safe to
+// call from another goroutine, which is what makes the fetch lazy: the volume is served
+// immediately and only its *reads* wait.
+func ResumeAwaitingBase(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption) (*Log, error) {
+	return resume(d, root, clk, volumeID, epoch, durableInS3, limits, enc, true)
+}
+
+func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption, awaitBase bool) (*Log, error) {
 	l := NewLogAfter(d, root, clk, volumeID, epoch, durableInS3, limits)
+	if awaitBase {
+		// Layered from the start, before a single record replays: a DISCARD replayed
+		// into an unlayered view records no tombstone, and the base installed
+		// afterwards would uncover exactly the range the guest discarded.
+		l.view = cow.NewIntervalMapOver(nil)
+		l.baseWait = make(chan struct{})
+		l.published = durableInS3
+	}
 	l.enc = enc
 	l.replayed = true
 

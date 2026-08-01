@@ -110,7 +110,9 @@ func TestResumeContinuesTheSequenceSpaceAndTheView(t *testing.T) {
 	}
 	for i, p := range payloads {
 		buf := make([]byte, len(p))
-		resumed.Read(uint64(i)*64, buf)
+		if err := resumed.Read(uint64(i)*64, buf); err != nil {
+			t.Fatalf("read: %v", err)
+		}
 		if string(buf) != p {
 			t.Fatalf("resumed read at %d = %q, want %q", i*64, buf, p)
 		}
@@ -151,7 +153,9 @@ func TestResumeRebuildsAnEncryptedView(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 	buf := make([]byte, len(secret))
-	resumed.Read(0, buf)
+	if err := resumed.Read(0, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
 	if !bytes.Equal(buf, secret) {
 		t.Fatalf("resumed read = %q, want the plaintext %q", buf, secret)
 	}

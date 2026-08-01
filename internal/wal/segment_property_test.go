@@ -161,7 +161,9 @@ func TestWALSegmentReplayProperty(t *testing.T) {
 		want := wal.ApplyAll(accepted[k:])
 		for _, r := range recs {
 			buf := make([]byte, max(int(r.Length), 1))
-			resumed.Read(r.Offset, buf)
+			if err := resumed.Read(r.Offset, buf); err != nil {
+				t.Fatalf("read: %v", err)
+			}
 			model := make([]byte, len(buf))
 			readModel(want, r.Offset, model)
 			if string(buf) != string(model) {

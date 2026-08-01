@@ -1166,7 +1166,9 @@ func scenarioWALWritePathNoPut(s *Sim) error {
 	// Read-back matches the last write at each offset.
 	for off, want := range written {
 		buf := make([]byte, len(want))
-		l.Read(off, buf)
+		if err := l.Read(off, buf); err != nil {
+			return err
+		}
 		if !bytes.Equal(buf, want) {
 			return fmt.Errorf("read-back at %d: got %q want %q", off, buf, want)
 		}

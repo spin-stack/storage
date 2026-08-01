@@ -55,7 +55,9 @@ func TestEncryptedWALIsCiphertextButReadsPlaintext(t *testing.T) {
 
 	// Live read through the log: plaintext.
 	buf := make([]byte, len(canary))
-	l.Read(0, buf)
+	if err := l.Read(0, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
 	if !bytes.Equal(buf, canary) {
 		t.Fatalf("live read should be plaintext, got %q", buf)
 	}
