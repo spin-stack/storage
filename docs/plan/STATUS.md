@@ -32,9 +32,9 @@ tracks state.
   to one volume served end to end by real binaries, ordered by dependency, from an
   eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
   done, and increment 2 — the keystone — is done, review-zone half included**
-  (`RUNTIME-FENCING-SPEC.md` records each decision). Next is increment 3, checkpoint and
-  truncate, which **must not merge before the view-adoption increment** — see the
-  truncation hole below.
+  (`RUNTIME-FENCING-SPEC.md` records each decision). **Next is increment 5, view
+  adoption** — not increment 3: checkpoint/truncate must not merge before it, and the
+  hole it fixes is now reproduced rather than argued (`VIEW-ADOPTION-SPEC.md`).
 
 ## Pick up here
 
@@ -224,6 +224,15 @@ Today this is latent, because nothing calls `TruncateLocal` in a running system.
 being latent the moment a durability scheduler exists: **a restart would then silently
 serve zeros for every truncated range, with no error anywhere.** None of the nine
 `Resume` tests truncates first, which is why the suite is green.
+
+**Reproduced 2026-08-01**, and it behaves exactly as described: six segments, flush,
+publish, truncate (five files unlinked), restart — and `Read` at offset 0 returns zeros
+where `0xAB` was written, ACKed durable and verified in the store. No error, no degraded
+flag, no log line. **`VIEW-ADOPTION-SPEC.md`** carries the reproduction and the four
+decisions the fix needs; it is a durability *and* format review zone, so it waits for a
+human. Note it did not reproduce on the first attempt: `reclaim` unlinks only *sealed*
+segments, so a test must use a small `SegmentBytes` and assert a file actually
+disappeared — which is how nine tests missed it.
 
 **Consequence for the build order: the checkpoint/truncate increment must not merge
 without the view-adoption increment** (`BUILD-INVENTORY.md`, increments 3 and 5).
