@@ -21,8 +21,9 @@ func pattern(seed byte, n int) []byte {
 }
 
 // TestServeReadWriteFlush is the increment's objective in one table: the three
-// request types §30.3 names, driven through a real descriptor chain by the
-// simulated front-end and completed against the backend.
+// request types this backend serves (virtio 1.2 §5.2.6 — IN, OUT, FLUSH), driven
+// through a real descriptor chain by the simulated front-end and completed against
+// the backend.
 func TestServeReadWriteFlush(t *testing.T) {
 	tests := []struct {
 		name string

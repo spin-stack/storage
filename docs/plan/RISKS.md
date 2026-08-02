@@ -150,7 +150,7 @@ Measurements worth keeping, all of them things the specification did not say:
   not the 60 of `struct virtio_blk_config`. The backend fills 60 and zero-fills up to the
   protocol's 256-byte maximum, which is what makes this a non-event.
 - `SET_VRING_NUM` is **128**, matching QEMU's `vhost-user-blk` `queue-size` default and
-  the depth §30.3 fixes. The lane asserts this so a default change surfaces as a named
+  the depth §4 fixes. The lane asserts this so a default change surfaces as a named
   failure rather than a connection that dies mid-handshake.
 - QEMU sends **`SET_VRING_ERR`**, which the simulated front-end did not, and never sends
   `GET_QUEUE_NUM`, which the simulated front-end did.

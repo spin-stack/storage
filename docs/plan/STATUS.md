@@ -643,6 +643,28 @@ a row.
 **ADR-0013 is deliberately untouched** and remains the open question under "Decisions
 waiting on a human".
 
+## Misdirected `§` citations, corrected 2026-08-02
+
+Following a citation from the code now lands on text that supports the comment. Two
+patterns, both found by sampling references against the document rather than by reading
+the comments:
+
+- **`§30.3` was doing work it cannot do.** It is a *roadmap item* ("vhost-user-blk with
+  raw backend + reconnection + inflight shmfd"), and fifteen comments cited it for the
+  single-queue decision and the 128 queue depth — including `features.go`'s "§30.3 is
+  explicit about a single queue", which it is not, and a **runtime error string** in
+  `device.go`. Those facts live in §4's decision table (`| Queues | Una |`,
+  `| Queue depth | 128 |`) and, for multi-queue as a non-objective, in §3. The four
+  places where the roadmap item genuinely *is* the subject keep the citation.
+- **`§26.4` does not exist.** §26 has 26.1, 26.2 and 26.3 and stops. Both citers meant
+  §23's "PostgreSQL caído", which is the passage that actually says Agents keep serving
+  while the Control Plane is unreachable. No DEV was opened: a mistyped citation is not
+  a doc↔code divergence, and an open DEV would block the gate for a typo.
+
+Also corrected: `.github/workflows/ci.yml` said the QEMU lane "runs on a developer
+machine only" and that STATUS.md carried an open decision about it — contradicted by the
+`guest-lane` job seventy lines above it in the same file.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,

@@ -447,10 +447,10 @@ func TestQEMUPerformsTheHandshakeWeImplemented(t *testing.T) {
 		index := binary.LittleEndian.Uint32(p[0:4])
 		num := binary.LittleEndian.Uint32(p[4:8])
 		if index != 0 {
-			t.Errorf("SET_VRING_NUM for queue %d; this backend serves one queue (§30.3)", index)
+			t.Errorf("SET_VRING_NUM for queue %d; this backend serves one queue (§4)", index)
 		}
 		// QEMU's vhost-user-blk `queue-size` property defaults to 128, which is
-		// the depth §30.3 fixes. This asserts the two still agree: a default
+		// the depth §4 fixes. This asserts the two still agree: a default
 		// change would otherwise show up as a connection that dies at
 		// SET_VRING_NUM with no explanation.
 		if num != vhost.MaxQueueSize {

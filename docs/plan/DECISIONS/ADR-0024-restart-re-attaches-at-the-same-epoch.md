@@ -82,9 +82,9 @@ the decision is only as good as they are:
 
 Bumping the epoch on every restart means a restart cannot complete without the Control
 Plane: a CAS on the epoch object, a `BumpVolumeEpoch` under a valid CP term, and a fresh
-lease grant. §26.4 wants Agents to survive a Control Plane outage; this would make the
-one moment an Agent is most fragile — coming back up — depend on the one component the
-design assumes can be down. It also drags in `FENCING_WAIT`, which exists to bound a
+lease grant. §23's "PostgreSQL caído" wants Agents to survive a Control Plane outage;
+this would make the one moment an Agent is most fragile — coming back up — depend on the
+one component the design assumes can be down. It also drags in `FENCING_WAIT`, which exists to bound a
 writer that may still be alive on *another* host, and buys nothing when the previous
 incarnation is a dead PID on this one.
 

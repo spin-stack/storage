@@ -48,7 +48,8 @@ func has(mask uint64, n uint) bool { return mask&bit(n) != 0 }
 //     backend's completion, and getting it wrong loses a completion — the guest
 //     hangs. Flow control is not what Increment 3.1 is proving.
 //   - VIRTIO_F_RING_PACKED is not offered: this backend walks split rings only.
-//   - VIRTIO_BLK_F_MQ is not offered. §30.3 is explicit about a single queue at
+//   - VIRTIO_BLK_F_MQ is not offered. §4's decision table fixes a single queue, and
+//     §3 lists multi-queue among the MVP's non-objectives, at
 //     depth 128; a queue count the backend does not serve is a lie the guest
 //     acts on.
 //   - VIRTIO_BLK_F_DISCARD / WRITE_ZEROES are still not offered, and the WAL

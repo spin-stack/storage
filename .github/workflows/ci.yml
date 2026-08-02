@@ -162,10 +162,10 @@ jobs:
       # TestContainers Postgres integration; ubuntu runners have Docker.
       #
       # The QEMU guest lane is inside this target and skips loudly when _output holds
-      # no QEMU — which is the case here: qemu.yml builds and publishes it on its own
-      # schedule (tens of minutes), and this workflow does not pull it. That lane
-      # therefore runs on a developer machine only; STATUS.md carries the decision
-      # that is still open about giving CI a QEMU.
+      # no QEMU — which is the case in *this* job: qemu.yml builds and publishes the
+      # image on its own schedule (tens of minutes), and this job does not pull it.
+      # The lane runs in the `guest-lane` job above instead, inside that published
+      # image (ADR-0025), so it is covered here by skipping rather than by absence.
       - name: Integration (TestContainers Postgres)
         run: task test:integration
 

@@ -563,7 +563,7 @@ func lapsedLeaseStopsPublishing(s *Sim, cacheTheLease bool) error {
 	s.Notef("volume %s: %d checkpoint(s) published while the lease was valid", volumeID, underLease)
 
 	// The lease lapses. Nothing renews it — a partitioned Agent, a Control Plane that
-	// cannot reach Postgres (§26.4). The host is SELF_FENCED on its own monotonic clock,
+	// cannot reach Postgres (§23, "PostgreSQL caído"). The host is SELF_FENCED on its own monotonic clock,
 	// with no message from anyone.
 	s.Tick(leaseTTL + time.Second)
 	if lm.Valid() {

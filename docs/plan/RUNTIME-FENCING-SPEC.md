@@ -161,7 +161,7 @@ the refusal — DEV-0012 exactly as it stood. INV-10 is now proven at both level
 blocking reads means `ProcessQueue` dispatching requests concurrently and completing them
 out of order. virtio allows it — the used ring carries each chain's head index — but it
 is a real data-path change: the used-ring publication needs its own lock, workers need
-bounding (the ring is ≤128 by §30.3, so it bounds itself), and in-flight requests at a
+bounding (the ring is ≤128 by §4, so it bounds itself), and in-flight requests at a
 session error interact directly with increment 3.3's inflight-shmfd tracking and RISK-10.
 It needs its own spec and its own review; it is not a follow-on edit to this one.
 

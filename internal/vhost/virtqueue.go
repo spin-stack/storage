@@ -14,7 +14,7 @@ import (
 // addresses it invented.
 var ErrRing = errors.New("vhost: malformed virtqueue")
 
-// MaxQueueSize is the queue depth §30.3 fixes for Phase 03: one queue, 128
+// MaxQueueSize is the queue depth §4's decision table fixes: one queue, 128
 // entries. It also bounds the descriptor chain walk, so a ring whose `next`
 // pointers form a cycle terminates with ErrRing instead of spinning.
 const MaxQueueSize = 128

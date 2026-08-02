@@ -92,7 +92,7 @@
 // wal.Log is not safe for concurrent use, and vhost.Backend does not promise its
 // methods are called from one goroutine. Every method here therefore holds one mutex
 // for the whole request. That serializes the guest's queue against itself, which is
-// what §30.3's single queue does anyway — but it does *not* protect the Log from a
+// what §4's single queue does anyway — but it does *not* protect the Log from a
 // caller that also holds it (a checkpointer, the Agent's reporter). Whoever owns the
 // Log owns that coordination; this device does not take ownership of it, and does not
 // close it.

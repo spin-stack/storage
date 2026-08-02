@@ -16,7 +16,7 @@ type Config struct {
 	// Mapper turns the front-end's memory-region descriptors into host memory.
 	Mapper Mapper
 	// QueueSize is the queue depth advertised to the front-end. Zero means
-	// MaxQueueSize (128, §30.3).
+	// MaxQueueSize (128, §4).
 	QueueSize uint16
 	// Serial answers VIRTIO_BLK_T_GET_ID. Truncated to 20 bytes.
 	Serial string
@@ -40,7 +40,7 @@ type Config struct {
 }
 
 // Device is one vhost-user connection's worth of state: the negotiated
-// features, the mapped guest memory, and the single virtqueue §30.3 fixes.
+// features, the mapped guest memory, and the single virtqueue §4 fixes.
 //
 // Every method is safe to call from the message loop and the queue loop at the
 // same time; there is exactly one of each.
@@ -241,7 +241,8 @@ func (d *Device) dispatch(ctx context.Context, m Message) (*Message, error) {
 		return nil, nil
 
 	case ReqGetQueueNum:
-		// One queue, as §30.3 fixes. VIRTIO_BLK_F_MQ is not offered, so a
+		// One queue, as §4 fixes and §3 lists multi-queue as a non-objective.
+		// VIRTIO_BLK_F_MQ is not offered, so a
 		// conforming front-end will not ask; answering honestly costs nothing.
 		return m.replyU64(1), nil
 
@@ -545,7 +546,7 @@ func (d *Device) setVringEnable(m Message) error {
 // checkIndex rejects any queue but the single one this backend serves.
 func checkIndex(i uint32) error {
 	if i != 0 {
-		return fmt.Errorf("%w: queue index %d, but this backend serves one queue (§30.3)", ErrProtocol, i)
+		return fmt.Errorf("%w: queue index %d, but this backend serves one queue (§4)", ErrProtocol, i)
 	}
 	return nil
 }

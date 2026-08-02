@@ -71,7 +71,7 @@ func TestHandshakeReachesReady(t *testing.T) {
 	})
 	t.Run("GET_QUEUE_NUM answers one queue", func(t *testing.T) {
 		if got := binary.LittleEndian.Uint64(replies[ReqGetQueueNum].Payload); got != 1 {
-			t.Fatalf("queue count %d, want 1 (§30.3)", got)
+			t.Fatalf("queue count %d, want 1 (§4)", got)
 		}
 	})
 	t.Run("GET_CONFIG reports the backend's capacity in sectors", func(t *testing.T) {
