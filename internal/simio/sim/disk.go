@@ -40,6 +40,10 @@ type Disk struct {
 	capacity map[string]int64
 	// budget is the size of the whole simulated device, or 0 for "never declared".
 	budget int64
+	// locks are the names currently held (DEV-0014). One sim.Disk is one host's
+	// filesystem, so the set living on the Disk is the model: two callers of the same
+	// Disk are two processes on one host, and the second must be refused.
+	locks map[string]bool
 }
 
 type content struct {
@@ -359,3 +363,36 @@ func (f *simFile) Size() (int64, error) {
 }
 
 func (f *simFile) Close() error { return nil }
+
+// Lock takes an exclusive, non-blocking lock on name.
+func (d *Disk) Lock(name string) (io.Closer, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.locks == nil {
+		d.locks = map[string]bool{}
+	}
+	if d.locks[name] {
+		return nil, fmt.Errorf("%w: %s", disk.ErrLocked, name)
+	}
+	d.locks[name] = true
+	return &simLock{d: d, name: name}, nil
+}
+
+// simLock releases on Close, and only once: a double Close must not free a lock a
+// *later* caller has since taken, which is the shape of every use-after-free.
+type simLock struct {
+	d      *Disk
+	name   string
+	closed bool
+}
+
+func (l *simLock) Close() error {
+	l.d.mu.Lock()
+	defer l.d.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+	delete(l.d.locks, l.name)
+	return nil
+}

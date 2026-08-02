@@ -4,7 +4,10 @@
 // synced may be lost. Production code depends on Disk/File, never on os directly.
 package disk
 
-import "errors"
+import (
+	"errors"
+	"io"
+)
 
 // ErrNotExist is returned when opening or renaming a missing file.
 var ErrNotExist = errors.New("simio/disk: file does not exist")
@@ -20,6 +23,10 @@ var ErrNotExist = errors.New("simio/disk: file does not exist")
 // on this interface the only portable test is the error's message, which is a string
 // comparison in the durability path.
 var ErrNoSpace = errors.New("simio/disk: no space left on device")
+
+// ErrLocked means another live process holds the lock. It is not a transient
+// condition to retry: it is the answer to "may I own this directory?", and it is no.
+var ErrLocked = errors.New("simio/disk: the lock is held by another process")
 
 // Usage is the state of the device backing a Disk: what statfs answers, in bytes.
 //
@@ -72,6 +79,20 @@ type Disk interface {
 	// the real implementation is a single statfs, which does not block on I/O and
 	// cannot be cancelled halfway.
 	Usage() (Usage, error)
+	// Lock takes an exclusive, non-blocking lock on name, creating it if needed, and
+	// returns a handle whose Close releases it. ErrLocked means another *process*
+	// holds it (§10: "un proceso por host", DEV-0014).
+	//
+	// Non-blocking is the design, not a convenience: a caller that blocked would hang
+	// with no output instead of exiting with a message naming the directory, and
+	// "started but wedged" is harder to diagnose than "refused to start".
+	//
+	// The lock is owned by the open file description, so the kernel releases it when
+	// the process dies by any means. That is what makes it usable for a data
+	// directory at all: a `kill -9` leaves nothing to clean up, and the next
+	// incarnation starts (ADR-0024). A lock needing explicit release would trade one
+	// bug for a worse one — an Agent that will not come back after a crash.
+	Lock(name string) (io.Closer, error)
 }
 
 // File is an append-only file with random reads and durable sync.

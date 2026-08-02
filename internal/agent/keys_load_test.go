@@ -11,6 +11,7 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
@@ -138,5 +139,65 @@ func TestAKMSNeedsASourceOfKeys(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a manager with a KMS and no key source was accepted")
+	}
+}
+
+// TestOneAgentPerDataDir is DEV-0014 at the manager's own seam. The e2e lane proves it
+// between two real processes with a real flock; this proves the manager takes the lock
+// at all, and gives it back — which is what makes a supervisor's stop-then-start work.
+//
+// §10 opens with "un proceso por host" and nothing enforced it: two Agents on one
+// directory both resume the same segment files and both append to them, and
+// hostio.Listen unlinks a stale socket before binding, so the second steals the guest
+// from the first rather than failing to bind.
+func TestOneAgentPerDataDir(t *testing.T) {
+	d := sim.NewDisk()
+	newManager := func() (*agent.VolumeManager, error) {
+		return agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+		}, agent.VolumeManagerDeps{
+			Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+			Disk:    d,
+			Listen:  newListenerFactory().listen,
+			Mapper:  unusedMapper{},
+			EventFD: unusedEventFD,
+		})
+	}
+
+	first, err := newManager()
+	if err != nil {
+		t.Fatalf("the first manager: %v", err)
+	}
+	if _, err := newManager(); !errors.Is(err, disk.ErrLocked) {
+		t.Fatalf("a second manager on the same data directory: want ErrLocked, got %v", err)
+	}
+
+	// Released by Close, or a supervisor could never restart an Agent in place.
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := newManager()
+	if err != nil {
+		t.Fatalf("after the holder closed: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A different directory on the same host is a different claim.
+	other, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin-other", SocketDir: "/run/spin",
+	}, agent.VolumeManagerDeps{
+		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+		Disk:    d,
+		Listen:  newListenerFactory().listen,
+		Mapper:  unusedMapper{},
+		EventFD: unusedEventFD,
+	})
+	if err != nil {
+		t.Fatalf("a different data directory must be claimable: %v", err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

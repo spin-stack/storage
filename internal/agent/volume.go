@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path"
 	"sort"
@@ -153,6 +154,13 @@ func (f leaseFunc) Valid() bool { return f() }
 // VolumeManagerConfig is where this host keeps things.
 type VolumeManagerConfig struct {
 	// DataDir holds the WALs: <data-dir>/wal/<volume-id>/<epoch>.
+	//
+	// It is a path *inside the injected Disk's namespace*, not a host path, and the
+	// difference has bitten once already: production roots its real.Disk at the
+	// operator's --data-dir, so passing the same absolute path here produced
+	// <data-dir>/<data-dir>/wal/... — every byte the Agent wrote was one level below
+	// where its operator was told to look. A rooted Disk wants "." here; a Disk
+	// spanning a whole filesystem (every test, and the DST harness) wants the path.
 	DataDir string
 	// SocketDir holds one vhost-user socket per volume: <socket-dir>/<volume-id>.sock.
 	SocketDir string
@@ -225,6 +233,9 @@ type VolumeManager struct {
 	// higher epoch is the Control Plane granting the volume again.
 	fencedEpoch map[string]int64
 	closed      bool
+	// lock is this host's claim on DataDir (DEV-0014). Held for the manager's life
+	// and released by Close.
+	lock io.Closer
 }
 
 // NewVolumeManager validates the wiring and returns a manager with nothing running.
@@ -256,12 +267,33 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		// Control Plane problem. It is a wiring problem, and it is visible here.
 		return nil, errors.New("agent: a KMS needs a source of wrapped volume keys (§15.1)")
 	}
+	// §10 opens with "un proceso por host", and until now nothing enforced it. Two
+	// Agents against one data directory both resume the same segment files and both
+	// append to them, and `hostio.Listen` unlinks a stale socket before binding — so
+	// the second silently steals the guest from the first rather than failing to bind.
+	// The lock is taken here rather than in `main` because this type owns DataDir, and
+	// because a step left to `main` is a step spin's runner will not inherit (ADR-0021)
+	// — which is exactly how HostID went missing until an e2e lane read the log line
+	// about it.
+	lock, err := deps.Disk.Lock(path.Join(cfg.DataDir, lockFile))
+	if err != nil {
+		if errors.Is(err, disk.ErrLocked) {
+			return nil, fmt.Errorf("agent: another Volume Agent is already using %s (§10: one Agent per host): %w",
+				cfg.DataDir, err)
+		}
+		return nil, fmt.Errorf("agent: claiming %s: %w", cfg.DataDir, err)
+	}
 	return &VolumeManager{
-		cfg: cfg, deps: deps,
+		cfg: cfg, deps: deps, lock: lock,
 		volumes:     map[string]*Volume{},
 		fencedEpoch: map[string]int64{},
 	}, nil
 }
+
+// lockFile is what this Agent claims inside its data directory. Its *contents* are
+// never read: a pid in it would be a liveness check the kernel already performs, with
+// the classic race (read pid, process dies, pid is reused) this deliberately avoids.
+const lockFile = "agent.lock"
 
 // Apply makes the running set match desired: start what is new, stop what left, and
 // replace what was promoted to a new epoch.
@@ -663,6 +695,13 @@ func (m *VolumeManager) Close() error {
 	for _, id := range ids {
 		if err := m.remove(id); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	// Released last, after every runtime is down: while any of them is still writing,
+	// this Agent still owns the directory.
+	if m.lock != nil {
+		if err := m.lock.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("agent: releasing %s: %w", m.cfg.DataDir, err))
 		}
 	}
 	return errors.Join(errs...)

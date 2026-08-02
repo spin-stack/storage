@@ -848,9 +848,13 @@ func agentEncryptsWhatLeavesTheHost(s *Sim, withoutKEK bool) error {
 
 	lm := lease.NewManager(s.Clock, time.Minute)
 	lm.Grant()
-	newManager := func(honest bool) (*agent.VolumeManager, error) {
+	// A data directory per manager. The second one below is a *different* Agent, and
+	// since DEV-0014 a manager claims its directory exclusively (§10: one Agent per
+	// host) — two sharing one would be the corruption that lock exists to prevent,
+	// not a convenience.
+	newManager := func(honest bool, dataDir string) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
-			DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+			DataDir: dataDir, SocketDir: "/run/spin",
 			Limits: wal.Limits{SegmentBytes: 8192},
 			HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
 		}, agent.VolumeManagerDeps{
@@ -870,7 +874,7 @@ func agentEncryptsWhatLeavesTheHost(s *Sim, withoutKEK bool) error {
 		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}
 
-	m, err := newManager(true)
+	m, err := newManager(true, "/var/lib/spin")
 	if err != nil {
 		return err
 	}
@@ -947,7 +951,7 @@ func agentEncryptsWhatLeavesTheHost(s *Sim, withoutKEK bool) error {
 	// The other half: a key this host cannot unwrap serves nothing. A different volume
 	// id, because the first one's runtime is still up.
 	badID := ids.NewAt(simEpoch*1000, s.Rand).String()
-	m2, err := newManager(false)
+	m2, err := newManager(false, "/var/lib/spin-second")
 	if err != nil {
 		return err
 	}

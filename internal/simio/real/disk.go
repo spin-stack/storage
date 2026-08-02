@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
@@ -223,3 +225,52 @@ func (r *realFile) Size() (int64, error) {
 }
 
 func (r *realFile) Close() error { return r.f.Close() }
+
+// Lock takes an exclusive, non-blocking flock on name inside this Disk's root
+// (DEV-0014, §10 "un proceso por host").
+//
+// The lock belongs to the open file description, which is why the returned Closer
+// keeps the *os.File alive: closing the file is what releases the lock, and letting
+// it be garbage-collected would release it while the caller still believed it held
+// the directory. It is also why nothing here has to clean up after a crash — the
+// kernel drops the lock when the process dies, so the next start is unblocked.
+func (d *Disk) Lock(name string) (io.Closer, error) {
+	path := d.path(name)
+	// The parent, like Create makes: a lock is taken before anything else exists, so
+	// requiring the directory first would mean every caller creating it by hand — and
+	// the sim, where a name needs no parent at all, would silently disagree.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("simio/real: creating the directory for %q: %w", path, err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("simio/real: opening the lock file %q: %w", path, err)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w: %s", disk.ErrLocked, path)
+		}
+		return nil, fmt.Errorf("simio/real: locking %q: %w", path, err)
+	}
+	return &fileLock{f: f}, nil
+}
+
+// fileLock makes Close idempotent. *os.File returns ErrClosed on a second Close and the
+// simulated lock returns nil, and a contract the two implementations answer differently
+// is a contract neither can be relied on for — a caller with a `defer unlock()` and an
+// explicit release on the happy path is ordinary, and must not have to care which Disk
+// it was handed.
+type fileLock struct {
+	f      *os.File
+	closed bool
+}
+
+func (l *fileLock) Close() error {
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+	// Closing the descriptor is what releases the flock; there is no separate unlock.
+	return l.f.Close()
+}

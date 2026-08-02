@@ -248,3 +248,63 @@ func TestSimSyncLossThenCrashLosesData(t *testing.T) {
 		t.Fatalf("lost sync + crash must lose data, got size %d", sz)
 	}
 }
+
+// The lock is DEV-0014's primitive: §10 assumes "un proceso por host" and nothing
+// enforced it, so two Agents on one --data-dir both resumed the same segment files and
+// both appended to them. Every property below is one the Agent depends on, and both
+// implementations must have all of them or the simulation is modelling a different
+// world from the one that ships.
+func TestLock(t *testing.T) {
+	for name, d := range impls(t) {
+		t.Run(name, func(t *testing.T) {
+			held, err := d.Lock("data/agent.lock")
+			if err != nil {
+				t.Fatalf("first lock: %v", err)
+			}
+
+			// Exclusive, and non-blocking about it: a second caller is told no rather
+			// than parked. A blocking lock would leave the second Agent hung with no
+			// output, which is harder to diagnose than a refusal.
+			if _, err := d.Lock("data/agent.lock"); !errors.Is(err, disk.ErrLocked) {
+				t.Fatalf("second lock: want ErrLocked, got %v", err)
+			}
+
+			// Per name, so two data directories on one host do not exclude each other.
+			other, err := d.Lock("other/agent.lock")
+			if err != nil {
+				t.Fatalf("a different name must be lockable: %v", err)
+			}
+			if err := other.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Released on Close, so a supervisor that stops one Agent and starts
+			// another in the same directory works.
+			if err := held.Close(); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+			again, err := d.Lock("data/agent.lock")
+			if err != nil {
+				t.Fatalf("a released lock must be retakeable: %v", err)
+			}
+
+			// Closing twice must not free a lock someone else has since taken — the
+			// shape of every use-after-free. Take the second close first, then prove
+			// the *live* holder still holds it.
+			if err := again.Close(); err != nil {
+				t.Fatal(err)
+			}
+			live, err := d.Lock("data/agent.lock")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = live.Close() }()
+			if err := again.Close(); err != nil {
+				t.Fatalf("a second Close must be a no-op: %v", err)
+			}
+			if _, err := d.Lock("data/agent.lock"); !errors.Is(err, disk.ErrLocked) {
+				t.Fatalf("a double Close released a lock another holder owns: %v", err)
+			}
+		})
+	}
+}

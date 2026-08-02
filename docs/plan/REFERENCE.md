@@ -179,9 +179,10 @@ commit named is where the fix landed.
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |
 | DEV-0011 | A segment's space is charged as used, not reserved at creation. | **open** → STATUS.md |
 | DEV-0012 | A self-fenced log still accepts WRITEs and still serves reads. | **open** → STATUS.md |
+| DEV-0017 | `cmd/volume-agent` rooted its Disk at `--data-dir` *and* passed the same absolute path as `DataDir`, so every WAL landed under `<data-dir>/<data-dir>/wal/...`. | resolved 2026-08-02 — the binary passes `DataDir: "."`; the e2e lane asserts the doubled directory does not exist |
 | DEV-0016 | `task lint` ran golangci-lint with no build tags, so the whole `integration/`+`internal/testinfra` surface was never parsed by it. | resolved 2026-08-02 — `--build-tags integration,e2e`, plus a harness exemption whose narrowness is checked by planting a `time.Now()` in a non-test file |
 | DEV-0015 | The volume descriptor (`volumes/<vol>/descriptor.json`) is the only on-S3 format with no integrity check: truncation is caught, a flipped bit inside a number is not. `dek_wrapped`/`dek_key_id` are self-detecting (AEAD + AAD); `size_bytes`/`block_size`/`chain_depth` on the rebuild path are not. | **open** → STATUS.md |
-| DEV-0014 | Nothing stops two Agents from sharing one `--data-dir`: both resume the same segment directory at the same epoch, and `hostio.Listen` unlinks the stale socket so the second *silently steals* it instead of failing with `EADDRINUSE`. Wants an exclusive lock at start-up (a primitive `simio/disk` does not have). | **open** → STATUS.md |
+| DEV-0014 | Two Agents could share one `--data-dir`: both resumed the same segment directory at the same epoch, and `hostio.Listen` unlinks the stale socket so the second *silently stole* it instead of failing with `EADDRINUSE`. | resolved 2026-08-02 — `disk.Lock` (flock, non-blocking) taken by `NewVolumeManager`; `DATA-DIR-LOCK-SPEC.md` |
 | DEV-0013 | `task lint` red since `e8bbdab`: the guest-side `integration/guestinit` tripped the INV-01 lint layer. | resolved 2026-07-28 — third INV-01 exemption, narrowness fixture |
 
 ## `RISK-`

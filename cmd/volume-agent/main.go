@@ -141,7 +141,12 @@ func run() error {
 	// which is the safe direction (no lease, no durable ACK).
 	var loop *agent.Loop
 	volumes, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir:   *dataDir,
+		// "." and not *dataDir: the Disk above is already rooted at --data-dir, which
+		// is what keeps the Agent from writing outside it, and DataDir is a path
+		// inside that namespace. Passing the operator's absolute path here put every
+		// WAL under <data-dir>/<data-dir>/wal/... — consistent, restart-safe, and
+		// nowhere near where the operator was told to look.
+		DataDir:   ".",
 		SocketDir: *socketDir,
 		// Without it no volume on this host ever runs a durability scheduler: a
 		// checkpoint names the host publishing it (§12.3-12.4), and checkpointsEnabled

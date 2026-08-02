@@ -524,6 +524,30 @@ segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
 
+## ~~DEV-0017~~ — the Agent wrote its WAL one level below where it was told *(resolved 2026-08-02)*
+
+Found while scoping the DEV-0014 lock to a directory, which forced the question of what
+`VolumeManagerConfig.DataDir` is a path *relative to*.
+
+`cmd/volume-agent` roots its `real.Disk` at `--data-dir` — that is what keeps the Agent
+from writing outside it — and then passed the same absolute path as `DataDir`. Since
+`DataDir` is a path inside the Disk's namespace, every name was resolved twice: the WAL
+landed under **`<data-dir>/<data-dir>/wal/<volume-id>/<epoch>`**.
+
+Not data loss, and not even inconsistent — a restart reproduces the same path and finds
+its own segments. What it breaks is everything outside the process: an operator looking in
+`--data-dir` finds nothing, and any tooling that inspects the WAL is looking at an empty
+directory next to a `/tmp/...` tree nested inside it.
+
+**Nothing in-process could have seen it.** Every unit test and the whole DST harness hand
+the manager a Disk spanning a full filesystem, where the two paths agree and the bug
+cancels out. It took the e2e lane, where the Disk is rooted the way production roots it.
+
+Fixed by passing `DataDir: "."` from the binary, with the convention now stated on the
+field. `TestTheAgentWritesWhereItWasTold` asserts the doubled directory does not exist,
+using the lock file as its witness because it is created at start-up — a WAL directory
+would only appear on the first guest append.
+
 ## ~~DEV-0016~~ — the entire build-tagged surface was never linted *(resolved 2026-08-02)*
 
 `task lint` ran `golangci-lint run ./...` with **no build tags**, so golangci-lint never
@@ -579,7 +603,7 @@ The blast radius is smaller than it first looks, and worth writing down precisel
 its own review, and doing it inside an increment about keys would bury it. It predates
 this change: the descriptor has had no test of any kind until now.
 
-## DEV-0014 — nothing stops two Agents from sharing one `--data-dir`
+## ~~DEV-0014~~ — two Agents could share one `--data-dir` *(resolved 2026-08-02)*
 
 Found while writing **ADR-0024** (a restarted writer re-attaches at the same epoch). The
 ADR is safe for the case it covers — the previous process is *gone* — and rests on four
@@ -605,11 +629,27 @@ that fails closed regardless of how the second process got there. It needs a loc
 primitive in `simio/disk` (INV-01: a lock is a syscall), which is why it is recorded
 rather than fixed in passing.
 
-**Blocks nothing today** — one Agent per host is the only configuration anything runs —
-and **must be closed before** the fleet ever runs two Agents on one host (per-device
-sharding, a blue/green upgrade), or before increment 8's e2e lane starts killing and
-restarting Agents under a supervisor, which is the first thing that could produce it by
-accident.
+**Closed by `DATA-DIR-LOCK-SPEC.md`.** `disk.Disk` gained `Lock(name) (io.Closer, error)`
+with `ErrLocked` — `unix.Flock(LOCK_EX|LOCK_NB)` in `real`, a set on the Disk in `sim`,
+one contract test over both — and `NewVolumeManager` claims `<data-dir>/agent.lock` for
+its lifetime.
+
+The lock lives in the manager and not in `main` deliberately: the manager owns `DataDir`,
+and a step left to `main` is a step spin's runner will not inherit when ADR-0021 lifts the
+manager across — which is precisely how `HostID` went missing until an e2e lane read the
+log line about it.
+
+Non-blocking, so the second Agent exits with a message naming the directory instead of
+hanging silently. No pid file and no liveness check: the kernel already answers "is that
+process alive?", and every hand-rolled version has the read-pid/reuse-pid race. And
+because the lock belongs to the open file description, a `kill -9` releases it — so
+ADR-0024's re-attach still works on the very next start, which a lock needing explicit
+release would have broken.
+
+Two things fell out of it. The contract test caught the two implementations disagreeing
+about a second `Close` (`*os.File` returns `ErrClosed`, the sim returned nil) — now
+idempotent in both, because a contract answered differently by the two Disks is one
+nothing can rely on. And **DEV-0017**, below.
 
 ## DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads
 
