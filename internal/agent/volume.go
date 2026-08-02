@@ -17,6 +17,7 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/ioclass"
+	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
@@ -429,6 +430,22 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		return nil, fmt.Errorf("agent: volume %s: looking for an existing WAL in %s: %w", id, dir, err)
 	}
 
+	// §14.8: the FLUSH ACK contract is per volume and the Control Plane owns it, so the
+	// Agent takes it from the desired state rather than defaulting. Resolved before the
+	// log exists, because a volume whose contract this host cannot establish must not be
+	// served at all — the same call encryptionFor makes, and for the same reason: the
+	// alternative to "the mode the catalog says" is not "a safe mode", it is a volume
+	// whose ACK means something nobody chose.
+	//
+	// An unset durability is refused, not guessed. wal.ModeFor is the single place the
+	// two vocabularies meet and it already refuses unknown values; keeping that promise
+	// here is what stops "the Control Plane forgot to set it" from being answered
+	// silently by this layer.
+	mode, err := durabilityMode(d)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: %w", id, err)
+	}
+
 	// §15: every payload of guest data is sealed with the volume's DEK before any PUT.
 	// The unwrap happens here, at attach, and nowhere else (§15.1) — one KMS call
 	// outside the data path, and what it returns never leaves memory.
@@ -495,6 +512,11 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 			leaseFunc(m.deps.Lease),
 		)
 	}
+
+	// After EnableRemote, because the two are orthogonal and the order says so: `local`
+	// still needs the batcher and the uploader — its records go to S3 asynchronously
+	// (§14.8 rule 3, agent.drainOnce), just not before the ACK.
+	log.SetDurabilityMode(mode)
 
 	dev, err := blockdev.New(log, d.GetSizeBytes())
 	if err != nil {
@@ -803,3 +825,36 @@ func (m *VolumeManager) Close() error {
 }
 
 var _ VolumeSource = (*VolumeManager)(nil)
+
+// durabilityMode resolves the §14.8 contract for one volume from the desired state.
+//
+// The proto enum is the wire form, lifecycle.Durability is what the Control Plane stores,
+// and wal.DurabilityMode is what the data path enforces. This is the only place the first
+// meets the second — wal.ModeFor is where the second meets the third — so a value that is
+// not one of the two modes stops here rather than becoming a default somewhere deeper.
+func durabilityMode(d *storagev1.DesiredVolume) (wal.DurabilityMode, error) {
+	switch d.GetDurability() {
+	case storagev1.Durability_DURABILITY_REMOTE:
+		return wal.ModeFor(lifecycle.DurabilityRemote)
+	case storagev1.Durability_DURABILITY_LOCAL:
+		return wal.ModeFor(lifecycle.DurabilityLocal)
+	default:
+		// Named rather than defaulted: §14.8 decides what an ACK means, and a volume
+		// whose ACK nobody chose is not a volume this host can serve honestly.
+		return wal.ModeRemote, fmt.Errorf("%w: durability %q — the Control Plane must set it (§14.8)",
+			lifecycle.ErrUnknownState, d.GetDurability())
+	}
+}
+
+// DurabilityMode reports the §14.8 contract a served volume is running under. It exists
+// for the tests that assert the Control Plane's choice reached the data path, which is
+// the wiring that was missing.
+func (m *VolumeManager) DurabilityMode(volumeID string) (wal.DurabilityMode, bool) {
+	m.mu.Lock()
+	v, ok := m.volumes[volumeID]
+	m.mu.Unlock()
+	if !ok {
+		return wal.ModeRemote, false
+	}
+	return v.log.Mode(), true
+}

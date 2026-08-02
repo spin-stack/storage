@@ -111,7 +111,8 @@ func TestAVolumeWhoseKeysAreUnusableIsNotServed(t *testing.T) {
 			id := ids.New().String()
 			err := m.Apply(t.Context(), []*storagev1.DesiredVolume{{
 				VolumeId: id, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-				State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+				Durability: storagev1.Durability_DURABILITY_REMOTE,
+				State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 			}})
 			if err == nil {
 				t.Fatal("the volume started with key material this host cannot use")

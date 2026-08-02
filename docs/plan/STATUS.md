@@ -707,6 +707,54 @@ nothing to do with the test. **The same trap exists in production**: an operator
 long `-vhost-socket-dir` gets `bind: invalid argument` and nothing else. Not fixed here —
 it is a `hostio.Listen` error-wrapping change, and it belongs with its own increment.
 
+## §14.8 is implemented end to end, since 2026-08-02
+
+Two halves, and the second was undesigned in any document — finding it is what this
+increment was mostly worth.
+
+**The mode the Control Plane sets now governs the ACK.** `internal/agent` never read
+`DesiredVolume.durability` and `Log.SetDurabilityMode` had no production caller, so every
+volume ran in the default `remote` mode whatever the catalog said. An unset durability is
+**refused** rather than guessed: `wal.ModeFor` already promised "an unknown value is an
+error, never a silent fallback to remote", and the Agent keeps that promise instead of
+answering for the Control Plane. Every fixture in the tree now states the mode it means,
+which is the cost of that decision and worth paying.
+
+**And "S3 is asynchronous" now has something doing it.** In `local` mode `durableStep`
+returns before the upload block, and that block is the only place in the tree draining
+`batcher.Pending()` — the tests said so without meaning to, since `rpo_test.go` builds a
+local log "with no remote path at all". So a `local` volume put nothing in the object
+store, ever: `durable` stayed 0, no checkpoint could publish, `TruncateLocal(published)`
+reclaimed nothing, and the WAL grew for the life of the volume. That is the
+pre-increment-3 failure, and it would have applied to every `local` volume the moment the
+first half landed. `agent.drainOnce` runs in the durability scheduler that already exists,
+under the lease and io-class gates that already exist.
+
+**The lease split is the decision worth reading twice.** Uploading is *not* gated: an
+object is create-only under a deterministic key and INV-21 hard-fails a divergent PUT, so
+writing one asserts nothing about who owns the volume — and a fenced host holds the only
+copy, so refusing to upload would turn a fencing event into data loss. Advancing
+`durable_sequence` *is* gated, on the same monotonic check §14.4 step 6 uses: it is the
+claim, INV-03 orders it, INV-13 truncates against it, and a promoted successor reads it.
+§14.8 frees the FLUSH *ACK* from the lease in local mode; it does not free the watermark.
+
+Two things the tests caught in the implementation, both fixed in the contract rather than
+in the test:
+
+- The first `DrainPending` returned what *that call* uploaded, so a drain refused for a
+  lapsed lease left the volume stuck below its own objects until the guest happened to
+  write again. It returns the highest sequence a verified object *covers*, which is what
+  its doc comment had claimed all along.
+- The DST arm's first version emitted a `durable-ack` event when nothing had been ACKed,
+  and with the lease flag taken from the closure under test. Both are false entries in a
+  trace: the event exists only when durable actually advanced, and `LeaseValid` carries
+  ground truth, because the checker's job is to compare the claim against reality.
+
+`local-volume-drains-without-claiming` is in the mandatory set, under the INV-06 checker
+that already governs the other path to `durable`. Its planted bug is the reading this
+increment rejected — a lease resolved once at construction instead of per call, which is
+the same shortcut `CheckpointLeaseChecker` plants.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
@@ -726,14 +774,6 @@ calls it.
   see a foreground request to yield to. The invariant is enforced against a condition
   nothing can produce. **Deciding between marking the data path and deleting the field
   with its gate is a durability-zone change** and gets its own increment.
-- **§14.8's durability mode is not implemented end to end.** The Control Plane decides it
-  (`-seed-durability`), stores it, and sends it on `DesiredVolume.durability`; a
-  `cpserver` test asserts the field arrives. Nothing reads it: `Log.SetDurabilityMode` has
-  no production caller, so every volume is served in the default `remote` mode whatever
-  the catalog says. Found while planting increment 9's bug. The direction is the *safe*
-  one — a `local` volume gets the stricter ACK rather than the looser — so this is a
-  missing feature rather than a durability hazard, but a mode the Control Plane can set
-  and the Agent silently ignores is worse than one that does not exist.
 - **`controlplane.Promoter`/`BumpVolumeEpoch` are not wired into any binary.**
   `NewPromoter` appears only in tests and DST. ADR-0024 already says so; this file did
   not. Failover therefore exists as a model, and nothing an operator can run performs it.

@@ -152,11 +152,12 @@ func newTestManager(t *testing.T) (*agent.VolumeManager, *listenerFactory, *sim.
 func desiredVolume(t *testing.T, epoch int64) *storagev1.DesiredVolume {
 	t.Helper()
 	return &storagev1.DesiredVolume{
-		VolumeId:  ids.New().String(),
-		SizeBytes: testVolumeSize,
-		BlockSize: testBlockSize,
-		Epoch:     epoch,
-		State:     storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		VolumeId:   ids.New().String(),
+		SizeBytes:  testVolumeSize,
+		BlockSize:  testBlockSize,
+		Epoch:      epoch,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}
 }
 
@@ -339,7 +340,8 @@ func TestAFencedVolumeDoesNotComeBackAtTheSameEpoch(t *testing.T) {
 	// thing that clears the fencing.
 	regranted := &storagev1.DesiredVolume{
 		VolumeId: v.GetVolumeId(), SizeBytes: v.GetSizeBytes(),
-		BlockSize: v.GetBlockSize(), Epoch: 2, State: v.GetState(),
+		BlockSize: v.GetBlockSize(), Epoch: 2, Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State: v.GetState(),
 	}
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{regranted}); err != nil {
 		t.Fatalf("Apply at the new epoch: %v", err)
@@ -542,7 +544,8 @@ func TestEpochChangeReplacesTheRuntime(t *testing.T) {
 
 	promoted := &storagev1.DesiredVolume{
 		VolumeId: v.GetVolumeId(), SizeBytes: v.GetSizeBytes(),
-		BlockSize: v.GetBlockSize(), Epoch: 2, State: v.GetState(),
+		BlockSize: v.GetBlockSize(), Epoch: 2, Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State: v.GetState(),
 	}
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{promoted}); err != nil {
 		t.Fatalf("Apply(epoch 2): %v", err)

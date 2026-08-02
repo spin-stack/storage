@@ -761,33 +761,13 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 		return ErrNoUploader
 	}
 
-	// A snapshot, because the list is about to be read without the lock and a
-	// concurrent WRITE may close a further batch onto the end of it. Those extra
-	// batches are not this ACK's business — they are above target — and dropping the
-	// first `done` entries still drops exactly the ones uploaded here.
-	pending := append([]*ClosedBatch(nil), l.batcher.Pending()...)
-	uploader := l.uploader
 	l.mu.Unlock()
-
-	done := 0
-	for _, cb := range pending { // step 4: upload + verify (covering <= target)
-		key, err := uploader.Upload(ctx, cb) // no lock held: this is the network
-		l.mu.Lock()
-		if err != nil {
-			l.batcher.RemoveUploaded(done)
-			l.recordWatermarks(ctx) // a growing gap is what an operator needs here
-			l.mu.Unlock()
-			return err // durable NOT advanced
-		}
-		l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
-		l.closeGap(int64(len(cb.Records)))
-		l.mu.Unlock()
-		done++
+	if _, err := l.uploadPending(ctx); err != nil { // step 4: upload + verify
+		return err // durable NOT advanced
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.batcher.RemoveUploaded(done)
 
 	// The log is not re-checked for self-fencing here, and that is deliberate: the
 	// only path that sets it while this one holds flushMu is a failed rollback in
@@ -813,6 +793,127 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	l.clearUnflushed()
 	l.recordWatermarks(ctx)
 	return nil // step 7: ack
+}
+
+// uploadPending puts every closed batch in the object store and returns the highest
+// sequence a verified object now covers (0 when there was nothing to upload).
+//
+// It must be called with flushMu held and mu NOT held, and it returns with mu not held.
+// The lock dance is the point rather than an accident: `mu` is released around each
+// Upload because holding it across a PUT would put S3 latency in the guest's WRITE path
+// (§5.3, INV-18) and blind the Agent's reporting for the length of an S3 stall.
+//
+// It does **not** advance durable_sequence and does not ACK anything. That separation is
+// what lets §14.8's two modes share one implementation of "put the records in S3": the
+// remote FLUSH advances after this returns and after the lease check, and the local
+// mode's asynchronous drain advances only if the caller still holds the lease. Uploading
+// is not a durability claim — the object is create-only with a deterministic key, so
+// writing it asserts nothing about who owns the volume — and INV-06 governs the claim.
+func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
+	// A snapshot, because the list is about to be read without the lock and a
+	// concurrent WRITE may close a further batch onto the end of it. Those extra
+	// batches are not this step's business, and dropping the first `done` entries
+	// still drops exactly the ones uploaded here.
+	l.mu.Lock()
+	if l.batcher == nil || l.uploader == nil {
+		l.mu.Unlock()
+		return 0, ErrNoUploader
+	}
+	pending := append([]*ClosedBatch(nil), l.batcher.Pending()...)
+	uploader := l.uploader
+	l.mu.Unlock()
+
+	done := 0
+	for _, cb := range pending {
+		key, err := uploader.Upload(ctx, cb) // no lock held: this is the network
+		l.mu.Lock()
+		if err != nil {
+			l.batcher.RemoveUploaded(done)
+			l.recordWatermarks(ctx) // a growing gap is what an operator needs here
+			l.mu.Unlock()
+			return l.coveredLocked(), err
+		}
+		l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
+		l.closeGap(int64(len(cb.Records)))
+		l.mu.Unlock()
+		done++
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.batcher.RemoveUploaded(done)
+	return l.coveredLocked(), nil
+}
+
+// coveredLocked is the highest sequence a verified object covers: the end of the
+// contiguous run over everything this log has uploaded in this epoch.
+//
+// It reports what the *store* holds rather than what the last call uploaded, and the
+// difference is load-bearing. A drain that uploads while the lease is invalid must not
+// advance durable_sequence (INV-06), but the records are in the bucket; the next drain
+// finds nothing pending, and if "covered" meant "uploaded just now" it would report 0 and
+// the volume would stay stuck below its own objects until the guest happened to write
+// again. A fenced host that regains its lease has to be able to claim what it already
+// put there.
+func (l *Log) coveredLocked() uint64 {
+	covered := uint64(0)
+	for _, o := range l.uploaded {
+		// The list is appended in upload order, which is sequence order, so a gap ends
+		// the contiguous run — and a durable point past a gap is exactly what INV-08
+		// forbids.
+		if o.First > covered+1 {
+			break
+		}
+		if o.Last > covered {
+			covered = o.Last
+		}
+	}
+	return covered
+}
+
+// DrainPending is §14.8 rule 3 — "S3 is asynchronous" — with something actually doing it.
+//
+// In `local` mode the FLUSH ACKs on fdatasync alone and returns before any PUT, so
+// without this nothing ever reaches the object store: durable_sequence stays at 0, no
+// checkpoint can publish, TruncateLocal(published) reclaims nothing, and the local WAL
+// grows for the life of the volume. That is the pre-increment-3 failure, and it applied
+// to every `local` volume the moment the Agent started honouring the mode.
+//
+// It closes the open batch first, because a drain that only moved batches something else
+// had already closed would leave the most recent writes behind for ever on a volume that
+// is idle — which is exactly the volume whose WAL an operator is waiting to see shrink.
+//
+// It returns the highest sequence a verified object now covers. Advancing
+// durable_sequence to it is the *caller's* decision: uploading asserts nothing, and
+// §12.6/INV-06 govern the claim. See agent.drainOnce.
+func (l *Log) DrainPending(ctx context.Context) (uint64, error) {
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+
+	l.mu.Lock()
+	if l.fenced {
+		l.mu.Unlock()
+		return 0, ErrSelfFenced
+	}
+	if l.batcher == nil || l.uploader == nil {
+		l.mu.Unlock()
+		return 0, ErrNoUploader
+	}
+	l.batcher.Flush()
+	if err := l.segs.sync(); err != nil {
+		l.mu.Unlock()
+		return 0, err
+	}
+	l.mu.Unlock()
+
+	return l.uploadPending(ctx)
+}
+
+// Mode reports the §14.8 ACK contract this log is serving.
+func (l *Log) Mode() DurabilityMode {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mode
 }
 
 func (l *Log) clearUnflushed() {

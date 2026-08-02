@@ -38,6 +38,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
 		{Name: "agent-encrypts-what-leaves-the-host", Run: scenarioAgentEncryptsWhatLeavesTheHost},
 		{Name: "encrypted-volume-survives-a-restart", Run: scenarioEncryptedVolumeSurvivesARestart},
+		{Name: "local-volume-drains-without-claiming", Run: scenarioLocalVolumeDrainsWithoutClaimingWithoutALease},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
 		{Name: "a-promoted-host-reads-the-previous-epoch", Run: scenarioAPromotedHostReadsThePreviousEpoch},
 	}
@@ -154,11 +155,12 @@ func fencedVolumeStopsServing(s *Sim, ignoreFencing bool) error {
 	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
 	desired := func(epoch int64) []*storagev1.DesiredVolume {
 		return []*storagev1.DesiredVolume{{
-			VolumeId:  volumeID,
-			SizeBytes: 1 << 20,
-			BlockSize: 512,
-			Epoch:     epoch,
-			State:     storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+			VolumeId:   volumeID,
+			SizeBytes:  1 << 20,
+			BlockSize:  512,
+			Epoch:      epoch,
+			Durability: storagev1.Durability_DURABILITY_REMOTE,
+			State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 		}}
 	}
 
@@ -366,7 +368,8 @@ func truncatedVolumeSurvivesARestart(s *Sim, hideObjects bool) error {
 
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		return fmt.Errorf("the restarted Agent could not start the volume: %w", err)
 	}
@@ -520,7 +523,8 @@ func lapsedLeaseStopsPublishing(s *Sim, cacheTheLease bool) error {
 
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		return fmt.Errorf("starting the volume: %w", err)
 	}
@@ -759,7 +763,8 @@ func crashedFlushDoesNotCollideOnRestart(s *Sim, shortenListings bool) error {
 
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		return fmt.Errorf("the restarted Agent could not re-attach at epoch 1: %w", err)
 	}
@@ -898,7 +903,8 @@ func agentEncryptsWhatLeavesTheHost(s *Sim, withoutKEK bool) error {
 	}
 	desired := []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}
 
 	m, err := newManager(true, "/var/lib/spin")
@@ -985,7 +991,8 @@ func agentEncryptsWhatLeavesTheHost(s *Sim, withoutKEK bool) error {
 	defer func() { _ = m2.Close() }()
 	badDesired := []*storagev1.DesiredVolume{{
 		VolumeId: badID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}
 	if err := m2.Apply(ctx, badDesired); err == nil {
 		return errors.New("a volume whose DEK could not be unwrapped was started anyway (§15)")
@@ -1085,6 +1092,7 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 
 	desired := &storagev1.DesiredVolume{
 		VolumeId: cloneID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		Durability:       storagev1.Durability_DURABILITY_REMOTE,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 		ParentSnapshotId: snapID,
 		ParentVolumeId:   parentID,
@@ -1211,7 +1219,8 @@ func aPromotedHostReadsThePreviousEpoch(s *Sim, hideObjects bool) error {
 
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 2,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		return fmt.Errorf("the destination could not start the promoted volume: %w", err)
 	}
@@ -1407,7 +1416,8 @@ func encryptedVolumeSurvivesARestart(s *Sim, dropKEKOnRestart bool) error {
 
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		return fmt.Errorf("the restarted Agent could not start the volume: %w", err)
 	}
@@ -1449,5 +1459,131 @@ func encryptedVolumeSurvivesARestart(s *Sim, dropKEKOnRestart bool) error {
 		return fmt.Errorf("volume %s answered a read after restarting with no KEK at all", volumeID)
 	}
 	s.Notef("the restarted Agent decrypted its own sealed objects and served the guest its own bytes")
+	return nil
+}
+
+// scenarioLocalVolumeDrainsWithoutClaimingWithoutALease is §14.8 rule 3 under the INV-06
+// checker that already governs every other way durable_sequence moves.
+//
+// The drain is a *second* path to advancing durable — the first is §14.4 step 6 — and a
+// second path is a second place for the lease rule to be forgotten. That is not
+// hypothetical here: the reading of §14.8 that this increment rejected ("the lease does
+// not gate durability in local mode") is a coherent sentence, and taking it would move a
+// watermark a promoted successor reads while this host is fenced.
+//
+// So the arm asserts the split the increment decided: the objects reach the store with no
+// lease at all, because a fenced host holds the only copy and refusing to upload would
+// turn fencing into data loss; and durable stands still until the lease is back.
+func scenarioLocalVolumeDrainsWithoutClaimingWithoutALease(s *Sim) error {
+	return localVolumeDrains(s, leaseResolvedPerCall)
+}
+
+const (
+	leaseResolvedPerCall  = false
+	leaseReadOnceAtStart  = true
+	localDrainVolumeBytes = 1 << 20
+)
+
+func localVolumeDrains(s *Sim, staleLease bool) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+
+	lm := lease.NewManager(s.Clock, time.Minute)
+	lm.Grant()
+	leaseValid := true
+
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+		Limits: wal.Limits{SegmentBytes: 8192},
+		HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
+	}, agent.VolumeManagerDeps{
+		Clock:   s.Clock,
+		Disk:    s.Disk,
+		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper:  simMapper{},
+		EventFD: simEventFD,
+		Store:   s.Store,
+		// The planted bug's lever, and it is a shortcut a real wiring can take: a Lease
+		// that answers from a snapshot taken at construction instead of resolving the
+		// current one per call. Every other Agent scenario takes it harmlessly, because
+		// their leases never lapse. Here it makes the fenced drain claim durability.
+		Lease: func() bool {
+			if staleLease {
+				return true
+			}
+			return leaseValid && lm.Valid()
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close() }()
+
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: localDrainVolumeBytes, BlockSize: 512, Epoch: 1,
+		Durability: storagev1.Durability_DURABILITY_LOCAL,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}); err != nil {
+		return fmt.Errorf("starting a local-durability volume: %w", err)
+	}
+	dev, ok := m.Device(volumeID)
+	if !ok {
+		return errors.New("the local-durability volume is not being served")
+	}
+
+	// A guest write and its FLUSH. In local mode this ACKs on fdatasync and puts nothing
+	// in the store — that is the mode, not a failure.
+	pattern := bytes.Repeat([]byte{0x5A}, 4096)
+	for i := range 4 {
+		if _, err := dev.WriteAt(pattern, int64(i)*4096); err != nil {
+			return fmt.Errorf("guest write %d: %w", i, err)
+		}
+	}
+	if err := dev.Flush(ctx); err != nil {
+		return fmt.Errorf("the local-mode FLUSH: %w", err)
+	}
+	objs, err := s.Store.List(ctx, "wal/"+volumeID+"/")
+	if err != nil {
+		return err
+	}
+	if len(objs) != 0 {
+		return fmt.Errorf("a local-mode FLUSH put %d object(s) in the store; §14.8 says it ACKs on fdatasync alone", len(objs))
+	}
+
+	// Now fence the host and drain. The objects must land; the claim must not.
+	leaseValid = false
+	if err := m.Drain(ctx, volumeID); err != nil {
+		return fmt.Errorf("the fenced drain: %w", err)
+	}
+	objs, err = s.Store.List(ctx, "wal/"+volumeID+"/")
+	if err != nil {
+		return err
+	}
+	if len(objs) == 0 {
+		return errors.New("the fenced host uploaded nothing: its records exist nowhere else, so this turns fencing into data loss")
+	}
+	// Emitted only if the drain actually claimed something. An event saying "durable
+	// ACK" when nothing was ACKed would be a false entry in the trace, and LeaseValid
+	// carries the *ground truth* rather than what the (possibly stale) closure answered
+	// — the checker's job is to compare the claim against reality, so reality is what it
+	// has to be given.
+	if fencedDurable := m.WatermarksOf(volumeID).Durable; fencedDurable > 0 {
+		s.Emit(Event{Kind: EventDurableAck, Key: volumeID, Durable: fencedDurable, LeaseValid: leaseValid && lm.Valid()})
+	}
+
+	// And with the lease back, the claim it already earned.
+	leaseValid = true
+	if err := m.Drain(ctx, volumeID); err != nil {
+		return fmt.Errorf("the drain after the lease returned: %w", err)
+	}
+	after := m.WatermarksOf(volumeID).Durable
+	if after > 0 {
+		s.Emit(Event{Kind: EventDurableAck, Key: volumeID, Durable: after, LeaseValid: leaseValid && lm.Valid()})
+	}
+	if after == 0 {
+		return errors.New("durable never advanced once the lease was valid: the volume is stuck below its own objects")
+	}
+	s.Notef("volume %s: %d object(s) drained while fenced, durable advanced to %d only once the lease was back",
+		volumeID, len(objs), after)
 	return nil
 }

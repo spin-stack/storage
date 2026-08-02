@@ -216,3 +216,23 @@ func TestRestartWithoutTheKEKRefusesRatherThanAnswering(t *testing.T) {
 			res.Err, res.TraceString())
 	}
 }
+
+// INV-06 (§12.2) reaching the second path that can advance durable_sequence.
+//
+// §14.4 step 6 was the only one until §14.8's asynchronous drain landed, and the drain is
+// where the rule is easiest to lose: the mode's whole point is that the FLUSH ACK does
+// *not* wait for the lease, and reading that as "durability does not need the lease in
+// local mode" is a coherent sentence rather than a slip. It is the reading this increment
+// rejected, and this is what stops it coming back.
+//
+// Planted by the wiring, not by a fault, and by the same shortcut CheckpointLeaseChecker
+// uses: a Lease function that answers from a snapshot taken at construction instead of
+// resolving the current one per call. Every other Agent scenario takes that shortcut
+// harmlessly because their leases never lapse; here it makes a fenced host claim
+// durability for records it uploaded after losing the volume.
+func TestPlantedBugLocalDrainClaimsWithoutALease(t *testing.T) {
+	requirePasses(t, 31, NewDurableAckLeaseChecker(), scenarioLocalVolumeDrainsWithoutClaimingWithoutALease)
+	plantedBug(t, 31, NewDurableAckLeaseChecker(), "durable-ack-requires-lease", func(s *Sim) error {
+		return localVolumeDrains(s, leaseReadOnceAtStart)
+	})
+}

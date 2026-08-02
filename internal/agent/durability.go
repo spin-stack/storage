@@ -11,6 +11,7 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/simio/clock"
+	"github.com/spin-stack/storage/internal/wal"
 )
 
 // The durability scheduler: the thing that decides *when* to checkpoint and truncate
@@ -57,6 +58,19 @@ func (m *VolumeManager) checkpointLoop(ctx context.Context, v *Volume, volumeID 
 		if err := m.deps.Clock.Sleep(ctx, poll); err != nil {
 			return // ctx done
 		}
+		// §14.8 rule 3, and it must come before the checkpoint rather than after: a
+		// `local` volume's FLUSH ACKs on fdatasync and returns before any PUT, so with
+		// nothing draining, durable_sequence stays at 0, checkpoint.Create has no
+		// durable point to publish, TruncateLocal(published) reclaims nothing, and the
+		// WAL grows for the life of the volume. That is the state increment 3 removed
+		// for `remote` volumes, and it applied to every `local` one the moment the Agent
+		// started honouring the mode the Control Plane sets.
+		//
+		// A no-op for remote volumes: their durable step already uploaded.
+		if v.log.Mode() == wal.ModeLocal {
+			m.drainOnce(ctx, v)
+		}
+
 		due, why := m.checkpointDue(v, last)
 		if !due {
 			continue
@@ -235,3 +249,87 @@ func (m *VolumeManager) checkpointsEnabled() error {
 // errNoPublisherIdentity is what a checkpoint with no host id would become: an
 // unattributable publication into an epoch, which §12.4's ownership check cannot verify.
 var errNoPublisherIdentity = errors.New("a checkpoint must name the host publishing it")
+
+// drainOnce is the asynchronous half of §14.8's `local` mode: the records a FLUSH already
+// ACKed on fdatasync alone are put in the object store, and durable_sequence is advanced
+// to cover them.
+//
+// The two halves are gated differently, and that split is the decision this function
+// exists to encode.
+//
+// **Uploading is not gated.** An object is create-only under a key derived from
+// (volume, epoch, sequences, content hash), and INV-21 hard-fails a divergent PUT — so
+// writing one asserts nothing about who owns the volume and takes nothing from a
+// successor. A host that has lost its lease still holds the only copy of these records,
+// and refusing to upload them would turn a fencing event into data loss.
+//
+// **Advancing durable_sequence is gated**, on the same monotonic lease check §14.4 step 5
+// applies. durable_sequence is the claim: INV-03 orders it, INV-13 truncates against it,
+// §12.6 governs what may be published under it, and a promoted successor reads it. §14.8
+// frees the *FLUSH ACK* from the lease in local mode; it does not free the watermark, and
+// reading it that way would let a fenced host move a number its replacement trusts.
+//
+// So a fenced local volume ends up with its records safe in the bucket and its watermark
+// standing still — which is exactly the state a successor wants to find.
+//
+// Errors are logged rather than returned: the caller is the scheduler loop, the next poll
+// retries, and a drain that failed has not made anything untrue. A drain that *cannot*
+// happen at all (no uploader) is not an error either — that is a local-only Agent with no
+// object store, where the local WAL is all there is by design.
+func (m *VolumeManager) drainOnce(ctx context.Context, v *Volume) {
+	covered, err := v.log.DrainPending(ctx)
+	switch {
+	case errors.Is(err, wal.ErrNoUploader), errors.Is(err, wal.ErrSelfFenced):
+		return // no object store, or already fenced: neither is this loop's problem
+	case err != nil:
+		slog.Warn("the local-mode drain could not reach the object store; this volume's RPO is growing",
+			"volume_id", v.id, "remote_gap_bytes", v.log.RemoteGapBytes(), "error", err)
+		return
+	case covered == 0:
+		return // nothing was pending
+	}
+
+	// The claim, and the only half the lease governs (see above).
+	if m.deps.Lease != nil && !m.deps.Lease() {
+		slog.Warn("drained to the object store but not advancing durable: this host's lease is not valid (§12.2, INV-06)",
+			"volume_id", v.id, "covered_sequence", covered)
+		return
+	}
+	if err := v.log.AdvanceDurable(covered); err != nil {
+		slog.Error("the drained records could not be marked durable",
+			"volume_id", v.id, "covered_sequence", covered, "error", err)
+		return
+	}
+	slog.Info("local-mode WAL drained to the object store",
+		"volume_id", v.id, "durable_sequence", covered, "remote_gap_bytes", v.log.RemoteGapBytes())
+}
+
+// Drain performs §14.8 rule 3's asynchronous upload for one volume now, instead of
+// waiting for the scheduler's next poll. It is the counterpart of Checkpoint: the same
+// work the loop does, reachable by a caller that has a reason not to wait — a drain
+// moving the volume, or a test that would otherwise have to drive the clock.
+//
+// It goes through drainOnce and therefore through the same lease split, because a second
+// path to advancing durable_sequence is a second place for §12.2 to be forgotten.
+func (m *VolumeManager) Drain(ctx context.Context, volumeID string) error {
+	m.mu.Lock()
+	v, ok := m.volumes[volumeID]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("agent: volume %s is not being served here", volumeID)
+	}
+	m.drainOnce(ctx, v)
+	return nil
+}
+
+// WatermarksOf reports one served volume's watermarks, or the zero value if this host is
+// not serving it.
+func (m *VolumeManager) WatermarksOf(volumeID string) wal.Watermarks {
+	m.mu.Lock()
+	v, ok := m.volumes[volumeID]
+	m.mu.Unlock()
+	if !ok {
+		return wal.Watermarks{}
+	}
+	return v.log.Watermarks()
+}

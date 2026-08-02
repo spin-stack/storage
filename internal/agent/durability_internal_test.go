@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -89,7 +90,8 @@ func newSchedRig(t *testing.T, cfg VolumeManagerConfig) *schedRig {
 	r.vol = [16]byte(id)
 	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{{
 		VolumeId: id.String(), SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -351,5 +353,128 @@ func TestCheckpointsNeedAStoreAndAnIdentity(t *testing.T) {
 				t.Errorf("error %q does not name %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// localRig is schedRig's `local` twin: the §14.8 mode where the FLUSH ACKs on fdatasync
+// and S3 catches up afterwards.
+func newLocalRig(t *testing.T) *schedRig {
+	t.Helper()
+	r := &schedRig{
+		clk:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+		store: sim.NewObjectStore(),
+		lease: true,
+	}
+	m, err := NewVolumeManager(VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin", HostID: ids.New().String(),
+	}, VolumeManagerDeps{
+		Clock:   r.clk,
+		Disk:    sim.NewDisk(),
+		Listen:  func(string) (vhost.Listener, error) { return &schedListener{closed: make(chan struct{})}, nil },
+		Mapper:  schedMapper{},
+		EventFD: schedEventFD,
+		Store:   r.store,
+		Lease:   func() bool { return r.lease },
+	})
+	if err != nil {
+		t.Fatalf("NewVolumeManager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	r.m = m
+
+	id := ids.New()
+	r.vol = [16]byte(id)
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{{
+		VolumeId: id.String(), SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		Durability: storagev1.Durability_DURABILITY_LOCAL,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	v, ok := m.volumes[id.String()]
+	if !ok {
+		t.Fatal("the local-mode volume is not being served")
+	}
+	r.v = v
+	return r
+}
+
+// writeAndFlush drives a guest's write and FLUSH through the device.
+func (r *schedRig) writeAndFlush(t *testing.T) {
+	t.Helper()
+	if _, err := r.v.dev.WriteAt(bytes.Repeat([]byte{0x5A}, 4096), 0); err != nil {
+		t.Fatalf("guest write: %v", err)
+	}
+	if err := r.v.dev.Flush(t.Context()); err != nil {
+		t.Fatalf("guest FLUSH: %v", err)
+	}
+}
+
+func (r *schedRig) objectCount(t *testing.T) int {
+	t.Helper()
+	objs, err := r.store.List(t.Context(), "wal/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(objs)
+}
+
+// §14.8 rule 3 says S3 is asynchronous in `local` mode. Until drainOnce existed, nothing
+// performed the "asynchronous" half: durableStep returns before the upload block, which
+// is the only place in the tree that drains batcher.Pending(). So a local volume put
+// nothing in the object store, ever — durable stayed 0, no checkpoint could publish,
+// TruncateLocal(published) reclaimed nothing, and the WAL grew for the life of the
+// volume. That is the pre-increment-3 failure, reappearing for every local volume the
+// moment the Agent started honouring the mode.
+func TestALocalVolumeFlushesWithoutS3AndDrainsAfterwards(t *testing.T) {
+	r := newLocalRig(t)
+
+	// The ACK itself: no object, and that is the mode working rather than failing.
+	r.writeAndFlush(t)
+	if n := r.objectCount(t); n != 0 {
+		t.Fatalf("a local FLUSH put %d object(s) in the store; §14.8 says it ACKs on fdatasync alone", n)
+	}
+	if got := r.v.log.Watermarks().Durable; got != 0 {
+		t.Fatalf("durable = %d after a local FLUSH; the object store has not confirmed anything yet", got)
+	}
+
+	// And then the asynchronous half.
+	r.m.drainOnce(t.Context(), r.v)
+	if n := r.objectCount(t); n == 0 {
+		t.Fatal("the drain put nothing in the object store: a local volume's records never leave the host")
+	}
+	if got := r.v.log.Watermarks().Durable; got == 0 {
+		t.Fatal("the drain uploaded but never advanced durable, so no checkpoint can publish and no byte is ever reclaimed")
+	}
+}
+
+// The B2 decision, pinned: uploading is not gated on the lease and advancing
+// durable_sequence is.
+//
+// An object is create-only under a deterministic key and INV-21 hard-fails a divergent
+// PUT, so writing one asserts nothing about who owns the volume — and a fenced host holds
+// the only copy of these records, so refusing to upload them would turn a fencing event
+// into data loss. durable_sequence is the claim: INV-03 orders it, INV-13 truncates
+// against it, and a promoted successor reads it. §14.8 frees the FLUSH ACK from the lease
+// in local mode; it does not free the watermark.
+func TestAFencedLocalVolumeUploadsButDoesNotClaimDurability(t *testing.T) {
+	r := newLocalRig(t)
+	r.writeAndFlush(t)
+
+	r.lease = false
+	r.m.drainOnce(t.Context(), r.v)
+
+	if n := r.objectCount(t); n == 0 {
+		t.Fatal("a fenced host refused to upload; its records exist nowhere else, so this turns fencing into data loss")
+	}
+	if got := r.v.log.Watermarks().Durable; got != 0 {
+		t.Fatalf("durable advanced to %d without a valid lease (§12.2, INV-06): a fenced host moved a watermark its successor trusts", got)
+	}
+
+	// And it resumes cleanly once the lease is back, rather than needing another write.
+	r.lease = true
+	r.m.drainOnce(t.Context(), r.v)
+	if got := r.v.log.Watermarks().Durable; got == 0 {
+		t.Fatal("durable never advanced after the lease came back; the volume is stuck until the next FLUSH")
 	}
 }
