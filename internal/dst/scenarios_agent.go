@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
@@ -13,6 +14,7 @@ import (
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lease"
+	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
@@ -30,6 +32,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "fenced-volume-stops-serving", Run: scenarioFencedVolumeStopsServing},
 		{Name: "truncated-volume-survives-a-restart", Run: scenarioTruncatedVolumeSurvivesARestart},
 		{Name: "lapsed-lease-stops-publishing", Run: scenarioLapsedLeaseStopsPublishing},
+		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
 	}
 }
 
@@ -62,7 +65,15 @@ func (c *FencedVolumeChecker) Check() error { return c.violation }
 // this world, so Accept blocks until Close — which is the whole contract Server.Serve
 // relies on to be cancellable, and the only part of the socket a simulation can
 // legitimately model (INV-01: no real sockets here).
-type simListener struct{ closed chan struct{} }
+// Close is idempotent through a sync.Once rather than a select-on-closed, which is not
+// a guard at all: two callers can both find the channel open and both close it. Both
+// callers exist — vhost.Server.Serve closes the listener from a context.AfterFunc while
+// the manager's teardown closes it directly — so this paniced under -race the first time
+// a scenario ran two managers in one simulation.
+type simListener struct {
+	closed chan struct{}
+	once   sync.Once
+}
 
 func newSimListener() *simListener { return &simListener{closed: make(chan struct{})} }
 
@@ -72,11 +83,7 @@ func (l *simListener) Accept() (vhost.Conn, error) {
 }
 
 func (l *simListener) Close() error {
-	select {
-	case <-l.closed:
-	default:
-		close(l.closed)
-	}
+	l.once.Do(func() { close(l.closed) })
 	return nil
 }
 
@@ -593,6 +600,185 @@ func countCheckpoints(ctx context.Context, s *Sim, volumeID string) (int, error)
 		return 0, fmt.Errorf("listing the volume's checkpoints: %w", err)
 	}
 	return len(objs), nil
+}
+
+// scenarioCrashedFlushDoesNotCollideOnRestart pins ADR-0024 — a restarted Agent
+// re-attaches at the *same* epoch — against the one state that makes it interesting:
+// **objects in S3 for sequences the guest was never told were durable.**
+//
+// §14.4 produces that state on purpose. Step 4 uploads; step 5 checks the lease. So a
+// writer whose lease lapses mid-FLUSH (or a process killed between the two) leaves the
+// bucket holding a *longer* contiguous prefix than anything it ever ACKed. If a restart
+// resumed from the last ACK — the number a dead process held, and the intuitive one — it
+// would re-issue those sequences with whatever the guest writes next. Same key, different
+// content hash: INV-21 hard-fails the PUT, and the volume stops being able to flush at
+// all.
+//
+// The assertion is that the second flush *succeeds*, which is only true if the resumed
+// writer numbered above the whole bucket. It is a behavioural check of ADR-0024's
+// properties 2 and 4 together, and it is the reason the ADR names them: relaxing either
+// turns this scenario red rather than leaving the decision quietly invalid.
+func scenarioCrashedFlushDoesNotCollideOnRestart(s *Sim) error {
+	// Both listings, because the difference between them is the point. The first attempt
+	// at this scenario ran only the honest one and asserted "the writer resumed above
+	// the bucket" — which was true, and for the wrong reason. Running it against a
+	// listing that comes back short was supposed to break it. It did not, and that is
+	// what identified which mechanism is actually load-bearing (see below).
+	if err := crashedFlushDoesNotCollideOnRestart(s, honestListing); err != nil {
+		return err
+	}
+	return crashedFlushDoesNotCollideOnRestart(s, shortListing)
+}
+
+const (
+	honestListing = false
+	// shortListing is a listing that comes back one object short — a truncated page, an
+	// eventually-consistent index, or the same resumed point that trusting a remembered
+	// watermark would produce. The no-collision property must survive it.
+	shortListing = true
+)
+
+// shortListingStore drops the newest object from every listing.
+type shortListingStore struct{ objectstore.Store }
+
+func (s shortListingStore) List(ctx context.Context, prefix string) ([]objectstore.ObjectInfo, error) {
+	objs, err := s.Store.List(ctx, prefix)
+	if err != nil || len(objs) == 0 {
+		return objs, err
+	}
+	return objs[:len(objs)-1], nil
+}
+
+func crashedFlushDoesNotCollideOnRestart(s *Sim, shortenListings bool) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return err
+	}
+	vol := [16]byte(u)
+	limits := wal.Limits{SegmentBytes: 8192}
+	const leaseTTL = 10 * time.Second
+
+	// Phase 1: the incarnation that dies. Four records ACKed, four more uploaded and
+	// never ACKed because the lease went away between step 4 and step 5.
+	lm := lease.NewManager(s.Clock, leaseTTL)
+	lm.Grant()
+	l := wal.NewLog(s.Disk, "/var/lib/spin/wal", s.Clock, vol, 1, limits)
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 3), lm)
+
+	acked := bytes.Repeat([]byte{0x11}, 4096)
+	for i := range 4 {
+		if _, err := l.Write(uint64(i)*4096, acked, 0); err != nil {
+			return fmt.Errorf("acked write %d: %w", i, err)
+		}
+	}
+	if err := l.Flush(ctx); err != nil {
+		return fmt.Errorf("the flush that is ACKed: %w", err)
+	}
+	ackedDurable := l.Watermarks().Durable
+
+	s.Tick(leaseTTL + time.Second)
+	unacked := bytes.Repeat([]byte{0x22}, 4096)
+	for i := range 4 {
+		if _, err := l.Write(uint64(4+i)*4096, unacked, 0); err != nil {
+			return fmt.Errorf("unacked write %d: %w", i, err)
+		}
+	}
+	if err := l.Flush(ctx); err == nil {
+		return errors.New("a FLUSH was ACKed with a lapsed lease (§12.2/INV-06)")
+	}
+	// The crash. Not Close(): a killed process does not get to run cleanup, and the
+	// point of the scenario is what the *next* process finds on disk and in S3.
+	inBucket, err := recovery.DurablePoint(ctx, s.Store, vol, 1)
+	if err != nil {
+		return fmt.Errorf("what the bucket can prove after the crash: %w", err)
+	}
+	if inBucket <= ackedDurable {
+		return fmt.Errorf("the bucket proves %d and the guest was told %d: this scenario needs the uploads to have outrun the ACK (§14.4 steps 4 and 5)",
+			inBucket, ackedDurable)
+	}
+	s.Notef("crash: the guest was told %d was durable, the bucket holds %d", ackedDurable, inBucket)
+
+	// Phase 2: the same host comes back, at the same epoch, with a fresh lease. No
+	// Control Plane involvement — GetDesiredState still lists epoch 1 (ADR-0024).
+	lm2 := lease.NewManager(s.Clock, leaseTTL)
+	lm2.Grant()
+	var store objectstore.Store = s.Store
+	if shortenListings {
+		store = shortListingStore{Store: s.Store}
+		s.Emit(Event{Kind: EventFault, Msg: "the object listing comes back one object short"})
+	}
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin", Limits: limits,
+		HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
+	}, agent.VolumeManagerDeps{
+		Clock:   s.Clock,
+		Disk:    s.Disk,
+		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper:  simMapper{},
+		EventFD: simEventFD,
+		Store:   store,
+		Lease:   func() bool { return lm2.Valid() },
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close() }()
+
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}); err != nil {
+		return fmt.Errorf("the restarted Agent could not re-attach at epoch 1: %w", err)
+	}
+	dev, ok := m.Device(volumeID)
+	if !ok {
+		return errors.New("the restarted Agent is not serving the volume")
+	}
+	// The read is what waits for the base, and the base is what carries the resumed
+	// durable point (InstallBase). Nothing below is meaningful before it lands.
+	if _, err := dev.ReadAt(make([]byte, 4096), 0); err != nil {
+		return fmt.Errorf("the first read after the restart: %w", err)
+	}
+
+	// **This is the mechanism.** The resumed writer numbers above everything the bucket
+	// holds, and it does so whether or not the listing was honest — because the number
+	// comes from the *local segments*, not from the base. `Resume` sets `local` to the
+	// last record on disk, `InstallBase` only ever raises watermarks, and INV-13 forbids
+	// truncating above `published`, which never exceeds what the bucket can prove. So
+	// everything the dead incarnation uploaded is still on this disk, with its sequence
+	// numbers, and the new incarnation cannot re-use them.
+	resumed := servedStatus(m, volumeID)
+	if uint64(resumed.LocalSequence) < inBucket {
+		return fmt.Errorf("the resumed writer numbers from %d while the bucket already holds %d: it would re-issue sequences that exist (ADR-0024, INV-13)",
+			resumed.LocalSequence, inBucket)
+	}
+
+	// The guest writes something *different* over the range whose sequences the dead
+	// incarnation had already uploaded. This is the collision, if there is one.
+	divergent := bytes.Repeat([]byte{0x33}, 4096)
+	for i := range 4 {
+		if _, err := dev.WriteAt(divergent, int64(4+i)*4096); err != nil {
+			return fmt.Errorf("post-restart write %d: %w", i, err)
+		}
+	}
+	if err := dev.Flush(ctx); err != nil {
+		// ErrDivergentObject here is the failure ADR-0024 exists to rule out: it means
+		// the resumed writer re-used sequences the bucket already had under a different
+		// content hash (INV-21, §14.5).
+		return fmt.Errorf("the first FLUSH after re-attaching at the same epoch: %w", err)
+	}
+	w := servedStatus(m, volumeID)
+	if uint64(w.DurableSequence) <= inBucket {
+		return fmt.Errorf("after the restart durable is %d, not past the %d the bucket already held (ADR-0024, INV-08)",
+			w.DurableSequence, inBucket)
+	}
+	s.Emit(Event{Kind: EventWatermark, Durable: uint64(w.DurableSequence), Published: uint64(w.PublishedSequence), Local: uint64(w.LocalSequence)})
+	s.Notef("re-attached at epoch 1 (listing short=%t) and flushed past the crash: durable %d -> %d",
+		shortenListings, inBucket, w.DurableSequence)
+	return nil
 }
 
 // servedStatus reads one volume's reported status out of the manager.

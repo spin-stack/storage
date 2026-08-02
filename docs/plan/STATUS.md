@@ -141,13 +141,13 @@ real binaries — and it is where "how much is left" is actually measured:
 | 1 — a volume can exist | **done** (`5953c73`) |
 | 2 — KEYSTONE: the per-volume runtime | **done** (`4f2852a`, `cf021cc`) |
 | 3 — checkpoint and truncate | **done** (scheduler, ADR-0023, and as of `b5bd268` its §12.6 checker) |
-| 4 — warm restart, same host | **absorbed, minus an ADR.** Its two data pieces were the durable point and the published point having no producer; increment 5's `InstallBase` supplies both, and `fetchBase` calls `recovery.DurablePoint`. What is left of it is the written decision on same-epoch re-attach vs. epoch bump — a fencing review zone, so it is an ADR, not a code task. |
+| 4 — warm restart, same host | **done.** Its two data pieces were the durable point and the published point having no producer; increment 5's `InstallBase` supplies both, and `fetchBase` calls `recovery.DurablePoint`. The written decision it also asked for is **ADR-0024** — same-epoch re-attach, with the four mechanisms it rests on named so a change cannot silently invalidate it. Writing it surfaced **DEV-0014** (two Agents, one data dir), which predates the decision. |
 | 5 — cold restart, seed the read view from S3 | **done** — this was the real correctness hole |
 | 6 — the DEK arm | **not started.** `dek_key_id` end to end plus a KEK source on the Agent. Until it lands every object in the bucket is plaintext and INV-15 is unreachable. Separable by design: 2–5 work with `enc == nil`. |
 | 7 — a guest that can issue FLUSH | **mostly done** (`e8bbdab`, `cef9881`) |
 | 8 — the e2e lane and a gate that can notice regressions | **not started.** Needs the QEMU-in-CI decision below. |
 
-So: **two increments of real work** (6 and 8), one ADR, and the QEMU-in-CI choice. The
+So: **two increments of real work** (6 and 8) and the QEMU-in-CI choice. The
 inventory sizes 6 at 1–2 days and 8 at 2–3. By its own definitions the first milestone
 matching the target slice's literal wording is the end of increment 6; the first one a
 **merge gate can defend** is the end of increment 8 — and until that exists, every green
@@ -299,6 +299,39 @@ nothing new to publish" is not the reason the honest arm stays quiet. The same p
 wiring trips `DurableAckLeaseChecker` too, asserted alongside it, because one cached
 answer loses both obligations.
 
+## ADR-0024 and the mechanism it first credited to the wrong thing
+
+Increment 4's last item was a written decision: does a restarted Agent re-attach at the
+same epoch, or must the epoch be bumped? **ADR-0024 decides same-epoch**, and it is a
+fencing review zone, so it landed with `scenarioCrashedFlushDoesNotCollideOnRestart`.
+
+The scenario builds the state that makes the question interesting: §14.4 uploads at step
+4 and checks the lease at step 5, so a writer that loses its lease mid-FLUSH leaves the
+bucket holding a *longer* contiguous prefix than the guest was ever told was durable.
+Here: the guest was told 4, the bucket holds 8. Re-attach at the same epoch, write
+something different over that range, flush — if the resumed writer had numbered from the
+last ACK it would re-issue sequences the bucket already has under a different content
+hash, INV-21 would hard-fail the PUT, and the volume could never flush again.
+
+**The first draft of the ADR credited S3 for preventing that, and was wrong.** It said
+`recovery.DurablePoint` → `InstallBase` resumes the writer above the bucket. True, and
+not sufficient: a listing that comes back one object short would resume *below* objects
+that exist. So the scenario was run against exactly that fault — and **it still passed**,
+which is what identified the real mechanism. `Resume` sets `local` from the last record
+**on disk**, `InstallBase` only ever raises, and INV-13 forbids truncating above
+`published`, which never exceeds what the bucket proves. Everything the dead incarnation
+uploaded is still in a local segment. S3 raises the floor; the local WAL is what stops it
+being lowered.
+
+Both listings now run, and the proof is a plausible regression rather than a hypothetical
+one: making `InstallBase` *set* rather than raise fails the short-listing arm while the
+honest arm still passes — which is the argument for the second arm existing.
+
+Two things came out of it beyond the ADR: **DEV-0014** (below), and a real race in the
+harness — `simListener.Close` guarded a channel close with a `select`/`default`, which is
+not a guard, and paniced under `-race` the first time a scenario ran two managers in one
+simulation. Now a `sync.Once`.
+
 ## The guest lane in CI: QEMU is the input that is still missing
 
 The kernel is solved (ADR-0022) and `task test:integration` no longer dies where QEMU is
@@ -411,6 +444,38 @@ segment: a format change of its own.
 segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
+
+## DEV-0014 — nothing stops two Agents from sharing one `--data-dir`
+
+Found while writing **ADR-0024** (a restarted writer re-attaches at the same epoch). The
+ADR is safe for the case it covers — the previous process is *gone* — and rests on four
+mechanisms that all concern what is in S3. None of them touches the case where the
+previous process is still alive.
+
+Start a second `volume-agent` against the same `--data-dir` (an operator, a supervisor
+restarting one that never actually died) and both incarnations resume the **same segment
+directory** at the same epoch, both appending through `disk.Open` (read + append), both
+numbering from the same resumed point. That is local corruption of the WAL, upstream of
+every invariant that watches the bucket.
+
+**Nothing detects it, and one thing actively hides it.** `hostio.Listen` unlinks a stale
+socket before binding — right for the crash case, and it means the second incarnation
+**silently steals the socket** instead of failing with `EADDRINUSE`. The first Agent keeps
+its open fds and its log; the guest follows the socket to the second.
+
+**It is not a consequence of ADR-0024 and predates it**: bumping the epoch would only have
+helped if the second incarnation went through the Control Plane, which is exactly what a
+stale supervisor restart does not do. This is **mutual exclusion on the data directory**,
+not an epoch policy, and the fix is an exclusive lock taken at start-up — the one thing
+that fails closed regardless of how the second process got there. It needs a lock
+primitive in `simio/disk` (INV-01: a lock is a syscall), which is why it is recorded
+rather than fixed in passing.
+
+**Blocks nothing today** — one Agent per host is the only configuration anything runs —
+and **must be closed before** the fleet ever runs two Agents on one host (per-device
+sharding, a blue/green upgrade), or before increment 8's e2e lane starts killing and
+restarting Agents under a supervisor, which is the first thing that could produce it by
+accident.
 
 ## DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads
 
