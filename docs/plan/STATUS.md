@@ -36,7 +36,10 @@ tracks state.
   done** (2026-08-01, `VIEW-ADOPTION-SPEC.md`): the seam is in `cow.IntervalMap`, `wal`
   can adopt a base lazily, the Agent resumes, and a DST arm restarts a truncated volume
   through the Agent on every seed. **Increment 3, checkpoint and truncate, is now
-  unblocked** — and it is the next thing to build.
+  unblocked**, and specified: `DURABILITY-SCHEDULER-SPEC.md` is awaiting review. Nothing
+  in it is about *how* to checkpoint — `checkpoint.Create` and `TruncateLocal` are both
+  done and careful — it is entirely about *when*, and every question in it has a
+  data-loss or an availability edge.
 
 ## Pick up here
 
