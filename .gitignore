@@ -31,3 +31,10 @@ cover*.out
 
 # Coverage intermediates
 cover.raw
+
+# pgregory.net/rapid writes a reproducer here when a property test fails. It is a
+# scratch artefact of one run on one machine: rapid replays it on the next run, so a
+# committed one makes every developer re-run a case that was fixed — and two of them
+# were committed by accident (2026-08-01, 2026-08-02) before this line existed. A case
+# worth keeping permanently belongs in the test as a named example.
+testdata/rapid/
