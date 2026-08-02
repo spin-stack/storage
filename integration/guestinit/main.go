@@ -36,6 +36,18 @@ const device = "/dev/vda"
 const (
 	writeOffset  = 1 << 20 // 1 MiB in
 	patternBytes = 4096
+	// blocks is how many patternBytes-sized blocks are written, and stride is how far
+	// apart. More than one block on purpose: a WAL segment is sealed by the append that
+	// would overflow it, so a single record leaves the only segment open and a
+	// truncation with nothing to reclaim — which would make the host's
+	// checkpoint-and-restart lane vacuous.
+	//
+	// They are *scattered* rather than consecutive for the same reason, discovered the
+	// hard way: the guest's page cache merges adjacent dirty blocks into one virtio
+	// request, so eight consecutive writes arrived as a single 32 KiB record and sealed
+	// nothing. A stride the kernel cannot coalesce across is what makes them eight.
+	blocks = 8
+	stride = 64 << 10
 )
 
 // verdict lines the host test greps for. The prefix is unlikely to appear in kernel
@@ -60,7 +72,7 @@ func main() {
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	openConsole()
 
-	if err := run(); err != nil {
+	if err := run(verifyOnly()); err != nil {
 		report("%s %v", verdictFail, err)
 	} else {
 		report("%s", verdictPass)
@@ -68,7 +80,22 @@ func main() {
 	powerOff()
 }
 
-func run() error {
+// verifyOnly reports whether the host asked this boot to *check* the device rather than
+// write to it, via `spin.mode=verify` on the kernel command line.
+//
+// The second boot of a volume is the only way to prove what a checkpoint and a
+// truncation left behind: the first boot writes and fsyncs, the host publishes and
+// reclaims, and this boot reads the same range back. Doing it in one boot would prove
+// nothing — the data would still be in the page cache and in the local WAL.
+func verifyOnly() bool {
+	cmdline, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(cmdline, []byte("spin.mode=verify"))
+}
+
+func run(verify bool) error {
 	// Plain O_RDWR: no O_SYNC, no O_DIRECT. Either would make the write durable on its
 	// own and leave fsync nothing to do — which would prove less, not more. The point
 	// is that a *buffered* write plus fsync produces a FLUSH, because that is what a
@@ -84,8 +111,17 @@ func run() error {
 		pattern[i] = byte('A' + (i % 23))
 	}
 
-	if _, err := f.WriteAt(pattern, writeOffset); err != nil {
-		return fmt.Errorf("writing at %d: %w", writeOffset, err)
+	if verify {
+		// Nothing written and nothing synced: whatever comes back was put there by a
+		// previous boot and survived whatever the host did in between.
+		return readBack(pattern)
+	}
+
+	for i := range blocks {
+		off := int64(writeOffset + i*stride)
+		if _, err := f.WriteAt(pattern, off); err != nil {
+			return fmt.Errorf("writing at %d: %w", off, err)
+		}
 	}
 
 	// The whole reason this program exists. fsync(2) on a block device the kernel knows
@@ -99,8 +135,12 @@ func run() error {
 		return fmt.Errorf("fsync (the FLUSH this lane exists for): %w", err)
 	}
 
-	// Read it back through a fresh descriptor so the answer cannot come from this
-	// process's own page cache.
+	return readBack(pattern)
+}
+
+// readBack re-reads the range through a *fresh* descriptor, so the answer cannot come
+// from this process's own page cache.
+func readBack(pattern []byte) error {
 	g, err := os.Open(device)
 	if err != nil {
 		return fmt.Errorf("reopening %s: %w", device, err)
@@ -108,11 +148,14 @@ func run() error {
 	defer func() { _ = g.Close() }()
 
 	got := make([]byte, patternBytes)
-	if _, err := g.ReadAt(got, writeOffset); err != nil {
-		return fmt.Errorf("reading back at %d: %w", writeOffset, err)
-	}
-	if !bytes.Equal(got, pattern) {
-		return fmt.Errorf("read-back mismatch at %d: the device did not return what fsync said was durable", writeOffset)
+	for i := range blocks {
+		off := int64(writeOffset + i*stride)
+		if _, err := g.ReadAt(got, off); err != nil {
+			return fmt.Errorf("reading back at %d: %w", off, err)
+		}
+		if !bytes.Equal(got, pattern) {
+			return fmt.Errorf("read-back mismatch at %d: the device did not return what fsync said was durable", off)
+		}
 	}
 	return nil
 }

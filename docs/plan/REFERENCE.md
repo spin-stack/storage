@@ -173,7 +173,7 @@ commit named is where the fix landed.
 | DEV-0004 | Fencing was fail-open, and promotion was neither atomic nor resumable. | resolved `6d5655e`, `f9f5885` |
 | DEV-0005 | Not every Control-Plane mutation was term-guarded. | resolved `93b70aa`, `15cb1e2` |
 | DEV-0006 | The object store exposed permanent deletion; the GC did not mark. | resolved `cd17e0b` |
-| DEV-0007 | Several phases marked done are partial models — the spine. | **open** → STATUS.md |
+| DEV-0007 | Several phases marked done are partial models — the spine. | **ADR-0018's chain closed 2026-08-02** (`TestAGuestSurvivesCheckpointAndTruncation`: a real guest writes, fsyncs, the Agent checkpoints and truncates, and a second boot reads it back from S3). The rest — background snapshot sealing, the clone chain link, segment objects, cross-host materialization — is still open → STATUS.md |
 | DEV-0008 | The drain was not idempotent across every crash boundary. | resolved `f9f5885` |
 | DEV-0009 | `rebuild-metadata` rebuilt volumes only. | resolved `2b09d1e` |
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |

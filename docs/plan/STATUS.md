@@ -476,7 +476,7 @@ disappeared — which is how nine tests missed it.
 **Consequence for the build order: the checkpoint/truncate increment must not merge
 without the view-adoption increment** (`BUILD-INVENTORY.md`, increments 3 and 5).
 
-## DEV-0007 — the spine's second half *(the only thing on the critical path)*
+## ~~DEV-0007~~ — the spine's second half *(the chain closed 2026-08-02)*
 
 ADR-0018's definition of done is one volume, one host, a real QEMU guest running
 **write → FLUSH → verified object → checkpoint → truncate**. The write is done. The rest
@@ -493,10 +493,11 @@ neither deep:
    spinbox's kernel is an ELF with Xen PVH notes (`CONFIG_PVH=y`) and QEMU enters it
    through `pvh.bin`, which was being extracted all along. Proven by booting with the
    blob deleted. The real reason was simply that no kernel image existed.
-   **What is left is the other side of the socket:** attaching a `vhost-user-blk` device
-   backed by `blockdev.Device` over `wal.Log` — which the keystone provides. The guest
-   currently fails with `GUESTINIT-FAIL opening /dev/vda: no such file or directory`,
-   which is the init working as designed.
+   **Closed 2026-08-02.** `TestALinuxGuestIssuesFLUSH` boots the pinned kernel against a
+   `vhost-user-blk` device the Agent serves over `wal.Log`, and a real kernel's `fsync`
+   makes a record durable in a verified object. Getting there needed the DEV-0018 fix:
+   a guest re-initialises the device when the firmware hands off to the OS, and the queue
+   loop stayed parked on the first kick.
 2. ~~`wal.Log` has no mutex~~ **cleared 2026-07-26** (`7afff77`). `Log` grew its own
    lock rather than the Agent being declared its single owner: `Log` is what owns the
    invariants, so that is where the guard belongs. Two mutexes — `mu` for state, held
@@ -507,9 +508,36 @@ neither deep:
    those accessors report is the RPO that is growing. Both halves are pinned by tests
    proven against that planted bug.
 
-Also part of DEV-0007, and untouched: snapshot sealing is synchronous rather than a
-background lifecycle, clone persists no parent/read-chain link, objectization publishes
-no segment objects, and cross-host materialization returns a view the caller discards.
+**ADR-0018's definition of done is now met, by a test.**
+`TestAGuestSurvivesCheckpointAndTruncation` boots one volume **twice**, through the real
+`agent.VolumeManager` with production's wiring (`hostio` for the socket and the kernel
+objects, `real.Disk`, a filesystem object store):
+
+1. the guest writes eight scattered blocks and calls `fsync` — one FLUSH, answered out of
+   §14.4, so the records are in verified objects;
+2. the Agent publishes a checkpoint and truncates to it — measured, not assumed: **7 of 8
+   segments reclaimed**, which is the moment the object store holds the only copy;
+3. the Agent and the guest are both restarted, and the guest reads the same ranges back —
+   out of a read view rebuilt from S3, because there is nowhere else left.
+
+Two things the writing of it turned up, both about making the test able to fail:
+
+- The guest's eight writes arrived as **one** 32 KiB record: the page cache merges
+  adjacent dirty blocks into a single virtio request, and a WAL segment is sealed by the
+  append that would overflow it — so nothing sealed and the truncation reclaimed nothing.
+  They are scattered at a 64 KiB stride now, which the kernel cannot coalesce across.
+- The first planted bug was **invalid**: pointing both Agents at a different bucket left
+  them consistent and the test passed. Deleting the bucket between the two boots is the
+  real one, and the guest then reports `read-back mismatch at 1048576`.
+
+`guestinit` gained a `spin.mode=verify` cmdline mode so the second boot reads without
+writing. Doing it in one boot would prove nothing: the data would still be in the page
+cache and in the local WAL.
+
+Still untouched, and no longer on this critical path: snapshot sealing is synchronous
+rather than a background lifecycle, clone persists no parent/read-chain link,
+objectization publishes no segment objects, and cross-host materialization returns a view
+the caller discards.
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 

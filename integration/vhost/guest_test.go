@@ -117,7 +117,7 @@ func TestALinuxGuestIssuesFLUSH(t *testing.T) {
 
 // runLinuxGuest boots kernel+initramfs against sock and returns QEMU's exit code and the
 // guest's console output.
-func runLinuxGuest(t *testing.T, ctx context.Context, sock, kernel, initramfs string) (int, string) {
+func runLinuxGuest(t *testing.T, ctx context.Context, sock, kernel, initramfs string, extraCmdline ...string) (int, string) {
 	t.Helper()
 	bin, bios := qemuPaths(t)
 
@@ -140,7 +140,7 @@ func runLinuxGuest(t *testing.T, ctx context.Context, sock, kernel, initramfs st
 		// `panic=-1` matters as much as the rest: PID 1 exiting panics the kernel, and a
 		// panicking kernel would otherwise sit there until the timeout, reporting a hang
 		// where there was a crash.
-		"-append", "console=ttyS0 panic=-1",
+		"-append", strings.Join(append([]string{"console=ttyS0", "panic=-1"}, extraCmdline...), " "),
 		"-serial", "stdio",
 		"-display", "none",
 		"-vga", "none",

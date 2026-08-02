@@ -18,9 +18,18 @@
 #                          runs in the integration lane
 #   - cmd/                  main() entrypoints
 #   - internal/dst         the DST test harness itself
+#   - integration/         the lanes themselves, and integration/guestinit, which is
+#                          PID 1 *inside the guest VM* — the same code the INV-01
+#                          exemption calls "not host code" (DEV-0013). It is never
+#                          linked into any binary this repository ships and cannot be
+#                          exercised from the host at all: its coverage comes from a
+#                          kernel booting it (TestALinuxGuestIssuesFLUSH). Counting it
+#                          as production the 90% floor governs was a category error,
+#                          invisible while the file was small and static, and it
+#                          surfaced when DEV-0018 added three functions to it.
 set -euo pipefail
 
-EXCLUDE='internal/db/|api/gen/|internal/metadata/pg/|internal/simio/real/s3.go|internal/simio/objectstore/storetest/|internal/metadata/metadatatest/|internal/testinfra/|/cmd/|internal/dst/'
+EXCLUDE='internal/db/|api/gen/|internal/metadata/pg/|internal/simio/real/s3.go|internal/simio/objectstore/storetest/|internal/metadata/metadatatest/|internal/testinfra/|/cmd/|internal/dst/|integration/'
 
 # -count=1: never reuse a cached test result here. A cached entry can carry coverage
 # blocks from an older compilation of a file, so the profile ends up describing two
