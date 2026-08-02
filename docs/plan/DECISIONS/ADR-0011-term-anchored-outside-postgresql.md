@@ -41,7 +41,7 @@ simply take turns, each believing the other's writes are its own resumed work.
 This is not a missing test. The system has nothing to test: there is no fact outside
 the restorable row that says "term 42 has already been issued".
 
-## Decision (proposed)
+## Decision
 
 **A term must be claimed in the object store before it is used, and the claim is
 create-only.**
@@ -96,10 +96,16 @@ mechanism, which is the one part of this that touches an area outside the term).
   "never PITR the Control Plane database while a leader is running", which is exactly
   the situation in which somebody will.
 
-## The test that would enforce it
+## The test that enforces it
 
-An integration test in the pg lane (TestContainers, `-tags integration`), because the
-whole point is that it survives a real database restore:
+`TestATermIsNeverIssuedTwiceAcrossADatabaseRestore`
+(`internal/metadata/pg/election_integration_test.go`), in the pg lane (TestContainers,
+`-tags integration`), because the whole point is that it survives a real database
+restore. The mechanism it covers runs in the binary: `cmd/control-plane` elects through
+`internal/controlplane/election.go`, and `scenarioRestoredControlPlane`
+(`internal/dst/scenarios_harness.go`) drives the same property deterministically.
+
+The shape it asserts:
 
 ```
 TestATermIsNeverIssuedTwiceAcrossADatabaseRestore

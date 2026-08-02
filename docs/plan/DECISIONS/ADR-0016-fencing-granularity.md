@@ -36,7 +36,19 @@ healthy host briefly interrupts durable ACKs for its other volumes.** A guest se
 FLUSH take longer, not a write fail — the WAL keeps accepting writes; it is the durable
 ACK that waits.
 
-### Stage 2 — the fence follows the volume (with the Agent, DEV-0007)
+### Stage 2 — the fence follows the volume
+
+> **Its stated blocker is gone, and it has not been scheduled.** This was written as
+> waiting on the Agent (DEV-0007), and DEV-0007's chain closed on 2026-08-02: the Agent
+> exists, serves volumes, and holds an epoch per volume. `internal/controlplane/drain.go`
+> carries the marker for where stage 2 lands.
+>
+> Nothing here is decided by that. Stage 2 changes **what `wal.Log` consults before ACKing
+> a FLUSH** (see the consequences below), which is the durability rule itself, so the
+> choice — schedule stage 2, or record stage 1 as the final answer and say why — is a
+> human's. Recorded under "Decisions waiting on a human" in `STATUS.md` rather than
+> settled here, because an ADR that quietly answers its own open question is how a
+> fencing decision changes without a review.
 
 The ACK gate becomes epoch holdership for **that volume**, not a lease for the host: a
 writer may ACK a FLUSH only while it can show it holds the volume's current epoch. The

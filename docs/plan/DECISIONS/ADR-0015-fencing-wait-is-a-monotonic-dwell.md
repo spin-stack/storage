@@ -54,16 +54,23 @@ whose length depends on how the database happens to be deployed.
 - **Bound replica lag and check it.** Requires a lag signal the CP can trust, which is
   the same problem one level down.
 
-## The tests that would enforce it
+## The tests that enforce it
 
-- A promoter test with a `metadata.Store` whose `GetHostLease` returns a `last_renewal`
-  from before the process started (a maximally stale read): the grant must still wait
-  the full dwell on the injected clock, and `PromotionWaitChecker` must stay quiet.
-- A test that a CP restart mid-fence resumes the dwell from the recorded instant rather
-  than restarting it, and that a *missing* record starts a fresh full dwell (fail slow,
-  never short).
-- A DST scenario `stale-lease-read-does-not-shorten-the-fence`, with the existing INV-11
-  checker and a planted bug that reverts the dwell to a timestamp comparison.
+All three landed, and the durable fence-start instant they need is a column on
+`volumes` (`internal/schema/schema.sql`), term-guarded like every other CP mutation.
+
+- `TestAStaleLeaseReadDoesNotShortenTheFence`
+  (`internal/controlplane/promotion_dwell_test.go`): a `metadata.Store` whose
+  `GetHostLease` returns a `last_renewal` from before the process started — a maximally
+  stale read — and the grant still waits the full dwell on the injected clock, with
+  `PromotionWaitChecker` quiet throughout.
+- `TestACrashMidFenceResumesTheDwellFromTheRecordedInstant` and
+  `TestAMissingFenceRecordStartsAFullDwell` (same file): a restart mid-fence resumes
+  from the recorded instant rather than restarting it, and a *missing* record starts a
+  fresh full dwell — fail slow, never short.
+- The DST scenario `stale-lease-read-does-not-shorten-the-fence`
+  (`internal/dst/scenarios_drain.go`), on the existing INV-11 checker, with its planted
+  bug reverting the dwell to a timestamp comparison.
 
 ## Consequences
 

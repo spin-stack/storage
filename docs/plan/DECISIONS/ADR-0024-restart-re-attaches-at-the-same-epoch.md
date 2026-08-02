@@ -113,9 +113,14 @@ Two things make it worse than it looks:
 
 This is a **mutual-exclusion problem on the data directory**, not an epoch policy, and it
 wants an exclusive lock taken at start-up — the one thing that fails closed regardless of
-how the second process got there. Recorded as **DEV-0014** in `STATUS.md`; it is not a
-consequence of this decision, it predates it, and choosing the other option would not
-have removed it.
+how the second process got there. It is not a consequence of this decision, it predates
+it, and choosing the other option would not have removed it.
+
+**Closed 2026-08-02 (DEV-0014).** The Agent takes an exclusive `flock` on `agent.lock`
+under its data directory and names the directory in the refusal, because the operator's
+next action is to find the process holding it. `DATA-DIR-LOCK-SPEC.md` records the
+decisions; `TestASecondAgentRefusesTheSameDataDir` in `integration/e2e` proves it against
+two real processes.
 
 ## Consequences
 

@@ -52,8 +52,13 @@ contiguous WAL prefix of the volume's epoch.
   `DRAINING` first; the Agent-side release is Phase 02/03 work. Until then the drain
   simply reports `ErrFencingWaitNotElapsed` and the reconciler retries — it never
   bypasses the wait.
-- **The snapshot path is not lost:** `controlplane.CloneCrossHost` materializes from a
-  published snapshot manifest (§20), so the doc's "snapshot + restore" flow exists for
-  clones; drain just does not depend on it.
+- **The snapshot path is not lost, but it moved.** This originally said
+  `controlplane.CloneCrossHost` materializes from a published snapshot manifest (§20).
+  That function was deleted on 2026-08-02 — it did expensive per-volume work on the
+  Control Plane, and it was called by nothing but its own test. §20's flow is now the
+  *destination Agent's*: it recovers its read view from the object store and layers its
+  parent's snapshot underneath (`agent.fetchBase`/`parentView`). The doc↔code bridge
+  §28.1 needed is therefore still here — it just points at the host that does the work
+  rather than at the one that used to. Drain still does not depend on it.
 - If the Agent RPC lands and a quiesced snapshot is preferred for planned drains, it can
   be added as a first step of `move` without changing the fencing order.

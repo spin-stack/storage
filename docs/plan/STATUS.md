@@ -678,6 +678,20 @@ calls it.
   proof the review did not happen — a commit records when a file entered the tree, not
   when a person read it — but the evidence CLAUDE.md's review-zone rule asks for is not
   in git, and only a human can say which it was.
+- **ADR-0023 shipped without a DST scenario, and its own text says so.** "It needs its
+  own DST arm" is still literally true, and it was left standing rather than tidied:
+  `grep -rn 'ADR-0023' internal/dst/` returns exactly one line, and that line explains
+  why `scenarios_agent.go` orders its checkpoint so ADR-0023 does **not** fire falsely —
+  the opposite of an arm that proves it. The only proof of the decision is a unit test
+  (`internal/agent/durability_internal_test.go`). CLAUDE.md lists "code touching
+  durability, fencing or GC with no DST scenario" as a stop signal, so this is recorded
+  as one: either the arm gets written, or the gap is accepted in writing.
+- **ADR-0016's stage 2 has lost its blocker and has not been scheduled.** It was written
+  as waiting on the Agent (DEV-0007), whose chain closed on 2026-08-02;
+  `internal/controlplane/drain.go` carries the marker for where it lands. Stage 2 changes
+  what `wal.Log` consults before ACKing a FLUSH — the durability rule itself — so the
+  choice between scheduling it and recording stage 1 as the final answer is not one an
+  increment should make on its way past.
 - **DEV-0012**, above.
 - **DEV-0020**, above: whether a clone chain is walked at materialization or flattened at
   clone time is a §19/§20 question, not an implementation detail.
