@@ -36,7 +36,7 @@ func TestGetVolumeKeysReturnsTheWrappedDEK(t *testing.T) {
 	wrapped := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	f.createVolume(t, metadata.Volume{
 		VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 3,
-		PrimaryHostID: hostA, DEKWrapped: wrapped, KEKID: "kek-7",
+		PrimaryHostID: hostA, DEKWrapped: wrapped, KEKID: "kek-7", DEKKeyID: 1,
 	})
 
 	msg, err := f.volumeKeys(t, hostA, "vol-a")
@@ -63,7 +63,7 @@ func TestGetVolumeKeysRefusesAHostThatIsNotTheWriter(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{
 		VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096,
-		PrimaryHostID: hostA, DEKWrapped: []byte{1, 2, 3}, KEKID: "kek-7",
+		PrimaryHostID: hostA, DEKWrapped: []byte{1, 2, 3}, KEKID: "kek-7", DEKKeyID: 1,
 	})
 
 	if _, err := f.volumeKeys(t, hostB, "vol-a"); connect.CodeOf(err) != connect.CodePermissionDenied {
@@ -75,7 +75,7 @@ func TestGetVolumeKeysArgumentErrors(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{
 		VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096,
-		PrimaryHostID: hostA, DEKWrapped: []byte{1}, KEKID: "kek",
+		PrimaryHostID: hostA, DEKWrapped: []byte{1}, KEKID: "kek", DEKKeyID: 1,
 	})
 	tests := []struct {
 		name         string

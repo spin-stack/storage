@@ -25,8 +25,8 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 
 	// Two volumes exist in S3 (descriptor + epoch object), nothing in PG.
 	descs := []descriptor.Descriptor{
-		{VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, KEKID: "k1", DEKWrapped: []byte{1, 2}},
-		{VolumeID: host1 /*any v7 id*/, SizeBytes: 2 << 30, BlockSize: 65536, Durability: "local", KEKID: "k2", DEKWrapped: []byte{3}},
+		{VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, KEKID: "k1", DEKWrapped: []byte{1, 2}, DEKKeyID: 1},
+		{VolumeID: host1 /*any v7 id*/, SizeBytes: 2 << 30, BlockSize: 65536, Durability: "local", KEKID: "k2", DEKWrapped: []byte{3}, DEKKeyID: 1},
 	}
 	epochsByVol := map[string]uint64{volID: 5, host1: 0}
 	for _, d := range descs {
@@ -68,7 +68,7 @@ func TestRebuildMetadataFromS3(t *testing.T) {
 func TestDescriptorRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	store := sim.NewObjectStore()
-	d := descriptor.Descriptor{VolumeID: volID, SizeBytes: 42, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 3, KEKID: "k", DEKWrapped: []byte{9}}
+	d := descriptor.Descriptor{DEKKeyID: 1, VolumeID: volID, SizeBytes: 42, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 3, KEKID: "k", DEKWrapped: []byte{9}}
 	if err := descriptor.Write(ctx, store, d); err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +126,7 @@ func TestRebuildRepairsAVolumeRowLeftBehindByS3(t *testing.T) {
 		VolumeID: staleVol, SizeBytes: 8 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 5, KEKID: "kek-1",
 		DEKWrapped: []byte{7, 7},
+		DEKKeyID:   1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +149,7 @@ func TestRebuildRepairsAVolumeRowLeftBehindByS3(t *testing.T) {
 		VolumeID: staleVol, SizeBytes: 8 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 2,
 		State: lifecycle.VolumeActive, PrimaryHostID: staleHost,
-		KEKID: "kek-1", DEKWrapped: []byte{7, 7},
+		KEKID: "kek-1", DEKWrapped: []byte{7, 7}, DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -200,8 +201,8 @@ func TestRebuildResumesAfterALeadershipChangeMidLoop(t *testing.T) {
 	epochs := epoch.NewStore(inner)
 
 	descs := []descriptor.Descriptor{
-		{VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 4, KEKID: "k1", DEKWrapped: []byte{1}},
-		{VolumeID: staleVol2, SizeBytes: 2 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 9, KEKID: "k2", DEKWrapped: []byte{2}},
+		{VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 4, KEKID: "k1", DEKWrapped: []byte{1}, DEKKeyID: 1},
+		{VolumeID: staleVol2, SizeBytes: 2 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, CurrentEpoch: 9, KEKID: "k2", DEKWrapped: []byte{2}, DEKKeyID: 1},
 	}
 	for _, d := range descs {
 		if err := descriptor.Write(ctx, inner, d); err != nil {
@@ -287,7 +288,7 @@ func TestRebuildNamesARowThatIsAheadOfS3(t *testing.T) {
 
 	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
 		VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536,
-		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 2, KEKID: "k", DEKWrapped: []byte{1},
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 2, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +304,7 @@ func TestRebuildNamesARowThatIsAheadOfS3(t *testing.T) {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: staleVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 7,
-		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1},
+		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +339,7 @@ func TestRebuildGrowsARowThatShrankUnderAPITR(t *testing.T) {
 
 	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
 		VolumeID: staleVol, SizeBytes: 16 << 30, BlockSize: 65536,
-		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +355,7 @@ func TestRebuildGrowsARowThatShrankUnderAPITR(t *testing.T) {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: staleVol, SizeBytes: 4 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1,
-		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1},
+		State: lifecycle.VolumeDetached, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

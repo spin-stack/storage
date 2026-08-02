@@ -51,7 +51,7 @@ func crossHostWorld(t *testing.T) (metadata.Store, int64, *sim.ObjectStore, snap
 	}
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
-		State: lifecycle.VolumeActive, PrimaryHostID: cloneHostA, DEKWrapped: []byte{7}, KEKID: "kek",
+		State: lifecycle.VolumeActive, PrimaryHostID: cloneHostA, DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

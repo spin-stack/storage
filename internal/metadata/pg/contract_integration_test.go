@@ -53,7 +53,7 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 	}
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		PrimaryHostID: hostID, DEKWrapped: []byte{1}, KEKID: "k",
+		PrimaryHostID: hostID, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -68,14 +68,14 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 			return store.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: ids.New().String(), SizeBytes: 1, BlockSize: 65536,
 				State: lifecycle.VolumeActive, PrimaryHostID: truncated,
-				DEKWrapped: []byte{1}, KEKID: "k",
+				DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 			}, nil)
 		}},
 		{"CreateVolume standby host", func() error {
 			return store.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: ids.New().String(), SizeBytes: 1, BlockSize: 65536,
 				State: lifecycle.VolumeActive, StandbyHostID: truncated,
-				DEKWrapped: []byte{1}, KEKID: "k",
+				DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 			}, nil)
 		}},
 		{"BumpVolumeEpoch primary host", func() error {
@@ -155,7 +155,7 @@ func TestPGVolumeStateGuardIsAtomic(t *testing.T) {
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestPGSnapshotStateGuardIsAtomic(t *testing.T) {
 	volID, snapID := ids.New().String(), ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

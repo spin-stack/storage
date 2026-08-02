@@ -42,9 +42,9 @@ func TestTheSpineEndToEnd(t *testing.T) {
 
 	// mine is served by this host under epoch 4; stolen was promoted away.
 	for _, v := range []metadata.Volume{
-		{VolumeID: "vol-mine", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4, PrimaryHostID: testHost,
+		{VolumeID: "vol-mine", DEKKeyID: 1, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4, PrimaryHostID: testHost,
 			State: lifecycle.VolumeActive, Durability: lifecycle.DurabilityRemote},
-		{VolumeID: "vol-stolen", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 9, PrimaryHostID: testHost,
+		{VolumeID: "vol-stolen", DEKKeyID: 1, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 9, PrimaryHostID: testHost,
 			State: lifecycle.VolumeActive, Durability: lifecycle.DurabilityRemote},
 	} {
 		if err := md.CreateVolume(t.Context(), term, v, nil); err != nil {
@@ -169,7 +169,7 @@ func TestTheAgentCanOpenAVolume(t *testing.T) {
 	if err := md.CreateVolume(t.Context(), term, metadata.Volume{
 		VolumeID: "vol-mine", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4,
 		PrimaryHostID: testHost, State: lifecycle.VolumeActive, Durability: lifecycle.DurabilityRemote,
-		DEKWrapped: wrapped, KEKID: kms.KEKID(),
+		DEKWrapped: wrapped, KEKID: kms.KEKID(), DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

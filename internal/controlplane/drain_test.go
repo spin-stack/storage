@@ -159,7 +159,7 @@ func newDrainWorld(t *testing.T, destTotalBytes int64) *drainWorld {
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: volID, SizeBytes: volSize, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
 			State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: cloneHostA,
-			DEKWrapped: []byte{7}, KEKID: "kek",
+			DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 1,
 		}, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -198,7 +198,7 @@ func (w *drainWorld) fill(t *testing.T, hostID string, n int) {
 		if err := w.base.CreateVolume(ctx, w.term, metadata.Volume{
 			VolumeID: format.UUIDString(vol), SizeBytes: volSize, BlockSize: 65536,
 			State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: hostID,
-			DEKWrapped: []byte{1}, KEKID: "k",
+			DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 		}, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -540,7 +540,7 @@ func TestDrainReleasesCapacityWhenMaterializationFails(t *testing.T) {
 	badID := format.UUIDString(bad)
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: badID, SizeBytes: volSize, BlockSize: 65536, State: lifecycle.VolumeActive,
-		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +578,7 @@ func TestDrainRejectsMalformedVolumeID(t *testing.T) {
 	w.pastFencingWait()
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: "not-a-uuid", SizeBytes: volSize, BlockSize: 65536,
-		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +748,7 @@ func TestDrainResumeUsesTheRecordedPlan(t *testing.T) {
 	lateID := format.UUIDString(late)
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: lateID, SizeBytes: volSize, BlockSize: 65536, State: lifecycle.VolumeActive,
-		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -967,7 +967,7 @@ func TestDrainAcceptsAnEmptyEpoch(t *testing.T) {
 	emptyID := format.UUIDString(empty)
 	if err := w.md.CreateVolume(ctx, w.term, metadata.Volume{
 		VolumeID: emptyID, SizeBytes: volSize, BlockSize: 65536, State: lifecycle.VolumeActive,
-		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k",
+		CurrentEpoch: 1, PrimaryHostID: cloneHostA, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lease"
@@ -33,6 +35,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "truncated-volume-survives-a-restart", Run: scenarioTruncatedVolumeSurvivesARestart},
 		{Name: "lapsed-lease-stops-publishing", Run: scenarioLapsedLeaseStopsPublishing},
 		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
+		{Name: "agent-encrypts-what-leaves-the-host", Run: scenarioAgentEncryptsWhatLeavesTheHost},
 	}
 }
 
@@ -779,6 +782,196 @@ func crashedFlushDoesNotCollideOnRestart(s *Sim, shortenListings bool) error {
 	s.Notef("re-attached at epoch 1 (listing short=%t) and flushed past the crash: durable %d -> %d",
 		shortenListings, inBucket, w.DurableSequence)
 	return nil
+}
+
+// scenarioAgentEncryptsWhatLeavesTheHost is INV-15 (§5.10) at the seam that decides
+// it. `scenarioEncryptedWALNoPlaintextLeak` already proves the *WAL* encrypts when it
+// is given an Encryption — but until BUILD-INVENTORY increment 6 nothing ever gave it
+// one: every volume the Agent served built its log with `enc == nil`, and the checker
+// that watches for cleartext had never seen an Agent.
+//
+// So this drives the real VolumeManager with a real crypto.DevKMS, writes a pattern a
+// guest would recognise, flushes it into the object store, and reads every object back
+// looking for that pattern. What it watches is not the flag — it is the bytes in the
+// bucket.
+//
+// It also covers the half that has no other test: an Agent whose KMS cannot unwrap a
+// volume's DEK must serve *nothing*. Falling back to plaintext would put this guest's
+// data in the bucket under a name that says it is encrypted, and §15.3's
+// crypto-shredding guarantee does not survive that — the objects stay readable after
+// the DEK is destroyed.
+func scenarioAgentEncryptsWhatLeavesTheHost(s *Sim) error {
+	return agentEncryptsWhatLeavesTheHost(s, hostHoldsItsKEK)
+}
+
+const (
+	hostHoldsItsKEK = false
+	// noKEKOnTheHost is an Agent started without -kek-file. It is a *supported* mode —
+	// dev and the QEMU lane run in it — and running a real volume in it is still an
+	// INV-15 violation, which is the point: the misconfiguration is the bug, it is
+	// reachable by leaving one flag off, and nothing but this checker notices.
+	noKEKOnTheHost = true
+)
+
+func agentEncryptsWhatLeavesTheHost(s *Sim, withoutKEK bool) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+
+	// A KEK drawn from the seeded PRNG, so the same seed gives the same key and the
+	// same ciphertext (INV-02).
+	var kek [crypto.DEKSize]byte
+	if _, err := io.ReadFull(s.Rand, kek[:]); err != nil {
+		return err
+	}
+	kms := crypto.NewDevKMS(kek, "kek-dst")
+	dek, err := crypto.GenerateDEK(s.Rand, 7)
+	if err != nil {
+		return err
+	}
+	wrapped, err := kms.WrapDEK(s.Rand, dek)
+	if err != nil {
+		return err
+	}
+
+	keys := func(honest bool) agent.KeysFunc {
+		return func(context.Context, string) (agent.VolumeKeys, error) {
+			k := agent.VolumeKeys{VolumeID: volumeID, DEKWrapped: wrapped, KEKID: "kek-dst", DEKKeyID: dek.KeyID}
+			if !honest {
+				// The version the Control Plane hands over, rewritten. It is bound as
+				// GCM additional authenticated data, so the unwrap fails — this is a
+				// key this host cannot open, reached without touching the Agent.
+				k.DEKKeyID = dek.KeyID + 1
+			}
+			return k, nil
+		}
+	}
+
+	lm := lease.NewManager(s.Clock, time.Minute)
+	lm.Grant()
+	newManager := func(honest bool) (*agent.VolumeManager, error) {
+		return agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+			Limits: wal.Limits{SegmentBytes: 8192},
+			HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
+		}, agent.VolumeManagerDeps{
+			Clock:   s.Clock,
+			Disk:    s.Disk,
+			Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+			Mapper:  simMapper{},
+			EventFD: simEventFD,
+			Store:   s.Store,
+			Lease:   func() bool { return lm.Valid() },
+			KMS:     kmsOrNil(kms, withoutKEK),
+			Keys:    keys(honest),
+		})
+	}
+	desired := []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}
+
+	m, err := newManager(true)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close() }()
+	if err := m.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("starting an encrypted volume: %w", err)
+	}
+	dev, ok := m.Device(volumeID)
+	if !ok {
+		return errors.New("the encrypted volume is not being served")
+	}
+
+	// A pattern no encryption would leave intact and no header would produce by
+	// accident: 4 KiB of one byte, which is exactly what a guest filesystem writing
+	// zeroed or filled blocks looks like.
+	pattern := bytes.Repeat([]byte{0xE7}, 4096)
+	for i := range 4 {
+		if _, err := dev.WriteAt(pattern, int64(i)*4096); err != nil {
+			return fmt.Errorf("guest write %d: %w", i, err)
+		}
+	}
+	if err := dev.Flush(ctx); err != nil {
+		return fmt.Errorf("the FLUSH that puts it in the bucket: %w", err)
+	}
+
+	// Everything this volume put in the store, examined for the guest's bytes. The
+	// event carries what was found, so the INV-15 checker sees it on every seed rather
+	// than only when this scenario's own assertion happens to run.
+	objs, err := s.Store.List(ctx, "wal/"+volumeID+"/")
+	if err != nil {
+		return err
+	}
+	if len(objs) == 0 {
+		return errors.New("no WAL objects were uploaded: this scenario would prove nothing")
+	}
+	leaked := false
+	for _, o := range objs {
+		body, err := s.Store.Get(ctx, o.Key)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(body, pattern) {
+			leaked = true
+			s.Emit(Event{Kind: EventLeavesHost, ClearLeak: true,
+				Msg: fmt.Sprintf("object %s carries the guest's plaintext", o.Key)})
+			break
+		}
+	}
+	if !leaked {
+		s.Emit(Event{Kind: EventLeavesHost, ClearLeak: false,
+			Msg: fmt.Sprintf("%d WAL objects, none carrying the guest's pattern", len(objs))})
+	}
+	if leaked {
+		return fmt.Errorf("volume %s wrote the guest's plaintext into the object store (§5.10/INV-15)", volumeID)
+	}
+
+	// And it is not encrypted-to-noise: the same log replays through the same key.
+	got := make([]byte, len(pattern))
+	if _, err := dev.ReadAt(got, 0); err != nil {
+		return fmt.Errorf("reading back through the encrypted log: %w", err)
+	}
+	if !bytes.Equal(got, pattern) {
+		return errors.New("the encrypted volume did not read back what the guest wrote")
+	}
+	s.Notef("volume %s: %d objects in the bucket, none in the clear, and the guest reads its own bytes",
+		volumeID, len(objs))
+
+	if withoutKEK {
+		// The second half asserts a refusal that only a KMS can produce. An Agent
+		// without one has already said everything it has to say.
+		return nil
+	}
+
+	// The other half: a key this host cannot unwrap serves nothing. A different volume
+	// id, because the first one's runtime is still up.
+	badID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	m2, err := newManager(false)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m2.Close() }()
+	badDesired := []*storagev1.DesiredVolume{{
+		VolumeId: badID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}
+	if err := m2.Apply(ctx, badDesired); err == nil {
+		return errors.New("a volume whose DEK could not be unwrapped was started anyway (§15)")
+	}
+	if _, served := m2.Device(badID); served {
+		return errors.New("a volume whose DEK could not be unwrapped is being served (§15)")
+	}
+	s.Notef("a volume whose DEK will not unwrap is not served at all, rather than served in the clear")
+	return nil
+}
+
+// kmsOrNil drops the KMS, which is all it takes to serve a volume in the clear.
+func kmsOrNil(k crypto.KMS, drop bool) crypto.KMS {
+	if drop {
+		return nil
+	}
+	return k
 }
 
 // servedStatus reads one volume's reported status out of the manager.

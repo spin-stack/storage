@@ -19,11 +19,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
@@ -54,6 +56,8 @@ func run() error {
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
+		kekFile      = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
+		kekID        = flag.String("kek-id", "", "identity of the KEK in -kek-file; must match the kek_id the Control Plane wrapped each volume's DEK under (required with -kek-file)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -68,6 +72,13 @@ func run() error {
 		return errors.New("-data-dir is required")
 	case *socketDir == "":
 		return errors.New("-vhost-socket-dir is required")
+	case *kekFile != "" && *kekID == "":
+		// The id is not cosmetic: crypto.DevKMS binds it to nothing, but the Agent
+		// compares it against the volume's kek_id before unwrapping, so a blank one
+		// would make every volume look like it was wrapped under a different key.
+		return errors.New("-kek-id is required with -kek-file")
+	case *kekFile == "" && *kekID != "":
+		return errors.New("-kek-id names a key nothing reads without -kek-file")
 	}
 
 	cfg := agent.Config{
@@ -102,6 +113,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// §15: every payload of guest data is sealed with the volume's DEK before any
+	// PUT. The KEK is read once, here — the Agent unwraps a DEK only at attach
+	// (§15.1) and keeps it in memory. Without -kek-file there is no KMS and the Agent
+	// runs in the clear, which is honest for dev and refused for anything else by the
+	// operator who chose not to pass the flag.
+	var kms crypto.KMS
+	if *kekFile != "" {
+		kekDisk, kerr := real.NewDisk(filepath.Dir(*kekFile))
+		if kerr != nil {
+			return fmt.Errorf("opening the directory holding the KEK: %w", kerr)
+		}
+		kek, kerr := agent.LoadKEK(kekDisk, filepath.Base(*kekFile))
+		if kerr != nil {
+			return kerr
+		}
+		kms = crypto.NewDevKMS(kek, *kekID)
+	} else {
+		slog.Warn("no -kek-file: this Agent writes guest data unencrypted (§15 requires encryption outside dev)")
+	}
+
 	// One runtime per volume, each with its own WAL, block device and vhost-user
 	// socket. This is what the Agent serves from — before it, the binary heartbeated
 	// about an empty set forever.
@@ -124,6 +155,16 @@ func run() error {
 		EventFD: hostio.NewEventFD,
 		Store:   store,
 		Lease:   func() bool { return loop != nil && loop.LeaseValid() },
+		KMS:     kms,
+		// Read through the loop for the same reason the lease is: the loop is assigned
+		// below, and it owns the cache whose entries are evicted when a volume leaves
+		// this host's desired state.
+		Keys: func(ctx context.Context, volumeID string) (agent.VolumeKeys, error) {
+			if loop == nil {
+				return agent.VolumeKeys{}, errors.New("the Agent loop is not running yet")
+			}
+			return loop.VolumeKeys(ctx, volumeID)
+		},
 	})
 	if err != nil {
 		return err

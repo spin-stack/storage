@@ -79,6 +79,9 @@ var (
 	// asserting that its writer is gone; handing it a fresh lease afterwards
 	// contradicts that assertion.
 	ErrHostNotServing = errors.New("metadata: host is not serving")
+
+	// ErrUnversionedDEK is a volume written with DEKKeyID 0 — see CheckDEKKeyID.
+	ErrUnversionedDEK = errors.New("metadata: a volume's DEK must carry a version")
 )
 
 // CheckWatermarkOrder returns ErrWatermarkOrder unless published ≤ durable ≤ local
@@ -93,6 +96,21 @@ func CheckWatermarkOrder(local, durable, published int64) error {
 	if published > durable || durable > local {
 		return fmt.Errorf("%w: published=%d durable=%d local=%d",
 			ErrWatermarkOrder, published, durable, local)
+	}
+	return nil
+}
+
+// CheckDEKKeyID returns ErrUnversionedDEK unless keyID is a real DEK version. It is
+// the Go half of volumes.dek_key_id's CHECK, for the same reason CheckWatermarkOrder
+// exists: both stores must refuse the same input with the same sentinel.
+//
+// Zero is the whole rule. It is not "unset" — on the WAL path KeyID 0 means *this
+// record is plaintext* (§14.1), so a volume row carrying 0 describes a key the Agent
+// must refuse at attach (wal.ErrUnversionedKey), after the KMS call, with the DEK
+// already in memory. Refusing it at the write refuses it while it can still be fixed.
+func CheckDEKKeyID(keyID uint32) error {
+	if keyID == 0 {
+		return fmt.Errorf("%w: 0 is the plaintext marker, not a DEK version (§15.1)", ErrUnversionedDEK)
 	}
 	return nil
 }
@@ -225,17 +243,23 @@ func PlanReservations(currentState []byte) []PlanReservation {
 
 // Volume is the durable-volume record (§8). Watermarks are informative (§5.8).
 type Volume struct {
-	VolumeID          string
-	SizeBytes         int64
-	Durability        lifecycle.Durability // §14.8
-	BlockSize         int32
-	CurrentEpoch      int64
-	State             lifecycle.VolumeState
-	PrimaryHostID     string
-	StandbyHostID     string
-	ChainDepth        int32
-	DEKWrapped        []byte
-	KEKID             string
+	VolumeID      string
+	SizeBytes     int64
+	Durability    lifecycle.Durability // §14.8
+	BlockSize     int32
+	CurrentEpoch  int64
+	State         lifecycle.VolumeState
+	PrimaryHostID string
+	StandbyHostID string
+	ChainDepth    int32
+	DEKWrapped    []byte
+	KEKID         string
+	// DEKKeyID is the DEK's own version — RecordHeader.KeyID (§15.1), the field that
+	// lets rotation re-key new data without re-encrypting history. It travels with
+	// DEKWrapped because a wrapped key and another key's version describe a volume
+	// nothing can open. Zero is not a version: it is the WAL's plaintext marker, and
+	// wal.NewEncryption refuses it.
+	DEKKeyID          uint32
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64

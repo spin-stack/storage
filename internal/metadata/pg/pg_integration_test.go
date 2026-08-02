@@ -78,7 +78,7 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, termA, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1, 2, 3}, KEKID: "kek-1",
+		DEKWrapped: []byte{1, 2, 3}, KEKID: "kek-1", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestPGFleetSurface(t *testing.T) {
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k", PrimaryHostID: hostA,
+		DEKWrapped: []byte{1}, KEKID: "k", PrimaryHostID: hostA, DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestPGFleetSurface(t *testing.T) {
 	}
 	if err := store.CreateVolume(ctx, staleTerm, metadata.Volume{
 		VolumeID: ids.New().String(), SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale-term create: want ErrStaleTerm, got %v", err)
 	}
@@ -231,7 +231,7 @@ func TestPGRejectsNonV7(t *testing.T) {
 	// A v1 UUID (version nibble 1) must be rejected by the CHECK constraint.
 	err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: "11111111-1111-1111-1111-111111111111", SizeBytes: 1, BlockSize: 65536,
-		State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
+		State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil)
 	if err == nil {
 		t.Fatal("Postgres must reject a non-v7 volume_id (INV-22 CHECK)")
@@ -265,8 +265,8 @@ func TestPGRejectsNonV7OnEveryIdentityColumn(t *testing.T) {
 		},
 		{
 			name: "volumes.volume_id",
-			insert: `INSERT INTO volumes (volume_id, size_bytes, block_size, state, dek_wrapped, kek_id)
-			         VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k')`,
+			insert: `INSERT INTO volumes (volume_id, size_bytes, block_size, state, dek_wrapped, kek_id, dek_key_id)
+			         VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k', 1)`,
 			row: func(id string) []any { return []any{id} },
 		},
 		{
@@ -291,8 +291,8 @@ func TestPGRejectsNonV7OnEveryIdentityColumn(t *testing.T) {
 
 	// The volume the snapshot rows hang off; its id is a valid v7.
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO volumes (volume_id, size_bytes, block_size, state, dek_wrapped, kek_id)
-		 VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k')`, seedVolume); err != nil {
+		`INSERT INTO volumes (volume_id, size_bytes, block_size, state, dek_wrapped, kek_id, dek_key_id)
+		 VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k', 1)`, seedVolume); err != nil {
 		t.Fatal(err)
 	}
 
@@ -408,7 +408,7 @@ func TestPGWatermarkOrderIsAConstraint(t *testing.T) {
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 		LocalSequence: 100, DurableSequence: 90, PublishedSequence: 80,
 	}, nil); err != nil {
 		t.Fatal(err)
@@ -422,9 +422,12 @@ func TestPGWatermarkOrderIsAConstraint(t *testing.T) {
 		{"published above durable", `UPDATE volumes SET published_sequence = 95 WHERE volume_id = $1`},
 		{"durable above local", `UPDATE volumes SET durable_sequence = 101 WHERE volume_id = $1`},
 		{"local below both", `UPDATE volumes SET local_sequence = 70 WHERE volume_id = $1`},
+		// dek_key_id is supplied so this row fails for the reason the case is named
+		// after. Without it the INSERT trips the NOT NULL first and the test would
+		// pass while proving nothing about the watermark ordering.
 		{"inserted out of order", `INSERT INTO volumes (volume_id, size_bytes, block_size, state,
-			dek_wrapped, kek_id, local_sequence, durable_sequence, published_sequence)
-			VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k', 1, 2, 3)`},
+			dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence)
+			VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k', 1, 1, 2, 3)`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -469,7 +472,7 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +539,7 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 	volID := ids.New().String()
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +666,7 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 		}
 		if err := store.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: ids.New().String(), SizeBytes: 1 << 30, BlockSize: 65536,
-			State: lifecycle.VolumeActive, PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k",
+			State: lifecycle.VolumeActive, PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 		}, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -865,7 +868,7 @@ func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
 		host := fleet[i%len(fleet)]
 		if err := store.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: id, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-			PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k",
+			PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 		}, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -982,5 +985,53 @@ func assertIndexed(t *testing.T, pool *pgxpool.Pool, index, table, query string,
 	}
 	if strings.Contains(plan, "Seq Scan on "+table) {
 		t.Fatalf("the query still scans the whole %s table:\n%s", table, plan)
+	}
+}
+
+// TestPGRejectsAnUnversionedDEK is volumes.dek_key_id's CHECK, on the database rather
+// than on the Go guard in front of it.
+//
+// Both layers exist for the reason CheckWatermarkOrder's two layers do: the Go check
+// gives a caller a sentinel it can branch on, and the constraint is what holds when a
+// row is written by something that is not this adapter — a repair script, a restore, a
+// future migration. Testing only the Go half would prove the guard, not the rule.
+//
+// 0 is the whole rule: on the WAL path KeyID 0 means "this record is plaintext"
+// (§14.1), so a volume row carrying it describes a key the Agent must refuse at attach
+// with the DEK already unwrapped.
+func TestPGRejectsAnUnversionedDEK(t *testing.T) {
+	ctx := t.Context()
+	pool := startPostgres(t)
+	store := pg.New(pool)
+	term, _ := store.AcquireLeadership(ctx, "cp")
+
+	// The adapter's own guard, first: a caller gets a sentinel, not a 23514.
+	err := store.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: ids.New().String(), SizeBytes: 1, BlockSize: 65536,
+		State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
+	}, nil)
+	if !errors.Is(err, metadata.ErrUnversionedDEK) {
+		t.Fatalf("CreateVolume with DEKKeyID 0: want ErrUnversionedDEK, got %v", err)
+	}
+
+	// And the constraint behind it, reached with SQL the adapter cannot express.
+	for _, tc := range []struct {
+		name  string
+		keyID int64
+	}{
+		{"zero is the plaintext marker", 0},
+		{"negative is not a uint32", -1},
+		{"past uint32 cannot round-trip the format field", 1 << 32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := pool.Exec(ctx, `
+				INSERT INTO volumes (volume_id, size_bytes, durability, block_size,
+				                     current_epoch, state, dek_wrapped, kek_id, dek_key_id)
+				VALUES ($1, 1, 'remote', 65536, 0, 'ACTIVE', '\x01', 'k', $2)`,
+				ids.New().String(), tc.keyID)
+			if err == nil {
+				t.Fatalf("Postgres accepted dek_key_id = %d", tc.keyID)
+			}
+		})
 	}
 }

@@ -426,7 +426,7 @@ func earlyPromotion(f promoFault) Scenario {
 		}
 		if err := md.CreateVolume(ctx, term, metadata.Volume{
 			VolumeID: fencedVol, State: lifecycle.VolumeActive,
-			PrimaryHostID: fencedHost1, DEKWrapped: []byte{1}, KEKID: "k",
+			PrimaryHostID: fencedHost1, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 		}, nil); err != nil {
 			return err
 		}

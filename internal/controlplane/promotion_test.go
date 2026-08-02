@@ -30,7 +30,7 @@ func setup(t *testing.T) (*controlplane.Promoter, metadata.Store, *epoch.Store, 
 	_ = md.UpsertHost(t.Context(), term, metadata.Host{HostID: host1, State: lifecycle.HostActive})
 	_ = md.UpsertHost(t.Context(), term, metadata.Host{HostID: host2, State: lifecycle.HostActive})
 	_ = md.CreateVolume(t.Context(), term, metadata.Volume{
-		VolumeID: volID, State: lifecycle.VolumeActive, PrimaryHostID: host1, DEKWrapped: []byte{1}, KEKID: "k",
+		VolumeID: volID, State: lifecycle.VolumeActive, PrimaryHostID: host1, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil)
 	if _, err := epochs.Init(t.Context(), volID, 0); err != nil {
 		t.Fatal(err)

@@ -192,7 +192,7 @@ func newWorld(t *testing.T, s metadata.Store) world {
 	}); err != nil {
 		t.Fatalf("UpsertHost: %v", err)
 	}
-	if err := s.CreateVolume(ctx, term, metadata.Volume{
+	if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: w.vol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		PrimaryHostID: w.host, DEKWrapped: []byte{1}, KEKID: "kek",
 	}, nil); err != nil {
@@ -242,7 +242,7 @@ func everyMutation() []mutation {
 			return revokeHostLease(ctx, s, term, w.host)
 		}},
 		{"CreateVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{
+			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 				VolumeID: id(), SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
 				DEKWrapped: []byte{1}, KEKID: "k",
 			}, nil)
@@ -445,7 +445,7 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 	if err := s.UpsertHost(ctx, w.term, metadata.Host{HostID: standby, State: lifecycle.HostActive}); err != nil {
 		t.Fatal(err)
 	}
-	want := metadata.Volume{
+	want := metadata.Volume{DEKKeyID: 1,
 		VolumeID: id(), SizeBytes: 1 << 33, Durability: lifecycle.DurabilityLocal,
 		BlockSize: 65536, CurrentEpoch: 7, State: lifecycle.VolumeDetached,
 		PrimaryHostID: w.host, StandbyHostID: standby, ChainDepth: 3,
@@ -479,7 +479,7 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
 	vol := id()
-	if err := s.CreateVolume(ctx, w.term, metadata.Volume{
+	if err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: vol, SizeBytes: 1 << 30, BlockSize: 65536, CurrentEpoch: 5,
 		State: lifecycle.VolumeActive, PrimaryHostID: w.host, DEKWrapped: []byte{1}, KEKID: "k",
 	}, nil); err != nil {
@@ -490,7 +490,7 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 	}
 
 	// The losing rebuild: a fresh descriptor-shaped row — epoch 2, no owner, DETACHED.
-	if err := s.CreateVolume(ctx, w.term, metadata.Volume{
+	if err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: vol, SizeBytes: 1 << 20, BlockSize: 65536, CurrentEpoch: 2,
 		State: lifecycle.VolumeDetached, DEKWrapped: []byte{1}, KEKID: "k",
 	}, nil); err != nil {
@@ -619,7 +619,7 @@ func watermarks(t *testing.T, s metadata.Store) {
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
 				vol := id()
-				err := s.CreateVolume(ctx, w.term, metadata.Volume{
+				err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
 					VolumeID: vol, SizeBytes: 1 << 20, BlockSize: 65536,
 					State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
 					LocalSequence: tc.local, DurableSequence: tc.durable, PublishedSequence: tc.published,
@@ -1097,7 +1097,7 @@ func capacity(t *testing.T, s metadata.Store) {
 	t.Run("the bound is a predicate of the write that places a volume", func(t *testing.T) {
 		tight := &metadata.CapacityBound{HostID: other, AddBytes: 2 * gib, Limit: gib}
 		fresh := id()
-		err := s.CreateVolume(ctx, w.term, metadata.Volume{
+		err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
 			VolumeID: fresh, SizeBytes: 2 * gib, BlockSize: 65536, State: lifecycle.VolumeActive,
 			PrimaryHostID: other, DEKWrapped: []byte{1}, KEKID: "k",
 		}, tight)
@@ -1109,7 +1109,7 @@ func capacity(t *testing.T, s metadata.Store) {
 		}
 		// Exactly at the bound is admitted, and the same write with no bound at all
 		// is not a placement decision and is never refused.
-		if err := s.CreateVolume(ctx, w.term, metadata.Volume{
+		if err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
 			VolumeID: fresh, SizeBytes: 2 * gib, BlockSize: 65536, State: lifecycle.VolumeActive,
 			PrimaryHostID: other, DEKWrapped: []byte{1}, KEKID: "k",
 		}, &metadata.CapacityBound{HostID: other, AddBytes: 2 * gib, Limit: 2 * gib}); err != nil {
@@ -1384,7 +1384,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			return revokeHostLease(ctx, s, term, "")
 		}},
 		{"CreateVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{
+			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 				VolumeID: "", SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
 				DEKWrapped: []byte{1}, KEKID: "k",
 			}, nil)

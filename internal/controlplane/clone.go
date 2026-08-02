@@ -39,6 +39,11 @@ func Clone(ctx context.Context, md metadata.Store, term int64, parentSnapshotID,
 		ChainDepth:    parent.ChainDepth + 1,
 		DEKWrapped:    parent.DEKWrapped,
 		KEKID:         parent.KEKID,
+		// A clone shares the parent's DEK (§19: the chain's objects are the parent's
+		// until the child writes), so it must share the *version* that names it —
+		// crypto.DevKMS binds it as GCM AAD, and a clone carrying the key without the
+		// version is a volume nobody can open.
+		DEKKeyID: parent.DEKKeyID,
 	}
 	if err := md.CreateVolume(ctx, term, clone, bound); err != nil {
 		return metadata.Volume{}, err

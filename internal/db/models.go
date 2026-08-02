@@ -82,6 +82,7 @@ type Volume struct {
 	ChainDepth        int32              `json:"chain_depth"`
 	DekWrapped        []byte             `json:"dek_wrapped"`
 	KekID             string             `json:"kek_id"`
+	DekKeyID          int64              `json:"dek_key_id"`
 	LocalSequence     int64              `json:"local_sequence"`
 	DurableSequence   int64              `json:"durable_sequence"`
 	PublishedSequence int64              `json:"published_sequence"`

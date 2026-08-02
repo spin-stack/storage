@@ -187,7 +187,7 @@ func newDrainWorld(s *Sim, tag byte, fence wal.LeaseChecker) (*drainWorld, error
 	if err := base.RenewHostLease(ctx, term, w.src, int(drainLeaseTTL/time.Second)); err != nil {
 		return nil, err
 	}
-	if err := base.CreateVolume(ctx, term, metadata.Volume{
+	if err := base.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: w.volID, SizeBytes: drainVolBytes, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
 		CurrentEpoch: 1, PrimaryHostID: w.src, DEKWrapped: []byte{1}, KEKID: "k",
@@ -200,7 +200,7 @@ func newDrainWorld(s *Sim, tag byte, fence wal.LeaseChecker) (*drainWorld, error
 	var idle [16]byte
 	idle[6], idle[8] = 0x70, 0x80
 	idle[14], idle[15] = tag, 0xb1
-	if err := base.CreateVolume(ctx, term, metadata.Volume{
+	if err := base.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: format.UUIDString(idle), SizeBytes: drainVolBytes, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
 		CurrentEpoch: 1, PrimaryHostID: w.dst, DEKWrapped: []byte{1}, KEKID: "k",

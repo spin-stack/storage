@@ -451,6 +451,9 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
 		return err
 	}
+	if err := metadata.CheckDEKKeyID(v.DEKKeyID); err != nil {
+		return err
+	}
 	boundHost, addBytes, limit, err := boundParams(bound)
 	if err != nil {
 		return err
@@ -458,7 +461,7 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	rows, err := s.q.CreateVolume(ctx, db.CreateVolumeParams{
 		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability.String(),
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
-		DekWrapped: v.DEKWrapped, KekID: v.KEKID,
+		DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
 		PrimaryHostID: primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence, Term: term,
@@ -491,6 +494,10 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: state,
 		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
 		ChainDepth: v.ChainDepth, DEKWrapped: v.DekWrapped, KEKID: v.KekID,
+		// The column's CHECK bounds it to (0, 2^32), so the narrowing is total —
+		// and it is the same 16-byte-id story as volume_id: BIGINT at the boundary,
+		// the format's own width in the interface.
+		DEKKeyID:      uint32(v.DekKeyID), //nolint:gosec // bounded by volumes.dek_key_id's CHECK
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence,
 		FencingStartedAt:  fromTS(v.FencingStartedAt),

@@ -1,0 +1,20 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-08-01T23:21:04-03:00",
+  "source_fingerprint": {
+    "hash": "ab477ed328ac294252a6d04cc4b78f01030d3394c00ccc2d014824fb912b0096"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE volumes\nADD COLUMN dek_key_id bigint NOT NULL CONSTRAINT volumes_dek_key_id_check CHECK (dek_key_id > 0 AND dek_key_id <= '4294967295'::bigint);",
+          "type": "table.column",
+          "operation": "create",
+          "path": "public.volumes.dek_key_id"
+        }
+      ]
+    }
+  ]
+}

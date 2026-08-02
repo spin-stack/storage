@@ -60,6 +60,11 @@ type VolumeKeys struct {
 	DEKWrapped []byte
 	// KEKID names the key that wraps it, for a host holding more than one.
 	KEKID string
+	// DEKKeyID is the DEK's version (§15.1), the value RecordHeader.KeyID carries.
+	// It is not decoration: crypto.DevKMS binds it as GCM additional authenticated
+	// data, so unwrapping with the wrong version fails outright rather than yielding
+	// a key that decrypts nothing. Never 0 — see VolumeKeys on the Loop.
+	DEKKeyID uint32
 }
 
 // VolumeSource is the set of volumes this host is serving right now. VolumeManager

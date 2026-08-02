@@ -143,13 +143,13 @@ real binaries — and it is where "how much is left" is actually measured:
 | 3 — checkpoint and truncate | **done** (scheduler, ADR-0023, and as of `b5bd268` its §12.6 checker) |
 | 4 — warm restart, same host | **done.** Its two data pieces were the durable point and the published point having no producer; increment 5's `InstallBase` supplies both, and `fetchBase` calls `recovery.DurablePoint`. The written decision it also asked for is **ADR-0024** — same-epoch re-attach, with the four mechanisms it rests on named so a change cannot silently invalidate it. Writing it surfaced **DEV-0014** (two Agents, one data dir), which predates the decision. |
 | 5 — cold restart, seed the read view from S3 | **done** — this was the real correctness hole |
-| 6 — the DEK arm | **not started.** `dek_key_id` end to end plus a KEK source on the Agent. Until it lands every object in the bucket is plaintext and INV-15 is unreachable. Separable by design: 2–5 work with `enc == nil`. |
+| 6 — the DEK arm | **done.** `dek_key_id` end to end (column + CHECK, proto, `metadata.Volume`, descriptor, `GetVolumeKeys`, provisioner, clone, rebuild-metadata) plus `-kek-file`/`-kek-id` on the Agent, `crypto.DevKMS`, and the unwrap at attach. Every object a served volume puts in the bucket is now ciphertext, and INV-15 is reachable — see below. |
 | 7 — a guest that can issue FLUSH | **mostly done** (`e8bbdab`, `cef9881`) |
 | 8 — the e2e lane and a gate that can notice regressions | **not started.** Needs the QEMU-in-CI decision below. |
 
-So: **two increments of real work** (6 and 8) and the QEMU-in-CI choice. The
-inventory sizes 6 at 1–2 days and 8 at 2–3. By its own definitions the first milestone
-matching the target slice's literal wording is the end of increment 6; the first one a
+So: **one increment of real work** (8) and the QEMU-in-CI choice. The
+inventory sizes 8 at 2–3 days. By its own definitions the milestone matching the target
+slice's literal wording was the end of increment 6, which is now in; the first one a
 **merge gate can defend** is the end of increment 8 — and until that exists, every green
 claim in this file is one developer's machine, not a gate.
 
@@ -299,6 +299,47 @@ nothing new to publish" is not the reason the honest arm stays quiet. The same p
 wiring trips `DurableAckLeaseChecker` too, asserted alongside it, because one cached
 answer loses both obligations.
 
+## Increment 6: what the DEK arm actually needed
+
+It was never "call `EnableEncryption`". Everything else existed and was tested —
+`crypto.DEK`, `crypto.DevKMS`, `wal.NewEncryption`, the provisioner minting and wrapping
+a DEK — and the Agent still could not build an encryptor, because **nothing remembered
+the DEK's version**. `wal.NewEncryption` refuses `KeyID 0` (0 is the WAL's plaintext
+marker), the catalog had no column for a version, and `GetVolumeKeysResponse`'s own
+comment said the field was absent because there was no honest value to put in it. The
+version now runs catalog → descriptor → wire → KMS, and `volumes.dek_key_id` carries a
+`CHECK (> 0 AND <= 2^32-1)` in both stores.
+
+That it is bound as **GCM additional authenticated data** is what makes the whole thing
+verifiable rather than merely copied: a wrapped DEK paired with the wrong version does
+not unwrap at all. Three tests lean on that — the four-boundary round trip, the clone,
+and the descriptor property test.
+
+**Three things this turned up that were not on the list.**
+
+- **`Clone` copied the parent's wrapped DEK without its version.** A clone shares the
+  parent's key (§19) and would have been unopenable; the failure would have surfaced on
+  the clone's first WRITE. Fixed, and asserted — after the assertion was found to prove
+  nothing, because the fixture's parent was at version 1 and so was the hardcoded value.
+  The fixture is now at 42, and the planted bug fails it.
+- **`rebuild-metadata` had the same hole** (§22.5), which is why the *descriptor* carries
+  the version and not only the catalog.
+- **The descriptor had no test of any kind** — see DEV-0015.
+
+**Fail closed, and a mode that is honest about itself.** An Agent with a KMS serves an
+encrypted volume or serves nothing: falling back to plaintext would put guest data in the
+bucket under a name that says otherwise, and §15.3's crypto-shredding guarantee does not
+survive that. An Agent started *without* `-kek-file` runs unencrypted — that is the
+dev/local mode the DST harness and the QEMU lane use — and says so in a warning at
+startup.
+
+**INV-15 now has a checker that has seen an Agent.**
+`scenarioEncryptedWALNoPlaintextLeak` drives `wal.Log` directly, so it could only ever
+prove the WAL encrypts *when handed a key*; nothing handed it one. The new arm serves a
+volume through the real `VolumeManager` with a real `DevKMS`, then reads every object out
+of the bucket looking for the guest's pattern. Its planted bug is leaving `-kek-file`
+off: one flag, a supported mode, still a violation for a real volume.
+
 ## ADR-0024 and the mechanism it first credited to the wrong thing
 
 Increment 4's last item was a written decision: does a restarted Agent re-attach at the
@@ -444,6 +485,31 @@ segment: a format change of its own.
 segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
+
+## DEV-0015 — the descriptor is the one on-S3 format with no integrity check
+
+Found while writing the property test increment 6 owed (`descriptor_property_test.go`).
+Everything else that leaves the host is self-verifying: WAL records carry a CRC32C of
+the *plaintext* plus a GCM tag (§14.1), objects are verified after upload (INV-07), and
+key material is an AEAD ciphertext whose version is bound as additional authenticated
+data. `volumes/<vol>/descriptor.json` is plain JSON with nothing over it.
+
+Truncation is caught — the test proves it at every byte, because JSON without its
+closing brace does not decode. **A flipped bit inside a number is not.** Change a digit
+in `size_bytes` and the object still decodes, into a different, perfectly valid
+descriptor; §22.5's rebuild-metadata would then recreate the volume at the wrong size.
+
+The blast radius is smaller than it first looks, and worth writing down precisely:
+
+- `dek_wrapped` and `dek_key_id` are **self-detecting** — corrupting either makes the
+  unwrap fail (`ErrUnwrap`), which the property test asserts on both fields.
+- `current_epoch` is not authoritative here; the epoch object is (§12.4).
+- What is left exposed is `size_bytes`, `block_size` and `chain_depth`, and only on the
+  rebuild path — a live volume never reads its own descriptor for those.
+
+**Not fixed in this increment.** Adding a checksum is a format change of its own with
+its own review, and doing it inside an increment about keys would bury it. It predates
+this change: the descriptor has had no test of any kind until now.
 
 ## DEV-0014 — nothing stops two Agents from sharing one `--data-dir`
 

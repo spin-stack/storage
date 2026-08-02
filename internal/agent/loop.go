@@ -16,6 +16,7 @@ import (
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
+	"github.com/spin-stack/storage/internal/wal"
 )
 
 // Deps are the Agent's injected collaborators (INV-01). None of them may be nil
@@ -318,10 +319,20 @@ func (l *Loop) VolumeKeys(ctx context.Context, volumeID string) (VolumeKeys, err
 		return VolumeKeys{}, fmt.Errorf("agent: reading the keys of volume %q: %w", volumeID, err)
 	}
 
+	// Refused here rather than carried: KeyID 0 means "plaintext record" on the WAL
+	// path (§14.1), so a 0 from the Control Plane is not a usable version — it is a
+	// volume whose key material this host cannot honestly use. Caching it would turn
+	// one bad answer into a permanently unopenable volume, since VolumeKeys never
+	// re-asks once it has an entry.
+	if id := resp.Msg.GetDekKeyId(); id == 0 {
+		return VolumeKeys{}, fmt.Errorf("agent: volume %q was handed a DEK with no version (§15.1): %w",
+			volumeID, wal.ErrUnversionedKey)
+	}
 	keys := VolumeKeys{
 		VolumeID:   volumeID,
 		DEKWrapped: resp.Msg.GetDekWrapped(),
 		KEKID:      resp.Msg.GetKekId(),
+		DEKKeyID:   resp.Msg.GetDekKeyId(),
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

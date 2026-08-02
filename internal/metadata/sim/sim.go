@@ -329,6 +329,9 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, b
 	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
 		return err
 	}
+	if err := metadata.CheckDEKKeyID(v.DEKKeyID); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {

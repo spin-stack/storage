@@ -17,7 +17,7 @@ func setKeys(f *fakeCP, volumeID, kekID string, wrapped []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.keys[volumeID] = &storagev1.GetVolumeKeysResponse{
-		VolumeId: volumeID, DekWrapped: wrapped, KekId: kekID,
+		VolumeId: volumeID, DekWrapped: wrapped, KekId: kekID, DekKeyId: 1,
 	}
 }
 

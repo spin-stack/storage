@@ -190,7 +190,7 @@ func scenarioDrainMovesVolumesFenced(s *Sim) error {
 		vols = append(vols, vol)
 		volByID[vid] = vol
 
-		if err := md.CreateVolume(ctx, term, metadata.Volume{
+		if err := md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 			VolumeID: vid, SizeBytes: volBytes, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
 			State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: srcHost,
 			DEKWrapped: []byte{1}, KEKID: "k",
@@ -479,7 +479,7 @@ func scenarioGCMarksOrphansNotLive(s *Sim) error {
 	vol[6], vol[8] = 0x70, 0x80
 
 	// A live WAL object anchored by a checkpoint, plus structural metadata.
-	_ = descriptor.Write(ctx, s.Store, descriptor.Descriptor{VolumeID: vid, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
+	_ = descriptor.Write(ctx, s.Store, descriptor.Descriptor{DEKKeyID: 1, VolumeID: vid, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
 	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
 	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
 	_, _ = l.Write(0, []byte("live"), 0)
@@ -604,7 +604,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 
 	md := metasim.New(s.Clock.Wall)
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: pvs, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: pvs, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 
 	// Parent writes + snapshot.
 	parent := wal.NewLog(s.Disk, "wal", s.Clock, pv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
@@ -702,7 +702,7 @@ func scenarioRebuildMetadataFromS3(s *Sim) error {
 	const vid = "00000000-0000-7000-8000-000000000050"
 	epochs := epoch.NewStore(s.Store)
 
-	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{DEKKeyID: 1,
 		VolumeID: vid, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote, KEKID: "k", DEKWrapped: []byte{1},
 	}); err != nil {
 		return err
@@ -759,7 +759,7 @@ func scenarioRecoveryAuthorityIsS3(s *Sim) error {
 	// about a writer.
 	md := metasim.New(s.Clock.Wall)
 	term, _ := md.AcquireLeadership(ctx, "cp")
-	if err := md.CreateVolume(ctx, term, metadata.Volume{
+	if err := md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: format.UUIDString(vol), State: lifecycle.VolumeActive,
 		LocalSequence: 999, DurableSequence: 999, DEKWrapped: []byte{1}, KEKID: "k",
 	}, nil); err != nil {
@@ -804,7 +804,7 @@ func scenarioFencedWriterNoLostAck(s *Sim) error {
 	term, _ := md.AcquireLeadership(ctx, "cp")
 	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost1, State: lifecycle.HostActive})
 	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: failHost2, State: lifecycle.HostActive})
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: format.UUIDString(volID), CurrentEpoch: 1, State: lifecycle.VolumeActive, PrimaryHostID: failHost1, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: format.UUIDString(volID), CurrentEpoch: 1, State: lifecycle.VolumeActive, PrimaryHostID: failHost1, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 	if _, err := epochs.Init(ctx, format.UUIDString(volID), 1); err != nil {
 		return err
 	}
@@ -888,7 +888,7 @@ func scenarioPromotionFencingWait(s *Sim) error {
 	term, _ := md.AcquireLeadership(ctx, "cp")
 	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost1, State: lifecycle.HostActive})
 	_ = md.UpsertHost(ctx, term, metadata.Host{HostID: promoHost2, State: lifecycle.HostActive})
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: promoVol, State: lifecycle.VolumeActive, PrimaryHostID: promoHost1, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: promoVol, State: lifecycle.VolumeActive, PrimaryHostID: promoHost1, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 	if _, err := epochs.Init(ctx, promoVol, 0); err != nil {
 		return err
 	}

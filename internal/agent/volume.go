@@ -12,6 +12,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/blockdev"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/recovery"
@@ -90,6 +91,52 @@ func (v *Volume) stop() error {
 // something it can close.
 type ListenFunc func(socket string) (vhost.Listener, error)
 
+// KeysFunc fetches one volume's wrapped key material. Production passes
+// Loop.VolumeKeys, which asks the Control Plane once and caches the answer; it is a
+// function rather than the Loop for the same reason Lease is (see leaseFunc), and
+// because ADR-0021 keeps this type from knowing what a Control Plane is.
+type KeysFunc func(ctx context.Context, volumeID string) (VolumeKeys, error)
+
+// encryptionFor unwraps this volume's DEK and binds it to the volume (§15.1). It
+// returns nil, nil for an Agent with no KMS — the dev/local mode — and an error for
+// every other failure, because the alternative to encrypting is not "encrypt later",
+// it is writing this guest's data into the bucket in the clear.
+func (m *VolumeManager) encryptionFor(ctx context.Context, id string, vol [16]byte) (*wal.Encryption, error) {
+	if m.deps.KMS == nil {
+		return nil, nil //nolint:nilnil // no KMS is a mode, not a failure: see VolumeManagerDeps.KMS
+	}
+	keys, err := m.deps.Keys(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: reading key material: %w", id, err)
+	}
+	if keys.KEKID != m.deps.KMS.KEKID() {
+		// Not a §15.1 rotation — that is the *DEK* rotating under one KEK. This is the
+		// volume having been wrapped by a KEK this host does not hold, and unwrapping
+		// would fail on the AEAD anyway. Saying which key is missing turns an opaque
+		// authentication failure into an operational instruction.
+		return nil, fmt.Errorf("agent: volume %s is wrapped under KEK %q; this host holds %q",
+			id, keys.KEKID, m.deps.KMS.KEKID())
+	}
+	dek, err := m.deps.KMS.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: unwrapping the DEK (version %d): %w", id, keys.DEKKeyID, err)
+	}
+	enc, err := wal.NewEncryption(dek, vol)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: %w", id, err)
+	}
+	return enc, nil
+}
+
+// encKeyID is the version the batcher stamps on objects: the DEK's, or 0 when there is
+// no encryption — which is what 0 means everywhere else on this path.
+func encKeyID(e *wal.Encryption) uint32 {
+	if e == nil {
+		return 0
+	}
+	return e.DEK.KeyID
+}
+
 // leaseFunc adapts the Agent's lease question into the wal.LeaseChecker the Log gates
 // its durable ACK on (§12.2, INV-06).
 //
@@ -147,6 +194,14 @@ type VolumeManagerDeps struct {
 	// It is required whenever Store is set, and it must be a call through to the
 	// current lease — see leaseFunc.
 	Lease func() bool
+	// KMS unwraps a volume's DEK, and Keys is where the wrapped one comes from. Both
+	// or neither: an Agent with no KMS runs unencrypted, which is the dev/local mode
+	// (§6.2) the DST harness and the QEMU lane use and which claims nothing it does
+	// not do. An Agent *with* a KMS encrypts every volume it serves or serves none of
+	// them — see start. §15.1 puts the unwrap at attach and nowhere else: one KMS call
+	// outside the data path, and the DEK lives in memory only.
+	KMS  crypto.KMS
+	Keys KeysFunc
 	// IOClass arbitrates the Agent's I/O between classes (INV-17, §11). One per Agent,
 	// not one per volume: the budget it hands out is a share of the host's NVMe and NIC
 	// (§10, `background_nvme_budget: 30% de IOPS/BW`). Nil disables the gate, which is
@@ -195,6 +250,11 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		// in the guest's I/O path. A store with nothing fencing the writer is not a
 		// configuration worth starting.
 		return nil, errors.New("agent: an object store needs a lease to gate its durable ACKs (§12.2, INV-06)")
+	case deps.KMS != nil && deps.Keys == nil:
+		// A KMS with nowhere to get wrapped keys from would unwrap nothing and every
+		// volume would fail to start — at attach, one at a time, looking like a
+		// Control Plane problem. It is a wiring problem, and it is visible here.
+		return nil, errors.New("agent: a KMS needs a source of wrapped volume keys (§15.1)")
 	}
 	return &VolumeManager{
 		cfg: cfg, deps: deps,
@@ -329,6 +389,19 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		return nil, fmt.Errorf("agent: volume %s: looking for an existing WAL in %s: %w", id, dir, err)
 	}
 
+	// §15: every payload of guest data is sealed with the volume's DEK before any PUT.
+	// The unwrap happens here, at attach, and nowhere else (§15.1) — one KMS call
+	// outside the data path, and what it returns never leaves memory.
+	//
+	// It fails the volume rather than degrading it. An Agent that fell back to
+	// plaintext would write cleartext into a bucket under a name that says otherwise,
+	// and §15.3's crypto-shredding guarantee cannot survive that: the objects would
+	// still be readable after the DEK was destroyed.
+	enc, err := m.encryptionFor(ctx, id, [16]byte(u))
+	if err != nil {
+		return nil, err
+	}
+
 	var log *wal.Log
 	resuming := len(existing) > 0
 	if resuming {
@@ -338,12 +411,15 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		// is known. Until then the log reports durable = 0 — an understatement, which
 		// is the safe direction for every rule that reads it.
 		log, err = wal.ResumeAwaitingBase(m.deps.Disk, root, m.deps.Clock,
-			[16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits, nil)
+			[16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits, enc)
 		if err != nil {
 			return nil, fmt.Errorf("agent: volume %s: resuming the WAL in %s: %w", id, dir, err)
 		}
 	} else {
 		log = wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits)
+		if enc != nil {
+			log.EnableEncryption(enc)
+		}
 	}
 
 	// Remote mode, and with it the uploader and the §14.4 ACK path. Without a store
@@ -355,7 +431,10 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 			attempts = 3
 		}
 		log.EnableRemote(
-			wal.NewBatcher(m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), 0, wal.DefaultBatchConfig()),
+			// The batcher stamps the object's key version, so it must be the same one
+			// the records carry: a mismatch names an object after a key that did not
+			// seal it. Zero is right exactly when there is no encryption.
+			wal.NewBatcher(m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), encKeyID(enc), wal.DefaultBatchConfig()),
 			wal.NewUploader(m.deps.Store, attempts),
 			leaseFunc(m.deps.Lease),
 		)

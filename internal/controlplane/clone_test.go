@@ -33,7 +33,10 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	md, term := cpStore(t)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
-		State: lifecycle.VolumeActive, ChainDepth: 0, DEKWrapped: []byte{7}, KEKID: "kek",
+		// Deliberately not 1. A parent at the first version would let an implementation
+		// that hardcodes "the first version" pass this test — which one did, until the
+		// assertion below was checked against a planted bug.
+		State: lifecycle.VolumeActive, ChainDepth: 0, DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 42,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +58,17 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	if string(clone.DEKWrapped) != string([]byte{7}) || clone.KEKID != "kek" {
 		t.Fatal("clone must inherit the parent DEK to read the shared base")
 	}
+	// And the DEK's *version* with it. crypto.DevKMS binds the version as GCM
+	// additional authenticated data, so a clone carrying the wrapped key without the
+	// number that names it cannot unwrap at all — and the failure would surface on the
+	// clone's first WRITE, a long way from the code that dropped it.
+	parentRow, err := md.GetVolume(ctx, parentVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clone.DEKKeyID != parentRow.DEKKeyID {
+		t.Fatalf("clone carries DEK version %d, parent %d", clone.DEKKeyID, parentRow.DEKKeyID)
+	}
 	// Parent is untouched.
 	p, _ := md.GetVolume(ctx, parentVol)
 	if p.ChainDepth != 0 {
@@ -66,7 +80,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 func TestCloneWithStaleTermFails(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"}, nil)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"}, nil)
 	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID})
 
 	stale := term
@@ -89,7 +103,7 @@ func TestCloneFromMissingSnapshotFails(t *testing.T) {
 func TestResizeGrowsOnly(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 100, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 100, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 
 	if err := md.ResizeVolume(ctx, term, parentVol, 200); err != nil {
 		t.Fatalf("grow: %v", err)
@@ -106,7 +120,7 @@ func TestResizeGrowsOnly(t *testing.T) {
 func TestSnapshotCatalogRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	md, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{VolumeID: parentVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
 	snap := metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 2, TargetSequence: 7, RootDigest: "d", State: lifecycle.SnapshotPublished, ManifestKey: "snapshots/x", RequestID: reqID}
 	if err := md.CreateSnapshot(ctx, term, snap); err != nil {
 		t.Fatal(err)

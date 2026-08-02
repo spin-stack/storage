@@ -13,9 +13,9 @@ WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $15
 )
 INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
-                     dek_wrapped, kek_id, primary_host_id, standby_host_id, chain_depth,
-                     local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                     dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
+                     chain_depth, local_sequence, durable_sequence, published_sequence)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, sqlc.arg(dek_key_id)::bigint, $9, $10, $11, $12, $13, $14
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The §28.2 oversubscription bound, as a predicate of the write that places the
   -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
@@ -41,6 +41,9 @@ ON CONFLICT (volume_id) DO UPDATE
       current_epoch = GREATEST(volumes.current_epoch, EXCLUDED.current_epoch),
       dek_wrapped = EXCLUDED.dek_wrapped,
       kek_id = EXCLUDED.kek_id,
+      -- The three key columns move together or not at all: a wrapped DEK paired with
+      -- another DEK's version is a volume nothing can open.
+      dek_key_id = EXCLUDED.dek_key_id,
       primary_host_id = COALESCE(volumes.primary_host_id, EXCLUDED.primary_host_id),
       standby_host_id = COALESCE(volumes.standby_host_id, EXCLUDED.standby_host_id),
       chain_depth = EXCLUDED.chain_depth,

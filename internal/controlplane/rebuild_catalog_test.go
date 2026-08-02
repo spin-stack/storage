@@ -39,6 +39,7 @@ func TestRebuildRestoresTheSnapshotCatalog(t *testing.T) {
 		VolumeID: rebuiltVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 3, KEKID: "kek-1",
 		DEKWrapped: []byte{1, 2},
+		DEKKeyID:   1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestRebuildIsIdempotent(t *testing.T) {
 
 	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
 		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536,
-		Durability: lifecycle.DurabilityLocal, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+		Durability: lifecycle.DurabilityLocal, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func TestRebuildRefusesACorruptManifest(t *testing.T) {
 
 	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
 		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536,
-		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +194,7 @@ func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
 
 	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
 		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536,
-		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1},
+		Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +206,7 @@ func TestRebuildAddsMissingSnapshotsToAnExistingVolume(t *testing.T) {
 	// The volume row survived; the catalog did not.
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: rebuiltVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeDetached,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +247,7 @@ func TestTwoConcurrentRebuildsBothComplete(t *testing.T) {
 		ep := int64(i + 1)
 		if err := descriptor.Write(ctx, store, descriptor.Descriptor{
 			VolumeID: volID, SizeBytes: int64(i+1) << 20, BlockSize: 65536,
-			Durability: lifecycle.DurabilityRemote, CurrentEpoch: ep, KEKID: "k", DEKWrapped: []byte{byte(i)},
+			Durability: lifecycle.DurabilityRemote, CurrentEpoch: ep, KEKID: "k", DEKWrapped: []byte{byte(i)}, DEKKeyID: 1,
 		}); err != nil {
 			t.Fatal(err)
 		}

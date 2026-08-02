@@ -179,6 +179,7 @@ commit named is where the fix landed.
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |
 | DEV-0011 | A segment's space is charged as used, not reserved at creation. | **open** → STATUS.md |
 | DEV-0012 | A self-fenced log still accepts WRITEs and still serves reads. | **open** → STATUS.md |
+| DEV-0015 | The volume descriptor (`volumes/<vol>/descriptor.json`) is the only on-S3 format with no integrity check: truncation is caught, a flipped bit inside a number is not. `dek_wrapped`/`dek_key_id` are self-detecting (AEAD + AAD); `size_bytes`/`block_size`/`chain_depth` on the rebuild path are not. | **open** → STATUS.md |
 | DEV-0014 | Nothing stops two Agents from sharing one `--data-dir`: both resume the same segment directory at the same epoch, and `hostio.Listen` unlinks the stale socket so the second *silently steals* it instead of failing with `EADDRINUSE`. Wants an exclusive lock at start-up (a primitive `simio/disk` does not have). | **open** → STATUS.md |
 | DEV-0013 | `task lint` red since `e8bbdab`: the guest-side `integration/guestinit` tripped the INV-01 lint layer. | resolved 2026-07-28 — third INV-01 exemption, narrowness fixture |
 

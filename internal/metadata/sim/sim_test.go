@@ -40,7 +40,7 @@ func TestZombieCPCannotMutate(t *testing.T) {
 
 	termA, _ := s.AcquireLeadership(ctx, "cp-a")
 	// Set up a volume under cp-a.
-	if err := s.CreateVolume(ctx, termA, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil); err != nil {
+	if err := s.CreateVolume(ctx, termA, metadata.Volume{DEKKeyID: 1, VolumeID: "v1", State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -76,7 +76,7 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 			return s.RenewHostLease(ctx, term, "h", 10)
 		}},
 		{"CreateVolume", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", State: lifecycle.VolumeActive}, nil)
+			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v", State: lifecycle.VolumeActive}, nil)
 		}},
 		{"BumpVolumeEpoch", func(s *sim.Store, term int64) error {
 			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h", 0)
@@ -149,7 +149,7 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 		t.Fatalf("GetHost: %+v err=%v", h, err)
 	}
 
-	if err := s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v1", State: lifecycle.VolumeActive}, nil); err != nil {
+	if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v1", State: lifecycle.VolumeActive}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateWatermarks(ctx, term, "v1", 10, 5, 3); err != nil {
@@ -199,10 +199,10 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 			return s.SetHostState(ctx, term, "h", lifecycle.HostState("PUBLISHED"))
 		}},
 		{"CreateVolume with the zero state", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{VolumeID: "v", Durability: lifecycle.DurabilityRemote}, nil)
+			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v", Durability: lifecycle.DurabilityRemote}, nil)
 		}},
 		{"CreateVolume with an unknown durability", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{
+			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 				VolumeID: "v", State: lifecycle.VolumeActive, Durability: lifecycle.Durability("cheap"),
 			}, nil)
 		}},
@@ -338,7 +338,7 @@ func TestDerivedCapacity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.CreateVolume(ctx, term, metadata.Volume{
+	if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: "v1", SizeBytes: 400, State: lifecycle.VolumeActive, PrimaryHostID: "h1",
 	}, nil); err != nil {
 		t.Fatal(err)
@@ -374,7 +374,7 @@ func TestDerivedCapacity(t *testing.T) {
 	}
 
 	// The §28.2 bound is a predicate of the write that places a volume.
-	err := s.CreateVolume(ctx, term, metadata.Volume{
+	err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: "v2", SizeBytes: 700, State: lifecycle.VolumeActive, PrimaryHostID: "h2",
 	}, &metadata.CapacityBound{HostID: "h2", AddBytes: 700, Limit: 1000})
 	if !errors.Is(err, metadata.ErrCapacityExceeded) {
@@ -383,14 +383,14 @@ func TestDerivedCapacity(t *testing.T) {
 	if _, gerr := s.GetVolume(ctx, "v2"); !errors.Is(gerr, metadata.ErrNotFound) {
 		t.Fatalf("a refused placement wrote the volume: %v", gerr)
 	}
-	if err := s.CreateVolume(ctx, term, metadata.Volume{
+	if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: "v2", SizeBytes: 600, State: lifecycle.VolumeActive, PrimaryHostID: "h2",
 	}, &metadata.CapacityBound{HostID: "h2", AddBytes: 600, Limit: 1000}); err != nil {
 		t.Fatalf("exactly at the bound was refused: %v", err)
 	}
 
 	// A bound naming a host nobody registered is ErrNotFound, not a silent pass.
-	if err := s.CreateVolume(ctx, term, metadata.Volume{
+	if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: "v3", SizeBytes: 1, State: lifecycle.VolumeActive,
 	}, &metadata.CapacityBound{HostID: "absent", AddBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("bound on a missing host: want ErrNotFound, got %v", err)
@@ -408,10 +408,10 @@ func TestListVolumesByHost(t *testing.T) {
 	term, _ := s.AcquireLeadership(ctx, "cp")
 
 	vols := []metadata.Volume{
-		{VolumeID: "v-b", State: lifecycle.VolumeActive, PrimaryHostID: "h1"},
-		{VolumeID: "v-a", State: lifecycle.VolumeActive, PrimaryHostID: "h1"},
-		{VolumeID: "v-c", State: lifecycle.VolumeActive, PrimaryHostID: "h2"},
-		{VolumeID: "v-d", State: lifecycle.VolumeActive}, // unattached
+		{VolumeID: "v-b", DEKKeyID: 1, State: lifecycle.VolumeActive, PrimaryHostID: "h1"},
+		{VolumeID: "v-a", DEKKeyID: 1, State: lifecycle.VolumeActive, PrimaryHostID: "h1"},
+		{VolumeID: "v-c", DEKKeyID: 1, State: lifecycle.VolumeActive, PrimaryHostID: "h2"},
+		{VolumeID: "v-d", DEKKeyID: 1, State: lifecycle.VolumeActive}, // unattached
 	}
 	for _, v := range vols {
 		if err := s.CreateVolume(ctx, term, v, nil); err != nil {

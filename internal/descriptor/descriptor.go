@@ -25,6 +25,13 @@ type Descriptor struct {
 	ChainDepth   int32                `json:"chain_depth"`
 	KEKID        string               `json:"kek_id"`
 	DEKWrapped   []byte               `json:"dek_wrapped"`
+	// DEKKeyID is the DEK's version (§15.1). It is here and not only in the catalog
+	// because §22.5's rebuild-metadata reads this object to reconstruct a volume the
+	// database no longer describes — and a volume rebuilt with its wrapped DEK but
+	// without the version that names it is a volume nothing can open. The descriptor
+	// stays cleartext (§15.3: manifests and descriptors carry no guest data); the
+	// version is not a secret, it is which secret.
+	DEKKeyID uint32 `json:"dek_key_id"`
 }
 
 // Key is the deterministic descriptor key for a volume.

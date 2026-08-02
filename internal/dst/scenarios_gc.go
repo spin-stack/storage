@@ -53,7 +53,7 @@ func scenarioGCKeepsSupersededEpochSnapshot(s *Sim) error {
 	vid := format.UUIDString(vol)
 	const snapID = "00000000-0000-7000-8000-0000000000c5"
 
-	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{DEKKeyID: 1,
 		VolumeID: vid, SizeBytes: 1 << 20, BlockSize: 65536, CurrentEpoch: 1,
 		KEKID: "k", DEKWrapped: []byte{1},
 	}); err != nil {

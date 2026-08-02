@@ -95,6 +95,11 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			ChainDepth: d.ChainDepth,
 			DEKWrapped: d.DEKWrapped,
 			KEKID:      d.KEKID,
+			// The version travels with the wrapped key or the rebuilt volume cannot
+			// be opened: crypto.DevKMS binds it as GCM AAD, so unwrapping with the
+			// wrong one fails outright. This is the whole reason §22.5's descriptor
+			// carries it rather than only the catalog.
+			DEKKeyID: d.DEKKeyID,
 			// No §28.2 bound (ADR-0017): rebuild-metadata records volumes that
 			// already exist and already occupy their hosts. A ceiling that refused
 			// to write them would leave the catalog short of reality, which is the

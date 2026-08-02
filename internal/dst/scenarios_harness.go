@@ -395,7 +395,7 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 			return err
 		}
 	}
-	if err := md.CreateVolume(ctx, term, metadata.Volume{
+	if err := md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
 		VolumeID: vid, CurrentEpoch: 1, State: lifecycle.VolumeActive,
 		PrimaryHostID: seededHost1, DEKWrapped: []byte{1}, KEKID: "k",
 	}, nil); err != nil {

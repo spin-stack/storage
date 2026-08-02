@@ -1,0 +1,160 @@
+package descriptor_test
+
+import (
+	"bytes"
+	"crypto/rand"
+	"errors"
+	"reflect"
+	"testing"
+
+	"pgregory.net/rapid"
+
+	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/descriptor"
+	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/lifecycle"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/simio/sim"
+)
+
+// The descriptor is an on-S3 format, so CLAUDE.md requires a serialize/replay property
+// test over arbitrary truncations and bit corruptions (§25.2). It had none until
+// dek_key_id was added to it; these are the tests that change owes.
+
+func genDescriptor(t *rapid.T) descriptor.Descriptor {
+	wrapped := rapid.SliceOfN(rapid.Byte(), 1, 64).Draw(t, "dek_wrapped")
+	return descriptor.Descriptor{
+		VolumeID:  ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "ms")), rand.Reader).String(),
+		SizeBytes: int64(rapid.IntRange(1, 1<<40).Draw(t, "size")),
+		BlockSize: int32(rapid.IntRange(512, 1<<20).Draw(t, "block")),
+		Durability: rapid.SampledFrom([]lifecycle.Durability{
+			lifecycle.DurabilityRemote, lifecycle.DurabilityLocal,
+		}).Draw(t, "durability"),
+		CurrentEpoch: int64(rapid.IntRange(0, 1<<20).Draw(t, "epoch")),
+		ChainDepth:   int32(rapid.IntRange(0, 32).Draw(t, "chain")),
+		KEKID:        rapid.StringMatching(`[a-z0-9-]{1,16}`).Draw(t, "kek_id"),
+		DEKWrapped:   wrapped,
+		// Never 0: a descriptor carrying 0 describes a volume nothing can open, and
+		// the write paths refuse it (metadata.CheckDEKKeyID). Generating it here would
+		// be testing a state the system does not produce.
+		DEKKeyID: uint32(rapid.IntRange(1, 1<<31).Draw(t, "dek_key_id")),
+	}
+}
+
+// TestDescriptorRoundTrips is the base case every corruption test needs: without it, a
+// truncation test that always errors would pass against a Read that never worked.
+func TestDescriptorRoundTrips(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		want := genDescriptor(rt)
+		store := sim.NewObjectStore()
+		ctx := t.Context()
+		if err := descriptor.Write(ctx, store, want); err != nil {
+			rt.Fatalf("write: %v", err)
+		}
+		got, err := descriptor.Read(ctx, store, want.VolumeID)
+		if err != nil {
+			rt.Fatalf("read: %v", err)
+		}
+		if got.DEKKeyID != want.DEKKeyID {
+			rt.Fatalf("dek_key_id %d survived as %d", want.DEKKeyID, got.DEKKeyID)
+		}
+		if !bytes.Equal(got.DEKWrapped, want.DEKWrapped) {
+			rt.Fatalf("dek_wrapped did not survive: %x -> %x", want.DEKWrapped, got.DEKWrapped)
+		}
+		// Every other field, compared as a whole rather than one assertion per field:
+		// a field added to this struct and forgotten by json is caught here.
+		gotBlank, wantBlank := got, want
+		gotBlank.DEKWrapped, wantBlank.DEKWrapped = nil, nil
+		if !reflect.DeepEqual(gotBlank, wantBlank) {
+			rt.Fatalf("round trip changed the descriptor:\n want %+v\n  got %+v", want, got)
+		}
+	})
+}
+
+// TestDescriptorTruncationIsDetected: cut the object at any byte and Read must fail.
+// A descriptor is JSON, so a truncated one loses its closing brace — but "must" is the
+// point: the failure mode this rules out is a short read that decodes to a descriptor
+// with default values, which would rebuild a volume at size 0 with no key at all.
+func TestDescriptorTruncationIsDetected(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		d := genDescriptor(rt)
+		store := sim.NewObjectStore()
+		ctx := t.Context()
+		if err := descriptor.Write(ctx, store, d); err != nil {
+			rt.Fatalf("write: %v", err)
+		}
+		full, err := store.Get(ctx, descriptor.Key(d.VolumeID))
+		if err != nil {
+			rt.Fatalf("get: %v", err)
+		}
+		at := rapid.IntRange(0, len(full)-1).Draw(rt, "truncate_at")
+		if _, err := store.Put(ctx, descriptor.Key(d.VolumeID), full[:at], objectstore.PutOptions{}); err != nil {
+			rt.Fatalf("put truncated: %v", err)
+		}
+		if got, err := descriptor.Read(ctx, store, d.VolumeID); err == nil {
+			rt.Fatalf("a descriptor truncated to %d/%d bytes decoded as %+v", at, len(full), got)
+		}
+	})
+}
+
+// TestCorruptedKeyMaterialCannotUnwrap is the assertion that matters for this
+// increment, and it is deliberately *not* "a bit flip is detected" — JSON carries no
+// checksum, so flipping a digit in size_bytes yields a different, perfectly valid
+// descriptor. That is a real gap, it predates this change, and it is recorded as
+// DEV-0015 rather than papered over here.
+//
+// What this proves is that the two fields this increment cares about are
+// self-detecting: dek_wrapped is an AEAD ciphertext and dek_key_id is bound to it as
+// additional authenticated data (crypto.DevKMS.WrapDEK), so corrupting *either* makes
+// the unwrap fail rather than yielding a key that decrypts nothing recognisable. A
+// silently wrong DEK would decrypt every replayed record to garbage that still passes
+// as bytes; ErrUnwrap says which object is broken.
+func TestCorruptedKeyMaterialCannotUnwrap(t *testing.T) {
+	var kek [crypto.DEKSize]byte
+	if _, err := rand.Read(kek[:]); err != nil {
+		t.Fatal(err)
+	}
+	kms := crypto.NewDevKMS(kek, "kek-1")
+
+	rapid.Check(t, func(rt *rapid.T) {
+		keyID := uint32(rapid.IntRange(1, 1<<20).Draw(rt, "key_id"))
+		dek, err := crypto.GenerateDEK(rand.Reader, keyID)
+		if err != nil {
+			rt.Fatalf("dek: %v", err)
+		}
+		wrapped, err := kms.WrapDEK(rand.Reader, dek)
+		if err != nil {
+			rt.Fatalf("wrap: %v", err)
+		}
+		// The control: intact material unwraps to the same key.
+		back, err := kms.UnwrapDEK(wrapped, keyID)
+		if err != nil {
+			rt.Fatalf("the intact DEK did not unwrap: %v", err)
+		}
+		if back.Key != dek.Key || back.KeyID != keyID {
+			rt.Fatalf("unwrap returned a different key")
+		}
+
+		switch rapid.SampledFrom([]string{"ciphertext", "version"}).Draw(rt, "corrupt") {
+		case "ciphertext":
+			i := rapid.IntRange(0, len(wrapped)-1).Draw(rt, "byte")
+			bit := rapid.IntRange(0, 7).Draw(rt, "bit")
+			corrupted := append([]byte(nil), wrapped...)
+			corrupted[i] ^= 1 << bit
+			if _, err := kms.UnwrapDEK(corrupted, keyID); !errors.Is(err, crypto.ErrUnwrap) {
+				rt.Fatalf("a bit flipped in dek_wrapped[%d] unwrapped anyway: %v", i, err)
+			}
+		case "version":
+			// The version travelling separately from the ciphertext is exactly the
+			// shape that could go wrong silently — a descriptor whose dek_key_id was
+			// rewritten while dek_wrapped was not. It cannot: the version is the AAD.
+			other := keyID ^ uint32(1<<rapid.IntRange(0, 19).Draw(rt, "version_bit"))
+			if other == keyID || other == 0 {
+				return
+			}
+			if _, err := kms.UnwrapDEK(wrapped, other); !errors.Is(err, crypto.ErrUnwrap) {
+				rt.Fatalf("a DEK wrapped under version %d unwrapped as version %d: %v", keyID, other, err)
+			}
+		}
+	})
+}

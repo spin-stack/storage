@@ -50,7 +50,7 @@ func newPromoWorld(t *testing.T) *promoWorld {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: promoVolume, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: promoOld,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestConcurrentPromotionsLeaveExactlyOneWriter(t *testing.T) {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: promoVolume, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: source,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

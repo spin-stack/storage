@@ -68,7 +68,7 @@ func newFenceWorld(t *testing.T) *fenceWorld {
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: fenceVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: fenceHostA,
-		DEKWrapped: []byte{1}, KEKID: "k",
+		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

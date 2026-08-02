@@ -57,6 +57,12 @@ func (f *fixture) createVolume(t *testing.T, v metadata.Volume) {
 	if v.Durability == "" {
 		v.Durability = lifecycle.DurabilityRemote
 	}
+	if v.DEKKeyID == 0 {
+		// Every real volume has one (§15.1) and the store refuses a row without it.
+		// The default is here rather than in twenty literals, but a case that cares
+		// about the version still sets its own.
+		v.DEKKeyID = 1
+	}
 	if err := f.md.CreateVolume(t.Context(), f.term, v, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -182,9 +188,9 @@ func TestStaleTermIsAborted(t *testing.T) {
 // TestGetDesiredStateListsThisHostsVolumes, ordered by volume id (INV-02).
 func TestGetDesiredStateListsThisHostsVolumes(t *testing.T) {
 	f := newFixture(t)
-	f.createVolume(t, metadata.Volume{VolumeID: "vol-b", SizeBytes: 2 << 30, BlockSize: 4096, CurrentEpoch: 5, PrimaryHostID: hostA})
-	f.createVolume(t, metadata.Volume{VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 512, CurrentEpoch: 1, PrimaryHostID: hostA, Durability: lifecycle.DurabilityLocal})
-	f.createVolume(t, metadata.Volume{VolumeID: "vol-z", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 1, PrimaryHostID: hostB})
+	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-b", SizeBytes: 2 << 30, BlockSize: 4096, CurrentEpoch: 5, PrimaryHostID: hostA})
+	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 512, CurrentEpoch: 1, PrimaryHostID: hostA, Durability: lifecycle.DurabilityLocal})
+	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-z", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 1, PrimaryHostID: hostB})
 
 	resp, err := f.srv.GetDesiredState(t.Context(), connect.NewRequest(&storagev1.GetDesiredStateRequest{HostId: hostA}))
 	if err != nil {
@@ -266,7 +272,7 @@ func TestReportVolumeState(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
-			f.createVolume(t, metadata.Volume{VolumeID: vol, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4, PrimaryHostID: hostA})
+			f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: vol, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4, PrimaryHostID: hostA})
 
 			resp, err := f.srv.ReportVolumeState(t.Context(), connect.NewRequest(&storagev1.ReportVolumeStateRequest{
 				HostId:  tc.host,
@@ -302,8 +308,8 @@ func TestReportVolumeState(t *testing.T) {
 // caller can pair results with what it sent without matching on ids.
 func TestReportVolumeStateAnswersEveryVolume(t *testing.T) {
 	f := newFixture(t)
-	f.createVolume(t, metadata.Volume{VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 1, PrimaryHostID: hostA})
-	f.createVolume(t, metadata.Volume{VolumeID: "vol-b", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 2, PrimaryHostID: hostA})
+	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 1, PrimaryHostID: hostA})
+	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-b", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 2, PrimaryHostID: hostA})
 
 	resp, err := f.srv.ReportVolumeState(t.Context(), connect.NewRequest(&storagev1.ReportVolumeStateRequest{
 		HostId: hostA,

@@ -70,3 +70,20 @@ func TestPlantedBugCheckpointPublishedWithoutLease(t *testing.T) {
 		return lapsedLeaseStopsPublishing(s, leaseAnsweredFromASnapshot)
 	})
 }
+
+// INV-15 (§5.10) at the Agent's seam rather than the WAL's. The existing proof
+// (TestPlantedBugPlaintextLeavesHost) drives wal.Log directly, so it can only ever show
+// that the *WAL* encrypts when handed a key. Until BUILD-INVENTORY increment 6 nothing
+// handed it one: every volume the Agent served built its log with enc == nil, and the
+// bytes in the bucket were the guest's own.
+//
+// Planted by leaving -kek-file off — one flag, a supported mode, and still a violation
+// for any real volume. That is the honest shape of this bug: it is not an algorithm that
+// breaks, it is a host configured without a key, and the only thing that can notice is
+// something reading the objects.
+func TestPlantedBugAgentServesAVolumeInTheClear(t *testing.T) {
+	requirePasses(t, 25, NewNoPlaintextLeavesHostChecker(), scenarioAgentEncryptsWhatLeavesTheHost)
+	plantedBug(t, 25, NewNoPlaintextLeavesHostChecker(), "no-plaintext-leaves-host", func(s *Sim) error {
+		return agentEncryptsWhatLeavesTheHost(s, noKEKOnTheHost)
+	})
+}

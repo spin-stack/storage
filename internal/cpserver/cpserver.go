@@ -165,6 +165,7 @@ func (s *Server) GetVolumeKeys(ctx context.Context, req *connect.Request[storage
 		VolumeId:   v.VolumeID,
 		DekWrapped: v.DEKWrapped,
 		KekId:      v.KEKID,
+		DekKeyId:   v.DEKKeyID,
 	}), nil
 }
 

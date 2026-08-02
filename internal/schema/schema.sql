@@ -107,6 +107,17 @@ CREATE TABLE volumes (
     chain_depth        INTEGER NOT NULL DEFAULT 0,
     dek_wrapped        BYTEA NOT NULL,                  -- DEK wrapped with the KEK
     kek_id             TEXT NOT NULL,
+    -- The DEK's own version, RecordHeader.KeyID (§15.1). Rotation re-keys new data
+    -- without re-encrypting history, which only works if every record says which key
+    -- sealed it — and the Agent can only say that if the catalog remembers it.
+    --
+    -- BIGINT because the format field is uint32 and Postgres INTEGER is signed 32-bit.
+    -- The lower bound is not a sanity check: KeyID 0 means "plaintext record" on the
+    -- WAL path, so a row carrying 0 would hand the Agent a version it must refuse
+    -- (wal.ErrUnversionedKey) at attach, with the DEK already unwrapped. Refusing it
+    -- at the write is refusing it where it can still be corrected.
+    dek_key_id         BIGINT NOT NULL
+                         CHECK (dek_key_id > 0 AND dek_key_id <= 4294967295),
     -- Watermarks are INFORMATIVE (lazy); authority is S3 (§5.8). Informative is not
     -- unconstrained: INV-03 (§5.6) says published <= durable <= local at every
     -- observation point, and this is that rule at the table rather than in the

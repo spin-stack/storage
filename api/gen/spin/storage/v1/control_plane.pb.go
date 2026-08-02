@@ -722,7 +722,17 @@ type GetVolumeKeysResponse struct {
 	DekWrapped []byte `protobuf:"bytes,2,opt,name=dek_wrapped,json=dekWrapped,proto3" json:"dek_wrapped,omitempty"`
 	// kek_id names the key that wraps it, so a host holding more than one (a
 	// rotation in progress, a migrated fleet) knows which to unwrap with.
-	KekId         string `protobuf:"bytes,3,opt,name=kek_id,json=kekId,proto3" json:"kek_id,omitempty"`
+	KekId string `protobuf:"bytes,3,opt,name=kek_id,json=kekId,proto3" json:"kek_id,omitempty"`
+	// dek_key_id is the DEK's own version — RecordHeader.KeyID, the field that lets
+	// §15.1 rotation re-key new data without re-encrypting history. It travels with
+	// dek_wrapped because a wrapped key and another key's version describe a volume
+	// nothing can open.
+	//
+	// It is never 0. On the WAL path 0 means "plaintext record" (§14.1), so
+	// wal.NewEncryption refuses it and volumes.dek_key_id carries a CHECK that keeps
+	// it out of the catalog. A host that receives 0 here has been handed a volume it
+	// must decline rather than serve in the clear.
+	DekKeyId      uint32 `protobuf:"varint,4,opt,name=dek_key_id,json=dekKeyId,proto3" json:"dek_key_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -776,6 +786,13 @@ func (x *GetVolumeKeysResponse) GetKekId() string {
 		return x.KekId
 	}
 	return ""
+}
+
+func (x *GetVolumeKeysResponse) GetDekKeyId() uint32 {
+	if x != nil {
+		return x.DekKeyId
+	}
+	return 0
 }
 
 // VolumeReport is one volume's watermarks as the Agent observes them, qualified
@@ -1056,12 +1073,14 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x1b\n" +
-	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\"l\n" +
+	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\"\x8a\x01\n" +
 	"\x15GetVolumeKeysResponse\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1f\n" +
 	"\vdek_wrapped\x18\x02 \x01(\fR\n" +
 	"dekWrapped\x12\x15\n" +
-	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\"\xec\x01\n" +
+	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
+	"\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xec\x01\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +

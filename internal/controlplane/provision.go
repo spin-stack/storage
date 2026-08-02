@@ -117,6 +117,7 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 		PrimaryHostID: spec.HostID,
 		DEKWrapped:    wrapped,
 		KEKID:         p.kms.KEKID(),
+		DEKKeyID:      dek.KeyID,
 	}
 	if err := p.md.CreateVolume(ctx, term, vol, nil); err != nil {
 		return ProvisionedVolume{}, fmt.Errorf("creating the volume row: %w", err)
@@ -130,6 +131,7 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 		CurrentEpoch: 1,
 		KEKID:        p.kms.KEKID(),
 		DEKWrapped:   wrapped,
+		DEKKeyID:     dek.KeyID,
 	}); err != nil {
 		// Reported, not rolled back. Deleting the row here would need a term-guarded
 		// delete that does not exist, and would turn one repairable inconsistency into

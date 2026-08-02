@@ -175,13 +175,16 @@ message GetVolumeKeysResponse {
   // kek_id names the key that wraps it, so a host holding more than one (a
   // rotation in progress, a migrated fleet) knows which to unwrap with.
   string kek_id = 3;
-  // The DEK's own version — RecordHeader.KeyID, the field that lets §15.1
-  // rotation re-key without re-encrypting history — is deliberately not here:
-  // nothing stores it. The catalog has dek_wrapped and kek_id and no column for
-  // a DEK version, so there is no honest value to put in this message, and a
-  // default of 0 would be actively wrong (0 means "plaintext record" on the WAL
-  // path). The increment that implements rotation adds the column and this
-  // field together.
+  // dek_key_id is the DEK's own version — RecordHeader.KeyID, the field that lets
+  // §15.1 rotation re-key new data without re-encrypting history. It travels with
+  // dek_wrapped because a wrapped key and another key's version describe a volume
+  // nothing can open.
+  //
+  // It is never 0. On the WAL path 0 means "plaintext record" (§14.1), so
+  // wal.NewEncryption refuses it and volumes.dek_key_id carries a CHECK that keeps
+  // it out of the catalog. A host that receives 0 here has been handed a volume it
+  // must decline rather than serve in the clear.
+  uint32 dek_key_id = 4;
 }
 
 // VolumeReport is one volume's watermarks as the Agent observes them, qualified

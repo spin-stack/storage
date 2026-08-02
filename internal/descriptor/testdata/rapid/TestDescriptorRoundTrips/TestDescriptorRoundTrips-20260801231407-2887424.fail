@@ -1,0 +1,41 @@
+# 2026/08/01 23:14:07.963892 [TestDescriptorRoundTrips] [rapid] draw dek_wrapped: []byte{0x0}
+# 2026/08/01 23:14:07.963898 [TestDescriptorRoundTrips] [rapid] draw ms: 1
+# 2026/08/01 23:14:07.963899 [TestDescriptorRoundTrips] [rapid] draw size: 1
+# 2026/08/01 23:14:07.963900 [TestDescriptorRoundTrips] [rapid] draw block: 512
+# 2026/08/01 23:14:07.963900 [TestDescriptorRoundTrips] [rapid] draw durability: "remote"
+# 2026/08/01 23:14:07.963903 [TestDescriptorRoundTrips] [rapid] draw epoch: 0
+# 2026/08/01 23:14:07.963904 [TestDescriptorRoundTrips] [rapid] draw chain: 0
+# 2026/08/01 23:14:07.963906 [TestDescriptorRoundTrips] [rapid] draw kek_id: "-"
+# 2026/08/01 23:14:07.963907 [TestDescriptorRoundTrips] [rapid] draw dek_key_id: 1
+# 2026/08/01 23:14:07.963910 [TestDescriptorRoundTrips] dek_key_id 1 survived as 0
+# 
+v0.4.8#17641682123061174319
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
