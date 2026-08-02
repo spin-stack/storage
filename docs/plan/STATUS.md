@@ -5,8 +5,11 @@ file disagrees with this one, this one is wrong and should be fixed — nothing 
 tracks state.
 
 - **Date:** 2026-08-01 · **Branch:** everything is on `main` — `guest-kernel-pinning`
-  was merged `--ff-only` at `283f1dd` after a full `task ci:full`. **Not pushed:** `origin`
-  (`/home/aledbf/spin-storage.git`, bare) is still at `be84619`, seventeen commits behind.
+  merged `--ff-only` at `283f1dd`, then `checkpoint-lease-checker` at `b5bd268`, each
+  after a full `task ci:full`. `origin` (`/home/aledbf/spin-storage.git`, bare) holds
+  everything through `4f6e125`; only `b5bd268` is unpushed. (An earlier revision of this
+  line claimed `origin` was seventeen commits behind at `be84619`. It was not — the claim
+  was written without checking, and `git ls-remote` disagrees with it.)
 - **Gate:** `task ci` green (2026-08-01, with the keystone and its review-zone half in). It had been red since
   `e8bbdab` until DEV-0013 was resolved on 2026-07-28, which nothing had noticed
   because nobody had run it.
@@ -116,6 +119,42 @@ binds and owns rather than one a test assembled. That is the **write** half of o
 on one host.
 Everything downstream — FLUSH's ACK path, the uploader, checkpoints, truncation — is
 still exercised only by tests, and there is no deployment.
+
+## How far is "functional" — and why the phase table does not answer that
+
+Two axes run through this document and they are easy to confuse.
+
+**The 13 phases below are the design doc's decomposition of the whole product.** They are
+not a schedule and not a queue: phase 12 is *not started* and is not on the path to
+anything working, phase 13 needs hardware that does not exist yet, and most of the rest
+say **model** — the library is written and DST-covered, with no integrated caller. Reading
+the table top to bottom gives the impression of being stuck near the end. Nothing is
+stuck near the end; the table is a map of the product, not a progress bar.
+
+**The queue is `BUILD-INVENTORY.md`, and it has eight increments.** It answers one
+question — what has to exist for *one volume on one host* to work end to end with the
+real binaries — and it is where "how much is left" is actually measured:
+
+| Increment | State |
+|---|---|
+| 0 — binaries runnable and debuggable | **done** (`5bf31d4`) |
+| 1 — a volume can exist | **done** (`5953c73`) |
+| 2 — KEYSTONE: the per-volume runtime | **done** (`4f2852a`, `cf021cc`) |
+| 3 — checkpoint and truncate | **done** (scheduler, ADR-0023, and as of `b5bd268` its §12.6 checker) |
+| 4 — warm restart, same host | **absorbed, minus an ADR.** Its two data pieces were the durable point and the published point having no producer; increment 5's `InstallBase` supplies both, and `fetchBase` calls `recovery.DurablePoint`. What is left of it is the written decision on same-epoch re-attach vs. epoch bump — a fencing review zone, so it is an ADR, not a code task. |
+| 5 — cold restart, seed the read view from S3 | **done** — this was the real correctness hole |
+| 6 — the DEK arm | **not started.** `dek_key_id` end to end plus a KEK source on the Agent. Until it lands every object in the bucket is plaintext and INV-15 is unreachable. Separable by design: 2–5 work with `enc == nil`. |
+| 7 — a guest that can issue FLUSH | **mostly done** (`e8bbdab`, `cef9881`) |
+| 8 — the e2e lane and a gate that can notice regressions | **not started.** Needs the QEMU-in-CI decision below. |
+
+So: **two increments of real work** (6 and 8), one ADR, and the QEMU-in-CI choice. The
+inventory sizes 6 at 1–2 days and 8 at 2–3. By its own definitions the first milestone
+matching the target slice's literal wording is the end of increment 6; the first one a
+**merge gate can defend** is the end of increment 8 — and until that exists, every green
+claim in this file is one developer's machine, not a gate.
+
+What that milestone is *not*: multi-host, warm standby, compaction, or anything measured
+on real hardware. Those are the phases below, and they start after the slice works.
 
 ## Where each phase actually is
 
