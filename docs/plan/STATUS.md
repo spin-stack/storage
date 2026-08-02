@@ -611,9 +611,54 @@ must stay: it uses `Progress.UpTo` for `guardDurableFloor` and the recovery poin
 materialization is the *proof* INV-09 rests on. Changing what that proves is a
 fencing/durability review-zone decision, not a cleanup.
 
-Still untouched: snapshot sealing is synchronous rather than a background lifecycle,
-objectization publishes no segment objects, and §22.4's lazy loading — which is what the
-cold RTO (RISK-04) actually needs — is designed and not implemented.
+**Snapshot sealing is split (2026-08-02, `SNAPSHOT-LIFECYCLE-SPEC.md`).** §19 separates a
+snapshot into "capturar atómicamente N (µs)" and, *in background*, making N durable and
+publishing the manifest. `Create` did both in one blocking call. `Capture` and `Seal` are
+now separate, `Create` is their composition, and a `Captured` value carries the `CREATING`
+state the lifecycle vocabulary had and nothing ever produced.
+
+No goroutine was added, deliberately: "in background" is the caller's property — the Agent
+has io-class budgets to spend it against (INV-17) and spin's runner may own the lifecycle
+(ADR-0021) — so a `go` statement in a library would be a policy decision taken in the
+wrong place.
+
+Two things it found:
+
+- **A retried `Seal` failed.** The manifest is published create-only, so the second
+  attempt got `ErrPreconditionFailed`. That is the exact case a background seal produces —
+  die between the PUT and whatever records PUBLISHED — and failing is the worst of the
+  three outcomes, because the manifest exists, is immutable (INV-16) and is a GC root
+  (§21.3), and the caller would write FAILED beside it. It converges on its *own* manifest
+  now, and refuses a different one at the same id (`ErrSnapshotConflict`): two snapshots
+  claiming one id is not something a retry can reconcile.
+- **§19's two mandatory metrics had never been recorded.** `internal/obs` has registered
+  `snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds` since Phase 01
+  and nothing observed either. `Capture` and `Seal` do now, and a test asserts it — a
+  metric nobody records is a metric that is missing during the first incident that needs
+  it.
+
+The pause test also earned its keep: the old one measured `Create`, which captures *and*
+seals, and passed because the simulated clock only advances when something works — proving
+the pause was zero without proving where the work went. `TestCaptureIsTheWholePause` holds
+the two apart: after a capture, nothing is durable, nothing is listed, and no manifest
+exists.
+
+**Objectization (segment objects) is specified and deliberately not implemented** —
+`OBJECTIZATION-SPEC.md`. §21.1's steps 4–7 (publish the checkpoint, advance, truncate) are
+done and proven end to end; steps 1–3 (build, upload and verify segments) **do not exist at
+all**: no `segments/` prefix, no producer, no consumer. It is a feature, not a defect, and
+the system is correct without it — what it buys is bounded replay, which is RISK-04's cold
+RTO and a performance property.
+
+It is a phase rather than the tail of an increment: a new on-S3 object kind with its own
+§25.2 property test, a `Checkpoint` format change, `recovery`/`materialize` reading both
+kinds (the code INV-08 and INV-09 rest on), and a third anchored kind for the GC (INV-14).
+Doing all four in the session that closed five other DEV items is how a format change gets
+merged without anyone reading it. The spec says what shape it should take and what to
+assert first: *a view rebuilt from segments + tail is byte-identical to the same view
+rebuilt from WAL alone.*
+
+§22.4's lazy loading — what the cold RTO actually needs — is designed and not implemented.
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 

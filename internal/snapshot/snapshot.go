@@ -16,9 +16,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/spin-stack/storage/internal/lifecycle"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -38,6 +41,11 @@ type Manifest struct {
 	RootDigest       string   `json:"root_digest"`
 	Objects          []string `json:"objects"`
 }
+
+// ErrSnapshotConflict means this snapshot id already names a *different* manifest. It
+// is not a retry of our own publish — a manifest is immutable (INV-16) — so it is two
+// snapshots claiming one id, which nothing can reconcile.
+var ErrSnapshotConflict = errors.New("snapshot: a different manifest already exists at this id")
 
 // ManifestKey is the deterministic manifest key for a snapshot.
 func ManifestKey(volumeID, snapshotID string) string {
@@ -94,6 +102,37 @@ type Snapshotter struct {
 	// holder. Empty means "would not say", which cannot be reconciled with any grant
 	// and is refused for every epoch that has one.
 	hostID string
+	// rec records §19's two mandatory metrics. Nil is a working no-op.
+	rec *obs.Recorder
+}
+
+// SetRecorder attaches the metric recorder. §19 makes two of them mandatory —
+// snapshot_pause_duration_seconds, which must stay ~0, and
+// snapshot_publish_duration_seconds — and internal/obs has registered both since Phase 01
+// with nothing observing either.
+func (s *Snapshotter) SetRecorder(r *obs.Recorder) { s.rec = r }
+
+// Captured is a snapshot that has been *taken* but not yet sealed: the §19 pause has
+// happened, the sequence is fixed, and everything durable is still ahead of it.
+//
+// It exists because §19 splits a snapshot in two — "capturar atómicamente N (µs)" and
+// then, "en background", making N durable and publishing the manifest — and a single
+// blocking call cannot express that. It carries the state the lifecycle vocabulary
+// already had and nothing ever produced: a captured snapshot is CREATING until Seal
+// publishes it (PUBLISHED) or the caller records the failure (FAILED).
+type Captured struct {
+	SnapshotID     string
+	ParentID       string
+	VolumeID       [16]byte
+	Epoch          uint64
+	TargetSequence uint64
+	// Pause is what the capture cost the guest. §19's headline property is that this
+	// stays ~0, and it is ~0 for a structural reason rather than a lucky one: the
+	// capture reads a watermark and does no I/O.
+	Pause time.Duration
+	// State is CREATING. It is here so a caller recording the snapshot in the catalog
+	// does not have to know which constant to reach for.
+	State lifecycle.SnapshotState
 }
 
 // NewSnapshotter returns a Snapshotter that does not name the host it publishes for.
@@ -133,36 +172,86 @@ func (s *Snapshotter) HeldBy(hostID string) *Snapshotter {
 // manifest naming another host's WAL objects, pinning its own view of that epoch
 // forever, and every clone taken from it rebuilds a state the live volume never had.
 func (s *Snapshotter) Create(ctx context.Context, log *wal.Log, volumeID [16]byte, epoch uint64, snapshotID, parentID string) (Manifest, time.Duration, error) {
-	// The pause: capture the sequence atomically. No I/O, no clock advance.
-	pauseStart := s.clk.Now()
+	c := s.Capture(ctx, log, volumeID, epoch, snapshotID, parentID)
+	m, err := s.Seal(ctx, log, c)
+	return m, c.Pause, err
+}
+
+// Capture is §19 step 1: fix the sequence, and nothing else.
+//
+// It does no I/O at all — it reads a watermark — which is why the pause it reports is ~0
+// for a structural reason rather than a lucky one, and why the guest keeps writing
+// through a snapshot at sequences > TargetSequence. Everything expensive is Seal's.
+func (s *Snapshotter) Capture(ctx context.Context, log *wal.Log, volumeID [16]byte, epoch uint64, snapshotID, parentID string) Captured {
+	start := s.clk.Now()
 	target := log.Watermarks().Local
-	pause := s.clk.Now().Sub(pauseStart)
+	pause := s.clk.Now().Sub(start)
 
 	vid := format.UUIDString(volumeID)
-	if err := recovery.VerifyPublisher(ctx, s.store, vid, epoch, s.hostID); err != nil {
-		return Manifest{}, pause, fmt.Errorf("snapshot: %s may not snapshot epoch %d: %w", vid, epoch, err)
+	s.rec.Observe(ctx, "snapshot_pause_duration_seconds", pause.Seconds(), obs.String("volume", vid))
+	return Captured{
+		SnapshotID: snapshotID, ParentID: parentID, VolumeID: volumeID,
+		Epoch: epoch, TargetSequence: target, Pause: pause,
+		State: lifecycle.SnapshotCreating,
 	}
+}
 
-	// Sealing (background class): make the captured prefix durable, then build the
-	// manifest from the objects covering it.
-	if err := log.Flush(ctx); err != nil {
-		return Manifest{}, pause, err
+// Seal is §19 step 3: make the captured prefix durable and publish the manifest.
+//
+// It is the part that belongs in the background, and it is deliberately *not* run in one
+// here. "In background" is a property of the caller — the Agent has io-class budgets to
+// spend it against (INV-17), and spin's runner may own the lifecycle instead (ADR-0021) —
+// so a `go` statement in this package would be a policy decision taken in a library.
+//
+// Safe to retry after a crash: the manifest is published create-only, so a second Seal
+// either wins or finds its own manifest already there, and the objects it lists are
+// derived from the same target sequence.
+func (s *Snapshotter) Seal(ctx context.Context, log *wal.Log, c Captured) (Manifest, error) {
+	started := s.clk.Now()
+	vid := format.UUIDString(c.VolumeID)
+	if err := recovery.VerifyPublisher(ctx, s.store, vid, c.Epoch, s.hostID); err != nil {
+		return Manifest{}, fmt.Errorf("snapshot: %s may not snapshot epoch %d: %w", vid, c.Epoch, err)
 	}
-	objects, err := recovery.ObjectKeysUpTo(ctx, s.store, volumeID, epoch, target)
+	if err := log.Flush(ctx); err != nil {
+		return Manifest{}, err
+	}
+	objects, err := recovery.ObjectKeysUpTo(ctx, s.store, c.VolumeID, c.Epoch, c.TargetSequence)
 	if err != nil {
-		return Manifest{}, pause, err
+		return Manifest{}, err
 	}
 	m := Manifest{
-		SnapshotID:       snapshotID,
+		SnapshotID:       c.SnapshotID,
 		VolumeID:         vid,
-		Epoch:            epoch,
-		TargetSequence:   target,
-		ParentSnapshotID: parentID,
+		Epoch:            c.Epoch,
+		TargetSequence:   c.TargetSequence,
+		ParentSnapshotID: c.ParentID,
 		Objects:          objects,
-		RootDigest:       Digest(target, objects),
+		RootDigest:       Digest(c.TargetSequence, objects),
 	}
 	if err := Publish(ctx, s.store, m); err != nil {
-		return Manifest{}, pause, err
+		if !errors.Is(err, objectstore.ErrPreconditionFailed) {
+			return Manifest{}, err
+		}
+		// The manifest is already there. Sealing is meant to run in the background
+		// (§19 step 3), so the process doing it can die between the PUT and whatever
+		// records PUBLISHED — and the retry that follows must converge, not fail.
+		// Failing would be the worst of the three outcomes: the manifest exists, is
+		// immutable (INV-16) and is a GC root (§21.3), and the caller would write
+		// FAILED next to it.
+		//
+		// Convergence is only safe if it is *our* manifest: a different one at this key
+		// means two snapshots claiming one id, which no retry can reconcile.
+		existing, rerr := Read(ctx, s.store, vid, c.SnapshotID)
+		if rerr != nil {
+			return Manifest{}, fmt.Errorf("snapshot: %s exists but could not be read: %w", c.SnapshotID, rerr)
+		}
+		if existing.RootDigest != m.RootDigest {
+			return Manifest{}, fmt.Errorf("%w: snapshot %s already exists with a different root digest (%s, not %s)",
+				ErrSnapshotConflict, c.SnapshotID, existing.RootDigest, m.RootDigest)
+		}
+		m = existing
 	}
-	return m, pause, nil
+	s.rec.Observe(ctx, "snapshot_publish_duration_seconds",
+		s.clk.Now().Sub(started).Seconds(), obs.String("volume", vid))
+	return m, nil
 }
