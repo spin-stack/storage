@@ -1,6 +1,6 @@
 # docs/plan — the map
 
-Eight entries. Each answers one question, and no two answer the same one.
+Each row answers one question, and no two answer the same one.
 
 | I want to know… | Read |
 |---|---|
@@ -11,7 +11,20 @@ Eight entries. Each answers one question, and no two answer the same one.
 | Why was this decided, and what was rejected | `DECISIONS/ADR-NNNN-*.md` |
 | What could still go wrong, and what forces a re-review | `RISKS.md` |
 | The on-disk segment format | `WAL-SEGMENTS-SPEC.md` |
+| What one increment in a human-review zone decided, and why | the other `*-SPEC.md` — see below |
 | How the system is supposed to work | `../../arquitectura_mvp_volumenes_remotos_v5.md` (v5.1, Spanish) |
+
+**The `*-SPEC.md` files are review artefacts, not a category.** `CLAUDE.md` asks for a
+spec before implementing *only* inside a human-review zone; everywhere else the increment
+is the plan. So each one exists to be read by a person before a risky change, and once
+that change has landed its decisions belong in comments at the code. Two of them are cited
+by `.go` files (`DURABILITY-SCHEDULER-SPEC.md`, `VIEW-ADOPTION-SPEC.md`); the rest are
+reachable only from `STATUS.md`. Treat a spec whose increment is done as history, which
+this directory keeps in git rather than in the tree.
+
+The count that used to open this file ("Eight entries") had been wrong for a while, in the
+direction that matters: the directory kept growing and the map did not. A number here is a
+second thing to maintain, so there is no longer one — the table is the map.
 
 Conventions, commands, the gate and the review zones are in **`CLAUDE.md`** at the repo
 root, because they apply while writing code rather than while planning.

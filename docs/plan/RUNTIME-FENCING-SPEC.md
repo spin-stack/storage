@@ -168,4 +168,7 @@ It needs its own spec and its own review; it is not a follow-on edit to this one
 ## What is not in this spec
 
 The uploader's scheduling (checkpoint/truncate) is increment 3, and it must not merge
-before the view-adoption increment — see the truncation hole in `STATUS.md`.
+before the view-adoption increment, because truncation without an adoptable read view
+makes a restart serve zeros for everything it reclaimed. Both landed on 2026-08-01 in
+that order (increment 5 then increment 3), so this constraint is satisfied rather than
+pending; `VIEW-ADOPTION-SPEC.md` records how the seam was built.

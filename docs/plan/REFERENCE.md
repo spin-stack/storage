@@ -1,6 +1,15 @@
 # REFERENCE — resolve any symbol the code cites, without opening another file
 
-The code carries **1.766 references** across 202 of its 238 Go files: `§14.4`, `INV-13`,
+> Whether this file still keeps its promise is a command, not a claim:
+> ```
+> comm -23 <(grep -rhoE 'ADR-[0-9]{4}' --include='*.go' . | sort -u) \
+>          <(grep -ohE 'ADR-[0-9]{4}' docs/plan/REFERENCE.md | sort -u)
+> ```
+> Empty means every ADR the code cites resolves here. Swap the pattern for `INV-` or
+> `DEV-` for the other two. This replaces the dated "up to date as of …" note that used
+> to serve the same purpose and could only ever be true on the day it was written.
+
+The code carries **2.106 references** across 228 of its 264 Go files: `§14.4`, `INV-13`,
 `ADR-0017`, `DEV-0007`. They are deliberate — they are what lets a reader check that a
 comment about fencing says what §12.4 actually says, and they are how four audits found
 real bugs. What they lacked was a way to *resolve* one without opening a 1.455-line
@@ -99,8 +108,12 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 
 ## `INV-` — the invariants
 
-Full statement, checker, and activation increment: **`INVARIANTS.md`**. State as of
-2026-07-26: 21 active, INV-19 pending.
+Full statement, checker, and activation increment: **`INVARIANTS.md`**.
+
+The dated aggregate that used to sit here ("State as of 2026-07-26: 21 active, INV-19
+pending") is gone rather than refreshed. A count is the part that rots first and the part
+nothing checks; the per-row state below is resolved against `INVARIANTS.md`, which is the
+file that owns it.
 
 | INV | One line | State |
 |---|---|---|
@@ -134,12 +147,8 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 
 | ADR | Decision | Status |
 |---|---|---|
-| ADR-0001 | Stack: Go 1.26, module `spin-stack/storage`, Taskfile, GitHub Actions. | Accepted |
-| ADR-0002 | Parallel tracks with Planner-owned hot zones. | Accepted |
 | ADR-0003 | The simulable-interfaces rule is enforced by a custom analyzer, not by intent. | Accepted |
-| ADR-0004 | The object store gets a real staging implementation, not only a simulator. | Accepted |
 | ADR-0005 | **WAL headers are 104 bytes**, not the doc's 96 — every field is load-bearing. | Accepted |
-| ADR-0006 | All SQL through sqlc; PostgreSQL verified with TestContainers. | Accepted |
 | ADR-0007 | PostgreSQL 18 + UUIDv7. *(Its tooling half — Atlas — is superseded by ADR-0019.)* | Partly superseded |
 | ADR-0008 | A drain moves a volume from its **durable prefix in S3**, not from a snapshot. | Accepted |
 | ADR-0009 | Lifecycles are typed (`internal/lifecycle`): compile time, store boundary, DB CHECK. | Accepted |
@@ -155,6 +164,7 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0019 | Schema tooling is **pgschema**, not Atlas; `schema.sql` is the declared state. | Accepted |
 | ADR-0020 | `internal/vhost/hostio` is the one documented INV-01 exception (SCM_RIGHTS + mmap). | Accepted |
 | ADR-0021 | storage integrates into **spin**; spin imports storage and never the reverse. The two binaries are test harnesses that must stay runnable end to end. spin migrates to pgschema. | Accepted |
+| ADR-0025 | The QEMU guest lane runs **inside the published runtime image** (`ghcr.io/<repo>/qemu:<version>`) as a CI container job, rather than installing QEMU's dynamic dependencies on a bare runner, so the dependency set has one definition in `Dockerfile.qemu`. The job is gated on the image existing and skips with a notice rather than failing the gate. | Accepted |
 | ADR-0024 | A restarted Agent re-attaches at the **same epoch** — no bump, no CP round trip, no FENCING_WAIT. Safe because a crash leaves S3 a prefix (never a gap), `DurablePoint`+`InstallBase` resume *above* everything in the bucket, `VerifyAgreement` checks any overlap record by record, and INV-21 hard-fails a divergent PUT. Does not cover two *live* Agents on one data dir — that is DEV-0014, a mutual-exclusion problem, not an epoch policy. | Accepted |
 | ADR-0023 | The object store is a fencing witness the data path may act on: a checkpoint that proves a second writer in this epoch tears the runtime down and records the fenced epoch, even while the Control Plane still lists the volume as this host's. | Accepted |
 | ADR-0022 | The guest kernel is pinned by sha256 and obtained by `task fetch:kernel` into `_output/guest/vmlinux` — never resolved from a sibling checkout's path. storage may *mirror* spinbox's artefact into a registry; mirroring is not building (ADR-0021 stands). | Accepted |
@@ -179,6 +189,8 @@ commit named is where the fix landed.
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |
 | DEV-0011 | A segment's space is charged as used, not reserved at creation. | **open** → STATUS.md |
 | DEV-0012 | A self-fenced log still accepts WRITEs and still serves reads. | **open** → STATUS.md |
+| DEV-0020 | A clone chain deeper than one link cannot be materialized: `materialize.FromSnapshot` resolves only the objects the parent's manifest lists, all under the parent's own id, so a clone of a clone never fetches its grandparent's extents. Unrelated to encryption — the same hole exists for a plaintext volume. | open — §19/§20 must say whether a chain is walked or flattened |
+| DEV-0019 | A restarted encrypted volume served its guest **ciphertext**: `agent.fetchBase` passed a literal `nil` `*wal.Encryption` to `recovery.RecoverOver` for a volume whose DEK it had just unwrapped, and `ApplyRecord` folded the sealed payload into the read view at exactly the plaintext's length, with no error anywhere. | resolved 2026-08-02 — `recovery.ErrSealedWithoutKey` makes it unrepresentable; `Volume` carries its `enc`; `parentView` re-binds the DEK to the parent's id; mandatory DST arm `encrypted-volume-survives-a-restart` |
 | DEV-0018 | Three documents claimed a Linux-guest lane that no test performed — every `integration/vhost` test boots a 512-byte SeaBIOS boot sector, and INT 13h has no flush verb. Writing the lane found a real hang: a guest re-initialises the device (firmware → OS hand-off) with a **new kick eventfd**, and the queue loop stayed parked on the first one. | resolved 2026-08-02 — `queueLoop.ensure` restarts on a new kick; `TestAReinitialisedDeviceIsStillServed` + `TestALinuxGuestIssuesFLUSH` |
 | DEV-0017 | `cmd/volume-agent` rooted its Disk at `--data-dir` *and* passed the same absolute path as `DataDir`, so every WAL landed under `<data-dir>/<data-dir>/wal/...`. | resolved 2026-08-02 — the binary passes `DataDir: "."`; the e2e lane asserts the doubled directory does not exist |
 | DEV-0016 | `task lint` ran golangci-lint with no build tags, so the whole `integration/`+`internal/testinfra` surface was never parsed by it. | resolved 2026-08-02 — `--build-tags integration,e2e`, plus a harness exemption whose narrowness is checked by planting a `time.Now()` in a non-test file |

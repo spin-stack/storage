@@ -4,18 +4,23 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-08-01 · **Branch:** everything is on `main` — `guest-kernel-pinning`
+- **Date:** 2026-08-02 · **Branch:** everything is on `main` — `guest-kernel-pinning`
   merged `--ff-only` at `283f1dd`, then `checkpoint-lease-checker` at `b5bd268`, each
-  after a full `task ci:full`. `origin` (`/home/aledbf/spin-storage.git`, bare) holds
-  everything through `4f6e125`; only `b5bd268` is unpushed. (An earlier revision of this
-  line claimed `origin` was seventeen commits behind at `be84619`. It was not — the claim
-  was written without checking, and `git ls-remote` disagrees with it.)
-- **Gate:** `task ci` green (2026-08-01, with the keystone and its review-zone half in). It had been red since
-  `e8bbdab` until DEV-0013 was resolved on 2026-07-28, which nothing had noticed
-  because nobody had run it.
-  Green *on a developer machine, and nowhere else*: `task cover` 90.3%
-  (floor 90 — the margin is thin because increments 0 and 1 added binary wiring that unit
-  tests do not reach), `task test:integration` green on PostgreSQL 18,
+  after a full `task ci:full`. `origin` (`/home/aledbf/spin-storage.git`, bare) is level
+  with `main`: `git ls-remote origin` reports `1a7f75d` for `refs/heads/main` and that is
+  `HEAD`. Nothing is unpushed.
+
+  This line has now been wrong twice, in opposite directions, and both times because it
+  was written from memory. It claimed `origin` was seventeen commits *behind* at
+  `be84619`; corrected, it then claimed `origin` stopped at `4f6e125` with one commit
+  unpushed, while `origin` was in fact seventeen commits *ahead* of `4f6e125`. The rule
+  this file needs is not "check before writing", which was already the rule — it is that
+  a claim about another system belongs next to the command that produced it. Here that
+  command is `git ls-remote origin`.
+- **Gate:** `task ci:full` green, 2026-08-02.
+  Green *on a developer machine, and nowhere else*: `task cover` 90.6%
+  (floor 90 — the margin is thin because the binary wiring increments 0 and 1 added is
+  not reached by unit tests), `task test:integration` green on PostgreSQL 18,
   `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
   `task qemu:verify` + `task guest:verify` green — all of that is one machine's word.
   **CI has never run.** `origin` is a local bare repo, so the GitHub workflows have
@@ -24,9 +29,9 @@ tracks state.
   the guest lane could not run there are now gone (2026-07-28): the kernel is fetched
   and pinned rather than read out of a sibling checkout (**ADR-0022**), and
   `test:integration:qemu` skips loudly instead of hard-failing when `_output` has no
-  QEMU — it used to `deps: [qemu:verify]`, which made `task test:integration`
-  unrunnable anywhere QEMU had not been built by hand, contradicting the task's own
-  description. **What remains is QEMU itself**, below.
+  QEMU. The third — how a runner obtains QEMU at all — was decided on 2026-08-02 by
+  **ADR-0025** and implemented as a container job. So nothing is *missing*; what is
+  missing is a run.
 - **Where this is going:** storage integrates into **spin** (`github.com/aledbf/spin`),
   which already has a control plane and a per-host runner — **ADR-0021**. spin imports
   storage, never the reverse; `cmd/control-plane` and `cmd/volume-agent` are test
@@ -131,7 +136,7 @@ say **model** — the library is written and DST-covered, with no integrated cal
 the table top to bottom gives the impression of being stuck near the end. Nothing is
 stuck near the end; the table is a map of the product, not a progress bar.
 
-**The queue is `BUILD-INVENTORY.md`, and it has eight increments.** It answers one
+**The queue is `BUILD-INVENTORY.md`, and it has nine increments** (0 through 8). It answers one
 question — what has to exist for *one volume on one host* to work end to end with the
 real binaries — and it is where "how much is left" is actually measured:
 
@@ -143,11 +148,11 @@ real binaries — and it is where "how much is left" is actually measured:
 | 3 — checkpoint and truncate | **done** (scheduler, ADR-0023, and as of `b5bd268` its §12.6 checker) |
 | 4 — warm restart, same host | **done.** Its two data pieces were the durable point and the published point having no producer; increment 5's `InstallBase` supplies both, and `fetchBase` calls `recovery.DurablePoint`. The written decision it also asked for is **ADR-0024** — same-epoch re-attach, with the four mechanisms it rests on named so a change cannot silently invalidate it. Writing it surfaced **DEV-0014** (two Agents, one data dir), which predates the decision. |
 | 5 — cold restart, seed the read view from S3 | **done** — this was the real correctness hole |
-| 6 — the DEK arm | **done.** `dek_key_id` end to end (column + CHECK, proto, `metadata.Volume`, descriptor, `GetVolumeKeys`, provisioner, clone, rebuild-metadata) plus `-kek-file`/`-kek-id` on the Agent, `crypto.DevKMS`, and the unwrap at attach. Every object a served volume puts in the bucket is now ciphertext, and INV-15 is reachable — see below. |
+| 6 — the DEK arm | **done.** `dek_key_id` end to end (column + CHECK, proto, `metadata.Volume`, descriptor, `GetVolumeKeys`, provisioner, clone, rebuild-metadata) plus `-kek-file`/`-kek-id` on the Agent, `crypto.DevKMS`, and the unwrap at attach. Every object a served volume puts in the bucket is now ciphertext, and INV-15 is reachable — see below. **Corrected 2026-08-02 (DEV-0019):** "done" was half true. The write half was; the *read* half handed the guest that ciphertext back on every restart, because `fetchBase` recovered with no key. Fixed, with the mandatory DST arm that crosses encryption with a restart — which is the arm whose absence let this row be written. |
 | 7 — a guest that can issue FLUSH | **mostly done** (`e8bbdab`, `cef9881`) |
-| 8 — the e2e lane and a gate that can notice regressions | **done**, minus the QEMU-in-CI decision. `integration/e2e` runs both binaries as processes in `ci:full` and in CI; CI builds them and the workflow now runs the lane. The guest (QEMU) lane still skips on a runner — see below. |
+| 8 — the e2e lane and a gate that can notice regressions | **done.** `integration/e2e` runs both binaries as processes in `ci:full` and in CI; CI builds them and the workflow runs the lane. The QEMU-in-CI question is decided and implemented (**ADR-0025**): the guest lane is a container job on the published runtime image, which skips with a notice when that image is absent — see below. |
 
-So: **the build order is done**, and what is left is the QEMU-in-CI choice. The
+So: **the build order is done.** The
 milestone matching the target slice's literal wording was the end of increment 6, and the
 first one a **merge gate can defend** was the end of increment 8. Both are in. The
 remaining honesty caveat is narrower than it was: the workflows have still never *run*,
@@ -163,10 +168,10 @@ on real hardware. Those are the phases below, and they start after the slice wor
 |---|---|---|
 | 01 skeleton (simio + DST + obs) | **model** | Simulable interfaces, the DST harness and the metric catalog all exist and are enforced by lint. Metrics are recorded by the paths that own them; wiring continues with each new path. |
 | 02 guest layout (3 devices + OverlayFS) | **not started** | Needs guest mounts / a VM. Nothing in the durability chain depends on it. Spec below. |
-| 03 vhost-user | **3.1 integrated + served by the Agent** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). A **Linux** guest boots the lane too (`task build:guest`). Since the keystone the *Agent* binds a socket per volume and serves `blockdev.Device` behind it, so there is now a device to issue FLUSH against — but only local-mode FLUSH until the lease adapter lands (`RUNTIME-FENCING-SPEC.md`). 3.2 reconnection and 3.3 inflight-shmfd untouched; RISK-10 open. |
-| 04 WAL/CoW format | **write path integrated**, rest model | A guest's WRITE lands as a replayable WAL record with **0 PUTs** (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims (`WAL-SEGMENTS-SPEC.md`). FLUSH / uploader / checkpoint are model-only. Format review still pending (human-review zone). |
-| 05 encryption (AES-256-GCM, DEK/KEK) | **model** | — |
-| 06 remote WAL (batching, idempotent PUT, summary) | **model** | No guest has ever driven a PUT. |
+| 03 vhost-user | **3.1 integrated + served by the Agent** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`task test:integration:qemu`). A **Linux** guest boots the lane too (`task build:guest`). Since the keystone the *Agent* binds a socket per volume and serves `blockdev.Device` behind it, so there is now a device to issue FLUSH against. The lease adapter landed with the keystone's review-zone half, so a FLUSH is the full §14.4 remote path and not local-mode. 3.2 reconnection and 3.3 inflight-shmfd untouched; RISK-10 open. |
+| 04 WAL/CoW format | **write path integrated**, rest model | A guest's WRITE lands as a replayable WAL record with **0 PUTs** (`internal/blockdev`); the WAL is a directory of segments so truncation reclaims (`WAL-SEGMENTS-SPEC.md`). FLUSH, the uploader and checkpoints are integrated too, and increment 3's scheduler is what finally reclaims a byte. Format review still pending (human-review zone). |
+| 05 encryption (AES-256-GCM, DEK/KEK) | **integrated** | Increment 6 wired it end to end: `-kek-file`/`-kek-id` on the Agent, the unwrap at attach, and every object a served volume PUTs is ciphertext. The *read* half was integrated and wrong until 2026-08-02 — see DEV-0019, and note that this row said "model / —" while a real defect lived in the path it declined to describe. |
+| 06 remote WAL (batching, idempotent PUT, summary) | **integrated** | A real Linux guest drives the whole chain: `TestAGuestSurvivesCheckpointAndTruncation` boots a kernel, writes, `fsync`s, takes a checkpoint, truncates, reboots and reads back — proven against a planted bug (deleting the bucket between the two boots). The previous entry here, "No guest has ever driven a PUT", was true when written and outlived that by two increments. `WriteSummary` remains the one piece with no producer. |
 | 07 Control Plane + leases + fencing | **model**, provisioning integrated | Fail-closed lease, resumable promotion, term guards. **A volume can now be created** (`controlplane.Provisioner`, `control-plane -seed-volume`): row + wrapped DEK + descriptor, verified against Postgres 18. |
 | 08 recovery (S3 authority) + rebuild-metadata | **model** | Objects are validated before they count as durable; the rebuild includes the snapshot catalog. |
 | 09 snapshots + clone + resize | **partial model** | The clone chain is persisted and a clone reads through its parent (DST arm + planted bug). Sealing is still synchronous (DEV-0007). |
@@ -204,39 +209,9 @@ claimed "a Linux guest boots the lane". It did not: see DEV-0018.) See
 either way it is rejected unless it hashes to the pin. `guest:verify` now also asserts
 `CONFIG_VIRTIO_BLK`/`PVH`/`BLK_DEV_INITRD`/`SERIAL_8250_CONSOLE` by reading the config
 the kernel embeds — all four proven to fail by planting them, along with a wrong hash, a
-non-ELF, and every source missing. Running the gate for it surfaced **DEV-0013** (below),
-which had been red since the day before; that is fixed too, so `task ci:full` is green
-end to end again.
-
-## ~~DEV-0013~~ — `task lint` was red from `e8bbdab` to 2026-07-28 *(resolved)*
-
-**The gate had not been green since the guest init landed on 2026-07-27**, and the claim
-at the top of this file said it was. `integration/guestinit/main.go` tripped the INV-01
-lint layer four times: `syscall` (depguard), `os.OpenFile` and `os.Open` (forbidigo), and
-an unchecked `syscall.Pause()` (errcheck) — plus the authoritative analyzer, twice. It
-surfaced on 2026-07-28 on the first `task ci` run since; nothing in the kernel increment
-touches Go, so it was not its doing.
-
-**INV-01 was never violated — the rule just did not say what it meant.** `guestinit` runs
-as PID 1 *inside the guest VM*: it is on the far side of the interface INV-01 governs, it
-is never linked into any binary this repository ships, and its purpose is to be the real
-world `simio` models. A block-device open it could simulate would prove nothing about a
-kernel deciding a write must be durable, which is the one thing no other test here
-reaches. That is a different reason from `internal/vhost/hostio`'s (ADR-0020), which is
-host code that *could* be simulated and deliberately is not — so it is recorded as its
-own exemption rather than folded into that one.
-
-**Fixed (human-approved) in both enforcement layers**, since either alone would leave the
-gate red: `exemptPathFragments` in `hack/analyzers/simulable/simulable.go`, and the
-`exclusions` in `.golangci.yml`. `syscall.Pause()`'s result is now explicitly discarded
-in the source rather than excluded in config.
-
-**The exemption is narrow, and there is a fixture that proves it.**
-`TestExemptGuestInit` asserts the guest program is clean; `TestIntegrationItselfIsNotExempt`
-asserts a host-side package under `integration/` is still flagged — because what earned
-the exemption is *"runs inside the guest"*, not *"lives under `integration/`"*, and an
-exemption that widened to the directory would quietly unsimulate the lane that drives
-QEMU.
+non-ELF, and every source missing. Running the gate for it surfaced DEV-0013 — `task
+lint` had been red since the day before and nobody had run it — which is resolved and now
+lives in git rather than here.
 
 ## The durability scheduler's two loose ends
 
@@ -301,180 +276,18 @@ nothing new to publish" is not the reason the honest arm stays quiet. The same p
 wiring trips `DurableAckLeaseChecker` too, asserted alongside it, because one cached
 answer loses both obligations.
 
-## Increment 8: the lane that runs the deployment, and the three things it found
+## The guest lane in CI
 
-`integration/e2e` (`task test:e2e`, in `ci:full` and in CI) starts the **real binaries**
-as processes against a real Postgres 18 and the pinned RustFS: `control-plane` elected,
-`volume-agent` heartbeating, a volume provisioned through the real provisioning path,
-picked up, and served behind a socket. `internal/testinfra` grew what that needs — a
-process supervisor that tees output to `t.Log`, waits on a *line the process printed*
-rather than on a sleep, and can SIGKILL — plus a Postgres helper built from `schema.sql`.
+**Decided 2026-08-02 — ADR-0025.** The lane runs inside the published QEMU runtime image
+as a container job, rather than installing its dynamic dependencies on a bare runner,
+because that keeps one definition of the dependency set in `Dockerfile.qemu`. It is
+implemented: `.github/workflows/ci.yml` has a `guest-lane-image` job that probes for
+`ghcr.io/<repo>/qemu:<version>` and a `guest-lane` job gated on it, which skips with a
+notice rather than failing the gate when the image has not been published yet.
 
-It found three defects on its first three runs, and none of them was reachable from any
-in-process test:
-
-- **`control-plane -seed-volume` stole the term from the running Control Plane.**
-  `AcquireLeadership` increments unconditionally, for the same holder id too — so
-  provisioning a volume left the *serving* CP holding a stale term, every write refused
-  as `ErrStaleTerm` until someone restarted it. Provisioning must not take down the
-  Control Plane: seeding now borrows the current term (`GetLeader`) and fails if there is
-  nobody to borrow from.
-- **The Agent was never given its own host id.** `cmd/volume-agent` built its
-  `VolumeManagerConfig` without `HostID`, and `checkpointsEnabled` refuses a scheduler
-  that cannot name the host publishing (§12.3–12.4). Every volume on every real Agent
-  would have grown its WAL for ever — increment 3's whole point, defeated by a missing
-  field in `main`. The lane read the log line saying so.
-- **The whole build-tagged surface was unlinted** — DEV-0016 above.
-
-Two ordering facts are now encoded rather than folklore: a volume cannot be provisioned
-for a host the catalog has never seen (the Agent's heartbeat creates the host row, and
-`volumes.primary_host_id` is a foreign key), and `-s3-create-bucket` belongs to exactly
-one process — every later one must find the bucket rather than invent it.
-
-`TestBothBinariesAgreeOnTheKEK` exists because of the regression that shipped *inside*
-increment 6: the two binaries had separate KEK readers with different rules — a
-hex-encoded key file was a working Control Plane and a dead Agent — and the id was a flag
-on one side and a hash of the material on the other. Both now go through
-`crypto.LoadKEK`/`crypto.KEKID`, the Agent's `-kek-id` flag is gone (derived, never
-configured), and the planted bug — the Agent naming its KEK `"kek-1"` — fails the lane.
-
-## Increment 6: what the DEK arm actually needed
-
-It was never "call `EnableEncryption`". Everything else existed and was tested —
-`crypto.DEK`, `crypto.DevKMS`, `wal.NewEncryption`, the provisioner minting and wrapping
-a DEK — and the Agent still could not build an encryptor, because **nothing remembered
-the DEK's version**. `wal.NewEncryption` refuses `KeyID 0` (0 is the WAL's plaintext
-marker), the catalog had no column for a version, and `GetVolumeKeysResponse`'s own
-comment said the field was absent because there was no honest value to put in it. The
-version now runs catalog → descriptor → wire → KMS, and `volumes.dek_key_id` carries a
-`CHECK (> 0 AND <= 2^32-1)` in both stores.
-
-That it is bound as **GCM additional authenticated data** is what makes the whole thing
-verifiable rather than merely copied: a wrapped DEK paired with the wrong version does
-not unwrap at all. Three tests lean on that — the four-boundary round trip, the clone,
-and the descriptor property test.
-
-**Three things this turned up that were not on the list.**
-
-- **`Clone` copied the parent's wrapped DEK without its version.** A clone shares the
-  parent's key (§19) and would have been unopenable; the failure would have surfaced on
-  the clone's first WRITE. Fixed, and asserted — after the assertion was found to prove
-  nothing, because the fixture's parent was at version 1 and so was the hardcoded value.
-  The fixture is now at 42, and the planted bug fails it.
-- **`rebuild-metadata` had the same hole** (§22.5), which is why the *descriptor* carries
-  the version and not only the catalog.
-- **The descriptor had no test of any kind** — see DEV-0015.
-
-**Fail closed, and a mode that is honest about itself.** An Agent with a KMS serves an
-encrypted volume or serves nothing: falling back to plaintext would put guest data in the
-bucket under a name that says otherwise, and §15.3's crypto-shredding guarantee does not
-survive that. An Agent started *without* `-kek-file` runs unencrypted — that is the
-dev/local mode the DST harness and the QEMU lane use — and says so in a warning at
-startup.
-
-**INV-15 now has a checker that has seen an Agent.**
-`scenarioEncryptedWALNoPlaintextLeak` drives `wal.Log` directly, so it could only ever
-prove the WAL encrypts *when handed a key*; nothing handed it one. The new arm serves a
-volume through the real `VolumeManager` with a real `DevKMS`, then reads every object out
-of the bucket looking for the guest's pattern. Its planted bug is leaving `-kek-file`
-off: one flag, a supported mode, still a violation for a real volume.
-
-## ADR-0024 and the mechanism it first credited to the wrong thing
-
-Increment 4's last item was a written decision: does a restarted Agent re-attach at the
-same epoch, or must the epoch be bumped? **ADR-0024 decides same-epoch**, and it is a
-fencing review zone, so it landed with `scenarioCrashedFlushDoesNotCollideOnRestart`.
-
-The scenario builds the state that makes the question interesting: §14.4 uploads at step
-4 and checks the lease at step 5, so a writer that loses its lease mid-FLUSH leaves the
-bucket holding a *longer* contiguous prefix than the guest was ever told was durable.
-Here: the guest was told 4, the bucket holds 8. Re-attach at the same epoch, write
-something different over that range, flush — if the resumed writer had numbered from the
-last ACK it would re-issue sequences the bucket already has under a different content
-hash, INV-21 would hard-fail the PUT, and the volume could never flush again.
-
-**The first draft of the ADR credited S3 for preventing that, and was wrong.** It said
-`recovery.DurablePoint` → `InstallBase` resumes the writer above the bucket. True, and
-not sufficient: a listing that comes back one object short would resume *below* objects
-that exist. So the scenario was run against exactly that fault — and **it still passed**,
-which is what identified the real mechanism. `Resume` sets `local` from the last record
-**on disk**, `InstallBase` only ever raises, and INV-13 forbids truncating above
-`published`, which never exceeds what the bucket proves. Everything the dead incarnation
-uploaded is still in a local segment. S3 raises the floor; the local WAL is what stops it
-being lowered.
-
-Both listings now run, and the proof is a plausible regression rather than a hypothetical
-one: making `InstallBase` *set* rather than raise fails the short-listing arm while the
-honest arm still passes — which is the argument for the second arm existing.
-
-Two things came out of it beyond the ADR: **DEV-0014** (below), and a real race in the
-harness — `simListener.Close` guarded a channel close with a `select`/`default`, which is
-not a guard, and paniced under `-race` the first time a scenario ran two managers in one
-simulation. Now a `sync.Once`.
-
-## The guest lane in CI: QEMU is the input that is still missing
-
-The kernel is solved (ADR-0022) and `task test:integration` no longer dies where QEMU is
-absent, so the remaining reason CI cannot run the guest lane is QEMU itself, and it is
-**not** the same problem the kernel had. `qemu.yml` already publishes both a runtime
-image and the extracted binaries, so obtaining them is easy; the difficulty is that the
-binaries are dynamically linked against what the runtime image provides
-(`libglib2.0-0`, `libpixman-1-0`, `libcap-ng0`, `libseccomp2`, `libaio1`, `liburing2`,
-`zlib1g` — the `runtime` stage of `Dockerfile.qemu`). Extracting them onto a bare runner
-and executing them is therefore not enough.
-
-Two shapes, and the choice has not been made:
-
-- **Run the lane's tests inside the published runtime image** (Go toolchain added to it).
-  One definition of the dependency set, which stays in `Dockerfile.qemu` where it
-  already is.
-- **Install the runtime libraries on the runner** and use `_output` as today. Smaller
-  change, but the list above then exists in two places and drifts silently — the failure
-  being a QEMU that will not start, in a lane whose whole purpose is to tell us something
-  else.
-
-Nothing here is a blocker for the keystone: the lane runs on a developer machine, which
-is where it has always run.
-
-## The hole: truncation makes a restart serve zeros
-
-`Log.view` — the read view a guest is answered from — is rebuilt **only from local
-segments**, and `TruncateLocal` unlinks exactly those. `view` is unexported and assigned
-in one place (`NewLogAfter`); there is no setter, so `recovery.Recover` and
-`materialize.From*` produce precisely the right object and **nothing can install it**.
-
-Today this is latent, because nothing calls `TruncateLocal` in a running system. It stops
-being latent the moment a durability scheduler exists: **a restart would then silently
-serve zeros for every truncated range, with no error anywhere.** None of the nine
-`Resume` tests truncates first, which is why the suite is green.
-
-**Closed 2026-08-01, Agent included.** What an Agent restart used to do, measured: write, FLUSH
-(object verified in the store), restart the Agent, read the same offset → **zeros,
-silently**. The object is in the store and the segment is on disk; the Agent looks at
-neither. The next *write* then fails loudly — `wal` refuses a fresh log over a directory
-that already holds unreplayed segments — so **nothing is overwritten and no committed
-data is destroyed**, but the volume is unusable until someone resumes it, and the read
-that came first was a silent lie.
-
-A layered
-`cow.IntervalMap` gives the read view a base, `wal.ResumeAwaitingBase` installs one
-lazily, and a read with no base fails with `ErrBaseUnavailable` instead of answering
-zeros. and the Agent now resumes rather than creating whenever the segment directory
-already holds files, recovering the base in the background. A restarted volume reads back
-what was flushed, and refuses to read at all when the base cannot be rebuilt. See
-`VIEW-ADOPTION-SPEC.md`.
-
-**Reproduced 2026-08-01**, and it behaves exactly as described: six segments, flush,
-publish, truncate (five files unlinked), restart — and `Read` at offset 0 returns zeros
-where `0xAB` was written, ACKed durable and verified in the store. No error, no degraded
-flag, no log line. **`VIEW-ADOPTION-SPEC.md`** carries the reproduction and the four
-decisions the fix needs; it is a durability *and* format review zone, so it waits for a
-human. Note it did not reproduce on the first attempt: `reclaim` unlinks only *sealed*
-segments, so a test must use a small `SegmentBytes` and assert a file actually
-disappeared — which is how nine tests missed it.
-
-**Consequence for the build order: the checkpoint/truncate increment must not merge
-without the view-adoption increment** (`BUILD-INVENTORY.md`, increments 3 and 5).
+What is still true is narrower, and it is the same caveat as everywhere else on this
+page: **no CI workflow has ever executed**, because `origin` is a local bare repo. The
+job is written and reviewed, not observed.
 
 ## ~~DEV-0007~~ — the spine's second half *(the chain closed 2026-08-02)*
 
@@ -675,204 +488,70 @@ segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
 
-## ~~DEV-0018~~ — the Linux guest lane, and the hang it found *(resolved 2026-08-02)*
+## ~~DEV-0019~~ — a restarted encrypted volume served its guest ciphertext *(resolved 2026-08-02)*
 
-**A stop signal, recorded rather than worked around.** Two findings, and the second is
-only visible because of the first.
+**The most serious correctness defect this repository has shipped**, and it survived the
+increment that was supposed to own it. `internal/agent/volume.go`'s `fetchBase` passed a
+literal `nil` `*wal.Encryption` into `recovery.RecoverOver` for a volume whose DEK `start`
+had unwrapped four lines earlier and handed to the WAL. `recovery.ApplyRecord` decrypted
+only `if enc != nil`, so with `nil` it folded the **undecrypted GCM ciphertext** into the
+read view.
 
-**1. Three documents claimed a lane that no test performed.** `STATUS.md` (twice) and
-`BUILD-INVENTORY.md` said increment 7 was mostly done because "a Linux guest boots the
-lane in ~1.1 s under TCG, reports a verdict and powers off". The artefacts are real —
-`task build:guest` builds the initramfs, `task fetch:kernel` pins the kernel, and
-`task guest:verify` asserts both — but **no Go file in the tree referenced either of
-them**. Every test under `integration/vhost` boots a 512-byte boot sector under SeaBIOS,
-which reaches the backend through INT 13h, and INT 13h has no flush verb. So the FLUSH
-those tests observe is one the *test* issued, never one a guest asked for — which is the
-exact gap `integration/guestinit` was written to close.
+Nothing anywhere could notice. `crypto.Seal` returns ciphertext of exactly the
+plaintext's length and stores the GCM tag separately in the record header, so the
+overwrite covered the right extent with the right number of bytes; the plaintext CRC is
+never re-consulted on that path; and every watermark, every object and every existing
+zeros-after-restart check agreed the volume was healthy. With `-kek-file` set, every range
+served from a recovered base was ciphertext handed to the guest as its own data — which is
+everything truncation reclaimed, everything a promoted host inherits (§12.3), and
+everything a clone reads through its parent (§20).
 
-It was found by trying to give CI that lane (ADR-0025) and asking what it would run.
+**Why nothing saw it** is the whole point, and it is the CLAUDE.md table's pattern
+exactly: both halves were covered and neither covered the seam. `internal/dst`'s
+`agent-encrypts-what-leaves-the-host` encrypts but never restarts; its
+`truncated-volume-survives-a-restart` restarts but runs with `keyID 0`, plaintext, and no
+KMS in its deps. The bug lived in the argument one well-tested component passed another.
 
-**2. With the lane written, a real kernel hangs on its first block request.**
-`TestALinuxGuestIssuesFLUSH` boots the pinned kernel with `guestinit` as PID 1. The
-kernel boots, `virtio_blk` registers the device and reports the right capacity — so the
-vhost-user handshake, the memory tables and GET_CONFIG are all correct — and then it
-stops. The last line is always:
+**Fixed on three levels, smallest first:**
 
-```
-virtio_blk virtio0: [vda] 32768 512-byte logical blocks (16.8 MB/16.0 MiB)
-```
+1. `recovery.ApplyRecord` now refuses (`recovery.ErrSealedWithoutKey`) a record carrying
+   `KeyID != 0` when it holds no key. `KeyID 0` is not a key version — it is the on-disk
+   marker for a cleartext payload (§14.1, `wal.ErrUnversionedKey`) — so "sealed record,
+   no key" is a contradiction rather than a mode. This makes the whole class
+   unrepresentable in recovery, in materialization and in any future caller, which is
+   why it was chosen over fixing the two call sites alone.
+2. `Volume` carries its `enc`, and `fetchBase` passes it.
+3. `parentView` re-binds the **same DEK to the parent's id** before materializing it.
+   Passing this volume's `enc` would have been a second bug: a clone inherits the
+   parent's DEK and its version (`controlplane.Clone`) so the chain stays readable, but
+   `crypto.deriveNonce`/`crypto.aad` bind the volume id and `Encryption.Decrypt` opens
+   with its own `VolumeID`, so the clone's binding fails `Open` on every parent record.
 
-No partition scan, no `Freeing unused kernel memory`, no init output, no panic. It sits
-there until the timeout.
+**Proven by** `encrypted-volume-survives-a-restart` (mandatory DST set — encryption *and*
+a restart, the cross that did not exist), `TestPlantedBugRestartServesCiphertext`, whose
+planted arm replays the volume's own sealed objects the pre-fix way and watches
+`DurableRangeChecker` catch it, and two tests in `internal/recovery`. The checker grew a
+second violation shape for this: `ForeignBytesAfterRestart`, because zeros are what a
+*missing* base looks like and this is what a base built *wrongly* looks like.
 
-**The cause, found by comparing the two handshakes.** Instrumenting the message loop and
-diffing what QEMU sends for a SeaBIOS guest against a Linux one showed the whole thing in
-one line: the Linux run has a **second configuration round**. `GET_VRING_BASE` stops the
-queue, and then `SET_FEATURES`, `SET_MEM_TABLE`, `SET_VRING_NUM/BASE/ADDR`, and — the
-important one — a **new `SET_VRING_KICK`** with a fresh eventfd.
+One consequence worth keeping: restarting an Agent **without** `-kek-file` used to be the
+cheapest route to the silent defect and now costs the volume its reads instead
+(`TestRestartWithoutTheKEKRefusesRatherThanAnswering`). One missing flag must not cost a
+guest its data.
 
-That is not reconnection (3.2): the connection never drops. It is what **every real boot
-does** — the firmware brings the device up, boots an OS, and the OS's driver brings it up
-again with its own rings.
+## DEV-0020 — a clone chain deeper than one link cannot be materialized
 
-`queueLoop.ensure` started the loop once (`if q.started { return }`) and kept the first
-kick, so after the hand-off it was parked on a descriptor nothing would ever signal again.
-The second driver's very first request sat in the ring for ever. The backend was healthy
-by every measure it had: ready, ring empty, no error.
+Found while fixing DEV-0019, and **not** fixed with it — it is a different defect and it
+predates that one. `materialize.FromSnapshot` resolves only the objects the parent's
+manifest lists, all under the parent's own volume id, so for `chain_depth > 1` the
+grandparent's extents are never fetched. A clone of a clone reads its grandparent's
+ranges as whatever the base underneath says — today, nothing.
 
-Every test in `internal/vhost` passed because the fake front-end configured the device
-**once**. `TestAReinitialisedDeviceIsStillServed` is that sequence — captured from the
-real QEMU trace — and it reproduces the hang in two seconds instead of ten minutes.
-
-**Fixed** by `ensure` restarting the loop when `dev.Kick()` is a descriptor other than the
-one it is parked on. `TestALinuxGuestIssuesFLUSH` now passes in ~1.3 s: a real Linux
-kernel's `fsync` makes a record durable in a verified object.
-
-**One real fix already landed on the way:** the initramfs is built by an unprivileged
-`cpio` and therefore contains no device nodes, so the kernel could not open an initial
-console and handed PID 1 **no stdio at all** — every line `guestinit` printed went to a
-closed descriptor. It now mounts devtmpfs and opens `/dev/console` explicitly. That was
-masking the hang as silence.
-
-The skip is gone with the fix, which is the only thing that should ever have removed it.
-
-## ~~DEV-0017~~ — the Agent wrote its WAL one level below where it was told *(resolved 2026-08-02)*
-
-Found while scoping the DEV-0014 lock to a directory, which forced the question of what
-`VolumeManagerConfig.DataDir` is a path *relative to*.
-
-`cmd/volume-agent` roots its `real.Disk` at `--data-dir` — that is what keeps the Agent
-from writing outside it — and then passed the same absolute path as `DataDir`. Since
-`DataDir` is a path inside the Disk's namespace, every name was resolved twice: the WAL
-landed under **`<data-dir>/<data-dir>/wal/<volume-id>/<epoch>`**.
-
-Not data loss, and not even inconsistent — a restart reproduces the same path and finds
-its own segments. What it breaks is everything outside the process: an operator looking in
-`--data-dir` finds nothing, and any tooling that inspects the WAL is looking at an empty
-directory next to a `/tmp/...` tree nested inside it.
-
-**Nothing in-process could have seen it.** Every unit test and the whole DST harness hand
-the manager a Disk spanning a full filesystem, where the two paths agree and the bug
-cancels out. It took the e2e lane, where the Disk is rooted the way production roots it.
-
-Fixed by passing `DataDir: "."` from the binary, with the convention now stated on the
-field. `TestTheAgentWritesWhereItWasTold` asserts the doubled directory does not exist,
-using the lock file as its witness because it is created at start-up — a WAL directory
-would only appear on the first guest append.
-
-## ~~DEV-0016~~ — the entire build-tagged surface was never linted *(resolved 2026-08-02)*
-
-`task lint` ran `golangci-lint run ./...` with **no build tags**, so golangci-lint never
-parsed a single file under `integration/` or `internal/testinfra`. The lanes that drive
-QEMU, Postgres and RustFS — and now the binaries — were invisible to the gate that is
-supposed to check them. Found while writing the e2e lane, when its own files turned out
-not to be linted either.
-
-Worth being precise about what this did *not* mean: the DEV-0013 fixture proves the
-`simulable` analyzer flags a host-side package under `integration/`, and that analyzer
-runs over the whole tree (`lint:simulable`, no tags needed for its own traversal). What
-was missing was golangci-lint's layer — forbidigo, depguard, staticcheck — on tagged
-files.
-
-**Fixed by running with `--build-tags integration,e2e`**, which then surfaced 9 real
-findings, all of one shape: **build-tagged test harnesses drive the real world, which is
-why they exist.** There is no clock to inject into another *process*, and a harness that
-waited on a simulated one would measure nothing. INV-01 governs production code, and none
-of this is linked into a shipped binary — every file carries a build tag.
-
-The exemption is by path and **narrow, with the narrowness checked rather than asserted**:
-it matches `integration/**/*_test.go` and `internal/testinfra/`, so an ordinary
-(non-`_test.go`) file under `integration/` is still flagged — verified by planting a
-`time.Now()` in one and watching forbidigo reject it. Unit tests everywhere else stay
-governed, because a `time.Now()` there is precisely how simulable code gets bypassed.
-
-One staticcheck finding was real and is excluded with its reason: `manager.Uploader` is
-deprecated in favour of a package this SDK version does not have, and §6.1 needs a
-multipart upload to prove an ETag is not a checksum.
-
-## ~~DEV-0015~~ — the descriptor had no integrity check *(resolved 2026-08-02)*
-
-Found while writing the property test increment 6 owed (`descriptor_property_test.go`).
-Everything else that leaves the host is self-verifying: WAL records carry a CRC32C of
-the *plaintext* plus a GCM tag (§14.1), objects are verified after upload (INV-07), and
-key material is an AEAD ciphertext whose version is bound as additional authenticated
-data. `volumes/<vol>/descriptor.json` is plain JSON with nothing over it.
-
-Truncation is caught — the test proves it at every byte, because JSON without its
-closing brace does not decode. **A flipped bit inside a number is not.** Change a digit
-in `size_bytes` and the object still decodes, into a different, perfectly valid
-descriptor; §22.5's rebuild-metadata would then recreate the volume at the wrong size.
-
-The blast radius is smaller than it first looks, and worth writing down precisely:
-
-- `dek_wrapped` and `dek_key_id` are **self-detecting** — corrupting either makes the
-  unwrap fail (`ErrUnwrap`), which the property test asserts on both fields.
-- `current_epoch` is not authoritative here; the epoch object is (§12.4).
-- What is left exposed is `size_bytes`, `block_size` and `chain_depth`, and only on the
-  rebuild path — a live volume never reads its own descriptor for those.
-
-**Closed by `DESCRIPTOR-DIGEST-SPEC.md`.** The stored object is now
-`<64 hex chars>\n<json>`: a SHA-256 over the bytes as stored, verified before anything is
-decoded. Bare JSON — the old shape — is refused with the same error as a corrupt object,
-because nothing is deployed and a lenient branch would leave the hole open permanently for
-a volume that does not exist.
-
-**The first design was wrong and the property test broke it on its first run**, which is
-the part worth keeping. The spec said: a `digest` field inside the JSON, recomputed from
-the decoded struct. Byte 2 of the object is the `v` of `"volume_id"`; flip one bit and it
-reads `"Volume_id"`, Go's decoder **matches field names case-insensitively**, the struct
-decodes identically, and re-marshalling reproduces the original digest exactly. The same
-hole swallows unknown fields, duplicate keys, whitespace and numeric spellings — a hash
-over a *re-encoding* sees only what the decoder did not normalise away. The digest has to
-be over the bytes, and outside them.
-
-## ~~DEV-0014~~ — two Agents could share one `--data-dir` *(resolved 2026-08-02)*
-
-Found while writing **ADR-0024** (a restarted writer re-attaches at the same epoch). The
-ADR is safe for the case it covers — the previous process is *gone* — and rests on four
-mechanisms that all concern what is in S3. None of them touches the case where the
-previous process is still alive.
-
-Start a second `volume-agent` against the same `--data-dir` (an operator, a supervisor
-restarting one that never actually died) and both incarnations resume the **same segment
-directory** at the same epoch, both appending through `disk.Open` (read + append), both
-numbering from the same resumed point. That is local corruption of the WAL, upstream of
-every invariant that watches the bucket.
-
-**Nothing detects it, and one thing actively hides it.** `hostio.Listen` unlinks a stale
-socket before binding — right for the crash case, and it means the second incarnation
-**silently steals the socket** instead of failing with `EADDRINUSE`. The first Agent keeps
-its open fds and its log; the guest follows the socket to the second.
-
-**It is not a consequence of ADR-0024 and predates it**: bumping the epoch would only have
-helped if the second incarnation went through the Control Plane, which is exactly what a
-stale supervisor restart does not do. This is **mutual exclusion on the data directory**,
-not an epoch policy, and the fix is an exclusive lock taken at start-up — the one thing
-that fails closed regardless of how the second process got there. It needs a lock
-primitive in `simio/disk` (INV-01: a lock is a syscall), which is why it is recorded
-rather than fixed in passing.
-
-**Closed by `DATA-DIR-LOCK-SPEC.md`.** `disk.Disk` gained `Lock(name) (io.Closer, error)`
-with `ErrLocked` — `unix.Flock(LOCK_EX|LOCK_NB)` in `real`, a set on the Disk in `sim`,
-one contract test over both — and `NewVolumeManager` claims `<data-dir>/agent.lock` for
-its lifetime.
-
-The lock lives in the manager and not in `main` deliberately: the manager owns `DataDir`,
-and a step left to `main` is a step spin's runner will not inherit when ADR-0021 lifts the
-manager across — which is precisely how `HostID` went missing until an e2e lane read the
-log line about it.
-
-Non-blocking, so the second Agent exits with a message naming the directory instead of
-hanging silently. No pid file and no liveness check: the kernel already answers "is that
-process alive?", and every hand-rolled version has the read-pid/reuse-pid race. And
-because the lock belongs to the open file description, a `kill -9` releases it — so
-ADR-0024's re-attach still works on the very next start, which a lock needing explicit
-release would have broken.
-
-Two things fell out of it. The contract test caught the two implementations disagreeing
-about a second `Close` (`*os.File` returns `ErrClosed`, the sim returned nil) — now
-idempotent in both, because a contract answered differently by the two Disks is one
-nothing can rely on. And **DEV-0017**, below.
+Unrelated to encryption: the same hole is there for a plaintext volume. It becomes
+reachable the moment anything creates a clone of a clone; `controlplane.Clone` already
+increments `ChainDepth` past 1 without complaint. §19/§20 need to say whether a chain is
+walked at materialization or flattened at clone time before this is implemented, so it
+is recorded here rather than decided in code.
 
 ## DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads
 
@@ -899,11 +578,109 @@ consistent LIST stays a precondition, certified per backend by `TestListSeesAFre
 (§6.1, blocking). **Waits on Phase 12's segment format**, which is born with a per-volume
 index readable by deterministic key.
 
+## Removed 2026-08-02: `cow.ActiveMap`
+
+87 lines and their test, plus the `github.com/RoaringBitmap/roaring/v2` dependency they
+were the only reason for (and two transitive ones with it). `ActiveMap`, `SegmentIndex`,
+`SegmentRange`, `Location`/`LocationKind` and the `SegmentSize` constant had **no user
+outside their own two files** — every path in the tree uses `cow.IntervalMap`. The same
+category as `CloneCrossHost`: tested, plausible, and called by nothing.
+
+One fact left with it, so a future reader can find it: `SegmentSize` was where §4/§13.1's
+**64 KiB CoW granularity** appeared in code. It survives in
+`arquitectura_mvp_volumenes_remotos_v5.md` and in `REFERENCE.md`'s §13.1 row, and
+`OBJECTIZATION-SPEC.md` already plans a different value (128 MiB) and a different
+structure — so the constant was not just unused, it was a value nothing intends to keep.
+
+Production coverage 90.7% → 90.6%; the file was at 100%, so removing it lowers the
+average slightly. That is the floor working as intended rather than a regression.
+
+## Clean shutdown is observed, since 2026-08-02
+
+`integration/e2e`'s `TestBothBinariesShutDownCleanly` sends SIGINT to each binary and
+asserts it exits within the timeout, exits zero, and prints its parting line. Before it,
+`testinfra.Process.Stop` had **no caller in the tree** — every lane either waited for a
+process that exits on its own or SIGKILLed one — so `signal.NotifyContext`, the Control
+Plane's `-shutdown-grace` and the Agent's `defer volumes.Close()` were code nothing had
+asked to run.
+
+**Worth recording, because it is the second time this exact mistake was made in this
+repository:** the test first asserted that a second Agent could claim the `--data-dir`
+afterwards, on the reasoning that this proved `volumes.Close()` had run. It proves
+nothing — the kernel releases a flock when a process exits, however it exits — and the
+assertion passed with `defer volumes.Close()` deleted. Planting the bug is what found it.
+The assertion that survives is the one a supervisor can actually tell apart, and its own
+plant (dropping `os.Interrupt` from `NotifyContext`, which is the bug the Control Plane
+really had) turns the lane red.
+
+## The ADRs, trimmed 2026-08-02: 25 → 21
+
+CLAUDE.md's test is that an ADR is justified only when all three hold — it spans
+components, it contradicts or extends the design doc, and getting it wrong is expensive.
+Four failed it, and all four had drifted besides:
+
+- **ADR-0001 (stack)** — a Phase-0 inventory of Go/Taskfile/golangci, all of it now in
+  `CLAUDE.md`'s Stack section, which is where someone writing code actually looks. It
+  also still recommended roaring bitmaps for an active map that no longer exists.
+- **ADR-0002 (parallel tracks)** — a *process* decision: a Planner role scheduling
+  parallel increment tracks against a hot-zone list, citing a `PLAN.md` deleted on
+  2026-07-26. This repository does not run that process. RISK-09 went with it.
+- **ADR-0004 (filesystem object store for Phase 01)** — a staging decision, explicitly
+  superseded by ADR-0010 when the S3 subsystem landed. The situation it describes is
+  over.
+- **ADR-0006 (sqlc + TestContainers)** — the rule itself is in `CLAUDE.md`'s SQL
+  section. The one thing that was *only* here — why `metadata.Store` has two
+  implementations, and why one real PostgreSQL for both is impossible — moved to a
+  comment on the interface in `internal/metadata/metadata.go`, which is where the
+  decision is made.
+
+The citations were removed *before* the files, in one pass across code, `Taskfile.yml`,
+`.github/workflows/ci.yml`, `CLAUDE.md`, `api/buf.gen.yaml` and the surviving ADRs, so
+no window existed where the tree cited a document that was not there. Verified by
+`comm` against `REFERENCE.md`: every ADR the code cites resolves, and every ADR file has
+a row.
+
+**ADR-0013 is deliberately untouched** and remains the open question under "Decisions
+waiting on a human".
+
+## Components with no production caller
+
+CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
+and `CloneCrossHost` was deleted for exactly it. These are the remaining ones. They are
+listed here, in the file that tracks state, because until now each was recorded only
+inside the spec or ADR that built it — which is how a thing stays "done" while nothing
+calls it.
+
+- **`internal/snapshot` has no production caller.** `NewSnapshotter`/`Snapshotter.Create`
+  are reached only from `internal/dst` and unit tests; no binary and no lane creates a
+  snapshot. This is the honest state of phase 09, and it was written down only in
+  `SNAPSHOT-LIFECYCLE-SPEC.md`.
+- **INV-17 has no path through the real Agent.** `VolumeManagerDeps.IOClass` is set by
+  nothing outside `internal/agent/durability_internal_test.go`, and
+  `ioclass.Scheduler.Begin`/`End` have no production caller at all — so even with a
+  scheduler injected, `HighActive()` would be 0 and the background budget would never
+  see a foreground request to yield to. The invariant is enforced against a condition
+  nothing can produce. **Deciding between marking the data path and deleting the field
+  with its gate is a durability-zone change** and gets its own increment.
+- **`controlplane.Promoter`/`BumpVolumeEpoch` are not wired into any binary.**
+  `NewPromoter` appears only in tests and DST. ADR-0024 already says so; this file did
+  not. Failover therefore exists as a model, and nothing an operator can run performs it.
+
 ## Decisions waiting on a human
 
 - **ADR-0013 (device pressure) is still `Proposed`.** It carries DEV-0011 and the
-  `SetLimits` the segment code has no way to receive today.
+  `SetLimits` the segment code has no way to receive today. Note the gap this leaves: 32
+  citations across 19 non-test files treat it as decided, and its WAL segment format has
+  landed. Either the review happened and the ADR should say so, or it did not.
+- **The review-zone specs have no commit that precedes their implementation.** Five
+  increments in a human-review zone (fencing, keys/format, on-S3 format ×3) have their
+  `*-SPEC.md` landing in the same commit as the code it was supposed to gate. That is not
+  proof the review did not happen — a commit records when a file entered the tree, not
+  when a person read it — but the evidence CLAUDE.md's review-zone rule asks for is not
+  in git, and only a human can say which it was.
 - **DEV-0012**, above.
+- **DEV-0020**, above: whether a clone chain is walked at materialization or flattened at
+  clone time is a §19/§20 question, not an implementation detail.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
 
 ---

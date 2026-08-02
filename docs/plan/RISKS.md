@@ -44,7 +44,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
   chrony monitored, alert at 500 ms; hosts over `max_clock_skew` ineligible for
   promotion; DST injects drift beyond the bound and asserts the only effect is waiting
   longer, never losing writes (INV-11).
-- Status: open (Phase 07 shipped the model; the mitigation is not complete — fencing is fail-open and promotion is not atomic, DEV-0004).
+- Status: open. **Not for the reason this line used to give.** It cited DEV-0004 (fail-open fencing, non-atomic promotion), which `REFERENCE.md` records as resolved at `6d5655e`/`f9f5885` — fencing fails closed and promotion is resumable. What keeps it open is that all of it is *modelled*: the drift injection lives in DST against a simulated clock, and no host has ever been observed crossing `max_clock_skew` with chrony running. Closes on a measurement, not on code.
 
 ### RISK-04 — Cold cross-host materialization RTO
 - Source: §29.4
@@ -71,7 +71,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Mitigation: VMs keep serving non-durable I/O; reconciliation makes catch-up trivial;
   PITR + `rebuild-metadata` cover blip-to-total-loss; verified CP term removes
   split-brain (INV-10, §7).
-- Status: open (rebuild-metadata reconstructs volume rows only — DEV-0009).
+- Status: open. The cited reason is stale: DEV-0009 (`rebuild-metadata` rebuilt volumes only) is resolved at `2b09d1e`, and the rebuild now covers the snapshot catalog too. What remains uncovered is the rest of the row set a Control Plane needs to resume — hosts, leases and operations are not reconstructed from S3, so a total PG loss still leaves placement and fencing state to be re-established by hand. Closes when the rehearsal in the trigger has actually been run.
 
 ### RISK-07 — Added complexity (implementation surface) of v5
 - Source: §29.7 (honest self-assessment)
@@ -89,17 +89,14 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Mitigation: strict ordering + DST/fault injection at each step + never truncate above
   a verified `published_sequence` + GC-cannot-permanently-delete as the final net
   (INV-13, INV-14).
-- Status: open (Phase 10 shipped a GC that computes candidate keys but does not mark, and the store still exposes permanent deletion — DEV-0006).
+- Status: open. DEV-0006 is resolved at `cd17e0b`: the GC marks reversibly and the store no longer exposes permanent deletion. The ordering property is proven in DST with a planted bug. It stays open because the final net has only ever been tested against *simulated* faults — no real backend has been made to lose a listing or reorder a delete mid-sweep, and §6.1's conformance suite does not cover a sweep.
 
-## Planning / execution risks (from this plan)
+## Planning / execution risks
 
-### RISK-09 — Hot-zone contention under parallel tracks
-- Source: ADR-0002, PLAN §3 stop signals
-- Owner: Planner
-- Trigger: two in-flight increments scheduled against the same hot zone.
-- Mitigation: Planner-owned hot-zone list, single-writer serialization; conflict is a
-  stop signal that halts the increment.
-- Status: open (managed continuously).
+> RISK-09 (hot-zone contention under parallel tracks) was removed on 2026-08-02 with
+> ADR-0002. It was a risk of a *process* — a Planner role scheduling parallel increment
+> tracks against a hot-zone list — and this repository does not run that process. A risk
+> nobody owns is worse than no entry, because it reads as watched.
 
 ### RISK-10 — QEMU 11.0.2 inflight-shmfd behavior unverified
 - Source: §16, §27 note, roadmap §30.3
@@ -133,12 +130,19 @@ What it proved:
   the boot signature; the boot sector then read LBA 1 and wrote it to LBA 64 via INT 13h
   (AH=42h/43h), and the bytes are asserted on the backend side. A planted bug that makes
   `RawFile.ReadAt` return zeros turns the lane red.
-- **FLUSH is *not* covered by this lane.** SeaBIOS's INT 13h has no flush verb, so no
-  real guest here issues one. FLUSH is covered by the unit tests against the simulated
-  front-end and by `hostio.RawFile`'s own tests. Proving it from a real guest needs a
-  Linux kernel: `-kernel` direct boot is not available because the firmware blobs
-  `task build:qemu` extracts do not include `linuxboot_dma.bin`, and this sandbox has no
-  readable kernel image. **Open gap, not a verified property.**
+- **FLUSH is not covered by *this* lane** — SeaBIOS's INT 13h has no flush verb, so the
+  boot-sector lane never issues one. **A separate lane does cover it, since 2026-08-02**:
+  `TestALinuxGuestIssuesFLUSH` boots the pinned Linux kernel and a real `fsync(2)`
+  becomes a verified object, and `TestAGuestSurvivesCheckpointAndTruncation` carries it
+  through a checkpoint, a truncation and a reboot.
+
+  **The reason recorded here for why that was impossible was wrong, and is corrected in
+  place rather than deleted** — a wrong reason that is merely removed gets rediscovered.
+  It said `-kernel` direct boot needed `linuxboot_dma.bin`, which `task build:qemu` does
+  not extract. It does not extract it, and it does not matter: the kernel is an ELF with
+  Xen PVH notes and QEMU enters it through `pvh.bin`, which was being extracted all
+  along. Proven by booting with `linuxboot_dma.bin` deleted. The only real blocker was
+  that no kernel image existed, which ADR-0022 fixed.
 
 Measurements worth keeping, all of them things the specification did not say:
 
