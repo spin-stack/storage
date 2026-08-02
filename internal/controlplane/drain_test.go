@@ -321,6 +321,13 @@ func (w *drainWorld) reconcile(t *testing.T, hostID, operationID string) (contro
 // destination at a bumped epoch, the source is fenced first (INV-10/INV-11), the
 // materialized prefix covers what the source ACKed (INV-09), an epoch-boundary
 // recovery point is written (INV-12), and capacity follows the volume (§28.2).
+// leaseOK is a lease that is always valid: these tests are about the drain, not about
+// fencing, and a Log in remote mode refuses every durable ACK without one. It moved here
+// from crosshost_test.go when that file was deleted (DEV-0007).
+type leaseOK struct{}
+
+func (leaseOK) Valid() bool { return true }
+
 func TestDrainMovesEveryVolumeFenced(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)

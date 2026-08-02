@@ -171,7 +171,7 @@ on real hardware. Those are the phases below, and they start after the slice wor
 | 08 recovery (S3 authority) + rebuild-metadata | **model** | Objects are validated before they count as durable; the rebuild includes the snapshot catalog. |
 | 09 snapshots + clone + resize | **partial model** | The clone chain is persisted and a clone reads through its parent (DST arm + planted bug). Sealing is still synchronous (DEV-0007). |
 | 10 objectization + checkpoints + GC + I/O classes | **partial model** | The GC marks reversibly; there are still no segment objects (DEV-0007). |
-| 11 cross-host + cordon/drain + capacity | **partial model** | The drain is idempotent across crash boundaries; the materialized view is still not persisted (DEV-0007). |
+| 11 cross-host + cordon/drain + capacity | **partial model** | The drain is idempotent across crash boundaries. `CloneCrossHost` is gone: the destination Agent builds its own view now (DEV-0007). The drain's bulk pass still materializes on the Control Plane. |
 | 12 warm standby + compaction + flatten | **not started** | Born with the by-key index ADR-0012 and ADR-0014 both need. |
 | 13 hardening | **13.1 model** | Typed lifecycles (ADR-0009). 13.2 (real-hardware fault injection + measured runbooks), 13.3 (backend conformance per version) and 13.4 (**INV-19**, the last pending invariant) need infra. |
 
@@ -586,13 +586,34 @@ Two tests had to learn the ordering that used to apply only to resumed volumes: 
 checkpoint is declined while the base is pending (ADR-0023's false-witness guard), so a
 read comes first. A real Agent satisfies that by itself, because the guest reads.
 
-Still untouched, and no longer on this critical path: snapshot sealing is synchronous
-rather than a background lifecycle, objectization publishes no segment objects, and
-cross-host materialization is done **on the Control Plane**, where the bytes land in
-memory nobody reads — `CloneCrossHost` has no production caller, and the drain's bulk pass
-warms the Control Plane rather than the destination. With the chain link in place the
-destination's own Agent now builds its view, so what is left there is deleting work rather
-than adding it, plus §22.4's lazy loading for the cold RTO (RISK-04).
+**`CloneCrossHost` is deleted (2026-08-02).** It materialized the parent snapshot **on the
+Control Plane** and returned the view, which its only caller — its own test — discarded.
+That is the wrong machine: the bytes landed in the Control Plane's memory, warming nothing
+on the destination, and ADR-0021 puts the data path in the Agent. It had no production
+caller at all.
+
+What replaced it is not new code. With the chain link persisted and the base rule fixed,
+the destination's **own Agent** builds its view from the object store — a cloned volume
+through its parent snapshot, a promoted one through the epoch chain. The advisory §28.2
+pre-check went with it: its stated purpose was to refuse before starting a cold
+materialization, and there is no longer one to protect. The authoritative bound is
+unchanged, because it was always a predicate of `CreateVolume`.
+
+Two claims in its tests were about `Clone` rather than about cross-host, and were ported
+rather than dropped: a clone from an **orphan snapshot** (its volume is gone) fails and
+creates nothing, and a **refused clone charges nothing** — ADR-0017's structural claim,
+that the destination is charged when the row naming it exists.
+
+**The drain's bulk pass has the same defect and is deliberately left alone.** It calls
+`FromEpoch` and discards the view, with a comment saying "this is where the cold RTO is
+spent (§22.3)" — but it spends it on the Control Plane. Its final pass is different and
+must stay: it uses `Progress.UpTo` for `guardDurableFloor` and the recovery point, and the
+materialization is the *proof* INV-09 rests on. Changing what that proves is a
+fencing/durability review-zone decision, not a cleanup.
+
+Still untouched: snapshot sealing is synchronous rather than a background lifecycle,
+objectization publishes no segment objects, and §22.4's lazy loading — which is what the
+cold RTO (RISK-04) actually needs — is designed and not implemented.
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 

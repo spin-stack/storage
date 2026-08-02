@@ -204,3 +204,64 @@ func TestACloneIsRebuiltAsAClone(t *testing.T) {
 			got.ParentSnapshotID, snapID)
 	}
 }
+
+// TestCloneFromAnOrphanSnapshotFails: a snapshot whose volume is gone — a catalog
+// half-restored, a manual delete — must not produce a clone that inherits nothing.
+//
+// Ported here when CloneCrossHost was deleted: the claim was always about Clone's own
+// lookups (it reads the snapshot, then the volume it belongs to), and the cross-host
+// wrapper only reached them.
+func TestCloneFromAnOrphanSnapshotFails(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: snapID, VolumeID: "00000000-0000-7000-8000-00000000dead", Epoch: 1,
+		TargetSequence: 1, RootDigest: "d", State: lifecycle.SnapshotPublished, RequestID: reqID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controlplane.Clone(ctx, md, store, term, snapID, cloneVol, cloneHostA, nil); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("clone from an orphan snapshot: want ErrNotFound, got %v", err)
+	}
+	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("a failed clone must not create the volume: %v", err)
+	}
+}
+
+// TestAFailedCloneChargesNothing is ADR-0017's structural claim, kept as its regression
+// guard: the destination is charged when the volume row naming it exists, and a clone
+// that fails never writes one. There is no delta anybody has to remember to reverse.
+func TestAFailedCloneChargesNothing(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	if err := md.UpsertHost(ctx, term, metadata.Host{
+		HostID: cloneHostA, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A bound the clone cannot fit: the write is refused by CreateVolume's own
+	// predicate, which is the authoritative check (§28.2).
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
+		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 1,
+		RootDigest: "d", State: lifecycle.SnapshotPublished, RequestID: reqID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := controlplane.Clone(ctx, md, store, term, snapID, cloneVol, cloneHostA,
+		&metadata.CapacityBound{HostID: cloneHostA, AddBytes: 1 << 30, Limit: 1})
+	if !errors.Is(err, metadata.ErrCapacityExceeded) {
+		t.Fatalf("want ErrCapacityExceeded, got %v", err)
+	}
+	if dst, _ := md.GetHost(ctx, cloneHostA); dst.NVMeCommittedBytes != 0 {
+		t.Fatalf("a refused clone leaked %d committed bytes", dst.NVMeCommittedBytes)
+	}
+	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("a refused clone must not create the volume: %v", err)
+	}
+}

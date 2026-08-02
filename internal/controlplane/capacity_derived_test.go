@@ -120,6 +120,15 @@ func capacityIsDerived(ctx context.Context, md metadata.Store) error {
 // bytes have not been given back. A stored number is then a statement about a world
 // that no longer exists — the source is charged for a volume it does not hold — and
 // every later placement decision is taken against it.
+// destHost and volSize used to live in crosshost_test.go, next to the cross-host clone
+// that was deleted with it (DEV-0007: it materialized on the Control Plane, where the
+// bytes land in memory nobody reads). They belong here now, with the capacity tests that
+// are their only remaining users.
+const (
+	destHost = "00000000-0000-7000-8000-0000000000d2"
+	volSize  = int64(1) << 30
+)
+
 func TestCommittedCapacityIsDerivedFromState(t *testing.T) {
 	ctx := t.Context()
 	w := newDrainWorld(t, 10*volSize)
