@@ -226,6 +226,13 @@ func (p *Process) Stop(t *testing.T, timeout time.Duration) {
 		<-p.done
 		t.Fatalf("%s did not exit within %s of SIGINT; killed", p.Name, timeout)
 	}
+	// A graceful stop that exits non-zero is a failed stop, so the check belongs here
+	// rather than in each caller. This is the half a supervisor sees: it sends the
+	// signal and reads the status, and a daemon that tears down badly is only
+	// distinguishable from one that tears down well by this number.
+	if p.err != nil {
+		t.Fatalf("%s exited badly after SIGINT: %v\n%s", p.Name, p.err, strings.Join(p.Output(), "\n"))
+	}
 	t.Logf("%s: stopped", p.Name)
 }
 
