@@ -41,9 +41,8 @@ tracks state.
   behind a valid lease (§12.6) and the background io-class budget (INV-17), then
   truncates to *published*. **Local WAL is reclaimed for the first time in this
   repository's history** — before it, `published` stayed 0 for the life of the process.
-  **Two things are still open on it:** the DST arm that drives the scheduler (the existing
-  restart arm still truncates by hand), and the planted bug the spec asked for turned out
-  to be unreachable — see below.
+  The DST arm drives the scheduler on every seed. One note below: the planted bug the
+  spec asked for turned out to be unreachable, and this arm uses a different one.
 
 ## Pick up here
 
@@ -209,12 +208,22 @@ every restart. `wal.Log.BasePending` now gates the scheduler, and it is covered 
 in each package. It was a DST run that tripped over it, which is the argument for the arm
 below.
 
-**The DST arm is not done.** Rewriting `scenarioTruncatedVolumeSurvivesARestart` to drive
-the real scheduler instead of truncating by hand was started and reverted: the mandatory
-set passed, but the planted bug (a store that lists nothing) stopped firing and the cause
-was not diagnosed. The arm as committed still truncates by hand, so the scheduler's
-*decision* is covered by unit tests and by nothing simulated. **Finish this before
-increment 4.**
+**~~The DST arm is not done.~~ Done 2026-08-01.**
+`scenarioTruncatedVolumeSurvivesARestart` now drives the real scheduler on every seed:
+after the restarted Agent reads back what truncation reclaimed, it writes again and
+`VolumeManager.Checkpoint` publishes and reclaims behind it.
+
+The first attempt broke the planted bug and the cause is worth keeping, because it is a
+trap the next scenario can fall into: **phase 1's hand truncation is the point of the
+scenario, not scaffolding.** Moving it after the restart left the local segments intact,
+so the resumed Agent replayed them and read the real data back even with an empty base —
+no zeros, no violation, a planted bug that silently proved nothing. The truncation must
+happen *before* the Agent starts, because the on-disk state a restart has to survive is
+the whole premise.
+
+The ordering also matters and is not arbitrary: the checkpoint must come *after* the
+read, because the read is what waits for the base, and a checkpoint taken while the base
+is pending is the false fencing witness above.
 
 **The planted bug the spec asked for does not exist.** It proposed "a scheduler that
 truncates to `durable` rather than `published`". That is unreachable:

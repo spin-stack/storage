@@ -318,6 +318,7 @@ func truncatedVolumeSurvivesARestart(s *Sim, hideObjects bool) error {
 	}
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/spin", SocketDir: "/run/spin", Limits: limits,
+		HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
 	}, agent.VolumeManagerDeps{
 		Clock:   s.Clock,
 		Disk:    s.Disk,
@@ -366,5 +367,42 @@ func truncatedVolumeSurvivesARestart(s *Sim, hideObjects bool) error {
 		return fmt.Errorf("read %x after restart, want %x", got[:8], payload[:8])
 	}
 	s.Notef("the restarted Agent read back what truncation had reclaimed locally")
+
+	// And now the *scheduler* does what phase 1 did by hand: publish a checkpoint and
+	// reclaim what it covers. Phase 1 stays hand-driven on purpose — it is the on-disk
+	// state a restart has to survive, and it must exist before the Agent starts — but
+	// deciding to truncate is the scheduler's job, and until this ran nothing simulated
+	// had ever watched it decide.
+	//
+	// It must come after the read: the read is what waits for the base, and a checkpoint
+	// taken while the base is pending sees durable = 0 against a store that proves more,
+	// which ADR-0023 would read as a second writer. wal.BasePending declines it; this
+	// ordering is what a real Agent does anyway, since the guest reads first.
+	newBytes := bytes.Repeat([]byte{0xCD}, 4096)
+	for i := range 4 {
+		if _, err := dev.WriteAt(newBytes, int64(i)*4096); err != nil {
+			return fmt.Errorf("post-restart write %d: %w", i, err)
+		}
+	}
+	if err := m.Checkpoint(ctx, volumeID); err != nil {
+		return fmt.Errorf("the scheduler could not checkpoint after the restart: %w", err)
+	}
+	w := servedStatus(m, volumeID)
+	s.Emit(Event{Kind: EventTruncate, TruncatedUpTo: uint64(w.PublishedSequence), Published: uint64(w.PublishedSequence)})
+	s.Notef("the scheduler published a checkpoint at sequence %d and reclaimed behind it", w.PublishedSequence)
 	return nil
+}
+
+// servedStatus reads one volume's reported status out of the manager.
+func servedStatus(m *agent.VolumeManager, volumeID string) agent.VolumeStatus {
+	vols, err := m.Volumes(context.Background())
+	if err != nil {
+		return agent.VolumeStatus{}
+	}
+	for _, v := range vols {
+		if v.VolumeID == volumeID {
+			return v
+		}
+	}
+	return agent.VolumeStatus{}
 }
