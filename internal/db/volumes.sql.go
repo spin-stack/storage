@@ -58,8 +58,10 @@ WITH valid AS (
 )
 INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
-                     chain_depth, local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $16::bigint, $9, $10, $11, $12, $13, $14
+                     chain_depth, parent_snapshot_id,
+                     local_sequence, durable_sequence, published_sequence)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, $16::bigint, $9, $10, $11,
+       $17::uuid, $12, $13, $14
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The §28.2 oversubscription bound, as a predicate of the write that places the
   -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
@@ -73,11 +75,11 @@ WHERE EXISTS (SELECT 1 FROM valid)
   -- A bound naming a host nobody registered admits nothing: the view has no row for
   -- it, the scalar subquery is NULL, and a NULL comparison admits no write. The
   -- EXISTS says so explicitly rather than leaving it to be re-derived by the reader.
-  AND ($17::uuid IS NULL
-       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = $17::uuid)
+  AND ($18::uuid IS NULL
+       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = $18::uuid)
            AND (SELECT c.committed_bytes FROM host_committed_bytes c
-                 WHERE c.host_id = $17::uuid)
-               + $18::bigint <= $19::bigint))
+                 WHERE c.host_id = $18::uuid)
+               + $19::bigint <= $20::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       durability = EXCLUDED.durability,
@@ -91,6 +93,9 @@ ON CONFLICT (volume_id) DO UPDATE
       primary_host_id = COALESCE(volumes.primary_host_id, EXCLUDED.primary_host_id),
       standby_host_id = COALESCE(volumes.standby_host_id, EXCLUDED.standby_host_id),
       chain_depth = EXCLUDED.chain_depth,
+      -- Never cleared by a converging write: a clone that lost its parent link reads
+      -- zeros, and rebuild-metadata's re-INSERT must not be able to cause that.
+      parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED.parent_snapshot_id),
       local_sequence = GREATEST(volumes.local_sequence, EXCLUDED.local_sequence),
       durable_sequence = GREATEST(volumes.durable_sequence, EXCLUDED.durable_sequence),
       published_sequence = GREATEST(volumes.published_sequence, EXCLUDED.published_sequence),
@@ -114,6 +119,7 @@ type CreateVolumeParams struct {
 	PublishedSequence int64       `json:"published_sequence"`
 	Term              int64       `json:"term"`
 	DekKeyID          int64       `json:"dek_key_id"`
+	ParentSnapshotID  pgtype.UUID `json:"parent_snapshot_id"`
 	BoundHost         pgtype.UUID `json:"bound_host"`
 	BoundAddBytes     int64       `json:"bound_add_bytes"`
 	BoundLimit        int64       `json:"bound_limit"`
@@ -147,6 +153,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.PublishedSequence,
 		arg.Term,
 		arg.DekKeyID,
+		arg.ParentSnapshotID,
 		arg.BoundHost,
 		arg.BoundAddBytes,
 		arg.BoundLimit,
@@ -158,7 +165,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -176,6 +183,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.ActiveRootID,
 		&i.PublishedRootID,
 		&i.ChainDepth,
+		&i.ParentSnapshotID,
 		&i.DekWrapped,
 		&i.KekID,
 		&i.DekKeyID,
@@ -190,7 +198,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, durability, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -215,6 +223,7 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.ActiveRootID,
 			&i.PublishedRootID,
 			&i.ChainDepth,
+			&i.ParentSnapshotID,
 			&i.DekWrapped,
 			&i.KekID,
 			&i.DekKeyID,

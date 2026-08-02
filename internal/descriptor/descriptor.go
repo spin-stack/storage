@@ -35,6 +35,11 @@ type Descriptor struct {
 	// stays cleartext (§15.3: manifests and descriptors carry no guest data); the
 	// version is not a secret, it is which secret.
 	DEKKeyID uint32 `json:"dek_key_id"`
+	// ParentSnapshotID is the snapshot this volume was cloned from (§20), empty for a
+	// volume that was created rather than cloned. It is here because §22.5's
+	// rebuild-metadata reconstructs volumes from these objects: a clone rebuilt
+	// without its parent link is a clone that reads zeros, with nothing to say why.
+	ParentSnapshotID string `json:"parent_snapshot_id,omitempty"`
 }
 
 // ErrCorruptDescriptor means the stored bytes disagree with their own digest. It is

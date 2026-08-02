@@ -105,6 +105,18 @@ CREATE TABLE volumes (
     active_root_id     UUIDV7,
     published_root_id  UUIDV7,
     chain_depth        INTEGER NOT NULL DEFAULT 0,
+    -- The snapshot this volume was cloned from (§20), or NULL for a volume that was
+    -- created rather than cloned. chain_depth says a chain exists; this says what is
+    -- on the other end of it, which is what a clone's Agent needs to find the objects
+    -- it reads through. Without it a clone starts an empty WAL under its own id, finds
+    -- nothing under that id in the object store, and serves zeros for everything its
+    -- parent ever wrote (DEV-0007).
+    --
+    -- The constraint itself is added below, after snapshots exists: snapshots already
+    -- references volumes, so the pair is circular and one of the two directions has to
+    -- be an ALTER. This one, because volumes is the table that has to exist first for
+    -- anything else to reference it.
+    parent_snapshot_id UUID,
     dek_wrapped        BYTEA NOT NULL,                  -- DEK wrapped with the KEK
     kek_id             TEXT NOT NULL,
     -- The DEK's own version, RecordHeader.KeyID (§15.1). Rotation re-keys new data
@@ -275,6 +287,16 @@ CREATE UNIQUE INDEX operations_one_live_drain_per_host_idx ON operations (host_i
 CREATE INDEX volumes_standby_host_id_idx ON volumes (standby_host_id);
 CREATE INDEX snapshots_volume_id_idx ON snapshots (volume_id);
 CREATE INDEX snapshots_parent_snapshot_id_idx ON snapshots (parent_snapshot_id);
+
+-- The other half of the volumes <-> snapshots cycle (see volumes.parent_snapshot_id).
+ALTER TABLE volumes
+    ADD CONSTRAINT volumes_parent_snapshot_id_fkey
+    FOREIGN KEY (parent_snapshot_id) REFERENCES snapshots(snapshot_id);
+
+-- Every FK *referencing* column carries an index: Postgres indexes only the referenced
+-- side, so a clone lookup by parent would otherwise be a sequential scan, and deleting
+-- a snapshot would take a full scan of volumes to check the constraint.
+CREATE INDEX volumes_parent_snapshot_id_idx ON volumes (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 CREATE INDEX operations_volume_id_idx ON operations (volume_id);
 

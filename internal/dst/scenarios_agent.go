@@ -18,6 +18,7 @@ import (
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/snapshot"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -36,6 +37,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "lapsed-lease-stops-publishing", Run: scenarioLapsedLeaseStopsPublishing},
 		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
 		{Name: "agent-encrypts-what-leaves-the-host", Run: scenarioAgentEncryptsWhatLeavesTheHost},
+		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
 	}
 }
 
@@ -977,6 +979,132 @@ func kmsOrNil(k crypto.KMS, drop bool) crypto.KMS {
 	}
 	return k
 }
+
+// scenarioACloneReadsThroughItsParent is DEV-0007's clone half, at the seam that
+// decides it.
+//
+// §20 says a clone is pure metadata: "a new active child at epoch 1 that reuses the
+// parent snapshot's already-durable objects, with no data copy". Nothing made that true.
+// The clone's Agent started an empty WAL under the *clone's* volume id and recovered
+// against that id, which finds nothing — every object the parent wrote is under the
+// parent's — so the base installed empty and the clone read **zeros for everything its
+// parent ever wrote**. A volume advertised as a copy, delivered blank.
+//
+// The checker is the one that already watches for exactly this: `DurableRangeChecker`
+// reads the bytes a guest would receive, which is the only place "cloned" and "cloned
+// correctly" differ.
+func scenarioACloneReadsThroughItsParent(s *Sim) error {
+	return aCloneReadsThroughItsParent(s, chainLinkCarried)
+}
+
+const (
+	chainLinkCarried = false
+	// chainLinkDropped is the defect this closes: the Control Plane knows the clone's
+	// parent and the desired state does not carry it. Reachable by one missing field,
+	// and the Agent cannot look it up — ADR-0021 keeps it from knowing what a Control
+	// Plane is.
+	chainLinkDropped = true
+)
+
+func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
+	ctx := context.Background()
+	parentID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	cloneID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	pu, err := ids.Parse(parentID)
+	if err != nil {
+		return err
+	}
+	parentVol := [16]byte(pu)
+
+	// The parent writes, flushes, and is snapshotted. Everything the clone will read
+	// lives under the parent's id from here on.
+	payload := bytes.Repeat([]byte{0x77}, 4096)
+	lm := lease.NewManager(s.Clock, time.Minute)
+	lm.Grant()
+	parent := wal.NewLog(s.Disk, "/var/lib/parent/wal", s.Clock, parentVol, 1, wal.Limits{})
+	parent.EnableRemote(wal.NewBatcher(s.Clock, parentVol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 3), leaseAlways{lm})
+	if _, err := parent.Write(0, payload, 0); err != nil {
+		return fmt.Errorf("the parent's write: %w", err)
+	}
+	if err := parent.Flush(ctx); err != nil {
+		return fmt.Errorf("the parent's flush: %w", err)
+	}
+	snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	man, _, err := snapshot.NewSnapshotter(s.Store, s.Clock).Create(ctx, parent, parentVol, 1, snapID, "")
+	if err != nil {
+		return fmt.Errorf("snapshotting the parent: %w", err)
+	}
+	if err := parent.Close(); err != nil {
+		return err
+	}
+	s.Notef("parent %s snapshotted at sequence %d", parentID, man.TargetSequence)
+
+	// The clone: its own volume id, its own empty WAL, and a desired state that names
+	// what it descends from.
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/clone", SocketDir: "/run/spin",
+	}, agent.VolumeManagerDeps{
+		Clock:   s.Clock,
+		Disk:    s.Disk,
+		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper:  simMapper{},
+		EventFD: simEventFD,
+		Store:   s.Store,
+		Lease:   func() bool { return lm.Valid() },
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close() }()
+
+	desired := &storagev1.DesiredVolume{
+		VolumeId: cloneID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		ParentSnapshotId: snapID,
+		ParentVolumeId:   parentID,
+	}
+	if dropLink {
+		desired.ParentSnapshotId, desired.ParentVolumeId = "", ""
+		s.Emit(Event{Kind: EventFault, Msg: "the desired state does not carry the clone's chain link"})
+	}
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{desired}); err != nil {
+		return fmt.Errorf("starting the clone: %w", err)
+	}
+	dev, ok := m.Device(cloneID)
+	if !ok {
+		return errors.New("the clone is not being served")
+	}
+
+	got := make([]byte, len(payload))
+	_, readErr := dev.ReadAt(got, 0)
+
+	// Zeros are the violation and an error is not: refusing to answer is the designed
+	// behaviour when the chain cannot be followed. It is the *silent* wrong answer this
+	// watches for, because a guest cannot tell those zeros from a range nobody wrote.
+	zeros := readErr == nil && bytes.Equal(got, make([]byte, len(got)))
+	s.Emit(Event{Kind: EventDurableRead, Key: cloneID, ZerosAfterRestart: zeros})
+	if zeros {
+		return fmt.Errorf("clone %s read zeros for a range its parent wrote (§20)", cloneID)
+	}
+	if readErr != nil {
+		if dropLink {
+			s.Notef("the read was refused rather than answered: %v", readErr)
+			return nil
+		}
+		return fmt.Errorf("the clone's read: %w", readErr)
+	}
+	if !bytes.Equal(got, payload) {
+		return fmt.Errorf("clone read %x, the parent wrote %x", got[:8], payload[:8])
+	}
+	s.Notef("clone %s read its parent's bytes through the snapshot, with no data copy", cloneID)
+	return nil
+}
+
+// leaseAlways adapts a lease.Manager into the wal.LeaseChecker the Log wants.
+type leaseAlways struct{ m *lease.Manager }
+
+func (l leaseAlways) Valid() bool { return l.m.Valid() }
 
 // servedStatus reads one volume's reported status out of the manager.
 func servedStatus(m *agent.VolumeManager, volumeID string) agent.VolumeStatus {

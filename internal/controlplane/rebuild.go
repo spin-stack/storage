@@ -56,6 +56,7 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 	if err != nil {
 		return res, err
 	}
+	var clones []descriptor.Descriptor
 	for _, id := range ids {
 		cur, err := md.GetVolume(ctx, id)
 		present := err == nil // already there; it may still disagree with S3
@@ -100,6 +101,9 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			// wrong one fails outright. This is the whole reason §22.5's descriptor
 			// carries it rather than only the catalog.
 			DEKKeyID: d.DEKKeyID,
+			// §20's chain. A clone rebuilt without it reads zeros for everything its
+			// parent wrote — the same failure the link exists to prevent, arriving via
+			// a restore instead of a fresh clone.
 			// No §28.2 bound (ADR-0017): rebuild-metadata records volumes that
 			// already exist and already occupy their hosts. A ceiling that refused
 			// to write them would leave the catalog short of reality, which is the
@@ -124,6 +128,27 @@ func RebuildMetadata(ctx context.Context, store objectstore.Store, epochs *epoch
 			return res, err
 		}
 		res.Snapshots += n
+		if d.ParentSnapshotID != "" {
+			clones = append(clones, d)
+		}
+	}
+
+	// The second pass: now that every snapshot row exists, the clones can be linked to
+	// what they descend from (§20). CreateVolume's conflict path converges rather than
+	// duplicating, and it only ever *fills* a NULL parent — so this cannot clear a link
+	// and cannot fail because the row is already there.
+	//
+	// It is a pass rather than an ordering trick because the graph is genuinely
+	// circular: snapshots reference volumes, and a cloned volume references a snapshot.
+	for _, d := range clones {
+		if err := md.CreateVolume(ctx, term, metadata.Volume{
+			VolumeID: d.VolumeID, SizeBytes: d.SizeBytes, Durability: d.Durability,
+			BlockSize: d.BlockSize, State: lifecycle.VolumeDetached, ChainDepth: d.ChainDepth,
+			DEKWrapped: d.DEKWrapped, KEKID: d.KEKID, DEKKeyID: d.DEKKeyID,
+			ParentSnapshotID: d.ParentSnapshotID,
+		}, nil); err != nil {
+			return res, fmt.Errorf("rebuild %s chain link: %w", d.VolumeID, err)
+		}
 	}
 	return res, nil
 }

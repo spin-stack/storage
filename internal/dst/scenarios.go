@@ -622,7 +622,7 @@ func scenarioSameHostCloneIndependent(s *Sim) error {
 	parentObjsBefore, _ := s.Store.List(ctx, "wal/"+pvs+"/")
 
 	// Clone (pure metadata; no data copy) then write to the clone.
-	if _, err := controlplane.Clone(ctx, md, term, m.SnapshotID, cvs, "00000000-0000-7000-8000-0000000000f1", nil); err != nil {
+	if _, err := controlplane.Clone(ctx, md, s.Store, term, m.SnapshotID, cvs, "00000000-0000-7000-8000-0000000000f1", nil); err != nil {
 		return err
 	}
 	clone := wal.NewLog(s.Disk, "wal", s.Clock, cv, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})

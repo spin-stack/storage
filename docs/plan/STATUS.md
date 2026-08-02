@@ -169,7 +169,7 @@ on real hardware. Those are the phases below, and they start after the slice wor
 | 06 remote WAL (batching, idempotent PUT, summary) | **model** | No guest has ever driven a PUT. |
 | 07 Control Plane + leases + fencing | **model**, provisioning integrated | Fail-closed lease, resumable promotion, term guards. **A volume can now be created** (`controlplane.Provisioner`, `control-plane -seed-volume`): row + wrapped DEK + descriptor, verified against Postgres 18. |
 | 08 recovery (S3 authority) + rebuild-metadata | **model** | Objects are validated before they count as durable; the rebuild includes the snapshot catalog. |
-| 09 snapshots + clone + resize | **partial model** | Sealing is synchronous and no chain link is persisted (DEV-0007). |
+| 09 snapshots + clone + resize | **partial model** | The clone chain is persisted and a clone reads through its parent (DST arm + planted bug). Sealing is still synchronous (DEV-0007). |
 | 10 objectization + checkpoints + GC + I/O classes | **partial model** | The GC marks reversibly; there are still no segment objects (DEV-0007). |
 | 11 cross-host + cordon/drain + capacity | **partial model** | The drain is idempotent across crash boundaries; the materialized view is still not persisted (DEV-0007). |
 | 12 warm standby + compaction + flatten | **not started** | Born with the by-key index ADR-0012 and ADR-0014 both need. |
@@ -534,10 +534,39 @@ Two things the writing of it turned up, both about making the test able to fail:
 writing. Doing it in one boot would prove nothing: the data would still be in the page
 cache and in the local WAL.
 
+**The clone's read chain closed 2026-08-02** (`CLONE-CHAIN-SPEC.md`). §20 said a clone
+"reuses the parent snapshot's already-durable objects, with no data copy"; nothing made
+that true. The clone's Agent recovered against the *clone's* volume id, which finds
+nothing — every object the parent wrote is under the parent's — so the base installed
+empty and **the clone read zeros for everything its parent ever wrote**. A volume
+advertised as a copy, delivered blank.
+
+`volumes.parent_snapshot_id` now carries the link, `Clone` sets it, the descriptor carries
+it for §22.5, `DesiredVolume` carries it and the parent's volume id to the Agent (which
+cannot look either up — ADR-0021), and `fetchBase` materializes the parent snapshot and
+layers the clone's own recovery over it.
+
+Four things the implementation turned up:
+
+- **`fetchBase` only ran when a volume was *resuming*.** A clone has no local segments, so
+  the parent view was never fetched at all. It is keyed on `resuming || has a parent` now,
+  and those are genuinely two different reasons to need a base.
+- **`SetBase` after the fact is wrong, and `cow` was right to refuse it.** An unlayered map
+  discards its tombstones as it replays, so giving it a base later would uncover every
+  range the clone was told to DISCARD. The layering has to happen at construction —
+  `recovery.RecoverOver`.
+- **`Clone` wrote no descriptor**, so rebuild-metadata could not see a clone at all. It
+  writes one now, reported-not-rolled-back, exactly as provisioning does.
+- **The rebuild needs two passes.** A clone's parent snapshot belongs to a *different*
+  volume that may not have been rebuilt yet, and the graph is genuinely circular
+  (snapshots reference volumes, a cloned volume references a snapshot). Its test mints the
+  clone's id *first* so the sort order is the one that breaks a single pass — minting the
+  parent first made the test pass for the wrong reason, which is how it was written the
+  first time.
+
 Still untouched, and no longer on this critical path: snapshot sealing is synchronous
-rather than a background lifecycle, clone persists no parent/read-chain link,
-objectization publishes no segment objects, and cross-host materialization returns a view
-the caller discards.
+rather than a background lifecycle, objectization publishes no segment objects, and
+cross-host materialization returns a view the caller discards.
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 

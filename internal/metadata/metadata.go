@@ -252,8 +252,20 @@ type Volume struct {
 	PrimaryHostID string
 	StandbyHostID string
 	ChainDepth    int32
-	DEKWrapped    []byte
-	KEKID         string
+	// ParentSnapshotID is the snapshot this volume was cloned from (§20), empty for a
+	// volume that was created rather than cloned. ChainDepth says a chain exists; this
+	// says what is on the other end of it, which is what the clone's Agent needs to
+	// find the objects it reads through.
+	ParentSnapshotID string
+	// ParentVolumeID is the volume that snapshot belongs to. It is derivable — it is
+	// snapshots.volume_id — and it is carried anyway, because the Agent is a thing that
+	// is *told* (ADR-0021) and cannot perform the second lookup itself. It is not a
+	// column and no store populates it: the one place that needs it — cpserver, when
+	// it builds the desired state — reads it from the snapshot row, so it cannot
+	// disagree with the snapshot it names.
+	ParentVolumeID string
+	DEKWrapped     []byte
+	KEKID          string
 	// DEKKeyID is the DEK's own version — RecordHeader.KeyID (§15.1), the field that
 	// lets rotation re-key new data without re-encrypting history. It travels with
 	// DEKWrapped because a wrapped key and another key's version describe a volume

@@ -332,6 +332,16 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, b
 	if err := metadata.CheckDEKKeyID(v.DEKKeyID); err != nil {
 		return err
 	}
+	// The pg half has a foreign key; this is the same rule where sim can enforce it.
+	// A clone naming a snapshot nobody created is a clone that reads zeros.
+	if v.ParentSnapshotID != "" {
+		s.mu.Lock()
+		_, ok := s.snaps[v.ParentSnapshotID]
+		s.mu.Unlock()
+		if !ok {
+			return fmt.Errorf("%w: parent snapshot %s", metadata.ErrNotFound, v.ParentSnapshotID)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {

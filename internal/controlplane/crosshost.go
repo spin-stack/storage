@@ -8,6 +8,7 @@ import (
 	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/placement"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
 // CrossHostClone is the result of placing a clone on a host that did not have the
@@ -36,8 +37,9 @@ type CrossHostClone struct {
 // because the decision was taken against a fleet read that a drain or another clone
 // may have shared: two clones that both fetch and one that is refused at the write
 // is wasted work, and it is the only shape in which the ceiling cannot be exceeded.
-func CloneCrossHost(ctx context.Context, md metadata.Store, mat *materialize.Materializer,
-	policy placement.Policy, term int64, parentSnapshotID, newVolumeID, destHost string,
+func CloneCrossHost(ctx context.Context, md metadata.Store, store objectstore.Store,
+	mat *materialize.Materializer, policy placement.Policy, term int64,
+	parentSnapshotID, newVolumeID, destHost string,
 ) (CrossHostClone, error) {
 	snap, err := md.GetSnapshot(ctx, parentSnapshotID)
 	if err != nil {
@@ -64,7 +66,7 @@ func CloneCrossHost(ctx context.Context, md metadata.Store, mat *materialize.Mat
 		return CrossHostClone{}, err
 	}
 
-	clone, err := Clone(ctx, md, term, parentSnapshotID, newVolumeID, destHost,
+	clone, err := Clone(ctx, md, store, term, parentSnapshotID, newVolumeID, destHost,
 		&metadata.CapacityBound{HostID: destHost, AddBytes: parent.SizeBytes, Limit: policy.Limit(dest)})
 	if err != nil {
 		return CrossHostClone{}, err

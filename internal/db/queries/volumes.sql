@@ -14,8 +14,10 @@ WITH valid AS (
 )
 INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
-                     chain_depth, local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, sqlc.arg(dek_key_id)::bigint, $9, $10, $11, $12, $13, $14
+                     chain_depth, parent_snapshot_id,
+                     local_sequence, durable_sequence, published_sequence)
+SELECT $1, $2, $3, $4, $5, $6, $7, $8, sqlc.arg(dek_key_id)::bigint, $9, $10, $11,
+       sqlc.narg(parent_snapshot_id)::uuid, $12, $13, $14
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The §28.2 oversubscription bound, as a predicate of the write that places the
   -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
@@ -47,6 +49,9 @@ ON CONFLICT (volume_id) DO UPDATE
       primary_host_id = COALESCE(volumes.primary_host_id, EXCLUDED.primary_host_id),
       standby_host_id = COALESCE(volumes.standby_host_id, EXCLUDED.standby_host_id),
       chain_depth = EXCLUDED.chain_depth,
+      -- Never cleared by a converging write: a clone that lost its parent link reads
+      -- zeros, and rebuild-metadata's re-INSERT must not be able to cause that.
+      parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED.parent_snapshot_id),
       local_sequence = GREATEST(volumes.local_sequence, EXCLUDED.local_sequence),
       durable_sequence = GREATEST(volumes.durable_sequence, EXCLUDED.durable_sequence),
       published_sequence = GREATEST(volumes.published_sequence, EXCLUDED.published_sequence),

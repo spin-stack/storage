@@ -87,3 +87,22 @@ func TestPlantedBugAgentServesAVolumeInTheClear(t *testing.T) {
 		return agentEncryptsWhatLeavesTheHost(s, noKEKOnTheHost)
 	})
 }
+
+// §20's promise — a clone "reuses the parent snapshot's already-durable objects, with no
+// data copy" — was not true of anything. The clone's Agent recovered against the clone's
+// own volume id, which finds nothing, so the base installed empty and the clone read
+// zeros for everything its parent ever wrote (DEV-0007).
+//
+// Planted by dropping the chain link from the desired state, which is the defect exactly:
+// the Control Plane knows what the clone descends from and the Agent is not told. One
+// missing field, and the Agent cannot compensate — ADR-0021 keeps it from knowing what a
+// Control Plane is.
+//
+// The checker is the one that already exists for this shape: it reads the bytes a guest
+// would receive, which is the only place "cloned" and "cloned correctly" differ.
+func TestPlantedBugACloneReadsZeros(t *testing.T) {
+	requirePasses(t, 26, NewDurableRangeChecker(), scenarioACloneReadsThroughItsParent)
+	plantedBug(t, 26, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
+		return aCloneReadsThroughItsParent(s, chainLinkDropped)
+	})
+}

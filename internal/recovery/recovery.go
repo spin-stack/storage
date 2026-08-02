@@ -603,6 +603,17 @@ func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byt
 // volume missing everything written before its last move. It returns the view and the
 // durable sequence of the requested epoch.
 func Recover(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, epoch uint64) (*cow.IntervalMap, uint64, error) {
+	return RecoverOver(ctx, store, enc, volumeID, epoch, nil)
+}
+
+// RecoverOver is Recover with the view layered over base — a clone's own records
+// replayed on top of the parent snapshot it reads through (§20).
+//
+// The layering has to happen *here*, at construction, and not by handing the result to
+// SetBase afterwards: an unlayered map discards its tombstones as it replays, so giving
+// it a base later would uncover every range the clone was told to DISCARD. A nil base
+// gives exactly the map Recover always returned.
+func RecoverOver(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, epoch uint64, base *cow.IntervalMap) (*cow.IntervalMap, uint64, error) {
 	spans, err := EpochChain(ctx, store, volumeID, epoch)
 	if err != nil {
 		return nil, 0, err
@@ -612,7 +623,7 @@ func Recover(ctx context.Context, store objectstore.Store, enc *wal.Encryption, 
 		return nil, 0, err
 	}
 
-	view := cow.NewIntervalMap()
+	view := cow.NewIntervalMapOver(base)
 	for _, span := range spans {
 		upto := durable
 		if span.Epoch != epoch {

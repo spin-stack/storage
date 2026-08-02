@@ -81,7 +81,7 @@ func TestCloneCrossHostMaterializesOnDestination(t *testing.T) {
 	ctx := t.Context()
 	md, term, store, m := crossHostWorld(t)
 
-	res, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+	res, err := controlplane.CloneCrossHost(ctx, md, store, materialize.New(store, nil, nil),
 		clonePolicy, term, m.SnapshotID, cloneVol, destHost)
 	if err != nil {
 		t.Fatalf("cross-host clone: %v", err)
@@ -124,7 +124,7 @@ func TestCloneCrossHostChargesNothingOnFailure(t *testing.T) {
 	if err := store.Delete(ctx, m.Objects[0]); err != nil {
 		t.Fatal(err)
 	}
-	_, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+	_, err := controlplane.CloneCrossHost(ctx, md, store, materialize.New(store, nil, nil),
 		clonePolicy, term, m.SnapshotID, cloneVol, destHost)
 	if !errors.Is(err, materialize.ErrMissingObject) {
 		t.Fatalf("want ErrMissingObject, got %v", err)
@@ -151,7 +151,7 @@ func TestCloneCrossHostFromOrphanSnapshotFails(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+	if _, err := controlplane.CloneCrossHost(ctx, md, store, materialize.New(store, nil, nil),
 		clonePolicy, term, orphanSnap, cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
@@ -166,7 +166,7 @@ func TestCloneCrossHostToUnknownHostFails(t *testing.T) {
 	ctx := t.Context()
 	md, term, store, m := crossHostWorld(t)
 
-	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+	if _, err := controlplane.CloneCrossHost(ctx, md, store, materialize.New(store, nil, nil),
 		clonePolicy, term, m.SnapshotID, cloneVol, "00000000-0000-7000-8000-00000000dead"); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
@@ -181,7 +181,7 @@ func TestCloneCrossHostFromMissingSnapshotFails(t *testing.T) {
 	ctx := t.Context()
 	md, term, store, _ := crossHostWorld(t)
 
-	if _, err := controlplane.CloneCrossHost(ctx, md, materialize.New(store, nil, nil),
+	if _, err := controlplane.CloneCrossHost(ctx, md, store, materialize.New(store, nil, nil),
 		clonePolicy, term, "no-such-snap", cloneVol, destHost); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}

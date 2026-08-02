@@ -80,6 +80,7 @@ type Volume struct {
 	ActiveRootID      pgtype.UUID        `json:"active_root_id"`
 	PublishedRootID   pgtype.UUID        `json:"published_root_id"`
 	ChainDepth        int32              `json:"chain_depth"`
+	ParentSnapshotID  pgtype.UUID        `json:"parent_snapshot_id"`
 	DekWrapped        []byte             `json:"dek_wrapped"`
 	KekID             string             `json:"kek_id"`
 	DekKeyID          int64              `json:"dek_key_id"`

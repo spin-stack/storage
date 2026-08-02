@@ -531,11 +531,25 @@ type DesiredVolume struct {
 	BlockSize int32                  `protobuf:"varint,3,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
 	// epoch is the volume's current epoch (§12.3). Everything the Agent later
 	// reports about this volume is qualified by it.
-	Epoch         int64       `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	State         VolumeState `protobuf:"varint,5,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
-	Durability    Durability  `protobuf:"varint,6,opt,name=durability,proto3,enum=spin.storage.v1.Durability" json:"durability,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Epoch      int64       `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	State      VolumeState `protobuf:"varint,5,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
+	Durability Durability  `protobuf:"varint,6,opt,name=durability,proto3,enum=spin.storage.v1.Durability" json:"durability,omitempty"`
+	// parent_snapshot_id and parent_volume_id name the snapshot this volume was
+	// cloned from (§20), and the volume that snapshot belongs to. Both empty for a
+	// volume that was created rather than cloned.
+	//
+	// They are on the wire because the Agent has to be *told*: ADR-0021 keeps it from
+	// knowing what a Control Plane is, so it cannot look either of them up. Without
+	// them a clone starts an empty WAL under its own id, finds nothing under that id
+	// in the object store, and serves zeros for everything its parent ever wrote —
+	// which is a volume advertised as a copy and delivered blank (DEV-0007).
+	//
+	// The volume id is carried rather than derived for the same reason: it lives on
+	// the snapshot row, which is one lookup the Agent cannot perform.
+	ParentSnapshotId string `protobuf:"bytes,7,opt,name=parent_snapshot_id,json=parentSnapshotId,proto3" json:"parent_snapshot_id,omitempty"`
+	ParentVolumeId   string `protobuf:"bytes,8,opt,name=parent_volume_id,json=parentVolumeId,proto3" json:"parent_volume_id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *DesiredVolume) Reset() {
@@ -608,6 +622,20 @@ func (x *DesiredVolume) GetDurability() Durability {
 		return x.Durability
 	}
 	return Durability_DURABILITY_UNSPECIFIED
+}
+
+func (x *DesiredVolume) GetParentSnapshotId() string {
+	if x != nil {
+		return x.ParentSnapshotId
+	}
+	return ""
+}
+
+func (x *DesiredVolume) GetParentVolumeId() string {
+	if x != nil {
+		return x.ParentVolumeId
+	}
+	return ""
 }
 
 type GetDesiredStateResponse struct {
@@ -1057,7 +1085,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xf1\x01\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xc9\x02\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1068,7 +1096,9 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x12;\n" +
 	"\n" +
 	"durability\x18\x06 \x01(\x0e2\x1b.spin.storage.v1.DurabilityR\n" +
-	"durability\"S\n" +
+	"durability\x12,\n" +
+	"\x12parent_snapshot_id\x18\a \x01(\tR\x10parentSnapshotId\x12(\n" +
+	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +

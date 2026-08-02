@@ -454,6 +454,10 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if err := metadata.CheckDEKKeyID(v.DEKKeyID); err != nil {
 		return err
 	}
+	parentSnap, err := nullUUID("parent snapshot", v.ParentSnapshotID)
+	if err != nil {
+		return err
+	}
 	boundHost, addBytes, limit, err := boundParams(bound)
 	if err != nil {
 		return err
@@ -462,7 +466,8 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability.String(),
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
 		DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
-		PrimaryHostID: primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
+		ParentSnapshotID: parentSnap,
+		PrimaryHostID:    primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence, Term: term,
 		BoundHost: boundHost, BoundAddBytes: addBytes, BoundLimit: limit,
@@ -493,7 +498,8 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes, Durability: durability,
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: state,
 		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
-		ChainDepth: v.ChainDepth, DEKWrapped: v.DekWrapped, KEKID: v.KekID,
+		ChainDepth: v.ChainDepth, ParentSnapshotID: fromNullUUID(v.ParentSnapshotID),
+		DEKWrapped: v.DekWrapped, KEKID: v.KekID,
 		// The column's CHECK bounds it to (0, 2^32), so the narrowing is total —
 		// and it is the same 16-byte-id story as volume_id: BIGINT at the boundary,
 		// the format's own width in the interface.

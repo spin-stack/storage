@@ -118,14 +118,31 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 	}
 	out := make([]*storagev1.DesiredVolume, 0, len(vols))
 	for _, v := range vols {
-		out = append(out, &storagev1.DesiredVolume{
+		d := &storagev1.DesiredVolume{
 			VolumeId:   v.VolumeID,
 			SizeBytes:  v.SizeBytes,
 			BlockSize:  v.BlockSize,
 			Epoch:      v.CurrentEpoch,
 			State:      volumeState(v.State),
 			Durability: durability(v.Durability),
-		})
+		}
+		// A clone reads through its parent's objects (§20), and the Agent cannot look
+		// the chain up itself (ADR-0021). The parent's *volume* id lives on the
+		// snapshot row, so it is read here — one lookup per clone, on a path that
+		// already reads the volume — rather than duplicated into volumes, where it
+		// could disagree with the snapshot it names.
+		if v.ParentSnapshotID != "" {
+			snap, serr := s.md.GetSnapshot(ctx, v.ParentSnapshotID)
+			if serr != nil {
+				// Refused, not degraded: a clone served without its chain reads zeros,
+				// and zeros are indistinguishable from a volume nobody wrote to.
+				return nil, rpcError(fmt.Errorf("cpserver: volume %s names parent snapshot %s: %w",
+					v.VolumeID, v.ParentSnapshotID, serr))
+			}
+			d.ParentSnapshotId = v.ParentSnapshotID
+			d.ParentVolumeId = snap.VolumeID
+		}
+		out = append(out, d)
 	}
 	return connect.NewResponse(&storagev1.GetDesiredStateResponse{Volumes: out}), nil
 }

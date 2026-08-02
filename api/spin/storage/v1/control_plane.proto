@@ -148,6 +148,20 @@ message DesiredVolume {
   int64 epoch = 4;
   VolumeState state = 5;
   Durability durability = 6;
+  // parent_snapshot_id and parent_volume_id name the snapshot this volume was
+  // cloned from (§20), and the volume that snapshot belongs to. Both empty for a
+  // volume that was created rather than cloned.
+  //
+  // They are on the wire because the Agent has to be *told*: ADR-0021 keeps it from
+  // knowing what a Control Plane is, so it cannot look either of them up. Without
+  // them a clone starts an empty WAL under its own id, finds nothing under that id
+  // in the object store, and serves zeros for everything its parent ever wrote —
+  // which is a volume advertised as a copy and delivered blank (DEV-0007).
+  //
+  // The volume id is carried rather than derived for the same reason: it lives on
+  // the snapshot row, which is one lookup the Agent cannot perform.
+  string parent_snapshot_id = 7;
+  string parent_volume_id = 8;
 }
 
 message GetDesiredStateResponse {

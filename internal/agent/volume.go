@@ -13,9 +13,11 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/blockdev"
+	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/ioclass"
+	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
@@ -435,8 +437,14 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	}
 
 	var log *wal.Log
+	// A volume needs a base fetched from the object store in two cases, and they are
+	// not the same case: it is *resuming* (its own objects hold what truncation
+	// reclaimed), or it is a *clone* (its parent's objects hold everything it has not
+	// written itself). A clone has no local segments at all, so keying this on
+	// `resuming` alone left the parent view unfetched and the clone reading zeros.
 	resuming := len(existing) > 0
-	if resuming {
+	needsBase := resuming || d.GetParentSnapshotId() != ""
+	if needsBase {
 		// The durable point is not passed here: it lives in the object store, and
 		// fetching it now would mean a round trip before the volume could be served.
 		// It arrives with the base (see baseFetch below), which is the only moment it
@@ -496,8 +504,8 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	serveCtx, cancel := context.WithCancel(ctx)
 	v.cancel = cancel
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
-	if resuming {
-		go m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()))
+	if needsBase {
+		go m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()), d)
 	}
 	// One line per volume this host starts serving. Everything else the manager logs
 	// is an exception, so an Agent that came up correctly said nothing at all about
@@ -525,7 +533,7 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 // It owes the log exactly one InstallBase or FailBase on every path, which is why there
 // is no early return that skips both. A log that gets neither parks every read for the
 // life of the process.
-func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]byte, epoch uint64) {
+func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]byte, epoch uint64, d *storagev1.DesiredVolume) {
 	if m.deps.Store == nil {
 		// Local-only mode has no object store to recover from, so the local segments
 		// are all there is and they have already been replayed. Nothing to wait for.
@@ -533,7 +541,23 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		return
 	}
 
-	base, durable, err := recovery.Recover(ctx, m.deps.Store, nil, volumeID, epoch)
+	// A clone reads *through* its parent (§20): its own objects are only what it has
+	// written since, and everything else lives under the parent's volume id. The
+	// parent's view goes underneath as the base layer, which is exactly what
+	// increment 5 built cow.IntervalMap's base for — the clone's own extents shadow
+	// it, and a DISCARD in the clone reads as zeros rather than falling through.
+	parent, err := m.parentView(ctx, v, d)
+	if err != nil {
+		// Fail closed, the same rule as a base that cannot be recovered and for the
+		// same reason: an empty view where data belongs is a wrong answer a guest
+		// cannot detect.
+		slog.Error("the clone's parent snapshot could not be materialized; its reads will fail",
+			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
+		v.log.FailBase(err)
+		return
+	}
+
+	base, durable, err := recovery.RecoverOver(ctx, m.deps.Store, nil, volumeID, epoch, parent)
 	if err != nil {
 		// Refuse loudly rather than serve zeros. An empty view where data belongs is
 		// indistinguishable from a fresh volume, which is the failure this whole
@@ -550,7 +574,31 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		return
 	}
 	slog.Info("read view recovered from the object store",
-		"volume_id", v.id, "epoch", v.epoch, "durable_sequence", durable)
+		"volume_id", v.id, "epoch", v.epoch, "durable_sequence", durable,
+		"cloned_from", d.GetParentSnapshotId())
+}
+
+// parentView materializes the snapshot this volume was cloned from, or returns nil for
+// a volume that was created rather than cloned.
+//
+// The ids come from the desired state rather than a lookup: ADR-0021 keeps this type
+// from knowing what a Control Plane is, so the Control Plane is what tells it.
+func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.DesiredVolume) (*cow.IntervalMap, error) {
+	snapID, parentVol := d.GetParentSnapshotId(), d.GetParentVolumeId()
+	if snapID == "" {
+		return nil, nil //nolint:nilnil // no parent is a shape, not a failure
+	}
+	if parentVol == "" {
+		// Half a link is worse than none: it would materialize nothing and install a
+		// base that silently reads as zeros for the parent's whole extent.
+		return nil, fmt.Errorf("agent: volume %s names parent snapshot %s with no parent volume", v.id, snapID)
+	}
+	view, _, err := materialize.New(m.deps.Store, m.deps.IOClass, nil).
+		FromSnapshot(ctx, parentVol, snapID)
+	if err != nil {
+		return nil, fmt.Errorf("agent: materializing parent snapshot %s of volume %s: %w", snapID, parentVol, err)
+	}
+	return view, nil
 }
 
 // supervise runs the vhost server and restarts it when it returns.
