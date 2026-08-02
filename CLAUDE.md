@@ -11,10 +11,47 @@ Engineering conventions for this module. The **design source of truth** is
   references; this resolves any of them in one line without opening another file.
 - **`docs/plan/INVARIANTS.md`** — each invariant, its checker, and where it activated.
 
-Do not re-design against the doc. Any implementation decision that contradicts,
-extends, or interprets it needs an ADR (`docs/plan/DECISIONS/`) before merge; an
-observed doc↔code divergence is a **DEV entry in `STATUS.md`**, and an open one blocks
-the gate.
+Do not re-design against the doc. An observed doc↔code divergence is a **DEV entry in
+`STATUS.md`**, and an open one blocks the gate. When a decision cannot live in the code,
+write it down — but read "Where a decision lives" below first: that is the exception, not
+the habit.
+
+## Build it thin, end to end, before you build it deep
+
+**This is the rule the rest of the file serves, and the one this project has broken most
+often.** The smallest version that a real caller drives, end to end, comes first. Depth —
+another invariant, another checker, another spec — comes after, on top of something that
+already runs.
+
+The evidence is not theoretical. Every one of these was found *after* the component it
+lived in had unit tests, property tests, DST scenarios and an invariant checker:
+
+| Defect | Why nothing saw it |
+|---|---|
+| `cmd/volume-agent` never set `HostID`, so **no real Agent ever ran a durability scheduler** | one field in `main`; every test built the manager itself |
+| `--data-dir` applied twice, so the WAL landed in `<dir>/<dir>/wal/...` | every test hands the manager a Disk spanning a whole filesystem, where the two paths agree |
+| The queue loop never restarted, so **any real Linux guest hung** on its first block request | the fake front-end configured the device once; every real boot configures it twice |
+| A promoted host served **zeros for its predecessor's whole volume** | the rule for "needs a read view" was written from the two cases that had tests |
+| A clone read zeros; a clone had no descriptor | §20's promise was in a doc comment and in nothing else |
+| The two binaries parsed the KEK file differently | nothing had ever run both binaries against one file |
+| Three documents claimed a Linux-guest lane **no test performed** | the artefacts were built and verified; nothing booted them |
+
+The pattern is one thing: **they are all at seams between components**, and a test suite
+that is deep in every component and thin at the seams cannot see any of them. Sophisticated
+machinery around an unwired path does not make the path work — it makes the gap harder to
+notice.
+
+So, in order:
+
+1. **Make the thinnest real path run.** Real binaries, real caller, one volume, no
+   sophistication. If a piece has no caller, it is not done, however well it is tested.
+2. **Assert on what the outside observes** — bytes in the bucket, a socket that exists, a
+   line the process printed, an exit code. Not on a flag the code sets.
+3. **Then deepen**: faults, invariants, checkers, the next case.
+
+A component with no caller is a **liability, not progress**. `CloneCrossHost` was deleted
+for exactly this: 280 lines, fully tested, doing expensive work on the wrong machine, and
+called only by its own test.
 
 ## The gate (definition of done for every increment)
 
@@ -28,7 +65,57 @@ the gate.
 **Stop signals** — halt, record in `STATUS.md`, escalate to a human: a test weakened or
 deleted to make a change pass; a `sleep`/magic timeout/infinite retry instead of a
 simulable interface; code touching durability, fencing or GC with no DST scenario;
-"I did it differently from the doc because it was simpler" with no ADR.
+"I did it differently from the doc because it was simpler" with nothing written down.
+
+## Principles
+
+- Keep it simple. Prefer the smallest solution that completely solves the current problem.
+- Remove obsolete code instead of preserving backward compatibility.
+- Build on working software. Add capabilities incrementally.
+- Keep responsibilities separated. One component, one purpose.
+- Prefer proven libraries over custom implementations.
+- Reuse existing project dependencies before adding new ones.
+
+## Rules
+
+- Do not add abstractions until they solve a real problem.
+- Do not introduce configuration for hypothetical future needs.
+- Do not implement compatibility layers, fallbacks, or migrations unless explicitly required.
+- Do not duplicate functionality already provided by the standard library or project dependencies.
+- Verify a dependency's capabilities before writing custom code.
+
+## Architecture
+
+- Optimize for clarity over cleverness.
+- Design for maintainability, not for speculative flexibility.
+- Every layer must justify its existence.
+- If removing code makes the system simpler without losing functionality, remove it.
+
+## Where a decision lives
+
+**Default: in the code, at the place the decision is made.** A reader hitting the line
+should find the reason there — including the alternative that was rejected and why. That
+is what this codebase's comments are for, and it is why they are long.
+
+There are **25 ADRs and 10 spec documents**, and the code cites them 218 times. That is
+too many, and it is a symptom: a decision that needed a separate file is usually a decision
+that had nowhere natural to live, which means the code was not shaped around it.
+
+Write a **comment** when the decision is about this function, this type, this format field —
+which is nearly always.
+
+Write an **ADR** only when all three hold:
+
+- it spans components, so no single file is its home;
+- it *contradicts or extends* the design doc, so a reader comparing them needs the bridge;
+- and getting it wrong is expensive — data loss, fencing, a format.
+
+Write a **spec before implementing** only inside a human-review zone (below). Everywhere
+else, the increment is the plan.
+
+**Do not write an ADR to record that you thought about something.** If the reasoning fits
+in a comment where the code is, it belongs there — and it will still be true when the ADR
+has been forgotten.
 
 ## Stack
 
@@ -106,6 +193,18 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Tests-first.** Write failing tests / DST scenarios / invariant checkers before the
   implementation. A test that is weakened or deleted to make a change pass is a stop
   signal.
+- **Test the seams, not only the parts.** Every defect this project has shipped lived
+  between two components that were each well covered (see "Build it thin"). `integration/e2e`
+  runs the real binaries as processes; `integration/vhost` boots a real kernel. A change to
+  anything a binary wires up belongs in one of those lanes, not only in a unit test that
+  constructs the type itself.
+- **Assert on what the outside observes.** Objects in the bucket, a socket that exists, a
+  line the process printed, bytes a guest reads back — not on a field the code set. A gate
+  that returns the right error and does the wrong thing satisfies any assertion on `err`.
+- **Prove the test can fail.** Plant the bug and watch it go red. Four assertions in this
+  repository proved nothing until that was done: a checker that never fired, a path
+  assertion that matched by prefix, a clone check whose fixture used the same value the
+  bug hardcoded, and two Agents pointed at the same wrong bucket so they agreed.
 - **Table-driven tests** for any repeated case shape: a `tests := []struct{...}` with a
   `name` and, where behavior varies, a `drive`/`mut func(...)` field, then
   `t.Run(tc.name, ...)`. Adding a case should be one struct literal. Don't force a table
@@ -121,9 +220,9 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Coverage.** `task cover` reports cross-package coverage (measured with
   `-coverpkg=./...`, since Go's default under-counts cross-package exercise) and
   **enforces a 90% floor on production code**. Excluded from that floor: generated
-  (`internal/db`), integration-only (`internal/metadata/pg`), `cmd/` mains, and the
-  `internal/dst` harness. Don't chase unreachable `os`-error branches —
-  that is what the sim models.
+  (`internal/db`), integration-only (`internal/metadata/pg`), `cmd/` mains, `integration/`
+  (the lanes, and `guestinit`, which is PID 1 *inside* the guest), and the `internal/dst`
+  harness. Don't chase unreachable `os`-error branches — that is what the sim models.
 
 ## Go style (Dave Cheney's practical Go)
 
