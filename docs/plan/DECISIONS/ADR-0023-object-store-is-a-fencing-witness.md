@@ -15,7 +15,7 @@ The design says how a writer learns it has been fenced, twice:
   manifests.
 - **From the Control Plane** (§12.3–12.4): a report is refused with `STALE_EPOCH`,
   `NOT_PRIMARY` or `UNKNOWN_VOLUME`, and the data path tears the runtime down
-  (`VolumeManager.Fence`, which resolved DEV-0012).
+  (`VolumeManager.Fence`, which resolved DEV-0012's Agent half).
 
 The durability scheduler (BUILD-INVENTORY increment 3) introduces a third way, and the
 design does not describe it. `checkpoint.Create` can fail with:

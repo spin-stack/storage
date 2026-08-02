@@ -79,7 +79,9 @@ answers):
    `EnableRemote` is now called, so a FLUSH is the §14.4 path.
 2. **Fencing tears the runtime down** — the safe side, throughout: log, socket and device
    all go, so neither reads nor writes are answered and the guest's I/O stalls rather
-   than being served by a host with no authority. **Resolves DEV-0012.** The half that is
+   than being served by a host with no authority. **Resolves DEV-0012's Agent half** — the
+   log's own self-fencing stops the durable path only, which §12.2 permits and
+   `wal.Log`'s `fenced` field now records as the policy. The half that is
    easy to miss: the Control Plane refuses the *report* while `GetDesiredState` may keep
    listing the volume, so a fenced epoch is remembered and only a *higher* epoch — the
    Control Plane granting the volume again — restarts it.
@@ -553,21 +555,38 @@ increments `ChainDepth` past 1 without complaint. §19/§20 need to say whether 
 walked at materialization or flattened at clone time before this is implemented, so it
 is recorded here rather than decided in code.
 
-## DEV-0012 — a self-fenced log still accepts WRITEs and still serves reads
+## ~~DEV-0012~~ — a self-fenced log still accepts WRITEs and still serves reads *(closed 2026-08-02: not a divergence)*
 
-§16 scopes SELF_FENCED to *durable ACKs*, and the code implements exactly that:
-`Log.Flush` refuses once fenced, `Log.Write` never consults the flag and `Log.Read` has
-no gate. So a fenced host keeps consuming device space for writes no FLUSH can cover, and
-can serve a read after another writer was promoted — a split-brain read.
+**Closed by reading the document rather than by changing the code.** §12.2, line 641, says
+a SELF_FENCED Agent *"puede seguir sirviendo reads de su caché mientras QEMU siga
+conectado, **según política**"*. The line **grants** the behaviour and delegates the
+choice. So this was never a doc↔code divergence: it was the policy §12.2 asks for, unwritten.
 
-**No ACKed data is at risk** (INV-06/09/10 all hold: nothing a fenced host writes is ever
-acknowledged durable or published); the exposure is a stale read reaching a guest, plus
-device pressure. **Deliberately not decided in code:** refusing writes or reads *extends*
-§16, which makes it a fencing-zone ADR. The counter-argument is that this is not the
-WAL's job — the **Agent** should tear the device down when the lease lapses, and a log
-that refuses I/O to a guest still attached is the worse failure. Decide before increment
-3.2, since a reconnecting front-end is the first caller that can observe a fenced log
-across a gap.
+It is written now, and in the code rather than here — at `wal.Log`'s `fenced` field, where
+a reader who wonders why `Write` does not consult it will actually be standing. The
+policy, in short: `fenced` stops every *durable* operation and nothing else; nothing a
+fenced host writes is ever ACKed durable or published (INV-06/09/10 hold with `Write`
+ungated, because they are properties of the durable path); the accepted exposure is a
+stale read reaching a guest plus device pressure; and stopping a guest's I/O is the
+*Agent's* job through the Control Plane's refusal, which is the right authority for "you
+no longer own this volume" — a host's own lease clock is not.
+
+**Two fencing triggers, and the distinction is what the record kept losing.** The Control
+Plane refusing a volume's report tears the runtime down — log, socket and device — and
+that is what the keystone closed. The Log self-fencing on its own lease check stops the
+durable path and leaves the runtime up. Five places said "Resolves DEV-0012" without
+saying which half; they now say.
+
+**`Log.Fenced()` has no production caller and, under this policy, should not.** It exists
+as proof — the DST scenarios and the INV-06 unit tests read the transition through it
+rather than through a flag they set themselves — and as the seam a stricter policy would
+consult on the day one is chosen. Recorded here so it is not mistaken for the
+CloneCrossHost pattern on a later sweep.
+
+**What would reopen this:** a guest observing a fenced log *across a reconnection gap*
+(increment 3.2), where the front-end reattaches to a log whose authority has changed
+without the Control Plane having said so. That is the case the original entry was worried
+about, and it is still the one worth watching.
 
 ## Gap 1 — a GC sweep cannot see an anchor its listing has not caught up to
 
@@ -823,7 +842,6 @@ calls it.
   what `wal.Log` consults before ACKing a FLUSH — the durability rule itself — so the
   choice between scheduling it and recording stage 1 as the final answer is not one an
   increment should make on its way past.
-- **DEV-0012**, above.
 - **DEV-0020**, above: whether a clone chain is walked at materialization or flattened at
   clone time is a §19/§20 question, not an implementation detail.
 - **The Phase 04 format review** (human-review zone) has never been signed off.

@@ -722,7 +722,9 @@ func (m *VolumeManager) supervise(ctx context.Context, v *Volume, first vhost.Li
 
 // Fence stops serving the named volumes, because the Control Plane has refused their
 // reports: this host is not their writer anymore — the epoch moved on, the primary
-// changed, or the volume is unknown to the fleet (§12.3, §16). Resolves DEV-0012.
+// changed, or the volume is unknown to the fleet (§12.3, §16). This is the trigger that
+// stops a guest's I/O — the Control Plane's view, not this host's lease clock; the log's
+// own self-fencing stops only the durable path, deliberately (see wal.Log's `fenced`).
 //
 // **It stops reads as well as writes, and it takes the socket with it.** That is the
 // safe side of a choice with no comfortable option. A read of already-written bytes

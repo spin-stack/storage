@@ -68,8 +68,14 @@ TTL change does not strand the Log on a dead manager — the planted bug being "
 **What is missing.** `Loop.report` already computes the fenced list from the Control
 Plane's refusals (`STALE_EPOCH`, `NOT_PRIMARY`, `UNKNOWN_VOLUME`) and stores it in
 `l.fenced`, where nothing reads it. Its own comment says the SELF_FENCED transition
-"belongs to the data path". This is **DEV-0012**: a self-fenced log still accepts WRITEs
-and still serves reads.
+"belongs to the data path". This is **DEV-0012's Agent half**, and it is what this spec
+closes.
+
+> The other half — that a log which self-fences on its own lease check keeps taking
+> writes and serving reads — was **closed on 2026-08-02 as not a divergence**. §12.2
+> line 641 grants exactly that behaviour and delegates the choice to policy; the policy
+> is now written at `wal.Log`'s `fenced` field. The two triggers are different and only
+> one of them is about stopping a guest.
 
 **Proposed shape.** After `report`, the loop hands the fenced ids to the manager, which
 stops those runtimes — the same path `Apply` uses when a volume leaves the desired state.

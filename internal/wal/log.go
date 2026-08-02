@@ -130,9 +130,41 @@ type Log struct {
 	batcher  *Batcher  // nil = local-only (no remote WAL)
 	uploader *Uploader // nil = local-only
 
-	mode   DurabilityMode // remote (default) | local (§14.8)
-	lease  LeaseChecker   // nil = no lease gate (dev/local without a CP)
-	fenced bool           // set once a FLUSH finds the lease invalid (§16 SELF_FENCED)
+	mode  DurabilityMode // remote (default) | local (§14.8)
+	lease LeaseChecker   // nil = no lease gate (dev/local without a CP)
+	// fenced is set once a durable step finds the lease invalid (§16 SELF_FENCED).
+	//
+	// **What it gates, and what it deliberately does not.** It stops every *durable*
+	// operation — durableStep and DrainPending — and nothing else. Write and Read do not
+	// consult it, so a self-fenced log keeps taking writes it can never flush and keeps
+	// answering reads from its view.
+	//
+	// That is the policy, not an omission, and §12.2 is what delegates it: a SELF_FENCED
+	// Agent "puede seguir sirviendo reads de su caché mientras QEMU siga conectado,
+	// **según política**". The line grants the behaviour and leaves the choice here, so
+	// here is where the choice is written down (it was carried as DEV-0012 until
+	// 2026-08-02, on the reading that the document had been contradicted; it had not).
+	//
+	// Why this policy and not the stricter one:
+	//
+	//   - Nothing a fenced host writes is ever ACKed durable or published — INV-06,
+	//     INV-09 and INV-10 all hold with Write ungated, because they are properties of
+	//     the durable path and the durable path is what `fenced` stops. The exposure is a
+	//     stale read reaching a guest, plus device pressure from writes no FLUSH covers.
+	//     Both are bounded and both are accepted here on purpose.
+	//   - Refusing I/O would *extend* §16, which scopes SELF_FENCED to durable ACKs. A
+	//     log that denies reads to a guest still attached is the worse failure: the guest
+	//     gets EIO for data this host holds and can serve correctly.
+	//   - Stopping I/O is the Agent's job and it already does it, through the other
+	//     trigger: the Control Plane refusing the volume's report tears the runtime down
+	//     — log, socket and device — so neither reads nor writes are answered. That path
+	//     is driven by the fleet's view rather than by one host's lease clock, which is
+	//     the right authority for "you no longer own this volume".
+	//
+	// The consequence to keep in view: a host whose lease lapses in a PostgreSQL blip
+	// keeps serving its guest, which is the intent, and Fenced() below is what a future
+	// policy would consult if that ever stops being the intent.
+	fenced bool
 
 	// degraded is what the local device is refusing to do, independently of the
 	// lease (see Degraded). outOfSpace classifies a disk error as ENOSPC.
@@ -284,7 +316,15 @@ func (l *Log) RemoteGapBytes() int64 {
 	return l.gapBytes
 }
 
-// Fenced reports whether the log has self-fenced (a FLUSH found the lease invalid).
+// Fenced reports whether the log has self-fenced (a durable step found the lease
+// invalid).
+//
+// It has no production caller, and under the policy on the `fenced` field it should not:
+// self-fencing stops the durable path from the inside, and stopping the *guest* is the
+// Agent's job through the Control Plane's refusal, not this host's lease clock. What it
+// exists for is proof — the DST scenarios and the unit tests that assert INV-06 read the
+// transition through it rather than through a flag they set themselves — and as the seam
+// a stricter policy would consult on the day one is chosen.
 func (l *Log) Fenced() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
