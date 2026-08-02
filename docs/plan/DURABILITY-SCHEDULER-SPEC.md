@@ -1,6 +1,7 @@
 # Spec — who decides *when* to checkpoint and truncate (BUILD-INVENTORY increment 3)
 
-**Status: awaiting human review of the plan below. Not implemented.** Durability review
+**Status: implemented 2026-08-01, per the plan below.** The one thing the design did not
+settle became **ADR-0023**. Durability review
 zone. Unblocked by increment 5 (`VIEW-ADOPTION-SPEC.md`), which had to land first:
 without it, truncating local WAL and then restarting served zeros.
 

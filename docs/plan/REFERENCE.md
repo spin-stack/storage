@@ -155,6 +155,7 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0019 | Schema tooling is **pgschema**, not Atlas; `schema.sql` is the declared state. | Accepted |
 | ADR-0020 | `internal/vhost/hostio` is the one documented INV-01 exception (SCM_RIGHTS + mmap). | Accepted |
 | ADR-0021 | storage integrates into **spin**; spin imports storage and never the reverse. The two binaries are test harnesses that must stay runnable end to end. spin migrates to pgschema. | Accepted |
+| ADR-0023 | The object store is a fencing witness the data path may act on: a checkpoint that proves a second writer in this epoch tears the runtime down and records the fenced epoch, even while the Control Plane still lists the volume as this host's. | Accepted |
 | ADR-0022 | The guest kernel is pinned by sha256 and obtained by `task fetch:kernel` into `_output/guest/vmlinux` — never resolved from a sibling checkout's path. storage may *mirror* spinbox's artefact into a registry; mirroring is not building (ADR-0021 stands). | Accepted |
 
 ## `DEV-` — doc↔code divergences

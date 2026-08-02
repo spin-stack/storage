@@ -36,10 +36,11 @@ tracks state.
   done** (2026-08-01, `VIEW-ADOPTION-SPEC.md`): the seam is in `cow.IntervalMap`, `wal`
   can adopt a base lazily, the Agent resumes, and a DST arm restarts a truncated volume
   through the Agent on every seed. **Increment 3, checkpoint and truncate, is now
-  unblocked**, and specified: `DURABILITY-SCHEDULER-SPEC.md` is awaiting review. Nothing
-  in it is about *how* to checkpoint — `checkpoint.Create` and `TruncateLocal` are both
-  done and careful — it is entirely about *when*, and every question in it has a
-  data-loss or an availability edge.
+  done** (2026-08-01, `DURABILITY-SCHEDULER-SPEC.md` + **ADR-0023**):
+  `internal/agent/durability.go` checkpoints at 256 MiB of WAL or two minutes (§21.1),
+  behind a valid lease (§12.6) and the background io-class budget (INV-17), then
+  truncates to *published*. **Local WAL is reclaimed for the first time in this
+  repository's history** — before it, `published` stayed 0 for the life of the process.
 
 ## Pick up here
 

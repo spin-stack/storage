@@ -8,10 +8,12 @@ import (
 	"path"
 	"sort"
 	"sync"
+	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/blockdev"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
@@ -112,6 +114,17 @@ type VolumeManagerConfig struct {
 	// UploadAttempts is how many times an object PUT is retried before the FLUSH that
 	// needed it fails. Zero means 3.
 	UploadAttempts int
+	// HostID is this host's fleet identity. A checkpoint names the host publishing it,
+	// which is what stops a second host publishing into an epoch it merely knows the
+	// number of (§12.3–12.4). Without it no durability scheduler runs.
+	HostID string
+	// CheckpointBytes and CheckpointInterval are the two triggers of §21.1: 256 MiB of
+	// local WAL, or two minutes, whichever comes first. Zero means the design's value.
+	CheckpointBytes    int64
+	CheckpointInterval time.Duration
+	// CheckpointPoll is how often the byte trigger is examined. Not a design number —
+	// see durability.go.
+	CheckpointPoll time.Duration
 }
 
 // VolumeManagerDeps are the injected collaborators (INV-01).
@@ -134,6 +147,11 @@ type VolumeManagerDeps struct {
 	// It is required whenever Store is set, and it must be a call through to the
 	// current lease — see leaseFunc.
 	Lease func() bool
+	// IOClass arbitrates the Agent's I/O between classes (INV-17, §11). One per Agent,
+	// not one per volume: the budget it hands out is a share of the host's NVMe and NIC
+	// (§10, `background_nvme_budget: 30% de IOPS/BW`). Nil disables the gate, which is
+	// what a unit test with no contention wants.
+	IOClass *ioclass.Scheduler
 }
 
 // VolumeManager owns the live runtimes and is the Agent's VolumeSource. Apply is the
@@ -369,6 +387,14 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
 	if resuming {
 		go m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()))
+	}
+	if err := m.checkpointsEnabled(); err != nil {
+		// Said once, at start, rather than every poll: a volume that will never reclaim
+		// a byte is worth one line explaining why.
+		slog.Info("no durability scheduler for this volume; local WAL will not be reclaimed",
+			"volume_id", id, "reason", err)
+	} else {
+		go m.checkpointLoop(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()))
 	}
 	return v, nil
 }
