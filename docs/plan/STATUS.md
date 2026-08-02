@@ -4,9 +4,9 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-08-01 · **Branch:** the kernel work and the keystone are on
-  `guest-kernel-pinning`, off `main`; everything before them is on `main`, pushed to
-  `origin` (`/home/aledbf/spin-storage.git`, bare).
+- **Date:** 2026-08-01 · **Branch:** everything is on `main` — `guest-kernel-pinning`
+  was merged `--ff-only` at `283f1dd` after a full `task ci:full`. **Not pushed:** `origin`
+  (`/home/aledbf/spin-storage.git`, bare) is still at `be84619`, seventeen commits behind.
 - **Gate:** `task ci` green (2026-08-01, with the keystone and its review-zone half in). It had been red since
   `e8bbdab` until DEV-0013 was resolved on 2026-07-28, which nothing had noticed
   because nobody had run it.
