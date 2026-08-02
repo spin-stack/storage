@@ -226,6 +226,15 @@ being latent the moment a durability scheduler exists: **a restart would then si
 serve zeros for every truncated range, with no error anywhere.** None of the nine
 `Resume` tests truncates first, which is why the suite is green.
 
+**Closed in `cow` and `wal` on 2026-08-01; still open in the Agent — and an Agent
+restart today is worse than "does not resume".** Measured, not argued: write, FLUSH
+(object verified in the store), restart the Agent, read the same offset → **zeros,
+silently**. The object is in the store and the segment is on disk; the Agent looks at
+neither. The next *write* then fails loudly — `wal` refuses a fresh log over a directory
+that already holds unreplayed segments — so **nothing is overwritten and no committed
+data is destroyed**, but the volume is unusable until someone resumes it, and the read
+that came first was a silent lie.
+
 **Closed in `cow` and `wal` on 2026-08-01; still open in the Agent.** A layered
 `cow.IntervalMap` gives the read view a base, `wal.ResumeAwaitingBase` installs one
 lazily, and a read with no base fails with `ErrBaseUnavailable` instead of answering

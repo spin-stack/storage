@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"path"
 	"sort"
-	"strconv"
 	"sync"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
@@ -37,8 +36,9 @@ import (
 type Volume struct {
 	id    string
 	epoch int64
-	// root is <data-dir>/wal/<volume-id>/<epoch>. The epoch is in the path because a
-	// promoted writer must never append into the segments of the epoch it replaced.
+	// root is what wal.SegmentDir is given; the segments themselves land in
+	// <root>/<volume-id>/<epoch>, and the epoch is in that path because a promoted
+	// writer must never append into the segments of the epoch it replaced.
 	root   string
 	socket string
 
@@ -291,7 +291,13 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		return nil, fmt.Errorf("agent: volume id %q: %w", id, err)
 	}
 
-	root := path.Join(m.cfg.DataDir, "wal", id, strconv.FormatInt(d.GetEpoch(), 10))
+	// The root is <data-dir>/wal and nothing more: wal.SegmentDir appends the volume
+	// and the epoch itself, so passing an already-namespaced path produced
+	// <data-dir>/wal/<id>/<epoch>/<id>/<epoch>. It went unnoticed because sim.Disk.List
+	// matches by prefix, so the test asserting the convention passed on the doubled
+	// path — see TestSocketAndWALPathsArePerVolumeAndEpoch, which now asserts the
+	// directory exactly.
+	root := path.Join(m.cfg.DataDir, "wal")
 	log := wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits)
 
 	// Remote mode, and with it the uploader and the §14.4 ACK path. Without a store

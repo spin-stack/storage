@@ -15,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/vhost"
+	"github.com/spin-stack/storage/internal/wal"
 )
 
 // The keystone's contract, stated once: a VolumeManager turns the desired state into
@@ -444,14 +445,29 @@ func TestSocketAndWALPathsArePerVolumeAndEpoch(t *testing.T) {
 	// picked the right path and never opened a log would pass a string comparison.
 	// A log creates nothing until something is written to it, so this writes first —
 	// which also means the assertion is about the path a guest's bytes really land in.
+	//
+	// The segment's *directory* is compared exactly. An earlier version of this test
+	// only checked that something existed under the prefix, and List matches by prefix
+	// — so it passed happily while every segment was landing in a doubled
+	// .../wal/<id>/<epoch>/<id>/<epoch>, which is what wal.SegmentDir does to a root
+	// that is already namespaced.
 	writeOneBlock(t, m, v.GetVolumeId())
-	wantRoot := path.Join("/var/lib/spin", "wal", v.GetVolumeId(), "7")
-	names, err := d.List(wantRoot)
+	u, err := ids.Parse(v.GetVolumeId())
 	if err != nil {
-		t.Fatalf("List(%s): %v", wantRoot, err)
+		t.Fatal(err)
+	}
+	wantDir := wal.SegmentDir(path.Join("/var/lib/spin", "wal"), [16]byte(u), 7)
+	names, err := d.List(path.Join("/var/lib/spin", "wal"))
+	if err != nil {
+		t.Fatalf("List: %v", err)
 	}
 	if len(names) == 0 {
-		t.Errorf("no WAL segment under %s; the log was never opened there", wantRoot)
+		t.Fatalf("no WAL segment anywhere under /var/lib/spin/wal")
+	}
+	for _, n := range names {
+		if got := path.Dir(n); got != wantDir {
+			t.Errorf("segment %s sits in %s, want exactly %s", n, got, wantDir)
+		}
 	}
 }
 
@@ -540,10 +556,14 @@ func TestEpochChangeReplacesTheRuntime(t *testing.T) {
 		t.Errorf("opened %d sockets, want 2 — the runtime was not replaced", got)
 	}
 	writeOneBlock(t, m, v.GetVolumeId())
-	root := path.Join("/var/lib/spin", "wal", v.GetVolumeId(), "2")
+	u, err := ids.Parse(v.GetVolumeId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := wal.SegmentDir(path.Join("/var/lib/spin", "wal"), [16]byte(u), 2)
 	names, err := d.List(root)
 	if err != nil || len(names) == 0 {
-		t.Errorf("no WAL under the new epoch's root %s (err=%v)", root, err)
+		t.Errorf("no WAL under the new epoch's directory %s (err=%v)", root, err)
 	}
 }
 
