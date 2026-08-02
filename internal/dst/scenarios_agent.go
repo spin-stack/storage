@@ -427,7 +427,7 @@ func truncatedVolumeSurvivesARestart(s *Sim, hideObjects bool) error {
 	return nil
 }
 
-// CheckpointLeaseChecker enforces the *other* half of §12.6. The sentence names two
+// CheckpointLeaseChecker enforces the *other* half of §12.2. The sentence names two
 // things a SELF_FENCED Agent stops doing — "deja de ACKear durabilidad, deja de publicar
 // checkpoints/manifests" — and only the first has ever had a checker
 // (DurableAckLeaseChecker, INV-06, on the FLUSH path). This watches the second: no
@@ -448,7 +448,7 @@ func (c *CheckpointLeaseChecker) Name() string { return "checkpoint-requires-lea
 
 func (c *CheckpointLeaseChecker) Observe(e Event) {
 	if e.Kind == EventCheckpoint && e.PublishedWithoutLease && c.violation == nil {
-		c.violation = fmt.Errorf("volume %s published a checkpoint at step %d with an invalid lease (violates §12.6)",
+		c.violation = fmt.Errorf("volume %s published a checkpoint at step %d with an invalid lease (violates §12.2)",
 			e.Key, e.Step)
 	}
 }
@@ -573,7 +573,7 @@ func lapsedLeaseStopsPublishing(s *Sim, cacheTheLease bool) error {
 	if lm.Valid() {
 		return errors.New("the lease did not lapse: the scenario advanced past its TTL")
 	}
-	s.Emit(Event{Kind: EventFault, Msg: "the host lease lapsed with no renewal (SELF_FENCED, §12.6)"})
+	s.Emit(Event{Kind: EventFault, Msg: "the host lease lapsed with no renewal (SELF_FENCED, §12.2)"})
 
 	// More guest writes, and a FLUSH that must fail. A scheduler that declined because
 	// there was nothing new to publish would look identical to one that declined because
@@ -615,7 +615,7 @@ func lapsedLeaseStopsPublishing(s *Sim, cacheTheLease bool) error {
 		Msg:                   fmt.Sprintf("objects=%d->%d refusal=%v", underLease, after, err),
 	})
 	if published {
-		return fmt.Errorf("volume %s published a checkpoint with a lapsed lease (%d objects, was %d) (§12.6)",
+		return fmt.Errorf("volume %s published a checkpoint with a lapsed lease (%d objects, was %d) (§12.2)",
 			volumeID, after, underLease)
 	}
 	if err == nil {

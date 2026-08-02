@@ -105,7 +105,7 @@ type Event struct {
 	// undecrypted ciphertext being the case that shipped, since GCM leaves the length
 	// intact and nothing downstream re-checks the plaintext CRC. Must always be false.
 	ForeignBytesAfterRestart bool
-	// Checkpoint events (§12.6): whether a checkpoint object appeared in the store while
+	// Checkpoint events (§12.2): whether a checkpoint object appeared in the store while
 	// the host's lease was invalid. Must always be false — a SELF_FENCED Agent "deja de
 	// publicar checkpoints/manifests". This is INV-06's other half: LeaseValid above
 	// covers the FLUSH ACK, this covers the publish.

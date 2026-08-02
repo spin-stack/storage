@@ -46,7 +46,7 @@ tracks state.
   through the Agent on every seed. **Increment 3, checkpoint and truncate, is now
   done** (2026-08-01, `DURABILITY-SCHEDULER-SPEC.md` + **ADR-0023**):
   `internal/agent/durability.go` checkpoints at 256 MiB of WAL or two minutes (§21.1),
-  behind a valid lease (§12.6) and the background io-class budget (INV-17), then
+  behind a valid lease (§12.2) and the background io-class budget (INV-17), then
   truncates to *published*. **Local WAL is reclaimed for the first time in this
   repository's history** — before it, `published` stayed 0 for the life of the process.
   The DST arm drives the scheduler on every seed. One note below: the planted bug the
@@ -145,7 +145,7 @@ real binaries — and it is where "how much is left" is actually measured:
 | 0 — binaries runnable and debuggable | **done** (`5bf31d4`) |
 | 1 — a volume can exist | **done** (`5953c73`) |
 | 2 — KEYSTONE: the per-volume runtime | **done** (`4f2852a`, `cf021cc`) |
-| 3 — checkpoint and truncate | **done** (scheduler, ADR-0023, and as of `b5bd268` its §12.6 checker) |
+| 3 — checkpoint and truncate | **done** (scheduler, ADR-0023, and as of `b5bd268` its §12.2 checker) |
 | 4 — warm restart, same host | **done.** Its two data pieces were the durable point and the published point having no producer; increment 5's `InstallBase` supplies both, and `fetchBase` calls `recovery.DurablePoint`. The written decision it also asked for is **ADR-0024** — same-epoch re-attach, with the four mechanisms it rests on named so a change cannot silently invalidate it. Writing it surfaced **DEV-0014** (two Agents, one data dir), which predates the decision. |
 | 5 — cold restart, seed the read view from S3 | **done** — this was the real correctness hole |
 | 6 — the DEK arm | **done.** `dek_key_id` end to end (column + CHECK, proto, `metadata.Volume`, descriptor, `GetVolumeKeys`, provisioner, clone, rebuild-metadata) plus `-kek-file`/`-kek-id` on the Agent, `crypto.DevKMS`, and the unwrap at attach. Every object a served volume puts in the bucket is now ciphertext, and INV-15 is reachable — see below. **Corrected 2026-08-02 (DEV-0019):** "done" was half true. The write half was; the *read* half handed the guest that ciphertext back on every restart, because `fetchBase` recovered with no key. Fixed, with the mandatory DST arm that crosses encryption with a restart — which is the arm whose absence let this row be written. |
@@ -247,7 +247,7 @@ unreachable: `StrictOrder.AllowTruncate` refuses `upTo > published` at the sourc
 mistake cannot be made through the API. The invariant is enforced where it should be, and
 a planted bug the API rejects proves nothing about the checker.
 
-The replacement is the other half of the same §12.6 sentence — *"deja de ACKear
+The replacement is the other half of the same §12.2 sentence — *"deja de ACKear
 durabilidad, **deja de publicar checkpoints/manifests**"*. Two obligations, one lease; the
 first has had a checker since 7.2 and **the second never did**, though the gate is one
 `if` at the top of `checkpointOnce`. `CheckpointLeaseChecker` +
@@ -754,6 +754,25 @@ in the test:
 that already governs the other path to `durable`. Its planted bug is the reading this
 increment rejected — a lease resolved once at construction instead of per call, which is
 the same shortcut `CheckpointLeaseChecker` plants.
+
+## The SELF_FENCED rule is cited where it lives, since 2026-08-02
+
+The sentence the durability scheduler enforces — *"deja de ACKear durabilidad, deja de
+publicar checkpoints/manifests"* — is at **line 641 of §12.2** ("Ciclo del lease, lado
+Agent", lines 619-642). Nineteen places cited **§12.6**, which is "Escalabilidad del
+fencing (por qué el lease es por host)" and contains no publication rule at all.
+
+It propagated the way these do. `INVARIANTS.md`'s INV-06 row contradicted itself — the
+prose said §12.6 while its own section column said §12.2 — and
+`DURABILITY-SCHEDULER-SPEC.md` wrote "§12.6 (line 641)", carrying the correct line number
+under the wrong section heading all the way into the scheduler, its tests, its DST
+checker and two error strings an operator would read.
+
+Corrected in code, tests, checkers, `INVARIANTS.md`, `STATUS.md`, the spec and ADR-0023.
+Deliberately untouched: `internal/lease`, `internal/metadata`, `internal/lifecycle`,
+ADR-0016 and `REFERENCE.md`, where §12.6 is cited for what it actually says — why the
+lease is per host. `task dst` produces the same trace on the same seed, which is the
+point: nothing changed except where a reader is sent.
 
 ## Components with no production caller
 

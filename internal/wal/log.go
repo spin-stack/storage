@@ -885,7 +885,7 @@ func (l *Log) coveredLocked() uint64 {
 //
 // It returns the highest sequence a verified object now covers. Advancing
 // durable_sequence to it is the *caller's* decision: uploading asserts nothing, and
-// §12.6/INV-06 govern the claim. See agent.drainOnce.
+// §12.2/INV-06 govern the claim. See agent.drainOnce.
 func (l *Log) DrainPending(ctx context.Context) (uint64, error) {
 	l.flushMu.Lock()
 	defer l.flushMu.Unlock()

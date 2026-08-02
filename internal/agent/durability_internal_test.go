@@ -161,7 +161,7 @@ func TestTheIntervalTriggerFiresOnAnIdleVolume(t *testing.T) {
 	}
 }
 
-// TestNoCheckpointWithoutAValidLease is §12.6 stated where it bites: a SELF_FENCED Agent
+// TestNoCheckpointWithoutAValidLease is §12.2 stated where it bites: a SELF_FENCED Agent
 // "deja de publicar checkpoints/manifests". The lease is checked before Create even
 // though Create verifies the epoch, because the two fail differently and this is the
 // cheap one.
@@ -171,7 +171,7 @@ func TestNoCheckpointWithoutAValidLease(t *testing.T) {
 	r.lease = false
 
 	if ran, _ := r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test"); ran {
-		t.Fatal("a checkpoint was published with no valid lease (§12.6)")
+		t.Fatal("a checkpoint was published with no valid lease (§12.2)")
 	}
 	keys, _ := r.store.List(t.Context(), "checkpoints/")
 	if len(keys) != 0 {

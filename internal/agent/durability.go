@@ -114,7 +114,7 @@ func (m *VolumeManager) checkpointDue(v *Volume, last clock.Instant) (bool, stri
 //
 // It goes through exactly the same gates as the scheduler — lease, io-class, the same
 // failure classification — because a second path to publication is a second place for the
-// §12.6 lease rule to be forgotten.
+// §12.2 lease rule to be forgotten.
 func (m *VolumeManager) Checkpoint(ctx context.Context, volumeID string) error {
 	m.mu.Lock()
 	v, ok := m.volumes[volumeID]
@@ -141,7 +141,7 @@ func (m *VolumeManager) Checkpoint(ctx context.Context, volumeID string) error {
 		case v.log.BasePending():
 			return fmt.Errorf("agent: volume %s is still recovering its read view", volumeID)
 		case m.deps.Lease != nil && !m.deps.Lease():
-			return fmt.Errorf("agent: volume %s has no valid lease to publish under (§12.6)", volumeID)
+			return fmt.Errorf("agent: volume %s has no valid lease to publish under (§12.2)", volumeID)
 		default:
 			return fmt.Errorf("agent: volume %s yielded to the guest (INV-17)", volumeID)
 		}
@@ -152,7 +152,7 @@ func (m *VolumeManager) Checkpoint(ctx context.Context, volumeID string) error {
 // checkpointOnce publishes a checkpoint and reclaims what it covers. It reports whether
 // the checkpoint was actually taken, so a skipped cycle does not reset the interval.
 func (m *VolumeManager) checkpointOnce(ctx context.Context, v *Volume, volumeID [16]byte, epoch uint64, why string) (bool, error) {
-	// §12.6: a SELF_FENCED Agent "deja de publicar checkpoints/manifests". The lease is
+	// §12.2: a SELF_FENCED Agent "deja de publicar checkpoints/manifests". The lease is
 	// checked here, on top of the epoch verification inside Create, because the two fail
 	// differently — the epoch object is a network read that can be served stale, the
 	// lease is local and monotonic — and the cheap one is the one that would otherwise
@@ -265,7 +265,7 @@ var errNoPublisherIdentity = errors.New("a checkpoint must name the host publish
 //
 // **Advancing durable_sequence is gated**, on the same monotonic lease check §14.4 step 5
 // applies. durable_sequence is the claim: INV-03 orders it, INV-13 truncates against it,
-// §12.6 governs what may be published under it, and a promoted successor reads it. §14.8
+// §12.2 governs what may be published under it, and a promoted successor reads it. §14.8
 // frees the *FLUSH ACK* from the lease in local mode; it does not free the watermark, and
 // reading it that way would let a fenced host move a number its replacement trusts.
 //

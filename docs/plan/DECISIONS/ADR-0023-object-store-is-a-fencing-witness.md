@@ -10,7 +10,7 @@
 
 The design says how a writer learns it has been fenced, twice:
 
-- **From its own lease** (§12.6): the lease lapses on the monotonic clock, the Agent
+- **From its own lease** (§12.2): the lease lapses on the monotonic clock, the Agent
   enters `SELF_FENCED`, stops ACKing durability and stops publishing checkpoints and
   manifests.
 - **From the Control Plane** (§12.3–12.4): a report is refused with `STALE_EPOCH`,
@@ -104,6 +104,6 @@ which is the thing the whole design exists to prevent.
   cycle, at the same epoch, and the scheduler discovers the same conflict again. That is
   the loop with extra steps, plus a socket that flaps.
 - **Self-fence the `wal.Log` only** (stop ACKing durability, keep serving reads). That is
-  §12.6's answer for a *lapsed lease*, where nobody is known to have taken the volume.
+  §12.2's answer for a *lapsed lease*, where nobody is known to have taken the volume.
   Here somebody demonstrably has, and their writes are already in the store — which is
   exactly the case where a stale read is wrong rather than merely old.

@@ -47,7 +47,7 @@ func TestPlantedBugDurableRangeReadsZeros(t *testing.T) {
 	})
 }
 
-// §12.6's second obligation: a SELF_FENCED Agent "deja de publicar checkpoints/manifests".
+// §12.2's second obligation: a SELF_FENCED Agent "deja de publicar checkpoints/manifests".
 // The first — no durable ACK — has had a checker since the beginning; this one never did,
 // even though the gate is one `if` at the top of checkpointOnce.
 //
@@ -68,7 +68,7 @@ func TestPlantedBugCheckpointPublishedWithoutLease(t *testing.T) {
 		return lapsedLeaseStopsPublishing(s, leaseAnsweredFromASnapshot)
 	})
 
-	// One cached answer, both of §12.6's obligations gone: the same wiring that let the
+	// One cached answer, both of §12.2's obligations gone: the same wiring that let the
 	// checkpoint out also let a FLUSH be ACKed as durable after the lease had expired.
 	// Asserted rather than left as a remark, because it is the reason the new checker is
 	// a second gate and not a duplicate of the old one — INV-06 sees the ACK, this sees

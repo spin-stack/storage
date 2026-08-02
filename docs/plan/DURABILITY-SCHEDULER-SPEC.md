@@ -44,7 +44,7 @@ every co-tenant of the disk.
 | What triggers a checkpoint? | §21.1 "Objectization", §10 config | `checkpoint_interval_bytes: 256 MiB`, `checkpoint_interval_time: 2m`. Both, whichever comes first. |
 | Is the io-class budget per host or per volume? | §10 config, §11 | Per **host**: `background_net_budget: 30% de NIC`, `background_nvme_budget: 30% de IOPS/BW`. Those are host resources; there is no per-volume budget to argue about. |
 | How much local WAL is kept? | §21.1 step 7, §14.7 | Everything with `sequences <= published_sequence` becomes eligible. No retention window. |
-| Must the lease be valid to publish? | §12.6 (line 641) | Yes, explicitly: a `SELF_FENCED` Agent "deja de ACKear durabilidad, **deja de publicar checkpoints/manifests**". `VerifyPublisher` is not a substitute. |
+| Must the lease be valid to publish? | §12.2 (line 641) | Yes, explicitly: a `SELF_FENCED` Agent "deja de ACKear durabilidad, **deja de publicar checkpoints/manifests**". `VerifyPublisher` is not a substitute. |
 | Where do reclaimed bytes go? | §26.2 | Metrics, not a proto field: `checkpoint_duration_seconds`, `objectization_pending_bytes`, `gc_reclaimed_bytes_total`. |
 
 **So the plan is:**
@@ -58,13 +58,13 @@ every co-tenant of the disk.
    NVMe.
 4. It requires `Lease.Valid()` before calling `Create`, on top of the epoch verification
    `Create` already does. The two fail differently — the epoch object is a network read
-   that can be stale-cached, the lease is local and monotonic — and §12.6 requires the
+   that can be stale-cached, the lease is local and monotonic — and §12.2 requires the
    cheap one.
 5. `checkpoint.Create` → `TruncateLocal(published)`. No retention window, per §21.1.
 6. Reclaimed bytes and checkpoint duration go to `obs`, not to `VolumeReport`.
 
 Note this is consistent with the fencing already built, and the two paths are meant to
-differ. §12.6 says a lease-expired Agent "puede seguir sirviendo reads de su caché
+differ. §12.2 says a lease-expired Agent "puede seguir sirviendo reads de su caché
 mientras QEMU siga conectado, según política" — and that is what happens: `wal` self-fences
 the *durability* path (FLUSH fails) and reads continue. `VolumeManager.Fence` is the other
 case entirely, where the Control Plane has said **another host is the writer**, and there
@@ -113,11 +113,11 @@ refuses `upTo > published` at the source, so the mistake cannot be made through 
 the invariant is enforced where it should be, and a planted bug that the type system
 rejects proves nothing about the checker.
 
-The replacement is the other half of the same §12.6 sentence, and it *is* reachable:
+The replacement is the other half of the same §12.2 sentence, and it *is* reachable:
 
 > Al vencer el lease sin renovación, el Agent entra en `SELF_FENCED`: deja de ACKear
 > durabilidad, **deja de publicar checkpoints/manifests**, y espera instrucciones.
-> — v5.1 §12.6
+> — v5.1 §12.2
 
 Two obligations, one lease. The first has had a checker since the beginning
 (`DurableAckLeaseChecker`, INV-06, on the FLUSH path). **The second has never had one.**
