@@ -3,10 +3,15 @@
 - **Status:** Accepted — 2026-07-27
 - **Date:** 2026-07-27
 - **Deciders:** human owner (approved), implementer agent (proposed)
-- **Relates to:** ADR-0018 (the spine), ADR-0019 (pgschema), ADR-0002 (parallel tracks)
+- **Relates to:** ADR-0018 (the spine), ADR-0019 (pgschema)
 - **Affects another repository:** `github.com/aledbf/spin` migrates from Atlas to
   pgschema. That half is recorded here because the decision was taken here; it needs a
   matching note in spin.
+- **Status of that half, checked 2026-08-02: not started.** spin still has `atlas.hcl`,
+  `migrations/atlas.sum` and an ordered migration chain. Nothing in storage depends on
+  it — this repository's schema tooling is settled by ADR-0019 — so it is not a blocker
+  here, but it is also not something storage can close. It is spin's work, and until
+  spin does it the "one database, one tool" reason below is a plan rather than a state.
 
 ## Context
 

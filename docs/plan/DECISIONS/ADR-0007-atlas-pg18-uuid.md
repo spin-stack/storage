@@ -4,7 +4,7 @@
   ADR-0019** (2026-07-26)
 - **Date:** 2026-07-25
 - **Deciders:** human owner + tech-lead agent
-- **Extends:** ADR-0006, §8
+- **Extends:** §8
 
 > **Superseded in part.** Decision 1 (Atlas owns migrations) no longer holds:
 > **pgschema** replaces Atlas as of ADR-0019. `internal/schema/schema.sql` is still the

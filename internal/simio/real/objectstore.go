@@ -15,10 +15,11 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// ObjectStore is a filesystem-backed object store used for local/dev mode
-// (§6.2). The production S3-SDK-backed store is the Track D S3 subsystem (§24);
-// see docs/plan/DECISIONS/ADR-0004-objectstore-real-staging.md. This
-// implementation satisfies the same Store contract without a network.
+// ObjectStore is a filesystem-backed object store used for local/dev mode (§6.2). The
+// production S3-SDK-backed store is the §24 subsystem, and it lives next door in s3.go
+// behind this same objectstore.Store contract (ADR-0010). This one satisfies that
+// contract without a network, which is what lets the DST harness and the whole contract
+// suite run in-process.
 //
 // Two properties are not incidental, because the protocol is built on them:
 //

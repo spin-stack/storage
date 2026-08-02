@@ -1,5 +1,5 @@
 // Package pg is the production metadata.Store: a thin adapter over the sqlc-
-// generated queries on pgx/v5 (ADR-0006). Identity columns are uuid (ADR-0007); the
+// generated queries on pgx/v5. Identity columns are uuid (ADR-0007); the
 // adapter parses string ids at the boundary. It is verified by TestContainers
 // integration tests; the fencing protocol itself is proven in metadata/sim.
 package pg

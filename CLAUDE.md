@@ -245,7 +245,7 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 - **Prefer composition** over inheritance-style embedding gymnastics; small, focused
   types.
 
-## SQL: sqlc + pgschema + Postgres 18 (ADR-0006, ADR-0007, ADR-0019)
+## SQL: sqlc + pgschema + Postgres 18 (ADR-0007, ADR-0019)
 
 - **All SQL goes through sqlc.** No hand-built query strings. Schema (the desired
   state) is `internal/schema/schema.sql`; queries are `internal/db/queries/*.sql`;

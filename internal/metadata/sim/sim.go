@@ -1,5 +1,5 @@
 // Package sim is the in-memory, deterministic metadata.Store used by the DST
-// harness (ADR-0006). The fencing protocol (§12) is proven here under simulated
+// harness. The fencing protocol (§12) is proven here under simulated
 // partitions and clock drift — a real Postgres cannot be deterministic under those
 // conditions. Timestamps come from an injected now-function so runs are reproducible.
 package sim

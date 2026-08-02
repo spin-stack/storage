@@ -100,7 +100,7 @@ tasks:
       - task: tools:protoc-plugins
 
   tools:sqlc:
-    desc: Install the pinned sqlc (ADR-0006).
+    desc: Install the pinned sqlc.
     status:
       - test -x {{.TOOLS_BIN}}/sqlc && {{.TOOLS_BIN}}/sqlc version | grep -q '{{.SQLC_VERSION}}'
     cmds:
@@ -154,7 +154,7 @@ tasks:
       - task: generate:proto:check
 
   generate:sqlc:
-    desc: Regenerate sqlc code from schema + queries (ADR-0006).
+    desc: Regenerate sqlc code from schema + queries.
     deps: [tools:sqlc]
     cmds:
       - "{{.TOOLS_BIN}}/sqlc generate"
@@ -424,7 +424,7 @@ tasks:
       - go test -race ./...
 
   test:integration:
-    desc: Run Docker-gated integration tests (TestContainers Postgres, ADR-0006).
+    desc: Run Docker-gated integration tests (TestContainers Postgres).
     cmds:
       - go test -tags integration -count=1 ./internal/metadata/pg/...
       - task: test:integration:qemu

@@ -67,17 +67,28 @@ that assigns a volume or records a plan — evaluated against the derived value.
   (`ErrCapacityExceeded`, `ErrCapacityConflict`) fold into the write that assigns the
   volume.
 
-## The tests that would enforce it
+## The tests that enforce it
 
-- The wave-3 crash tests, unchanged in intent: kill a pass at each boundary, resume, and
-  assert the host's committed value moved by exactly one volume size. Under a derived
-  number they should become uninteresting — which is the point, and worth saying in the
-  commit that makes them pass trivially.
-- A test that a volume in flight is charged to its destination before it is primary
-  there, and to neither host twice.
-- A property test: for any interleaving of moves and crashes, `committed(host)` equals
-  the sum over the host's volumes and in-flight plans. A ledger cannot state that
-  property; a derived value is that property.
+All landed, and the prediction they were written to test came out as predicted: the
+crash tests *did* become uninteresting, because a derived number has nothing to be
+half-updated. There is no `nvme_committed_bytes` column — `internal/schema/schema.sql`
+says so at the point where it would have been — and the derivation is the
+`host_committed_bytes` view (`schema.sql:346`), which landed with increment 5.
+
+- `TestCommittedCapacityIsDerivedFromState` and
+  `TestVolumeInFlightIsChargedToItsDestinationOnce`
+  (`internal/controlplane/capacity_derived_test.go`): a volume in flight is charged to
+  its destination before it is primary there, and to neither host twice.
+- `TestCommittedCapacityHoldsUnderAnyInterleaving` (same file): for any interleaving of
+  moves and crashes, `committed(host)` equals the sum over the host's volumes and
+  in-flight plans. A ledger cannot state that property; a derived value *is* that
+  property.
+- `TestCommittedBytesIsDerivedInOnePlace` (`internal/db/queries_guard_test.go`): the
+  derivation has exactly one home, so a second query cannot quietly reintroduce the
+  ledger.
+
+An unresolved prediction in an ADR is how a decision record stops matching the code
+without anyone noticing, so this section is written in the past tense on purpose.
 - A contract case pinning that the oversubscription bound is still evaluated inside the
   write, against the derived value.
 

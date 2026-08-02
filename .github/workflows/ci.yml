@@ -127,7 +127,7 @@ jobs:
       - name: Format check
         run: task fmt:check
 
-      - name: Generated code is current (sqlc, ADR-0006)
+      - name: Generated code is current (sqlc)
         run: task generate:check
 
       - name: Build
@@ -159,7 +159,7 @@ jobs:
       - name: Build the binaries
         run: task build:cmd
 
-      # TestContainers Postgres integration (ADR-0006); ubuntu runners have Docker.
+      # TestContainers Postgres integration; ubuntu runners have Docker.
       #
       # The QEMU guest lane is inside this target and skips loudly when _output holds
       # no QEMU — which is the case here: qemu.yml builds and publishes it on its own

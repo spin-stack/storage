@@ -99,8 +99,8 @@ source has it, and verifies before booting anything with it.**
 - **This does not make CI run the lane on its own.** The kernel was one of two missing
   inputs; QEMU is the other, and it is a different problem — the binaries are dynamically
   linked against what the runtime image provides, so extracting them onto a bare runner
-  and executing them is not enough. That is recorded as open in `STATUS.md`, not solved
-  here.
+  and executing them is not enough. **Decided separately on 2026-08-02 by ADR-0025**:
+  the lane runs inside the published runtime image as a container job.
 - **If spinbox later publishes the kernel itself, nothing here has to be undone.**
   `GUEST_KERNEL_IMAGE` points at spinbox's package instead of ours and the mirror becomes
   redundant — which is the outcome to prefer, and the reason the pin lives here rather

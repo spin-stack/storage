@@ -1,7 +1,7 @@
 //go:build integration
 
 // Integration tests for the pg metadata adapter against a real Postgres 18 via
-// TestContainers (ADR-0006, ADR-0007). It builds the database from
+// TestContainers (ADR-0007). It builds the database from
 // internal/schema/schema.sql — the declared state that is the source of truth
 // (ADR-0019) — so what these tests run against is the artefact sqlc generates from
 // and `task db:verify` checks, not a replay that could have drifted from it. Run

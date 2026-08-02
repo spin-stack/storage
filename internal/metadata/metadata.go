@@ -2,11 +2,21 @@
 // snapshots, hosts/capacity, reconciliation operations, and CP terms (§7, §8). It is
 // NOT the authority for the durable point of data (that is S3, §5.8).
 //
-// It is reached through a Store interface with two implementations (ADR-0006):
-// metadata/sim (in-memory, deterministic — for DST fencing proofs under partitions
-// and clock drift) and metadata/pg (a thin adapter over sqlc-generated queries on
-// pgx/v5, verified by TestContainers). Every mutating operation is guarded by the
-// Control Plane term; a zombie CP affects 0 rows and gets ErrStaleTerm.
+// It is reached through a Store interface with two implementations, and the reason is
+// not symmetry:
+//
+//   - metadata/sim — in-memory and deterministic. The §12 fencing protocol is *proven*
+//     here, under injected partitions and clock drift, and a real PostgreSQL cannot be
+//     deterministic under either. That is the whole constraint: the DST harness must be
+//     able to prove fencing without Docker, on any machine, reproducibly from a seed.
+//   - metadata/pg — the production path: a thin adapter over sqlc-generated queries on
+//     pgx/v5, verified against a real PostgreSQL 18 by TestContainers.
+//
+// Rejected: one real PostgreSQL serving both. It would make the fencing proof
+// non-reproducible, which is the single property that proof exists to have.
+//
+// Every mutating operation is guarded by the Control Plane term; a zombie CP affects 0
+// rows and gets ErrStaleTerm.
 package metadata
 
 import (

@@ -4,11 +4,11 @@
 - **Date:** 2026-07-25
 - **Deciders:** human (asked for the verification and the wrapper), implementer agent
 - **Implements/Extends:** §6.1 (backend requirements + conformance suite), §24 (S3
-  client as a subsystem), §25.4. Supersedes the follow-up recorded in ADR-0004.
+  client as a subsystem), §25.4.
 
 ## Context
 
-ADR-0004 deferred the S3-backed `objectstore.Store` to Track D and marked the
+Phase 01 shipped a filesystem-backed `objectstore.Store` and deferred the S3-backed one, marking the
 `If-Match`/`If-None-Match` support of the target backends as *Unverified*. Two
 questions had to be answered before building on it: is the official AWS SDK the right
 client for a non-AWS backend, and does RustFS actually implement the conditional

@@ -1,5 +1,5 @@
 // Package metadatatest is the shared contract every metadata.Store implementation
-// must satisfy. It exists because the two implementations (ADR-0006) carry two
+// must satisfy. It exists because the two implementations carry two
 // different kinds of proof: metadata/sim carries the DST fencing and idempotency
 // scenarios, metadata/pg carries production. A property proven against the sim is
 // only a proof about production if both answer the same way — same branch taken,
