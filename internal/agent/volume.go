@@ -437,13 +437,23 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	}
 
 	var log *wal.Log
-	// A volume needs a base fetched from the object store in two cases, and they are
-	// not the same case: it is *resuming* (its own objects hold what truncation
-	// reclaimed), or it is a *clone* (its parent's objects hold everything it has not
-	// written itself). A clone has no local segments at all, so keying this on
-	// `resuming` alone left the parent view unfetched and the clone reading zeros.
+	// Every volume with an object store behind it needs its read view built from that
+	// store. There is no case where the local segments are the whole truth:
+	//
+	//   - *resuming* — its own objects hold what truncation reclaimed;
+	//   - a *clone* — its parent's objects hold everything it has not written itself;
+	//   - and the one that cost the most to find: a volume **promoted to this host**
+	//     (§12.3, a drain or a failover) has no local segments and no parent, and
+	//     everything it owns was written by a previous epoch on another machine.
+	//     Keying this on "resuming, or a clone" made a promoted destination serve
+	//     **zeros for its predecessor's whole volume** — no error, no complaint, and
+	//     INV-09's guarantee intact in the object store the Agent never asked.
+	//
+	// A genuinely new volume recovers an empty view, which is the right answer for it,
+	// and costs one LIST. That is the price of not having to decide which of the four
+	// cases this is from the outside.
 	resuming := len(existing) > 0
-	needsBase := resuming || d.GetParentSnapshotId() != ""
+	needsBase := m.deps.Store != nil
 	if needsBase {
 		// The durable point is not passed here: it lives in the object store, and
 		// fetching it now would mean a round trip before the volume could be served.

@@ -38,6 +38,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
 		{Name: "agent-encrypts-what-leaves-the-host", Run: scenarioAgentEncryptsWhatLeavesTheHost},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
+		{Name: "a-promoted-host-reads-the-previous-epoch", Run: scenarioAPromotedHostReadsThePreviousEpoch},
 	}
 }
 
@@ -523,6 +524,14 @@ func lapsedLeaseStopsPublishing(s *Sim, cacheTheLease bool) error {
 	}
 	if err := dev.Flush(ctx); err != nil {
 		return fmt.Errorf("the FLUSH under a valid lease: %w", err)
+	}
+	// A read before the checkpoint, because the read is what waits for the base and a
+	// checkpoint taken while it is pending is declined (wal.BasePending). That used to
+	// apply only to a *resumed* volume; since a promoted destination turned out to need
+	// a base too, every volume with an object store waits for one — and a real Agent
+	// satisfies this ordering by itself, because the guest reads.
+	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
+		return fmt.Errorf("the read that waits for the base: %w", err)
 	}
 	s.Emit(Event{Kind: EventDurableAck, Durable: 4, LeaseValid: lm.Valid()})
 	if err := m.Checkpoint(ctx, volumeID); err != nil {
@@ -1098,6 +1107,122 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 		return fmt.Errorf("clone read %x, the parent wrote %x", got[:8], payload[:8])
 	}
 	s.Notef("clone %s read its parent's bytes through the snapshot, with no data copy", cloneID)
+	return nil
+}
+
+// scenarioAPromotedHostReadsThePreviousEpoch is INV-09 where a guest can see it: every
+// write the fenced writer ACKed as durable must be readable on the host that replaced it.
+//
+// The invariant was never in doubt in the object store — `recovery.DurablePrefix` finds
+// the data, and the drain proves it does. What nothing checked is whether the **Agent on
+// the destination ever asks**. It did not: a promoted volume has no local segments and no
+// parent snapshot, so the Agent skipped the base fetch entirely and served **zeros for
+// its predecessor's whole volume**, with no error anywhere. INV-09 held in S3 and the
+// guest still got nothing.
+//
+// The promotion here is the real sequence, not a shortcut: the previous epoch's writer
+// flushes, and the new epoch gets a recovery point (§12.5) — the immutable boundary that
+// says what it adopted. Without that object the epoch chain is broken and the Agent
+// refuses, which is a different (and correct) behaviour that would have hidden this.
+func scenarioAPromotedHostReadsThePreviousEpoch(s *Sim) error {
+	return aPromotedHostReadsThePreviousEpoch(s, storeIsReachable)
+}
+
+const (
+	storeIsReachable = false
+	// destinationCannotList is how a promoted host is made to see nothing: a listing
+	// that returns no objects for the volume. It is the same fault the truncated-restart
+	// arm uses, and it belongs here too — the destination has *only* the object store,
+	// so a store that answers empty is the whole of its world.
+	destinationCannotList = true
+)
+
+func aPromotedHostReadsThePreviousEpoch(s *Sim, hideObjects bool) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return err
+	}
+	vol := [16]byte(u)
+	payload := bytes.Repeat([]byte{0x42}, 4096)
+
+	// Epoch 1, on the host that is about to be fenced.
+	lm := lease.NewManager(s.Clock, time.Minute)
+	lm.Grant()
+	l := wal.NewLog(s.Disk, "/var/lib/source/wal", s.Clock, vol, 1, wal.Limits{})
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 3), leaseAlways{lm})
+	if _, err := l.Write(0, payload, 0); err != nil {
+		return fmt.Errorf("the fenced writer's write: %w", err)
+	}
+	if err := l.Flush(ctx); err != nil {
+		return fmt.Errorf("the fenced writer's flush: %w", err)
+	}
+	acked := l.Watermarks().Durable
+	if err := l.Close(); err != nil {
+		return err
+	}
+
+	// The promotion's own durable step: epoch 2 records what it adopted from epoch 1
+	// (§12.5). This object is the boundary the chain is read across.
+	if err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, acked); err != nil {
+		return fmt.Errorf("writing the recovery point: %w", err)
+	}
+	s.Notef("epoch 1 ACKed %d; epoch 2's recovery point adopts it", acked)
+
+	// The destination: another host's data directory, no local WAL, epoch 2.
+	var store objectstore.Store = s.Store
+	if hideObjects {
+		store = hidingStore{Store: s.Store}
+		s.Emit(Event{Kind: EventFault, Msg: "the destination's object store lists nothing"})
+	}
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/dest", SocketDir: "/run/spin",
+	}, agent.VolumeManagerDeps{
+		Clock:   s.Clock,
+		Disk:    s.Disk,
+		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper:  simMapper{},
+		EventFD: simEventFD,
+		Store:   store,
+		Lease:   func() bool { return lm.Valid() },
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close() }()
+
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 2,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}); err != nil {
+		return fmt.Errorf("the destination could not start the promoted volume: %w", err)
+	}
+	dev, ok := m.Device(volumeID)
+	if !ok {
+		return errors.New("the promoted volume is not being served on the destination")
+	}
+
+	got := make([]byte, len(payload))
+	_, readErr := dev.ReadAt(got, 0)
+
+	zeros := readErr == nil && bytes.Equal(got, make([]byte, len(got)))
+	s.Emit(Event{Kind: EventDurableRead, Key: volumeID, ZerosAfterRestart: zeros})
+	if zeros {
+		return fmt.Errorf("the promoted host read zeros for a range epoch 1 ACKed as durable (§12.3/INV-09)")
+	}
+	if readErr != nil {
+		if hideObjects {
+			s.Notef("the read was refused rather than answered: %v", readErr)
+			return nil
+		}
+		return fmt.Errorf("the promoted host's read: %w", readErr)
+	}
+	if !bytes.Equal(got, payload) {
+		return fmt.Errorf("the promoted host read %x, epoch 1 wrote %x", got[:8], payload[:8])
+	}
+	s.Notef("the promoted host serves epoch 1's bytes from the object store alone")
 	return nil
 }
 

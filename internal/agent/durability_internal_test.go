@@ -99,6 +99,15 @@ func newSchedRig(t *testing.T, cfg VolumeManagerConfig) *schedRig {
 	if r.v == nil {
 		t.Fatal("the volume did not start")
 	}
+	// Wait for the read view, the way a guest does: every volume with an object store
+	// behind it builds one at start (a resumed volume's own objects, a clone's parent,
+	// a promoted volume's predecessor), and the scheduler declines while it is pending
+	// — a checkpoint taken then compares the store's real durable point against 0 and
+	// reads as a second writer (ADR-0023). A real Agent satisfies this by itself,
+	// because the guest reads.
+	if _, err := r.v.dev.ReadAt(make([]byte, 512), 0); err != nil {
+		t.Fatalf("the read that waits for the base: %v", err)
+	}
 	return r
 }
 

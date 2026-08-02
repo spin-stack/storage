@@ -564,9 +564,35 @@ Four things the implementation turned up:
   parent first made the test pass for the wrong reason, which is how it was written the
   first time.
 
+**And the clone work found a bigger one, on the failover path.** The rule for "does this
+volume need a read view from the object store?" was *resuming, or a clone*. A volume
+**promoted to this host** (§12.3 — a drain, a failover) is neither: no local segments, no
+parent snapshot, and everything it owns written by a previous epoch on another machine.
+The Agent skipped the base fetch entirely and served **zeros for its predecessor's whole
+volume**, with no error anywhere.
+
+INV-09 was never violated in the object store — `recovery.DurablePrefix` finds the data
+and the drain proves it does. What nothing checked is whether the **Agent on the
+destination ever asks**, and it did not. The invariant held and the guest still got
+nothing.
+
+The rule is now "there is an object store", which covers all four cases — resumed, cloned,
+promoted, and genuinely new (which recovers an empty view, the right answer, for one
+LIST). `scenarioAPromotedHostReadsThePreviousEpoch` drives the real promotion sequence,
+recovery point (§12.5) included, and putting the old rule back turns it red on the first
+seed.
+
+Two tests had to learn the ordering that used to apply only to resumed volumes: a
+checkpoint is declined while the base is pending (ADR-0023's false-witness guard), so a
+read comes first. A real Agent satisfies that by itself, because the guest reads.
+
 Still untouched, and no longer on this critical path: snapshot sealing is synchronous
 rather than a background lifecycle, objectization publishes no segment objects, and
-cross-host materialization returns a view the caller discards.
+cross-host materialization is done **on the Control Plane**, where the bytes land in
+memory nobody reads — `CloneCrossHost` has no production caller, and the drain's bulk pass
+warms the Control Plane rather than the destination. With the chain link in place the
+destination's own Agent now builds its view, so what is left there is deleting work rather
+than adding it, plus §22.4's lazy loading for the cold RTO (RISK-04).
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 

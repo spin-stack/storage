@@ -106,3 +106,24 @@ func TestPlantedBugACloneReadsZeros(t *testing.T) {
 		return aCloneReadsThroughItsParent(s, chainLinkDropped)
 	})
 }
+
+// INV-09 where a guest can see it (§12.3): every write the fenced writer ACKed as durable
+// must be readable on the host that replaced it.
+//
+// The invariant was never in doubt in the object store — recovery.DurablePrefix finds the
+// data and the drain proves it. What nothing checked is whether the **Agent on the
+// destination ever asks**. It did not: a promoted volume has no local segments and no
+// parent snapshot, so the base fetch was skipped entirely and the destination served
+// zeros for its predecessor's whole volume, with no error anywhere. INV-09 held in S3 and
+// the guest still got nothing.
+//
+// Planted with a store that lists nothing for the volume — the destination has *only* the
+// object store, so a listing that comes back empty is the whole of its world, and it is
+// the same fault the truncated-restart arm uses. The read must then be refused, not
+// answered with zeros: a guest cannot tell those from a range nobody wrote.
+func TestPlantedBugAPromotedHostReadsZeros(t *testing.T) {
+	requirePasses(t, 27, NewDurableRangeChecker(), scenarioAPromotedHostReadsThePreviousEpoch)
+	plantedBug(t, 27, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
+		return aPromotedHostReadsThePreviousEpoch(s, destinationCannotList)
+	})
+}
