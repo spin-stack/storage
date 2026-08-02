@@ -568,7 +568,20 @@ func (l *Log) Read(offset uint64, buf []byte) error {
 // local segments replayed. It is the seam BUILD-INVENTORY increment 5 exists to add:
 // recovery.Recover and materialize.From* have always produced exactly this object and
 // nothing could consume it.
-func (l *Log) InstallBase(base *cow.IntervalMap) error {
+// InstallBase adopts the read view recovered from the object store, under everything the
+// local segments replayed, and with it the durable sequence that view covers.
+//
+// The watermarks it sets are the point of taking `durable` here rather than at resume:
+//
+//   - durable and published both become the recovered point. Those objects are verified
+//     — that is what made truncating the local WAL legal — so published must say so, or
+//     StrictOrder.AllowTruncate (INV-13) refuses to reclaim ranges the store already
+//     holds and the first checkpoint after a restart republishes finished work.
+//   - local is raised to at least that point. Not bookkeeping: the next append must not
+//     reuse a sequence an object already carries, which is exactly what would happen on
+//     a volume whose local segments were all reclaimed and whose replay therefore found
+//     nothing.
+func (l *Log) InstallBase(base *cow.IntervalMap, durable uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.baseWait == nil {
@@ -581,6 +594,16 @@ func (l *Log) InstallBase(base *cow.IntervalMap) error {
 	}
 	if err := l.view.SetBase(base); err != nil {
 		return fmt.Errorf("wal: installing the base: %w", err)
+	}
+	if durable > l.local {
+		l.local = durable
+		l.start = durable
+	}
+	if durable > l.durable {
+		l.durable = durable
+	}
+	if durable > l.published {
+		l.published = durable
 	}
 	close(l.baseWait)
 	return nil
@@ -623,6 +646,18 @@ func (l *Log) Sync() error {
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// A log resumed awaiting a base may have reads parked on it. Resolving the base as
+	// failed is what lets them leave: without it a shutdown that races the recovery
+	// fetch strands every parked read for the life of the process, and the goroutine
+	// that owed the log an InstallBase may itself be gone.
+	if l.baseWait != nil {
+		select {
+		case <-l.baseWait:
+		default:
+			l.baseErr = errors.New("the log was closed before its base arrived")
+			close(l.baseWait)
+		}
+	}
 	return l.segs.close()
 }
 

@@ -1,7 +1,7 @@
 # Spec — a rebuilt read view has no way in (BUILD-INVENTORY increment 5)
 
-**Status: reviewed 2026-08-01; the `cow` + `wal` half is implemented, the Agent half is
-not — see "What is left" at the bottom.** Durability *and* format review zone, so it was
+**Status: reviewed and implemented, 2026-08-01.** All four decisions taken and built,
+including the Agent half. Durability *and* format review zone, so it was
 reviewed before the code existed.
 
 **Decisions taken:** (1) the seam goes in `cow.IntervalMap` — the type that owns the
@@ -150,19 +150,37 @@ it should allow. Needs deciding as part of the constructor's contract.
 The `cow` and `wal` work is done and green. The Agent's is not, and it is **larger than
 this spec assumed**, because of something found while wiring it:
 
-**`internal/agent/volume.go` calls `wal.NewLog`, never `wal.Resume`. The Agent has never
-resumed a WAL at all.** On a restart it builds an empty log over a root that already has
-segments, leaves them unread, and starts appending at sequence 1. So the Agent half is
-not "fetch a base and install it" — it is:
+**`internal/agent/volume.go` called `wal.NewLog`, never `wal.Resume`. The Agent had never
+resumed a WAL at all** — measured, not argued: write, FLUSH (object verified), restart,
+read → zeros, silently; and the *next* write then failed loudly, because `wal` refuses a
+fresh log over a directory holding segments it did not replay. So nothing was destroyed
+and the volume was merely unusable, but the read that came first was a lie.
 
-1. resume rather than create, when the root already holds segments;
-2. use `ResumeAwaitingBase` and kick off `recovery.Recover` in a goroutine;
-3. `InstallBase` on success, `FailBase` on failure — exactly one of the two, always,
-   including on the paths that return early;
-4. decide what a *fresh* volume does, since it has no objects to recover and must not
-   wait for a base that will never come.
+Done, 2026-08-01. The disk decides, not configuration: a segment directory that already
+holds files means resume. `ResumeAwaitingBase` then serves immediately and
+`fetchBase` recovers in a goroutine, owing the log exactly one `InstallBase` or
+`FailBase` on every path — a log that gets neither parks every read for the life of the
+process. A fresh volume gets `NewLog` and waits for nothing; a local-only Agent
+(no store) fails the base immediately, because its local segments are all there is and
+they have already been replayed.
 
-That is its own increment and its own review.
+**The durable point moved into `InstallBase`** (the fourth decision, taken 2026-08-01).
+`ResumeAwaitingBase` deliberately takes no durable sequence: that number lives in the
+object store, and asking for it up front would mean a round trip before the volume could
+be served — the eager shape this design rejected. It arrives with the base, which is the
+only moment it is known. Until then the log reports `durable = 0`, which understates what
+is durable — the safe direction for every rule that reads it, and true of this process:
+nothing has been verified by anyone here yet.
+
+Installing it raises three watermarks, and the third is the one that is not bookkeeping:
+`durable` and `published` become the recovered point (INV-13 would otherwise refuse to
+reclaim ranges the store already holds), and **`local` is raised to at least it**, so the
+next append cannot reuse a sequence an object already carries — which is exactly what
+would happen on a volume whose local segments had all been reclaimed and whose replay
+therefore found nothing.
+
+`Close` resolves the base as failed if it is still pending, so a shutdown racing the
+recovery fetch never strands a parked read.
 
 ## Tests that must land with it
 

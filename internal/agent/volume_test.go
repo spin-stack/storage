@@ -1,6 +1,8 @@
 package agent_test
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -13,6 +15,7 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
@@ -718,4 +721,147 @@ func TestUnusableVolumeIsRefused(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestARestartedVolumeReadsBackWhatWasFlushed is the whole point of resuming, measured
+// where an operator would feel it. Before this, an Agent restart served zeros for data
+// that had been written, FLUSHed and verified in the object store — silently, because
+// the manager built a fresh wal.NewLog over a directory it never looked at.
+func TestARestartedVolumeReadsBackWhatWasFlushed(t *testing.T) {
+	t.Parallel()
+	d, store := sim.NewDisk(), sim.NewObjectStore()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	v := desiredVolume(t, 1)
+	desired := []*storagev1.DesiredVolume{v}
+
+	newManager := func() *agent.VolumeManager {
+		f := newListenerFactory()
+		m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+		}, agent.VolumeManagerDeps{
+			Clock: clk, Disk: d, Listen: f.listen,
+			Mapper: unusedMapper{}, EventFD: unusedEventFD,
+			Store: store, Lease: func() bool { return true },
+		})
+		if err != nil {
+			t.Fatalf("NewVolumeManager: %v", err)
+		}
+		return m
+	}
+
+	payload := bytes.Repeat([]byte{0xAB}, testBlockSize)
+
+	first := newManager()
+	if err := first.Apply(t.Context(), desired); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	dev, ok := first.Device(v.GetVolumeId())
+	if !ok {
+		t.Fatal("no device")
+	}
+	if _, err := dev.WriteAt(payload, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	if err := dev.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The restart: a new manager, the same disk and store, the same desired state.
+	second := newManager()
+	t.Cleanup(func() { _ = second.Close() })
+	if err := second.Apply(t.Context(), desired); err != nil {
+		t.Fatalf("Apply after restart: %v", err)
+	}
+	dev2, ok := second.Device(v.GetVolumeId())
+	if !ok {
+		t.Fatal("no device after restart")
+	}
+
+	got := make([]byte, len(payload))
+	if _, err := dev2.ReadAt(got, 0); err != nil {
+		t.Fatalf("read after restart: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("read %x after restart, want %x — flushed, verified data was lost", got[:8], payload[:8])
+	}
+
+	// And it can be written to. Before this the next append refused outright, because
+	// a fresh log will not open over segments it did not replay.
+	if _, err := dev2.WriteAt(bytes.Repeat([]byte{0xCD}, testBlockSize), testBlockSize); err != nil {
+		t.Fatalf("write after restart: %v", err)
+	}
+}
+
+// TestARestartedVolumeRefusesToReadWhenTheStoreIsGone is decision 3 where it lands: the
+// base cannot be built, so the volume refuses rather than answering with the zeros it
+// happens to hold.
+func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
+	t.Parallel()
+	d := sim.NewDisk()
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	v := desiredVolume(t, 1)
+	desired := []*storagev1.DesiredVolume{v}
+
+	f := newListenerFactory()
+	first, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+	}, agent.VolumeManagerDeps{
+		Clock: clk, Disk: d, Listen: f.listen,
+		Mapper: unusedMapper{}, EventFD: unusedEventFD,
+	})
+	if err != nil {
+		t.Fatalf("NewVolumeManager: %v", err)
+	}
+	if err := first.Apply(t.Context(), desired); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	writeOneBlock(t, first, v.GetVolumeId())
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The restart, with a store that fails every request.
+	f2 := newListenerFactory()
+	second, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+	}, agent.VolumeManagerDeps{
+		Clock: clk, Disk: d, Listen: f2.listen,
+		Mapper: unusedMapper{}, EventFD: unusedEventFD,
+		Store: newUnreachableStore(), Lease: func() bool { return true },
+	})
+	if err != nil {
+		t.Fatalf("NewVolumeManager: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if err := second.Apply(t.Context(), desired); err != nil {
+		t.Fatalf("Apply after restart: %v", err)
+	}
+	dev, ok := second.Device(v.GetVolumeId())
+	if !ok {
+		t.Fatal("no device after restart")
+	}
+	if _, err := dev.ReadAt(make([]byte, testBlockSize), 0); err == nil {
+		t.Fatal("a read was answered with no recoverable base: the volume served zeros")
+	}
+}
+
+// unreachableStore is an object store that answers nothing, which is what a base that
+// cannot be recovered looks like from the Agent's side. It is backed by a real one so
+// every method it does not override still exists — a nil embedded interface would panic
+// instead of failing, and a panic is not the behaviour under test.
+type unreachableStore struct{ objectstore.Store }
+
+func newUnreachableStore() unreachableStore { return unreachableStore{Store: sim.NewObjectStore()} }
+
+var errStoreUnreachable = errors.New("the object store is unreachable")
+
+func (unreachableStore) List(context.Context, string) ([]objectstore.ObjectInfo, error) {
+	return nil, errStoreUnreachable
+}
+
+func (unreachableStore) Get(context.Context, string) ([]byte, error) {
+	return nil, errStoreUnreachable
 }

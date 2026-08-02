@@ -33,9 +33,9 @@ tracks state.
   eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
   done, and increment 2 — the keystone — is done, review-zone half included**
   (`RUNTIME-FENCING-SPEC.md` records each decision). **Increment 5, view adoption, is
-  half done** (2026-08-01): the `cow` + `wal` seam exists and the hole is closed at that
-  level; the Agent half is specified and not built (`VIEW-ADOPTION-SPEC.md`). Increment 3
-  still must not merge before it.
+  done** (2026-08-01, `VIEW-ADOPTION-SPEC.md`): the seam is in `cow.IntervalMap`, `wal`
+  can adopt a base lazily, and the Agent resumes. **Increment 3, checkpoint and truncate,
+  is now unblocked.**
 
 ## Pick up here
 
@@ -226,8 +226,7 @@ being latent the moment a durability scheduler exists: **a restart would then si
 serve zeros for every truncated range, with no error anywhere.** None of the nine
 `Resume` tests truncates first, which is why the suite is green.
 
-**Closed in `cow` and `wal` on 2026-08-01; still open in the Agent — and an Agent
-restart today is worse than "does not resume".** Measured, not argued: write, FLUSH
+**Closed 2026-08-01, Agent included.** What an Agent restart used to do, measured: write, FLUSH
 (object verified in the store), restart the Agent, read the same offset → **zeros,
 silently**. The object is in the store and the segment is on disk; the Agent looks at
 neither. The next *write* then fails loudly — `wal` refuses a fresh log over a directory
@@ -235,13 +234,13 @@ that already holds unreplayed segments — so **nothing is overwritten and no co
 data is destroyed**, but the volume is unusable until someone resumes it, and the read
 that came first was a silent lie.
 
-**Closed in `cow` and `wal` on 2026-08-01; still open in the Agent.** A layered
+A layered
 `cow.IntervalMap` gives the read view a base, `wal.ResumeAwaitingBase` installs one
 lazily, and a read with no base fails with `ErrBaseUnavailable` instead of answering
-zeros. What is not done is the Agent using any of it — and wiring it turned up that
-**`internal/agent/volume.go` calls `wal.NewLog` and never `wal.Resume`, so the Agent has
-never resumed a WAL at all**: a restart builds an empty log over a root that already
-holds segments and starts appending at sequence 1. See `VIEW-ADOPTION-SPEC.md`.
+zeros. and the Agent now resumes rather than creating whenever the segment directory
+already holds files, recovering the base in the background. A restarted volume reads back
+what was flushed, and refuses to read at all when the base cannot be rebuilt. See
+`VIEW-ADOPTION-SPEC.md`.
 
 **Reproduced 2026-08-01**, and it behaves exactly as described: six segments, flush,
 publish, truncate (five files unlinked), restart — and `Read` at offset 0 returns zeros

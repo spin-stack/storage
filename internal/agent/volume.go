@@ -12,6 +12,7 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/blockdev"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -298,7 +299,34 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	// path — see TestSocketAndWALPathsArePerVolumeAndEpoch, which now asserts the
 	// directory exactly.
 	root := path.Join(m.cfg.DataDir, "wal")
-	log := wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits)
+
+	// Resume, or start fresh. Which one is decided by the disk, not by configuration:
+	// a directory that already holds segments belongs to a previous run of this Agent,
+	// and building a fresh log over it would leave every one of those records unread —
+	// including ones a guest was told were durable. wal refuses that outright, so the
+	// volume would be unusable rather than wrong, but unusable is not the goal.
+	dir := wal.SegmentDir(root, [16]byte(u), uint64(d.GetEpoch()))
+	existing, err := m.deps.Disk.List(dir)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: looking for an existing WAL in %s: %w", id, dir, err)
+	}
+
+	var log *wal.Log
+	resuming := len(existing) > 0
+	if resuming {
+		// The durable point is not passed here: it lives in the object store, and
+		// fetching it now would mean a round trip before the volume could be served.
+		// It arrives with the base (see baseFetch below), which is the only moment it
+		// is known. Until then the log reports durable = 0 — an understatement, which
+		// is the safe direction for every rule that reads it.
+		log, err = wal.ResumeAwaitingBase(m.deps.Disk, root, m.deps.Clock,
+			[16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits, nil)
+		if err != nil {
+			return nil, fmt.Errorf("agent: volume %s: resuming the WAL in %s: %w", id, dir, err)
+		}
+	} else {
+		log = wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits)
+	}
 
 	// Remote mode, and with it the uploader and the §14.4 ACK path. Without a store
 	// the Log stays local: it takes writes and serves reads, and a FLUSH ACKs on
@@ -339,7 +367,45 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	serveCtx, cancel := context.WithCancel(ctx)
 	v.cancel = cancel
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
+	if resuming {
+		go m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()))
+	}
 	return v, nil
+}
+
+// fetchBase rebuilds the read view from the object store and hands it to the log. This
+// is the lazy half of BUILD-INVENTORY increment 5: the volume is already being served,
+// and only its *reads* are waiting on this.
+//
+// It owes the log exactly one InstallBase or FailBase on every path, which is why there
+// is no early return that skips both. A log that gets neither parks every read for the
+// life of the process.
+func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]byte, epoch uint64) {
+	if m.deps.Store == nil {
+		// Local-only mode has no object store to recover from, so the local segments
+		// are all there is and they have already been replayed. Nothing to wait for.
+		v.log.FailBase(errors.New("this Agent has no object store: the read view is whatever the local WAL holds"))
+		return
+	}
+
+	base, durable, err := recovery.Recover(ctx, m.deps.Store, nil, volumeID, epoch)
+	if err != nil {
+		// Refuse loudly rather than serve zeros. An empty view where data belongs is
+		// indistinguishable from a fresh volume, which is the failure this whole
+		// increment exists to make impossible.
+		slog.Error("the volume's read view could not be recovered; its reads will fail",
+			"volume_id", v.id, "epoch", v.epoch, "error", err)
+		v.log.FailBase(err)
+		return
+	}
+	if err := v.log.InstallBase(base, durable); err != nil {
+		slog.Error("the recovered read view could not be installed",
+			"volume_id", v.id, "epoch", v.epoch, "error", err)
+		v.log.FailBase(err)
+		return
+	}
+	slog.Info("read view recovered from the object store",
+		"volume_id", v.id, "epoch", v.epoch, "durable_sequence", durable)
 }
 
 // supervise runs the vhost server and restarts it when it returns.

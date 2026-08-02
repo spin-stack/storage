@@ -65,20 +65,23 @@ func Resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch,
 }
 
 // ResumeAwaitingBase is Resume for a WAL whose local segments may have been truncated:
-// the log's read view is layered, its reads block until InstallBase or FailBase, and
-// `published` starts at the durable point rather than 0.
+// the log's read view is layered and its reads block until InstallBase or FailBase.
 //
-// That last part is a durability rule, not bookkeeping. The base covers everything up to
-// durableInS3 and those objects are verified — that is what made the truncation legal in
-// the first place — so `published` must say so, or StrictOrder.AllowTruncate (INV-13)
-// would refuse to reclaim ranges the object store already holds and the first checkpoint
-// after a restart would republish work already published.
+// It takes no durable point, deliberately. That number lives in the object store, and
+// asking for it here would mean a store round trip before the volume could be served —
+// the eager shape this design rejected. It arrives with the base instead, in InstallBase,
+// which is the only moment it is known and the only moment it can be trusted.
+//
+// Until then the log reports durable = 0. That understates what is durable, which is the
+// safe direction for every rule that reads it, and it is true of *this process*: nothing
+// has been verified by anyone here yet.
 //
 // The caller owes the returned log exactly one InstallBase or FailBase. Both are safe to
 // call from another goroutine, which is what makes the fetch lazy: the volume is served
-// immediately and only its *reads* wait.
-func ResumeAwaitingBase(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption) (*Log, error) {
-	return resume(d, root, clk, volumeID, epoch, durableInS3, limits, enc, true)
+// immediately and only its *reads* wait. Close resolves the base too, so a shutdown
+// never strands a read.
+func ResumeAwaitingBase(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch uint64, limits Limits, enc *Encryption) (*Log, error) {
+	return resume(d, root, clk, volumeID, epoch, 0, limits, enc, true)
 }
 
 func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption, awaitBase bool) (*Log, error) {
@@ -89,7 +92,6 @@ func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch,
 		// afterwards would uncover exactly the range the guest discarded.
 		l.view = cow.NewIntervalMapOver(nil)
 		l.baseWait = make(chan struct{})
-		l.published = durableInS3
 	}
 	l.enc = enc
 	l.replayed = true

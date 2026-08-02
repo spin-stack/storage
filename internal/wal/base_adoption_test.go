@@ -75,20 +75,20 @@ func truncatedVolume(t *testing.T) (*sim.Disk, *sim.ObjectStore, *sim.Clock, [16
 // TestAResumedVolumeReadsWhatTruncationReclaimed is the hole, closed.
 func TestAResumedVolumeReadsWhatTruncationReclaimed(t *testing.T) {
 	ctx := t.Context()
-	d, store, clk, vol, durable, payload := truncatedVolume(t)
+	d, store, clk, vol, _, payload := truncatedVolume(t)
 
-	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1, durable,
+	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1,
 		wal.Limits{SegmentBytes: baseTestSegmentBytes}, nil)
 	if err != nil {
 		t.Fatalf("ResumeAwaitingBase: %v", err)
 	}
 	defer func() { _ = l.Close() }()
 
-	base, _, err := recovery.Recover(ctx, store, nil, vol, 1)
+	base, recovered, err := recovery.Recover(ctx, store, nil, vol, 1)
 	if err != nil {
 		t.Fatalf("recovery.Recover: %v", err)
 	}
-	if err := l.InstallBase(base); err != nil {
+	if err := l.InstallBase(base, recovered); err != nil {
 		t.Fatalf("InstallBase: %v", err)
 	}
 
@@ -101,11 +101,18 @@ func TestAResumedVolumeReadsWhatTruncationReclaimed(t *testing.T) {
 			got[:8], payload[:8])
 	}
 
-	// Published starts at the base, not at 0: those objects are verified, which is what
-	// made the truncation legal, and INV-13 would otherwise refuse to reclaim ranges the
-	// object store already holds.
-	if w := l.Watermarks(); w.Published != durable {
-		t.Errorf("published=%d after resuming at durable=%d", w.Published, durable)
+	// The base brings the watermarks with it. published lands on the recovered point
+	// because those objects are verified — which is what made the truncation legal, and
+	// INV-13 would otherwise refuse to reclaim ranges the store already holds — and
+	// local is raised to at least it, so the next append cannot reuse a sequence an
+	// object already carries.
+	w := l.Watermarks()
+	if w.Published != recovered || w.Durable != recovered {
+		t.Errorf("watermarks %+v after installing a base covering sequence %d", w, recovered)
+	}
+	if w.Local < recovered {
+		t.Errorf("local=%d is below the recovered point %d: the next append would reuse a sequence",
+			w.Local, recovered)
 	}
 }
 
@@ -114,9 +121,9 @@ func TestAResumedVolumeReadsWhatTruncationReclaimed(t *testing.T) {
 // belongs are indistinguishable from a fresh volume, and that is the failure mode this
 // whole increment exists to remove.
 func TestAResumedVolumeRefusesToServeZerosWhenTheBaseIsLost(t *testing.T) {
-	d, _, clk, vol, durable, payload := truncatedVolume(t)
+	d, _, clk, vol, _, payload := truncatedVolume(t)
 
-	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1, durable,
+	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1,
 		wal.Limits{SegmentBytes: baseTestSegmentBytes}, nil)
 	if err != nil {
 		t.Fatalf("ResumeAwaitingBase: %v", err)
@@ -139,9 +146,9 @@ func TestAResumedVolumeRefusesToServeZerosWhenTheBaseIsLost(t *testing.T) {
 // between a guest and a wrong answer is that its read blocks.
 func TestReadsWaitForTheBaseRatherThanAnsweringEarly(t *testing.T) {
 	ctx := t.Context()
-	d, store, clk, vol, durable, payload := truncatedVolume(t)
+	d, store, clk, vol, _, payload := truncatedVolume(t)
 
-	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1, durable,
+	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1,
 		wal.Limits{SegmentBytes: baseTestSegmentBytes}, nil)
 	if err != nil {
 		t.Fatalf("ResumeAwaitingBase: %v", err)
@@ -158,11 +165,11 @@ func TestReadsWaitForTheBaseRatherThanAnsweringEarly(t *testing.T) {
 	default:
 	}
 
-	base, _, err := recovery.Recover(ctx, store, nil, vol, 1)
+	base, recovered, err := recovery.Recover(ctx, store, nil, vol, 1)
 	if err != nil {
 		t.Fatalf("recovery.Recover: %v", err)
 	}
-	if err := l.InstallBase(base); err != nil {
+	if err := l.InstallBase(base, recovered); err != nil {
 		t.Fatalf("InstallBase: %v", err)
 	}
 
@@ -191,7 +198,7 @@ func TestADiscardIsNotUndoneByTheBase(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := [16]byte{0x78}
 
-	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1, 0, wal.Limits{}, nil)
+	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1, wal.Limits{}, nil)
 	if err != nil {
 		t.Fatalf("ResumeAwaitingBase: %v", err)
 	}
@@ -200,7 +207,7 @@ func TestADiscardIsNotUndoneByTheBase(t *testing.T) {
 	if _, err := l.Discard(0, 4096); err != nil {
 		t.Fatalf("Discard: %v", err)
 	}
-	if err := l.InstallBase(base); err != nil {
+	if err := l.InstallBase(base, 0); err != nil {
 		t.Fatalf("InstallBase: %v", err)
 	}
 
