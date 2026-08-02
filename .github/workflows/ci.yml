@@ -8,6 +8,93 @@ permissions:
   contents: read
 
 jobs:
+  # Does the pinned QEMU runtime image exist? It is built by qemu.yml, not here — the
+  # build takes tens of minutes and runs only when its inputs change — so a fresh clone
+  # has no image to run the guest lane against. Rather than fail the gate for a reason
+  # that has nothing to do with the code, the lane below is skipped, visibly, with this
+  # job's output as the reason (ADR-0025).
+  guest-lane-image:
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+      image: ${{ steps.check.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Task
+        uses: go-task/setup-task@v2
+
+      - name: Look for the pinned image
+        id: check
+        run: |
+          # The version comes from the Taskfile, never from a literal here: two places
+          # to bump is how CI and production end up on different QEMUs.
+          version="$(task qemu:version)"
+          image="ghcr.io/${{ github.repository }}/qemu:${version}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          if docker manifest inspect "${image}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${image} is not published; the guest lane will be skipped. Run the QEMU workflow to build it."
+          fi
+
+  # The one test that proves a *real Linux kernel* issues VIRTIO_BLK_T_FLUSH and that our
+  # answer satisfies fsync(2). It runs inside the published runtime image because QEMU is
+  # dynamically linked against what that image provides — the list lives in
+  # Dockerfile.qemu, and installing it a second time here is two lists that drift, with
+  # the drift presenting as a QEMU that will not start (ADR-0025).
+  #
+  # Its own job, not part of `ci`: `ci` needs Docker for TestContainers and the e2e lane,
+  # which a container job would need Docker-in-Docker to keep. This lane needs none — QEMU,
+  # a kernel and an initramfs are files.
+  guest-lane:
+    needs: guest-lane-image
+    if: needs.guest-lane-image.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.guest-lane-image.outputs.image }}
+      # The image's ENTRYPOINT is qemu-system-x86_64; a job needs a shell instead.
+      options: --entrypoint /bin/bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Task
+        uses: go-task/setup-task@v2
+
+      # The image lays QEMU out as /usr/local/bin + /usr/share/spin-stack/qemu; the lane
+      # expects <root>/bin + <root>/share/spin-stack/qemu and reads QEMU_OUTPUT_DIR to
+      # find it. Symlinks rather than copies: a copy is a second thing that can be stale.
+      - name: Point the lane at the image's QEMU
+        run: |
+          set -euo pipefail
+          mkdir -p _output/share
+          ln -sfn /usr/local/bin _output/bin
+          ln -sfn /usr/share/spin-stack _output/share/spin-stack
+          task qemu:verify
+
+      # The guest's two inputs: the kernel pinned by sha256 (ADR-0022) and the initramfs
+      # built from integration/guestinit. guest:verify asserts both before booting.
+      - name: Fetch the pinned kernel and build the initramfs
+        run: |
+          task fetch:kernel
+          task build:guest
+          task guest:verify
+
+      # No /dev/kvm on a GitHub runner, so the guest boots under TCG — minutes, not the
+      # ~1.1s a developer machine takes. The lane's own -timeout 15m accounts for it.
+      - name: Guest lane (a real Linux kernel issues FLUSH)
+        run: task test:integration:qemu
+
   ci:
     runs-on: ubuntu-latest
     steps:

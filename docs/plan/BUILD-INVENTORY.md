@@ -145,8 +145,14 @@ This also unblocks every drain destination and cross-host move.
 
 > Pulled forward, because spinbox already builds a kernel and already demonstrates a
 > static Go init (`cmd/vminitd`) — the estimate below assumed both had to be built.
-> `task build:guest` + `task guest:verify` exist and a Linux guest boots the lane in
-> ~1.1 s under TCG, reports a verdict and powers off.
+> `task build:guest` + `task guest:verify` exist and build the guest's two inputs.
+>
+> **Correction (2026-08-02, DEV-0018):** this note also claimed "a Linux guest boots the
+> lane in ~1.1 s under TCG, reports a verdict and powers off". **No test did that** — no
+> Go file in the tree referenced the kernel or the initramfs, and every test under
+> `integration/vhost` boots a 512-byte boot sector under SeaBIOS. The lane now exists
+> (`TestALinuxGuestIssuesFLUSH`) and is skipped: a real kernel hangs on its first block
+> request. See STATUS.md.
 >
 > **The firmware row below is wrong and was reverted.** `-kernel` never needed
 > `linuxboot_dma.bin`: spinbox's kernel is an ELF with Xen PVH notes and QEMU enters it

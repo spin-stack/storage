@@ -47,11 +47,18 @@ const (
 )
 
 func main() {
-	// Best-effort: the verdict goes to the console either way, and a guest that cannot
-	// mount /proc can still open a block device.
+	// Best-effort: a guest that cannot mount /proc can still open a block device.
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+	// devtmpfs is not best-effort in one respect: it is what creates /dev/console.
+	// The initramfs is built by an unprivileged `cpio`, so it contains no device
+	// nodes, and the kernel therefore could not open an initial console for PID 1 —
+	// it warns and execs init with *no stdio at all*. Every line this program printed
+	// went to a closed descriptor, and the lane saw a guest that booted, said nothing
+	// and hung. Mounting devtmpfs is what makes the console exist; opening it is the
+	// next line.
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
+	openConsole()
 
 	if err := run(); err != nil {
 		report("%s %v", verdictFail, err)
@@ -110,13 +117,33 @@ func run() error {
 	return nil
 }
 
-// report writes a line to the console. It goes to fd 1, which the kernel wires to
-// console= — the host reads it off the serial port.
+// console is where the verdict goes. It is opened explicitly rather than assumed,
+// because PID 1 in an initramfs with no device nodes is handed no stdio: the kernel
+// prints "unable to open an initial console" and execs init anyway.
+var console *os.File
+
+// openConsole points the verdict at /dev/console, which devtmpfs has just created. It
+// is deliberately quiet on failure: there would be nowhere to report the failure to,
+// and the host's timeout is the honest signal that the guest could not speak.
+func openConsole() {
+	if f, err := os.OpenFile("/dev/console", os.O_WRONLY, 0); err == nil {
+		console = f
+		return
+	}
+	// A kernel that *did* give us stdio (a console node baked into the image) still
+	// works: fd 1 is then the console it opened.
+	console = os.Stdout
+}
+
+// report writes a line to the console — the serial port the host is reading.
 func report(format string, args ...any) {
-	fmt.Printf(format+"\n", args...)
+	if console == nil {
+		console = os.Stdout
+	}
+	_, _ = fmt.Fprintf(console, format+"\n", args...)
 	// PID 1 has no one to flush its buffers on exit, and an unflushed verdict is an
 	// invisible one.
-	_ = os.Stdout.Sync()
+	_ = console.Sync()
 }
 
 // powerOff halts the machine. PID 1 returning would panic the kernel, which the host

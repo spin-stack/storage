@@ -194,7 +194,8 @@ audit. The build order for all of it is `BUILD-INVENTORY.md`.
 reachable from both binaries and signs its requests — it never did, `s3.New` resolves no
 credential chain, so every request had been going out unsigned; a bad `-host-id` fails on
 the flag instead of writing zero rows forever; a failing reconciliation cycle now says so
-with its backoff; a volume can be provisioned; and a Linux guest boots the lane. See
+with its backoff; and a volume can be provisioned. (An earlier revision of this line also
+claimed "a Linux guest boots the lane". It did not: see DEV-0018.) See
 `BUILD-INVENTORY.md` for what each increment covered.
 
 **Landed 2026-07-28** (ADR-0022): the guest kernel is fetched into
@@ -483,7 +484,8 @@ has never been driven by a guest, and two blockers stand in front of it — both
 neither deep:
 
 1. ~~No guest in the lane can emit a FLUSH~~ **cleared 2026-07-27** (`e8bbdab`,
-   `cef9881`). A real Linux guest boots the lane in ~1.1 s under TCG, runs a static Go
+   `cef9881`). **Corrected 2026-08-02 (DEV-0018): no test did this.** The claim was that a real Linux
+   guest boots the lane in ~1.1 s under TCG, running a static Go
    `/init`, and reports a verdict before powering itself off. `task build:guest` builds
    the initramfs; `task guest:verify` checks it and the kernel.
    **The blocker was never the firmware.** The audit said `-kernel` was impossible
@@ -523,6 +525,54 @@ segment: a format change of its own.
 segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
+
+## DEV-0018 — the Linux guest lane never existed, and the guest hangs on its first I/O
+
+**A stop signal, recorded rather than worked around.** Two findings, and the second is
+only visible because of the first.
+
+**1. Three documents claimed a lane that no test performed.** `STATUS.md` (twice) and
+`BUILD-INVENTORY.md` said increment 7 was mostly done because "a Linux guest boots the
+lane in ~1.1 s under TCG, reports a verdict and powers off". The artefacts are real —
+`task build:guest` builds the initramfs, `task fetch:kernel` pins the kernel, and
+`task guest:verify` asserts both — but **no Go file in the tree referenced either of
+them**. Every test under `integration/vhost` boots a 512-byte boot sector under SeaBIOS,
+which reaches the backend through INT 13h, and INT 13h has no flush verb. So the FLUSH
+those tests observe is one the *test* issued, never one a guest asked for — which is the
+exact gap `integration/guestinit` was written to close.
+
+It was found by trying to give CI that lane (ADR-0025) and asking what it would run.
+
+**2. With the lane written, a real kernel hangs on its first block request.**
+`TestALinuxGuestIssuesFLUSH` boots the pinned kernel with `guestinit` as PID 1. The
+kernel boots, `virtio_blk` registers the device and reports the right capacity — so the
+vhost-user handshake, the memory tables and GET_CONFIG are all correct — and then it
+stops. The last line is always:
+
+```
+virtio_blk virtio0: [vda] 32768 512-byte logical blocks (16.8 MB/16.0 MiB)
+```
+
+No partition scan, no `Freeing unused kernel memory`, no init output, no panic. It sits
+there until the timeout.
+
+**What is ruled out so far:** the initramfs is a valid static `/init`; `VIRTIO_RING_F_INDIRECT_DESC`
+*is* offered; the call (interrupt) eventfd *is* signalled by `queueLoop.drain` when
+`ProcessQueue` reports completions with `notify`. What is not ruled out is where the
+difference between SeaBIOS and Linux actually lies — SeaBIOS **polls** the used ring and
+never waits for an interrupt, so every passing test in this lane is blind to a completion
+path a sleeping driver depends on. That is the first place to look.
+
+**One real fix already landed on the way:** the initramfs is built by an unprivileged
+`cpio` and therefore contains no device nodes, so the kernel could not open an initial
+console and handed PID 1 **no stdio at all** — every line `guestinit` printed went to a
+closed descriptor. It now mounts devtmpfs and opens `/dev/console` explicitly. That was
+masking the hang as silence.
+
+The test is committed and **skipped, with the reason as its skip message**. Skipped rather
+than deleted because the test is not what is wrong; skipped rather than left red because a
+red gate everyone knows about stops being a gate. Deleting it would put the tree back
+where it was — a guest built, verified, and booted by nothing.
 
 ## ~~DEV-0017~~ — the Agent wrote its WAL one level below where it was told *(resolved 2026-08-02)*
 
