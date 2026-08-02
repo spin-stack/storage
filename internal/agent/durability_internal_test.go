@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,7 +159,7 @@ func TestNoCheckpointWithoutAValidLease(t *testing.T) {
 	r.write(t, 8192)
 	r.lease = false
 
-	if r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test") {
+	if ran, _ := r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test"); ran {
 		t.Fatal("a checkpoint was published with no valid lease (§12.6)")
 	}
 	keys, _ := r.store.List(t.Context(), "checkpoints/")
@@ -177,12 +178,13 @@ func TestBackgroundYieldsToTheGuest(t *testing.T) {
 	r.write(t, 8192)
 
 	sched.Begin(ioclass.Foreground) // the guest is mid-request
-	if r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test") {
+	if ran, _ := r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test"); ran {
 		t.Fatal("a checkpoint ran while a foreground op was in flight (INV-17)")
 	}
 	sched.End(ioclass.Foreground)
 
-	if !r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test") {
+	if ran, err := r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test"); !ran {
+		t.Logf("checkpoint error: %v", err)
 		t.Fatal("the checkpoint did not run once the guest was done")
 	}
 }
@@ -200,7 +202,8 @@ func TestACheckpointReclaimsTheLocalWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test") {
+	if ran, err := r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test"); !ran {
+		t.Logf("checkpoint error: %v", err)
 		t.Fatal("the checkpoint did not run")
 	}
 
@@ -261,5 +264,83 @@ func TestATransientFailureIsRetried(t *testing.T) {
 
 	if _, ok := r.m.Device(id); !ok {
 		t.Fatal("the volume was torn down over a transient checkpoint failure")
+	}
+}
+
+// TestCheckpointSaysWhyItDeclined. The scheduler declines for three reasons and they are
+// not interchangeable: a pending base clears on its own, a lapsed lease is fencing, and a
+// denied budget means the guest is busy. An explicit Checkpoint has to say which — the
+// first version returned "did not run" and swallowed the cause, which is how the base
+// interaction below stayed invisible until a DST run tripped over it.
+func TestCheckpointSaysWhyItDeclined(t *testing.T) {
+	r := newSchedRig(t, VolumeManagerConfig{})
+	id := r.v.id
+
+	r.lease = false
+	err := r.m.Checkpoint(t.Context(), id)
+	if err == nil {
+		t.Fatal("an explicit checkpoint succeeded with no lease")
+	}
+	if !strings.Contains(err.Error(), "lease") {
+		t.Errorf("the refusal does not name the lease: %v", err)
+	}
+
+	if err := r.m.Checkpoint(t.Context(), ids.New().String()); err == nil {
+		t.Error("a checkpoint was accepted for a volume this host does not serve")
+	}
+}
+
+// TestNoCheckpointWhileTheBaseIsPending is the interaction a DST run caught: a resumed
+// log reports durable = 0 until its base arrives, so a checkpoint taken in that window
+// raises ErrDurablePointMismatch — which ADR-0023 reads as "another writer is in this
+// epoch" and acts on by fencing. A healthy host would fence itself out of its own volume
+// on every restart.
+func TestNoCheckpointWhileTheBaseIsPending(t *testing.T) {
+	r := newSchedRig(t, VolumeManagerConfig{})
+
+	pending, err := wal.ResumeAwaitingBase(sim.NewDisk(), "wal", r.clk, r.vol, 1, wal.Limits{}, nil)
+	if err != nil {
+		t.Fatalf("ResumeAwaitingBase: %v", err)
+	}
+	defer func() { _ = pending.Close() }()
+	r.v.log = pending
+
+	ran, cerr := r.m.checkpointOnce(t.Context(), r.v, r.vol, 1, "test")
+	if ran {
+		t.Fatal("a checkpoint ran while the volume was still recovering its read view")
+	}
+	if cerr != nil {
+		t.Errorf("a pending base is a decline, not a failure: %v", cerr)
+	}
+}
+
+// TestCheckpointsNeedAStoreAndAnIdentity. A local-only Agent has nothing to publish into,
+// and a checkpoint with no host id is an unattributable publication into an epoch —
+// which is precisely what §12.4's ownership check cannot verify. Both are refused before
+// a scheduler is ever started, and the reason is logged once rather than every poll.
+func TestCheckpointsNeedAStoreAndAnIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		mut  func(*VolumeManager)
+		want string
+	}{
+		{"no object store", func(m *VolumeManager) { m.deps.Store = nil }, "object store"},
+		{"no host id", func(m *VolumeManager) { m.cfg.HostID = "" }, "host id"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newSchedRig(t, VolumeManagerConfig{})
+			if err := r.m.checkpointsEnabled(); err != nil {
+				t.Fatalf("a fully wired manager cannot checkpoint: %v", err)
+			}
+			tc.mut(r.m)
+			err := r.m.checkpointsEnabled()
+			if err == nil {
+				t.Fatal("a scheduler was allowed with a missing dependency")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not name %q", err, tc.want)
+			}
+		})
 	}
 }

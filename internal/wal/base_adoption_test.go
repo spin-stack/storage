@@ -219,3 +219,45 @@ func TestADiscardIsNotUndoneByTheBase(t *testing.T) {
 		t.Fatalf("a discarded range came back as %x: the base undid the DISCARD (§14.6)", got[:8])
 	}
 }
+
+// TestBasePendingIsTrueOnlyWhileTheBaseIsAwaited exists because of what it prevents. A
+// resumed log reports durable = 0 until its base arrives, and a durability scheduler that
+// checkpoints in that window compares the object store's real durable point against 0 and
+// concludes another writer is in the epoch — fencing a healthy host out of its own volume
+// on every restart (ADR-0023 acting on a false witness). The scheduler asks this.
+func TestBasePendingIsTrueOnlyWhileTheBaseIsAwaited(t *testing.T) {
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+
+	plain := wal.NewLog(sim.NewDisk(), "wal", clk, [16]byte{0x91}, 1, wal.Limits{})
+	defer func() { _ = plain.Close() }()
+	if plain.BasePending() {
+		t.Error("a log that was never resumed is waiting for a base")
+	}
+
+	d := sim.NewDisk()
+	l, err := wal.ResumeAwaitingBase(d, "wal", clk, [16]byte{0x92}, 1, wal.Limits{}, nil)
+	if err != nil {
+		t.Fatalf("ResumeAwaitingBase: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	if !l.BasePending() {
+		t.Fatal("a log resumed awaiting a base does not report it as pending")
+	}
+	if err := l.InstallBase(cow.NewIntervalMap(), 0); err != nil {
+		t.Fatalf("InstallBase: %v", err)
+	}
+	if l.BasePending() {
+		t.Error("the base is still pending after it was installed")
+	}
+
+	// A failed base resolves it too: the reads stop waiting, they just fail.
+	l2, err := wal.ResumeAwaitingBase(d, "wal2", clk, [16]byte{0x93}, 1, wal.Limits{}, nil)
+	if err != nil {
+		t.Fatalf("ResumeAwaitingBase: %v", err)
+	}
+	defer func() { _ = l2.Close() }()
+	l2.FailBase(errors.New("the store is gone"))
+	if l2.BasePending() {
+		t.Error("the base is still pending after the attempt failed")
+	}
+}

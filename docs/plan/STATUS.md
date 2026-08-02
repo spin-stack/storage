@@ -41,6 +41,9 @@ tracks state.
   behind a valid lease (§12.6) and the background io-class budget (INV-17), then
   truncates to *published*. **Local WAL is reclaimed for the first time in this
   repository's history** — before it, `published` stayed 0 for the life of the process.
+  **Two things are still open on it:** the DST arm that drives the scheduler (the existing
+  restart arm still truncates by hand), and the planted bug the spec asked for turned out
+  to be unreachable — see below.
 
 ## Pick up here
 
@@ -194,6 +197,32 @@ asserts a host-side package under `integration/` is still flagged — because wh
 the exemption is *"runs inside the guest"*, not *"lives under `integration/`"*, and an
 exemption that widened to the directory would quietly unsimulate the lane that drives
 QEMU.
+
+## The durability scheduler's two loose ends
+
+**A false fencing witness, found and fixed.** A resumed log reports `durable = 0` until
+its base arrives (increment 5's lazy recovery), and a checkpoint taken in that window
+compares the object store's real durable point against 0 and raises
+`ErrDurablePointMismatch` — which **ADR-0023 reads as "another writer is in this epoch"
+and acts on by fencing**. A healthy host would have fenced itself out of its own volume on
+every restart. `wal.Log.BasePending` now gates the scheduler, and it is covered by a test
+in each package. It was a DST run that tripped over it, which is the argument for the arm
+below.
+
+**The DST arm is not done.** Rewriting `scenarioTruncatedVolumeSurvivesARestart` to drive
+the real scheduler instead of truncating by hand was started and reverted: the mandatory
+set passed, but the planted bug (a store that lists nothing) stopped firing and the cause
+was not diagnosed. The arm as committed still truncates by hand, so the scheduler's
+*decision* is covered by unit tests and by nothing simulated. **Finish this before
+increment 4.**
+
+**The planted bug the spec asked for does not exist.** It proposed "a scheduler that
+truncates to `durable` rather than `published`". That is unreachable:
+`StrictOrder.AllowTruncate` refuses `upTo > published` at the source, so the mistake
+cannot be made through the API. The invariant is enforced where it should be, and the
+planted bug for this arm has to be something else — the honest candidate is a checkpoint
+published without the lease gate (§12.6), which is reachable and which no checker
+currently watches.
 
 ## The guest lane in CI: QEMU is the input that is still missing
 

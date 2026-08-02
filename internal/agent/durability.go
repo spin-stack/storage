@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/checkpoint"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/simio/clock"
 )
@@ -60,7 +61,7 @@ func (m *VolumeManager) checkpointLoop(ctx context.Context, v *Volume, volumeID 
 		if !due {
 			continue
 		}
-		if m.checkpointOnce(ctx, v, volumeID, epoch, why) {
+		if ran, _ := m.checkpointOnce(ctx, v, volumeID, epoch, why); ran {
 			last = m.deps.Clock.Now()
 		}
 	}
@@ -93,30 +94,80 @@ func (m *VolumeManager) checkpointDue(v *Volume, last clock.Instant) (bool, stri
 	return local >= limit, "bytes"
 }
 
+// Checkpoint publishes a checkpoint for one volume now and reclaims what it covers,
+// instead of waiting for a trigger. It is what a drain calls before moving a volume, and
+// what a test calls instead of driving the clock.
+//
+// It goes through exactly the same gates as the scheduler — lease, io-class, the same
+// failure classification — because a second path to publication is a second place for the
+// §12.6 lease rule to be forgotten.
+func (m *VolumeManager) Checkpoint(ctx context.Context, volumeID string) error {
+	m.mu.Lock()
+	v, ok := m.volumes[volumeID]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("agent: volume %s is not being served here", volumeID)
+	}
+	if err := m.checkpointsEnabled(); err != nil {
+		return fmt.Errorf("agent: volume %s cannot checkpoint: %w", volumeID, err)
+	}
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return err
+	}
+	ran, err := m.checkpointOnce(ctx, v, [16]byte(u), uint64(v.epoch), "explicit")
+	if err != nil {
+		return fmt.Errorf("agent: the checkpoint for volume %s failed: %w", volumeID, err)
+	}
+	if !ran {
+		// Declined rather than failed. Which of the three it was matters to whoever
+		// called: a pending base clears on its own, a lapsed lease is fencing, and a
+		// denied budget means the guest is busy.
+		switch {
+		case v.log.BasePending():
+			return fmt.Errorf("agent: volume %s is still recovering its read view", volumeID)
+		case m.deps.Lease != nil && !m.deps.Lease():
+			return fmt.Errorf("agent: volume %s has no valid lease to publish under (§12.6)", volumeID)
+		default:
+			return fmt.Errorf("agent: volume %s yielded to the guest (INV-17)", volumeID)
+		}
+	}
+	return nil
+}
+
 // checkpointOnce publishes a checkpoint and reclaims what it covers. It reports whether
 // the checkpoint was actually taken, so a skipped cycle does not reset the interval.
-func (m *VolumeManager) checkpointOnce(ctx context.Context, v *Volume, volumeID [16]byte, epoch uint64, why string) bool {
+func (m *VolumeManager) checkpointOnce(ctx context.Context, v *Volume, volumeID [16]byte, epoch uint64, why string) (bool, error) {
 	// §12.6: a SELF_FENCED Agent "deja de publicar checkpoints/manifests". The lease is
 	// checked here, on top of the epoch verification inside Create, because the two fail
 	// differently — the epoch object is a network read that can be served stale, the
 	// lease is local and monotonic — and the cheap one is the one that would otherwise
 	// not be made.
 	if m.deps.Lease != nil && !m.deps.Lease() {
-		return false
+		return false, nil
+	}
+
+	// A resumed log reports durable = 0 until its base arrives (see wal.BasePending).
+	// Checkpointing in that window compares the store's real durable point against 0
+	// and raises ErrDurablePointMismatch — which ADR-0023 reads as "another writer is
+	// in this epoch" and acts on by fencing. That would fence a healthy host out of its
+	// own volume on every restart, and it is exactly what the DST arm caught.
+	if v.log.BasePending() {
+		return false, nil
 	}
 
 	// INV-17: background yields. A checkpoint is a LIST and a PUT against the same
 	// object store the guest's FLUSH path uses, and the guest wins. Denied means try
 	// again next poll, not queue behind the guest.
 	if m.deps.IOClass != nil && !m.deps.IOClass.TryAcquire(ioclass.Background, backgroundCost) {
-		return false
+		return false, nil
 	}
 
 	started := m.deps.Clock.Now()
 	cp, err := m.checkpointer().Create(ctx, v.log, volumeID, epoch)
 	if err != nil {
 		m.handleCheckpointError(ctx, v, err)
-		return false
+		return false, err
 	}
 
 	// Truncate to *published*, never to durable. They differ by exactly the window in
@@ -126,7 +177,7 @@ func (m *VolumeManager) checkpointOnce(ctx context.Context, v *Volume, volumeID 
 	if err := v.log.TruncateLocal(published); err != nil {
 		slog.Error("the checkpoint published but the local WAL could not be reclaimed",
 			"volume_id", v.id, "epoch", v.epoch, "published", published, "error", err)
-		return true // the checkpoint itself succeeded; the space comes back next time
+		return true, nil // the checkpoint itself succeeded; the space comes back next time
 	}
 
 	slog.Info("checkpoint published and local WAL reclaimed",
@@ -134,7 +185,7 @@ func (m *VolumeManager) checkpointOnce(ctx context.Context, v *Volume, volumeID 
 		"durable_sequence", cp.DurableSequence,
 		"reclaimed_bytes", v.log.ReclaimedBytes(),
 		"took", m.deps.Clock.Now().Sub(started))
-	return true
+	return true, nil
 }
 
 // handleCheckpointError decides whether a failed checkpoint is something to retry or

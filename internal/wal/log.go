@@ -564,6 +564,29 @@ func (l *Log) Read(offset uint64, buf []byte) error {
 	return nil
 }
 
+// BasePending reports whether this log is still waiting for the read view's base, and
+// with it the durable sequence that base covers.
+//
+// It exists for the durability scheduler. A resumed log reports durable = 0 until the
+// base arrives, and a checkpoint taken in that window compares the object store's real
+// durable point against 0 and concludes another writer is in the epoch — which under
+// ADR-0023 fences a perfectly healthy host out of its own volume, on every restart.
+// A log that does not yet know its own durable point has no business publishing one.
+func (l *Log) BasePending() bool {
+	l.mu.Lock()
+	wait := l.baseWait
+	l.mu.Unlock()
+	if wait == nil {
+		return false
+	}
+	select {
+	case <-wait:
+		return false
+	default:
+		return true
+	}
+}
+
 // InstallBase adopts the read view recovered from the object store, under everything the
 // local segments replayed. It is the seam BUILD-INVENTORY increment 5 exists to add:
 // recovery.Recover and materialize.From* have always produced exactly this object and
