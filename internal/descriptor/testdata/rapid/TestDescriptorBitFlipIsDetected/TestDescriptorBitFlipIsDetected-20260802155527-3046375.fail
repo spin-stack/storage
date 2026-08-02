@@ -1,0 +1,87 @@
+# 2026/08/02 15:55:27.611217 [TestDescriptorBitFlipIsDetected] [rapid] draw dek_wrapped: []byte{0xc0, 0x42, 0x2}
+# 2026/08/02 15:55:27.611221 [TestDescriptorBitFlipIsDetected] [rapid] draw ms: 256
+# 2026/08/02 15:55:27.611222 [TestDescriptorBitFlipIsDetected] [rapid] draw size: 3
+# 2026/08/02 15:55:27.611222 [TestDescriptorBitFlipIsDetected] [rapid] draw block: 2044
+# 2026/08/02 15:55:27.611223 [TestDescriptorBitFlipIsDetected] [rapid] draw durability: "local"
+# 2026/08/02 15:55:27.611227 [TestDescriptorBitFlipIsDetected] [rapid] draw epoch: 138
+# 2026/08/02 15:55:27.611227 [TestDescriptorBitFlipIsDetected] [rapid] draw chain: 1
+# 2026/08/02 15:55:27.611229 [TestDescriptorBitFlipIsDetected] [rapid] draw kek_id: "z34-jd86"
+# 2026/08/02 15:55:27.611229 [TestDescriptorBitFlipIsDetected] [rapid] draw dek_key_id: 1
+# 2026/08/02 15:55:27.611231 [TestDescriptorBitFlipIsDetected] [rapid] draw byte: 2
+# 2026/08/02 15:55:27.611231 [TestDescriptorBitFlipIsDetected] [rapid] draw bit: 5
+# 2026/08/02 15:55:27.611236 [TestDescriptorBitFlipIsDetected] a bit flipped at byte 2 (bit 5) read back as a valid descriptor: {VolumeID:00000000-0100-7918-b93c-36aef1bd8a62 SizeBytes:3 BlockSize:2044 Durability:local CurrentEpoch:138 ChainDepth:1 KEKID:z34-jd86 DEKWrapped:[192 66 2] DEKKeyID:1 Digest:407595acf04d381ad9ad6c8bb0813e05342829d7a648ab5fc19ce49731b76d39}
+# 
+v0.4.8#8616604475993067023
+0x14f31198362c82
+0x12a044f144171c
+0xc0
+0x12da117daef671
+0x1d59d09e43dcbd
+0x42
+0xbcefcd231436a
+0x81b167c613dc0
+0x2
+0x42b874efc094f
+0x12549efba9b6c9
+0xe001a5d3f36ba
+0xff
+0xf38e7ef7a722d
+0x2e629bf3d9120
+0x2
+0x1acccd03b857a6
+0x1409c4882d9968
+0x5fc
+0x1dc81d3fd661e
+0x1
+0x1d36a51b73021e
+0x1131d8291a26b6
+0x8a
+0x58dd3f1209ceb
+0xf33f61e63b53
+0x1
+0xfabed6630235c
+0x0
+0x1fdc5789a4a057
+0xffffffffffffffff
+0x17d37d86cb6914
+0x0
+0x737d09d4d8546
+0x4
+0x15714803823219
+0x0
+0x76e8db108fecd
+0x5
+0x6e255a99e0760
+0x0
+0x4e9bcf0ae8054
+0x0
+0xa71f763e8fd38
+0x0
+0xeaa0a18b687ea
+0x2c
+0x14
+0x1c00d142773a17
+0x0
+0x9ce8fd9e05a7d
+0xe
+0xc4da415a4557a
+0x0
+0x1ca433c905a958
+0x38
+0x3f
+0x2f
+0x9
+0x16e62958e20192
+0x0
+0x7eb1fbee3e221
+0x7
+0x4516866a0fec5
+0x1af3dd2339e19c
+0x3a5de7f463e88
+0x0
+0x1911185ea55bd0
+0x4883dd48764bd
+0x2
+0x1d423a566d0e4e
+0x1299d909e904ff
+0x5

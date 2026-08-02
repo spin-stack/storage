@@ -578,7 +578,7 @@ One staticcheck finding was real and is excluded with its reason: `manager.Uploa
 deprecated in favour of a package this SDK version does not have, and §6.1 needs a
 multipart upload to prove an ETag is not a checksum.
 
-## DEV-0015 — the descriptor is the one on-S3 format with no integrity check
+## ~~DEV-0015~~ — the descriptor had no integrity check *(resolved 2026-08-02)*
 
 Found while writing the property test increment 6 owed (`descriptor_property_test.go`).
 Everything else that leaves the host is self-verifying: WAL records carry a CRC32C of
@@ -599,9 +599,20 @@ The blast radius is smaller than it first looks, and worth writing down precisel
 - What is left exposed is `size_bytes`, `block_size` and `chain_depth`, and only on the
   rebuild path — a live volume never reads its own descriptor for those.
 
-**Not fixed in this increment.** Adding a checksum is a format change of its own with
-its own review, and doing it inside an increment about keys would bury it. It predates
-this change: the descriptor has had no test of any kind until now.
+**Closed by `DESCRIPTOR-DIGEST-SPEC.md`.** The stored object is now
+`<64 hex chars>\n<json>`: a SHA-256 over the bytes as stored, verified before anything is
+decoded. Bare JSON — the old shape — is refused with the same error as a corrupt object,
+because nothing is deployed and a lenient branch would leave the hole open permanently for
+a volume that does not exist.
+
+**The first design was wrong and the property test broke it on its first run**, which is
+the part worth keeping. The spec said: a `digest` field inside the JSON, recomputed from
+the decoded struct. Byte 2 of the object is the `v` of `"volume_id"`; flip one bit and it
+reads `"Volume_id"`, Go's decoder **matches field names case-insensitively**, the struct
+decodes identically, and re-marshalling reproduces the original digest exactly. The same
+hole swallows unknown fields, duplicate keys, whitespace and numeric spellings — a hash
+over a *re-encoding* sees only what the decoder did not normalise away. The digest has to
+be over the bytes, and outside them.
 
 ## ~~DEV-0014~~ — two Agents could share one `--data-dir` *(resolved 2026-08-02)*
 

@@ -3,6 +3,7 @@ package descriptor_test
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -97,11 +98,69 @@ func TestDescriptorTruncationIsDetected(t *testing.T) {
 	})
 }
 
-// TestCorruptedKeyMaterialCannotUnwrap is the assertion that matters for this
-// increment, and it is deliberately *not* "a bit flip is detected" — JSON carries no
-// checksum, so flipping a digit in size_bytes yields a different, perfectly valid
-// descriptor. That is a real gap, it predates this change, and it is recorded as
-// DEV-0015 rather than papered over here.
+// TestDescriptorBitFlipIsDetected is what DEV-0015 was: until the digest landed, JSON
+// carried no checksum, so flipping a digit in size_bytes yielded a different and
+// perfectly valid descriptor — and §22.5's rebuild-metadata would recreate the volume
+// at the wrong size, which re-running nothing repairs.
+//
+// Written as the general case rather than for the three fields that were exposed: any
+// bit, at any offset, must make Read fail. A flip inside a whitespace-free JSON object
+// either breaks the syntax or changes a value, and both must be caught — the second is
+// the one that was silent.
+func TestDescriptorBitFlipIsDetected(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		d := genDescriptor(rt)
+		store := sim.NewObjectStore()
+		ctx := t.Context()
+		if err := descriptor.Write(ctx, store, d); err != nil {
+			rt.Fatalf("write: %v", err)
+		}
+		full, err := store.Get(ctx, descriptor.Key(d.VolumeID))
+		if err != nil {
+			rt.Fatalf("get: %v", err)
+		}
+		i := rapid.IntRange(0, len(full)-1).Draw(rt, "byte")
+		bit := rapid.IntRange(0, 7).Draw(rt, "bit")
+		corrupted := append([]byte(nil), full...)
+		corrupted[i] ^= 1 << bit
+		if bytes.Equal(corrupted, full) {
+			return
+		}
+		if _, err := store.Put(ctx, descriptor.Key(d.VolumeID), corrupted, objectstore.PutOptions{}); err != nil {
+			rt.Fatalf("put corrupted: %v", err)
+		}
+		if got, rerr := descriptor.Read(ctx, store, d.VolumeID); rerr == nil {
+			rt.Fatalf("a bit flipped at byte %d (bit %d) read back as a valid descriptor: %+v", i, bit, got)
+		}
+	})
+}
+
+// TestADescriptorWithNoDigestIsRefused — bare JSON, which is the shape of the format as
+// it stood before DEV-0015 was closed, and it is refused rather than tolerated: nothing is
+// deployed, so there is no such object anywhere to be lenient for, and a lenient branch
+// would leave the hole open permanently for the sake of a volume that does not exist.
+func TestADescriptorWithNoDigestIsRefused(t *testing.T) {
+	ctx := t.Context()
+	store := sim.NewObjectStore()
+	d := descriptor.Descriptor{
+		VolumeID: ids.New().String(), SizeBytes: 1 << 30, BlockSize: 4096,
+		Durability: lifecycle.DurabilityRemote, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
+	}
+	body, err := json.Marshal(d) // marshalled directly: bare JSON, with no digest line
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(ctx, descriptor.Key(d.VolumeID), body, objectstore.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := descriptor.Read(ctx, store, d.VolumeID); !errors.Is(err, descriptor.ErrCorruptDescriptor) {
+		t.Fatalf("want ErrCorruptDescriptor, got %v", err)
+	}
+}
+
+// TestCorruptedKeyMaterialCannotUnwrap is the *other* half, and it holds independently
+// of the digest: key material is self-detecting wherever it travels, including in a
+// catalog row that never passed through this object.
 //
 // What this proves is that the two fields this increment cares about are
 // self-detecting: dek_wrapped is an AEAD ciphertext and dek_key_id is bound to it as
