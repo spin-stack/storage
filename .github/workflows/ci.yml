@@ -66,7 +66,19 @@ jobs:
       - name: Schema verify (pgschema, ADR-0019)
         run: task db:verify
 
+      # The binaries the e2e lane runs as processes. `test:e2e` depends on this
+      # target, so this step is belt and braces — it fails here, with its own name,
+      # rather than inside a lane about something else.
+      - name: Build the binaries
+        run: task build:cmd
+
       # TestContainers Postgres integration (ADR-0006); ubuntu runners have Docker.
+      #
+      # The QEMU guest lane is inside this target and skips loudly when _output holds
+      # no QEMU — which is the case here: qemu.yml builds and publishes it on its own
+      # schedule (tens of minutes), and this workflow does not pull it. That lane
+      # therefore runs on a developer machine only; STATUS.md carries the decision
+      # that is still open about giving CI a QEMU.
       - name: Integration (TestContainers Postgres)
         run: task test:integration
 
@@ -76,3 +88,10 @@ jobs:
       # strongly consistent LIST), so a backend that loses one must not merge.
       - name: Object-store conformance (RustFS, §6.1)
         run: task backend:conformance
+
+      # The deployment, not the library: both binaries as processes against a real
+      # Postgres and the pinned RustFS. It is the only lane that can catch the two
+      # of them disagreeing — a key file each parses differently, a flag main never
+      # passes — because every other lane drives Go types in-process.
+      - name: End to end (real binaries, §6.2)
+        run: task test:e2e

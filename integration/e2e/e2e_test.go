@@ -1,0 +1,397 @@
+//go:build e2e
+
+// Package e2e runs the deployment, not the library.
+//
+// Everything else in this repository drives Go types in-process — which is where the
+// correctness proofs belong, and which is exactly why nothing had ever noticed the two
+// things a deployment is actually made of: a `control-plane` and a `volume-agent` that
+// were started with flags, found each other over a socket, and can be killed. The gap
+// this closes is not a missing invariant; it is that no invariant was ever checked
+// against the binaries.
+//
+// It is `-tags e2e` and not part of `task test` because it starts containers and
+// processes and takes tens of seconds. `task ci:full` runs it.
+package e2e
+
+import (
+	"bytes"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
+	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
+	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/testinfra"
+)
+
+const (
+	startup = 60 * time.Second
+	bucket  = "spin-e2e"
+)
+
+// deployment is the whole thing, running: Postgres, RustFS, a Control Plane process and
+// an Agent process, plus the directories the Agent was given.
+type deployment struct {
+	dsn      string
+	store    testinfra.ObjectStoreBackend
+	cpURL    string
+	hostID   string
+	dataDir  string
+	sockDir  string
+	kekFile  string
+	kekID    string
+	cp       *testinfra.Process
+	agentBin string
+	agentEnv []string
+}
+
+// start brings up everything except the Agent — the Agent is started per test, because
+// several of them are about what happens when it is killed and started again.
+func start(t *testing.T) *deployment {
+	t.Helper()
+
+	cpBin := testinfra.Binary(t, "control-plane")
+	agentBin := testinfra.Binary(t, "volume-agent")
+
+	dsn := testinfra.Postgres(t)
+	store := testinfra.RustFS(t, os.Getenv("RUSTFS_IMAGE"))
+
+	// Credentials in the environment, never on the command line: storecfg takes them
+	// from the SDK's default chain precisely so a secret does not land in `ps` output
+	// or in a systemd unit (see internal/storecfg).
+	env := []string{
+		"AWS_ACCESS_KEY_ID=" + store.AccessKey,
+		"AWS_SECRET_ACCESS_KEY=" + store.SecretKey,
+		"AWS_REGION=" + store.Region,
+	}
+	dir := t.TempDir()
+	kekFile := filepath.Join(dir, "kek")
+	kek := bytes.Repeat([]byte{0x3F}, crypto.DEKSize)
+	if err := os.WriteFile(kekFile, kek, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &deployment{
+		dsn: dsn, store: store,
+		hostID:   ids.New().String(),
+		dataDir:  filepath.Join(dir, "data"),
+		sockDir:  filepath.Join(dir, "run"),
+		kekFile:  kekFile,
+		kekID:    crypto.KEKID([crypto.DEKSize]byte(kek)),
+		agentBin: agentBin, agentEnv: env,
+	}
+	for _, p := range []string{d.dataDir, d.sockDir} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	port := freePort(t)
+	d.cpURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+	d.cp = testinfra.Start(t, testinfra.ProcessConfig{
+		Name: "control-plane",
+		Path: cpBin,
+		// -s3-create-bucket only here: the bucket is created once, by the first
+		// process that needs it, and every later process must find it rather than
+		// invent one — which is why the flag is off by default (storecfg).
+		Args: append([]string{
+			"-listen", fmt.Sprintf("127.0.0.1:%d", port),
+			"-database-url", dsn,
+			"-holder-id", "cp-e2e",
+			"-lease-ttl", "30s",
+			"-s3-create-bucket",
+		}, d.storeArgs()...),
+		Env: env,
+	})
+	d.cp.WaitForLine(t, "control-plane elected", startup)
+	return d
+}
+
+// storeArgs repeats the object-store flags for a second process.
+func (d *deployment) storeArgs() []string {
+	return []string{
+		"-s3-bucket", bucket,
+		"-s3-endpoint", d.store.Endpoint,
+		"-s3-region", d.store.Region,
+	}
+}
+
+// startAgent starts a volume-agent against this deployment.
+func (d *deployment) startAgent(t *testing.T, name string) *testinfra.Process {
+	t.Helper()
+	p := testinfra.Start(t, testinfra.ProcessConfig{
+		Name: name,
+		Path: d.agentBin,
+		Args: append([]string{
+			"-host-id", d.hostID,
+			"-control-plane", d.cpURL,
+			"-data-dir", d.dataDir,
+			"-vhost-socket-dir", d.sockDir,
+			"-kek-file", d.kekFile,
+			"-heartbeat-interval", "1s",
+		}, d.storeArgs()...),
+		Env: d.agentEnv,
+	})
+	p.WaitForLine(t, "key-encryption key loaded", startup)
+	return p
+}
+
+// seedVolume runs `control-plane -seed-volume`, which provisions one volume and exits.
+func (d *deployment) seedVolume(t *testing.T) {
+	t.Helper()
+	p := testinfra.Start(t, testinfra.ProcessConfig{
+		Name: "seed",
+		Path: testinfra.Binary(t, "control-plane"),
+		Args: append([]string{
+			"-database-url", d.dsn,
+			"-holder-id", "cp-seed",
+			"-seed-volume",
+			"-seed-host", d.hostID,
+			"-seed-size", "1073741824",
+			"-kek-file", d.kekFile,
+		}, d.storeArgs()...),
+		Env: d.agentEnv,
+	})
+	if err := p.Wait(t, startup); err != nil {
+		t.Fatalf("seeding a volume: %v", err)
+	}
+}
+
+// waitForHost blocks until the Agent's heartbeat has registered this host. Nothing can
+// be provisioned for a host the catalog does not know: volumes.primary_host_id is a
+// foreign key, and the fleet learns a host exists by being told, not by configuration.
+func (d *deployment) waitForHost(t *testing.T) {
+	t.Helper()
+	pool, err := pgxpool.New(t.Context(), d.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	waitFor(t, startup, "the host to register itself", func() bool {
+		var n int
+		if err := pool.QueryRow(t.Context(),
+			`SELECT count(*) FROM hosts WHERE host_id = $1`, d.hostID).Scan(&n); err != nil {
+			return false
+		}
+		return n == 1
+	})
+}
+
+func (d *deployment) cpClient() storagev1connect.ControlPlaneServiceClient {
+	return storagev1connect.NewControlPlaneServiceClient(
+		&http.Client{Timeout: 10 * time.Second}, d.cpURL)
+}
+
+// TestTheDeploymentServesAVolume is the slice, end to end, through the binaries: a
+// Control Plane that was elected, a volume provisioned by the real provisioning path,
+// an Agent that heartbeats, is handed that volume, and binds a socket for it.
+//
+// The assertion that matters is the *socket*: it is the only artefact that proves the
+// Agent got as far as building a runtime. A heartbeat proves the process started; a
+// desired-state answer proves the RPC works; only a bound socket proves a volume was
+// opened, its keys unwrapped and its WAL created.
+func TestTheDeploymentServesAVolume(t *testing.T) {
+	d := start(t)
+	// The Agent first: a volume references its primary host, and the host row is
+	// created by the Agent's own heartbeat. Provisioning for a host the fleet has
+	// never seen fails on the foreign key, which is the catalog saying the same thing.
+	agent := d.startAgent(t, "volume-agent")
+	d.waitForHost(t)
+	d.seedVolume(t)
+
+	volumeID := waitForServedVolume(t, d)
+	sock := filepath.Join(d.sockDir, volumeID+".sock")
+	waitFor(t, 30*time.Second, fmt.Sprintf("the socket for %s", volumeID), func() bool {
+		_, err := os.Stat(sock)
+		return err == nil
+	})
+
+	// And the Agent says what it built. Asserting on the log line rather than on a WAL
+	// directory is deliberate: segments are created by the first append, and no guest
+	// has written yet — a directory assertion would be waiting for something the
+	// system correctly does not do.
+	agent.WaitForLine(t, "serving volume", 30*time.Second)
+	assertLogField(t, agent, "serving volume", "encrypted=true")
+
+	// The durability scheduler must be running. It is refused when the Agent has no
+	// host id, and the binary did not pass one until this lane read the line saying so
+	// — every volume on every real Agent would have grown its WAL for ever.
+	for _, line := range agent.Output() {
+		if strings.Contains(line, "no durability scheduler") {
+			t.Fatalf("this volume will never reclaim a byte: %s", line)
+		}
+	}
+}
+
+// assertLogField fails unless the process printed a line containing both needles. slog
+// writes key=value, so this reads a structured field without parsing the format.
+func assertLogField(t *testing.T, p *testinfra.Process, line, field string) {
+	t.Helper()
+	for _, l := range p.Output() {
+		if strings.Contains(l, line) && strings.Contains(l, field) {
+			return
+		}
+	}
+	t.Fatalf("no %q line carried %q; got:\n%s", line, field, strings.Join(p.Output(), "\n"))
+}
+
+// TestBothBinariesAgreeOnTheKEK is the regression this lane was built too late to
+// prevent and exists to stop repeating.
+//
+// The Control Plane wraps a volume's DEK under the KEK it read; the Agent unwraps it
+// under the KEK *it* read, and refuses the volume unless the ids match. Those were two
+// separate readers with different rules until 2026-08-02 — a hex-encoded key file was a
+// working Control Plane and a dead Agent — and the id was a flag on one side and a hash
+// on the other. Nothing in-process could see it: it is only wrong once both binaries
+// read the same file.
+func TestBothBinariesAgreeOnTheKEK(t *testing.T) {
+	d := start(t)
+	agent := d.startAgent(t, "volume-agent")
+	d.waitForHost(t)
+	d.seedVolume(t)
+
+	// What the Control Plane recorded, read straight from the catalog.
+	pool, err := pgxpool.New(t.Context(), d.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var kekID string
+	var keyID int64
+	if err := pool.QueryRow(t.Context(),
+		`SELECT kek_id, dek_key_id FROM volumes LIMIT 1`).Scan(&kekID, &keyID); err != nil {
+		t.Fatal(err)
+	}
+	if kekID != d.kekID {
+		t.Fatalf("the Control Plane wrapped under %q; the same file hashes to %q", kekID, d.kekID)
+	}
+	if keyID == 0 {
+		t.Fatal("the catalog holds a DEK with no version (§15.1)")
+	}
+
+	// And the Agent opens it. It refuses a volume whose kek_id is not its own and a
+	// DEK whose version does not authenticate, so a served volume *is* the assertion
+	// that both binaries reached the same key from the same file.
+	volumeID := waitForServedVolume(t, d)
+	waitFor(t, 30*time.Second, "the volume's socket", func() bool {
+		_, err := os.Stat(filepath.Join(d.sockDir, volumeID+".sock"))
+		return err == nil
+	})
+	for _, line := range agent.Output() {
+		if strings.Contains(line, "unwrapping the DEK") || strings.Contains(line, "is wrapped under KEK") {
+			t.Fatalf("the Agent could not use the key the Control Plane wrapped: %s", line)
+		}
+	}
+}
+
+// TestAKilledAgentReAttachesAtTheSameEpoch is ADR-0024 as a deployment experiences it:
+// SIGKILL, no cleanup, and a new process that finds a WAL on disk and a Control Plane
+// still listing the volume at the epoch it was granted.
+//
+// The DST arm proves the numbering cannot collide. What only this lane can show is that
+// the *process* comes back at all — that `Apply` resumes rather than refusing, and that
+// nothing in the start-up path needs a clean shutdown to have happened.
+func TestAKilledAgentReAttachesAtTheSameEpoch(t *testing.T) {
+	d := start(t)
+	first := d.startAgent(t, "agent-1")
+	d.waitForHost(t)
+	d.seedVolume(t)
+	volumeID := waitForServedVolume(t, d)
+	sock := filepath.Join(d.sockDir, volumeID+".sock")
+	waitFor(t, 30*time.Second, "the first socket", func() bool {
+		_, err := os.Stat(sock)
+		return err == nil
+	})
+	epochBefore := volumeEpoch(t, d, volumeID)
+
+	first.Kill(t)
+
+	second := d.startAgent(t, "agent-2")
+	second.WaitForLine(t, "key-encryption key loaded", startup)
+	waitFor(t, 60*time.Second, "the volume served again", func() bool {
+		for _, v := range servedVolumes(t, d) {
+			if v.GetVolumeId() == volumeID {
+				return true
+			}
+		}
+		return false
+	})
+	if got := volumeEpoch(t, d, volumeID); got != epochBefore {
+		t.Fatalf("the epoch moved across a restart: %d -> %d (ADR-0024 says it must not)", epochBefore, got)
+	}
+}
+
+// --- helpers -------------------------------------------------------------------
+
+func servedVolumes(t *testing.T, d *deployment) []*storagev1.DesiredVolume {
+	t.Helper()
+	resp, err := d.cpClient().GetDesiredState(t.Context(),
+		connect.NewRequest(&storagev1.GetDesiredStateRequest{HostId: d.hostID}))
+	if err != nil {
+		return nil
+	}
+	return resp.Msg.GetVolumes()
+}
+
+func waitForServedVolume(t *testing.T, d *deployment) string {
+	t.Helper()
+	var id string
+	waitFor(t, 30*time.Second, "a volume in the desired state", func() bool {
+		vols := servedVolumes(t, d)
+		if len(vols) == 0 {
+			return false
+		}
+		id = vols[0].GetVolumeId()
+		return true
+	})
+	return id
+}
+
+func volumeEpoch(t *testing.T, d *deployment, volumeID string) int64 {
+	t.Helper()
+	for _, v := range servedVolumes(t, d) {
+		if v.GetVolumeId() == volumeID {
+			return v.GetEpoch()
+		}
+	}
+	t.Fatalf("volume %s is not in the desired state", volumeID)
+	return 0
+}
+
+// waitFor polls until cond holds. Polling is right here and a sleep is not: the thing
+// being waited on is another *process* reaching a state, and the only alternative to
+// asking is guessing how long it takes.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+// freePort asks the kernel for a port and closes it. There is a race between closing
+// and the Control Plane binding, and it is the standard one: the alternative is a
+// hardcoded port, which fails when two lanes run at once.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port
+}

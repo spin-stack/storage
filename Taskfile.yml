@@ -429,6 +429,16 @@ tasks:
       - go test -tags integration -count=1 ./internal/metadata/pg/...
       - task: test:integration:qemu
 
+  test:e2e:
+    desc: >-
+      Run the deployment, not the library: the real control-plane and volume-agent
+      as processes, against a real Postgres 18 and the pinned RustFS. It is the only
+      lane that can see the two binaries disagree — about a key file, about a flag
+      nobody passes — because everything else drives Go types in-process.
+    deps: [build:cmd]
+    cmds:
+      - RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags e2e -count=1 -timeout 15m ./integration/e2e/...
+
   test:integration:qemu:
     desc: >-
       Boot a real QEMU {{.QEMU_VERSION}} guest against the vhost-user-blk backend
@@ -485,7 +495,12 @@ tasks:
     desc: Run golangci-lint (incl. forbidigo/depguard belt-and-suspenders).
     deps: [tools:golangci]
     cmds:
-      - "{{.TOOLS_BIN}}/golangci-lint run ./..."
+      # The build tags matter: without them golangci-lint never parses a single file
+      # under `integration/` or `internal/testinfra`, so the entire integration and
+      # e2e surface was unlinted — including the lanes that drive QEMU and Postgres.
+      # Found 2026-08-02, when the e2e lane's own files turned out to be invisible to
+      # the gate that was supposed to check them.
+      - "{{.TOOLS_BIN}}/golangci-lint run --build-tags integration,e2e ./..."
 
   lint:simulable:
     desc: Run the authoritative simulable-interfaces analyzer over all packages.
@@ -533,3 +548,4 @@ tasks:
       - task: cover
       - task: test:integration
       - task: backend:conformance
+      - task: test:e2e

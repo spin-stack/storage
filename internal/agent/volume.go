@@ -467,6 +467,14 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	if resuming {
 		go m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()))
 	}
+	// One line per volume this host starts serving. Everything else the manager logs
+	// is an exception, so an Agent that came up correctly said nothing at all about
+	// the volumes it opened — which is the state an operator most needs confirmed, and
+	// the only evidence available to anything watching from outside the process.
+	slog.Info("serving volume",
+		"volume_id", id, "epoch", d.GetEpoch(), "socket", socket,
+		"resumed", resuming, "encrypted", enc != nil)
+
 	if err := m.checkpointsEnabled(); err != nil {
 		// Said once, at start, rather than every poll: a volume that will never reclaim
 		// a byte is worth one line explaining why.

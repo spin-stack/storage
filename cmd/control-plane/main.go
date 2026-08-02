@@ -14,11 +14,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -99,22 +96,28 @@ func run() error {
 	}
 	defer pool.Close()
 
-	// Fail closed on a missing store: without a witness outside PostgreSQL the
-	// Elector cannot prove a term has never been issued, and issuing one anyway is
-	// the failure ADR-0011 exists for. storeFlags.Open refuses the empty case.
+	// storeFlags.Open refuses the empty case: the object store is the recovery
+	// authority (§5.8) and both paths below need it.
 	store, err := storeFlags.Open(ctx)
 	if err != nil {
 		return err
 	}
 
 	md := pg.New(pool)
-	term, err := controlplane.NewElector(md, store).Acquire(ctx, *holderID)
-	if err != nil {
-		return fmt.Errorf("acquiring a Control Plane term: %w", err)
-	}
-	slog.Info("control-plane elected", "holder_id", *holderID, "term", term, "version", version)
 
+	// Seeding is an admin command, not a leader taking over, and the difference is not
+	// cosmetic: AcquireLeadership increments the term unconditionally — for the same
+	// holder id too — so a seed run against a live deployment would leave the *serving*
+	// Control Plane holding a stale term, with every write it makes from that moment on
+	// refused as ErrStaleTerm until someone restarts it. Provisioning a volume must not
+	// take down the fleet's Control Plane. It borrows the current term instead, and
+	// fails if there is nobody to borrow from.
 	if *seedVolume {
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("-seed-volume needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		slog.Info("seeding under the current term", "holder_id", leader.HolderID, "term", leader.Term)
 		durability := lifecycle.DurabilityRemote
 		if *seedLocal {
 			durability = lifecycle.DurabilityLocal
@@ -124,8 +127,17 @@ func run() error {
 			BlockSize:  int32(*seedBlock),
 			HostID:     *seedHost,
 			Durability: durability,
-		}, term)
+		}, leader.Term)
 	}
+
+	// Fail closed on a missing store: without a witness outside PostgreSQL the Elector
+	// cannot prove a term has never been issued, and issuing one anyway is the failure
+	// ADR-0011 exists for.
+	term, err := controlplane.NewElector(md, store).Acquire(ctx, *holderID)
+	if err != nil {
+		return fmt.Errorf("acquiring a Control Plane term: %w", err)
+	}
+	slog.Info("control-plane elected", "holder_id", *holderID, "term", term, "version", version)
 
 	// The term is fixed for the life of the process. A process that loses it does
 	// not "renew" into a new one: every write it attempts fails with ErrStaleTerm,
@@ -171,7 +183,7 @@ func seed(ctx context.Context, md metadata.Store, store objectstore.Store, kekFi
 	// crypto/rand, passed explicitly: the Provisioner takes its randomness as a
 	// parameter so a DST run is reproducible, which means production has to say out
 	// loud that it wants the real thing.
-	p := controlplane.NewProvisioner(md, store, crypto.NewDevKMS(kek, kekIDFor(kek)), rand.Reader)
+	p := controlplane.NewProvisioner(md, store, crypto.NewDevKMS(kek, crypto.KEKID(kek)), rand.Reader)
 	vol, err := p.Provision(ctx, term, spec)
 	if err != nil {
 		return err
@@ -187,47 +199,13 @@ func seed(ctx context.Context, md metadata.Store, store objectstore.Store, kekFi
 //
 // It reads through simio/disk rather than os (INV-01): every file this tree opens goes
 // through the injected interface, and a key file is not an exception worth carving.
+// readKEK opens the directory holding the KEK and reads it through simio (INV-01).
+// The parsing rules live in internal/crypto so this binary and the Agent cannot
+// disagree about what a key file is.
 func readKEK(path string) ([crypto.DEKSize]byte, error) {
-	var kek [crypto.DEKSize]byte
 	d, err := real.NewDisk(filepath.Dir(path))
 	if err != nil {
-		return kek, fmt.Errorf("opening the KEK's directory: %w", err)
+		return [crypto.DEKSize]byte{}, fmt.Errorf("opening the KEK's directory: %w", err)
 	}
-	f, err := d.Open(filepath.Base(path))
-	if err != nil {
-		return kek, fmt.Errorf("reading the KEK: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-	size, err := f.Size()
-	if err != nil {
-		return kek, fmt.Errorf("sizing the KEK: %w", err)
-	}
-	// A key file is small; anything large is not one, and reading it whole would be
-	// the only unbounded allocation in this binary.
-	if size > 1024 {
-		return kek, fmt.Errorf("the KEK file is %d bytes: that is not a key", size)
-	}
-	raw := make([]byte, size)
-	if _, err := f.ReadAt(raw, 0); err != nil {
-		return kek, fmt.Errorf("reading the KEK: %w", err)
-	}
-	raw = bytes.TrimSpace(raw)
-	// Hex is accepted so the file survives a copy-paste; raw bytes are accepted so
-	// `head -c 32 /dev/urandom > kek` works.
-	if decoded, derr := hex.DecodeString(string(raw)); derr == nil && len(decoded) == crypto.DEKSize {
-		copy(kek[:], decoded)
-		return kek, nil
-	}
-	if len(raw) != crypto.DEKSize {
-		return kek, fmt.Errorf("the KEK must be %d bytes (raw) or %d hex characters, got %d bytes", crypto.DEKSize, crypto.DEKSize*2, len(raw))
-	}
-	copy(kek[:], raw)
-	return kek, nil
-}
-
-// kekIDFor names a KEK by a hash of itself, so the id cannot drift from the material
-// and two deployments do not both call theirs "default".
-func kekIDFor(kek [crypto.DEKSize]byte) string {
-	sum := sha256.Sum256(kek[:])
-	return "kek-" + hex.EncodeToString(sum[:8])
+	return crypto.LoadKEK(d, filepath.Base(path))
 }

@@ -85,6 +85,34 @@ linters:
         linters:
           - depguard
           - forbidigo
+      # Build-tagged test harnesses drive the real world, which is the whole reason
+      # they exist. `integration/**`'s host-side lanes start QEMU and wait for it;
+      # internal/testinfra starts containers and subprocesses. There is no clock to
+      # inject into another *process*, and a harness that waited on a simulated one
+      # would be measuring nothing — INV-01 governs production code, and none of this
+      # is linked into a binary this repository ships (every file here carries a
+      # build tag).
+      #
+      # Narrow deliberately, and the narrowness is enforced, not asserted: the
+      # exemption is by path *and* the paths are all tagged, ordinary unit tests stay
+      # governed (a time.Now() there is how simulable code gets bypassed), and the
+      # simulable analyzer keeps its own fixture proving a host-side package under
+      # integration/ is still flagged when it is not a harness.
+      - path: (^|/)integration/.*_test\.go$
+        linters:
+          - depguard
+          - forbidigo
+      - path: internal/testinfra/
+        linters:
+          - depguard
+          - forbidigo
+      # The AWS SDK's manager.Uploader is deprecated in favour of a package that does
+      # not exist in this SDK version yet. It is used in exactly one place, and for a
+      # reason no replacement changes: §6.1 requires the conformance suite to prove a
+      # *multipart* upload's ETag is not a checksum, and this is what performs one.
+      - path: integration/backend/edgecases_test\.go
+        linters:
+          - staticcheck
       # analyzer golden fixtures deliberately contain violations.
       - path: hack/analyzers/.*/testdata/
         linters:

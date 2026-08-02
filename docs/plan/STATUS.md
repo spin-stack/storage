@@ -145,13 +145,14 @@ real binaries — and it is where "how much is left" is actually measured:
 | 5 — cold restart, seed the read view from S3 | **done** — this was the real correctness hole |
 | 6 — the DEK arm | **done.** `dek_key_id` end to end (column + CHECK, proto, `metadata.Volume`, descriptor, `GetVolumeKeys`, provisioner, clone, rebuild-metadata) plus `-kek-file`/`-kek-id` on the Agent, `crypto.DevKMS`, and the unwrap at attach. Every object a served volume puts in the bucket is now ciphertext, and INV-15 is reachable — see below. |
 | 7 — a guest that can issue FLUSH | **mostly done** (`e8bbdab`, `cef9881`) |
-| 8 — the e2e lane and a gate that can notice regressions | **not started.** Needs the QEMU-in-CI decision below. |
+| 8 — the e2e lane and a gate that can notice regressions | **done**, minus the QEMU-in-CI decision. `integration/e2e` runs both binaries as processes in `ci:full` and in CI; CI builds them and the workflow now runs the lane. The guest (QEMU) lane still skips on a runner — see below. |
 
-So: **one increment of real work** (8) and the QEMU-in-CI choice. The
-inventory sizes 8 at 2–3 days. By its own definitions the milestone matching the target
-slice's literal wording was the end of increment 6, which is now in; the first one a
-**merge gate can defend** is the end of increment 8 — and until that exists, every green
-claim in this file is one developer's machine, not a gate.
+So: **the build order is done**, and what is left is the QEMU-in-CI choice. The
+milestone matching the target slice's literal wording was the end of increment 6, and the
+first one a **merge gate can defend** was the end of increment 8. Both are in. The
+remaining honesty caveat is narrower than it was: the workflows have still never *run*,
+because `origin` is a local bare repo — but `ci:full` now includes every lane except the
+QEMU guest one, and CI runs the same tasks.
 
 What that milestone is *not*: multi-host, warm standby, compaction, or anything measured
 on real hardware. Those are the phases below, and they start after the slice works.
@@ -298,6 +299,43 @@ ACKed — which is exactly the material a fenced host would publish, and why "th
 nothing new to publish" is not the reason the honest arm stays quiet. The same planted
 wiring trips `DurableAckLeaseChecker` too, asserted alongside it, because one cached
 answer loses both obligations.
+
+## Increment 8: the lane that runs the deployment, and the three things it found
+
+`integration/e2e` (`task test:e2e`, in `ci:full` and in CI) starts the **real binaries**
+as processes against a real Postgres 18 and the pinned RustFS: `control-plane` elected,
+`volume-agent` heartbeating, a volume provisioned through the real provisioning path,
+picked up, and served behind a socket. `internal/testinfra` grew what that needs — a
+process supervisor that tees output to `t.Log`, waits on a *line the process printed*
+rather than on a sleep, and can SIGKILL — plus a Postgres helper built from `schema.sql`.
+
+It found three defects on its first three runs, and none of them was reachable from any
+in-process test:
+
+- **`control-plane -seed-volume` stole the term from the running Control Plane.**
+  `AcquireLeadership` increments unconditionally, for the same holder id too — so
+  provisioning a volume left the *serving* CP holding a stale term, every write refused
+  as `ErrStaleTerm` until someone restarted it. Provisioning must not take down the
+  Control Plane: seeding now borrows the current term (`GetLeader`) and fails if there is
+  nobody to borrow from.
+- **The Agent was never given its own host id.** `cmd/volume-agent` built its
+  `VolumeManagerConfig` without `HostID`, and `checkpointsEnabled` refuses a scheduler
+  that cannot name the host publishing (§12.3–12.4). Every volume on every real Agent
+  would have grown its WAL for ever — increment 3's whole point, defeated by a missing
+  field in `main`. The lane read the log line saying so.
+- **The whole build-tagged surface was unlinted** — DEV-0016 above.
+
+Two ordering facts are now encoded rather than folklore: a volume cannot be provisioned
+for a host the catalog has never seen (the Agent's heartbeat creates the host row, and
+`volumes.primary_host_id` is a foreign key), and `-s3-create-bucket` belongs to exactly
+one process — every later one must find the bucket rather than invent it.
+
+`TestBothBinariesAgreeOnTheKEK` exists because of the regression that shipped *inside*
+increment 6: the two binaries had separate KEK readers with different rules — a
+hex-encoded key file was a working Control Plane and a dead Agent — and the id was a flag
+on one side and a hash of the material on the other. Both now go through
+`crypto.LoadKEK`/`crypto.KEKID`, the Agent's `-kek-id` flag is gone (derived, never
+configured), and the planted bug — the Agent naming its KEK `"kek-1"` — fails the lane.
 
 ## Increment 6: what the DEK arm actually needed
 
@@ -485,6 +523,36 @@ segment: a format change of its own.
 segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
+
+## ~~DEV-0016~~ — the entire build-tagged surface was never linted *(resolved 2026-08-02)*
+
+`task lint` ran `golangci-lint run ./...` with **no build tags**, so golangci-lint never
+parsed a single file under `integration/` or `internal/testinfra`. The lanes that drive
+QEMU, Postgres and RustFS — and now the binaries — were invisible to the gate that is
+supposed to check them. Found while writing the e2e lane, when its own files turned out
+not to be linted either.
+
+Worth being precise about what this did *not* mean: the DEV-0013 fixture proves the
+`simulable` analyzer flags a host-side package under `integration/`, and that analyzer
+runs over the whole tree (`lint:simulable`, no tags needed for its own traversal). What
+was missing was golangci-lint's layer — forbidigo, depguard, staticcheck — on tagged
+files.
+
+**Fixed by running with `--build-tags integration,e2e`**, which then surfaced 9 real
+findings, all of one shape: **build-tagged test harnesses drive the real world, which is
+why they exist.** There is no clock to inject into another *process*, and a harness that
+waited on a simulated one would measure nothing. INV-01 governs production code, and none
+of this is linked into a shipped binary — every file carries a build tag.
+
+The exemption is by path and **narrow, with the narrowness checked rather than asserted**:
+it matches `integration/**/*_test.go` and `internal/testinfra/`, so an ordinary
+(non-`_test.go`) file under `integration/` is still flagged — verified by planting a
+`time.Now()` in one and watching forbidigo reject it. Unit tests everywhere else stay
+governed, because a `time.Now()` there is precisely how simulable code gets bypassed.
+
+One staticcheck finding was real and is excluded with its reason: `manager.Uploader` is
+deprecated in favour of a package this SDK version does not have, and §6.1 needs a
+multipart upload to prove an ETag is not a checksum.
 
 ## DEV-0015 — the descriptor is the one on-S3 format with no integrity check
 

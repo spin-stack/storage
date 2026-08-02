@@ -104,7 +104,7 @@ Full statement, checker, and activation increment: **`INVARIANTS.md`**. State as
 
 | INV | One line | State |
 |---|---|---|
-| INV-01 | Simulable interfaces only — no `time.Now()`/sockets/syscalls outside `simio`. Two exemptions: `internal/vhost/hostio` (host code, ADR-0020) and `integration/guestinit` (not host code — PID 1 inside the guest, DEV-0013). | active |
+| INV-01 | Simulable interfaces only — no `time.Now()`/sockets/syscalls outside `simio`. Three exemptions, all narrow and all with a fixture proving they did not widen: `internal/vhost/hostio` (host code, ADR-0020), `integration/guestinit` (not host code — PID 1 inside the guest, DEV-0013), and build-tagged test harnesses (`integration/**/*_test.go`, `internal/testinfra` — they drive real processes and containers, so there is no clock to inject; DEV-0016). | active |
 | INV-02 | Deterministic replay: same seed ⇒ identical trace. | active |
 | INV-03 | Ordered watermarks: `published ≤ durable ≤ local`. | active |
 | INV-04 | Unflushed bounds: backpressure rather than a silent NVMe fill. | active |
@@ -179,6 +179,7 @@ commit named is where the fix landed.
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |
 | DEV-0011 | A segment's space is charged as used, not reserved at creation. | **open** → STATUS.md |
 | DEV-0012 | A self-fenced log still accepts WRITEs and still serves reads. | **open** → STATUS.md |
+| DEV-0016 | `task lint` ran golangci-lint with no build tags, so the whole `integration/`+`internal/testinfra` surface was never parsed by it. | resolved 2026-08-02 — `--build-tags integration,e2e`, plus a harness exemption whose narrowness is checked by planting a `time.Now()` in a non-test file |
 | DEV-0015 | The volume descriptor (`volumes/<vol>/descriptor.json`) is the only on-S3 format with no integrity check: truncation is caught, a flipped bit inside a number is not. `dek_wrapped`/`dek_key_id` are self-detecting (AEAD + AAD); `size_bytes`/`block_size`/`chain_depth` on the rebuild path are not. | **open** → STATUS.md |
 | DEV-0014 | Nothing stops two Agents from sharing one `--data-dir`: both resume the same segment directory at the same epoch, and `hostio.Listen` unlinks the stale socket so the second *silently steals* it instead of failing with `EADDRINUSE`. Wants an exclusive lock at start-up (a primitive `simio/disk` does not have). | **open** → STATUS.md |
 | DEV-0013 | `task lint` red since `e8bbdab`: the guest-side `integration/guestinit` tripped the INV-01 lint layer. | resolved 2026-07-28 — third INV-01 exemption, narrowness fixture |

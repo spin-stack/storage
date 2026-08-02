@@ -1,0 +1,253 @@
+//go:build integration || e2e
+
+package testinfra
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// Running the real binaries, as processes.
+//
+// Every other lane in this repository drives Go types in-process. That is where the
+// correctness proofs belong — but it means nothing has ever exercised the two things a
+// deployment is made of: a `control-plane` and a `volume-agent` that were started with
+// flags, that found each other over a socket, and that can be killed. `exec.Command`
+// appears twice in the tree and both are QEMU.
+//
+// This is deliberately not a framework. It starts a binary, lets a test wait for a line
+// it printed, and kills it. The "restart the Agent" arm of the e2e lane is a literal
+// SIGKILL, because that is the failure ADR-0024 reasons about.
+
+// Binary resolves one of this project's binaries in _output/bin and skips the test —
+// loudly, naming the command that produces it — when it is not there.
+//
+// Skipping rather than failing is the same call `test:integration:qemu` makes: a lane
+// whose *input* is missing has not found a defect, and a red build that means "you did
+// not run task build:cmd" trains people to ignore red builds. CI builds them, so CI
+// never skips.
+func Binary(t *testing.T, name string) string {
+	t.Helper()
+	root, err := repoRoot()
+	if err != nil {
+		t.Fatalf("locating the repository root: %v", err)
+	}
+	path := filepath.Join(root, "_output", "bin", name)
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("%s is not built (run `task build:cmd`): %v", path, err)
+	}
+	return path
+}
+
+// repoRoot walks up from the test's working directory to the module root. Tests run in
+// their own package directory, and the binaries are at a path relative to the module.
+func repoRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", errors.New("no go.mod found above the working directory")
+		}
+		dir = parent
+	}
+}
+
+// Process is one running binary. Its combined output is tee'd to the test log as it
+// arrives, so a failure shows what the process was doing rather than only that it
+// exited — and `WaitForLine` reads the same stream, which is how a test waits for
+// readiness without a sleep.
+type Process struct {
+	Name string
+
+	cmd    *exec.Cmd
+	cancel context.CancelFunc
+
+	mu     sync.Mutex
+	lines  []string
+	waiter chan struct{} // closed and replaced on every new line
+
+	done chan struct{}
+	err  error
+}
+
+// ProcessConfig is what to start.
+type ProcessConfig struct {
+	// Name labels the process in the test log. Two Agents in one test are told apart
+	// by this and nothing else.
+	Name string
+	Path string
+	Args []string
+	// Env is added to the parent environment. Credentials go here rather than on the
+	// command line: storecfg takes them from the SDK's default chain precisely so they
+	// do not land in `ps` output (see internal/storecfg).
+	Env []string
+}
+
+// Start launches the process and arranges for it to be killed when the test ends.
+func Start(t *testing.T, cfg ProcessConfig) *Process {
+	t.Helper()
+
+	// Not t.Context(): the process is killed from t.Cleanup, which runs after the test
+	// context is cancelled — a cancelled context there would kill it before the test's
+	// own teardown had a chance to look at it.
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:usetesting // see above
+
+	cmd := exec.CommandContext(ctx, cfg.Path, cfg.Args...)
+	cmd.Env = append(os.Environ(), cfg.Env...)
+	// Kill, not interrupt: this is the teardown path, and a binary that hangs on
+	// shutdown must not hang the test suite. Stop() is how a test asks politely.
+	cmd.Cancel = func() error { return cmd.Process.Kill() }
+
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatalf("%s: stdout: %v", cfg.Name, err)
+	}
+	cmd.Stderr = cmd.Stdout
+
+	p := &Process{
+		Name: cfg.Name, cmd: cmd, cancel: cancel,
+		waiter: make(chan struct{}), done: make(chan struct{}),
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("%s: starting %s: %v", cfg.Name, cfg.Path, err)
+	}
+	t.Logf("%s: started (pid %d): %s %s", cfg.Name, cmd.Process.Pid, cfg.Path, strings.Join(cfg.Args, " "))
+
+	go p.pump(t, out)
+	go func() {
+		p.err = cmd.Wait()
+		close(p.done)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		<-p.done
+	})
+	return p
+}
+
+// pump tees the process's output to the test log and records it for WaitForLine.
+func (p *Process) pump(t *testing.T, r io.Reader) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		t.Logf("%s | %s", p.Name, line)
+		p.mu.Lock()
+		p.lines = append(p.lines, line)
+		close(p.waiter)
+		p.waiter = make(chan struct{})
+		p.mu.Unlock()
+	}
+}
+
+// WaitForLine blocks until the process has printed a line containing want, the process
+// exits, or the timeout elapses.
+//
+// Waiting on the process's own output rather than on a duration is the whole point: a
+// `sleep 2` that usually works is the thing CLAUDE.md calls a stop signal, and it fails
+// as a flake on a loaded machine rather than as a diagnosis.
+func (p *Process) WaitForLine(t *testing.T, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		p.mu.Lock()
+		for _, l := range p.lines {
+			if strings.Contains(l, want) {
+				p.mu.Unlock()
+				return
+			}
+		}
+		next := p.waiter
+		p.mu.Unlock()
+
+		select {
+		case <-next:
+		case <-p.done:
+			// One more look: the line may have arrived in the same instant the process
+			// exited, and reporting "never printed it" then would be false.
+			p.mu.Lock()
+			for _, l := range p.lines {
+				if strings.Contains(l, want) {
+					p.mu.Unlock()
+					return
+				}
+			}
+			p.mu.Unlock()
+			t.Fatalf("%s exited (%v) without ever printing %q", p.Name, p.err, want)
+		case <-deadline:
+			t.Fatalf("%s did not print %q within %s", p.Name, want, timeout)
+		}
+	}
+}
+
+// Kill stops the process the way a crash does: SIGKILL, no cleanup, no flush. This is
+// the arm ADR-0024 is about — the WAL and the bucket are left exactly as they were at
+// that instant, and the next incarnation has to make sense of them.
+func (p *Process) Kill(t *testing.T) {
+	t.Helper()
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("%s: kill: %v", p.Name, err)
+	}
+	<-p.done
+	t.Logf("%s: killed", p.Name)
+}
+
+// Stop asks the process to shut down and waits for it. It is the graceful counterpart
+// to Kill: a test that means "the operator restarted it" should use this, so that a
+// clean shutdown path staying clean is also covered.
+func (p *Process) Stop(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	if err := p.cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("%s: interrupt: %v", p.Name, err)
+	}
+	select {
+	case <-p.done:
+	case <-time.After(timeout):
+		p.cancel()
+		<-p.done
+		t.Fatalf("%s did not exit within %s of SIGINT; killed", p.Name, timeout)
+	}
+	t.Logf("%s: stopped", p.Name)
+}
+
+// Wait blocks until the process exits and returns its error. It is for the binaries
+// that are *supposed* to exit — `control-plane -seed-volume` provisions one volume and
+// leaves.
+func (p *Process) Wait(t *testing.T, timeout time.Duration) error {
+	t.Helper()
+	select {
+	case <-p.done:
+		return p.err
+	case <-time.After(timeout):
+		p.cancel()
+		<-p.done
+		return fmt.Errorf("%s did not exit within %s", p.Name, timeout)
+	}
+}
+
+// Output returns everything the process has printed so far, for an assertion that has
+// to look at the whole stream rather than wait for one line.
+func (p *Process) Output() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.lines...)
+}

@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration || e2e
 
 // Package testinfra starts the real dependencies an integration test needs, as
 // containers, so every scenario is reproducible on a laptop and in CI with no

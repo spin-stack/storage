@@ -57,7 +57,6 @@ func run() error {
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
 		kekFile      = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
-		kekID        = flag.String("kek-id", "", "identity of the KEK in -kek-file; must match the kek_id the Control Plane wrapped each volume's DEK under (required with -kek-file)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -72,13 +71,6 @@ func run() error {
 		return errors.New("-data-dir is required")
 	case *socketDir == "":
 		return errors.New("-vhost-socket-dir is required")
-	case *kekFile != "" && *kekID == "":
-		// The id is not cosmetic: crypto.DevKMS binds it to nothing, but the Agent
-		// compares it against the volume's kek_id before unwrapping, so a blank one
-		// would make every volume look like it was wrapped under a different key.
-		return errors.New("-kek-id is required with -kek-file")
-	case *kekFile == "" && *kekID != "":
-		return errors.New("-kek-id names a key nothing reads without -kek-file")
 	}
 
 	cfg := agent.Config{
@@ -124,11 +116,15 @@ func run() error {
 		if kerr != nil {
 			return fmt.Errorf("opening the directory holding the KEK: %w", kerr)
 		}
-		kek, kerr := agent.LoadKEK(kekDisk, filepath.Base(*kekFile))
+		kek, kerr := crypto.LoadKEK(kekDisk, filepath.Base(*kekFile))
 		if kerr != nil {
 			return kerr
 		}
-		kms = crypto.NewDevKMS(kek, *kekID)
+		// The id is derived from the key, never configured: it is what the volume row
+		// records and what the Agent compares against before unwrapping, and the
+		// Control Plane derives it the same way from the same file (crypto.KEKID).
+		kms = crypto.NewDevKMS(kek, crypto.KEKID(kek))
+		slog.Info("key-encryption key loaded", "kek_id", crypto.KEKID(kek))
 	} else {
 		slog.Warn("no -kek-file: this Agent writes guest data unencrypted (§15 requires encryption outside dev)")
 	}
@@ -147,6 +143,13 @@ func run() error {
 	volumes, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir:   *dataDir,
 		SocketDir: *socketDir,
+		// Without it no volume on this host ever runs a durability scheduler: a
+		// checkpoint names the host publishing it (§12.3-12.4), and checkpointsEnabled
+		// refuses to start one that cannot. The consequence is not subtle — `published`
+		// stays 0 for the life of the process, not one byte of local WAL is ever
+		// reclaimed, and the NVMe fills. It was missing until the e2e lane started the
+		// real binary and read the line it logs about it.
+		HostID: *hostID,
 	}, agent.VolumeManagerDeps{
 		Clock:   real.NewClock(),
 		Disk:    disk,

@@ -1,7 +1,6 @@
 package agent_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -12,125 +11,8 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
-
-// LoadKEK is the one place a host's key-encryption key enters the process (§15.1's
-// "KEK por host en archivo"). Its whole contract is the size check, and the size check
-// matters because *any* 32 bytes are a valid AES-256 key: a KEK read from a file with a
-// trailing newline, or from a hex dump, would be perfectly usable and completely wrong,
-// and every volume on the host would then fail to unwrap with an authentication error
-// that points at the DEK rather than at the file.
-
-func writeKEKFile(t *testing.T, d disk.Disk, name string, body []byte) {
-	t.Helper()
-	f, err := d.Create(name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Append(body); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLoadKEK(t *testing.T) {
-	exact := bytes.Repeat([]byte{0xAB}, crypto.DEKSize)
-
-	tests := []struct {
-		name string
-		body []byte
-		// write is false for the missing-file case: there is nothing to write.
-		write   bool
-		wantErr error
-	}{
-		{name: "exactly 32 bytes", body: exact, write: true},
-		{name: "empty file", body: nil, write: true, wantErr: agent.ErrBadKEK},
-		{
-			name: "one byte short — a truncated write, and still a usable-looking key",
-			body: exact[:crypto.DEKSize-1], write: true, wantErr: agent.ErrBadKEK,
-		},
-		{
-			name: "a trailing newline — what `echo` and most editors produce",
-			body: append(append([]byte(nil), exact...), '\n'), write: true, wantErr: agent.ErrBadKEK,
-		},
-		{
-			name:  "64 hex characters — a key that is right, in the wrong encoding",
-			body:  []byte("ababababababababababababababababababababababababababababababab00"),
-			write: true, wantErr: agent.ErrBadKEK,
-		},
-		{name: "no file at all", write: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			d := sim.NewDisk()
-			if tc.write {
-				writeKEKFile(t, d, "kek", tc.body)
-			}
-			got, err := agent.LoadKEK(d, "kek")
-			switch {
-			case tc.wantErr != nil:
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("want %v, got %v", tc.wantErr, err)
-				}
-			case !tc.write:
-				if err == nil {
-					t.Fatal("a missing KEK file must be an error, not an all-zero key")
-				}
-			default:
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				if !bytes.Equal(got[:], exact) {
-					t.Fatalf("the KEK read back as %x", got[:8])
-				}
-			}
-			// Whatever went wrong, nothing partial comes back: a caller that ignored
-			// the error would otherwise hold a key made of whatever fitted.
-			if err != nil && got != ([crypto.DEKSize]byte{}) {
-				t.Fatal("a failed load returned key material")
-			}
-		})
-	}
-}
-
-// TestLoadKEKRoundTripsThroughTheKMS closes the loop the size check exists to protect:
-// the bytes on disk are the bytes that unwrap a DEK wrapped under them. Without this,
-// LoadKEK could return a correctly-sized, correctly-rejected-when-wrong, and entirely
-// scrambled key and every test above would still pass.
-func TestLoadKEKRoundTripsThroughTheKMS(t *testing.T) {
-	var kek [crypto.DEKSize]byte
-	for i := range kek {
-		kek[i] = byte(i * 7)
-	}
-	d := sim.NewDisk()
-	writeKEKFile(t, d, "kek", kek[:])
-
-	loaded, err := agent.LoadKEK(d, "kek")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrapper := crypto.NewDevKMS(kek, "kek-1")
-	dek, err := crypto.GenerateDEK(&ramp{b: 5}, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrapped, err := wrapper.WrapDEK(&ramp{b: 9}, dek)
-	if err != nil {
-		t.Fatal(err)
-	}
-	back, err := crypto.NewDevKMS(loaded, "kek-1").UnwrapDEK(wrapped, 3)
-	if err != nil {
-		t.Fatalf("a DEK wrapped under the file's key did not unwrap under the loaded one: %v", err)
-	}
-	if back.Key != dek.Key {
-		t.Fatal("the loaded KEK unwrapped a different key")
-	}
-}
 
 // A volume whose key material this host cannot use is not served. There is no
 // degraded mode: serving it unencrypted would write this guest's data into the bucket
