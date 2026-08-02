@@ -37,6 +37,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "lapsed-lease-stops-publishing", Run: scenarioLapsedLeaseStopsPublishing},
 		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
 		{Name: "agent-encrypts-what-leaves-the-host", Run: scenarioAgentEncryptsWhatLeavesTheHost},
+		{Name: "encrypted-volume-survives-a-restart", Run: scenarioEncryptedVolumeSurvivesARestart},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
 		{Name: "a-promoted-host-reads-the-previous-epoch", Run: scenarioAPromotedHostReadsThePreviousEpoch},
 	}
@@ -235,9 +236,17 @@ func (hidingStore) List(context.Context, string) ([]objectstore.ObjectInfo, erro
 
 // DurableRangeChecker enforces, from the guest's side, the promise INV-08 and INV-13
 // make from the store's: a range this volume ACKed as durable must never come back as
-// zeros. Every other checker here watches watermarks and objects; this one watches the
-// bytes a guest would actually receive, which is the only place the difference between
-// "recovered" and "recovered correctly" is visible.
+// something other than what the guest wrote. Every other checker here watches
+// watermarks and objects; this one watches the bytes a guest would actually receive,
+// which is the only place the difference between "recovered" and "recovered correctly"
+// is visible.
+//
+// It watches two shapes of the same wrong answer, because a rebuilt base can be wrong
+// in two directions and only one of them was ever modelled: zeros, which is a base that
+// is *missing*, and foreign bytes, which is a base that was *built wrongly*. The second
+// is why this comment grew — an Agent replaying its own sealed objects with no key
+// folded ciphertext into the view at exactly the plaintext's length, and every
+// watermark, every object and every zero-check agreed the volume was fine.
 type DurableRangeChecker struct{ violation error }
 
 // NewDurableRangeChecker returns a fresh checker.
@@ -246,8 +255,15 @@ func NewDurableRangeChecker() *DurableRangeChecker { return &DurableRangeChecker
 func (c *DurableRangeChecker) Name() string { return "durable-range-survives-restart" }
 
 func (c *DurableRangeChecker) Observe(e Event) {
-	if e.Kind == EventDurableRead && e.ZerosAfterRestart && c.violation == nil {
+	if e.Kind != EventDurableRead || c.violation != nil {
+		return
+	}
+	switch {
+	case e.ZerosAfterRestart:
 		c.violation = fmt.Errorf("volume %s read zeros at step %d for a range it ACKed as durable (violates §5.8/INV-08)",
+			e.Key, e.Step)
+	case e.ForeignBytesAfterRestart:
+		c.violation = fmt.Errorf("volume %s was served bytes it never wrote at step %d for a range it ACKed as durable (violates §5.8/INV-08)",
 			e.Key, e.Step)
 	}
 }
@@ -1243,4 +1259,195 @@ func servedStatus(m *agent.VolumeManager, volumeID string) agent.VolumeStatus {
 		}
 	}
 	return agent.VolumeStatus{}
+}
+
+// scenarioEncryptedVolumeSurvivesARestart is the cross nothing in this harness made:
+// encryption *and* a restart. Both halves were modelled separately and each was green —
+// agent-encrypts-what-leaves-the-host never restarts, and
+// truncated-volume-survives-a-restart runs with keyID 0 and no KMS in its deps — so the
+// path where they meet had no coverage at all, and that is exactly where the defect was:
+// internal/agent handed recovery.RecoverOver a literal nil Encryption for a volume whose
+// DEK it had just unwrapped, and the guest was served its own data still sealed.
+//
+// It is the "test the seams, not only the parts" rule with a name: two well-covered
+// components, and the bug living in the argument one passes the other.
+func scenarioEncryptedVolumeSurvivesARestart(s *Sim) error {
+	return encryptedVolumeSurvivesARestart(s, restartHoldingTheKEK)
+}
+
+const (
+	restartHoldingTheKEK = false
+	restartWithoutTheKEK = true
+)
+
+func encryptedVolumeSurvivesARestart(s *Sim, dropKEKOnRestart bool) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return err
+	}
+	vol := [16]byte(u)
+
+	// Key material from the seeded PRNG, so the same seed produces the same ciphertext
+	// (INV-02) and this scenario is reproducible byte for byte.
+	var kek [crypto.DEKSize]byte
+	if _, err := io.ReadFull(s.Rand, kek[:]); err != nil {
+		return err
+	}
+	kms := crypto.NewDevKMS(kek, "kek-dst")
+	dek, err := crypto.GenerateDEK(s.Rand, 7)
+	if err != nil {
+		return err
+	}
+	wrapped, err := kms.WrapDEK(s.Rand, dek)
+	if err != nil {
+		return err
+	}
+	enc, err := wal.NewEncryption(dek, vol)
+	if err != nil {
+		return err
+	}
+
+	// A pattern no encryption leaves intact and no header produces by accident.
+	pattern := bytes.Repeat([]byte{0xE7}, 4096)
+	const segBytes = 8192
+	limits := wal.Limits{SegmentBytes: segBytes}
+
+	// Phase 1 — a previous run of this Agent, hand-driven through wal for the same
+	// reason the truncated-restart scenario is: what a restart has to survive is an
+	// on-disk state that must already exist before the Agent starts.
+	lm := lease.NewManager(s.Clock, time.Minute)
+	lm.Grant()
+	l := wal.NewLog(s.Disk, "/var/lib/spin/wal", s.Clock, vol, 1, limits)
+	l.EnableEncryption(enc)
+	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, dek.KeyID, wal.DefaultBatchConfig()),
+		wal.NewUploader(s.Store, 3), lm)
+	for i := range 6 {
+		if _, err := l.Write(uint64(i)*4096, pattern, 0); err != nil {
+			return fmt.Errorf("seeding write %d: %w", i, err)
+		}
+	}
+	if err := l.Flush(ctx); err != nil {
+		return fmt.Errorf("seeding flush: %w", err)
+	}
+	durable := l.Watermarks().Durable
+
+	// Truncate, so the read view after the restart *must* come from the object store.
+	// Without this the local segments answer the read and the scenario proves nothing
+	// about the recovered base — which is the only thing it exists to prove.
+	dir := wal.SegmentDir("/var/lib/spin/wal", vol, 1)
+	before, err := s.Disk.List(dir)
+	if err != nil {
+		return err
+	}
+	if err := l.AdvancePublished(durable); err != nil {
+		return err
+	}
+	if err := l.TruncateLocal(durable); err != nil {
+		return err
+	}
+	after, err := s.Disk.List(dir)
+	if err != nil {
+		return err
+	}
+	if len(after) >= len(before) {
+		return fmt.Errorf("truncation unlinked nothing (%d segments, then %d): this scenario proves nothing",
+			len(before), len(after))
+	}
+	if err := l.Close(); err != nil {
+		return err
+	}
+
+	// The objects really are sealed, checked here rather than assumed. If this ever
+	// stopped holding, the restart below would read back the pattern for the wrong
+	// reason and the scenario would pass while proving nothing.
+	objs, err := s.Store.List(ctx, "wal/"+volumeID+"/")
+	if err != nil {
+		return err
+	}
+	if len(objs) == 0 {
+		return errors.New("no WAL objects were uploaded: this scenario would prove nothing")
+	}
+	for _, o := range objs {
+		body, err := s.Store.Get(ctx, o.Key)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(body, pattern) {
+			return fmt.Errorf("object %s carries the guest's plaintext (§5.10/INV-15)", o.Key)
+		}
+	}
+	s.Notef("volume %s: %d segments reclaimed, %d sealed objects hold durable=%d",
+		volumeID, len(before)-len(after), len(objs), durable)
+
+	// Phase 2 — the Agent restarts and must rebuild that view from the sealed objects.
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin", Limits: limits,
+		HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
+	}, agent.VolumeManagerDeps{
+		Clock:   s.Clock,
+		Disk:    s.Disk,
+		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper:  simMapper{},
+		EventFD: simEventFD,
+		Store:   s.Store,
+		Lease:   func() bool { return lm.Valid() },
+		KMS:     kmsOrNil(kms, dropKEKOnRestart),
+		Keys: func(context.Context, string) (agent.VolumeKeys, error) {
+			return agent.VolumeKeys{
+				VolumeID: volumeID, DEKWrapped: wrapped, KEKID: "kek-dst", DEKKeyID: dek.KeyID,
+			}, nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close() }()
+
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}); err != nil {
+		return fmt.Errorf("the restarted Agent could not start the volume: %w", err)
+	}
+	dev, ok := m.Device(volumeID)
+	if !ok {
+		return errors.New("the restarted Agent is not serving the volume")
+	}
+
+	got := make([]byte, len(pattern))
+	_, readErr := dev.ReadAt(got, 0)
+
+	// Three outcomes, and only one of them is correct. Zeros mean the base was missing;
+	// foreign bytes mean it was built wrongly — the ciphertext case, which is why this
+	// scenario exists. An error is not a violation: refusing to answer is the designed
+	// behaviour when the base cannot be rebuilt, and it is the *silent* wrong answer
+	// that a guest has no way to detect.
+	answered := readErr == nil
+	zeros := answered && bytes.Equal(got, make([]byte, len(got)))
+	foreign := answered && !zeros && !bytes.Equal(got, pattern)
+	s.Emit(Event{Kind: EventDurableRead, Key: volumeID,
+		ZerosAfterRestart: zeros, ForeignBytesAfterRestart: foreign})
+	if zeros {
+		return fmt.Errorf("volume %s read zeros for a range it ACKed as durable", volumeID)
+	}
+	if foreign {
+		return fmt.Errorf("volume %s was served %x… for a range where it wrote %x… (§5.8/INV-08)",
+			volumeID, got[:8], pattern[:8])
+	}
+	if readErr != nil {
+		if dropKEKOnRestart {
+			// The whole point of the planted arm: one missing flag must cost the volume
+			// its reads, not cost the guest its data.
+			s.Notef("restarted without the KEK: the read was refused rather than answered: %v", readErr)
+			return nil
+		}
+		return fmt.Errorf("read after restart: %w", readErr)
+	}
+	if dropKEKOnRestart {
+		return fmt.Errorf("volume %s answered a read after restarting with no KEK at all", volumeID)
+	}
+	s.Notef("the restarted Agent decrypted its own sealed objects and served the guest its own bytes")
+	return nil
 }

@@ -51,6 +51,12 @@ type Volume struct {
 
 	log *wal.Log
 	dev *blockdev.Device
+	// enc is this volume's DEK bound to its id, or nil when the Agent has no KMS.
+	// The Log already holds it for the write path; it is kept here because the *read*
+	// path needs it too and rebuilding the base happens on a goroutine that has no
+	// other way to reach it. Passing a literal nil there is the bug this field exists
+	// to make hard to write — see fetchBase.
+	enc *wal.Encryption
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -499,7 +505,7 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	socket := path.Join(m.cfg.SocketDir, id+".sock")
 	v := &Volume{
 		id: id, epoch: d.GetEpoch(), root: root, socket: socket,
-		log: log, dev: dev,
+		log: log, dev: dev, enc: enc,
 		done: make(chan struct{}),
 	}
 
@@ -567,7 +573,11 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		return
 	}
 
-	base, durable, err := recovery.RecoverOver(ctx, m.deps.Store, nil, volumeID, epoch, parent)
+	// v.enc, not nil: these objects are this volume's own, sealed under this volume's
+	// id, and replaying them without the key folds GCM ciphertext into the read view
+	// at exactly the right length with no error (recovery.ErrSealedWithoutKey now
+	// refuses it rather than serving it, but the key belongs here regardless).
+	base, durable, err := recovery.RecoverOver(ctx, m.deps.Store, v.enc, volumeID, epoch, parent)
 	if err != nil {
 		// Refuse loudly rather than serve zeros. An empty view where data belongs is
 		// indistinguishable from a fresh volume, which is the failure this whole
@@ -603,12 +613,39 @@ func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.
 		// base that silently reads as zeros for the parent's whole extent.
 		return nil, fmt.Errorf("agent: volume %s names parent snapshot %s with no parent volume", v.id, snapID)
 	}
-	view, _, err := materialize.New(m.deps.Store, m.deps.IOClass, nil).
+	// The parent's records need the parent's Encryption, which is *not* this volume's
+	// even though the DEK is the same one. A clone inherits the parent's DEK and its
+	// version (controlplane.Clone: DEKWrapped, KEKID, DEKKeyID) precisely so the
+	// chain's objects stay readable — but crypto.deriveNonce and crypto.aad both bind
+	// the volume id, and Encryption.Decrypt opens with its own VolumeID rather than the
+	// record's. Handing v.enc here would fail Open on every record the parent wrote.
+	penc, err := m.parentEncryption(v, parentVol)
+	if err != nil {
+		return nil, err
+	}
+	view, _, err := materialize.New(m.deps.Store, m.deps.IOClass, penc).
 		FromSnapshot(ctx, parentVol, snapID)
 	if err != nil {
 		return nil, fmt.Errorf("agent: materializing parent snapshot %s of volume %s: %w", snapID, parentVol, err)
 	}
 	return view, nil
+}
+
+// parentEncryption re-binds this volume's DEK to its parent's id, which is what opens
+// the objects the parent wrote. Returns nil for an unencrypted volume.
+func (m *VolumeManager) parentEncryption(v *Volume, parentVol string) (*wal.Encryption, error) {
+	if v.enc == nil {
+		return nil, nil //nolint:nilnil // no encryption is a mode, not a failure — see encryptionFor
+	}
+	u, err := ids.Parse(parentVol)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s names parent volume %q, which is not a uuid: %w", v.id, parentVol, err)
+	}
+	penc, err := wal.NewEncryption(v.enc.DEK, [16]byte(u))
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: binding the DEK to parent %s: %w", v.id, parentVol, err)
+	}
+	return penc, nil
 }
 
 // supervise runs the vhost server and restarts it when it returns.

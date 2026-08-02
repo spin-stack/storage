@@ -99,6 +99,12 @@ type Event struct {
 	// DurableRead events (§5.8): whether a range the volume ACKed as durable came back
 	// as zeros after a restart. Must always be false (INV-08 from the guest's side).
 	ZerosAfterRestart bool
+	// ForeignBytesAfterRestart is the same violation wearing different clothes: the
+	// read was answered, and with neither the guest's bytes nor zeros. Zeros are the
+	// shape a *missing* base has; this is the shape a base rebuilt *wrongly* has —
+	// undecrypted ciphertext being the case that shipped, since GCM leaves the length
+	// intact and nothing downstream re-checks the plaintext CRC. Must always be false.
+	ForeignBytesAfterRestart bool
 	// Checkpoint events (§12.6): whether a checkpoint object appeared in the store while
 	// the host's lease was invalid. Must always be false — a SELF_FENCED Agent "deja de
 	// publicar checkpoints/manifests". This is INV-06's other half: LeaseValid above
@@ -130,7 +136,8 @@ func (e Event) String() string {
 	case EventTruncate:
 		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
 	case EventDurableRead:
-		return fmt.Sprintf("%04d durable-read vol=%s zeros_after_restart=%t", e.Step, e.Key, e.ZerosAfterRestart)
+		return fmt.Sprintf("%04d durable-read vol=%s zeros_after_restart=%t foreign_bytes_after_restart=%t",
+			e.Step, e.Key, e.ZerosAfterRestart, e.ForeignBytesAfterRestart)
 	case EventVolumeServe:
 		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
 	case EventCheckpoint:

@@ -667,20 +667,44 @@ func replayEpoch(ctx context.Context, store objectstore.Store, enc *wal.Encrypti
 	return nil
 }
 
+// ErrSealedWithoutKey is returned when a replayed record is sealed and the replay was
+// handed no Encryption to open it. It is deliberately not a decryption failure: the
+// key was never offered, so there is nothing to tamper with and nothing to retry —
+// the caller passed the wrong arguments.
+var ErrSealedWithoutKey = errors.New("recovery: record is sealed and this replay holds no key")
+
 // ApplyRecord folds one replayed record into the read view, decrypting WRITEs when
-// the volume is encrypted (enc nil ⇒ plaintext). It is the single definition of
-// "replaying a WAL record onto a view", shared by recovery and by cross-host
-// materialization (§20, §22).
+// the volume is encrypted. It is the single definition of "replaying a WAL record
+// onto a view", shared by recovery and by cross-host materialization (§20, §22).
+//
+// A nil enc means "this volume is plaintext", and the record itself is what says
+// whether that is true: KeyID 0 is not a key version, it is the on-disk marker for a
+// cleartext payload (§14.1, and wal.ErrUnversionedKey spells out why 0 can never be a
+// DEK). So a sealed record arriving with no key is a contradiction, and it fails here.
+//
+// This check is load-bearing rather than defensive. Without it the mistake is
+// invisible in every direction: crypto.Seal returns ciphertext of exactly the
+// plaintext's length with the GCM tag held separately in the header, so folding the
+// undecrypted payload into the view overwrites the right extent with the right number
+// of bytes and no CRC is consulted on this path. internal/agent shipped exactly that —
+// a literal nil passed to RecoverOver for a volume whose DEK it had just unwrapped —
+// and the guest was served its own data as ciphertext with no error anywhere. Callers
+// that legitimately have no key (a plaintext volume, dev mode without a KMS) are
+// unaffected, because their records carry KeyID 0.
 func ApplyRecord(view *cow.IntervalMap, enc *wal.Encryption, rec wal.Record) error {
 	switch rec.Type {
 	case format.RecordWrite:
 		payload := rec.Payload
-		if enc != nil {
+		switch {
+		case enc != nil:
 			pt, err := enc.Decrypt(rec)
 			if err != nil {
 				return fmt.Errorf("recovery: decrypt seq %d: %w", rec.Sequence, err)
 			}
 			payload = pt
+		case rec.KeyID != 0:
+			return fmt.Errorf("%w: sequence %d is sealed with key version %d",
+				ErrSealedWithoutKey, rec.Sequence, rec.KeyID)
 		}
 		view.Overwrite(rec.Offset, payload)
 	case format.RecordDiscard, format.RecordWriteZeroes:
