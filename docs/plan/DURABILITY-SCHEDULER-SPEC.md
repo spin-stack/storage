@@ -104,3 +104,47 @@ open question.
 - **INV-17 under load**: a checkpoint in flight must not delay a guest FLUSH. Same shape
   as `TestAReadIsAnsweredWhileAFlushIsUploading`, which is the only reason the analogous
   regression in `blockdev` is impossible today.
+
+## Addendum (2026-08-01): the planted bug this spec asked for, replaced
+
+The one above — *a scheduler that truncates to `durable` rather than `published`* — was
+written before the code existed and turned out to be **unreachable**. `wal.StrictOrder`
+refuses `upTo > published` at the source, so the mistake cannot be made through the API:
+the invariant is enforced where it should be, and a planted bug that the type system
+rejects proves nothing about the checker.
+
+The replacement is the other half of the same §12.6 sentence, and it *is* reachable:
+
+> Al vencer el lease sin renovación, el Agent entra en `SELF_FENCED`: deja de ACKear
+> durabilidad, **deja de publicar checkpoints/manifests**, y espera instrucciones.
+> — v5.1 §12.6
+
+Two obligations, one lease. The first has had a checker since the beginning
+(`DurableAckLeaseChecker`, INV-06, on the FLUSH path). **The second has never had one.**
+Nothing simulated has ever watched a checkpoint decide whether it may publish, even
+though `checkpointOnce` gates on exactly that and the gate is one `if` deep.
+
+**What the checker watches.** A publish that happened while the host's lease was invalid.
+Not the gate's return value — the object store's contents before and after the attempt,
+against `lease.Manager.Valid()` at that instant. A checker that read the gate would be
+asserting the code calls the function it calls; this asserts that no checkpoint object
+appears in a window where the fleet no longer recognises this writer.
+
+**How it is planted, without touching production code.** The honest wiring resolves the
+lease per call — `Lease: func() bool { return lm.Valid() }` — which is what `applyLease`
+does and why `volume.go` warns against capturing a `*lease.Manager`. The planted bug is
+the wiring that answers from a snapshot: `Lease: func() bool { return true }`, a lease
+question asked once at start-up and never asked again. That is not a hypothetical either
+— it is what `scenarioTruncatedVolumeSurvivesARestart` already passes, which is fine
+there (its lease never lapses) and is precisely the shortcut that would go unnoticed in a
+volume whose lease does.
+
+The Agent is otherwise untouched: same manager, same scheduler, same store. The lapse is
+real time passing on the simulated clock past a real `lease.Manager`'s TTL.
+
+**Why the publish still succeeds under the bug** — which is what makes the checker worth
+having. `checkpoint.Create`'s own gate is `recovery.VerifyPublisher`: the epoch object
+still names this host, because being fenced by a lapsed lease is exactly the case where
+nobody has taken the epoch away yet. §12.4's ownership check cannot see a lease. The
+`if` in `checkpointOnce` is the only thing between a SELF_FENCED Agent and a published
+checkpoint, and until now nothing proved it was there.

@@ -49,6 +49,7 @@ const (
 	EventIOClass     EventKind = "io-class"
 	EventVolumeServe EventKind = "volume-serve"
 	EventDurableRead EventKind = "durable-read"
+	EventCheckpoint  EventKind = "checkpoint"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -98,6 +99,11 @@ type Event struct {
 	// DurableRead events (§5.8): whether a range the volume ACKed as durable came back
 	// as zeros after a restart. Must always be false (INV-08 from the guest's side).
 	ZerosAfterRestart bool
+	// Checkpoint events (§12.6): whether a checkpoint object appeared in the store while
+	// the host's lease was invalid. Must always be false — a SELF_FENCED Agent "deja de
+	// publicar checkpoints/manifests". This is INV-06's other half: LeaseValid above
+	// covers the FLUSH ACK, this covers the publish.
+	PublishedWithoutLease bool
 }
 
 // String renders an event deterministically for the trace.
@@ -127,6 +133,9 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d durable-read vol=%s zeros_after_restart=%t", e.Step, e.Key, e.ZerosAfterRestart)
 	case EventVolumeServe:
 		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
+	case EventCheckpoint:
+		return fmt.Sprintf("%04d checkpoint vol=%s lease_valid=%t published_without_lease=%t %s",
+			e.Step, e.Key, e.LeaseValid, e.PublishedWithoutLease, e.Msg)
 	case EventIOClass:
 		return fmt.Sprintf("%04d io-class bg_granted=%t high_in_flight=%t", e.Step, e.BgGranted, e.HighInFlight)
 	case EventObject:

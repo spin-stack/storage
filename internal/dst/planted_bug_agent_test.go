@@ -39,3 +39,34 @@ func TestPlantedBugDurableRangeReadsZeros(t *testing.T) {
 		return truncatedVolumeSurvivesARestart(s, storeHidesTheObjects)
 	})
 }
+
+// §12.6's second obligation: a SELF_FENCED Agent "deja de publicar checkpoints/manifests".
+// The first — no durable ACK — has had a checker since the beginning; this one never did,
+// even though the gate is one `if` at the top of checkpointOnce.
+//
+// Planted by the wiring, not by a fault: a Lease function that answers from a snapshot
+// taken at start-up instead of resolving the lease per call. That is the shortcut every
+// other Agent scenario here takes — harmlessly, because their leases never lapse — and it
+// is the same category as DEV-0012 and the plaintext-WAL proof: not a broken algorithm, a
+// question that stopped being asked.
+//
+// Everything else stays honest. The epoch object names this host, so §12.4's ownership
+// check inside checkpoint.Create passes and the publish genuinely succeeds under the bug;
+// the verdict is read from the object store's contents rather than from the error the
+// call returned, because a gate that returns the right error and publishes anyway would
+// satisfy any assertion on err.
+func TestPlantedBugCheckpointPublishedWithoutLease(t *testing.T) {
+	requirePasses(t, 24, NewCheckpointLeaseChecker(), scenarioLapsedLeaseStopsPublishing)
+	plantedBug(t, 24, NewCheckpointLeaseChecker(), "checkpoint-requires-lease", func(s *Sim) error {
+		return lapsedLeaseStopsPublishing(s, leaseAnsweredFromASnapshot)
+	})
+
+	// One cached answer, both of §12.6's obligations gone: the same wiring that let the
+	// checkpoint out also let a FLUSH be ACKed as durable after the lease had expired.
+	// Asserted rather than left as a remark, because it is the reason the new checker is
+	// a second gate and not a duplicate of the old one — INV-06 sees the ACK, this sees
+	// the publish, and a host can lose the right to do the second while doing neither.
+	plantedBug(t, 24, NewDurableAckLeaseChecker(), "durable-ack-requires-lease", func(s *Sim) error {
+		return lapsedLeaseStopsPublishing(s, leaseAnsweredFromASnapshot)
+	})
+}

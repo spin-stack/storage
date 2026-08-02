@@ -225,13 +225,40 @@ The ordering also matters and is not arbitrary: the checkpoint must come *after*
 read, because the read is what waits for the base, and a checkpoint taken while the base
 is pending is the false fencing witness above.
 
-**The planted bug the spec asked for does not exist.** It proposed "a scheduler that
-truncates to `durable` rather than `published`". That is unreachable:
-`StrictOrder.AllowTruncate` refuses `upTo > published` at the source, so the mistake
-cannot be made through the API. The invariant is enforced where it should be, and the
-planted bug for this arm has to be something else — the honest candidate is a checkpoint
-published without the lease gate (§12.6), which is reachable and which no checker
-currently watches.
+**~~The planted bug the spec asked for does not exist.~~ Replaced 2026-08-01.** It
+proposed "a scheduler that truncates to `durable` rather than `published`". That is
+unreachable: `StrictOrder.AllowTruncate` refuses `upTo > published` at the source, so the
+mistake cannot be made through the API. The invariant is enforced where it should be, and
+a planted bug the API rejects proves nothing about the checker.
+
+The replacement is the other half of the same §12.6 sentence — *"deja de ACKear
+durabilidad, **deja de publicar checkpoints/manifests**"*. Two obligations, one lease; the
+first has had a checker since 7.2 and **the second never did**, though the gate is one
+`if` at the top of `checkpointOnce`. `CheckpointLeaseChecker` +
+`scenarioLapsedLeaseStopsPublishing` now watch it, and `plantedProofs` counts 16
+behavioural proofs.
+
+Three things make it a proof rather than a formality:
+
+- **The verdict comes from the object store, not the gate.** It counts checkpoint objects
+  before and after the attempt against `lease.Manager.Valid()`. A gate that returned the
+  right error and published anyway would satisfy any assertion on `err`.
+- **The bug is the wiring, not a fault.** `Lease: func() bool { return true }` — the lease
+  question asked once at start-up instead of resolved per call, which is what
+  `applyLease` does and what `volume.go` warns against. Same category as DEV-0012: not a
+  broken algorithm, a question that stopped being asked.
+- **The publish genuinely succeeds under it.** The epoch object names this host, so
+  §12.4's `VerifyPublisher` lets it through — being fenced by one's own monotonic clock is
+  precisely the case where nobody has taken the epoch away yet. The `if` is the only thing
+  there, and until now nothing proved it was.
+
+The scenario also found something worth writing down: §14.4 uploads (step 4) *before* it
+checks the lease (step 5), so a lapsed-lease FLUSH leaves its objects in S3 and refuses
+only the ACK. The store can then prove a longer durable prefix than the volume ever
+ACKed — which is exactly the material a fenced host would publish, and why "there was
+nothing new to publish" is not the reason the honest arm stays quiet. The same planted
+wiring trips `DurableAckLeaseChecker` too, asserted alongside it, because one cached
+answer loses both obligations.
 
 ## The guest lane in CI: QEMU is the input that is still missing
 
