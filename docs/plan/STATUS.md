@@ -526,7 +526,7 @@ segment creation is latched exactly like ENOSPC while appending
 (`TestAFullDeviceAtASegmentBoundaryLeavesNoStub`). **Waits on ADR-0013**, where the Agent
 knows a volume's share of the device budget.
 
-## DEV-0018 — the Linux guest lane never existed, and the guest hangs on its first I/O
+## ~~DEV-0018~~ — the Linux guest lane, and the hang it found *(resolved 2026-08-02)*
 
 **A stop signal, recorded rather than worked around.** Two findings, and the second is
 only visible because of the first.
@@ -556,12 +556,28 @@ virtio_blk virtio0: [vda] 32768 512-byte logical blocks (16.8 MB/16.0 MiB)
 No partition scan, no `Freeing unused kernel memory`, no init output, no panic. It sits
 there until the timeout.
 
-**What is ruled out so far:** the initramfs is a valid static `/init`; `VIRTIO_RING_F_INDIRECT_DESC`
-*is* offered; the call (interrupt) eventfd *is* signalled by `queueLoop.drain` when
-`ProcessQueue` reports completions with `notify`. What is not ruled out is where the
-difference between SeaBIOS and Linux actually lies — SeaBIOS **polls** the used ring and
-never waits for an interrupt, so every passing test in this lane is blind to a completion
-path a sleeping driver depends on. That is the first place to look.
+**The cause, found by comparing the two handshakes.** Instrumenting the message loop and
+diffing what QEMU sends for a SeaBIOS guest against a Linux one showed the whole thing in
+one line: the Linux run has a **second configuration round**. `GET_VRING_BASE` stops the
+queue, and then `SET_FEATURES`, `SET_MEM_TABLE`, `SET_VRING_NUM/BASE/ADDR`, and — the
+important one — a **new `SET_VRING_KICK`** with a fresh eventfd.
+
+That is not reconnection (3.2): the connection never drops. It is what **every real boot
+does** — the firmware brings the device up, boots an OS, and the OS's driver brings it up
+again with its own rings.
+
+`queueLoop.ensure` started the loop once (`if q.started { return }`) and kept the first
+kick, so after the hand-off it was parked on a descriptor nothing would ever signal again.
+The second driver's very first request sat in the ring for ever. The backend was healthy
+by every measure it had: ready, ring empty, no error.
+
+Every test in `internal/vhost` passed because the fake front-end configured the device
+**once**. `TestAReinitialisedDeviceIsStillServed` is that sequence — captured from the
+real QEMU trace — and it reproduces the hang in two seconds instead of ten minutes.
+
+**Fixed** by `ensure` restarting the loop when `dev.Kick()` is a descriptor other than the
+one it is parked on. `TestALinuxGuestIssuesFLUSH` now passes in ~1.3 s: a real Linux
+kernel's `fsync` makes a record durable in a verified object.
 
 **One real fix already landed on the way:** the initramfs is built by an unprivileged
 `cpio` and therefore contains no device nodes, so the kernel could not open an initial
@@ -569,10 +585,7 @@ console and handed PID 1 **no stdio at all** — every line `guestinit` printed 
 closed descriptor. It now mounts devtmpfs and opens `/dev/console` explicitly. That was
 masking the hang as silence.
 
-The test is committed and **skipped, with the reason as its skip message**. Skipped rather
-than deleted because the test is not what is wrong; skipped rather than left red because a
-red gate everyone knows about stops being a gate. Deleting it would put the tree back
-where it was — a guest built, verified, and booted by nothing.
+The skip is gone with the fix, which is the only thing that should ever have removed it.
 
 ## ~~DEV-0017~~ — the Agent wrote its WAL one level below where it was told *(resolved 2026-08-02)*
 

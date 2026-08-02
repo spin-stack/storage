@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The tests in this file never poll and never sleep. §25.1/INV-01 keeps
@@ -32,24 +33,57 @@ type eventFactory struct {
 	call  *fakeEvent
 	n     int
 	wired chan struct{}
+	// newKick carries every kick descriptor handed out, in order. A real guest
+	// reconfigures the device at least once — firmware brings it up, then hands off
+	// to the OS, which brings it up again with fresh rings and fresh eventfds — so
+	// "the kick" is not one object for the life of a session. Buffered and never
+	// drained by the factory, so a test can pick up the nth whenever it asks.
+	newKick chan *fakeEvent
 }
 
-func newEventFactory() *eventFactory { return &eventFactory{wired: make(chan struct{})} }
+func newEventFactory() *eventFactory {
+	return &eventFactory{wired: make(chan struct{}), newKick: make(chan *fakeEvent, 8)}
+}
 
 func (f *eventFactory) make(*os.File) (EventFD, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
 	e := newFakeEvent()
+	// Odd descriptors are kicks and even ones calls, in the order queueLoop.ensure
+	// asks for them.
+	if f.n%2 == 1 {
+		f.newKick <- e
+	} else {
+		e.signal = f.onSignal
+	}
 	switch f.n {
 	case 1:
 		f.kick = e
 	case 2:
-		e.signal = f.onSignal
 		f.call = e
 		close(f.wired)
 	}
 	return e, nil
+}
+
+// nthKick blocks until the backend has asked for n kick descriptors and returns the
+// nth. Blocking on the channel rather than polling a clock is not only INV-01: the
+// queue loop wires itself up asynchronously, and any timeout a test picked would be a
+// guess about a machine it is not running on.
+func (f *eventFactory) nthKick(t *testing.T, n int) *fakeEvent {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var e *fakeEvent
+	for range n {
+		select {
+		case e = <-f.newKick:
+		case <-ctx.Done():
+			t.Fatalf("the backend never asked for kick descriptor %d", n)
+		}
+	}
+	return e
 }
 
 func TestNewServerRejectsAnUnusableConfig(t *testing.T) {
@@ -260,5 +294,55 @@ func TestServeStopsWhenTheListenerCloses(t *testing.T) {
 	_ = ln.Close()
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Serve: %v", err)
+	}
+}
+
+// TestAReinitialisedDeviceIsStillServed is DEV-0018 reduced to its mechanism.
+//
+// Every real boot configures this device twice: the firmware brings it up, boots an OS,
+// and the OS's driver brings it up again — GET_VRING_BASE to stop the queue, then the
+// whole configuration replayed with **new** kick and call eventfds. The connection never
+// drops, so this is not reconnection (3.2); it is one session with two set-ups.
+//
+// The queue loop started once and captured the first kick. After the hand-off it was
+// parked on a descriptor nothing would ever signal again, so the second driver's very
+// first request sat in the ring for ever. A real Linux guest hung with `virtio_blk`
+// registered and the right capacity printed — and every test in this package passed,
+// because the fake front-end only ever configured the device once.
+func TestAReinitialisedDeviceIsStillServed(t *testing.T) {
+	s := newSession(t)
+	s.handshake(t)
+	s.idle()
+
+	// The hand-off. The guest's ring state goes with it: a fresh driver publishes from
+	// index 0 into a ring the backend must also read from 0.
+	for _, m := range s.g.reinitMessages() {
+		s.conn.in <- m
+	}
+
+	// The second kick is the one that matters. Waiting for the backend to ask for it is
+	// also the first assertion: a backend that never noticed the reconfiguration would
+	// never ask.
+	kick2 := s.f.nthKick(t, 2)
+	// The same discipline s.idle() enforces for the first loop: publishing into the
+	// ring before the loop is parked on the kick races its own reads. Inherent to a
+	// shared virtqueue, and visible here only because both halves are goroutines.
+	<-kick2.waiting
+
+	data := pattern(0x5b, SectorSize)
+	s.g.publish(0, readable(blkHeader(blkTypeOut, 8)), readable(data), writable(1))
+	if err := kick2.Signal(); err != nil {
+		t.Fatal(err)
+	}
+
+	served, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-s.completed:
+	case <-served.Done():
+		t.Fatal("the request published after the device was re-initialised was never served")
+	}
+	if got := s.raw.Snapshot(8*SectorSize, len(data)); !bytes.Equal(got, data) {
+		t.Fatal("the device does not hold what the second driver wrote")
 	}
 }

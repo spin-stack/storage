@@ -151,8 +151,9 @@ This also unblocks every drain destination and cross-host move.
 > lane in ~1.1 s under TCG, reports a verdict and powers off". **No test did that** — no
 > Go file in the tree referenced the kernel or the initramfs, and every test under
 > `integration/vhost` boots a 512-byte boot sector under SeaBIOS. The lane now exists
-> (`TestALinuxGuestIssuesFLUSH`) and is skipped: a real kernel hangs on its first block
-> request. See STATUS.md.
+> (`TestALinuxGuestIssuesFLUSH`) and passes — after fixing what writing it found: a guest
+> re-initialises the device when the firmware hands off to the OS, with a new kick
+> eventfd, and the queue loop stayed parked on the first one. See STATUS.md.
 >
 > **The firmware row below is wrong and was reverted.** `-kernel` never needed
 > `linuxboot_dma.bin`: spinbox's kernel is an ELF with Xen PVH notes and QEMU enters it

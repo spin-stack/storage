@@ -188,12 +188,37 @@ type queueLoop struct {
 	started bool
 	kick    EventFD
 	call    EventFD
-	done    chan struct{}
-	err     error
+	// kickFile is the descriptor the running loop is parked on. It is what tells a
+	// re-initialisation apart from an idle re-check: the front-end passes a *new*
+	// eventfd every time the device is configured, so a different pointer here means
+	// the loop is waiting on something nothing will ever signal again.
+	kickFile *os.File
+	done     chan struct{}
+	err      error
 }
 
-// ensure starts the queue loop once the device is ready and has a kick.
+// ensure starts the queue loop once the device is ready and has a kick — and starts it
+// *again* when the device is reconfigured underneath it.
+//
+// Every real boot configures this device twice: the firmware brings it up, boots an OS,
+// and the OS's driver brings it up again with fresh rings and fresh eventfds, over the
+// same connection (GET_VRING_BASE, then the whole configuration replayed). This used to
+// start once and keep the first kick, so the second driver's first request sat in the
+// ring for ever — a Linux guest hung with virtio_blk registered and the right capacity
+// printed, which is DEV-0018.
 func (q *queueLoop) ensure(ctx context.Context) error {
+	q.mu.Lock()
+	restart := q.started && q.dev.Kick() != q.kickFile && q.dev.Kick() != nil
+	q.mu.Unlock()
+	if restart {
+		// Outside the lock: stop() waits for the loop to leave, and the loop takes
+		// this same mutex on its way out.
+		q.stop()
+		q.mu.Lock()
+		q.started = false
+		q.mu.Unlock()
+	}
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.started {
@@ -214,7 +239,7 @@ func (q *queueLoop) ensure(ctx context.Context) error {
 			return fmt.Errorf("vhost: call descriptor: %w", err)
 		}
 	}
-	q.kick, q.call, q.started = kick, call, true
+	q.kick, q.call, q.started, q.kickFile = kick, call, true, kickFD
 	q.done = make(chan struct{})
 	go q.run(ctx)
 	return nil

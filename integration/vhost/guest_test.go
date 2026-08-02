@@ -32,7 +32,7 @@ import (
 // guestBootTimeout is generous on purpose. The kernel boots under TCG wherever /dev/kvm
 // is absent — every CI runner — and a kernel plus an initramfs is a great deal more work
 // than a boot sector.
-var guestBootTimeout = 10 * time.Minute
+const guestBootTimeout = 10 * time.Minute
 
 // guestImages returns the kernel and initramfs, or skips.
 //
@@ -71,23 +71,6 @@ func guestImages(t *testing.T) (kernel, initramfs string) {
 //     FLUSH would fail the syscall, and a guest whose fsync fails is entitled to consider
 //     its data lost.
 func TestALinuxGuestIssuesFLUSH(t *testing.T) {
-	// DEV-0018, and a stop signal per CLAUDE.md rather than a test quietly parked.
-	//
-	// This test runs, and it fails: the kernel boots, virtio_blk registers the device
-	// and reports the right capacity — so the vhost-user handshake and GET_CONFIG are
-	// correct — and then the guest hangs on its first block request until the timeout.
-	// The last line is always `virtio_blk virtio0: [vda] 32768 512-byte logical blocks`,
-	// with no partition scan after it.
-	//
-	// It is skipped rather than deleted because the *test* is not what is wrong, and it
-	// is skipped rather than left red because a red gate that everyone knows about stops
-	// being a gate. Deleting it would put the tree back where it was: a Linux guest
-	// built by `task build:guest`, verified by `task guest:verify`, and booted by
-	// nothing — which is how three documents came to claim a lane that did not exist.
-	//
-	// Remove this skip with the fix, not before. STATUS.md carries what is known.
-	t.Skip("DEV-0018: the guest hangs on its first block request; see STATUS.md")
-
 	kernel, initramfs := guestImages(t)
 	ctx := t.Context()
 

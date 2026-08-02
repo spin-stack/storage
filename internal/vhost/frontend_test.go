@@ -122,6 +122,33 @@ func (g *fakeGuest) handshakeMessages() []Message {
 	}
 }
 
+// reinitMessages is what QEMU sends when the *guest* re-initialises the device: the
+// firmware brings it up, boots an OS, and the OS's driver brings it up again with its
+// own rings. Captured from a real QEMU 11.0.2 handing a Linux 7.1 guest over from
+// SeaBIOS — GET_VRING_BASE stops the queue, and then the whole configuration is
+// replayed with **new** kick and call descriptors.
+//
+// It is not reconnection (3.2): the connection never drops. It is one session in which
+// the device is set up twice, which is what every real boot does and what no test did
+// until DEV-0018.
+func (g *fakeGuest) reinitMessages() []Message {
+	return []Message{
+		msg(ReqGetVringBase, encodeVringState(vringState{Num: 0})),
+		msg(ReqSetFeatures, u64Payload(DeviceFeatures)),
+		msg(ReqSetVringCall, u64Payload(0), mustEventFile()),
+		msg(ReqSetMemTable, encodeMemTable([]Region{g.region()}), nil),
+		msg(ReqSetVringNum, encodeVringState(vringState{Num: uint32(g.num)})),
+		msg(ReqSetVringBase, encodeVringState(vringState{Num: 0})),
+		msg(ReqSetVringAddr, encodeVringAddr(vringAddr{
+			DescUserAddr:  testUserAddrBase + descOffset,
+			AvailUserAddr: testUserAddrBase + availOffset,
+			UsedUserAddr:  testUserAddrBase + usedOffset,
+		})),
+		msg(ReqSetVringKick, u64Payload(0), mustEventFile()),
+		msg(ReqSetVringEnable, encodeVringState(vringState{Num: 1})),
+	}
+}
+
 // mustEventFile stands in for the eventfd QEMU passes over SCM_RIGHTS. The
 // device only stores it and hands it to the EventFDFunc, so any open
 // descriptor is a faithful stand-in for the protocol's purposes; os.Pipe gives
