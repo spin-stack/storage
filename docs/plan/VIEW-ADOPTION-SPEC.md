@@ -186,13 +186,22 @@ recovery fetch never strands a parked read.
 
 - **The reproduction below, inverted**: write → flush → publish → truncate (asserting a
   segment file actually disappeared) → resume → read the truncated range → get the data.
-- **A DST arm.** `internal/dst` now has an Agent model (`scenarios_agent.go`), so this can
-  drive a real restart: serve, write, flush, truncate, tear the runtime down, `Apply` it
-  again, read. The checker is "no read returns zeros for a range this volume ACKed as
-  durable" — the shape of INV-08/INV-13's promise from the guest's side, which no current
-  checker states.
-- **A planted bug that a checker catches**: adopt an *empty* base (today's behaviour) and
-  the arm must fail. That is a behavioural proof, and it is the bug this increment fixes.
+- **A DST arm** — `scenarioTruncatedVolumeSurvivesARestart`. Written, flushed, published,
+  truncated (asserting segments were actually unlinked), then read back *through the
+  Agent*, because what regressed was the Agent's decision to create rather than resume
+  and no test of `wal` could have seen it. `DurableRangeChecker` states INV-08's promise
+  from the guest's side — no range ACKed as durable ever comes back as zeros — which no
+  existing checker did: they all watch watermarks and objects, and this watches the bytes
+  a guest would receive.
+- **A planted bug that a checker catches** — an object store that lists nothing under the
+  volume's prefix. A mis-typed bucket, a lost listing, a wrong-epoch key: recovery cannot
+  tell any of those from a volume that never wrote anything, so it rebuilds an *empty*
+  base, installs it without complaint, and the read comes back zeros. Behavioural, and
+  reached through a fault in the simulated store rather than by disabling the fix.
+
+Note what the checker deliberately does **not** flag: a read that *fails*. Refusing to
+answer is the designed behaviour when the base cannot be rebuilt. It is the silent wrong
+answer this exists to catch.
 
 ## The reproduction, verbatim
 

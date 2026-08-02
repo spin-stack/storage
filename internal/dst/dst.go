@@ -48,6 +48,7 @@ const (
 	EventTruncate    EventKind = "truncate"
 	EventIOClass     EventKind = "io-class"
 	EventVolumeServe EventKind = "volume-serve"
+	EventDurableRead EventKind = "durable-read"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -94,6 +95,9 @@ type Event struct {
 	// VolumeServe events (§16, §12.3): whether the Agent still had something to answer
 	// a fenced volume's requests with. Must always be false (INV-10's Agent half).
 	ServedAfterFence bool
+	// DurableRead events (§5.8): whether a range the volume ACKed as durable came back
+	// as zeros after a restart. Must always be false (INV-08 from the guest's side).
+	ZerosAfterRestart bool
 }
 
 // String renders an event deterministically for the trace.
@@ -119,6 +123,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d snapshot mutated=%t %s", e.Step, e.SnapshotMutated, e.Msg)
 	case EventTruncate:
 		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
+	case EventDurableRead:
+		return fmt.Sprintf("%04d durable-read vol=%s zeros_after_restart=%t", e.Step, e.Key, e.ZerosAfterRestart)
 	case EventVolumeServe:
 		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
 	case EventIOClass:

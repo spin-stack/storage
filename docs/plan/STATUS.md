@@ -34,8 +34,9 @@ tracks state.
   done, and increment 2 — the keystone — is done, review-zone half included**
   (`RUNTIME-FENCING-SPEC.md` records each decision). **Increment 5, view adoption, is
   done** (2026-08-01, `VIEW-ADOPTION-SPEC.md`): the seam is in `cow.IntervalMap`, `wal`
-  can adopt a base lazily, and the Agent resumes. **Increment 3, checkpoint and truncate,
-  is now unblocked.**
+  can adopt a base lazily, the Agent resumes, and a DST arm restarts a truncated volume
+  through the Agent on every seed. **Increment 3, checkpoint and truncate, is now
+  unblocked** — and it is the next thing to build.
 
 ## Pick up here
 

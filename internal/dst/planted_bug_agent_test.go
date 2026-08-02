@@ -21,3 +21,21 @@ func TestPlantedBugFencedVolumeStillServed(t *testing.T) {
 		return fencedVolumeStopsServing(s, fencingIgnored)
 	})
 }
+
+// INV-08 from the guest's side (§5.8): a range ACKed as durable never comes back as
+// zeros. Every other checker watches watermarks and objects; this one watches the bytes
+// a guest would receive, which is the only place "recovered" and "recovered correctly"
+// differ.
+//
+// Planted by an object store that lists nothing under the volume's prefix — a mis-typed
+// bucket, a lost listing, a wrong-epoch key. Recovery cannot tell any of those from a
+// volume that never wrote anything, so it rebuilds an *empty* base, installs it without
+// complaint, and the read comes back as zeros. That is exactly the behaviour this
+// increment removed, reached through a fault in the simulated store rather than by
+// disabling the fix.
+func TestPlantedBugDurableRangeReadsZeros(t *testing.T) {
+	requirePasses(t, 23, NewDurableRangeChecker(), scenarioTruncatedVolumeSurvivesARestart)
+	plantedBug(t, 23, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
+		return truncatedVolumeSurvivesARestart(s, storeHidesTheObjects)
+	})
+}
