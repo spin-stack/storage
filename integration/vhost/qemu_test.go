@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/testinfra"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
 )
@@ -57,27 +58,6 @@ const (
 	// magnitude: if the guest is going to run at all, it has run by now.
 	refusalTimeout = 15 * time.Second
 )
-
-// qemuPaths locates the pinned QEMU and its firmware. The binary and the BIOS
-// blobs are what `task build:qemu` extracts into _output; the lane skips rather
-// than fails when they are absent, because a developer who has not built QEMU
-// has not broken anything.
-func qemuPaths(t *testing.T) (bin, bios string) {
-	t.Helper()
-	root := os.Getenv("QEMU_OUTPUT_DIR")
-	if root == "" {
-		root = filepath.Join("..", "..", "_output")
-	}
-	bin = filepath.Join(root, "bin", "qemu-system-x86_64")
-	bios = filepath.Join(root, "share", "spin-stack", "qemu")
-	if _, err := os.Stat(bin); err != nil {
-		t.Skipf("no QEMU at %s — run: task build:qemu", bin)
-	}
-	if _, err := os.Stat(filepath.Join(bios, "bios-256k.bin")); err != nil {
-		t.Skipf("no firmware at %s — run: task build:qemu", bios)
-	}
-	return bin, bios
-}
 
 // bootSector is the guest, all 512 bytes of it. See testdata/bootsector.S.
 func bootSector(t *testing.T) []byte {
@@ -264,7 +244,7 @@ func start(t *testing.T, ctx context.Context, seed func([]byte)) *lane {
 // status and its output.
 func runQEMU(t *testing.T, ctx context.Context, l *lane) (int, string) {
 	t.Helper()
-	bin, bios := qemuPaths(t)
+	bin, bios := testinfra.QEMUPaths(t)
 
 	args := []string{
 		"-L", bios,
@@ -509,7 +489,7 @@ func TestQEMUPerformsTheHandshakeWeImplemented(t *testing.T) {
 // built on top of. See docs/plan/RISKS.md, RISK-10.
 func TestQEMUNeverRunsAGuestOnABackendThatCannotSpeak(t *testing.T) {
 	ctx := t.Context()
-	bin, bios := qemuPaths(t)
+	bin, bios := testinfra.QEMUPaths(t)
 
 	dir, err := os.MkdirTemp("", "vhostlane") //nolint:usetesting // sun_path is 108 bytes
 	if err != nil {

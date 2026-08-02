@@ -27,6 +27,8 @@ import (
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/crypto"
@@ -85,7 +87,7 @@ func start(t *testing.T) *deployment {
 		dsn: dsn, store: store,
 		hostID:   ids.New().String(),
 		dataDir:  filepath.Join(dir, "data"),
-		sockDir:  filepath.Join(dir, "run"),
+		sockDir:  shortSocketDir(t),
 		kekFile:  kekFile,
 		kekID:    crypto.KEKID([crypto.DEKSize]byte(kek)),
 		agentBin: agentBin, agentEnv: env,
@@ -115,6 +117,31 @@ func start(t *testing.T) *deployment {
 	})
 	d.cp.WaitForLine(t, "control-plane elected", startup)
 	return d
+}
+
+// shortSocketDir is a temporary directory for the vhost-user sockets that is *not*
+// derived from the test's name.
+//
+// A Unix socket path is bounded by sun_path, 108 bytes on Linux, and bind(2) reports
+// nothing more helpful than EINVAL when it overflows. t.TempDir() embeds the test's name,
+// so `<tmp>/<TestName><digits>/001/run/<uuid>.sock` puts the test's own identifier in the
+// path — and a volume id is 36 characters before the suffix. This lane was one long test
+// name away from failing for a reason no error message would explain, and it took exactly
+// one to find out: TestAGuestMakesTheDeploymentWriteADurableObject produced a 112-byte
+// path.
+//
+// Named for the socket and not the test, so the length depends on nothing a future test
+// can change.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	// t.TempDir() is what usetesting wants and it is exactly what does not work here:
+	// it derives the path from the test's name, which is the overflow.
+	dir, err := os.MkdirTemp("", "spinsock") //nolint:usetesting // sun_path is 108 bytes; see above
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 // storeArgs repeats the object-store flags for a second process.
@@ -521,4 +548,97 @@ func assertSaid(t *testing.T, p *testinfra.Process, want string) {
 		}
 	}
 	t.Fatalf("%s never printed %q:\n%s", p.Name, want, strings.Join(p.Output(), "\n"))
+}
+
+// TestAGuestMakesTheDeploymentWriteADurableObject is the assertion this lane did not
+// have: an artefact that exists only if the *binary* did its work.
+//
+// Everything else here stops at os.Stat(sock) and two log lines. That leaves the closure
+// governing every durable ACK —
+//
+//	Lease: func() bool { return loop != nil && loop.LeaseValid() }   (cmd/volume-agent)
+//
+// — able to answer false for ever, or true for ever, with the whole lane still green. The
+// QEMU lane did not cover it either: integration/vhost builds an agent.VolumeManager
+// *in process*, with a filesystem-backed store and a lease it grants itself, so nothing
+// anywhere exercised the binary's flags, its S3 credentials or its Control-Plane-driven
+// lease on the data path.
+//
+// So a real Linux kernel drives the socket a real volume-agent bound, against the real
+// Postgres and the real RustFS this deployment already starts, and the assertion is a key
+// under wal/<volume-id>/ in the bucket. Nothing simulated is left in the path.
+//
+// A simulated front-end would have been cheaper and would run without QEMU. It was
+// rejected: DEV-0018 is exactly the shape of bug a fake front-end hides — it configured
+// the device once, every real boot configures it twice, and the queue loop stayed parked
+// on the first kick.
+func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
+	// Skip before anything is built, and loudly: a lane whose inputs are missing has
+	// not found a defect. CI builds them, so CI does not skip (ADR-0025).
+	kernel, initramfs := testinfra.GuestImages(t)
+	_, _ = testinfra.QEMUPaths(t)
+
+	d := start(t)
+	agent := d.startAgent(t, "volume-agent")
+	d.waitForHost(t)
+	d.seedVolume(t)
+
+	volumeID := waitForServedVolume(t, d)
+	sock := filepath.Join(d.sockDir, volumeID+".sock")
+	waitFor(t, 30*time.Second, fmt.Sprintf("the socket for %s", volumeID), func() bool {
+		_, err := os.Stat(sock)
+		return err == nil
+	})
+	agent.WaitForLine(t, "serving volume", 30*time.Second)
+
+	// Nothing may be in the bucket for this volume yet: a guest's WRITE is 0 PUTs
+	// (§5.3, INV-18), and if objects appeared here the assertion below would prove
+	// nothing about the FLUSH.
+	if keys := walKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("%d object(s) under wal/%s/ before the guest ran: the FLUSH assertion would be vacuous:\n%v",
+			len(keys), volumeID, keys)
+	}
+
+	code, out := testinfra.RunLinuxGuest(t, t.Context(), sock, kernel, initramfs)
+	switch {
+	case strings.Contains(out, "GUESTINIT-FAIL"):
+		t.Fatalf("the guest reported a failure:\n%s", testinfra.VerdictLines(out))
+	case !strings.Contains(out, "GUESTINIT-PASS"):
+		t.Fatalf("the guest never reported a verdict (exit %d):\n%s", code, testinfra.VerdictLines(out))
+	}
+
+	// The object is necessary and *not* sufficient, which planting the bug is what
+	// established. §14.4 uploads at step 4 and only verifies the lease at step 5, so an
+	// object lands in the bucket even when the ACK is refused — asserting on it alone
+	// would have passed with the lease closure returning false for ever, which is the
+	// exact hole this test was written for. The guest's verdict above is the
+	// load-bearing assertion; this one says the ACK was backed by a real object rather
+	// than by a local fdatasync, which is the §14.8 mode difference.
+	keys := walKeys(t, d, volumeID)
+	if len(keys) == 0 {
+		t.Fatalf("the guest's fsync returned success and the bucket holds nothing under wal/%s/ — "+
+			"either no FLUSH reached the backend or it ACKed without a durable object (§14.4/INV-07):\n%s",
+			volumeID, testinfra.VerdictLines(out))
+	}
+	t.Logf("a real kernel's fsync left %d object(s) under wal/%s/: %v", len(keys), volumeID, keys)
+}
+
+// walKeys lists what this volume has actually put in the bucket. It asks the object store
+// directly rather than the Agent, because the Agent reporting its own watermarks is the
+// claim under test, not the evidence for it.
+func walKeys(t *testing.T, d *deployment, volumeID string) []string {
+	t.Helper()
+	prefix := "wal/" + volumeID + "/"
+	out, err := d.store.Client().ListObjectsV2(t.Context(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+	if err != nil {
+		t.Fatalf("listing %s: %v", prefix, err)
+	}
+	keys := make([]string, 0, len(out.Contents))
+	for _, o := range out.Contents {
+		keys = append(keys, aws.ToString(o.Key))
+	}
+	return keys
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/internal/testinfra"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -55,8 +56,8 @@ import (
 // then reports `read-back mismatch at 1048576` — the bytes are gone from the only place
 // left holding them.
 func TestAGuestSurvivesCheckpointAndTruncation(t *testing.T) {
-	kernel, initramfs := guestImages(t)
-	_, _ = qemuPaths(t) // skip early if QEMU is missing, before anything is built
+	kernel, initramfs := testinfra.GuestImages(t)
+	_, _ = testinfra.QEMUPaths(t) // skip early if QEMU is missing, before anything is built
 
 	ctx := t.Context()
 	dir := laneDir(t)
@@ -65,8 +66,8 @@ func TestAGuestSurvivesCheckpointAndTruncation(t *testing.T) {
 	m, sock := startAgent(t, ctx, dir, volumeID)
 
 	// (1) The guest writes and fsyncs.
-	if _, out := runLinuxGuest(t, ctx, sock, kernel, initramfs); !strings.Contains(out, "GUESTINIT-PASS") {
-		t.Fatalf("the first boot did not report a pass:\n%s", verdictLines(out))
+	if _, out := testinfra.RunLinuxGuest(t, ctx, sock, kernel, initramfs); !strings.Contains(out, "GUESTINIT-PASS") {
+		t.Fatalf("the first boot did not report a pass:\n%s", testinfra.VerdictLines(out))
 	}
 
 	before := segmentFiles(t, dir, volumeID)
@@ -95,11 +96,11 @@ func TestAGuestSurvivesCheckpointAndTruncation(t *testing.T) {
 	m2, sock2 := startAgent(t, ctx, dir, volumeID)
 	defer func() { _ = m2.Close() }()
 
-	_, out := runLinuxGuest(t, ctx, sock2, kernel, initramfs, "spin.mode=verify")
+	_, out := testinfra.RunLinuxGuest(t, ctx, sock2, kernel, initramfs, "spin.mode=verify")
 	switch {
 	case strings.Contains(out, "GUESTINIT-FAIL"):
 		t.Fatalf("after a checkpoint and a truncation the guest could not read its own data:\n%s",
-			verdictLines(out))
+			testinfra.VerdictLines(out))
 	case !strings.Contains(out, "GUESTINIT-PASS"):
 		t.Fatalf("the second boot reported no verdict:\n%s", out)
 	}

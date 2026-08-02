@@ -665,6 +665,48 @@ Also corrected: `.github/workflows/ci.yml` said the QEMU lane "runs on a develop
 machine only" and that STATUS.md carried an open decision about it — contradicted by the
 `guest-lane` job seventy lines above it in the same file.
 
+## The e2e lane proves a durable ACK, since 2026-08-02
+
+It used to stop at `os.Stat(sock)` and two log lines. That left the closure governing
+every durable ACK —
+
+```go
+Lease: func() bool { return loop != nil && loop.LeaseValid() }   // cmd/volume-agent
+```
+
+— able to answer `false` for ever, or `true` for ever, with all five tests green. **The
+QEMU lane did not cover it either**, which is the part that was not written down anywhere:
+`integration/vhost` builds an `agent.VolumeManager` *in process*, with a filesystem-backed
+store and a lease it grants itself, so nothing in the tree exercised the binary's flags,
+its S3 credentials or its Control-Plane-driven lease on the data path.
+
+`TestAGuestMakesTheDeploymentWriteADurableObject` now boots the pinned kernel against the
+socket a real `volume-agent` bound, with the real Postgres and RustFS the lane already
+starts. The guest's `fsync` is the load-bearing assertion and the object under
+`wal/<volume-id>/` is the corroborating one. The QEMU guest helpers moved to
+`internal/testinfra` so both lanes share one command line.
+
+**Two things planting the bug taught, both of which contradicted the increment's own
+spec:**
+
+1. **The object in the bucket is necessary and not sufficient.** §14.4 uploads at step 4
+   and verifies the lease at step 5, so an object lands even when the ACK is refused. The
+   spec had listed it as the primary observable; it would have passed with the lease
+   closure returning `false` for ever. The guest's `fsync` returning `EIO` is what
+   actually catches it.
+2. **A plant must reach the binary.** The first two attempts ran `go test` directly and
+   tested a stale `_output/bin/volume-agent`, so the plant appeared not to fire and looked
+   like a defect in the fencing chain. `task test:e2e` rebuilds; `go test` does not.
+
+**A latent trap this found:** a Unix socket path is bounded by `sun_path`, 108 bytes, and
+`bind(2)` reports only `EINVAL` when it overflows. `t.TempDir()` embeds the test's name, so
+`<tmp>/<TestName><digits>/001/run/<uuid>.sock` was 112 bytes for a test whose name was
+long enough — this one. The lane was one long test name away from failing for a reason no
+error message explains. The fixture now takes its socket directory from a name that has
+nothing to do with the test. **The same trap exists in production**: an operator passing a
+long `-vhost-socket-dir` gets `bind: invalid argument` and nothing else. Not fixed here —
+it is a `hostio.Listen` error-wrapping change, and it belongs with its own increment.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
@@ -684,6 +726,14 @@ calls it.
   see a foreground request to yield to. The invariant is enforced against a condition
   nothing can produce. **Deciding between marking the data path and deleting the field
   with its gate is a durability-zone change** and gets its own increment.
+- **§14.8's durability mode is not implemented end to end.** The Control Plane decides it
+  (`-seed-durability`), stores it, and sends it on `DesiredVolume.durability`; a
+  `cpserver` test asserts the field arrives. Nothing reads it: `Log.SetDurabilityMode` has
+  no production caller, so every volume is served in the default `remote` mode whatever
+  the catalog says. Found while planting increment 9's bug. The direction is the *safe*
+  one — a `local` volume gets the stricter ACK rather than the looser — so this is a
+  missing feature rather than a durability hazard, but a mode the Control Plane can set
+  and the Agent silently ignores is worse than one that does not exist.
 - **`controlplane.Promoter`/`BumpVolumeEpoch` are not wired into any binary.**
   `NewPromoter` appears only in tests and DST. ADR-0024 already says so; this file did
   not. Failover therefore exists as a model, and nothing an operator can run performs it.
