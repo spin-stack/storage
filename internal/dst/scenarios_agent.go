@@ -1496,6 +1496,18 @@ func localVolumeDrains(s *Sim, staleLease bool) error {
 		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
 		Limits: wal.Limits{SegmentBytes: 8192},
 		HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
+		// The scheduler's own loop must not run here, and finding out why cost a
+		// determinism failure: checkpointLoop drains local-mode volumes too, so with a
+		// live poll it races the explicit Drain calls below. Whether the loop's drain
+		// landed before or after `leaseValid` flipped decided which events were emitted,
+		// and the same seed produced two different traces — INV-02, caught by
+		// TestDeterministicReplay rather than by reasoning.
+		//
+		// A poll longer than anything this scenario simulates parks the loop on the
+		// simulated clock, which never advances on its own. The loop's *own* behaviour is
+		// covered by the checkpoint scenarios; what this one drives is drainOnce, and it
+		// drives it directly so the ordering is the scenario's rather than a race's.
+		CheckpointPoll: 24 * time.Hour,
 	}, agent.VolumeManagerDeps{
 		Clock:   s.Clock,
 		Disk:    s.Disk,
@@ -1529,6 +1541,16 @@ func localVolumeDrains(s *Sim, staleLease bool) error {
 	dev, ok := m.Device(volumeID)
 	if !ok {
 		return errors.New("the local-durability volume is not being served")
+	}
+
+	// Wait for the read view before touching the volume, by doing what waits for it: a
+	// read. fetchBase runs on its own goroutine and InstallBase *raises* watermarks, so
+	// driving the volume while it is still in flight means durable can move for a reason
+	// that is not this scenario's drain — and whether it landed before or after the lease
+	// flipped decided the trace. The same seed produced two outcomes until this line
+	// existed (INV-02, caught by TestDeterministicReplay).
+	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
+		return fmt.Errorf("waiting for the read view: %w", err)
 	}
 
 	// A guest write and its FLUSH. In local mode this ACKs on fdatasync and puts nothing

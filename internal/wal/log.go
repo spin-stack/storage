@@ -130,6 +130,15 @@ type Log struct {
 	batcher  *Batcher  // nil = local-only (no remote WAL)
 	uploader *Uploader // nil = local-only
 
+	// covered is the end of the contiguous run of sequences a verified object holds.
+	//
+	// It is maintained as objects upload rather than recomputed, and it replaced a
+	// []SummaryObject that grew by one entry per upload with nothing trimming it — for
+	// the life of the volume, since the durability scheduler outlives every FLUSH. The
+	// list had one reader inside this package and one writer with no production caller.
+	// A watermark is O(1), bounded, and cannot hold an entry from an earlier pass.
+	covered uint64
+
 	mode  DurabilityMode // remote (default) | local (§14.8)
 	lease LeaseChecker   // nil = no lease gate (dev/local without a CP)
 	// fenced is set once a durable step finds the lease invalid (§16 SELF_FENCED).
@@ -197,9 +206,8 @@ type Log struct {
 	oldestGapAt    clock.Instant
 	hasGap         bool
 	discardedBytes int64
-	truncatedUpTo  uint64          // local WAL discarded up to this sequence (§14.7)
-	reclaimedBytes int64           // bytes given back to the device by unlinked segments
-	uploaded       []SummaryObject // durable objects, for the summary (§22.1)
+	truncatedUpTo  uint64 // local WAL discarded up to this sequence (§14.7)
+	reclaimedBytes int64  // bytes given back to the device by unlinked segments
 
 	rec      *obs.Recorder // nil = telemetry not wired (no-op)
 	volLabel string
@@ -873,7 +881,15 @@ func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
 			l.mu.Unlock()
 			return l.coveredLocked(), err
 		}
-		l.uploaded = append(l.uploaded, SummaryObject{Key: key, First: cb.First, Last: cb.Last})
+		// The contiguous run advances only when this object continues it. A gap simply
+		// leaves `covered` where it was — and a durable point past a gap is exactly what
+		// INV-08 forbids. Uploads are issued in sequence order and a failure stops the
+		// loop, so the batch that failed stays at the head of pending and is retried
+		// first; contiguity is a property of that ordering rather than an assumption.
+		if cb.First == l.covered+1 {
+			l.covered = cb.Last
+		}
+		_ = key
 		l.closeGap(int64(len(cb.Records)))
 		l.mu.Unlock()
 		done++
@@ -895,21 +911,7 @@ func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
 // the volume would stay stuck below its own objects until the guest happened to write
 // again. A fenced host that regains its lease has to be able to claim what it already
 // put there.
-func (l *Log) coveredLocked() uint64 {
-	covered := uint64(0)
-	for _, o := range l.uploaded {
-		// The list is appended in upload order, which is sequence order, so a gap ends
-		// the contiguous run — and a durable point past a gap is exactly what INV-08
-		// forbids.
-		if o.First > covered+1 {
-			break
-		}
-		if o.Last > covered {
-			covered = o.Last
-		}
-	}
-	return covered
-}
+func (l *Log) coveredLocked() uint64 { return l.covered }
 
 // DrainPending is §14.8 rule 3 — "S3 is asynchronous" — with something actually doing it.
 //

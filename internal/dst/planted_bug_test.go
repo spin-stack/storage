@@ -88,18 +88,6 @@ func requirePasses(t *testing.T, seed int64, checker Checker, sc Scenario) {
 // Behavioural planted bugs: real code, real fault, checker sees the consequence.
 // ---------------------------------------------------------------------------
 
-// INV-14: the GC never permanently deletes. Planted by taking versioning off the
-// bucket — the single configuration mistake that turns every delete marker the GC
-// writes into an irreversible delete, with no error anywhere. The GC scenario is
-// otherwise unchanged; it derives the event from whether the mark can be undone.
-func TestPlantedBugPermanentDelete(t *testing.T) {
-	requirePasses(t, 1234, NewNoPermanentDeleteChecker(), scenarioGCMarksOrphansNotLive)
-	plantedBug(t, 1234, NewNoPermanentDeleteChecker(), "no-permanent-delete", func(s *Sim) error {
-		s.Store.InjectPermanentDelete()
-		return scenarioGCMarksOrphansNotLive(s)
-	})
-}
-
 // INV-16: a published snapshot never changes. Planted by a backend that accepts a
 // conditional write unconditionally — a real §6.1 conformance failure, and the one
 // that silently makes every create-only publication in the system overwritable.
@@ -650,7 +638,6 @@ const (
 
 // plantedProofs maps every checker to the strength of its proof.
 var plantedProofs = map[string]proofKind{
-	"no-permanent-delete":         proofBehavioural,
 	"immutable-snapshots":         proofBehavioural,
 	"no-lost-acked-write":         proofBehavioural,
 	"effective-single-writer":     proofBehavioural,
@@ -686,8 +673,15 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 // TestPlantedBugCoverageIsNotSilentlyWeakened pins the number of behavioural proofs.
 // Converting a literal proof to a behavioural one is progress and raises this number;
 // a checker quietly downgraded to a hand-written Emit is not, and fails here.
+//
+// It went 16 -> 15 on 2026-08-02, which is the one shape of decrease this test is not
+// meant to stop: `no-permanent-delete` was removed *with its subject*. ADR-0026 deleted
+// internal/gc, nothing issues a delete any more, and a checker that cannot fire proves
+// nothing. INV-14 is `pending` rather than dropped — the number goes back up with the
+// sweeper. A decrease for any other reason is the weakening this test exists to catch,
+// and the comment is the difference between the two.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 16
+	const wantBehavioural = 15
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {

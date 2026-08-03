@@ -47,62 +47,6 @@ func TestBoundaryMustNotRegress(t *testing.T) {
 	}
 }
 
-// TestBoundaryMustNotDropBelowWhatThePreviousWriterAcked is the lagging-LIST case
-// (§22.1, and the eventual-LIST fault the sim models). The previous epoch's summary
-// is a strongly consistent record of what its writer ACKed; a LIST that has not
-// caught up reports a shorter prefix, with no error. Writing *that* number as the
-// next epoch's floor is how a stale listing loses an ACKed FLUSH permanently.
-func TestBoundaryMustNotDropBelowWhatThePreviousWriterAcked(t *testing.T) {
-	ctx := t.Context()
-	store := sim.NewObjectStore()
-	store.SetEventualList(true)
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	vol := vol7()
-
-	l := epochWriter(t, store, clk, vol, 1, 0)
-	for i := range 3 {
-		if _, err := l.Write(uint64(i)*4096, []byte("acked"), 0); err != nil {
-			t.Fatal(err)
-		}
-		if err := l.Flush(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := l.WriteSummary(ctx); err != nil {
-		t.Fatal(err)
-	}
-	acked := l.Watermarks().Durable
-	if acked != 3 {
-		t.Fatalf("setup: ACKed durable = %d, want 3", acked)
-	}
-
-	// The LIST has not caught up: recovery can prove nothing from it.
-	stale, err := recovery.DurablePrefix(ctx, store, vol, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stale != 0 {
-		t.Fatalf("setup: a lagging LIST should report 0, got %d", stale)
-	}
-
-	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, stale); err == nil {
-		t.Fatalf("a boundary of %d was written while the previous epoch's writer ACKed %d: "+
-			"those FLUSHes are now below an immutable floor", stale, acked)
-	} else if !errors.Is(err, recovery.ErrBoundaryRegression) {
-		t.Fatalf("want ErrBoundaryRegression, got %v", err)
-	}
-
-	// Once the listing catches up the same promotion succeeds.
-	store.Settle()
-	settled, err := recovery.DurablePrefix(ctx, store, vol, 1)
-	if err != nil || settled != acked {
-		t.Fatalf("after Settle: DurablePrefix = %d err=%v, want %d", settled, err, acked)
-	}
-	if err := recovery.WriteRecoveryPoint(ctx, store, vol, 2, 1, settled); err != nil {
-		t.Fatalf("the honest boundary must be writable: %v", err)
-	}
-}
-
 // TestEpochChainRefusesANonMonotonicChain: the guard above cannot catch a pair
 // written in an order that hides the regression (epoch 3's boundary first, then
 // epoch 2's). Recovery must still refuse to build a volume out of it rather than
@@ -143,9 +87,6 @@ func TestBoundaryWriteRefusesWhatItCannotCheck(t *testing.T) {
 	}{
 		{"the previous boundary cannot be read", func(s *sim.ObjectStore) objectstore.Store {
 			return rpFaultStore{Store: s, err: sim.ErrThrottled}
-		}},
-		{"the previous epoch's summary cannot be read", func(s *sim.ObjectStore) objectstore.Store {
-			return summaryFaultStore{Store: s}
 		}},
 	}
 	for _, tc := range tests {

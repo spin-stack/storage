@@ -53,7 +53,10 @@ func TestCheckerNamesAndTrace(t *testing.T) {
 		// Observing an unrelated event kind must be a harmless no-op.
 		c.Observe(dst.Event{Kind: dst.EventNote, Msg: "ignored"})
 	}
-	for _, want := range []string{"monotonic-clock", "no-permanent-delete", "watermark-order", "no-plaintext-leaves-host"} {
+	// "no-permanent-delete" left this list on 2026-08-02 with internal/gc (ADR-0026):
+	// nothing issues a delete any more, so the checker could not fire, and INV-14 is
+	// pending until a sweeper exists again.
+	for _, want := range []string{"monotonic-clock", "watermark-order", "no-plaintext-leaves-host"} {
 		if !names[want] {
 			t.Fatalf("DefaultCheckers missing %q", want)
 		}

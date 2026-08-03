@@ -1,7 +1,6 @@
 package materialize_test
 
 import (
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -295,27 +294,6 @@ func TestFromEpochRebuildsDurablePrefix(t *testing.T) {
 	}
 	if prog.UpTo != w.log.Watermarks().Durable {
 		t.Fatalf("covered up to %d, want the durable point %d", prog.UpTo, w.log.Watermarks().Durable)
-	}
-}
-
-// TestFromEpochRefusesLyingSummary: the summary must never claim more than the
-// contiguous prefix provides (§22.1) — materialization inherits that guard.
-func TestFromEpochRefusesLyingSummary(t *testing.T) {
-	ctx := t.Context()
-	w := newWorld(t, nil)
-	w.writeAndFlush(t, 0, "alpha")
-
-	lie, err := json.Marshal(wal.Summary{
-		VolumeID: format.UUIDString(w.vol), Epoch: 1, DurableSequence: 999,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.store.Put(ctx, wal.SummaryKey(w.vol, 1), lie, objectstore.PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := materialize.New(w.store, nil, nil).FromEpoch(ctx, w.vol, 1); err == nil {
-		t.Fatal("a summary claiming more than the contiguous prefix must be refused")
 	}
 }
 

@@ -2,16 +2,13 @@ package recovery_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/recovery"
-	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
-	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 func v7Vol() [16]byte {
@@ -145,29 +142,6 @@ func (r *ramp) Read(p []byte) (int, error) {
 		r.b++
 	}
 	return len(p), nil
-}
-
-// TestDurablePointRejectsLyingSummary is the §22.1 cross-check: a summary that
-// claims more than the contiguous prefix provides is rejected.
-func TestDurablePointRejectsLyingSummary(t *testing.T) {
-	ctx := t.Context()
-	store := sim.NewObjectStore()
-	vol := v7Vol()
-
-	// Only seq 1-2 are actually durable.
-	putBatch(t, store, vol, 1, 1, 2)
-	if last, _ := recovery.DurablePoint(ctx, store, vol, 1); last != 2 {
-		t.Fatalf("honest durable point = %d, want 2", last)
-	}
-
-	// Forge a summary claiming durable=5, which the objects do not back.
-	body, _ := json.Marshal(wal.Summary{VolumeID: format.UUIDString(vol), Epoch: 1, DurableSequence: 5})
-	if _, err := store.Put(ctx, wal.SummaryKey(vol, 1), body, objectstore.PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recovery.DurablePoint(ctx, store, vol, 1); err == nil {
-		t.Fatal("a summary claiming more than the contiguous prefix must be rejected")
-	}
 }
 
 // TestRecoverExcludesLatePutBeyondGap is INV-12: a late PUT beyond a gap is not

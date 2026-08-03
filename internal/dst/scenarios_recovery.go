@@ -37,7 +37,6 @@ func recoveryScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "superseded-epoch-has-a-ceiling", Run: scenarioSupersededEpochCeiling},
 		{Name: "boundary-chain-is-monotonic", Run: scenarioBoundaryChainMonotonic},
-		{Name: "durable-point-under-a-lagging-list", Run: scenarioDurablePointUnderLaggingList},
 		{Name: "divergent-objects-are-refused", Run: scenarioDivergentObjectsRefused},
 		{Name: "publishers-must-hold-the-epoch", Run: scenarioPublishersMustHoldTheEpoch},
 	}
@@ -468,66 +467,6 @@ func scenarioBoundaryChainMonotonic(s *Sim) error {
 		return errors.New("the regressing boundary object was written anyway")
 	}
 	s.Notef("three chained boundaries, non-decreasing; a fourth below them was refused")
-	return nil
-}
-
-// scenarioDurablePointUnderLaggingList is the eventual-LIST fault (§22.1, §24). The
-// listing is behind, so recovery can prove less than the writer ACKed — with no error.
-// Two things must hold: the observed durable point never goes backwards as the listing
-// catches up, and the number a lagging listing produces is never allowed to become an
-// epoch boundary.
-func scenarioDurablePointUnderLaggingList(s *Sim) error {
-	ctx := context.Background()
-	vol := recVol()
-
-	s.Store.SetEventualList(true)
-	l, err := recLog(s, vol, 1, 0)
-	if err != nil {
-		return err
-	}
-	for i := range 3 {
-		if _, err := l.Write(uint64(i)*4096, []byte("acked"), 0); err != nil {
-			return err
-		}
-		if err := l.Flush(ctx); err != nil {
-			return fmt.Errorf("flush %d: %w", i, err)
-		}
-		if _, err := observeDurablePoint(s, vol, 1); err != nil {
-			return err
-		}
-	}
-	if err := l.WriteSummary(ctx); err != nil {
-		return err
-	}
-	acked := l.Watermarks().Durable
-
-	stale, err := observeDurablePoint(s, vol, 1)
-	if err != nil {
-		return err
-	}
-	if stale >= acked {
-		return fmt.Errorf("the lagging listing proved %d of %d ACKed — the fault did not fire", stale, acked)
-	}
-	// Writing that number down is the permanent loss. It must be refused.
-	if err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, stale); !errors.Is(err, recovery.ErrBoundaryRegression) {
-		return fmt.Errorf("a boundary of %d was accepted while the writer ACKed %d: %v", stale, acked, err)
-	}
-
-	s.Store.Settle()
-	settled, err := observeDurablePoint(s, vol, 1)
-	if err != nil {
-		return err
-	}
-	if settled != acked {
-		return fmt.Errorf("after the listing caught up the durable point is %d, want %d", settled, acked)
-	}
-	if err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, settled); err != nil {
-		return fmt.Errorf("the honest boundary must be writable: %w", err)
-	}
-	if err := observeBoundary(s, vol, 2); err != nil {
-		return err
-	}
-	s.Notef("lagging listing proved %d of %d; the boundary waited for %d", stale, acked, settled)
 	return nil
 }
 

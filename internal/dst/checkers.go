@@ -49,28 +49,6 @@ func (c *MonotonicClockChecker) Observe(e Event) {
 
 func (c *MonotonicClockChecker) Check() error { return c.violation }
 
-// NoPermanentDeleteChecker enforces INV-14 (in framework form for Phase 01): the
-// GC/data path never performs a permanent (irreversible) delete. It watches
-// delete events for the Permanent flag. The sim object store only ever performs
-// reversible deletes, so this passes in real scenarios; the planted-bug test
-// feeds a Permanent delete to prove the checker catches it.
-type NoPermanentDeleteChecker struct {
-	violation error
-}
-
-// NewNoPermanentDeleteChecker returns a fresh checker.
-func NewNoPermanentDeleteChecker() *NoPermanentDeleteChecker { return &NoPermanentDeleteChecker{} }
-
-func (c *NoPermanentDeleteChecker) Name() string { return "no-permanent-delete" }
-
-func (c *NoPermanentDeleteChecker) Observe(e Event) {
-	if e.Kind == EventDelete && e.Permanent && c.violation == nil {
-		c.violation = fmt.Errorf("permanent delete of live object %q at step %d (violates §5.11/§21.3)", e.Key, e.Step)
-	}
-}
-
-func (c *NoPermanentDeleteChecker) Check() error { return c.violation }
-
 // WatermarkOrderChecker enforces INV-03 (§5.6): published <= durable <= local at
 // every observation. It watches watermark events.
 type WatermarkOrderChecker struct {
@@ -248,7 +226,6 @@ func DefaultCheckers() []Checker {
 	all = append(all, drainCheckers()...)
 	all = append(all, recoveryCheckers()...)
 	all = append(all, harnessCheckers()...)
-	all = append(all, gcCheckers()...)
 	all = append(all, walCheckers()...)
 	all = append(all, agentCheckers()...)
 	return all
@@ -260,7 +237,6 @@ func DefaultCheckers() []Checker {
 func coreCheckers() []Checker {
 	return []Checker{
 		NewMonotonicClockChecker(),
-		NewNoPermanentDeleteChecker(),
 		NewWatermarkOrderChecker(),
 		NewNoPlaintextLeavesHostChecker(),
 		NewDurableAckLeaseChecker(),

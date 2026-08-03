@@ -812,6 +812,38 @@ through when the source host is full, cordoned or gone — making it mandatory w
 scheduling to a host with no obligation to be up), and the locality is *time-bounded* (the
 source host holds the data only while it still holds the volume).
 
+## ~~DEV-0021~~ — the recovery-point floor was fictional *(closed 2026-08-02 by deletion)*
+
+Found while executing ADR-0026's increment 1, and it is the finding, not the deletion.
+
+§22.1 describes a **summary object**: a strongly consistent record of what a writer ACKed,
+used to cross-check the contiguous prefix and, crucially, as the **floor a new epoch's
+recovery point may not drop below**. `recovery` read it on every checkpoint and
+`boundaryFloor` raised the floor from it.
+
+**Nothing ever wrote one.** `wal.Log.WriteSummary` had no production caller — only tests
+and DST scenarios. So in production `readSummary` always returned `ok=false`, the
+cross-check was a permanent no-op, and **the boundary floor was only ever the prior
+boundary**. A `WriteRecoveryPoint` that dropped below what the previous writer ACKed would
+have been accepted, silently.
+
+**Three tests asserted the protection and all three passed only because they fabricated
+the input themselves** — `TestBoundaryMustNotDropBelowWhatThePreviousWriterAcked`,
+`TestDurablePointRejectsLyingSummary`, `TestFromEpochRefusesLyingSummary`, plus the DST
+scenario `durable-point-under-a-lagging-list`. Removing the writer made all four fail
+immediately, which is how it was found: the mechanism they proved existed only inside
+them. That is CLAUDE.md's fourth "prove the test can fail" case, and this is its fourth
+instance.
+
+**Closed by deletion, not by a fix.** Under ADR-0026 there is no promotion, so there are
+no epoch boundaries for a floor to protect; `wal.Summary`, `SummaryKey`,
+`recovery.readSummary`, `ErrSummaryOverclaims`, `SummaryOverclaim`, the `boundaryFloor`
+summary read and all four proofs are gone. `durablePrefix` returns one number again,
+because the second existed only to tell a lying summary apart from a superseded epoch.
+
+**If ADR-0026 is ever reversed**, this is a hole that comes back with it, and it should
+come back with a writer before it comes back with a test.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,

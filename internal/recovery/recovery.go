@@ -62,27 +62,6 @@ var ErrBoundaryRegression = errors.New("recovery: epoch boundary would move back
 // create-only PUTs succeed. Which one wins would otherwise be decided by sort order.
 var ErrAmbiguousSequence = errors.New("recovery: two objects carry different records for the same sequence")
 
-// ErrSummaryOverclaims means the summary object names a durable sequence the
-// contiguous prefix cannot reach: an object it counted is gone. The summary is an
-// accelerator, not an authority (§22.1), so this is reported with the prefix S3 can
-// still prove rather than as an opaque failure.
-var ErrSummaryOverclaims = errors.New("recovery: the summary claims more than the contiguous prefix provides")
-
-// SummaryOverclaim carries both numbers behind ErrSummaryOverclaims so a caller can
-// act on the discrepancy — the honest prefix is still recoverable.
-type SummaryOverclaim struct {
-	Claimed    uint64
-	Contiguous uint64
-}
-
-func (e *SummaryOverclaim) Error() string {
-	return fmt.Sprintf("%s: summary says %d, prefix reaches %d",
-		ErrSummaryOverclaims.Error(), e.Claimed, e.Contiguous)
-}
-
-// Unwrap makes errors.Is(err, ErrSummaryOverclaims) work.
-func (e *SummaryOverclaim) Unwrap() error { return ErrSummaryOverclaims }
-
 // ObjectSpan is the sequence range a validated WAL object actually carries — the
 // records', not the header's claim.
 type ObjectSpan struct {
@@ -509,62 +488,36 @@ func EpochCeiling(ctx context.Context, store objectstore.Store, volumeID [16]byt
 // (INV-08): the end of the longest contiguous run of *validated* records between the
 // epoch's floor and, once a promotion has closed the epoch, its ceiling.
 func DurablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
-	_, adopted, err := durablePrefix(ctx, store, volumeID, epoch)
+	adopted, err := durablePrefix(ctx, store, volumeID, epoch)
 	return adopted, err
 }
 
-// durablePrefix returns both numbers the callers need: `proven` is what the epoch's
-// own objects establish, and `adopted` is that clamped to the ceiling a successor
-// recorded. They differ exactly when a fenced writer's PUT landed late, and keeping
-// them apart is what stops that from being reported as a summary over-claim — the
-// summary is not lying, its epoch was simply superseded under it.
-func durablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (proven, adopted uint64, err error) {
+// durablePrefix is what the epoch's own objects establish, clamped to the ceiling a
+// successor recorded.
+//
+// It used to return both numbers, because the unclamped one told a summary over-claim
+// ("the summary is lying") apart from a superseded epoch ("a fenced writer's PUT landed
+// late"). The summary went with ADR-0026 — nothing ever wrote one — so there is one
+// number again and the distinction has no reader.
+func durablePrefix(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (adopted uint64, err error) {
 	objs, err := listObjects(ctx, store, volumeID, epoch)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	floor, err := PrefixFloor(ctx, store, format.UUIDString(volumeID), epoch)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	proven = ContiguousEnd(objs, floor)
+	proven := ContiguousEnd(objs, floor)
 
 	ceiling, closed, err := EpochCeiling(ctx, store, volumeID, epoch)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	if closed && ceiling < proven {
-		return proven, ceiling, nil
+		return ceiling, nil
 	}
-	return proven, proven, nil
-}
-
-// readSummary loads the epoch's summary for the cross-check below. It separates the
-// three cases the old code collapsed into "err == nil or nothing":
-//
-//   - the object is not there — nothing to cross-check against;
-//   - the backend could not be read — unknown, and the caller must retry rather than
-//     act on a number nobody verified;
-//   - the object is there but is not this volume/epoch's summary, or is not a summary
-//     at all — it makes no claim about us, so it is ignored. The key is overwritable,
-//     so without this one stray or mis-keyed object could veto a volume's recovery
-//     for ever.
-func readSummary(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (wal.Summary, bool, error) {
-	var s wal.Summary
-	body, err := store.Get(ctx, wal.SummaryKey(volumeID, epoch))
-	switch {
-	case errors.Is(err, objectstore.ErrNotFound):
-		return s, false, nil
-	case err != nil:
-		return s, false, fmt.Errorf("recovery: cannot read the epoch %d summary: %w", epoch, err)
-	}
-	if err := json.Unmarshal(body, &s); err != nil {
-		return s, false, nil
-	}
-	if s.VolumeID != format.UUIDString(volumeID) || s.Epoch != epoch {
-		return s, false, nil
-	}
-	return s, true, nil
+	return proven, nil
 }
 
 // DurablePoint is DurablePrefix with a summary cross-check (§22.1): the summary
@@ -582,18 +535,11 @@ func readSummary(ctx context.Context, store objectstore.Store, volumeID [16]byte
 // at 4 wrote an honest summary, and reporting that as an over-claim would turn every
 // ordinary promotion into an unrecoverable epoch.
 func DurablePoint(ctx context.Context, store objectstore.Store, volumeID [16]byte, epoch uint64) (uint64, error) {
-	proven, adopted, err := durablePrefix(ctx, store, volumeID, epoch)
-	if err != nil {
-		return 0, err
-	}
-	sum, ok, err := readSummary(ctx, store, volumeID, epoch)
-	if err != nil {
-		return 0, err
-	}
-	if ok && sum.DurableSequence > proven {
-		return 0, &SummaryOverclaim{Claimed: sum.DurableSequence, Contiguous: proven}
-	}
-	return adopted, nil
+	// §22.1 also described a summary object cross-checked against this prefix. It went
+	// on 2026-08-02 with ADR-0026: nothing ever wrote one, so the check was a permanent
+	// no-op, and V1 has no promotion for it to become a floor for. The contiguous
+	// prefix is the authority, which is what §5.8 said all along.
+	return durablePrefix(ctx, store, volumeID, epoch)
 }
 
 // Recover reconstructs the read view (interval map) from S3 up to the durable point,
@@ -745,13 +691,6 @@ func boundaryFloor(ctx context.Context, store objectstore.Store, volumeID [16]by
 		// prevEpoch is the volume's first epoch: no earlier boundary to respect.
 	default:
 		return 0, fmt.Errorf("recovery: cannot read the epoch %d boundary: %w", prevEpoch, err)
-	}
-	sum, ok, err := readSummary(ctx, store, volumeID, prevEpoch)
-	if err != nil {
-		return 0, err
-	}
-	if ok && sum.DurableSequence > floor {
-		floor = sum.DurableSequence
 	}
 	return floor, nil
 }

@@ -263,11 +263,6 @@ func scenarioLaggingListNeverLowersTheBoundary(s *Sim) error {
 			return fmt.Errorf("flush %d: %w", i, err)
 		}
 	}
-	// The summary is a strongly consistent record of what the writer ACKed; it is the
-	// only thing that can contradict a short listing.
-	if err := l.WriteSummary(ctx); err != nil {
-		return err
-	}
 	acked := l.Watermarks().Durable
 	if acked != 3 {
 		return fmt.Errorf("setup: ACKed durable = %d, want 3", acked)
@@ -284,25 +279,11 @@ func scenarioLaggingListNeverLowersTheBoundary(s *Sim) error {
 	}
 	s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("lagging LIST proves %d of %d ACKed", stale, acked)})
 
-	if stale < acked {
-		// The cross-check must notice rather than smooth it over: the summary claims
-		// more than the listing can produce (§22.1).
-		var over *recovery.SummaryOverclaim
-		if _, err := recovery.DurablePoint(ctx, s.Store, vol, 1); !errors.As(err, &over) {
-			return fmt.Errorf("a listing short of the summary must be reported as an overclaim, got %v", err)
-		}
-		if over.Claimed != acked || over.Contiguous != stale {
-			return fmt.Errorf("overclaim reported %+v, want claimed=%d contiguous=%d", over, acked, stale)
-		}
-		// And the boundary write must refuse the short number outright.
-		err := recovery.WriteRecoveryPoint(ctx, s.Store, vol, 2, 1, stale)
-		if !errors.Is(err, recovery.ErrBoundaryRegression) {
-			return fmt.Errorf("a boundary of %d was accepted while the writer ACKed %d: want ErrBoundaryRegression, got %v", stale, acked, err)
-		}
-		if _, err := recovery.ReadRecoveryPoint(ctx, s.Store, vol, 2); !errors.Is(err, objectstore.ErrNotFound) {
-			return fmt.Errorf("a refused boundary must leave no object behind, got %v", err)
-		}
-	}
+	// §22.1 also described a summary object that could contradict a short listing, and
+	// the assertions that lived here exercised it. It went with ADR-0026 on 2026-08-02:
+	// nothing ever wrote a summary, so in production the floor was only ever the prior
+	// boundary and this defence never existed outside a scenario that fabricated its own
+	// input. What the lagging listing proves is above; what it must not do is below.
 
 	// The listing catches up; the honest boundary is writable and covers every ACK.
 	s.Store.Settle()
@@ -428,9 +409,6 @@ func scenarioSeededFaultsAcrossFailover(s *Sim) error {
 	s.Emit(Event{Kind: EventDurableAck, Durable: acked, LeaseValid: lm.Valid()})
 	if acked != uint64(plan.records) {
 		return fmt.Errorf("w1 ACKed %d of %d records", acked, plan.records)
-	}
-	if err := w1.WriteSummary(ctx); err != nil {
-		return err
 	}
 
 	// The host may die with one record appended and never FLUSHed: the crash discards

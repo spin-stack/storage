@@ -12,7 +12,6 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/epoch"
-	"github.com/spin-stack/storage/internal/gc"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -63,7 +62,6 @@ func MandatoryScenarios() []MandatoryScenario {
 	all = append(all, drainScenarios()...)
 	all = append(all, recoveryScenarios()...)
 	all = append(all, harnessScenarios()...)
-	all = append(all, gcScenarios()...)
 	all = append(all, walScenarios()...)
 	all = append(all, agentScenarios()...)
 	return all
@@ -89,7 +87,6 @@ func coreScenarios() []MandatoryScenario {
 		{Name: "snapshot-pausefree-immutable", Run: scenarioSnapshotPauseFreeImmutable},
 		{Name: "same-host-clone-independent", Run: scenarioSameHostCloneIndependent},
 		{Name: "checkpoint-then-truncate", Run: scenarioCheckpointThenTruncate},
-		{Name: "gc-marks-orphans-not-live", Run: scenarioGCMarksOrphansNotLive},
 		{Name: "background-yields-to-foreground", Run: scenarioBackgroundYields},
 		{Name: "cross-host-materialization", Run: scenarioCrossHostMaterialization},
 		{Name: "drain-moves-volumes-fenced", Run: scenarioDrainMovesVolumesFenced},
@@ -467,87 +464,6 @@ func scenarioBackgroundYields(s *Sim) error {
 		return errors.New("background should resume once high classes drain")
 	}
 	s.Notef("background yielded under foreground/flush contention, resumed when idle")
-	return nil
-}
-
-// scenarioGCMarksOrphansNotLive is INV-14 (§21.3, §5.11): the GC marks unreachable
-// objects reversibly and never permanently deletes; a live object is never marked.
-func scenarioGCMarksOrphansNotLive(s *Sim) error {
-	ctx := context.Background()
-	const vid = "00000000-0000-7000-8000-000000000090"
-	var vol [16]byte
-	vol[6], vol[8] = 0x70, 0x80
-
-	// A live WAL object anchored by a checkpoint, plus structural metadata.
-	_ = descriptor.Write(ctx, s.Store, descriptor.Descriptor{DEKKeyID: 1, VolumeID: vid, SizeBytes: 1, BlockSize: 65536, KEKID: "k", DEKWrapped: []byte{1}})
-	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 5), alwaysValidLease{})
-	_, _ = l.Write(0, []byte("live"), 0)
-	if err := l.Flush(ctx); err != nil {
-		return err
-	}
-	if _, err := checkpoint.NewCheckpointer(s.Store).Create(ctx, l, vol, 1); err != nil {
-		return err
-	}
-	liveObjs, _ := s.Store.List(ctx, "wal/"+format.UUIDString(vol)+"/1/")
-	var live string
-	for _, o := range liveObjs {
-		if len(o.Key) > 4 && o.Key[len(o.Key)-4:] == ".wal" {
-			live = o.Key
-		}
-	}
-
-	// An orphan object referenced by nothing.
-	if _, err := s.Store.Put(ctx, "wal/"+format.UUIDString(vol)+"/1/999-999-deadbeef.wal", []byte("orphan"), objectstore.PutOptions{}); err != nil {
-		return err
-	}
-
-	reachable, err := gc.Reachable(ctx, s.Store)
-	if err != nil {
-		return err
-	}
-	// Mark for real: the GC places reversible delete markers, it does not hand back
-	// a list for someone else to act on (DEV-0006).
-	marks, err := gc.Mark(ctx, s.Store, s.Clock, reachable, 0)
-	if err != nil {
-		return err
-	}
-
-	if len(marks) == 0 {
-		return errors.New("the GC should have marked the orphan")
-	}
-	// Whether a mark is permanent is not something this scenario may assert on the
-	// GC's behalf — it is a property of the bucket, and a bucket without versioning
-	// turns every mark into an irreversible delete with no error anywhere. So probe
-	// it: a marked object must be hidden from reads *and* come back on Restore, and
-	// the delete event carries what actually happened rather than what should have.
-	liveMarked := false
-	for _, m := range marks {
-		if m == live {
-			liveMarked = true
-		}
-		hiddenErr := func() error {
-			if _, err := s.Store.Head(ctx, m); err == nil {
-				return fmt.Errorf("a marked object must not answer reads: %q", m)
-			}
-			return nil
-		}()
-		restoreErr := s.Store.Restore(ctx, m)
-		_, backErr := s.Store.Head(ctx, m)
-		reversible := restoreErr == nil && backErr == nil
-		s.Emit(Event{Kind: EventDelete, Key: m, Permanent: !reversible})
-		if hiddenErr != nil {
-			return hiddenErr
-		}
-		if !reversible {
-			return fmt.Errorf("the GC's mark of %q is irreversible (restore=%v, read-back=%v): "+
-				"the bucket has no versioning and the bytes are gone (§5.11/§21.3, INV-14)", m, restoreErr, backErr)
-		}
-	}
-	if liveMarked {
-		return errors.New("the GC marked a live object")
-	}
-	s.Notef("GC marked %d orphan(s), no live object, no permanent delete", len(marks))
 	return nil
 }
 

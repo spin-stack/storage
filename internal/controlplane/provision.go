@@ -77,7 +77,7 @@ func NewProvisioner(md metadata.Store, store objectstore.Store, kms KeyWrapper, 
 // fleet knows about whose object-store anchor is missing — visible, repairable, and
 // refused by the Agent when it cannot read the descriptor. The reverse order leaves an
 // orphan descriptor under a volume id no row mentions: invisible to every query, and a
-// root `gc.Reachable` would walk from forever.
+// root a reachability sweep would walk from forever.
 //
 // The volume starts at **epoch 1**, not 0. Epoch 0 is the absence of an epoch, and a
 // writer cannot address a WAL namespace under it.
