@@ -89,9 +89,11 @@ func startWAL(t *testing.T, ctx context.Context, limits wal.Limits, seed func(wr
 	lm := lease.NewManager(clk, leaseTTL)
 	lm.Grant()
 
+	// No remote path (ADR-0026 increment 4.5): a FLUSH is fdatasync. The counting store
+	// stays, and it is now a stronger statement than it was — it counts PUTs on a device
+	// that has no way to issue one, so INV-18 ("S3 is not in the guest's write path") is
+	// true by construction rather than by discipline.
 	log := wal.NewLog(d, walRoot, clk, walVolume, 1, limits)
-	log.EnableRemote(wal.NewBatcher(clk, walVolume, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(counting, 3), lm)
 	t.Cleanup(func() { _ = log.Close() })
 
 	// Seeding goes through the log, not around it: the boot sector SeaBIOS reads to
@@ -209,25 +211,27 @@ func TestQEMUGuestWritesThroughTheWAL(t *testing.T) {
 		}
 	})
 
-	t.Run("FLUSH makes it durable in the object store", func(t *testing.T) {
+	t.Run("FLUSH advances durable, and still issues no PUT", func(t *testing.T) {
+		// The subtest above proves the *write* path never touches S3. This one used to
+		// prove the FLUSH path does — "FLUSH makes it durable in the object store" — and
+		// that is exactly what ADR-0026 withdrew: a FLUSH is fdatasync and an ACK, and
+		// the volume reaches the object store when it stops.
+		//
+		// So the PUT count is asserted again rather than dropped, and it is a stronger
+		// statement now than it was: with a real guest, a real filesystem and a real
+		// object store in the loop, *nothing on the guest's I/O path* reaches S3 at all.
+		// INV-18 stops being a discipline and becomes a property of the wiring.
 		if err := l.dev.Flush(ctx); err != nil {
 			t.Fatalf("FLUSH: %v", err)
 		}
-		if got := l.store.Puts(); got == 0 {
-			t.Fatal("FLUSH issued no PUT, so the 0 above says nothing about the write path")
+		if got := l.store.Puts(); got != 0 {
+			t.Fatalf("a FLUSH issued %d PUT(s); §14.8 says it ACKs on fdatasync alone", got)
 		}
 		w := l.log.Watermarks()
 		if w.Durable != w.Local {
 			t.Fatalf("after a successful FLUSH durable=%d, local=%d", w.Durable, w.Local)
 		}
-		objs, err := l.store.List(ctx, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(objs) == 0 {
-			t.Fatal("FLUSH ACKed with nothing in the object store (INV-07)")
-		}
-		t.Logf("the guest's %d records are covered by %d verified object(s)", w.Durable, len(objs))
+		t.Logf("a real guest's FLUSH made %d records durable locally, with no object-store traffic", w.Durable)
 	})
 }
 

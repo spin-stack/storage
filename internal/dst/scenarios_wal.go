@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/blockdev"
-	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -55,11 +54,10 @@ func scenarioGuestDeviceDurability(s *Sim) error {
 		ttl      = 10 * time.Second
 	)
 
-	lm := lease.NewManager(s.Clock, ttl)
-	lm.Grant()
+	// No remote path: there is one ACK contract now (§14.8) and a FLUSH is fdatasync.
+	// What this scenario is about — the device ACKing durability only when the guest
+	// asks for it — is unchanged by that.
 	l := wal.NewLog(s.Disk, root, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(s.Store, 5), lm)
 	dev, err := blockdev.New(l, capacity)
 	if err != nil {
 		return err
@@ -117,13 +115,11 @@ func scenarioGuestDeviceDurability(s *Sim) error {
 	if w.Durable != w.Local {
 		return fmt.Errorf("after a successful FLUSH durable=%d, local=%d", w.Durable, w.Local)
 	}
-	objs, err = s.Store.List(ctx, "")
-	if err != nil {
-		return err
-	}
-	if len(objs) == 0 {
-		return errors.New("FLUSH ACKed with nothing in the object store (INV-07)")
-	}
+	// The old assertion here was "a FLUSH ACKed with nothing in the object store
+	// violates INV-07". With one ACK contract (§14.8) a FLUSH is fdatasync and puts
+	// nothing in the store on purpose — the volume goes there when it stops. What the
+	// scenario still proves is the half that never depended on S3: durable moves to
+	// local exactly when the guest asks, and not before.
 	acked := w.Durable
 
 	// (4) The lease lapses. The next guest WRITE still lands locally — fencing is
@@ -133,28 +129,14 @@ func scenarioGuestDeviceDurability(s *Sim) error {
 		return fmt.Errorf("WRITE before the lease lapsed: %w", err)
 	}
 	s.Tick(ttl + time.Second)
-	s.Emit(Event{Kind: EventFault, Msg: "the lease lapsed on the monotonic clock"})
+	// The lease-lapse arm ended here: a FLUSH after the lease lapsed had to fail with
+	// ErrSelfFenced and leave durable where it was. It went with the lease-gated ACK
+	// (ADR-0026 increment 4.5) — a FLUSH consults no lease now. What the scenario keeps
+	// is the half that never depended on one: a WRITE does not advance durable, and only
+	// a FLUSH does.
 
-	err = guest.Flush(ctx)
-	if err == nil {
-		return errors.New("FLUSH ACKed after the lease lapsed (INV-06)")
-	}
-	if !errors.Is(err, wal.ErrSelfFenced) {
-		return fmt.Errorf("FLUSH after the lease lapsed: %w, want ErrSelfFenced", err)
-	}
-	if !l.Fenced() {
-		return errors.New("the log did not self-fence")
-	}
 	emitWatermarks(s, l)
-	if got := l.Watermarks().Durable; got != acked {
-		return fmt.Errorf("durable moved from %d to %d on a FLUSH that was never ACKed", acked, got)
-	}
-	// Fencing is not transient: every later FLUSH fails at once. A guest can act on
-	// an error; it cannot act on a device that stops answering.
-	if err := guest.Flush(ctx); !errors.Is(err, wal.ErrSelfFenced) {
-		return fmt.Errorf("a second FLUSH on a fenced device: %w, want ErrSelfFenced", err)
-	}
-	s.Notef("lease lapsed: FLUSH refused, durable held at %d, device still answering", acked)
+	s.Notef("the device ACKed durability only where the guest asked for it, at %d", acked)
 	return l.Close()
 }
 
@@ -288,8 +270,6 @@ func walCrashArm(s *Sim, boundary walCrashBoundary, reclaimAboveThePoint bool) e
 	const groups, perGroup = 5, 3
 	limits := wal.Limits{MaxUnflushedBytes: 1 << 20}
 	l := wal.NewLog(s.Disk, root, s.Clock, vol, 1, limits)
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(s.Store, 5), alwaysValidLease{})
 
 	// Five segments' worth of records, all of them durable in S3 so the published
 	// point is free to land anywhere. Rotation is driven by Seal rather than by

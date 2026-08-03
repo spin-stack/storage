@@ -163,7 +163,6 @@ func run() error {
 		Mapper:  hostio.NewMapper(),
 		EventFD: hostio.NewEventFD,
 		Store:   store,
-		Lease:   func() bool { return loop != nil && loop.LeaseValid() },
 		KMS:     kms,
 		// §15: the image chunk nonces. Real randomness in the binary; the DST
 		// harness injects a seeded reader so the same seed gives the same ciphertext.

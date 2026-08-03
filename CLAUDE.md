@@ -62,8 +62,7 @@ called only by its own test.
 - [ ] **Touching an on-disk / on-S3 format:** a serialize/replay property test with
       arbitrary truncations and bit corruptions (§25.2).
 
-**Stop signals** — halt, record in `STATUS.md`, escalate to a human: a test weakened or
-deleted to make a change pass; a `sleep`/magic timeout/infinite retry instead of a
+**Stop signals** — halt, record in `STATUS.md`, escalate to a human: a `sleep`/magic timeout/infinite retry instead of a
 simulable interface; code touching durability, fencing or GC with no DST scenario;
 "I did it differently from the doc because it was simpler" with nothing written down.
 
@@ -191,7 +190,7 @@ See `docs/plan/INVARIANTS.md` for the full list + checkers. The two enforced by 
 ## Testing
 
 - **Tests-first.** Write failing tests / DST scenarios / invariant checkers before the
-  implementation. A test that is weakened or deleted to make a change pass is a stop
+  implementation. A test that is weakened to make a change pass is a stop
   signal.
 - **Test the seams, not only the parts.** Every defect this project has shipped lived
   between two components that were each well covered (see "Build it thin"). `integration/e2e`

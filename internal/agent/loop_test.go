@@ -259,8 +259,8 @@ func (h *harness) awaitBeat(t *testing.T, n int) {
 // which no per-volume limit ever sums.
 func TestReconcileReportsTheDevicePicture(t *testing.T) {
 	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 1 << 40, UsedBytes: 300 << 30})
-	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-b", Epoch: 2, RemoteGapBytes: 11})
-	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 1, RemoteGapBytes: 7})
+	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-b", Epoch: 2})
+	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 1})
 
 	if err := h.loop.Reconcile(t.Context()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -277,8 +277,11 @@ func TestReconcileReportsTheDevicePicture(t *testing.T) {
 	if dev.GetUsedBytes() != 300<<30 {
 		t.Errorf("used_bytes = %d, want %d", dev.GetUsedBytes(), int64(300)<<30)
 	}
-	if dev.GetRemoteBacklogBytes() != 18 {
-		t.Errorf("remote_backlog_bytes = %d, want 18 (the sum over volumes)", dev.GetRemoteBacklogBytes())
+	// The heartbeat used to carry the host's remote backlog. It went with the uploader
+	// (ADR-0026 increment 4.5) and nothing measures what a host would lose mid-session
+	// now — recorded in STATUS.md rather than left to be noticed.
+	if dev.GetRemoteBacklogBytes() != 0 {
+		t.Errorf("remote_backlog_bytes = %d, want 0: nothing reports a backlog", dev.GetRemoteBacklogBytes())
 	}
 }
 

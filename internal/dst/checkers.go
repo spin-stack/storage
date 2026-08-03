@@ -93,26 +93,6 @@ func (c *NoPlaintextLeavesHostChecker) Observe(e Event) {
 
 func (c *NoPlaintextLeavesHostChecker) Check() error { return c.violation }
 
-// DurableAckLeaseChecker enforces INV-06 (§12.2): no FLUSH/FUA is ACKed as durable
-// while the host lease is invalid. It watches durable-ack events for an ACK that
-// escaped with an invalid lease.
-type DurableAckLeaseChecker struct {
-	violation error
-}
-
-// NewDurableAckLeaseChecker returns a fresh checker.
-func NewDurableAckLeaseChecker() *DurableAckLeaseChecker { return &DurableAckLeaseChecker{} }
-
-func (c *DurableAckLeaseChecker) Name() string { return "durable-ack-requires-lease" }
-
-func (c *DurableAckLeaseChecker) Observe(e Event) {
-	if e.Kind == EventDurableAck && !e.LeaseValid && c.violation == nil {
-		c.violation = fmt.Errorf("durable ACK of seq %d with an invalid lease at step %d (violates §12.2/INV-06)", e.Durable, e.Step)
-	}
-}
-
-func (c *DurableAckLeaseChecker) Check() error { return c.violation }
-
 // PromotionWaitChecker enforces INV-11 (§12.3): no epoch N+1 is granted before
 // FENCING_WAIT elapses.
 type PromotionWaitChecker struct{ violation error }
@@ -203,42 +183,25 @@ func (c *TruncateBelowPublishedChecker) Observe(e Event) {
 
 func (c *TruncateBelowPublishedChecker) Check() error { return c.violation }
 
-// BackgroundYieldsChecker enforces INV-17 (§5.9): a background op is never granted
-// while a foreground/flush op is in flight.
-type BackgroundYieldsChecker struct{ violation error }
-
-// NewBackgroundYieldsChecker returns a fresh checker.
-func NewBackgroundYieldsChecker() *BackgroundYieldsChecker { return &BackgroundYieldsChecker{} }
-
-func (c *BackgroundYieldsChecker) Name() string { return "background-yields" }
-
-func (c *BackgroundYieldsChecker) Observe(e Event) {
-	if e.Kind == EventIOClass && e.BgGranted && e.HighInFlight && c.violation == nil {
-		c.violation = fmt.Errorf("background I/O granted while foreground/flush in flight at step %d (violates §5.9/INV-17)", e.Step)
+// DefaultCheckers returns the checkers active so far. Later phases append.
+// coreCheckers are the checkers whose subjects survive V1 (ADR-0026). Four went with
+// theirs in increment 4: promotion wait, no-lost-acked-write, truncate-below-published
+// and immutable-snapshots; durable-ack-requires-lease and background-yields went in 4.5
+// with the lease-gated ACK and the io-class scheduler. A checker that cannot fire proves
+// nothing, which is this file's own rule.
+func coreCheckers() []Checker {
+	return []Checker{
+		NewMonotonicClockChecker(),
+		NewWatermarkOrderChecker(),
+		NewNoPlaintextLeavesHostChecker(),
+		NewSingleWriterChecker(),
 	}
 }
 
-func (c *BackgroundYieldsChecker) Check() error { return c.violation }
-
-// DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	all := coreCheckers()
 	all = append(all, harnessCheckers()...)
 	all = append(all, walCheckers()...)
 	all = append(all, agentCheckers()...)
 	return all
-}
-
-// coreCheckers are the checkers that predate the split by area; new ones belong in
-// the per-area file (scenarios_drain.go, scenarios_recovery.go, scenarios_harness.go)
-// so two increments never edit the same list.
-func coreCheckers() []Checker {
-	return []Checker{
-		NewMonotonicClockChecker(),
-		NewWatermarkOrderChecker(),
-		NewNoPlaintextLeavesHostChecker(),
-		NewDurableAckLeaseChecker(),
-		NewSingleWriterChecker(),
-		NewBackgroundYieldsChecker(),
-	}
 }

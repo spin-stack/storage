@@ -75,7 +75,7 @@ func has(mask uint64, n uint) bool { return mask&bit(n) != 0 }
 // virtio-blk has no FUA bit at all — `struct virtio_blk_outhdr` is type,
 // ioprio, sector, and the type space defines no such flag — so the Linux block
 // layer decomposes REQ_FUA into the WRITE followed by a FLUSH, which lands on
-// the same ACK contract wal.Log.WriteFUA carries. See internal/blockdev.
+// the same ACK contract a FLUSH carries. See internal/blockdev.
 const DeviceFeatures uint64 = 1<<featureBlkSegMax |
 	1<<featureBlkBlkSize |
 	1<<featureBlkFlush |

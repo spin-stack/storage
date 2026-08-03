@@ -963,6 +963,54 @@ subset of the truth, it is a different thing.
 self-describing anchor in the object store, so deleting it is not obviously right — but a
 thing only ever written is the pattern this sweep exists to remove. §22.5 records it too.
 
+## ADR-0026 increment 4.5 — one ACK contract, and the WAL's remote half is gone
+
+`durableStep` is `fdatasync` then ACK. `uploader.go`, `batch.go`, `EnableRemote`,
+`LeaseChecker`, the durability modes, the remote-gap accounting, `ErrSelfFenced`,
+`ErrNoLease` and `ErrNoUploader` are gone, and so is `internal/ioclass` — whose only
+reader was the scheduler deleted in 4.1.
+
+**Increment 4.6's open question is answered.** `VolumeManagerDeps.Lease` had one reader
+left after the ACK gate and the scheduler went: the constructor guard that checked the
+dependency existed. So the lease **disappears from the Agent's data path** rather than
+shrinking; the `Loop` still renews it for the Control Plane's liveness view.
+
+**Two meanings were sharing one flag.** `fenced` meant "a durable step found the lease
+invalid" *and* "a failed rollback left the tail unknown". The first went with the gate;
+the second is `broken`, with `ErrLogBroken`, and `blockdev` stops calling it a loss of
+authority — nothing took the volume away, the log simply cannot describe what it holds.
+
+**The method, recorded because two attempts failed on it.** Delete a function when its
+*subject* is gone, not when its *setup* mentions the removed API.
+`guest-device-acks-durability-only-on-flush`, the ENOSPC arm and the WAL crash boundaries
+all kept their subjects and lost only their setup lines and the assertions that named
+uploads. Two tests **hung rather than failed** — they waited on a FLUSH that blocks on an
+upload — which is worth knowing before touching this again.
+
+**INV-18 is now a property of the wiring rather than a discipline.** The guest lanes still
+count PUTs, and they now assert **zero on the FLUSH path too**: with a real kernel, a real
+filesystem and a real object store in the loop, nothing on a guest's I/O path can reach S3
+at all. The e2e observable moved with it — the artefact is the image published when the
+Agent stops, not an object a FLUSH left behind.
+
+**§6.1 was the one piece that was not deletion.** Its conformance test used the Batcher
+and Uploader as a byte source to prove a real backend's create-only PUT and `If-Match`.
+Those are properties of the *backend*, so the test survives with `internal/image` as its
+source — a suite exercising a byte source production no longer uses would certify the
+wrong thing.
+
+**And the coverage floor was met by writing tests, not by moving the gate.** It fell to
+89.9% because ~2 000 lines of well-covered production code left. `internal/storecfg` and
+`internal/simio/real/s3_bootstrap.go` had no unit tests at all, and both hold real
+decisions: the mutual exclusion of `-s3-bucket` and `-object-store-dir` (guessing which an
+operator meant is not a thing to be clever about), and **which two error codes mean "this
+bucket is already ours"** — too strict and every run after the first refuses to start, too
+loose and we version and write into a bucket somebody else owns. Both proven against
+planted bugs.
+
+Six checkers have now been retired with their subjects across 4 and 4.5; the planted-proof
+ratchet is 8 → 6, each step with its reason beside the constant.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,

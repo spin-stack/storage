@@ -17,6 +17,8 @@ import (
 // ErrBackpressure is returned when a WRITE would exceed the unflushed limits
 // (§5.7): the guest gets an explicit error rather than the host silently filling
 // NVMe.
+var ErrLogBroken = errors.New("wal: the log's tail is unknown after a failed rollback")
+
 var ErrBackpressure = errors.New("wal: backpressure (unflushed limit reached)")
 
 // ErrWatermarkOrder is returned by an attempt to advance a watermark past a higher
@@ -56,12 +58,6 @@ type Limits struct {
 	// cleared by Sync.
 	MaxUnflushedBytes int64
 	MaxUnflushedAge   time.Duration
-	// MaxRemoteGapBytes bounds the bytes that no verified object covers yet — the
-	// backlog a host loss destroys. It is a separate limit because fdatasync clears
-	// the two above while leaving this one untouched, so on a `local` volume (or a
-	// remote one riding out an S3 outage) nothing else stops the device from filling
-	// with writes no other machine has. 0 disables it.
-	MaxRemoteGapBytes int64
 	// SegmentBytes is the size at which a WAL segment is sealed and the next one
 	// started. 0 means SegmentBytes, the 32 MiB default.
 	//
@@ -108,6 +104,15 @@ type Log struct {
 	mu      sync.Mutex
 	flushMu sync.Mutex
 
+	// broken is set when a failed rollback leaves the tail unknown: the log cannot
+	// describe what it holds, so it must not ACK anything against it.
+	//
+	// It used to be `fenced`, and it meant two things — this, and "a durable step found
+	// the lease invalid" (§16 SELF_FENCED). The second went with the lease-gated ACK
+	// (ADR-0026): V1 ACKs on fdatasync and nothing consults a lease on this path. One
+	// flag for one meaning is what stops a reader inferring the other.
+	broken bool
+
 	segs     *segments
 	clk      clock.Clock
 	volumeID [16]byte
@@ -126,45 +131,6 @@ type Log struct {
 	view   *cow.IntervalMap
 	limits Limits
 	enc    *Encryption // nil = plaintext WAL
-
-	batcher  *Batcher  // nil = local-only (no remote WAL)
-	uploader *Uploader // nil = local-only
-
-	mode  DurabilityMode // remote (default) | local (§14.8)
-	lease LeaseChecker   // nil = no lease gate (dev/local without a CP)
-	// fenced is set once a durable step finds the lease invalid (§16 SELF_FENCED).
-	//
-	// **What it gates, and what it deliberately does not.** It stops every *durable*
-	// operation — durableStep and DrainPending — and nothing else. Write and Read do not
-	// consult it, so a self-fenced log keeps taking writes it can never flush and keeps
-	// answering reads from its view.
-	//
-	// That is the policy, not an omission, and §12.2 is what delegates it: a SELF_FENCED
-	// Agent "puede seguir sirviendo reads de su caché mientras QEMU siga conectado,
-	// **según política**". The line grants the behaviour and leaves the choice here, so
-	// here is where the choice is written down (it was carried as DEV-0012 until
-	// 2026-08-02, on the reading that the document had been contradicted; it had not).
-	//
-	// Why this policy and not the stricter one:
-	//
-	//   - Nothing a fenced host writes is ever ACKed durable or published — INV-06,
-	//     INV-09 and INV-10 all hold with Write ungated, because they are properties of
-	//     the durable path and the durable path is what `fenced` stops. The exposure is a
-	//     stale read reaching a guest, plus device pressure from writes no FLUSH covers.
-	//     Both are bounded and both are accepted here on purpose.
-	//   - Refusing I/O would *extend* §16, which scopes SELF_FENCED to durable ACKs. A
-	//     log that denies reads to a guest still attached is the worse failure: the guest
-	//     gets EIO for data this host holds and can serve correctly.
-	//   - Stopping I/O is the Agent's job and it already does it, through the other
-	//     trigger: the Control Plane refusing the volume's report tears the runtime down
-	//     — log, socket and device — so neither reads nor writes are answered. That path
-	//     is driven by the fleet's view rather than by one host's lease clock, which is
-	//     the right authority for "you no longer own this volume".
-	//
-	// The consequence to keep in view: a host whose lease lapses in a PostgreSQL blip
-	// keeps serving its guest, which is the intent, and Fenced() below is what a future
-	// policy would consult if that ever stops being the intent.
-	fenced bool
 
 	// degraded is what the local device is refusing to do, independently of the
 	// lease (see Degraded). outOfSpace classifies a disk error as ENOSPC.
@@ -189,13 +155,6 @@ type Log struct {
 	oldestUnflushedAt clock.Instant
 	hasUnflushed      bool
 
-	// Remote-durability backlog: the bytes appended that no verified S3 object
-	// covers yet. Deliberately separate from the unflushed accounting above, which
-	// fdatasync clears: fdatasync is host durability, and the host is exactly what
-	// this backlog would be lost with (§14.8 RPO).
-	gapBytes       int64
-	oldestGapAt    clock.Instant
-	hasGap         bool
 	discardedBytes int64
 	truncatedUpTo  uint64 // local WAL discarded up to this sequence (§14.7)
 	reclaimedBytes int64  // bytes given back to the device by unlinked segments
@@ -259,13 +218,6 @@ func (l *Log) TruncateLocal(upTo uint64) error {
 	return err
 }
 
-// SetDurabilityMode selects the FLUSH/FUA ACK contract (§14.8). Default is remote.
-func (l *Log) SetDurabilityMode(m DurabilityMode) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.mode = m
-}
-
 // SetRecorder wires the §26.2 metrics this log owns: the watermarks, the unflushed
 // backlog, and the self-fencing counter. A nil recorder is a no-op, so the DST
 // harness and unit tests run without an exporter (DEV-0010).
@@ -292,42 +244,19 @@ func (l *Log) recordWatermarks(ctx context.Context) {
 	// `local` volume ACKs on fdatasync, so its unflushed count is 0 while its RPO
 	// exposure is the whole backlog — reporting the former as the latter is the
 	// operator's only RPO signal telling them the opposite of the truth.
-	l.rec.Gauge(ctx, "wal_durable_gap_bytes", float64(l.gapBytes), vol)
-	l.rec.Gauge(ctx, "wal_durable_gap_seconds", l.gapAge().Seconds(), vol)
 	// Republished here so the series exists for a healthy volume too: an alert on
 	// "the device is full" cannot fire on a metric that only appears once it is.
 	l.recordDegraded(ctx)
 }
 
-// gapAge is how long the oldest un-remote-durable record has been waiting: the
-// effective RPO in seconds (§14.8, §26.2).
-func (l *Log) gapAge() time.Duration {
-	if !l.hasGap {
-		return 0
-	}
-	return l.clk.Now().Sub(l.oldestGapAt)
-}
-
-// RemoteGapBytes reports the bytes appended that no verified object covers yet.
-func (l *Log) RemoteGapBytes() int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.gapBytes
-}
-
-// Fenced reports whether the log has self-fenced (a durable step found the lease
-// invalid).
+// Broken reports whether a failed rollback left this log's tail unknown.
 //
-// It has no production caller, and under the policy on the `fenced` field it should not:
-// self-fencing stops the durable path from the inside, and stopping the *guest* is the
-// Agent's job through the Control Plane's refusal, not this host's lease clock. What it
-// exists for is proof — the DST scenarios and the unit tests that assert INV-06 read the
-// transition through it rather than through a flag they set themselves — and as the seam
-// a stricter policy would consult on the day one is chosen.
-func (l *Log) Fenced() bool {
+// It has no production caller. What it exists for is proof — the tests that plant a
+// rollback failure read the transition through it rather than a flag they set themselves.
+func (l *Log) Broken() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.fenced
+	return l.broken
 }
 
 // EnableEncryption binds an Encryption context so subsequent WRITEs seal their
@@ -336,45 +265,6 @@ func (l *Log) EnableEncryption(e *Encryption) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.enc = e
-	l.alignKeyID()
-}
-
-// alignKeyID makes the DEK the single source of truth for the KeyID an assembled
-// object announces (§15.1). The Batcher is constructed independently of the
-// Encryption context — every call site in the tree passes 0 — and an object header
-// naming a key version that did not seal its records points a recovering host at the
-// wrong DEK. The two cannot disagree if only one of them is authoritative.
-func (l *Log) alignKeyID() {
-	if l.enc != nil && l.batcher != nil {
-		l.batcher.keyID = l.enc.DEK.KeyID
-	}
-}
-
-// EnableRemote wires the on-demand batcher and idempotent uploader so FLUSH/FUA
-// make records durable in S3 (§14.3–14.5). Must be set before the first WRITE.
-// EnableRemote wires the remote path. The lease checker is a parameter rather than a
-// later setter so that every call site has to answer the question "what fences this
-// writer?" — nil is legal only for `local` durability (§14.8 rule 3), and a remote
-// FLUSH with a nil lease fails closed with ErrNoLease (DEV-0004).
-func (l *Log) EnableRemote(b *Batcher, u *Uploader, lease LeaseChecker) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.batcher = b
-	l.uploader = u
-	if lease != nil {
-		l.lease = lease
-	}
-	l.alignKeyID()
-	// A resumed log carries the records the crash left un-uploaded (Resume). They
-	// are the writes that exist on this host only, so the batcher gets them the
-	// moment there is one — forgetting them here would lose every write since the
-	// last successful upload, silently.
-	if b != nil {
-		for _, r := range l.resumeTail {
-			b.Append(r.seq, r.encoded, false)
-		}
-		l.resumeTail = nil
-	}
 }
 
 // NewLog creates a log over the WAL directory <root>/<volume-id>/<epoch>, timed by
@@ -412,9 +302,6 @@ func (l *Log) backpressure(add int) error {
 	}
 	if l.hasUnflushed && l.limits.MaxUnflushedAge > 0 &&
 		l.clk.Now().Sub(l.oldestUnflushedAt) > l.limits.MaxUnflushedAge {
-		return ErrBackpressure
-	}
-	if l.limits.MaxRemoteGapBytes > 0 && l.gapBytes+int64(add) > l.limits.MaxRemoteGapBytes {
 		return ErrBackpressure
 	}
 	return nil
@@ -456,7 +343,7 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 		if rollbackErr != nil {
 			// The log's tail is now unknown. Refuse to serve it rather than ACK
 			// anything against a segment we cannot describe.
-			l.fenced = true
+			l.broken = true
 			return 0, errors.Join(err, fmt.Errorf("wal: could not roll back a partial append: %w", rollbackErr))
 		}
 		return 0, err
@@ -464,7 +351,6 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	l.local = seq
 	addView()
 	l.trackUnflushed(len(enc))
-	l.trackGap(len(enc))
 	return seq, nil
 }
 
@@ -478,29 +364,6 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.write(offset, data, flags)
-}
-
-// WriteFUA appends a WRITE carrying the FUA flag and makes it durable before it
-// returns, under the same ACK contract as a FLUSH (§14.3.1, §14.8): in `remote` mode
-// the record is in a verified object and the lease was valid at the instant of the
-// ACK, in `local` mode it is on the host's stable media. On any failure the record
-// stays in the local WAL — as an un-ACKed FLUSH's records do — and the caller gets
-// the error instead of a completion the guest would trust.
-// The append and the durable step are two critical sections, not one: the durable
-// step uploads, and mu may not be held across a PUT. The FUA record's sequence is
-// captured under the first, so a write that races in between raises `local` without
-// widening what this ACK confirms.
-func (l *Log) WriteFUA(ctx context.Context, offset uint64, data []byte) (uint64, error) {
-	l.mu.Lock()
-	seq, err := l.write(offset, data, format.FlagFUA)
-	l.mu.Unlock()
-	if err != nil {
-		return 0, err
-	}
-	if err := l.durableStep(ctx, seq); err != nil {
-		return 0, err
-	}
-	return seq, nil
 }
 
 func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
@@ -523,9 +386,6 @@ func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	got, err := l.appendEncoded(seq, enc, func() { l.view.Overwrite(offset, plaintext) })
 	if err != nil {
 		return 0, err
-	}
-	if l.batcher != nil {
-		l.batcher.Append(seq, enc, flags&format.FlagFUA != 0)
 	}
 	return got, nil
 }
@@ -556,9 +416,6 @@ func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (ui
 	got, err := l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
 	if err != nil {
 		return 0, err
-	}
-	if l.batcher != nil {
-		l.batcher.Append(seq, enc, false)
 	}
 	l.discardedBytes += int64(length)
 	return got, nil
@@ -757,130 +614,34 @@ func (l *Log) Flush(ctx context.Context) error {
 	return l.durableStep(ctx, target)
 }
 
-// durableStep is the §14.4 sequence shared by FLUSH and FUA — they carry the same
-// ACK contract, so they must not have two implementations of it. target is the
-// sequence the ACK would confirm, captured before the batch is closed.
+// durableStep is the ACK path shared by FLUSH and FUA — they carry the same contract, so
+// they must not have two implementations of it.
 //
-// It runs under flushMu, so only one durable step is in flight at a time, and it takes
-// mu in short stretches around the upload rather than across it. See the Log type
-// comment: mu held across a PUT would put the object store in the guest's write path
-// and blind the Agent's reporting for the length of an S3 stall.
+// **One contract (§14.8, ADR-0026): fdatasync, then ACK.** No upload, no lease check. A
+// FLUSH is durable against this process, this Agent and QEMU dying; it is not durable
+// against the host dying, and §2 says so rather than paying for the difference on every
+// commit. The volume reaches the object store when it stops (agent.Volume.publish).
+//
+// What was here was §14.4's six steps — close the batch, fdatasync, upload every covering
+// object, verify the lease on the monotonic clock, advance durable_sequence, ACK — plus a
+// `local` mode that skipped four of them. Both went with the remote durability chain.
 func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	l.flushMu.Lock()
 	defer l.flushMu.Unlock()
 
 	l.mu.Lock()
-	if l.fenced {
-		l.mu.Unlock()
-		return ErrSelfFenced
+	defer l.mu.Unlock()
+	if l.broken {
+		return ErrLogBroken
 	}
-	if l.batcher != nil {
-		l.batcher.Flush() // step 2: close current batch
-	}
-	if err := l.segs.sync(); err != nil { // step 3: fdatasync local
-		l.mu.Unlock()
+	if err := l.segs.sync(); err != nil {
 		return err
 	}
-
-	if l.mode == ModeLocal {
-		// §14.8: ACK on local durability; no lease gate, no synchronous S3. The
-		// remote gap is untouched on purpose — it is exactly what this ACK does not
-		// cover, and it is the RPO an operator reads.
-		l.clearUnflushed()
-		l.recordWatermarks(ctx)
-		l.mu.Unlock()
-		return nil
-	}
-
-	// Remote durability with nothing able to PUT is not "nothing to upload": it is a
-	// durability claim with no backing. Refuse it here rather than let step 6 move
-	// durable_sequence past what S3 can produce (INV-07).
-	if l.batcher == nil || l.uploader == nil {
-		l.mu.Unlock()
-		return ErrNoUploader
-	}
-
-	l.mu.Unlock()
-	if err := l.uploadPending(ctx); err != nil { // step 4: upload + verify
-		return err // durable NOT advanced
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// The log is not re-checked for self-fencing here, and that is deliberate: the
-	// only path that sets it while this one holds flushMu is a failed rollback in
-	// appendEncoded, which leaves the tail *above* target unknown. The records this
-	// step uploaded were appended and verified before that, so confirming them is
-	// true. Fencing stops the next durable step, at the top.
-
-	// step 5: verify the lease on the monotonic clock (§12.2, INV-06). If it is not
-	// valid, do NOT advance durable and do NOT ACK — self-fence. In remote mode the
-	// check is mandatory: no lease checker means nothing is fencing this writer, so
-	// the ACK is refused rather than granted by default.
-	if l.lease == nil {
-		return ErrNoLease
-	}
-	if !l.lease.Valid() {
-		l.fenced = true
-		l.rec.Count(ctx, "self_fenced_total", 1, obs.String("volume", l.volLabel))
-		return ErrSelfFenced
-	}
-	if err := l.advanceDurableLocked(target); err != nil { // step 6
+	if err := l.advanceDurableLocked(target); err != nil {
 		return err
 	}
 	l.clearUnflushed()
 	l.recordWatermarks(ctx)
-	return nil // step 7: ack
-}
-
-// uploadPending puts every closed batch in the object store and returns the highest
-// sequence a verified object now covers (0 when there was nothing to upload).
-//
-// It must be called with flushMu held and mu NOT held, and it returns with mu not held.
-// The lock dance is the point rather than an accident: `mu` is released around each
-// Upload because holding it across a PUT would put S3 latency in the guest's WRITE path
-// (§5.3, INV-18) and blind the Agent's reporting for the length of an S3 stall.
-//
-// It does **not** advance durable_sequence and does not ACK anything. That separation is
-// what lets §14.8's two modes share one implementation of "put the records in S3": the
-// remote FLUSH advances after this returns and after the lease check, and the local
-// mode's asynchronous drain advances only if the caller still holds the lease. Uploading
-// is not a durability claim — the object is create-only with a deterministic key, so
-// writing it asserts nothing about who owns the volume — and INV-06 governs the claim.
-func (l *Log) uploadPending(ctx context.Context) error {
-	// A snapshot, because the list is about to be read without the lock and a
-	// concurrent WRITE may close a further batch onto the end of it. Those extra
-	// batches are not this step's business, and dropping the first `done` entries
-	// still drops exactly the ones uploaded here.
-	l.mu.Lock()
-	if l.batcher == nil || l.uploader == nil {
-		l.mu.Unlock()
-		return ErrNoUploader
-	}
-	pending := append([]*ClosedBatch(nil), l.batcher.Pending()...)
-	uploader := l.uploader
-	l.mu.Unlock()
-
-	done := 0
-	for _, cb := range pending {
-		key, err := uploader.Upload(ctx, cb) // no lock held: this is the network
-		l.mu.Lock()
-		if err != nil {
-			l.batcher.RemoveUploaded(done)
-			l.recordWatermarks(ctx) // a growing gap is what an operator needs here
-			l.mu.Unlock()
-			return err
-		}
-		_ = key
-		l.closeGap(int64(len(cb.Records)))
-		l.mu.Unlock()
-		done++
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.batcher.RemoveUploaded(done)
 	return nil
 }
 
@@ -895,25 +656,6 @@ func (l *Log) trackUnflushed(n int) {
 		l.hasUnflushed = true
 	}
 	l.unflushedBytes += int64(n)
-}
-
-// trackGap records bytes that no object covers yet.
-func (l *Log) trackGap(n int) {
-	if !l.hasGap {
-		l.oldestGapAt = l.clk.Now()
-		l.hasGap = true
-	}
-	l.gapBytes += int64(n)
-}
-
-// closeGap discounts the bytes of an object that is now verified in the store. Only
-// a verified PUT closes the gap — not fdatasync, not an ACK.
-func (l *Log) closeGap(n int64) {
-	l.gapBytes -= n
-	if l.gapBytes <= 0 {
-		l.gapBytes = 0
-		l.hasGap = false
-	}
 }
 
 // Watermarks returns the current watermarks. The trio is read under one lock so a
@@ -936,36 +678,10 @@ func (l *Log) UnflushedBytes() int64 {
 	return l.unflushedBytes
 }
 
-// ViewBytes reports the read-view memory (active_map_bytes proxy for Phase 04).
-// ViewAtRest returns the read view and the sequence it stands at, for serialising the
-// volume into an image.
-//
-// **It is only valid once nothing can append** — after the serve loop has stopped, which
-// is where Volume.stop calls it. That precondition is in the name because both other
-// designs are wrong: a getter that took `mu` would hand back a pointer the lock stops
-// protecting the moment it returns, and a callback holding `mu` across image.Publish
-// would hold it across an object-store PUT, which this type's two-mutex design exists to
-// prevent (see the type comment).
-//
-// A snapshot of a *running* volume is a different problem and does not use this: the view
-// is moving, so the frozen point has to be a sequence number rather than a moment (§19).
-// Mode reports the §14.8 ACK contract this log is serving.
-func (l *Log) Mode() DurabilityMode {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.mode
-}
-
 func (l *Log) ViewAtRest() (*cow.IntervalMap, uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.view, l.local
-}
-
-func (l *Log) ViewBytes() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.view.Bytes()
 }
 
 // AdvanceDurable advances the durable watermark, enforcing durable <= local (§5.6).

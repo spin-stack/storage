@@ -127,7 +127,6 @@ func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch,
 			return nil, fmt.Errorf("wal: resume sequence %d: %w", rec.Sequence, err)
 		}
 		l.resumeTail = append(l.resumeTail, resumedRecord{seq: rec.Sequence, encoded: encoded})
-		l.trackGap(len(encoded))
 	}
 	return l, nil
 }

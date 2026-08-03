@@ -210,10 +210,12 @@ func (l *Loop) fence(ctx context.Context) error {
 }
 
 func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeStatus) error {
+	// The heartbeat used to carry the host's remote backlog — the bytes no verified
+	// object covered yet. It went with the uploader (ADR-0026 increment 4.5): with the
+	// ACK local and the volume published at stop there is no continuous distance to S3
+	// to measure. What a host would lose if it died mid-session is bounded by the session
+	// and, deliberately, nothing measures it — see STATUS.md.
 	var backlog int64
-	for _, v := range vols {
-		backlog += v.RemoteGapBytes
-	}
 
 	// The lease is anchored to the instant the request leaves, never to the answer's
 	// (§12.2): the Control Plane stamps last_renewal at or after this instant, so the
@@ -356,7 +358,6 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			LocalSequence:     v.LocalSequence,
 			DurableSequence:   v.DurableSequence,
 			PublishedSequence: v.PublishedSequence,
-			RemoteGapBytes:    v.RemoteGapBytes,
 		})
 	}
 	resp, err := l.cp.ReportVolumeState(ctx, connect.NewRequest(&storagev1.ReportVolumeStateRequest{

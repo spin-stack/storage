@@ -29,13 +29,14 @@
 //
 // # FUA
 //
-// wal.Log has WriteFUA, and nothing in this package calls it, because a virtio-blk
+// wal.Log had a WriteFUA, and nothing ever called it, because a virtio-blk
 // request cannot ask for FUA. `struct virtio_blk_outhdr` carries a type, an ioprio and
 // a sector, and the type space (virtio 1.2 §5.2.6) has no FUA bit — the only high bit
 // ever defined there is the legacy VIRTIO_BLK_T_BARRIER, which this backend does not
 // negotiate. A guest that wants force-unit-access gets it the way the Linux block layer
 // produces it for any device without FUA support: the WRITE, then a FLUSH. That decomposition
-// lands on Write + Flush here, which carry exactly the ACK contract WriteFUA does —
+// lands on Write + Flush here, which carry exactly the ACK contract it did — so it was
+// deleted with ADR-0026 increment 4.5 rather than kept as a second spelling of them —
 // wal.Log implements both through one durableStep — so the guarantee is the same and
 // only the number of requests differs.
 //

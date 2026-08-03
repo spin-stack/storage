@@ -39,8 +39,6 @@ func truncatedVolume(t *testing.T) (*sim.Disk, *sim.ObjectStore, *sim.Clock, [16
 
 	limits := wal.Limits{SegmentBytes: baseTestSegmentBytes}
 	l := wal.NewLog(d, "wal", clk, vol, 1, limits)
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(store, 3), lm)
 
 	payload := bytes.Repeat([]byte{0xAB}, 4096)
 	for i := range 6 {

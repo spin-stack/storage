@@ -8,21 +8,9 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/crypto"
-	"github.com/spin-stack/storage/internal/ioclass"
-	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/simio/network"
-	"github.com/spin-stack/storage/internal/simio/objectstore"
-	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
-	"github.com/spin-stack/storage/internal/wal/format"
 )
-
-// alwaysValidLease is the fence for scenarios that are not about fencing: remote
-// durability requires a lease checker (DEV-0004), and these scenarios assert other
-// properties with the lease held.
-type alwaysValidLease struct{}
-
-func (alwaysValidLease) Valid() bool { return true }
 
 // deterministicReader yields seed-derived bytes for DEK material under DST.
 type deterministicReader struct{ b byte }
@@ -57,17 +45,12 @@ func MandatoryScenarios() []MandatoryScenario {
 // coreScenarios are the §25.1 entries that predate the split by area.
 func coreScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
-		{Name: "lost-put-idempotent-retry", Run: scenarioLostPutIdempotent},
 		{Name: "crash-around-fdatasync", Run: scenarioCrashAroundFdatasync},
 		{Name: "clock-drift-beyond-skew", Run: scenarioClockDriftBeyondSkew},
 		{Name: "network-partition", Run: scenarioNetworkPartition},
 		{Name: "wal-write-path-no-put", Run: scenarioWALWritePathNoPut},
 		{Name: "wal-backpressure", Run: scenarioWALBackpressure},
 		{Name: "encrypted-wal-no-plaintext-leak", Run: scenarioEncryptedWALNoPlaintextLeak},
-		{Name: "remote-flush-ordering", Run: scenarioRemoteFlushOrdering},
-		{Name: "idempotent-batch-upload", Run: scenarioIdempotentBatchUpload},
-		{Name: "lease-fences-durable-ack", Run: scenarioLeaseFencesDurableAck},
-		{Name: "background-yields-to-foreground", Run: scenarioBackgroundYields},
 		{Name: "torn-append-leaves-nothing-behind", Run: scenarioTornAppend},
 	}
 }
@@ -133,46 +116,6 @@ func scenarioTornAppend(s *Sim) error {
 // nil-able argument, so the mistake is one omitted parameter and no error anywhere.
 const ()
 
-// scenarioBackgroundYields is INV-17 (§5.9, §11): background I/O yields whenever a
-// foreground or flush op is in flight, and stays within its token budget.
-func scenarioBackgroundYields(s *Sim) error {
-	sched := ioclass.NewScheduler(200)
-
-	// Idle: background is granted (within budget) and no high op is in flight.
-	g := sched.TryAcquire(ioclass.Background, 100)
-	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
-	if !g {
-		return errors.New("idle background within budget should be granted")
-	}
-
-	// Under contention: a foreground op in flight → background must yield.
-	sched.Begin(ioclass.Foreground)
-	g = sched.TryAcquire(ioclass.Background, 1)
-	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
-	if g {
-		return errors.New("background was granted while foreground in flight (INV-17)")
-	}
-	// A flush op too.
-	sched.Begin(ioclass.Flush)
-	g = sched.TryAcquire(ioclass.Background, 1)
-	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
-	if g {
-		return errors.New("background was granted while flush in flight (INV-17)")
-	}
-
-	// After the high ops drain, background resumes.
-	sched.End(ioclass.Foreground)
-	sched.End(ioclass.Flush)
-	sched.Refill()
-	g = sched.TryAcquire(ioclass.Background, 100)
-	s.Emit(Event{Kind: EventIOClass, BgGranted: g, HighInFlight: sched.HighActive() > 0})
-	if !g {
-		return errors.New("background should resume once high classes drain")
-	}
-	s.Notef("background yielded under foreground/flush contention, resumed when idle")
-	return nil
-}
-
 // failVol/failHosts are the v7-shaped ids for the full-fencing scenario.
 const ()
 
@@ -180,156 +123,6 @@ const ()
 const ()
 
 // Which lease checker the WAL is handed. honestLeaseChecker is the real manager;
-// lyingLeaseChecker keeps answering "valid" after the lease has expired — a stuck
-// renewal, or a heartbeat thread that died holding its last answer — and is how the
-// INV-06 checker is proven to catch a real violation rather than a fabricated event.
-const (
-	honestLeaseChecker = false
-	lyingLeaseChecker  = true
-)
-
-// scenarioLeaseFencesDurableAck is INV-06 (§12.2): a valid lease lets a FLUSH ACK;
-// once the lease expires, a FLUSH whose object still lands in S3 is NOT ACKed —
-// durable does not advance and the log self-fences.
-func scenarioLeaseFencesDurableAck(s *Sim) error {
-	return leaseFencesDurableAck(s, honestLeaseChecker)
-}
-
-func leaseFencesDurableAck(s *Sim, lying bool) error {
-	ctx := context.Background()
-	vol := [16]byte{8}
-	lm := lease.NewManager(s.Clock, 10*time.Second)
-	lm.Grant()
-
-	// The log consults `check`; every durable-ack event carries `lm`'s verdict, which
-	// is the lease that actually governs the writer. When the two disagree the ACK is
-	// exactly the violation INV-06 forbids, and the checker must see it.
-	var check wal.LeaseChecker = lm
-	if lying {
-		check = alwaysValidLease{}
-	}
-	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(
-		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(s.Store, 5),
-		check,
-	)
-
-	// (1) With a valid lease, the FLUSH ACKs.
-	if _, err := l.Write(0, []byte("acked"), 0); err != nil {
-		return err
-	}
-	if err := l.Flush(ctx); err != nil {
-		return fmt.Errorf("flush with valid lease: %w", err)
-	}
-	s.Emit(Event{Kind: EventDurableAck, Durable: l.Watermarks().Durable, LeaseValid: lm.Valid()})
-	ackedDurable := l.Watermarks().Durable
-
-	// (2) Lease expires; a further write + FLUSH must self-fence without ACKing,
-	// even though the object reaches S3.
-	if _, err := l.Write(8, []byte("not-acked"), 0); err != nil {
-		return err
-	}
-	s.Clock.Advance(11 * time.Second) // no renewal
-	err := l.Flush(ctx)
-	if err == nil {
-		// The FLUSH ACKed. Record it with the real lease's verdict: if that lease had
-		// expired, a durable ACK just escaped an invalid fence.
-		s.Emit(Event{Kind: EventDurableAck, Durable: l.Watermarks().Durable, LeaseValid: lm.Valid()})
-		return fmt.Errorf("expired-lease flush ACKed seq %d (INV-06)", l.Watermarks().Durable)
-	}
-	if !errors.Is(err, wal.ErrSelfFenced) {
-		return fmt.Errorf("expired-lease flush: want ErrSelfFenced, got %v", err)
-	}
-	// No durable-ack event is emitted here — there was no ACK. The checker verifies
-	// no ACK ever escaped with an invalid lease.
-	if l.Watermarks().Durable != ackedDurable {
-		return fmt.Errorf("durable advanced past the last ACK despite an invalid lease (INV-06)")
-	}
-	if !l.Fenced() {
-		return errors.New("log should have self-fenced")
-	}
-	if objs, _ := s.Store.List(ctx, "wal/"); len(objs) != 2 {
-		return fmt.Errorf("both objects should be in S3 (PUT succeeded), got %d", len(objs))
-	}
-	s.Notef("lease expiry self-fenced the ACK; object in S3 but not confirmed")
-	return nil
-}
-
-func remoteLog(s *Sim, vol [16]byte) (*wal.Log, error) {
-	l := wal.NewLog(s.Disk, "wal", s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(
-		wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(s.Store, 5),
-		alwaysValidLease{},
-	)
-	return l, nil
-}
-
-// scenarioRemoteFlushOrdering is INV-07 (§14.4): durable_sequence advances only
-// after the covering objects are verified in S3. A failing upload must leave
-// durable where it was.
-func scenarioRemoteFlushOrdering(s *Sim) error {
-	ctx := context.Background()
-	l, err := remoteLog(s, [16]byte{5})
-	if err != nil {
-		return err
-	}
-	if _, err := l.Write(0, []byte("durable-me"), 0); err != nil {
-		return err
-	}
-
-	s.Store.InjectThrottle(5) // exhaust the uploader budget, then clear
-	if err := l.Flush(ctx); err == nil {
-		return errors.New("flush should fail while uploads fail")
-	}
-	emitWatermarks(s, l)
-	if l.Watermarks().Durable != 0 {
-		return fmt.Errorf("durable advanced to %d despite upload failure (INV-07)", l.Watermarks().Durable)
-	}
-	if objs, _ := s.Store.List(ctx, "wal/"); len(objs) != 0 {
-		return fmt.Errorf("no object should be durable, got %d", len(objs))
-	}
-
-	// Retry succeeds; durable now advances.
-	if err := l.Flush(ctx); err != nil {
-		return fmt.Errorf("retry flush: %w", err)
-	}
-	emitWatermarks(s, l)
-	if l.Watermarks().Durable != 1 {
-		return fmt.Errorf("durable should be 1 after verified upload, got %d", l.Watermarks().Durable)
-	}
-	s.Emit(Event{Kind: EventObject, Msg: "batch verified in S3"})
-	return nil
-}
-
-// scenarioIdempotentBatchUpload is INV-21 (§14.5): a PUT that persisted but lost
-// its response reconciles on retry, and re-uploads never duplicate.
-func scenarioIdempotentBatchUpload(s *Sim) error {
-	ctx := context.Background()
-	vol := [16]byte{6}
-	b := wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig())
-	enc, _ := wal.Record{Type: format.RecordWrite, Epoch: 1, Sequence: 1, Payload: []byte("batch-bytes")}.Encode()
-	b.Append(1, enc, false)
-	b.Flush()
-	cb := b.Pending()[0]
-
-	s.Store.InjectLostResponse(cb.Object().Key)
-	up := wal.NewUploader(s.Store, 5)
-	if _, err := up.Upload(ctx, cb); err != nil {
-		return fmt.Errorf("upload should be idempotent after lost response: %w", err)
-	}
-	if _, err := up.Upload(ctx, cb); err != nil {
-		return fmt.Errorf("re-upload should be idempotent: %w", err)
-	}
-	objs, _ := s.Store.List(ctx, "wal/")
-	if len(objs) != 1 {
-		return fmt.Errorf("expected exactly 1 object after idempotent retries, got %d", len(objs))
-	}
-	s.Notef("idempotent upload: 1 object after lost response + re-upload")
-	return nil
-}
-
 // Whether the volume under test was created with a DEK. plaintextWAL is not a bug in
 // the crypto — it is a Log that was never handed one, which is exactly how a plaintext
 // volume reaches production, and it is what proves the INV-15 checker catches a real
@@ -461,43 +254,6 @@ func scenarioWALBackpressure(s *Sim) error {
 		return fmt.Errorf("write after sync should resume: %w", err)
 	}
 	emitWatermarks(s, l)
-	return nil
-}
-
-// scenarioLostPutIdempotent: a PUT persists but its response is lost (§14.5). The
-// idempotent retry sees the object already present (412), HEADs it, and the
-// checksums match => success without duplication.
-func scenarioLostPutIdempotent(s *Sim) error {
-	ctx := context.Background()
-	key := "wal/vol/0/1-1-hash.wal"
-	data := []byte("the-encrypted-batch")
-
-	s.Store.InjectLostResponse(key)
-	s.Notef("PUT with lost response injected")
-	_, err := s.Store.Put(ctx, key, data, objectstore.PutOptions{IfNoneMatch: true})
-	if !errors.Is(err, sim.ErrLostResponse) {
-		return fmt.Errorf("expected lost-response error, got %v", err)
-	}
-	s.Emit(Event{Kind: EventObject, Key: key, Msg: "put response lost"})
-
-	// Retry: create-only now fails because it persisted.
-	_, err = s.Store.Put(ctx, key, data, objectstore.PutOptions{IfNoneMatch: true})
-	if !errors.Is(err, objectstore.ErrPreconditionFailed) {
-		return fmt.Errorf("retry expected precondition-failed, got %v", err)
-	}
-	// HEAD + checksum reconcile: same size and readable content => idempotent OK.
-	info, err := s.Store.Head(ctx, key)
-	if err != nil {
-		return fmt.Errorf("HEAD after retry: %w", err)
-	}
-	if info.Size != int64(len(data)) {
-		return fmt.Errorf("HEAD size mismatch: got %d want %d", info.Size, len(data))
-	}
-	got, err := s.Store.Get(ctx, key)
-	if err != nil || !bytes.Equal(got, data) {
-		return fmt.Errorf("content mismatch after lost-response retry: %q err=%v", got, err)
-	}
-	s.Emit(Event{Kind: EventObject, Key: key, Msg: "idempotent retry reconciled"})
 	return nil
 }
 

@@ -22,7 +22,6 @@ func TestFlushRecordsTheWatermarkMetrics(t *testing.T) {
 	}
 	defer func() { _ = p.Shutdown(ctx) }()
 
-	store := sim.NewObjectStore()
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	lm := lease.NewManager(clk, 10*time.Second)
 	lm.Grant()
@@ -30,7 +29,6 @@ func TestFlushRecordsTheWatermarkMetrics(t *testing.T) {
 	d := sim.NewDisk()
 	vol := [16]byte{7}
 	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), lm)
 	l.SetRecorder(obs.NewRecorder(p.Metrics), "vol-7")
 
 	if _, err := l.Write(0, []byte("data"), 0); err != nil {
@@ -46,45 +44,13 @@ func TestFlushRecordsTheWatermarkMetrics(t *testing.T) {
 	}
 	for _, name := range []string{
 		"wal_local_sequence", "wal_durable_sequence", "wal_published_sequence",
-		"wal_unflushed_bytes", "wal_durable_gap_bytes",
+		// wal_durable_gap_bytes went with the uploader (ADR-0026 increment 4.5): with
+		// nothing uploading there is no distance to S3 to report. STATUS.md records
+		// that nothing measures what a host would lose if it died mid-session.
+		"wal_unflushed_bytes",
 	} {
 		if !got[name] {
 			t.Fatalf("%s is declared but never recorded; collected: %v", name, got)
 		}
-	}
-}
-
-func TestSelfFencingIsCounted(t *testing.T) {
-	ctx := t.Context()
-	p, err := obs.NewTestProvider("wal-telemetry")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = p.Shutdown(ctx) }()
-
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	lm := lease.NewManager(clk, 10*time.Second)
-	lm.Grant()
-
-	d := sim.NewDisk()
-	vol := [16]byte{7}
-	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), lm)
-	l.SetRecorder(obs.NewRecorder(p.Metrics), "vol-7")
-
-	if _, err := l.Write(0, []byte("data"), 0); err != nil {
-		t.Fatal(err)
-	}
-	clk.Advance(30 * time.Second) // the lease expires
-	if err := l.Flush(ctx); err == nil {
-		t.Fatal("expected the flush to self-fence")
-	}
-	got, err := p.CollectedMetrics(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !got["self_fenced_total"] {
-		t.Fatalf("a self-fencing event must be counted; collected: %v", got)
 	}
 }

@@ -59,12 +59,16 @@ func TestALinuxGuestIssuesFLUSH(t *testing.T) {
 	}
 
 	// And the backend's side of the same event, because a guest that printed PASS while
-	// this backend did nothing durable would make the whole lane a tautology.
+	// this backend did nothing would make the whole lane a tautology.
 	//
-	// Asserted as the §14.4 *outcome* rather than as a message count: the guest's write
-	// reached the WAL, and a FLUSH — which is the only thing that advances `durable` —
-	// put it in a verified object. Nothing else in this test issues one; the test never
-	// touches l.dev.
+	// Asserted as the outcome rather than as a message count: the guest's write reached
+	// the WAL, and a FLUSH — the only thing that advances `durable` — happened. Nothing
+	// else in this test issues one; the test never touches l.dev.
+	//
+	// It used to also require a verified object in the store. That went with ADR-0026:
+	// a FLUSH is fdatasync and an ACK, so the store is empty here on purpose, and the
+	// PUT count is asserted to be zero rather than the assertion being dropped — with a
+	// real kernel in the loop that is the strongest form INV-18 has ever had.
 	w := l.log.Watermarks()
 	switch {
 	case w.Local == 0:
@@ -72,12 +76,8 @@ func TestALinuxGuestIssuesFLUSH(t *testing.T) {
 	case w.Durable == 0:
 		t.Fatalf("the guest's fsync advanced nothing: local=%d, durable=0 — no FLUSH reached this backend", w.Local)
 	}
-	objs, err := l.store.List(ctx, "")
-	if err != nil {
-		t.Fatal(err)
+	if got := l.store.Puts(); got != 0 {
+		t.Fatalf("a real kernel's fsync issued %d PUT(s); §14.8 says the ACK is local", got)
 	}
-	if len(objs) == 0 {
-		t.Fatal("durable advanced with nothing in the object store (INV-07)")
-	}
-	t.Logf("a real kernel's fsync made %d record(s) durable in %d verified object(s)", w.Durable, len(objs))
+	t.Logf("a real kernel's fsync made %d record(s) durable locally, with no object-store traffic", w.Durable)
 }

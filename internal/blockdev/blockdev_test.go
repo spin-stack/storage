@@ -3,15 +3,12 @@ package blockdev_test
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/blockdev"
 	"github.com/spin-stack/storage/internal/lease"
-	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/vhost"
@@ -57,12 +54,6 @@ func (s *countingStore) Puts() int {
 	return s.puts
 }
 
-func (s *countingStore) failEveryPut(err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.fail = err
-}
-
 // rig is one device over one log, plus the pieces a test needs to reach behind it.
 type rig struct {
 	dev   *blockdev.Device
@@ -86,14 +77,6 @@ type rigConfig struct {
 }
 
 func withLimits(l wal.Limits) rigOption { return func(c *rigConfig) { c.limits = l } }
-func withRoot(r string) rigOption       { return func(c *rigConfig) { c.root = r } }
-func localOnly() rigOption              { return func(c *rigConfig) { c.remote = false } }
-func withoutLease() rigOption           { return func(c *rigConfig) { c.leaseOn = false } }
-func withENOSPC(bytes int64) rigOption {
-	return func(c *rigConfig) {
-		c.inject = func(d *sim.Disk, root string) { d.InjectENOSPC(root, bytes) }
-	}
-}
 
 func newRig(t *testing.T, opts ...rigOption) *rig {
 	t.Helper()
@@ -118,13 +101,6 @@ func newRig(t *testing.T, opts ...rigOption) *rig {
 
 	lm := lease.NewManager(clk, 10*time.Second)
 	lm.Grant()
-	if cfg.remote {
-		var lc wal.LeaseChecker
-		if cfg.leaseOn {
-			lc = lm
-		}
-		l.EnableRemote(wal.NewBatcher(clk, volume, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), lc)
-	}
 
 	dev, err := blockdev.New(l, cfg.cap)
 	if err != nil {
@@ -259,37 +235,6 @@ func TestReadYourWritesWithoutFlush(t *testing.T) {
 	})
 }
 
-// TestWriteAtIssuesNoPut is INV-18 at the seam a guest actually reaches: the store
-// receives nothing at all on the write path, and durability arrives only with FLUSH.
-// The second half proves the counter can move, so "0 PUTs" is evidence and not an
-// artefact of a store nobody wired up.
-func TestWriteAtIssuesNoPut(t *testing.T) {
-	ctx := t.Context()
-	r := newRig(t)
-
-	for i := range 8 {
-		if _, err := r.dev.WriteAt(pattern(byte(i), vhost.SectorSize), int64(i)*vhost.SectorSize); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if got := r.store.Puts(); got != 0 {
-		t.Fatalf("the write path issued %d PUT(s); a normal WRITE must not PUT (§5.3, INV-18)", got)
-	}
-	if w := r.log.Watermarks(); w.Durable != 0 || w.Local != 8 {
-		t.Fatalf("watermarks after 8 writes = %+v, want local 8 / durable 0", w)
-	}
-
-	if err := r.dev.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	if got := r.store.Puts(); got == 0 {
-		t.Fatal("FLUSH issued no PUT, so the 0 above says nothing about the write path")
-	}
-	if w := r.log.Watermarks(); w.Durable != w.Local {
-		t.Fatalf("after a successful FLUSH durable = %d, local = %d", w.Durable, w.Local)
-	}
-}
-
 // TestWriteAtNeverCarriesFUA is decision (1)/(3) as an assertion about the bytes on
 // disk. wal.Log.Write refuses format.FlagFUA on purpose (ErrFUAOnWrite) because a
 // plain WRITE implements none of the FUA ACK contract; the device must therefore
@@ -311,203 +256,6 @@ func TestWriteAtNeverCarriesFUA(t *testing.T) {
 	}
 	if recs[0].Offset != 0 || string(recs[0].Payload) != string(pattern(1, vhost.SectorSize)) {
 		t.Fatalf("the record does not carry the guest's bytes at the guest's offset")
-	}
-}
-
-// TestFlushWithoutAValidLeaseFailsAndDoesNotAck is decision (2) and the golden rule:
-// Flush is the §14.4 ACK path, not an fsync. If the lease cannot be confirmed the
-// guest must see an error — never a success — and durable must not move.
-func TestFlushWithoutAValidLeaseFailsAndDoesNotAck(t *testing.T) {
-	ctx := t.Context()
-
-	tests := []struct {
-		name string
-		opts []rigOption
-		// arm brings the rig to the state under test and returns the sentinel the
-		// guest-facing FLUSH must carry.
-		arm  func(t *testing.T, r *rig) error
-		want error
-	}{
-		{
-			name: "no lease checker at all fails closed",
-			opts: []rigOption{withoutLease(), withRoot("wal-nolease")},
-			arm:  func(*testing.T, *rig) error { return nil },
-			want: wal.ErrNoLease,
-		},
-		{
-			name: "an expired lease self-fences instead of ACKing",
-			opts: []rigOption{withRoot("wal-expired")},
-			arm: func(_ *testing.T, r *rig) error {
-				r.clk.Advance(30 * time.Second)
-				return nil
-			},
-			want: wal.ErrSelfFenced,
-		},
-		{
-			name: "a failing object store is not a durable FLUSH",
-			opts: []rigOption{withRoot("wal-s3down")},
-			arm: func(_ *testing.T, r *rig) error {
-				r.store.failEveryPut(errors.New("the object store is unreachable"))
-				return nil
-			},
-			want: nil, // any error will do; what matters is that it is not success
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r := newRig(t, tc.opts...)
-			if _, err := r.dev.WriteAt(pattern(2, vhost.SectorSize), 0); err != nil {
-				t.Fatalf("the write itself must succeed: %v", err)
-			}
-			if err := tc.arm(t, r); err != nil {
-				t.Fatal(err)
-			}
-
-			err := r.dev.Flush(ctx)
-			if err == nil {
-				t.Fatal("FLUSH reported success; nothing may ACK durability the object store cannot produce")
-			}
-			if tc.want != nil && !errors.Is(err, tc.want) {
-				t.Fatalf("FLUSH error = %v, want one wrapping %v", err, tc.want)
-			}
-			if w := r.log.Watermarks(); w.Durable != 0 {
-				t.Fatalf("a refused FLUSH advanced durable to %d", w.Durable)
-			}
-		})
-	}
-}
-
-// TestASelfFencedDeviceKeepsRefusingTheFlush: fencing is not a transient fault. Once
-// the log has self-fenced every later FLUSH fails immediately — the guest gets an
-// error at once rather than an ACK, and rather than a wait.
-func TestASelfFencedDeviceKeepsRefusingTheFlush(t *testing.T) {
-	ctx := t.Context()
-	r := newRig(t)
-	if _, err := r.dev.WriteAt(pattern(3, vhost.SectorSize), 0); err != nil {
-		t.Fatal(err)
-	}
-	r.clk.Advance(30 * time.Second)
-	if err := r.dev.Flush(ctx); !errors.Is(err, wal.ErrSelfFenced) {
-		t.Fatalf("first FLUSH after the lease expired: %v, want ErrSelfFenced", err)
-	}
-	// Even with the lease handed back, the log stays fenced: the Control Plane, not
-	// the host, decides who writes (§12.2, §16).
-	r.lease.Grant()
-	for i := range 3 {
-		if err := r.dev.Flush(ctx); !errors.Is(err, wal.ErrSelfFenced) {
-			t.Fatalf("FLUSH %d on a fenced device: %v, want ErrSelfFenced", i, err)
-		}
-	}
-	if w := r.log.Watermarks(); w.Durable != 0 {
-		t.Fatalf("a fenced device advanced durable to %d", w.Durable)
-	}
-}
-
-// TestEveryWALRefusalReachesTheGuestAsAnError is decision (4). virtio-blk's status
-// byte has exactly three values — OK, IOERR, UNSUPP — so all three conditions below
-// complete as VIRTIO_BLK_S_IOERR and the guest's block layer reports EIO; ENOSPC is
-// not expressible on this wire (see the package doc). What this test pins is the part
-// that *is* ours: each condition produces an error rather than a success, promptly,
-// and carrying a sentinel an operator and the Agent can tell apart.
-//
-// The transport half of the claim — a non-nil Backend error becomes IOERR and never a
-// dropped request — is TestBackendFailuresBecomeIOErrorsNotHangs in internal/vhost,
-// and the whole path is exercised against a real guest in integration/vhost.
-func TestEveryWALRefusalReachesTheGuestAsAnError(t *testing.T) {
-	ctx := t.Context()
-
-	tests := []struct {
-		name string
-		opts []rigOption
-		// drive brings the device to the failure and returns the error the guest
-		// would be shown.
-		drive func(t *testing.T, r *rig) error
-		want  error
-		// alsoIs, when set, must match too: ErrDeviceFull is a classification laid
-		// over the device's own error, not a replacement for it.
-		alsoIs error
-	}{
-		{
-			name: "backpressure: the unflushed backlog hit its bound (§5.7)",
-			opts: []rigOption{withRoot("wal-bp"), withLimits(wal.Limits{MaxUnflushedBytes: 700})},
-			drive: func(_ *testing.T, r *rig) error {
-				// One 512-byte record (104-byte header + payload) fits; the second
-				// does not.
-				if _, err := r.dev.WriteAt(pattern(4, vhost.SectorSize), 0); err != nil {
-					return fmt.Errorf("the first write should fit: %w", err)
-				}
-				_, err := r.dev.WriteAt(pattern(5, vhost.SectorSize), vhost.SectorSize)
-				return err
-			},
-			want: wal.ErrBackpressure,
-		},
-		{
-			name: "out of space: the local device is full",
-			opts: []rigOption{withRoot("wal-enospc"), withENOSPC(1040)},
-			drive: func(t *testing.T, r *rig) error {
-				var err error
-				for i := range 20 {
-					if _, err = r.dev.WriteAt(make([]byte, 200), int64(i)*vhost.SectorSize); err != nil {
-						break
-					}
-				}
-				if err == nil {
-					t.Fatal("the capped device never refused a write")
-				}
-				if got := r.log.Degraded(); got != wal.DegradedOutOfSpace {
-					t.Fatalf("the log reports %q, want %q", got, wal.DegradedOutOfSpace)
-				}
-				return err
-			},
-			want: blockdev.ErrDeviceFull,
-			// The classification is laid *over* the device's own error, not
-			// substituted for it: whoever needs the underlying cause still has it.
-			alsoIs: disk.ErrNoSpace,
-		},
-		{
-			name: "self-fenced: this host has lost the authority to write",
-			opts: []rigOption{withRoot("wal-fenced")},
-			drive: func(_ *testing.T, r *rig) error {
-				if _, err := r.dev.WriteAt(pattern(6, vhost.SectorSize), 0); err != nil {
-					return err
-				}
-				r.clk.Advance(30 * time.Second)
-				return r.dev.Flush(ctx)
-			},
-			want: wal.ErrSelfFenced,
-		},
-		{
-			name: "outside the device: a sector that does not exist",
-			opts: []rigOption{withRoot("wal-range")},
-			drive: func(_ *testing.T, r *rig) error {
-				_, err := r.dev.WriteAt(pattern(7, vhost.SectorSize), capacity)
-				return err
-			},
-			want: vhost.ErrOutOfRange,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r := newRig(t, tc.opts...)
-			err := tc.drive(t, r)
-			if err == nil {
-				t.Fatal("the device reported success where the WAL said no")
-			}
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("error = %v, want one wrapping %v", err, tc.want)
-			}
-			if tc.alsoIs != nil && !errors.Is(err, tc.alsoIs) {
-				t.Fatalf("error = %v, want one also wrapping %v", err, tc.alsoIs)
-			}
-			// An operator reads this string in a log line next to a guest's EIO.
-			// "the device is full" and "this host is fenced" have different remedies
-			// and must not arrive as the same sentence.
-			if !strings.HasPrefix(err.Error(), "blockdev: ") {
-				t.Fatalf("error %q does not name the layer that refused", err)
-			}
-		})
 	}
 }
 
@@ -583,110 +331,6 @@ func TestRequestsOutsideTheDeviceAreRefused(t *testing.T) {
 			t.Fatalf("an empty WRITE consumed sequence %d", got)
 		}
 	})
-}
-
-// TestLocalDurabilityModeStillNeedsNoPutOnTheWritePath: §14.8's `local` mode changes
-// what a FLUSH waits for, never what a WRITE does.
-func TestLocalDurabilityModeStillNeedsNoPutOnTheWritePath(t *testing.T) {
-	ctx := t.Context()
-	r := newRig(t, localOnly())
-	r.log.SetDurabilityMode(wal.ModeLocal)
-
-	if _, err := r.dev.WriteAt(pattern(11, vhost.SectorSize), 0); err != nil {
-		t.Fatal(err)
-	}
-	if got := r.store.Puts(); got != 0 {
-		t.Fatalf("%d PUT(s) on the write path in local mode", got)
-	}
-	if err := r.dev.Flush(ctx); err != nil {
-		t.Fatalf("a local-mode FLUSH ACKs on fdatasync: %v", err)
-	}
-	if got := r.store.Puts(); got != 0 {
-		t.Fatalf("a local-mode FLUSH issued %d PUT(s) synchronously", got)
-	}
-}
-
-// TestConcurrentRequestsDoNotRaceTheLog: wal.Log is not safe for concurrent use, and
-// vhost.Device serves one queue from one goroutine — but the Backend contract does
-// not say so, and the device is what stands between the two. Run under -race.
-// gatedStore holds every Put until it is released, so a test can stand inside a FLUSH
-// that is talking to the object store and ask what the device will still answer.
-type gatedStore struct {
-	objectstore.Store
-	arrived chan struct{}
-	release chan struct{}
-}
-
-func newGatedStore() *gatedStore {
-	return &gatedStore{Store: sim.NewObjectStore(), arrived: make(chan struct{}, 8), release: make(chan struct{})}
-}
-
-func (s *gatedStore) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
-	s.arrived <- struct{}{}
-	<-s.release
-	return s.Store.Put(ctx, key, data, opts)
-}
-
-// TestAReadIsAnsweredWhileAFlushIsUploading is the regression this device's lack of a
-// lock exists for. It used to hold one mutex for the whole of every request, FLUSH
-// included, so a guest READ waited on an S3 round trip — the exact coupling wal's
-// two-mutex design was built to remove, reintroduced one layer up.
-//
-// Nothing about the Log's safety changed when that mutex went: the Log serializes its
-// own state and captures a FLUSH's target sequence under the same lock a WRITE appends
-// under. This test is what would fail if the mutex came back, since no correctness
-// assertion would notice it.
-func TestAReadIsAnsweredWhileAFlushIsUploading(t *testing.T) {
-	ctx := t.Context()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	d := sim.NewDisk()
-	store := newGatedStore()
-	l := wal.NewLog(d, "wal", clk, volume, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	lm := lease.NewManager(clk, 10*time.Second)
-	lm.Grant()
-	l.EnableRemote(wal.NewBatcher(clk, volume, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 3), lm)
-	t.Cleanup(func() { _ = l.Close() })
-
-	dev, err := blockdev.New(l, capacity)
-	if err != nil {
-		t.Fatalf("blockdev.New: %v", err)
-	}
-	want := pattern(0xab, vhost.SectorSize)
-	if _, err := dev.WriteAt(want, 0); err != nil {
-		t.Fatalf("WriteAt: %v", err)
-	}
-
-	flushed := make(chan error, 1)
-	go func() { flushed <- dev.Flush(ctx) }()
-	<-store.arrived // the FLUSH is now inside the object store
-
-	read := make(chan error, 1)
-	go func() {
-		got := make([]byte, vhost.SectorSize)
-		if _, err := dev.ReadAt(got, 0); err != nil {
-			read <- err
-			return
-		}
-		if string(got) != string(want) {
-			read <- fmt.Errorf("read %x, want %x", got[:8], want[:8])
-			return
-		}
-		read <- nil
-	}()
-
-	select {
-	case err := <-read:
-		if err != nil {
-			t.Fatalf("the read during an upload: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("a guest READ was still waiting on the object store when the test ended")
-	}
-
-	close(store.release)
-	if err := <-flushed; err != nil {
-		t.Fatalf("flush: %v", err)
-	}
 }
 
 func TestConcurrentRequestsDoNotRaceTheLog(t *testing.T) {

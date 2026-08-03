@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -171,100 +170,6 @@ func writeOneBlock(t *testing.T, m *agent.VolumeManager, volumeID string) {
 	}
 	if _, err := dev.WriteAt(make([]byte, testBlockSize), 0); err != nil {
 		t.Fatalf("WriteAt: %v", err)
-	}
-}
-
-// remoteManager is a manager in remote mode: a real object store and a lease whose
-// answer the test controls, so a FLUSH goes down the §14.4 path.
-func remoteManager(t *testing.T, lease func() bool) (*agent.VolumeManager, *listenerFactory) {
-	t.Helper()
-	f := newListenerFactory()
-	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir:   "/var/lib/spin",
-		SocketDir: "/run/spin",
-	}, agent.VolumeManagerDeps{
-		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
-		Disk:    sim.NewDisk(),
-		Listen:  f.listen,
-		Mapper:  unusedMapper{},
-		EventFD: unusedEventFD,
-		Store:   sim.NewObjectStore(),
-		Lease:   lease,
-	})
-	if err != nil {
-		t.Fatalf("NewVolumeManager: %v", err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	return m, f
-}
-
-// TestAStoreWithoutALeaseIsRefused. wal.EnableRemote accepts a nil lease without
-// complaining and the failure surfaces at the first FLUSH, inside the guest's I/O path,
-// as ErrNoLease. A writer with an uploader and nothing fencing it is not a
-// configuration worth starting.
-func TestAStoreWithoutALeaseIsRefused(t *testing.T) {
-	t.Parallel()
-	f := newListenerFactory()
-	_, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
-	}, agent.VolumeManagerDeps{
-		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
-		Disk:    sim.NewDisk(),
-		Listen:  f.listen,
-		Mapper:  unusedMapper{},
-		EventFD: unusedEventFD,
-		Store:   sim.NewObjectStore(),
-	})
-	if err == nil {
-		t.Fatal("a manager was built with an object store and no lease to gate its ACKs")
-	}
-}
-
-// TestTheLeaseIsResolvedOnEveryAck is the trap this adapter exists for, stated as a
-// test: the answer must be re-read, never captured. Loop.applyLease allocates a *new*
-// lease.Manager whenever the Control Plane changes the TTL, so a Log holding the old
-// object would be gated by one nobody renews — invalid at the old TTL, never valid
-// again, self-fencing a host that is perfectly healthy.
-//
-// Flipping the answer between two FLUSHes is what a captured lease could not survive.
-func TestTheLeaseIsResolvedOnEveryAck(t *testing.T) {
-	t.Parallel()
-	var mu sync.Mutex
-	valid := true
-	m, _ := remoteManager(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return valid
-	})
-
-	v := desiredVolume(t, 1)
-	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	dev, ok := m.Device(v.GetVolumeId())
-	if !ok {
-		t.Fatal("no device")
-	}
-	if _, err := dev.WriteAt(make([]byte, testBlockSize), 0); err != nil {
-		t.Fatalf("WriteAt: %v", err)
-	}
-	if err := dev.Flush(t.Context()); err != nil {
-		t.Fatalf("the first FLUSH, with a valid lease: %v", err)
-	}
-
-	mu.Lock()
-	valid = false
-	mu.Unlock()
-
-	if _, err := dev.WriteAt(make([]byte, testBlockSize), testBlockSize); err != nil {
-		t.Fatalf("WriteAt: %v", err)
-	}
-	err := dev.Flush(t.Context())
-	if err == nil {
-		t.Fatal("a FLUSH was ACKed after the lease stopped being valid (INV-06)")
-	}
-	if !strings.Contains(err.Error(), "authority") {
-		t.Errorf("the refusal does not read as a fencing one: %v", err)
 	}
 }
 
@@ -744,7 +649,7 @@ func TestARestartedVolumeReadsBackWhatWasFlushed(t *testing.T) {
 		}, agent.VolumeManagerDeps{
 			Clock: clk, Disk: d, Listen: f.listen,
 			Mapper: unusedMapper{}, EventFD: unusedEventFD,
-			Store: store, Lease: func() bool { return true },
+			Store: store,
 		})
 		if err != nil {
 			t.Fatalf("NewVolumeManager: %v", err)
@@ -833,7 +738,7 @@ func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
 	}, agent.VolumeManagerDeps{
 		Clock: clk, Disk: d, Listen: f2.listen,
 		Mapper: unusedMapper{}, EventFD: unusedEventFD,
-		Store: newUnreachableStore(), Lease: func() bool { return true },
+		Store: newUnreachableStore(),
 	})
 	if err != nil {
 		t.Fatalf("NewVolumeManager: %v", err)

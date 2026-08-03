@@ -17,8 +17,6 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
-	"github.com/spin-stack/storage/internal/ioclass"
-	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -84,16 +82,6 @@ type Volume struct {
 	baseFailed bool
 }
 
-// ID is the volume this runtime serves.
-func (v *Volume) ID() string { return v.id }
-
-// Epoch is the epoch it was started under.
-func (v *Volume) Epoch() int64 { return v.epoch }
-
-// Device is the block device a guest is served from. It is what a test drives when
-// there is no QEMU to drive it.
-func (v *Volume) Device() *blockdev.Device { return v.dev }
-
 // Status is what the Agent reports about this volume: the watermarks the log actually
 // holds, qualified by the epoch they were produced under (§12.3).
 func (v *Volume) Status() VolumeStatus {
@@ -104,7 +92,6 @@ func (v *Volume) Status() VolumeStatus {
 		LocalSequence:     int64(w.Local),
 		DurableSequence:   int64(w.Durable),
 		PublishedSequence: int64(w.Published),
-		RemoteGapBytes:    v.log.RemoteGapBytes(),
 	}
 }
 
@@ -169,7 +156,8 @@ type ListenFunc func(socket string) (vhost.Listener, error)
 
 // KeysFunc fetches one volume's wrapped key material. Production passes
 // Loop.VolumeKeys, which asks the Control Plane once and caches the answer; it is a
-// function rather than the Loop for the same reason Lease is (see leaseFunc), and
+// function rather than the Loop because ADR-0021 keeps this type from knowing what a
+// Control Plane is, and
 // because ADR-0021 keeps this type from knowing what a Control Plane is.
 type KeysFunc func(ctx context.Context, volumeID string) (VolumeKeys, error)
 
@@ -203,28 +191,6 @@ func (m *VolumeManager) encryptionFor(ctx context.Context, id string, vol [16]by
 	}
 	return enc, nil
 }
-
-// encKeyID is the version the batcher stamps on objects: the DEK's, or 0 when there is
-// no encryption — which is what 0 means everywhere else on this path.
-func encKeyID(e *wal.Encryption) uint32 {
-	if e == nil {
-		return 0
-	}
-	return e.DEK.KeyID
-}
-
-// leaseFunc adapts the Agent's lease question into the wal.LeaseChecker the Log gates
-// its durable ACK on (§12.2, INV-06).
-//
-// It is a *function*, resolved on every call, and that is the whole point. Loop's
-// applyLease allocates a new lease.Manager whenever the Control Plane changes the TTL,
-// so a Log holding a captured *lease.Manager would be gated by an object nobody renews:
-// it would go invalid at the old TTL and never recover, and the volume would self-fence
-// while the host is perfectly healthy. Calling through Loop.LeaseValid resolves the
-// current manager every time.
-type leaseFunc func() bool
-
-func (f leaseFunc) Valid() bool { return f() }
 
 // VolumeManagerConfig is where this host keeps things.
 type VolumeManagerConfig struct {
@@ -273,10 +239,6 @@ type VolumeManagerDeps struct {
 	// Store is where FLUSH makes a write durable (§14.4). Nil is local-only mode: the
 	// device serves and takes writes, and no FLUSH ever claims remote durability.
 	Store objectstore.Store
-	// Lease answers "does this host still hold its lease, on the monotonic clock?".
-	// It is required whenever Store is set, and it must be a call through to the
-	// current lease — see leaseFunc.
-	Lease func() bool
 	// KMS unwraps a volume's DEK, and Keys is where the wrapped one comes from. Both
 	// or neither: an Agent with no KMS runs unencrypted, which is the dev/local mode
 	// (§6.2) the DST harness and the QEMU lane use and which claims nothing it does
@@ -285,11 +247,6 @@ type VolumeManagerDeps struct {
 	// outside the data path, and the DEK lives in memory only.
 	KMS  crypto.KMS
 	Keys KeysFunc
-	// IOClass arbitrates the Agent's I/O between classes (INV-17, §11). One per Agent,
-	// not one per volume: the budget it hands out is a share of the host's NVMe and NIC
-	// (§10, `background_nvme_budget: 30% de IOPS/BW`). Nil disables the gate, which is
-	// what a unit test with no contention wants.
-	IOClass *ioclass.Scheduler
 	// Rand is where the image's chunk nonces come from (§15, image.Publish). It is
 	// injected rather than reached for because INV-01 keeps randomness out of the data
 	// path's dependencies and because DST needs the same seed to produce the same
@@ -343,12 +300,6 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		// the first stop, in the teardown path, where the data is already unreachable.
 		// Refused here instead (§15, image.Publish).
 		return nil, errors.New("agent: a random source must be injected when a KMS is (§15: image chunk nonces)")
-	case deps.Store != nil && deps.Lease == nil:
-		// wal.EnableRemote accepts a nil lease without complaining and the failure
-		// surfaces much later, as ErrNoLease inside durableStep — at the first FLUSH,
-		// in the guest's I/O path. A store with nothing fencing the writer is not a
-		// configuration worth starting.
-		return nil, errors.New("agent: an object store needs a lease to gate its durable ACKs (§12.2, INV-06)")
 	case deps.KMS != nil && deps.Keys == nil:
 		// A KMS with nowhere to get wrapped keys from would unwrap nothing and every
 		// volume would fail to start — at attach, one at a time, looking like a
@@ -509,22 +460,6 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		return nil, fmt.Errorf("agent: volume %s: looking for an existing WAL in %s: %w", id, dir, err)
 	}
 
-	// §14.8: the FLUSH ACK contract is per volume and the Control Plane owns it, so the
-	// Agent takes it from the desired state rather than defaulting. Resolved before the
-	// log exists, because a volume whose contract this host cannot establish must not be
-	// served at all — the same call encryptionFor makes, and for the same reason: the
-	// alternative to "the mode the catalog says" is not "a safe mode", it is a volume
-	// whose ACK means something nobody chose.
-	//
-	// An unset durability is refused, not guessed. wal.ModeFor is the single place the
-	// two vocabularies meet and it already refuses unknown values; keeping that promise
-	// here is what stops "the Control Plane forgot to set it" from being answered
-	// silently by this layer.
-	mode, err := durabilityMode(d)
-	if err != nil {
-		return nil, fmt.Errorf("agent: volume %s: %w", id, err)
-	}
-
 	// §15: every payload of guest data is sealed with the volume's DEK before any PUT.
 	// The unwrap happens here, at attach, and nowhere else (§15.1) — one KMS call
 	// outside the data path, and what it returns never leaves memory.
@@ -574,28 +509,9 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		}
 	}
 
-	// Remote mode, and with it the uploader and the §14.4 ACK path. Without a store
-	// the Log stays local: it takes writes and serves reads, and a FLUSH ACKs on
-	// fdatasync alone (§14.8) rather than claiming a durability it cannot back.
-	if m.deps.Store != nil {
-		attempts := m.cfg.UploadAttempts
-		if attempts <= 0 {
-			attempts = 3
-		}
-		log.EnableRemote(
-			// The batcher stamps the object's key version, so it must be the same one
-			// the records carry: a mismatch names an object after a key that did not
-			// seal it. Zero is right exactly when there is no encryption.
-			wal.NewBatcher(m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), encKeyID(enc), wal.DefaultBatchConfig()),
-			wal.NewUploader(m.deps.Store, attempts),
-			leaseFunc(m.deps.Lease),
-		)
-	}
-
-	// After EnableRemote, because the two are orthogonal and the order says so: `local`
-	// still needs the batcher and the uploader — its records go to S3 asynchronously
-	// (§14.8 rule 3, agent.drainOnce), just not before the ACK.
-	log.SetDurabilityMode(mode)
+	// Nothing enables a remote path any more (ADR-0026 increment 4.5). A FLUSH is
+	// fdatasync and an ACK; the volume reaches the object store when it stops, as one
+	// image, and that is the whole of what leaves the host.
 
 	dev, err := blockdev.New(log, d.GetSizeBytes())
 	if err != nil {
@@ -942,36 +858,3 @@ func (m *VolumeManager) Close() error {
 }
 
 var _ VolumeSource = (*VolumeManager)(nil)
-
-// durabilityMode resolves the §14.8 contract for one volume from the desired state.
-//
-// The proto enum is the wire form, lifecycle.Durability is what the Control Plane stores,
-// and wal.DurabilityMode is what the data path enforces. This is the only place the first
-// meets the second — wal.ModeFor is where the second meets the third — so a value that is
-// not one of the two modes stops here rather than becoming a default somewhere deeper.
-func durabilityMode(d *storagev1.DesiredVolume) (wal.DurabilityMode, error) {
-	switch d.GetDurability() {
-	case storagev1.Durability_DURABILITY_REMOTE:
-		return wal.ModeFor(lifecycle.DurabilityRemote)
-	case storagev1.Durability_DURABILITY_LOCAL:
-		return wal.ModeFor(lifecycle.DurabilityLocal)
-	default:
-		// Named rather than defaulted: §14.8 decides what an ACK means, and a volume
-		// whose ACK nobody chose is not a volume this host can serve honestly.
-		return wal.ModeRemote, fmt.Errorf("%w: durability %q — the Control Plane must set it (§14.8)",
-			lifecycle.ErrUnknownState, d.GetDurability())
-	}
-}
-
-// DurabilityMode reports the §14.8 contract a served volume is running under. It exists
-// for the tests that assert the Control Plane's choice reached the data path, which is
-// the wiring that was missing.
-func (m *VolumeManager) DurabilityMode(volumeID string) (wal.DurabilityMode, bool) {
-	m.mu.Lock()
-	v, ok := m.volumes[volumeID]
-	m.mu.Unlock()
-	if !ok {
-		return wal.ModeRemote, false
-	}
-	return v.log.Mode(), true
-}

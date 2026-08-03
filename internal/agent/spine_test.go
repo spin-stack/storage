@@ -53,7 +53,7 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	}
 
 	vols := agent.NewVolumeSet()
-	vols.Set(agent.VolumeStatus{VolumeID: "vol-mine", Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10, RemoteGapBytes: 1 << 20})
+	vols.Set(agent.VolumeStatus{VolumeID: "vol-mine", Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10})
 	vols.Set(agent.VolumeStatus{VolumeID: "vol-stolen", Epoch: 8, LocalSequence: 7, DurableSequence: 7, PublishedSequence: 7})
 
 	loop, err := agent.New(testConfig(), agent.Deps{
@@ -77,10 +77,10 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	if host.NVMeTotalBytes != 1<<40 || host.NVMeUsedBytes != 512<<30 {
 		t.Fatalf("device numbers did not cross the wire: %+v", host)
 	}
-	// vol-mine's 1 MiB gap is the whole fleet's view of what is not on S3 yet: the
-	// Agent sums it per device, and this is where that sum lands. vol-stolen
-	// contributes nothing, which is right — it reports a closed gap.
-	if host.RemoteBacklogBytes != 1<<20 {
+	// The field still crosses the wire and is always zero: nothing measures a backlog
+	// since the uploader went (ADR-0026 increment 4.5). Asserted rather than dropped,
+	// because a field that silently starts carrying something again is worth catching.
+	if host.RemoteBacklogBytes != 0 {
 		t.Fatalf("the aggregate remote backlog did not cross the wire: %+v", host)
 	}
 	if host.AgentVersion != testVersion || host.MaxFormatVersion != 3 {

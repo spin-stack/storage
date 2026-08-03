@@ -48,72 +48,11 @@ const enospcRecord = 200
 // is what tells an operator which remedy applies. It is orthogonal to `Fenced()` on
 // purpose and the scenario asserts that too: a full disk is local and recoverable, and
 // handing the volume to another host over it would turn it into a failover.
+// Arm 1 — "backpressure arrives before the device fills" — went with the remote gap bound
+// (ADR-0026 increment 4.5). What is left is the arm that never depended on S3: a device
+// that fills must leave the WAL replayable, not corrupt.
 func scenarioDiskFillsWithS3Down(s *Sim) error {
-	if err := enospcBackpressureFirst(s); err != nil {
-		return err
-	}
 	return enospcTailReplaysClean(s)
-}
-
-// enospcBackpressureFirst is arm 1: the remote-gap bound fires before the device does.
-func enospcBackpressureFirst(s *Sim) error {
-	const (
-		// The cap covers the volume's whole WAL directory, not one file: a WAL is a
-		// set of segments, and a per-file ceiling would be lifted by rotating.
-		device   = "wal-gap-bound"
-		capacity = 1 << 13 // 8 KiB of device
-		gapBound = 1500    // ~4 records: reached long before the device is
-	)
-	s.Disk.InjectENOSPC(device, capacity)
-
-	var vol [16]byte
-	vol[6], vol[8] = 0x70, 0x80
-	vol[15] = 0xf1
-	l := wal.NewLog(s.Disk, device, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20, MaxRemoteGapBytes: gapBound})
-	l.EnableRemote(wal.NewBatcher(s.Clock, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(s.Store, 2), alwaysValidLease{})
-
-	// S3 is unreachable for the whole arm: nothing can close the gap.
-	s.Store.InjectThrottle(1 << 20)
-	s.Emit(Event{Kind: EventFault, Msg: "object store unreachable; remote gap cannot close"})
-
-	accepted := 0
-	for i := range 100 {
-		_, err := l.Write(uint64(i)*4096, make([]byte, enospcRecord), 0)
-		switch {
-		case err == nil:
-			accepted++
-		case errors.Is(err, wal.ErrBackpressure):
-			s.Emit(Event{Kind: EventFault, Msg: fmt.Sprintf("backpressure after %d records", accepted)})
-			// The bound did its job: the device still has room, so no WRITE ever saw
-			// a raw ENOSPC.
-			size, serr := l.LocalBytes()
-			if serr != nil {
-				return serr
-			}
-			if size >= capacity {
-				return fmt.Errorf("backpressure arrived only once the device was full (%d/%d bytes)", size, capacity)
-			}
-			// A FLUSH cannot rescue it while S3 is down: durable must not move.
-			if ferr := l.Flush(context.Background()); ferr == nil {
-				return errors.New("a FLUSH ACKed while the object store was unreachable (INV-07)")
-			}
-			emitWatermarks(s, l)
-			if w := l.Watermarks(); w.Durable != 0 {
-				return fmt.Errorf("durable advanced to %d with nothing in S3", w.Durable)
-			}
-			// Backpressure is not a full device, and reporting it as one would send
-			// an operator to grow a disk that has room.
-			if d := l.Degraded(); d != wal.DegradedNone {
-				return fmt.Errorf("the log reports %s while the device still has room", d)
-			}
-			return nil
-		case errors.Is(err, sim.ErrNoSpace):
-			return fmt.Errorf("the device filled at record %d before the WAL applied backpressure (§5.7)", i)
-		default:
-			return fmt.Errorf("write %d: %w", i, err)
-		}
-	}
-	return errors.New("the remote-gap bound never fired: 100 records were accepted with S3 down")
 }
 
 // enospcTailReplaysClean is arm 2: with no gap bound the device fills, and the WAL
@@ -121,15 +60,16 @@ func enospcBackpressureFirst(s *Sim) error {
 // numbering once space is reclaimed.
 func enospcTailReplaysClean(s *Sim) error {
 	const (
-		device   = "wal-no-bound"
-		capacity = 1040 // a 64-byte segment header and three 304-byte records fit; the fourth does not
+		device         = "wal-no-bound"
+		unflushedBound = 1500 // ~4 records: reached long before the device fills
+		capacity       = 1040 // a 64-byte segment header and three 304-byte records fit; the fourth does not
 	)
 	s.Disk.InjectENOSPC(device, capacity)
 
 	var vol [16]byte
 	vol[6], vol[8] = 0x70, 0x80
 	vol[15] = 0xf2
-	l := wal.NewLog(s.Disk, device, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
+	l := wal.NewLog(s.Disk, device, s.Clock, vol, 1, wal.Limits{MaxUnflushedBytes: unflushedBound})
 
 	accepted := 0
 	var full error
@@ -178,7 +118,7 @@ func enospcTailReplaysClean(s *Sim) error {
 			return fmt.Errorf("the device state cleared to %s while the device was still full", d)
 		}
 	}
-	if l.Fenced() {
+	if l.Broken() {
 		return errors.New("the log self-fenced on ENOSPC; only a lease failure may do that (§16)")
 	}
 

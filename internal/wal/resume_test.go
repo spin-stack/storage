@@ -71,11 +71,6 @@ func newResumeWorld(t *testing.T, enc *wal.Encryption) *resumeWorld {
 		vol:   [16]byte{21},
 	}
 	w.log = wal.NewLog(w.disk, "wal", w.clk, w.vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	w.log.EnableRemote(
-		wal.NewBatcher(w.clk, w.vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(w.store, 5),
-		leaseOK{},
-	)
 	if enc != nil {
 		w.log.EnableEncryption(enc)
 	}
@@ -255,39 +250,6 @@ func TestResumeStopsAtATornTail(t *testing.T) {
 	}
 	if got := resumed.Watermarks().Local; got != 2 {
 		t.Fatalf("resumed local = %d, want 2 (the last intact record)", got)
-	}
-}
-
-// TestRemoteGapBackpressureIsExplicit is §5.7/INV-04 for the backlog that actually
-// matters: MaxUnflushedBytes is cleared by fdatasync, so on a `local` volume (or a
-// remote one during an S3 outage where anything calls Sync) nothing bounds the bytes
-// that only this host holds. The guest must get an explicit error rather than the
-// host silently filling NVMe with writes no other machine has.
-func TestRemoteGapBackpressureIsExplicit(t *testing.T) {
-	ctx := t.Context()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	d := sim.NewDisk()
-	l := wal.NewLog(d, "wal", clk, [16]byte{22}, 1, wal.Limits{
-		MaxUnflushedBytes: 1 << 20, // roomy: this is not the limit under test
-		MaxRemoteGapBytes: 400,     // ~2 records (104-byte header + payload)
-	})
-	l.SetDurabilityMode(wal.ModeLocal)
-
-	var lastErr error
-	for i := range 10 {
-		if _, err := l.Write(uint64(i)*64, make([]byte, 64), 0); err != nil {
-			lastErr = err
-			break
-		}
-		if err := l.Sync(); err != nil { // fdatasync clears the *unflushed* accounting
-			t.Fatal(err)
-		}
-		if err := l.Flush(ctx); err != nil { // a local-mode ACK: still nothing in S3
-			t.Fatal(err)
-		}
-	}
-	if !errors.Is(lastErr, wal.ErrBackpressure) {
-		t.Fatalf("the un-remote-durable backlog grew unbounded; last write error: %v", lastErr)
 	}
 }
 

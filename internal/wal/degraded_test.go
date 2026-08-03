@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -102,43 +101,6 @@ func TestAFullDeviceIsAStickyTypedState(t *testing.T) {
 	}
 	if l.Watermarks().Local != uint64(accepted+1) {
 		t.Fatalf("local watermark = %d, want %d", l.Watermarks().Local, accepted+1)
-	}
-}
-
-// TestOutOfSpaceDoesNotFenceAndFencingIsNotOutOfSpace pins the orthogonality the
-// finding asks to be decided: fencing is about the lease (cluster-wide authority to
-// write at all, §16), degradation is about the device (local, and recoverable
-// without the Control Plane). Conflating them would either hand a volume to another
-// host because a disk filled, or leave a full device looking healthy because the
-// lease is fine.
-func TestOutOfSpaceDoesNotFenceAndFencingIsNotOutOfSpace(t *testing.T) {
-	l, _ := enospcLog(t, "wal-orthogonal")
-	fillTheDevice(t, l)
-	if l.Fenced() {
-		t.Fatal("a full device self-fenced the log; only a lease failure may do that (§16)")
-	}
-
-	// The mirror image: a self-fenced log on a healthy device is fenced, not degraded.
-	ctx := t.Context()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	d := sim.NewDisk()
-	lm := lease.NewManager(clk, 10*time.Second)
-	lm.Grant()
-	vol := [16]byte{10}
-	fl := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	fl.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(sim.NewObjectStore(), 5), lm)
-	if _, err := fl.Write(0, []byte("data"), 0); err != nil {
-		t.Fatal(err)
-	}
-	clk.Advance(30 * time.Second) // the lease expires
-	if err := fl.Flush(ctx); !errors.Is(err, wal.ErrSelfFenced) {
-		t.Fatalf("flush after the lease expired: %v, want ErrSelfFenced", err)
-	}
-	if !fl.Fenced() {
-		t.Fatal("the log did not self-fence")
-	}
-	if got := fl.Degraded(); got != wal.DegradedNone {
-		t.Fatalf("a self-fenced log on a healthy device reports %q, want %q", got, wal.DegradedNone)
 	}
 }
 

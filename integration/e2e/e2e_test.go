@@ -593,9 +593,9 @@ func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
 
 	// Nothing may be in the bucket for this volume yet: a guest's WRITE is 0 PUTs
 	// (§5.3, INV-18), and if objects appeared here the assertion below would prove
-	// nothing about the FLUSH.
-	if keys := walKeys(t, d, volumeID); len(keys) != 0 {
-		t.Fatalf("%d object(s) under wal/%s/ before the guest ran: the FLUSH assertion would be vacuous:\n%v",
+	// nothing about what the stop publishes.
+	if keys := storeKeys(t, d, "image/"+volumeID+"/"); len(keys) != 0 {
+		t.Fatalf("%d object(s) under image/%s/ before the guest ran: the assertion would be vacuous:\n%v",
 			len(keys), volumeID, keys)
 	}
 
@@ -607,28 +607,31 @@ func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
 		t.Fatalf("the guest never reported a verdict (exit %d):\n%s", code, testinfra.VerdictLines(out))
 	}
 
-	// The object is necessary and *not* sufficient, which planting the bug is what
-	// established. §14.4 uploads at step 4 and only verifies the lease at step 5, so an
-	// object lands in the bucket even when the ACK is refused — asserting on it alone
-	// would have passed with the lease closure returning false for ever, which is the
-	// exact hole this test was written for. The guest's verdict above is the
-	// load-bearing assertion; this one says the ACK was backed by a real object rather
-	// than by a local fdatasync, which is the §14.8 mode difference.
-	keys := walKeys(t, d, volumeID)
+	// The fsync ACKed locally and put nothing in the bucket — that is §14.8, and
+	// asserting it here is what keeps the next assertion meaningful.
+	if keys := storeKeys(t, d, "image/"+volumeID+"/"); len(keys) != 0 {
+		t.Fatalf("a guest's fsync published %d object(s); §14.8 says the ACK is local:\n%v", len(keys), keys)
+	}
+
+	// Stopping is what publishes (ADR-0026), and this is the artefact V1's whole
+	// durability contract produces: an image that exists only if the *binary* resolved
+	// its credentials, sealed the chunks and CASed the manifest.
+	agent.Stop(t, 30*time.Second)
+
+	keys := storeKeys(t, d, "image/"+volumeID+"/")
 	if len(keys) == 0 {
-		t.Fatalf("the guest's fsync returned success and the bucket holds nothing under wal/%s/ — "+
-			"either no FLUSH reached the backend or it ACKed without a durable object (§14.4/INV-07):\n%s",
+		t.Fatalf("the Agent stopped and the bucket holds nothing under image/%s/ — "+
+			"the session's writes exist only on a host that has released them:\n%s",
 			volumeID, testinfra.VerdictLines(out))
 	}
-	t.Logf("a real kernel's fsync left %d object(s) under wal/%s/: %v", len(keys), volumeID, keys)
+	t.Logf("a real kernel's writes left %d object(s) under image/%s/: %v", len(keys), volumeID, keys)
 }
 
-// walKeys lists what this volume has actually put in the bucket. It asks the object store
-// directly rather than the Agent, because the Agent reporting its own watermarks is the
-// claim under test, not the evidence for it.
-func walKeys(t *testing.T, d *deployment, volumeID string) []string {
+// storeKeys lists what is actually in the bucket under a prefix. It asks the object store
+// directly rather than the Agent, because the Agent reporting its own state is the claim
+// under test, not the evidence for it.
+func storeKeys(t *testing.T, d *deployment, prefix string) []string {
 	t.Helper()
-	prefix := "wal/" + volumeID + "/"
 	out, err := d.store.Client().ListObjectsV2(t.Context(), &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),

@@ -150,46 +150,6 @@ func TestUnversionedDEKIsRefusedAtWriteTime(t *testing.T) {
 	}
 }
 
-// TestEncryptedObjectHeaderCarriesTheDEKKeyID: the object header's KeyID is what a
-// recoverer reads to pick the DEK *version* (§15.1 rotation). It is taken from the
-// batcher, which is constructed independently of the Encryption context, so the two
-// can disagree — and then the object announces a key version that did not seal it.
-// The DEK is the only source of truth for that field.
-func TestEncryptedObjectHeaderCarriesTheDEKKeyID(t *testing.T) {
-	ctx := t.Context()
-	dek, err := crypto.GenerateDEK(&ramp{b: 3}, 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	d := sim.NewDisk()
-	vol := [16]byte{9, 9, 9}
-	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	// The batcher is told KeyID 0 — the value every call site in the tree passes.
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
-	l.EnableEncryption(&wal.Encryption{DEK: dek, VolumeID: vol})
-
-	if _, err := l.Write(0, []byte("guest bytes"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	objs, _ := store.List(ctx, "wal/")
-	if len(objs) != 1 {
-		t.Fatalf("expected 1 object, got %d", len(objs))
-	}
-	body, _ := store.Get(ctx, objs[0].Key)
-	h, err := format.UnmarshalObjectHeader(body[:format.ObjectHeaderSize])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h.KeyID != dek.KeyID {
-		t.Fatalf("object header claims KeyID %d, the records were sealed with %d", h.KeyID, dek.KeyID)
-	}
-}
-
 // TestDecryptRejectsAKeyVersionItDoesNotHold: rotation (§15.1) leaves history sealed
 // under older DEK versions, so a record whose KeyID this volume does not hold is a
 // *missing key*, not a tamper. Reporting it as a GCM authentication failure aborts

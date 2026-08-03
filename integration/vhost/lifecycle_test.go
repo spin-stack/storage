@@ -148,7 +148,6 @@ func startAgent(t *testing.T, ctx context.Context, dir, volumeID string) (*agent
 		Mapper:  hostio.NewMapper(),
 		EventFD: hostio.NewEventFD,
 		Store:   store,
-		Lease:   lm.Valid,
 	})
 	if err != nil {
 		t.Fatalf("NewVolumeManager: %v", err)

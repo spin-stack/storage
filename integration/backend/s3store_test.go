@@ -5,11 +5,14 @@ package backend_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/spin-stack/storage/internal/cow"
+	"github.com/spin-stack/storage/internal/image"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -17,8 +20,6 @@ import (
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/real"
-	"github.com/spin-stack/storage/internal/simio/sim"
-	"github.com/spin-stack/storage/internal/wal"
 )
 
 // makeVersionedBucket creates a bucket with versioning Enabled, the way §10 requires
@@ -182,81 +183,62 @@ func TestConditionalWritesThroughS3StoreMapEveryLoser(t *testing.T) {
 	}
 }
 
-// Finding 3. Every proof about the §14.5 lost-response path — the single most common
-// S3 failure — was written against the sim, whose ETag is a SHA-256. S3's is a quoted
-// MD5, and a multipart object's is an MD5-of-MD5s with a `-N` suffix. Run the real
-// uploader against the real backend so "idempotent retry" is a fact about the thing
-// production uses, not about the simulator.
-func TestWALUploaderIsIdempotentAgainstARealBackend(t *testing.T) {
+// TestTheImageIsIdempotentAgainstARealBackend is §6.1 for the format that actually
+// leaves the host now.
+//
+// It replaced the WAL uploader's version, which went with the uploader (ADR-0026
+// increment 4.5). The properties did not change and they are properties of the
+// *backend*, not of the producer: identical bytes at a deterministic key reconcile to
+// success when a response is lost, and If-Match must actually fence a stale writer.
+//
+// The producer is internal/image because that is what production writes. A conformance
+// suite exercising a byte source production no longer uses would certify the wrong thing.
+func TestTheImageIsIdempotentAgainstARealBackend(t *testing.T) {
 	ctx := t.Context()
 	be := backendConfig(t)
-	store := newVersionedS3Store(t, be, "wal-uploader")
-
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-
-	// A volume per case. The two cases both number their records from 1, and one
-	// uploader may not publish two spans that overlap inside a single (volume, epoch)
-	// — a real writer never restarts its sequence space there, and the uploader now
-	// refuses it (INV-21). Sharing one volume here would have been the fixture
-	// asserting something no writer does.
-	batch := func(vol [16]byte, payload []byte, records int) *wal.ClosedBatch {
-		t.Helper()
-		b := wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig())
-		for seq := 1; seq <= records; seq++ {
-			enc, err := wal.Record{Sequence: uint64(seq), Epoch: 1, Payload: payload}.Encode()
-			if err != nil {
-				t.Fatal(err)
-			}
-			b.Append(uint64(seq), enc, false)
-		}
-		b.Flush()
-		return b.Pending()[0]
-	}
-
-	up := wal.NewUploader(store, 3)
+	store := newVersionedS3Store(t, be, "image")
 
 	tests := []struct {
 		name    string
 		tag     byte
 		payload []byte
-		records int
 	}{
-		{"a small batch", 0x01, []byte("a short encrypted record"), 4},
+		{"a small image", 0x01, []byte("a short guest extent")},
 		// Above the SDK's 5 MiB multipart threshold, where the ETag stops even
 		// pretending to be a content hash.
-		{"a batch past the multipart threshold", 0x02, bytes.Repeat([]byte("payload-"), 1<<19), 2},
+		{"an image past the multipart threshold", 0x02, bytes.Repeat([]byte("payload-"), 1<<19)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var vol [16]byte
 			vol[6], vol[8] = 0x70, 0x80
 			vol[15] = tc.tag
-			cb := batch(vol, tc.payload, tc.records)
-			key, err := up.Upload(ctx, cb)
-			if err != nil {
-				t.Fatalf("first upload: %v", err)
-			}
-			// The §14.5 case: the PUT persisted, the response was lost, the Agent
-			// retries the identical batch. It must reconcile to success.
-			again, err := up.Upload(ctx, cb)
-			if err != nil {
-				t.Fatalf("retry after a lost response must be an idempotent success, got %v", err)
-			}
-			if again != key {
-				t.Fatalf("retry returned key %q, want %q", again, key)
-			}
 
-			// Different bytes at the same deterministic key is corruption, and must
-			// stay a hard fail rather than be reconciled away.
-			if _, err := store.Put(ctx, key+".divergent", []byte("not the batch"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
-				t.Fatal(err)
+			view := cow.NewIntervalMap()
+			view.Overwrite(0, tc.payload)
+
+			etag, err := image.Publish(ctx, store, rand.Reader, nil, vol, view, 1, "")
+			if err != nil {
+				t.Fatalf("first publish: %v", err)
 			}
-			other := batch(vol, append([]byte("different-"), tc.payload...), tc.records)
-			if _, err := store.Put(ctx, other.Object().Key, []byte("someone else's bytes"), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
-				t.Fatal(err)
+			// Republishing an unchanged view must reconcile rather than fail: the chunks
+			// are already there under their own digests.
+			if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, view, 2, etag); err != nil {
+				t.Fatalf("republishing an unchanged image must succeed, got %v", err)
 			}
-			if _, err := up.Upload(ctx, other); !errors.Is(err, wal.ErrDivergentObject) {
-				t.Fatalf("divergent object at a deterministic key: %v, want ErrDivergentObject", err)
+			loaded, _, _, err := image.Load(ctx, store, nil, vol)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			got := make([]byte, len(tc.payload))
+			loaded.Read(0, got)
+			if !bytes.Equal(got, tc.payload) {
+				t.Fatal("the image did not survive a real backend round trip")
+			}
+			// The fence: a stale ETag is refused rather than silently replacing the
+			// manifest. On a real backend this is the whole of V1's fencing.
+			if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, view, 3, etag); !errors.Is(err, image.ErrSuperseded) {
+				t.Fatalf("a stale ETag published against a real backend: %v, want ErrSuperseded", err)
 			}
 		})
 	}

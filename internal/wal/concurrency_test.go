@@ -104,16 +104,13 @@ func (g *gateStore) putCount() map[string]int {
 	return out
 }
 
-// concurrentLog builds a remote, leased log over the given store.
+// concurrentLog builds a log for the concurrency arms. It used to be remote and leased;
+// with one ACK contract (§14.8) there is only one kind of log, and what these tests are
+// about — that mu is not held where it must not be — is unchanged.
 func concurrentLog(t *testing.T, store objectstore.Store, clk *sim.Clock, lm *lease.Manager) *wal.Log {
 	t.Helper()
 	vol := [16]byte{9}
 	l := wal.NewLog(sim.NewDisk(), "wal", clk, vol, 1, wal.Limits{})
-	l.EnableRemote(
-		wal.NewBatcher(clk, vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(store, 5),
-		lm,
-	)
 	return l
 }
 
@@ -121,20 +118,6 @@ func grantedLease(clk *sim.Clock) *lease.Manager {
 	lm := lease.NewManager(clk, time.Hour)
 	lm.Grant()
 	return lm
-}
-
-// waitFor blocks until done fires, failing the test rather than hanging the suite if
-// the thing under test deadlocked. The bound comes from a context rather than
-// time.After because INV-01 forbids reaching for the time package directly.
-func waitFor(t *testing.T, done <-chan struct{}, what string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatalf("timed out waiting for %s — the Log is holding a lock it should not be", what)
-	}
 }
 
 // TestConcurrentGuestIOAndAgentCheckpointDoNotRace drives the exact shape that is
@@ -187,8 +170,7 @@ func TestConcurrentGuestIOAndAgentCheckpointDoNotRace(t *testing.T) {
 		defer wg.Done()
 		for range 300 {
 			_ = l.Watermarks()
-			_ = l.RemoteGapBytes()
-			_ = l.Fenced()
+			_ = l.Broken()
 			_ = l.UnflushedBytes()
 			_, _ = l.LocalBytes()
 		}
@@ -199,87 +181,6 @@ func TestConcurrentGuestIOAndAgentCheckpointDoNotRace(t *testing.T) {
 	w := l.Watermarks()
 	if w.Published > w.Durable || w.Durable > w.Local {
 		t.Fatalf("watermarks left unordered by concurrent use (INV-03): %+v", w)
-	}
-}
-
-// TestTheAgentReadsWatermarksWhileAFlushIsUploading pins the operational property: a
-// FLUSH stalled on the object store must not stop the Agent reporting state.
-//
-// This is not a performance preference. The gap these accessors report is the volume's
-// RPO — the bytes that exist on this host alone — and an S3 outage is precisely when
-// it grows and when an operator needs to see it. A Log that held one lock across the
-// upload would go silent for the duration of the outage, reporting nothing at the only
-// moment the number matters.
-func TestTheAgentReadsWatermarksWhileAFlushIsUploading(t *testing.T) {
-	ctx := t.Context()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	store := newGateStore(true)
-	l := concurrentLog(t, store, clk, grantedLease(clk))
-
-	if _, err := l.Write(0, []byte("a write nobody has made durable yet"), 0); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	flushed := make(chan error, 1)
-	go func() { flushed <- l.Flush(ctx) }()
-
-	<-store.arrived // the upload is in flight and will not complete until released
-
-	read := make(chan struct{})
-	var gap int64
-	go func() {
-		defer close(read)
-		gap = l.RemoteGapBytes()
-		_ = l.Watermarks()
-		_ = l.Fenced()
-	}()
-	waitFor(t, read, "the Agent to read the watermarks during an upload")
-
-	if gap <= 0 {
-		t.Fatalf("the backlog reads as %d bytes while an upload is stalled; that is the RPO an operator is watching", gap)
-	}
-
-	close(store.release)
-	if err := <-flushed; err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	if w := l.Watermarks(); w.Durable == 0 {
-		t.Fatal("durable did not advance after the upload completed")
-	}
-}
-
-// TestAGuestWriteCompletesWhileAFlushIsUploading is the same argument on the data
-// path: S3 is not in the WRITE path (§5.3, INV-18), and a lock held across the PUT
-// would put it there through the back door — the write would not touch the object
-// store, it would just wait for one.
-func TestAGuestWriteCompletesWhileAFlushIsUploading(t *testing.T) {
-	ctx := t.Context()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	store := newGateStore(true)
-	l := concurrentLog(t, store, clk, grantedLease(clk))
-
-	if _, err := l.Write(0, []byte("first"), 0); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	flushed := make(chan error, 1)
-	go func() { flushed <- l.Flush(ctx) }()
-	<-store.arrived
-
-	wrote := make(chan struct{})
-	var err error
-	go func() {
-		defer close(wrote)
-		_, err = l.Write(4096, []byte("a write the guest issues mid-flush"), 0)
-	}()
-	waitFor(t, wrote, "a guest write to complete during an upload")
-	if err != nil {
-		t.Fatalf("write during upload: %v", err)
-	}
-
-	close(store.release)
-	if ferr := <-flushed; ferr != nil {
-		t.Fatalf("flush: %v", ferr)
 	}
 }
 

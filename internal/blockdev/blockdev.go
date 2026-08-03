@@ -146,8 +146,12 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 		where = "FLUSH"
 	}
 	switch {
-	case errors.Is(err, wal.ErrSelfFenced):
-		return fmt.Errorf("blockdev: %s refused: this host has lost the authority to write this volume (§12.2, §16): %w", where, err)
+	case errors.Is(err, wal.ErrLogBroken):
+		// Not a loss of authority — nothing took the volume away. This log cannot say
+		// what its tail holds after a failed rollback, so it will not confirm anything
+		// against it. The lease-fencing case that used to be here went with the
+		// lease-gated ACK (ADR-0026).
+		return fmt.Errorf("blockdev: %s refused: this volume's log cannot describe its own tail: %w", where, err)
 	case errors.Is(err, wal.ErrBackpressure):
 		return fmt.Errorf("blockdev: %s refused: the unflushed backlog is at its bound (§5.7); a successful FLUSH clears it: %w", where, err)
 	}
