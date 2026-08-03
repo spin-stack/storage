@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -123,25 +122,4 @@ func unframe(body []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: stored %s, contents hash to %s", ErrCorruptDescriptor, stored, got)
 	}
 	return payload, nil
-}
-
-// ListVolumeIDs scans the buckets and returns every volume id that has a descriptor.
-func ListVolumeIDs(ctx context.Context, store objectstore.Store) ([]string, error) {
-	infos, err := store.List(ctx, "volumes/")
-	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for _, info := range infos {
-		// keys look like volumes/<vol>/descriptor.json
-		if !strings.HasSuffix(info.Key, "/descriptor.json") {
-			continue
-		}
-		rest := strings.TrimPrefix(info.Key, "volumes/")
-		id := strings.TrimSuffix(rest, "/descriptor.json")
-		if id != "" && !strings.Contains(id, "/") {
-			ids = append(ids, id)
-		}
-	}
-	return ids, nil
 }

@@ -610,82 +610,28 @@ Métricas: `io_class_bytes_total{class,resource}`, `io_class_throttled_seconds{c
 
 ---
 
-## 12. Fencing y leases (nuevo — protocolo completo)
+## 12. Fencing (V1)
 
-Este protocolo cierra la ventana de v4 en la que un stale writer con acceso a S3 podía seguir ACKeando FLUSHes que el nuevo writer jamás vería.
+> **Reducido en 2026-08-02 por ADR-0026.** Lo que había aquí — ciclo de lease, promoción,
+> `FENCING_WAIT`, objeto de epoch con CAS, PUTs tardíos del writer viejo, escalabilidad del
+> lease por host — describía un protocolo que gobernaba **cada ACK durable**. V1 no ACKea
+> nada contra S3: el ACK es `fdatasync` local (§14.8) y el volumen sube al parar. El
+> protocolo completo está en git y vuelve con la durabilidad remota, que es V2.
 
-### 12.1 Supuestos explícitos
+V1 conserva **una** obligación de fencing, y es la única que sigue siendo capaz de perder
+datos en silencio:
 
-1. Relojes **monotónicos** locales correctos (no requiere sincronía absoluta para la seguridad del writer viejo).
-2. Deriva máxima de reloj de pared entre CP y hosts acotada por `max_clock_skew = 2 s`. NTP/chrony obligatorio; alerta si el offset reportado supera 500 ms. Este supuesto solo se usa para la espera de promoción.
+**Dos incarnaciones de un volumen no pueden publicar las dos.** Si dos hosts arrancan el
+mismo volumen y ambos suben su imagen al parar, el segundo manifiesto sustituye al primero
+y las escrituras de aquella sesión desaparecen sin error en ninguna parte.
 
-### 12.2 Ciclo del lease (lado Agent)
+El mecanismo es un **compare-and-set sobre el manifiesto**: un host publica contra el ETag
+del manifiesto que leyó al arrancar, y un manifiesto que se movió por debajo le rechaza la
+publicación (`image.ErrSuperseded`). Un host que nunca leyó ninguno publica en modo
+create-only, así que pierde contra el que sí lo leyó.
 
-```text
-1. El lease es POR HOST: un único lease cubre todos los volúmenes
-   attacheados al host (cada uno conserva su propio epoch de attachment).
-   El Agent registra t0 = monotonic_now() al recibir la concesión.
-2. Renovación cada lease_renewal_interval (3 s) vía el MISMO heartbeat
-   que reporta capacidad: una transacción por host, no por volumen.
-   Cada renovación exitosa actualiza t0.
-3. lease_valido() := monotonic_now() - t0 < lease_ttl
-   (gobierna los ACKs durables de TODOS los volúmenes del host)
-```
-
-**Regla dura de ACK** (sin round-trips extra; una comparación de timestamps):
-
-```text
-Antes de ACKear cualquier FLUSH/FUA:
-    if !lease_valido():
-        no ACKear; fallar la request; transicionar a SELF_FENCED
-Un PUT exitoso con lease vencido NO se confirma al guest.
-```
-
-Al vencer el lease sin renovación, el Agent entra en `SELF_FENCED`: deja de ACKear durabilidad, deja de publicar checkpoints/manifests, y espera instrucciones (puede seguir sirviendo reads de su caché mientras QEMU siga conectado, según política).
-
-### 12.3 Promoción (lado Control Plane)
-
-```text
-1. Heartbeat del writer W1 (epoch N) vencido → PRIMARY_SUSPECTED.
-2. Decisión de failover (manual en MVP) → FENCING_WAIT.
-3. Esperar hasta: last_renewal(W1) + lease_ttl + max_clock_skew  (10 + 2 = 12 s)
-   Garantía: pasado ese instante, W1 ya no puede ACKear durabilidad
-   (por la regla dura de 12.2 sobre su reloj monotónico).
-4. Incrementar epoch → N+1. CAS del objeto de epoch en S3 (12.4).
-5. Conceder lease del epoch N+1 al nuevo host W2 → RECOVERING.
-6. W2 fija su punto de recovery listando S3 (§22.1). Todo write que W1
-   ACKeó como durable está, por construcción, dentro de ese prefijo.
-```
-
-### 12.4 Cinturón y tiradores: objeto de epoch con CAS en S3
-
-Objeto pequeño `volumes/<volume_id>/epoch` con el epoch vigente. Operaciones de **baja frecuencia** (publicar checkpoint, publicar manifest, compactación) lo validan con escritura condicional (`If-Match` sobre ETag) o al menos GET + comparación antes de publicar. No se aplica a cada PUT de WAL: ahí el lease local alcanza y el CAS duplicaría latencia.
-
-> Verificar soporte de `If-Match`/CAS en la versión desplegada de MinIO/RustFS; S3 lo soporta desde 2024. Si el backend no lo soporta, el protocolo sigue siendo seguro por 12.2 + 12.3; el CAS es defensa en profundidad.
-
-### 12.5 Qué pasa con los PUTs tardíos del writer viejo
-
-Un W1 particionado puede lograr PUTs a `wal/<vol>/<N>/...` después del fencing. Es inocuo:
-
-- No fueron ACKeados al guest (regla 12.2).
-- El recovery de W2 fijó su prefijo del epoch N en el paso 6; los objetos tardíos quedan fuera del prefijo elegido o pertenecen a sequences ya cubiertas.
-- El GC los recoge como huérfanos (objetos de epoch < vigente no referenciados por el punto de recovery registrado).
-
-Para eliminar ambigüedad, W2 escribe al inicio de su epoch un objeto `wal/<vol>/<N+1>/recovery-point.json` con `{prev_epoch: N, recovered_up_to: seq}`. Ese objeto es la frontera inmutable entre epochs y la referencia del GC.
-
-### 12.6 Escalabilidad del fencing (por qué el lease es por host)
-
-Un lease por volumen renovado cada 3 s genera `V/3` transacciones/s contra PG a través del CP: con 1.000 volúmenes son ~330 tx/s y con 10.000 son ~3.300 tx/s solo de leases — no escala. Con lease por host son `H/3` tx/s: con 300 hosts, ~100 tx/s triviales, independiente de cuántos volúmenes tenga cada host (modelo de agregación tipo GFS). El costo del trade-off: la expiración del lease de un host fencea la durabilidad de *todos* sus volúmenes a la vez — que es exactamente el comportamiento correcto, porque el evento que se está detectando (host particionado o muerto) afecta al host entero. La promoción (`FENCING_WAIT`) también opera a nivel host y luego recupera volumen por volumen.
-
-**Fase transitoria (v5.1, fleets < 50–100 hosts)**: se permite lease por volumen (filas por volumen, TTL 15–30 s, renovación cada 5–10 s) mientras se valida el resto del sistema, con tres condiciones no negociables:
-
-1. La **renovación va agrupada por host** en un solo RPC/transacción desde el día 1 (el heartbeat ya existe; es una línea). Con esto la migración a lease por host es un colapso de esquema, no un cambio de protocolo.
-2. La **regla de ACK con reloj monotónico (§12.2) es idéntica** en ambas fases — es lo que hace el fencing correcto, no el esquema de la tabla.
-3. Acoples asumidos explícitamente: `TTL ≥ 3× intervalo de renovación`; `FENCING_WAIT = TTL + skew` sube en proporción (15–30 s + 2 s), y la ventana de degradación con PG caído para volúmenes `remote` también.
-
-Misma disciplina para los watermarks informativos: las actualizaciones lazy de `local/durable/published_sequence` se agrupan **por host en una sola transacción periódica** (ej. cada 15–30 s), no una tx por volumen.
-
----
+Los chunks son direccionados por contenido y create-only, de modo que dos escritores que
+produzcan los mismos bytes no pueden corromperse entre sí — la clave *es* el contenido.
 
 ## 13. Modelo CoW
 
@@ -1041,113 +987,35 @@ Equivalente al `flatten` de RBD / compactación de niveles de un LSM. Sin esto, 
 
 ---
 
-## 21. Objectization, compactación y GC
+## 21. Objectization, compactación y GC — V2
 
-### 21.1 Objectization
+> **Retirados en 2026-08-02 por ADR-0026.** Describían la cadena de durabilidad remota:
+> objectization y truncado a mitad de sesión (§21.1), compactación (§21.2), GC
+> mark-and-sweep (§21.3), determinación del punto durable desde S3 (§22.1), standby tibio
+> (§22.3), lazy loading (§22.4) y `rebuild-metadata` (§22.5).
+>
+> V1 no tiene nada de eso: un volumen es una imagen que se publica al parar (§14.8), su
+> WAL local vive una sesión, y arrancar es leer un manifiesto. El texto completo está en
+> git y vuelve con la durabilidad remota.
+>
+> Lo que **no** se fue con ellos: §19 (un snapshot es un número, no un evento) y §20
+> (clonado, localidad y cadenas), que son los dos que más peso cargan en V1.
 
-Valores iniciales:
+## 22. Recovery, standby y reconstrucción — V2
 
-```text
-segment_target_size:     128 MiB
-checkpoint_interval:     256 MiB de WAL o 2 minutos
-checkpoint_on_snapshot:  true
-```
+Retirada con §21 por ADR-0026, y con la misma razón. Las subsecciones que el código
+todavía cita se resuelven aquí:
 
-Orden estricto (sin cambios de fondo vs v4, con CAS agregado):
-
-1. Crear segmentos (aplicando DISCARDs).
-2. Subir segmentos (clase background).
-3. Verificarlos (HEAD + checksum).
-4. Publicar checkpoint (validando epoch por CAS).
-5. Publicar manifest.
-6. Actualizar PostgreSQL.
-7. Marcar como elegible el WAL local con `sequences <= published_sequence`.
-
-Nunca truncar WAL local antes de que el checkpoint correspondiente esté verificado en S3.
-
-### 21.2 Compactación de WAL objects (nuevo)
-
-Los workloads fsync-pesados generan inevitablemente objetos chicos (un PUT por flush). Un compactador de clase background:
-
-- Fusiona WAL objects chicos ya durables en objetos de 64–128 MiB (mismo contenido lógico, claves nuevas `walc/<vol>/<epoch>/...`).
-- Actualiza el summary object; los originales quedan huérfanos y los recoge el GC.
-- Nunca toca objetos referenciados por un manifest sin reescribir el manifest de forma transaccional (CAS).
-
-Beneficios: costo de requests y de LIST, cardinalidad de objetos, y velocidad de replay en recovery. Patrón tomado de los sistemas log-sobre-S3 (WarpStream / LSMs). Métricas: `compaction_bytes_total`, `compaction_objects_merged_total`.
-
-### 21.3 GC seguro: mark-and-sweep sin borrado directo (nuevo)
-
-El incidente más probable de pérdida de datos en este sistema no es un crash: es **un bug del GC que borra objetos vivos**. Diseño por etapas (v5.1):
-
-**Día 1 (todo entorno con datos que importen)**: Versioning + lifecycle. **El GC no tiene permisos de borrado permanente desde el día 1** — sobre un bucket versionado, un delete marker es reversible; esta protección no requiere Object Lock.
-
-**Gate de producción**: Object Lock (modo governance) se activa **antes del primer dato de producción real** (no "cuando el GC madure" a secas). Es la capa anti-ransomware/anti-operador; en staging on-prem puede diferirse para reducir fricción con los backends.
-
-Mecánica:
-
-1. **Mark**: el GC (en el CP) recorre descriptors + manifests + recovery-points y computa el conjunto alcanzable. Todo lo no alcanzable y más viejo que el grace period (24–48 h) se marca (tag o delete marker versionado).
-2. **Sweep**: lo ejecuta el **lifecycle del bucket** expirando versiones no-actuales tras el grace period. El GC nunca ejecuta `DeleteObject` permanente ni bypass de Object Lock.
-
-Un GC que no puede borrar permanentemente no puede causar el peor incidente. Costo: storage extra durante el grace period — el seguro más barato disponible. Métricas: `orphan_objects_total`, `gc_marked_bytes_total`, `gc_reclaimed_bytes_total`.
-
----
-
-## 22. Recovery, standby y reconstrucción
-
-### 22.1 Determinación del punto durable (autoridad: S3)
-
-```text
-1. GET volumes/<vol>/epoch → epoch fenced más alto E (fallback: LIST de prefijos de epoch).
-2. GET wal/<vol>/<E>/summary.json (si existe) → último estado conocido + rangos.
-3. LIST desde el punto del summary; verificar prefijo CONTIGUO de sequences.
-4. punto_durable = fin del prefijo contiguo. Objetos más allá de un gap se ignoran
-   (y serán GC'd como huérfanos).
-```
-
-**Summary object** (evita LISTs masivos con muchos objetos): el Agent escribe periódicamente (ej. cada 30 s de actividad o cada checkpoint) un objeto pequeño `wal/<vol>/<epoch>/summary.json` con el último sequence durable conocido y la lista de rangos/objetos. Recovery = 2 GETs + 1 LIST corto. (Modelo tomado de Litestream: generations = epochs, restore = replay del prefijo contiguo listado desde S3.)
-
-### 22.2 Mismo host
-
-1. Reiniciar Agent (las VMs no se reinician: reconexión vhost-user, §16).
-2. Validar epoch + lease.
-3. Cargar checkpoint; escanear WAL local; completar contra WAL remoto.
-4. Reconstruir active map.
-5. Reabrir sockets; recuperar inflight.
-
-### 22.3 Pérdida del host — con standby tibio (nuevo)
-
-Para volúmenes marcados (`standby_host_id`), el host secundario mantiene en background (con presupuesto):
-
-- El último checkpoint descargado.
-- Opcionalmente, WAL objects recientes.
-
-Failover: `FENCING_WAIT` (12 s) → replay del delta desde el checkpoint → boot. **RTO en minutos** en lugar de horas. Es un cron con métricas, no un sistema de replicación: `standby_checkpoint_lag_bytes` con alerta si el standby se atrasa.
-
-Sin standby (frío): materialización completa; el RTO se publica **por GiB medido** en el runbook, para que el operador sepa cuánto tarda antes de apretar el botón.
-
-### 22.4 Lazy loading (diseñado ahora, implementado después)
-
-Modelo EBS-restore / overlaybd / Nydus: boot inmediato, bloques on-demand desde S3 (primera lectura lenta) + hidratación en background con presupuesto. El formato de checkpoint y el active map de v5 ya son compatibles (bitmap de presencia por segmento); no requiere cambios de formato cuando se implemente.
-
-### 22.5 `rebuild-metadata`: reconstrucción total de PostgreSQL desde S3 (nuevo)
-
-El layout en S3 es autodescriptivo para que la pérdida total de PG sea recuperable en horas:
-
-```text
-volumes/<vol>/descriptor.json    # tamaño, kek_id, dek_wrapped, epoch history,
-                                 # linaje de snapshots, chain_depth
-volumes/<vol>/epoch              # epoch vigente (objeto CAS)
-snapshots: manifests con parentesco completo (parent_snapshot_id, root, rangos)
-wal/<vol>/<epoch>/recovery-point.json y summary.json
-```
-
-Herramienta `rebuild-metadata`: escanea los buckets, valida consistencia y repuebla PG. Complementos: PITR de PostgreSQL (WAL-G/pgBackRest hacia el mismo object store) con restore **ensayado** trimestralmente.
-
-### 22.6 Runbook mínimo de recovery
-
-Documentos operativos exigidos por esta arquitectura desde el día 1: failover de writer (con los tiempos de `FENCING_WAIT`), restore de PG (PITR y rebuild), pérdida de nodo del object store, break-glass del CP, y RTO medido por escenario.
-
----
+- **§22.1** — determinación del punto durable con autoridad S3. V1 no la necesita: no hay
+  prefijo contiguo que establecer, hay un manifiesto que resuelve o no.
+- **§22.3** — standby tibio. Requiere durabilidad remota continua.
+- **§22.4** — lazy loading. Diseñado, no implementado, y ahora tampoco necesario: un clon
+  en el host de origen no descarga nada (§20).
+- **§22.5** — `rebuild-metadata`, reconstrucción de PostgreSQL desde S3. **Su implementación
+  se fue con esta sección.** El `descriptor.json` que un volumen escribe al aprovisionarse
+  sigue existiendo y sigue siendo la única ancla auto-descriptiva de un volumen en el
+  object store — pero su lector se fue con el rebuild, así que hoy tiene escritores y
+  ningún lector. Registrado en `STATUS.md`, no resuelto aquí.
 
 ## 23. Edge cases
 

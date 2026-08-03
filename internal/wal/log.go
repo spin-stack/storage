@@ -130,15 +130,6 @@ type Log struct {
 	batcher  *Batcher  // nil = local-only (no remote WAL)
 	uploader *Uploader // nil = local-only
 
-	// covered is the end of the contiguous run of sequences a verified object holds.
-	//
-	// It is maintained as objects upload rather than recomputed, and it replaced a
-	// []SummaryObject that grew by one entry per upload with nothing trimming it — for
-	// the life of the volume, since the durability scheduler outlives every FLUSH. The
-	// list had one reader inside this package and one writer with no production caller.
-	// A watermark is O(1), bounded, and cannot hold an entry from an earlier pass.
-	covered uint64
-
 	mode  DurabilityMode // remote (default) | local (§14.8)
 	lease LeaseChecker   // nil = no lease gate (dev/local without a CP)
 	// fenced is set once a durable step finds the lease invalid (§16 SELF_FENCED).
@@ -810,7 +801,7 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	}
 
 	l.mu.Unlock()
-	if _, err := l.uploadPending(ctx); err != nil { // step 4: upload + verify
+	if err := l.uploadPending(ctx); err != nil { // step 4: upload + verify
 		return err // durable NOT advanced
 	}
 
@@ -857,7 +848,7 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 // mode's asynchronous drain advances only if the caller still holds the lease. Uploading
 // is not a durability claim — the object is create-only with a deterministic key, so
 // writing it asserts nothing about who owns the volume — and INV-06 governs the claim.
-func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
+func (l *Log) uploadPending(ctx context.Context) error {
 	// A snapshot, because the list is about to be read without the lock and a
 	// concurrent WRITE may close a further batch onto the end of it. Those extra
 	// batches are not this step's business, and dropping the first `done` entries
@@ -865,7 +856,7 @@ func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
 	l.mu.Lock()
 	if l.batcher == nil || l.uploader == nil {
 		l.mu.Unlock()
-		return 0, ErrNoUploader
+		return ErrNoUploader
 	}
 	pending := append([]*ClosedBatch(nil), l.batcher.Pending()...)
 	uploader := l.uploader
@@ -879,15 +870,7 @@ func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
 			l.batcher.RemoveUploaded(done)
 			l.recordWatermarks(ctx) // a growing gap is what an operator needs here
 			l.mu.Unlock()
-			return l.coveredLocked(), err
-		}
-		// The contiguous run advances only when this object continues it. A gap simply
-		// leaves `covered` where it was — and a durable point past a gap is exactly what
-		// INV-08 forbids. Uploads are issued in sequence order and a failure stops the
-		// loop, so the batch that failed stays at the head of pending and is retried
-		// first; contiguity is a property of that ordering rather than an assumption.
-		if cb.First == l.covered+1 {
-			l.covered = cb.Last
+			return err
 		}
 		_ = key
 		l.closeGap(int64(len(cb.Records)))
@@ -898,64 +881,7 @@ func (l *Log) uploadPending(ctx context.Context) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.batcher.RemoveUploaded(done)
-	return l.coveredLocked(), nil
-}
-
-// coveredLocked is the highest sequence a verified object covers: the end of the
-// contiguous run over everything this log has uploaded in this epoch.
-//
-// It reports what the *store* holds rather than what the last call uploaded, and the
-// difference is load-bearing. A drain that uploads while the lease is invalid must not
-// advance durable_sequence (INV-06), but the records are in the bucket; the next drain
-// finds nothing pending, and if "covered" meant "uploaded just now" it would report 0 and
-// the volume would stay stuck below its own objects until the guest happened to write
-// again. A fenced host that regains its lease has to be able to claim what it already
-// put there.
-func (l *Log) coveredLocked() uint64 { return l.covered }
-
-// DrainPending is §14.8 rule 3 — "S3 is asynchronous" — with something actually doing it.
-//
-// In `local` mode the FLUSH ACKs on fdatasync alone and returns before any PUT, so
-// without this nothing ever reaches the object store: durable_sequence stays at 0, no
-// checkpoint can publish, TruncateLocal(published) reclaims nothing, and the local WAL
-// grows for the life of the volume. That is the pre-increment-3 failure, and it applied
-// to every `local` volume the moment the Agent started honouring the mode.
-//
-// It closes the open batch first, because a drain that only moved batches something else
-// had already closed would leave the most recent writes behind for ever on a volume that
-// is idle — which is exactly the volume whose WAL an operator is waiting to see shrink.
-//
-// It returns the highest sequence a verified object now covers. Advancing
-// durable_sequence to it is the *caller's* decision: uploading asserts nothing, and
-// §12.2/INV-06 govern the claim. See agent.drainOnce.
-func (l *Log) DrainPending(ctx context.Context) (uint64, error) {
-	l.flushMu.Lock()
-	defer l.flushMu.Unlock()
-
-	l.mu.Lock()
-	if l.fenced {
-		l.mu.Unlock()
-		return 0, ErrSelfFenced
-	}
-	if l.batcher == nil || l.uploader == nil {
-		l.mu.Unlock()
-		return 0, ErrNoUploader
-	}
-	l.batcher.Flush()
-	if err := l.segs.sync(); err != nil {
-		l.mu.Unlock()
-		return 0, err
-	}
-	l.mu.Unlock()
-
-	return l.uploadPending(ctx)
-}
-
-// Mode reports the §14.8 ACK contract this log is serving.
-func (l *Log) Mode() DurabilityMode {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.mode
+	return nil
 }
 
 func (l *Log) clearUnflushed() {
@@ -1023,6 +949,13 @@ func (l *Log) UnflushedBytes() int64 {
 //
 // A snapshot of a *running* volume is a different problem and does not use this: the view
 // is moving, so the frozen point has to be a sequence number rather than a moment (§19).
+// Mode reports the §14.8 ACK contract this log is serving.
+func (l *Log) Mode() DurabilityMode {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mode
+}
+
 func (l *Log) ViewAtRest() (*cow.IntervalMap, uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

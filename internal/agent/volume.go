@@ -71,6 +71,17 @@ type Volume struct {
 
 	cancel context.CancelFunc
 	done   chan struct{}
+	// baseDone is closed once fetchBase has resolved the read view, whether it installed
+	// a base or failed one. stop() waits on it, and the reason is not tidiness: the base
+	// is everything the volume held before this session, so publishing before it lands
+	// writes an image with that data missing — and the publish CASes over the previous
+	// manifest, so it would replace the volume's own history with a partial view of it.
+	// nil when this Agent has no object store and there is no base to wait for.
+	baseDone chan struct{}
+	// baseFailed records that fetchBase could not resolve the view. A volume that never
+	// got its base must not publish at all: its view is not a subset of the truth, it is
+	// a different thing.
+	baseFailed bool
 }
 
 // ID is the volume this runtime serves.
@@ -121,6 +132,18 @@ func (v *Volume) stop() error {
 func (v *Volume) publish() {
 	if v.store == nil {
 		return // local-only Agent: the local WAL is all there is, by design
+	}
+	if v.baseDone != nil {
+		// The fetch runs on its own goroutine and is not covered by v.done, which waits
+		// for the serve loop. Publishing without waiting is how a race becomes data loss:
+		// the view would be missing everything the base holds, and the CAS would install
+		// that over the manifest the base came from.
+		<-v.baseDone
+	}
+	if v.baseFailed {
+		slog.Warn("not publishing this volume's image: its read view never resolved, so the image would be missing everything it held before this session",
+			"volume_id", v.id)
+		return
 	}
 	view, seq := v.log.ViewAtRest()
 	// Not the serve context: that one is already cancelled by the time this runs, and a
@@ -600,7 +623,11 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	v.cancel = cancel
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
 	if needsBase {
-		go m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()), d)
+		v.baseDone = make(chan struct{})
+		go func() {
+			defer close(v.baseDone)
+			m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()), d)
+		}()
 	}
 	// One line per volume this host starts serving. Everything else the manager logs
 	// is an exception, so an Agent that came up correctly said nothing at all about
@@ -624,6 +651,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	if m.deps.Store == nil {
 		// Local-only mode has no object store to recover from, so the local segments
 		// are all there is and they have already been replayed. Nothing to wait for.
+		v.baseFailed = true
 		v.log.FailBase(errors.New("this Agent has no object store: the read view is whatever the local WAL holds"))
 		return
 	}
@@ -640,6 +668,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		// cannot detect.
 		slog.Error("the clone's parent snapshot could not be materialized; its reads will fail",
 			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
+		v.baseFailed = true
 		v.log.FailBase(err)
 		return
 	}
@@ -664,6 +693,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		// indistinguishable from a fresh volume, and a guest cannot tell them apart.
 		slog.Error("the volume's image could not be loaded; its reads will fail",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)
+		v.baseFailed = true
 		v.log.FailBase(err)
 		return
 	default:
@@ -671,6 +701,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 			if err := base.SetBase(parent); err != nil {
 				slog.Error("the clone's parent could not be layered under its image; its reads will fail",
 					"volume_id", v.id, "error", err)
+				v.baseFailed = true
 				v.log.FailBase(err)
 				return
 			}
@@ -684,6 +715,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	if err := v.log.InstallBase(base, durable); err != nil {
 		slog.Error("the recovered read view could not be installed",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)
+		v.baseFailed = true
 		v.log.FailBase(err)
 		return
 	}

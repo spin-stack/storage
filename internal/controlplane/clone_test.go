@@ -6,15 +6,11 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/controlplane"
-	"github.com/spin-stack/storage/internal/descriptor"
-	"github.com/spin-stack/storage/internal/epoch"
-	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
-	"github.com/spin-stack/storage/internal/snapshot"
 )
 
 const (
@@ -121,110 +117,6 @@ func TestResizeGrowsOnly(t *testing.T) {
 	// Shrink is rejected (§3 non-goal).
 	if err := md.ResizeVolume(ctx, term, parentVol, 50); !errors.Is(err, metadata.ErrShrinkNotAllowed) {
 		t.Fatalf("shrink: want ErrShrinkNotAllowed, got %v", err)
-	}
-}
-
-func TestSnapshotCatalogRoundTrip(t *testing.T) {
-	ctx := t.Context()
-	md, _, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
-	snap := metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 2, TargetSequence: 7, RootDigest: "d", State: lifecycle.SnapshotPublished, ManifestKey: "snapshots/x", RequestID: reqID}
-	if err := md.CreateSnapshot(ctx, term, snap); err != nil {
-		t.Fatal(err)
-	}
-	got, err := md.GetSnapshot(ctx, snapID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.TargetSequence != 7 || got.RootDigest != "d" || got.ManifestKey != "snapshots/x" {
-		t.Fatalf("snapshot round-trip: %+v", got)
-	}
-	if _, err := md.GetSnapshot(ctx, "no-such-snap"); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("missing snapshot: %v", err)
-	}
-}
-
-// TestACloneIsRebuiltAsAClone is §22.5 for the chain: a clone whose catalog is gone must
-// come back as a clone, not as an empty volume.
-//
-// The link is the difference between a volume that reads its parent's data and one that
-// reads zeros, and rebuild-metadata reconstructs volumes from descriptors — so a
-// descriptor that does not carry it turns a restore into the same data-loss-shaped bug a
-// fresh clone used to have.
-//
-// It also pins the ordering: the parent snapshot belongs to a *different* volume, so the
-// rebuild links clones in a second pass, after every snapshot row exists. Rebuilding with
-// the clone's descriptor sorting first is exactly the case that fails the foreign key if
-// that pass is removed.
-func TestACloneIsRebuiltAsAClone(t *testing.T) {
-	ctx := t.Context()
-	md, store, term := cpStore(t)
-
-	// The *clone's* id is minted first, so that ListVolumeIDs — which sorts, and v7 ids
-	// sort by creation — hands the rebuild the clone before the parent. That is the
-	// order that breaks a single-pass rebuild: the clone's row would reference a
-	// snapshot row that does not exist yet, and the foreign key refuses it. Minting the
-	// parent first makes the test pass for the wrong reason.
-	cloneVol := ids.New().String()
-	parentVol, snapID := ids.New().String(), ids.New().String()
-	for _, d := range []descriptor.Descriptor{
-		{VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 4096,
-			Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1,
-			KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1},
-		{VolumeID: cloneVol, SizeBytes: 1 << 30, BlockSize: 4096,
-			Durability: lifecycle.DurabilityRemote, CurrentEpoch: 1, ChainDepth: 1,
-			KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
-			ParentSnapshotID: snapID},
-	} {
-		if err := descriptor.Write(ctx, store, d); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// The manifest is what makes the snapshot row reconstructible (§19): its presence
-	// in S3 is the evidence a snapshot was published. It also has to be *written* here
-	// rather than the row created directly, because that is the only input the rebuild
-	// reads.
-	man := snapshot.Manifest{
-		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 1,
-	}
-	man.RootDigest = snapshot.Digest(man.TargetSequence, man.Objects)
-	if err := snapshot.Publish(ctx, store, man); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := controlplane.RebuildMetadata(ctx, store, epoch.NewStore(store), md, term); err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
-	got, err := md.GetVolume(ctx, cloneVol)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ParentSnapshotID != snapID {
-		t.Fatalf("the rebuilt clone descends from %q, want %q — it would read zeros",
-			got.ParentSnapshotID, snapID)
-	}
-}
-
-// TestCloneFromAnOrphanSnapshotFails: a snapshot whose volume is gone — a catalog
-// half-restored, a manual delete — must not produce a clone that inherits nothing.
-//
-// Ported here when CloneCrossHost was deleted: the claim was always about Clone's own
-// lookups (it reads the snapshot, then the volume it belongs to), and the cross-host
-// wrapper only reached them.
-func TestCloneFromAnOrphanSnapshotFails(t *testing.T) {
-	ctx := t.Context()
-	md, store, term := cpStore(t)
-	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: "00000000-0000-7000-8000-00000000dead", Epoch: 1,
-		TargetSequence: 1, RootDigest: "d", State: lifecycle.SnapshotPublished, RequestID: reqID,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := controlplane.Clone(ctx, md, store, term, snapID, cloneVol, cloneHostA, nil); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("clone from an orphan snapshot: want ErrNotFound, got %v", err)
-	}
-	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("a failed clone must not create the volume: %v", err)
 	}
 }
 

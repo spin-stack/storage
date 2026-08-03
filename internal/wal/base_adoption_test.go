@@ -8,7 +8,6 @@ import (
 
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/lease"
-	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -74,8 +73,7 @@ func truncatedVolume(t *testing.T) (*sim.Disk, *sim.ObjectStore, *sim.Clock, [16
 
 // TestAResumedVolumeReadsWhatTruncationReclaimed is the hole, closed.
 func TestAResumedVolumeReadsWhatTruncationReclaimed(t *testing.T) {
-	ctx := t.Context()
-	d, store, clk, vol, _, payload := truncatedVolume(t)
+	d, _, clk, vol, _, payload := truncatedVolume(t)
 
 	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1,
 		wal.Limits{SegmentBytes: baseTestSegmentBytes}, nil)
@@ -84,10 +82,12 @@ func TestAResumedVolumeReadsWhatTruncationReclaimed(t *testing.T) {
 	}
 	defer func() { _ = l.Close() }()
 
-	base, recovered, err := recovery.Recover(ctx, store, nil, vol, 1)
-	if err != nil {
-		t.Fatalf("recovery.Recover: %v", err)
-	}
+	// The base, built directly. It used to come from recovery.Recover replaying the WAL
+	// objects; under ADR-0026 it comes from image.Load, which this package cannot import
+	// (image imports wal). What these tests are about is what the Log does *with* a base,
+	// so the base is constructed rather than recovered — which is also a truer unit test:
+	// it no longer passes or fails for reasons that live in another package.
+	base, recovered := baseHolding(payload), uint64(1)
 	if err := l.InstallBase(base, recovered); err != nil {
 		t.Fatalf("InstallBase: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestAResumedVolumeRefusesToServeZerosWhenTheBaseIsLost(t *testing.T) {
 // between a guest and a wrong answer is that its read blocks.
 func TestReadsWaitForTheBaseRatherThanAnsweringEarly(t *testing.T) {
 	ctx := t.Context()
-	d, store, clk, vol, _, payload := truncatedVolume(t)
+	d, _, clk, vol, _, payload := truncatedVolume(t)
 
 	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1,
 		wal.Limits{SegmentBytes: baseTestSegmentBytes}, nil)
@@ -165,10 +165,12 @@ func TestReadsWaitForTheBaseRatherThanAnsweringEarly(t *testing.T) {
 	default:
 	}
 
-	base, recovered, err := recovery.Recover(ctx, store, nil, vol, 1)
-	if err != nil {
-		t.Fatalf("recovery.Recover: %v", err)
-	}
+	// The base, built directly. It used to come from recovery.Recover replaying the WAL
+	// objects; under ADR-0026 it comes from image.Load, which this package cannot import
+	// (image imports wal). What these tests are about is what the Log does *with* a base,
+	// so the base is constructed rather than recovered — which is also a truer unit test:
+	// it no longer passes or fails for reasons that live in another package.
+	base, recovered := baseHolding(payload), uint64(1)
 	if err := l.InstallBase(base, recovered); err != nil {
 		t.Fatalf("InstallBase: %v", err)
 	}
@@ -260,4 +262,13 @@ func TestBasePendingIsTrueOnlyWhileTheBaseIsAwaited(t *testing.T) {
 	if l2.BasePending() {
 		t.Error("the base is still pending after the attempt failed")
 	}
+}
+
+// baseHolding is a read view containing data at offset 0 — the shape image.Load returns
+// and InstallBase consumes. Constructed here rather than recovered, so these tests fail
+// only for reasons inside this package.
+func baseHolding(data []byte) *cow.IntervalMap {
+	m := cow.NewIntervalMap()
+	m.Overwrite(0, data)
+	return m
 }

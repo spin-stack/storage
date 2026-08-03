@@ -223,8 +223,6 @@ func (c *BackgroundYieldsChecker) Check() error { return c.violation }
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	all := coreCheckers()
-	all = append(all, drainCheckers()...)
-	all = append(all, recoveryCheckers()...)
 	all = append(all, harnessCheckers()...)
 	all = append(all, walCheckers()...)
 	all = append(all, agentCheckers()...)
@@ -240,11 +238,7 @@ func coreCheckers() []Checker {
 		NewWatermarkOrderChecker(),
 		NewNoPlaintextLeavesHostChecker(),
 		NewDurableAckLeaseChecker(),
-		NewPromotionWaitChecker(),
 		NewSingleWriterChecker(),
-		NewNoLostAckedWriteChecker(),
-		NewImmutableSnapshotChecker(),
-		NewTruncateBelowPublishedChecker(),
 		NewBackgroundYieldsChecker(),
 	}
 }

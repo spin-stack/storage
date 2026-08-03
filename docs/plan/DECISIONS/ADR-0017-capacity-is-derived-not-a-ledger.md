@@ -75,17 +75,19 @@ half-updated. There is no `nvme_committed_bytes` column — `internal/schema/sch
 says so at the point where it would have been — and the derivation is the
 `host_committed_bytes` view (`schema.sql:346`), which landed with increment 5.
 
-- `TestCommittedCapacityIsDerivedFromState` and
-  `TestVolumeInFlightIsChargedToItsDestinationOnce`
-  (`internal/controlplane/capacity_derived_test.go`): a volume in flight is charged to
-  its destination before it is primary there, and to neither host twice.
-- `TestCommittedCapacityHoldsUnderAnyInterleaving` (same file): for any interleaving of
-  moves and crashes, `committed(host)` equals the sum over the host's volumes and
-  in-flight plans. A ledger cannot state that property; a derived value *is* that
-  property.
 - `TestCommittedBytesIsDerivedInOnePlace` (`internal/db/queries_guard_test.go`): the
   derivation has exactly one home, so a second query cannot quietly reintroduce the
-  ledger.
+  ledger. This is the structural guarantee and it is the one that survives.
+
+**The behavioural tests went with the drain on 2026-08-02 (ADR-0026).**
+`TestCommittedCapacityIsDerivedFromState`,
+`TestVolumeInFlightIsChargedToItsDestinationOnce` and
+`TestCommittedCapacityHoldsUnderAnyInterleaving` asserted the identity across drain
+passes, faults and crashes — "for any interleaving of moves and crashes,
+`committed(host)` equals the sum over the host's volumes and in-flight plans". V1
+performs no moves, so the interleaving they quantified over is empty. The decision is
+unchanged and still right; what is gone is the *scenario* that made it interesting, and
+it comes back with cross-host movement.
 
 An unresolved prediction in an ADR is how a decision record stops matching the code
 without anyone noticing, so this section is written in the past tense on purpose.

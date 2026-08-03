@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/crypto"
-	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -226,60 +225,6 @@ func TestResumeRefusesAnotherVolumesRecords(t *testing.T) {
 	if _, err := wal.Resume(w.disk, "wal", w.clk, other, 1, 0,
 		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil); !errors.Is(err, wal.ErrForeignVolume) {
 		t.Fatalf("resuming volume %x over volume %x's segments must fail closed, got %v", other, w.vol, err)
-	}
-}
-
-// TestResumeUploadsOnlyTheTailS3NeverGot: the records between the durable point and
-// the end of the WAL exist only on this host. A resume that forgets them loses every
-// write since the last successful upload; a resume that re-uploads the whole file
-// re-issues spans S3 already has, which is the divergent-object case of INV-21. Only
-// the tail moves.
-func TestResumeUploadsOnlyTheTailS3NeverGot(t *testing.T) {
-	ctx := t.Context()
-	w := newResumeWorld(t, nil)
-	if _, err := w.log.Write(0, []byte("durable-one"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.log.Write(64, []byte("durable-two"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.log.Flush(ctx); err != nil { // sequences 1..2 reach S3
-		t.Fatal(err)
-	}
-	if _, err := w.log.Write(128, []byte("only-on-this-host"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.log.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	durable := w.log.Watermarks().Durable
-	objectsBefore, _ := w.store.List(ctx, "wal/")
-
-	resumed, err := wal.Resume(w.disk, "wal", w.clk, w.vol, 1, durable,
-		wal.Limits{MaxUnflushedBytes: 1 << 20}, nil)
-	if err != nil {
-		t.Fatalf("resume: %v", err)
-	}
-	resumed.EnableRemote(
-		wal.NewBatcher(w.clk, w.vol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(w.store, 5),
-		leaseOK{},
-	)
-	if err := resumed.Flush(ctx); err != nil {
-		t.Fatalf("the resumed tail must be uploadable: %v", err)
-	}
-
-	prefix, err := recovery.DurablePrefix(ctx, w.store, w.vol, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if prefix != 3 {
-		t.Fatalf("S3 reproduces up to %d after the resume, want 3", prefix)
-	}
-	objectsAfter, _ := w.store.List(ctx, "wal/")
-	if len(objectsAfter) != len(objectsBefore)+1 {
-		t.Fatalf("resume produced %d new objects, want exactly the one covering the tail",
-			len(objectsAfter)-len(objectsBefore))
 	}
 }
 

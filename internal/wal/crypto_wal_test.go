@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/crypto"
-	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -188,49 +187,6 @@ func TestEncryptedObjectHeaderCarriesTheDEKKeyID(t *testing.T) {
 	}
 	if h.KeyID != dek.KeyID {
 		t.Fatalf("object header claims KeyID %d, the records were sealed with %d", h.KeyID, dek.KeyID)
-	}
-}
-
-// TestEncryptedWriteSurvivesTheS3RoundTrip is the positive control for the two above:
-// with a versioned DEK the ACKed FLUSH is genuinely reproducible from the bucket.
-func TestEncryptedWriteSurvivesTheS3RoundTrip(t *testing.T) {
-	ctx := t.Context()
-	dek, err := crypto.GenerateDEK(&ramp{b: 5}, 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	d := sim.NewDisk()
-	vol := [16]byte{9, 9, 9}
-	enc := &wal.Encryption{DEK: dek, VolumeID: vol}
-	l := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{MaxUnflushedBytes: 1 << 20})
-	l.EnableRemote(wal.NewBatcher(clk, vol, 1, dek.KeyID, wal.DefaultBatchConfig()), wal.NewUploader(store, 5), leaseOK{})
-	l.EnableEncryption(enc)
-
-	payload := []byte("guest bytes that must come back")
-	if _, err := l.Write(0, payload, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	prefix, err := recovery.DurablePrefix(ctx, store, vol, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if prefix != l.Watermarks().Durable {
-		t.Fatalf("S3 reproduces up to %d, the FLUSH ACKed %d", prefix, l.Watermarks().Durable)
-	}
-	view, _, err := recovery.Recover(ctx, store, enc, vol, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, len(payload))
-	view.Read(0, buf)
-	if !bytes.Equal(buf, payload) {
-		t.Fatalf("recovered %q, want %q", buf, payload)
 	}
 }
 

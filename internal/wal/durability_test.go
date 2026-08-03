@@ -7,7 +7,6 @@ import (
 
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/lifecycle"
-	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -24,37 +23,6 @@ func remoteLeasedLog(t *testing.T, store *sim.ObjectStore, clk *sim.Clock, lm *l
 		lm,
 	)
 	return l
-}
-
-// TestFlushAcksWhileLeaseValid: the happy path — a valid lease lets the FLUSH
-// advance durable and ACK.
-func TestFlushAcksWhileLeaseValid(t *testing.T) {
-	ctx := t.Context()
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	lm := lease.NewManager(clk, 10*time.Second)
-	lm.Grant()
-
-	l := remoteLeasedLog(t, store, clk, lm)
-	_, _ = l.Write(0, []byte("data"), 0)
-	if err := l.Flush(ctx); err != nil {
-		t.Fatalf("flush with valid lease: %v", err)
-	}
-	if l.Watermarks().Durable != 1 {
-		t.Fatalf("durable = %d, want 1", l.Watermarks().Durable)
-	}
-	if l.Fenced() {
-		t.Fatal("should not be fenced")
-	}
-	// The ACK claims remote durability, so the bucket must be able to reproduce the
-	// target on its own (INV-07/INV-08) — the watermark alone proves nothing.
-	prefix, err := recovery.DurablePrefix(ctx, store, [16]byte{7}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if prefix < l.Watermarks().Durable {
-		t.Fatalf("S3 reproduces up to %d, the FLUSH ACKed durable=%d", prefix, l.Watermarks().Durable)
-	}
 }
 
 // TestRemoteFlushWithALeaseButNoUploaderFailsClosed: `remote` is the default mode, so
@@ -83,39 +51,6 @@ func TestRemoteFlushWithALeaseButNoUploaderFailsClosed(t *testing.T) {
 	}
 	if objs, _ := store.List(ctx, "wal/"); len(objs) != 0 {
 		t.Fatalf("expected an empty bucket, got %d objects", len(objs))
-	}
-}
-
-// TestFUAWriteIsDurableOrRefused is §14.3.1/§14.8 for the FUA flag: a FUA WRITE
-// carries the same ACK contract as a FLUSH. Today Log.Write accepts the flag, closes
-// the batch with it, and returns — no fdatasync, no PUT, no lease check — so the flag
-// is half-handled, which reads as "FUA is implemented". A completed FUA write whose
-// bytes are only in the host page cache is a write the guest believes is on stable
-// media.
-//
-// Either contract is defensible; silently swallowing the flag is not. So: a FUA
-// write either fails, or by the time it returns the record is in a verified object.
-func TestFUAWriteIsDurableOrRefused(t *testing.T) {
-	ctx := t.Context()
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	lm := lease.NewManager(clk, 10*time.Second)
-	lm.Grant()
-
-	l := remoteLeasedLog(t, store, clk, lm)
-	seq, err := l.Write(0, []byte("fua-payload"), format.FlagFUA)
-	if err != nil {
-		return // refused outright: an honest contract
-	}
-	prefix, perr := recovery.DurablePrefix(ctx, store, [16]byte{7}, 1)
-	if perr != nil {
-		t.Fatal(perr)
-	}
-	if prefix < seq {
-		t.Fatalf("FUA write of sequence %d completed with S3 reproducing only %d", seq, prefix)
-	}
-	if l.Watermarks().Durable < seq {
-		t.Fatalf("FUA write completed with durable=%d < %d", l.Watermarks().Durable, seq)
 	}
 }
 
@@ -193,41 +128,6 @@ func TestLocalModeIgnoresLeaseForFlush(t *testing.T) {
 	}
 	if l.Fenced() {
 		t.Fatal("local mode must not self-fence on FLUSH")
-	}
-}
-
-// (Removed) TestNoLeaseConfiguredStillAcks asserted that a remote-durability log
-// with no lease checker "should ACK". That was the specification of DEV-0004: it
-// made an unfenced writer legal, and every other fencing proof was conditional on
-// somebody remembering to call SetLease. TestRemoteModeWithoutALeaseFailsClosed
-// below asserts the opposite, which is what §12.2 requires.
-
-// TestWriteFUAIsInAVerifiedObjectBeforeItReturns is the FUA half of §14.8's remote
-// contract: the three properties TestFlushAcksWhileLeaseValid asserts for a FLUSH,
-// applied to the write that carries the flag. A FUA write that returns before its
-// record is in S3 is a write the guest believes is on stable media and a host loss
-// destroys.
-func TestWriteFUAIsInAVerifiedObjectBeforeItReturns(t *testing.T) {
-	ctx := t.Context()
-	store := sim.NewObjectStore()
-	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
-	lm := lease.NewManager(clk, 10*time.Second)
-	lm.Grant()
-
-	l := remoteLeasedLog(t, store, clk, lm)
-	seq, err := l.WriteFUA(ctx, 0, []byte("fua-payload"))
-	if err != nil {
-		t.Fatalf("FUA write with a valid lease: %v", err)
-	}
-	prefix, err := recovery.DurablePrefix(ctx, store, [16]byte{7}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if prefix < seq {
-		t.Fatalf("FUA write of sequence %d returned with S3 reproducing only %d", seq, prefix)
-	}
-	if l.Watermarks().Durable != seq {
-		t.Fatalf("durable = %d after a FUA write of %d", l.Watermarks().Durable, seq)
 	}
 }
 

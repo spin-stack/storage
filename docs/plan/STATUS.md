@@ -918,6 +918,51 @@ second Agent and a second boot read the same range back. Removing the WAL is a s
 statement than the truncation it replaced — the second boot has nothing but the image.
 Green against real QEMU.
 
+## ADR-0026 increment 4 — the remote durability chain is gone
+
+**Deleted, with the document sections that described them, in one commit each way so no
+commit exists where the tree cites something that is not there:**
+
+`internal/recovery` (890), `internal/materialize` (293), `internal/checkpoint` (215),
+`internal/epoch` (200), `internal/snapshot`, and `controlplane`'s `drain.go` (807),
+`promotion.go` (438) and `rebuild.go` — none of which had a production caller outside each
+other and DST. With them: `scenarios_drain.go` (801), `scenarios_recovery.go` (623), and
+most of `scenarios.go`.
+
+**§12 shrank to one paragraph.** It described a protocol governing *every durable ACK*;
+V1 ACKs nothing against S3. What survives is the single obligation that can still lose
+data silently — two incarnations must not both publish — and its mechanism, the
+compare-and-set on the manifest. §21 and §22 became notes pointing at V2, kept as headings
+rather than deleted so the citations that survive in `descriptor`, `clone` and `election`
+still resolve to something that explains itself.
+
+**Four checkers were retired with their subjects**, because a checker that cannot fire
+proves nothing: `PromotionWaitChecker` (INV-11, no promotion), `NoLostAckedWriteChecker`
+(INV-09, no failover), `TruncateBelowPublishedChecker` (INV-13, no truncation) and
+`ImmutableSnapshotChecker` (INV-16, whose package went). The planted-proof ratchet is
+14 → 8 with the reason recorded. `INVARIANTS.md` needs a pass of its own against this;
+it has not had one.
+
+**ADR-0017's behavioural tests went with the drain** and its text now says so: the
+decision — committed capacity is derived, not a ledger — is unchanged and still enforced
+structurally by `TestCommittedBytesIsDerivedInOnePlace`, but the interleaving of moves and
+crashes it quantified over is empty in V1.
+
+**A correctness bug this deletion exposed, fixed here.** `-race` in `ci:full` caught
+`fetchBase` and `Volume.publish` racing on the image ETag — and looking at it found worse
+than a race: `stop()` published without waiting for the base to be installed. The base is
+everything the volume held before this session, so publishing early writes an image with
+that data missing, and the CAS installs it **over the manifest the base came from**. It
+would replace a volume's history with a partial view of it. `stop()` now waits for the
+fetch, and a volume whose base never resolved does not publish at all: its view is not a
+subset of the truth, it is a different thing.
+
+**New finding, not resolved: `descriptor` has writers and no reader.** `provision` and
+`clone` write `descriptor.json`; its readers were `gc.Reachable` and
+`controlplane.RebuildMetadata`, and both are gone. It is the volume's only
+self-describing anchor in the object store, so deleting it is not obviously right — but a
+thing only ever written is the pattern this sweep exists to remove. §22.5 records it too.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
