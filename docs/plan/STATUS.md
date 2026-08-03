@@ -857,10 +857,22 @@ Increment 12 (`WriteSummary` and its unbounded accumulator) was specced and its 
 chosen — delete the writer and the accumulator — before the stop. It is subsumed: under
 ADR-0026 the whole summary mechanism goes, not just its writer.
 
-**What replaces the cleanup plan** is ADR-0026's own work, which is a different shape and
-wants its own inventory: withdraw the remote chain, implement snapshot-as-`fsync`-plus-copy
-(§19's sequence number is the frozen view, so the ~0 pause survives), and reduce fencing
-to a compare-and-set at stop. None of it is started.
+**What replaces the cleanup plan is `BUILD-INVENTORY.md`**, rewritten 2026-08-02 for
+ADR-0026. Six increments, ordered by the real dependency graph, and **none of them is
+started**.
+
+The ordering rule is the one this repository keeps having to relearn: **build the new thin
+path before deleting the old one.** Increment 2 (upload at stop, boot from the copy) and
+increment 3 (snapshot as `fsync` plus a copy) come *before* increment 4 cuts `recovery`,
+`materialize`, `checkpoint` and the remote half of `wal` — because deleting first leaves no
+way to serve a volume.
+
+**Increment 0 is the architecture document, and it is the owner's.** §2 still declares
+"RPO 0 bajo el modelo de fallas probado por DST", so every deletion in increments 1-4
+contradicts it. CLAUDE.md makes an observed doc↔code divergence a DEV entry and an open
+DEV blocks the gate — so until §2's SLO table and §14.8 are revised, the rest of the
+inventory **cannot pass its own gate**. That is not a formality; it is the first thing
+that will stop the work.
 
 **What is *not* paused:** anything outside the durability chain. The transport, the block
 device, the read view, the guest lane and the documentation work are unaffected by
