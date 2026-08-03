@@ -2,6 +2,7 @@ package image_test
 
 import (
 	"bytes"
+	"crypto/rand"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -46,10 +47,10 @@ func TestPublishLoadRoundTrip(t *testing.T) {
 			}
 		}
 
-		if _, err := image.Publish(ctx, store, vol, view, 42, ""); err != nil {
+		if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, view, 42, ""); err != nil {
 			rt.Fatalf("Publish: %v", err)
 		}
-		loaded, man, _, err := image.Load(ctx, store, vol)
+		loaded, man, _, err := image.Load(ctx, store, nil, vol)
 		if err != nil {
 			rt.Fatalf("Load: %v", err)
 		}
@@ -82,7 +83,7 @@ func TestLoadRefusesCorruptedChunks(t *testing.T) {
 
 		view := cow.NewIntervalMap()
 		view.Overwrite(0, bytes.Repeat([]byte{0xAB}, 2048))
-		if _, err := image.Publish(ctx, store, vol, view, 1, ""); err != nil {
+		if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, view, 1, ""); err != nil {
 			rt.Fatal(err)
 		}
 
@@ -110,7 +111,7 @@ func TestLoadRefusesCorruptedChunks(t *testing.T) {
 			rt.Fatal(err)
 		}
 
-		if _, _, _, err := image.Load(ctx, store, vol); err == nil {
+		if _, _, _, err := image.Load(ctx, store, nil, vol); err == nil {
 			rt.Fatal("a corrupted chunk loaded without complaint; the guest would be served zeros or wrong bytes")
 		}
 	})

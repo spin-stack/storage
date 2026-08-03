@@ -852,19 +852,26 @@ view, which the map did not expose), a §25.2 round-trip property test over arbi
 writes and discards, corruption tests for truncation and bit flips, and the
 compare-and-set that is the whole of V1's fencing. All green.
 
-**Nothing calls it, and that is deliberate: the chunks are plaintext.** §15/INV-15 says
-nothing leaves the host in cleartext, so wiring it as it stands would put guest data in
-the bucket in the clear. The wiring was written, found this, and was reverted rather than
-landed.
+**Chunks are sealed (2026-08-02).** The first version wrote plaintext and its round-trip
+property test passed happily, which is why the assertion that matters is on the bucket:
+`TestPublishedChunksAreCiphertext` greps the published objects for the guest's bytes.
 
-**The open question is the nonce**, and it is a review-zone decision. `crypto.DEK.Seal`
-derives its nonce from (volumeID, epoch, sequence) — unique per WAL record by
-construction. A chunk has no sequence. Deriving it from the chunk's plaintext digest is
-unique per content and keeps content-addressing working, so an unchanged region still
-costs nothing to re-publish; it also makes equality of plaintexts observable within a
-volume, which is a property to accept explicitly rather than arrive at. Nonce reuse across
-two plaintexts under one DEK is catastrophic in GCM, so this is decided before anything
-calls `Publish`.
+**The nonce is drawn, never derived, and a chunk is sealed exactly once — ever.** Those
+two together are what make reuse impossible: a nonce covers exactly one plaintext, because
+the plaintext that produced the key is the only one that will ever be sealed under it. A
+chunk whose key already exists is skipped rather than re-sealed, which is also what keeps
+dedup. `TestAnUnchangedChunkIsNeverResealed` pins the mechanism by republishing with a
+different random source and asserting the bytes did not move.
+
+Both derived alternatives were rejected: a generation counter is written *before* the
+compare-and-set that decides which writer wins, so two hosts at the same generation with
+different content would seal two plaintexts under one nonce; and the plaintext digest
+makes the nonce a function of the secret. The cost accepted is the one every deduplicating
+encrypted store pays — equality of plaintexts is observable within a volume, to someone
+who can already read the bucket.
+
+**Still not wired.** `Volume.stop` publishing and `fetchBase` loading are written and
+reverted once (see below); landing them is the rest of increment 2.
 
 **What the reverted wiring also established**, and what the next attempt should expect:
 
