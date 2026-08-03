@@ -106,6 +106,53 @@ func chunkKey(volumeID [16]byte, digest string) string {
 	return Prefix(volumeID) + "chunks/" + digest
 }
 
+// SnapshotKey is where a named, frozen point of a volume lives. It sits under the
+// volume's own prefix so it shares the chunk store: a snapshot of a volume that has
+// barely changed costs almost nothing, which is what makes §2's primary use case —
+// frequent cloning from snapshots — affordable.
+func SnapshotKey(volumeID [16]byte, snapshotID string) string {
+	return Prefix(volumeID) + "snapshots/" + snapshotID + ".json"
+}
+
+// ErrSnapshotExists means a snapshot with that id was already published. §5.2/INV-16: a
+// published snapshot never changes, so this is a refusal rather than an overwrite — and
+// it is the difference between a snapshot and the volume's own manifest, which is CASed
+// because it is *meant* to move.
+var ErrSnapshotExists = errors.New("image: this snapshot is already published and snapshots are immutable")
+
+// PublishSnapshot freezes a view under a name. The caller froze it (wal.Log.Freeze);
+// this writes it down.
+//
+// Create-only, because §5.2 says a PUBLISHED snapshot is immutable and because two
+// writers racing to publish the same id must not both think they won. The chunks are the
+// volume's own, so nothing is copied that already exists.
+func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, view *cow.IntervalMap, seq uint64, snapshotID string) (string, error) {
+	man, err := uploadChunks(ctx, store, rnd, enc, volumeID, view, seq)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(man)
+	if err != nil {
+		return "", err
+	}
+	res, err := store.Put(ctx, SnapshotKey(volumeID, snapshotID), body, objectstore.PutOptions{IfNoneMatch: true})
+	if errors.Is(err, objectstore.ErrPreconditionFailed) {
+		return "", fmt.Errorf("%w: %s", ErrSnapshotExists, snapshotID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("image: publishing snapshot %s: %w", snapshotID, err)
+	}
+	return res.ETag, nil
+}
+
+// LoadSnapshot reads a named frozen point. It is what a clone reads: the parent's *live*
+// image would carry writes the parent made after the snapshot, which is not what a clone
+// descending from that snapshot is entitled to see.
+func LoadSnapshot(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, snapshotID string) (*cow.IntervalMap, Manifest, error) {
+	view, man, _, err := loadManifest(ctx, store, enc, volumeID, SnapshotKey(volumeID, snapshotID))
+	return view, man, err
+}
+
 // Publish writes the volume's state and CASes the manifest over it.
 //
 // Order matters and it is the same order every publish protocol in this repository uses:
@@ -118,45 +165,10 @@ func chunkKey(volumeID [16]byte, digest string) string {
 // published while this one was uploading, and overwriting it is the silent lost update
 // that ADR-0026 keeps fencing for.
 func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, view *cow.IntervalMap, seq uint64, prevETag string) (string, error) {
-	man := Manifest{VolumeID: format.UUIDString(volumeID), Sequence: seq}
-
-	for _, r := range view.Ranges() {
-		for off := r.Offset; off < r.Offset+r.Length; {
-			n := min64(uint64(MaxChunkBytes), r.Offset+r.Length-off)
-			buf := make([]byte, n)
-			view.Read(off, buf)
-
-			sum := sha256.Sum256(buf)
-			digest := hex.EncodeToString(sum[:])
-
-			// A chunk that already exists holds exactly these bytes — the key is their
-			// digest — so it is skipped rather than re-uploaded. That is what makes a
-			// second stop cheap when little changed, and it is also what makes the
-			// encryption safe: skipping means the chunk is sealed exactly once, ever,
-			// so its nonce is used for exactly one plaintext.
-			if _, err := store.Head(ctx, chunkKey(volumeID, digest)); err == nil {
-				man.Chunks = append(man.Chunks, Chunk{Offset: off, Length: n, Digest: digest})
-				off += n
-				continue
-			} else if !errors.Is(err, objectstore.ErrNotFound) {
-				return "", fmt.Errorf("image: checking chunk at %d: %w", off, err)
-			}
-
-			body, err := seal(rnd, enc, volumeID, digest, buf)
-			if err != nil {
-				return "", fmt.Errorf("image: sealing chunk at %d: %w", off, err)
-			}
-			// Create-only: a race that puts the same bytes under the same key is
-			// harmless — whichever ciphertext wins decrypts to the same plaintext.
-			_, err = store.Put(ctx, chunkKey(volumeID, digest), body, objectstore.PutOptions{IfNoneMatch: true})
-			if err != nil && !errors.Is(err, objectstore.ErrPreconditionFailed) {
-				return "", fmt.Errorf("image: uploading chunk at %d: %w", off, err)
-			}
-			man.Chunks = append(man.Chunks, Chunk{Offset: off, Length: n, Digest: digest})
-			off += n
-		}
+	man, err := uploadChunks(ctx, store, rnd, enc, volumeID, view, seq)
+	if err != nil {
+		return "", err
 	}
-
 	body, err := json.Marshal(man)
 	if err != nil {
 		return "", err
@@ -175,6 +187,53 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 	return res.ETag, nil
 }
 
+// uploadChunks puts every region the view holds in the store and returns the manifest
+// describing them. It is shared by Publish and PublishSnapshot: the two differ only in
+// which object the manifest is written to and under what precondition, and a second
+// implementation of "put the bytes there" is a second place for the sealing rule to be
+// forgotten.
+func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, view *cow.IntervalMap, seq uint64) (Manifest, error) {
+	man := Manifest{VolumeID: format.UUIDString(volumeID), Sequence: seq}
+
+	for _, r := range view.Ranges() {
+		for off := r.Offset; off < r.Offset+r.Length; {
+			n := min64(uint64(MaxChunkBytes), r.Offset+r.Length-off)
+			buf := make([]byte, n)
+			view.Read(off, buf)
+
+			sum := sha256.Sum256(buf)
+			digest := hex.EncodeToString(sum[:])
+
+			// A chunk that already exists holds exactly these bytes — the key is their
+			// digest — so it is skipped rather than re-uploaded. That is what makes a
+			// second stop (or a second snapshot) cheap when little changed, and it is
+			// also what makes the encryption safe: skipping means a chunk is sealed
+			// exactly once, ever, so its nonce covers exactly one plaintext.
+			if _, err := store.Head(ctx, chunkKey(volumeID, digest)); err == nil {
+				man.Chunks = append(man.Chunks, Chunk{Offset: off, Length: n, Digest: digest})
+				off += n
+				continue
+			} else if !errors.Is(err, objectstore.ErrNotFound) {
+				return Manifest{}, fmt.Errorf("image: checking chunk at %d: %w", off, err)
+			}
+
+			body, err := seal(rnd, enc, volumeID, digest, buf)
+			if err != nil {
+				return Manifest{}, fmt.Errorf("image: sealing chunk at %d: %w", off, err)
+			}
+			// Create-only: a race that puts the same bytes under the same key is
+			// harmless — whichever ciphertext wins decrypts to the same plaintext.
+			_, err = store.Put(ctx, chunkKey(volumeID, digest), body, objectstore.PutOptions{IfNoneMatch: true})
+			if err != nil && !errors.Is(err, objectstore.ErrPreconditionFailed) {
+				return Manifest{}, fmt.Errorf("image: uploading chunk at %d: %w", off, err)
+			}
+			man.Chunks = append(man.Chunks, Chunk{Offset: off, Length: n, Digest: digest})
+			off += n
+		}
+	}
+	return man, nil
+}
+
 // Load reads a volume's image into a read view, and returns the manifest's ETag so the
 // caller can CAS against it when it publishes in turn.
 //
@@ -182,41 +241,46 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 // a volume being served for the first time has written nothing, and refusing it would
 // make the first boot the one case that cannot work.
 func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte) (*cow.IntervalMap, Manifest, string, error) {
-	head, err := store.Head(ctx, ManifestKey(volumeID))
+	return loadManifest(ctx, store, enc, volumeID, ManifestKey(volumeID))
+}
+
+// loadManifest reads one manifest and the chunks it names. Shared by Load and
+// LoadSnapshot, which differ only in which key they read.
+//
+// Every failure is closed. A manifest that names a chunk which is not there is a *broken*
+// image, not an empty one, and the difference matters: an empty view reads as zeros, and
+// a guest cannot tell those from a range it never wrote.
+func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, key string) (*cow.IntervalMap, Manifest, string, error) {
+	head, err := store.Head(ctx, key)
 	if errors.Is(err, objectstore.ErrNotFound) {
 		return nil, Manifest{}, "", ErrNotPublished
 	}
 	if err != nil {
-		return nil, Manifest{}, "", fmt.Errorf("image: reading the manifest: %w", err)
+		return nil, Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
 	}
-	body, err := store.Get(ctx, ManifestKey(volumeID))
+	body, err := store.Get(ctx, key)
 	if err != nil {
-		return nil, Manifest{}, "", fmt.Errorf("image: reading the manifest: %w", err)
+		return nil, Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
 	}
 	var man Manifest
 	if err := json.Unmarshal(body, &man); err != nil {
-		return nil, Manifest{}, "", fmt.Errorf("image: parsing the manifest: %w", err)
+		return nil, Manifest{}, "", fmt.Errorf("image: parsing %s: %w", key, err)
 	}
 	if man.VolumeID != format.UUIDString(volumeID) {
-		return nil, Manifest{}, "", fmt.Errorf("image: manifest at %s describes volume %s",
-			ManifestKey(volumeID), man.VolumeID)
+		return nil, Manifest{}, "", fmt.Errorf("image: manifest at %s describes volume %s", key, man.VolumeID)
 	}
 
 	view := cow.NewIntervalMap()
 	for _, c := range man.Chunks {
 		data, err := store.Get(ctx, chunkKey(volumeID, c.Digest))
 		if err != nil {
-			// A manifest naming a chunk that is not there is a broken image, not an
-			// empty one. Failing closed matters: the alternative is a view with a hole
-			// in it, which reads as zeros and is indistinguishable from a range the
-			// guest never wrote.
 			return nil, Manifest{}, "", fmt.Errorf("image: chunk %s at offset %d: %w", c.Digest, c.Offset, err)
 		}
 		plain, err := open(enc, volumeID, c.Digest, data)
 		if err != nil {
 			return nil, Manifest{}, "", fmt.Errorf("image: chunk %s at offset %d: %w", c.Digest, c.Offset, err)
 		}
-		// The digest is the key, so verifying it is checking the store kept its promise
+		// The digest is the key, so verifying it checks the store kept its promise
 		// rather than checking our own arithmetic — and a backend that returns the wrong
 		// object for a key is exactly what §6.1's conformance suite exists to catch. It
 		// is checked on the *plaintext*, because that is what the key names.
@@ -227,8 +291,7 @@ func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, vol
 			return nil, Manifest{}, "", fmt.Errorf("image: chunk %s is %d bytes, manifest says %d",
 				c.Digest, len(plain), c.Length)
 		}
-		data = plain
-		view.Overwrite(c.Offset, data)
+		view.Overwrite(c.Offset, plain)
 	}
 	return view, man, head.ETag, nil
 }

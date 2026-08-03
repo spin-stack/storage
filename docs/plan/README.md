@@ -17,10 +17,12 @@ Each row answers one question, and no two answer the same one.
 **The `*-SPEC.md` files are review artefacts, not a category.** `CLAUDE.md` asks for a
 spec before implementing *only* inside a human-review zone; everywhere else the increment
 is the plan. So each one exists to be read by a person before a risky change, and once
-that change has landed its decisions belong in comments at the code. Two of them are cited
-by `.go` files (`DURABILITY-SCHEDULER-SPEC.md`, `VIEW-ADOPTION-SPEC.md`); the rest are
-reachable only from `STATUS.md`. Treat a spec whose increment is done as history, which
-this directory keeps in git rather than in the tree.
+that change has landed its decisions belong in comments at the code. One of them is cited
+by a `.go` file (`VIEW-ADOPTION-SPEC.md`); the rest are reachable only from `STATUS.md`.
+Treat a spec whose increment is done as history, which this directory keeps in git rather
+than in the tree — `SNAPSHOT-LIFECYCLE-SPEC.md` and `OBJECTIZATION-SPEC.md` were removed on
+that rule (2026-08-03), the first superseded by ADR-0026 increment 3 and the second
+describing a V2 object kind whose readers no longer exist.
 
 The count that used to open this file ("Eight entries") had been wrong for a while, in the
 direction that matters: the directory kept growing and the map did not. A number here is a

@@ -78,7 +78,15 @@ volume produce one object and one loud refusal — not two objects.
 
 ---
 
-## Increment 3 — a snapshot is an `fsync` and a copy
+## Increment 3 — a snapshot is an `fsync` and a copy *(mechanism done 2026-08-03)*
+
+**Done:** `wal.Log.Freeze` (§19's capture + seal), `image.PublishSnapshot`/`LoadSnapshot`
+(create-only, chunks shared with the volume's image), `agent.VolumeManager.Snapshot`, and
+`parentView` reading the *snapshot* rather than the parent's live image — which was a live
+defect, not a refactor. **Not done: nothing can ask for a snapshot.** The trigger is a
+`pending_snapshot_id` on `DesiredVolume` and the taken id back on `VolumeReport`, plus the
+column the Control Plane sets and clears; it reaches into `schema.sql` and is its own
+increment, tracked in `STATUS.md`.
 
 | Piece | Where | Why |
 |---|---|---|

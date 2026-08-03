@@ -60,3 +60,20 @@ func TestPlantedBugACloneReadsZeros(t *testing.T) {
 		return aCloneReadsThroughItsParent(s, chainLinkDropped)
 	})
 }
+
+// §19's whole content: a snapshot is a sequence number, so a copy taken at one is frozen
+// while the source VM keeps writing. Without that, "snapshot" names whatever the volume
+// held when the upload happened to finish.
+//
+// Planted by taking the snapshot after the later writes — which is not an approximation
+// of the bug, it is byte-for-byte what an implementation that copies the live view
+// publishes. No fault is injected anywhere: the disk, the store and the clock all behave.
+//
+// The checker is the one that already watches the bytes a guest receives, via its
+// foreign-bytes arm: the clone is served a write made after the moment it descends from.
+func TestPlantedBugASnapshotIsNotFrozen(t *testing.T) {
+	requirePasses(t, 31, NewDurableRangeChecker(), scenarioASnapshotOfALiveVolumeIsFrozen)
+	plantedBug(t, 31, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
+		return aSnapshotOfALiveVolumeIsFrozen(s, snapshotTakenLate)
+	})
+}

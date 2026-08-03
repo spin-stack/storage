@@ -678,6 +678,40 @@ func (l *Log) UnflushedBytes() int64 {
 	return l.unflushedBytes
 }
 
+// Freeze seals the current read view under a sequence number and hands it back, leaving
+// the volume writing into a fresh layer over it. It is §19's snapshot, and §19 is what
+// makes it possible:
+//
+//  1. capture N = local_sequence under the volume's lock (µs)
+//  2. keep accepting writes normally (sequences > N)
+//     3b. seal a CoW view of the active map at sequence N
+//
+// The seal is one pointer. cow.NewIntervalMapOver layers a new map over the old one and
+// never writes through to it — "the base is read, never written" — so the map handed back
+// is immutable from this moment by construction rather than by a rule somebody has to
+// remember. That is where §2's "pausa de I/O por snapshot ~0" comes from: there is no
+// queue to drain and no quiesce, only a swap.
+//
+// The fdatasync comes first because the frozen view describes records the local WAL must
+// still hold if this process dies before the copy is uploaded.
+//
+// The caller owns the returned view and must not mutate it; PublishSnapshot only reads.
+func (l *Log) Freeze() (*cow.IntervalMap, uint64, error) {
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.broken {
+		return nil, 0, ErrLogBroken
+	}
+	if err := l.segs.sync(); err != nil {
+		return nil, 0, err
+	}
+	frozen := l.view
+	l.view = cow.NewIntervalMapOver(frozen)
+	return frozen, l.local, nil
+}
+
 func (l *Log) ViewAtRest() (*cow.IntervalMap, uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

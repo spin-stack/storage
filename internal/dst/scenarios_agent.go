@@ -17,7 +17,6 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
-	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
@@ -35,6 +34,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "fenced-volume-stops-serving", Run: scenarioFencedVolumeStopsServing},
 		{Name: "a-stopped-volume-comes-back-from-its-image", Run: scenarioAStoppedVolumeComesBackFromItsImage},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
+		{Name: "a-snapshot-of-a-live-volume-is-frozen", Run: scenarioASnapshotOfALiveVolumeIsFrozen},
 	}
 }
 
@@ -322,22 +322,17 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	}
 	parentVol := [16]byte(pu)
 
-	// The parent writes and publishes its image. Everything the clone will read lives
-	// under the parent's id from here on.
-	//
-	// Under ADR-0026 that publish *is* the snapshot: a parent's state in the object store
-	// is its image, and a clone reads it with the same operation a boot uses. It used to
-	// be a checkpoint plus the WAL objects after it, assembled into a snapshot manifest.
+	// The parent writes and publishes a snapshot. Everything the clone will read lives
+	// under the parent's id from here on, in chunks the snapshot's manifest names — the
+	// clone copies nothing, which is §20's whole claim.
 	payload := bytes.Repeat([]byte{0x77}, 4096)
-	lm := lease.NewManager(s.Clock, time.Minute)
-	lm.Grant()
+	snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
 	parentDone := cow.NewIntervalMap()
 	parentDone.Overwrite(0, payload)
-	if _, err := image.Publish(ctx, s.Store, s.Rand, nil, parentVol, parentDone, 1, ""); err != nil {
-		return fmt.Errorf("publishing the parent's image: %w", err)
+	if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, parentVol, parentDone, 1, snapID); err != nil {
+		return fmt.Errorf("publishing the parent's snapshot: %w", err)
 	}
-	snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
-	s.Notef("parent %s published its image", parentID)
+	s.Notef("parent %s published snapshot %s", parentID, snapID)
 
 	// The clone: its own volume id, its own empty WAL, and a desired state that names
 	// what it descends from.
@@ -397,6 +392,142 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 		return fmt.Errorf("clone read %x, the parent wrote %x", got[:8], payload[:8])
 	}
 	s.Notef("clone %s read its parent's bytes through the snapshot, with no data copy", cloneID)
+	return nil
+}
+
+// scenarioASnapshotOfALiveVolumeIsFrozen is §19 as a guest experiences it, and the only
+// place "snapshot" means anything.
+//
+// The source VM is not stopped and not paused: it writes pattern A, a snapshot is taken,
+// it writes pattern B over the same offset, and a clone of that snapshot must read **A**.
+// If it reads B the copy was never frozen — it is whatever the volume happened to hold
+// when the upload finished, which is a snapshot of no moment in particular.
+//
+// §19 is what makes this cost nothing: freezing is a pointer swap (cow.NewIntervalMapOver
+// layers a new map over the old and never writes through to it), so the "pause" §2 budgets
+// at ~0 really is one lock acquisition. The scenario drives it through the *Agent*, not
+// through wal.Freeze, because the sequence-capture and the upload are on opposite sides of
+// the seam this project keeps breaking.
+func scenarioASnapshotOfALiveVolumeIsFrozen(s *Sim) error {
+	return aSnapshotOfALiveVolumeIsFrozen(s, snapshotFrozen)
+}
+
+const (
+	snapshotFrozen = false
+	// snapshotTakenLate models the implementation that does not freeze: the copy is taken
+	// from the live view, so it carries every write that landed between the snapshot and
+	// the upload. Reached here by taking the snapshot after the later writes, which is
+	// byte-for-byte what an unfrozen implementation publishes.
+	snapshotTakenLate = true
+)
+
+func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
+	ctx := context.Background()
+	sourceID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	cloneID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	before := bytes.Repeat([]byte{0xA1}, 4096)
+	after := bytes.Repeat([]byte{0xB2}, 4096)
+
+	start := func(dataDir string) (*agent.VolumeManager, error) {
+		return agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: dataDir, SocketDir: "/run/spin",
+			Limits:         wal.Limits{SegmentBytes: 8192},
+			HostID:         ids.NewAt(simEpoch*1000, s.Rand).String(),
+			CheckpointPoll: 24 * time.Hour,
+		}, agent.VolumeManagerDeps{
+			Clock:   s.Clock,
+			Disk:    s.Disk,
+			Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+			Mapper:  simMapper{},
+			EventFD: simEventFD,
+			Store:   s.Store,
+			Rand:    s.Rand,
+		})
+	}
+
+	source, err := start("/var/lib/spin")
+	if err != nil {
+		return err
+	}
+	// The source VM stays up for the whole scenario, including while the clone reads. A
+	// snapshot that only works once its parent has stopped is the stop-and-upload path
+	// with extra steps.
+	defer func() { _ = source.Close() }()
+	if err := source.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: sourceID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}); err != nil {
+		return fmt.Errorf("starting the source volume: %w", err)
+	}
+	dev, ok := source.Device(sourceID)
+	if !ok {
+		return errors.New("the source volume is not being served")
+	}
+	// The read is what waits for the base; driving the volume before it lands makes the
+	// trace depend on a goroutine's timing (INV-02).
+	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
+		return fmt.Errorf("waiting for the read view: %w", err)
+	}
+	if _, err := dev.WriteAt(before, 0); err != nil {
+		return fmt.Errorf("the write before the snapshot: %w", err)
+	}
+	if !late {
+		if err := source.Snapshot(ctx, sourceID, snapID); err != nil {
+			return fmt.Errorf("snapshotting the live volume: %w", err)
+		}
+	}
+	// The guest carries on. This is the write the snapshot must not contain.
+	if _, err := dev.WriteAt(after, 0); err != nil {
+		return fmt.Errorf("the write after the snapshot: %w", err)
+	}
+	if late {
+		s.Emit(Event{Kind: EventFault, Msg: "the snapshot is taken from the live view, after the later writes"})
+		if err := source.Snapshot(ctx, sourceID, snapID); err != nil {
+			return fmt.Errorf("snapshotting the live volume: %w", err)
+		}
+	}
+	s.Notef("volume %s snapshotted as %s while still writing", sourceID, snapID)
+
+	// The clone, on its own data directory so only the snapshot can answer.
+	clone, err := start("/var/lib/spin-clone")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = clone.Close() }()
+	if err := clone.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
+		Durability:       storagev1.Durability_DURABILITY_REMOTE,
+		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		ParentSnapshotId: snapID,
+		ParentVolumeId:   sourceID,
+	}}); err != nil {
+		return fmt.Errorf("starting the clone: %w", err)
+	}
+	cdev, ok := clone.Device(cloneID)
+	if !ok {
+		return errors.New("the clone is not being served")
+	}
+
+	got := make([]byte, len(before))
+	if _, err := cdev.ReadAt(got, 0); err != nil {
+		return fmt.Errorf("the clone's read: %w", err)
+	}
+	// "Bytes it never wrote" is exactly right for the failure: the clone descends from a
+	// point where the offset held A, and it is served B — a write made by another volume
+	// after the moment this one claims to copy.
+	foreign := bytes.Equal(got, after)
+	s.Emit(Event{Kind: EventDurableRead, Key: cloneID,
+		ZerosAfterRestart:        bytes.Equal(got, make([]byte, len(got))),
+		ForeignBytesAfterRestart: foreign})
+	if foreign {
+		return fmt.Errorf("clone %s read the write that followed snapshot %s: the copy was not frozen (§19)", cloneID, snapID)
+	}
+	if !bytes.Equal(got, before) {
+		return fmt.Errorf("clone read %x, the snapshot held %x", got[:8], before[:8])
+	}
+	s.Notef("clone %s read the snapshot's bytes, not the %d the source wrote afterwards", cloneID, len(after))
 	return nil
 }
 

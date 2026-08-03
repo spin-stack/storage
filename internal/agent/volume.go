@@ -640,12 +640,12 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		"cloned_from", d.GetParentSnapshotId())
 }
 
-// parentView loads the image of the volume this one was cloned from, or returns nil for
-// a volume that was created rather than cloned (§20).
+// parentView loads the snapshot this volume was cloned from, or returns nil for a volume
+// that was created rather than cloned (§20).
 //
-// It used to materialize the parent's *snapshot* from a checkpoint plus the WAL objects
-// after it. Under ADR-0026 a parent's state is its image, and reading it is the same
-// operation a boot performs — one manifest and its chunks, no replay.
+// It used to materialize that snapshot from a checkpoint plus the WAL objects after it.
+// Under ADR-0026 a snapshot is one manifest naming chunks the parent already wrote, and
+// reading it is the same operation a boot performs — no replay, and no data copied.
 //
 // The ids come from the desired state rather than a lookup: ADR-0021 keeps this type from
 // knowing what a Control Plane is, so the Control Plane is what tells it.
@@ -671,15 +671,20 @@ func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.
 	if err != nil {
 		return nil, err
 	}
-	view, _, _, err := image.Load(ctx, m.deps.Store, penc, [16]byte(u))
+	// The *snapshot*, not the parent's live image. A parent that is still running has
+	// written past the point this clone descends from, and its image carries those
+	// writes — so loading it would hand the clone a state its snapshot never described.
+	// §19 is what makes the distinction cheap: the snapshot is a frozen view at a
+	// sequence, sharing the parent's chunks.
+	view, _, err := image.LoadSnapshot(ctx, m.deps.Store, penc, [16]byte(u), snapID)
 	if errors.Is(err, image.ErrNotPublished) {
-		// A parent that never stopped cleanly has no image. That is not this volume's
-		// failure to hide: a clone whose parent published nothing would read zeros for
-		// everything the parent wrote, which is DEV-0007's shape.
-		return nil, fmt.Errorf("agent: volume %s clones parent %s, which has published no image", v.id, parentVol)
+		// Not this volume's failure to hide: a clone whose parent snapshot was never
+		// published would read zeros for everything the parent wrote — DEV-0007's shape.
+		return nil, fmt.Errorf("agent: volume %s clones snapshot %s of %s, which was never published",
+			v.id, snapID, parentVol)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("agent: loading the image of parent %s of volume %s: %w", parentVol, v.id, err)
+		return nil, fmt.Errorf("agent: loading snapshot %s of parent %s for volume %s: %w", snapID, parentVol, v.id, err)
 	}
 	return view, nil
 }
@@ -858,3 +863,42 @@ func (m *VolumeManager) Close() error {
 }
 
 var _ VolumeSource = (*VolumeManager)(nil)
+
+// Snapshot freezes a running volume under a name and publishes the frozen copy.
+//
+// It is §19 end to end and it does not stop the guest: Freeze captures the sequence and
+// swaps the read view under the volume's lock, the guest carries on writing into a fresh
+// layer, and the upload happens afterwards against a map nothing can mutate. §2's "pausa
+// de I/O por snapshot ~0" is that swap.
+//
+// The snapshot does *not* become the volume's image. They are different things with
+// different lives: the image is where this volume resumes, the snapshot is a named point
+// others descend from. Coupling them would make taking a snapshot change what a restart
+// reads, which is not something anybody asked for.
+func (m *VolumeManager) Snapshot(ctx context.Context, volumeID, snapshotID string) error {
+	m.mu.Lock()
+	v, ok := m.volumes[volumeID]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("agent: volume %s is not being served here", volumeID)
+	}
+	if m.deps.Store == nil {
+		return fmt.Errorf("agent: volume %s has no object store to snapshot into", volumeID)
+	}
+	if v.log.BasePending() {
+		// Snapshotting before the base lands would freeze a view missing everything the
+		// volume held before this session — the same hazard Volume.publish waits for,
+		// and here it would be written down under a name others clone from.
+		return fmt.Errorf("agent: volume %s is still loading its read view", volumeID)
+	}
+
+	frozen, seq, err := v.log.Freeze()
+	if err != nil {
+		return fmt.Errorf("agent: volume %s: freezing at a sequence: %w", volumeID, err)
+	}
+	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.vol, frozen, seq, snapshotID); err != nil {
+		return fmt.Errorf("agent: volume %s: publishing snapshot %s: %w", volumeID, snapshotID, err)
+	}
+	slog.Info("snapshot published", "volume_id", volumeID, "snapshot_id", snapshotID, "sequence", seq)
+	return nil
+}

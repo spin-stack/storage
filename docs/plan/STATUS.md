@@ -426,54 +426,27 @@ must stay: it uses `Progress.UpTo` for `guardDurableFloor` and the recovery poin
 materialization is the *proof* INV-09 rests on. Changing what that proves is a
 fencing/durability review-zone decision, not a cleanup.
 
-**Snapshot sealing is split (2026-08-02, `SNAPSHOT-LIFECYCLE-SPEC.md`).** §19 separates a
-snapshot into "capturar atómicamente N (µs)" and, *in background*, making N durable and
-publishing the manifest. `Create` did both in one blocking call. `Capture` and `Seal` are
-now separate, `Create` is their composition, and a `Captured` value carries the `CREATING`
-state the lifecycle vocabulary had and nothing ever produced.
+**Snapshot sealing — superseded 2026-08-03 by ADR-0026 increment 3.** `internal/snapshot`
+and its `Capture`/`Seal` split went with the checkpoint chain in increment 4;
+`SNAPSHOT-LIFECYCLE-SPEC.md` described a package that no longer exists and is deleted. §19's split
+survives in a smaller form — `wal.Log.Freeze` is the capture, `image.PublishSnapshot` is
+the seal — and two of that spec's findings carried over intact: the manifest is
+create-only so a retry converges on its own manifest and refuses a different one at the
+same id (`image.ErrSnapshotExists`), and the pause is measured where the capture is, not
+around the whole operation.
 
-No goroutine was added, deliberately: "in background" is the caller's property — the Agent
-has io-class budgets to spend it against (INV-17) and spin's runner may own the lifecycle
-(ADR-0021) — so a `go` statement in a library would be a policy decision taken in the
-wrong place.
+**§19's two mandatory metrics are unrecorded again.** `internal/obs` registers
+`snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds`; the code that
+observed them was deleted with `internal/snapshot`, and `VolumeManager.Snapshot` does not
+observe them yet. It belongs with the trigger increment, because a metric nobody records
+is a metric that is missing during the first incident that needs it.
 
-Two things it found:
-
-- **A retried `Seal` failed.** The manifest is published create-only, so the second
-  attempt got `ErrPreconditionFailed`. That is the exact case a background seal produces —
-  die between the PUT and whatever records PUBLISHED — and failing is the worst of the
-  three outcomes, because the manifest exists, is immutable (INV-16) and is a GC root
-  (§21.3), and the caller would write FAILED beside it. It converges on its *own* manifest
-  now, and refuses a different one at the same id (`ErrSnapshotConflict`): two snapshots
-  claiming one id is not something a retry can reconcile.
-- **§19's two mandatory metrics had never been recorded.** `internal/obs` has registered
-  `snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds` since Phase 01
-  and nothing observed either. `Capture` and `Seal` do now, and a test asserts it — a
-  metric nobody records is a metric that is missing during the first incident that needs
-  it.
-
-The pause test also earned its keep: the old one measured `Create`, which captures *and*
-seals, and passed because the simulated clock only advances when something works — proving
-the pause was zero without proving where the work went. `TestCaptureIsTheWholePause` holds
-the two apart: after a capture, nothing is durable, nothing is listed, and no manifest
-exists.
-
-**Objectization (segment objects) is specified and deliberately not implemented** —
-`OBJECTIZATION-SPEC.md`. §21.1's steps 4–7 (publish the checkpoint, advance, truncate) are
-done and proven end to end; steps 1–3 (build, upload and verify segments) **do not exist at
-all**: no `segments/` prefix, no producer, no consumer. It is a feature, not a defect, and
-the system is correct without it — what it buys is bounded replay, which is RISK-04's cold
-RTO and a performance property.
-
-It is a phase rather than the tail of an increment: a new on-S3 object kind with its own
-§25.2 property test, a `Checkpoint` format change, `recovery`/`materialize` reading both
-kinds (the code INV-08 and INV-09 rest on), and a third anchored kind for the GC (INV-14).
-Doing all four in the session that closed five other DEV items is how a format change gets
-merged without anyone reading it. The spec says what shape it should take and what to
-assert first: *a view rebuilt from segments + tail is byte-identical to the same view
-rebuilt from WAL alone.*
-
-§22.4's lazy loading — what the cold RTO actually needs — is designed and not implemented.
+**Objectization, lazy loading and the cold-RTO work are withdrawn, not deferred to a spec.**
+`OBJECTIZATION-SPEC.md` described segments feeding `recovery` and `materialize`, both of
+which are gone (increment 4); the spec is deleted with them. Bounded replay is not a property V1 has: there is no
+mid-session replay to bound. §22.4's lazy loading is the same. Under ADR-0026 the cold path
+is one manifest and its chunks, and what shortens it is placement (increment 5), not a new
+object kind.
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 
@@ -608,8 +581,9 @@ category as `CloneCrossHost`: tested, plausible, and called by nothing.
 One fact left with it, so a future reader can find it: `SegmentSize` was where §4/§13.1's
 **64 KiB CoW granularity** appeared in code. It survives in
 `arquitectura_mvp_volumenes_remotos_v5.md` and in `REFERENCE.md`'s §13.1 row, and
-`OBJECTIZATION-SPEC.md` already plans a different value (128 MiB) and a different
-structure — so the constant was not just unused, it was a value nothing intends to keep.
+the objectization spec planned a different value (128 MiB) and a different structure — so
+the constant was not just unused, it was a value nothing intends to keep. (That spec is
+gone too, with the object kind it described.)
 
 Production coverage 90.7% → 90.6%; the file was at 100%, so removing it lowers the
 average slightly. That is the floor working as intended rather than a regression.
@@ -1011,6 +985,39 @@ planted bugs.
 Six checkers have now been retired with their subjects across 4 and 4.5; the planted-proof
 ratchet is 8 → 6, each step with its reason beside the constant.
 
+## ADR-0026 increment 3 — a snapshot is a frozen view, since 2026-08-03
+
+**★ on-S3 format.** A snapshot is `image/<vol>/snapshots/<snap>.json`, a manifest naming
+chunks under the same `image/<vol>/chunks/` prefix the volume's own image uses. Nothing is
+copied: a snapshot of a volume that has not changed since the last one uploads **zero new
+chunks**, which is what makes §2's frequent-clone case affordable.
+
+**`wal.Log.Freeze` is §19's three steps in one operation** — `fdatasync`, capture
+`N = local`, and swap `l.view` for a fresh layer over the old one. The seal is a pointer:
+`cow.NewIntervalMapOver` never writes through to its base, so the view handed back is
+immutable by construction rather than by a rule someone has to remember. That is where §2's
+"pausa de I/O por snapshot ~0" comes from — there is no queue to drain and no quiesce.
+
+**Two mechanisms, because they are two objects with different lives.** The volume's
+manifest moves and is written with a CAS; a snapshot never moves and is written
+create-only (`ErrSnapshotExists`, §5.2/INV-16). And a snapshot does **not** advance the
+volume's image: coupling them would make taking a snapshot change what a restart reads.
+
+**A live defect closed on the way.** `parentView` loaded the parent's *live image*, so a
+clone of a still-running parent would read writes made after the point it claims to
+descend from. It loads the snapshot now. The DST arm is the observable that shows the
+difference: write A, snapshot, write B over it, and a clone reads **A** while the source VM
+is still up. The planted bug is taking the snapshot after the later writes — not an
+approximation of "did not freeze", but byte-for-byte what that implementation publishes.
+
+**What is not done, and it is the honest half of this row.** `VolumeManager.Snapshot` has
+**no production caller**: nothing in the Control Plane can ask a host to take a snapshot.
+`DesiredVolume` carries no pending-snapshot field and `VolumeReport` carries no taken-id,
+so production can *consume* snapshots (the clone path does) and cannot *produce* them. The
+trigger is its own increment — a proto field each way, plus the volume column the Control
+Plane sets and clears — and it is listed below with the other callerless components rather
+than left implied by this section.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
@@ -1019,10 +1026,11 @@ listed here, in the file that tracks state, because until now each was recorded 
 inside the spec or ADR that built it — which is how a thing stays "done" while nothing
 calls it.
 
-- **`internal/snapshot` has no production caller.** `NewSnapshotter`/`Snapshotter.Create`
-  are reached only from `internal/dst` and unit tests; no binary and no lane creates a
-  snapshot. This is the honest state of phase 09, and it was written down only in
-  `SNAPSHOT-LIFECYCLE-SPEC.md`.
+- **`agent.VolumeManager.Snapshot` has no production caller** (increment 3, above). The
+  mechanism is complete and proven; the *request* path does not exist. Consistent with
+  ADR-0021 it can only be desired state — the Agent cannot be asked anything, it is told —
+  so the shape is a `pending_snapshot_id` on `DesiredVolume` and the id back on
+  `VolumeReport`, which reaches into `schema.sql` and is therefore its own increment.
 - **INV-17 has no path through the real Agent.** `VolumeManagerDeps.IOClass` is set by
   nothing outside `internal/agent/durability_internal_test.go`, and
   `ioclass.Scheduler.Begin`/`End` have no production caller at all — so even with a
