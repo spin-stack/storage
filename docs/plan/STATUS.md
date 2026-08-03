@@ -899,12 +899,23 @@ increment 3 (snapshot as `fsync` plus a copy) come *before* increment 4 cuts `re
 `materialize`, `checkpoint` and the remote half of `wal` — because deleting first leaves no
 way to serve a volume.
 
-**Increment 0 is the architecture document, and it is the owner's.** §2 still declares
-"RPO 0 bajo el modelo de fallas probado por DST", so every deletion in increments 1-4
-contradicts it. CLAUDE.md makes an observed doc↔code divergence a DEV entry and an open
-DEV blocks the gate — so until §2's SLO table and §14.8 are revised, the rest of the
-inventory **cannot pass its own gate**. That is not a formality; it is the first thing
-that will stop the work.
+**Increment 0's blocking half is done (2026-08-02).** §2's SLO table and §14.8 were
+rewritten in place: the RPO is one session, the two durability modes collapse to one
+contract, and §2 records that the withdrawn "RPO 0" row — not the use case — is what
+generated the remote chain. The gate is unblocked.
+
+**The rest of the document goes with its code, not before it.** §12, §21 and §22 still
+describe promotion, objectization and mid-session recovery, and the code still cites
+them — 57 references to §12.3 alone, all inside `controlplane/promotion.go` and its
+neighbours. Sections leave in the same commit as the code that cited them, exactly as the
+ADRs did in the earlier sweep, so no commit exists where the tree cites a section that is
+not there. `REFERENCE.md` carries the command that checks it.
+
+Rewriting the document from scratch was considered and rejected: the code cites it by
+section number **2.106 times**, so a new document would have to preserve the numbering —
+at which point it *is* the old one with sections removed, and writing it fresh only risks
+losing what survives untouched (§14.1's record layout, §26.2's metric catalog, §23's edge
+cases, §6.1's backend requirements).
 
 **What is *not* paused:** anything outside the durability chain. The transport, the block
 device, the read view, the guest lane and the documentation work are unaffected by

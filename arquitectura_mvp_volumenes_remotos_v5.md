@@ -87,17 +87,20 @@ Las decisiones "aceptadas en el MVP" solo son evaluables contra un caso de uso d
 
 **SLOs objetivo del MVP** (medidos, no prometidos contractualmente):
 
-| Métrica | Objetivo MVP |
+| Métrica | Objetivo V1 |
 |---|---|
-| RPO (writes cubiertos por FLUSH/FUA) | 0 bajo el modelo de fallas probado por DST |
-| RPO (writes no flusheados) | ≤ `max_unflushed_age` (30 s default) |
-| Latencia FLUSH p99 (backend misma región/red local) | < 100 ms objetivo; < 500 ms alerta |
-| RTO failover cross-host con standby tibio | minutos (replay desde último checkpoint) |
-| RTO failover cross-host sin standby (frío) | horas; documentado por GiB en el runbook |
-| Pausa de I/O por snapshot | ~0 (crash-consistent, sin quiesce) |
+| **RPO** | **una sesión.** Un FLUSH/FUA ACKeado es durable frente a la caída del proceso, del Agent y de QEMU — no frente a la pérdida del host. |
+| Latencia de FLUSH | la de `fdatasync` local. S3 no está en el camino del ACK. |
+| Pausa de I/O por snapshot | ~0 (crash-consistent, sin quiesce; el punto congelado es un número de secuencia, §19) |
 | Pausa de I/O por deploy/crash del Agent | segundos (reconexión vhost-user), sin reinicio de VM |
+| Boot de un clon en el host de origen | sin descarga (§20) |
+| Boot de un clon en otro host | descarga completa; medido por GiB, no prometido |
 
-Workloads con fsync intensivo (bases de datos transaccionales exigentes) son **soportados pero no el objetivo de optimización** del MVP: pagan la latencia de PUT en cada commit. Se documenta explícitamente al usuario.
+**El RPO de una sesión es una decisión, no una limitación pendiente de arreglar** (ADR-0026). Un host que muere a mitad de sesión pierde todo lo escrito desde que el volumen se atachó. Se documenta explícitamente al usuario, sin letra chica.
+
+Es coherente con el caso de uso de arriba: nadie pide que un runner de CI sobreviva a la muerte de su host. La versión anterior de esta tabla pedía **RPO 0 bajo el modelo de fallas probado por DST**, y esa fila —no el caso de uso— es la que generaba la cadena de durabilidad remota completa: subida por cada FLUSH, ACK gobernado por lease, checkpoints, promoción y recuperación a mitad de sesión. Nadie la había pedido.
+
+Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un requisito real detrás.
 
 ---
 
@@ -836,29 +839,31 @@ El storage converge al working set en lugar de crecer monotónicamente. Métrica
 
 Rotación a ~256 MiB o en checkpoint. Nunca truncar por encima de `published_sequence` verificado.
 
-### 14.8 Modos de durabilidad por volumen (nuevo en v5.1)
+### 14.8 El contrato de ACK (V1)
 
-Atributo `durability` por volumen, **fijado en la creación** (cambio solo vía operación administrativa explícita con `request_id`, nunca silencioso). El guest no puede detectar la diferencia — el contrato es con el operador, por lo que el modo es visible en API, PG y métricas.
-
-**`remote` (default)** — el contrato de v5: ACK de FLUSH/FUA tras `fdatasync` local + PUTs verificados en S3 + lease vigente. RPO 0 para writes cubiertos, bajo el modelo de fallas probado.
-
-**`local`** — para CI/dev y cargas que prefieren latencia:
+Un solo contrato, para todos los volúmenes. El atributo `durability` por volumen y el par
+`remote`/`local` se retiraron con **ADR-0026**: un modo que nadie selecciona es un segundo
+contrato que mantener correcto gratis.
 
 ```text
-FLUSH/FUA → fdatasync local → ACK        (sin esperar S3, sin depender del lease)
-S3        → asíncrono (batcher normal), RPO ≤ max_unflushed_age
+FLUSH/FUA → fdatasync local → ACK        (sin esperar a S3, sin depender del lease)
 ```
 
-Reglas del modo `local`:
+Reglas:
 
-1. **Snapshots idénticos en ambos modos**: un snapshot `PUBLISHED` está siempre completo y verificado en S3. Es el mecanismo para obtener puntos de RPO 0 portables bajo demanda en un volumen `local`.
-2. **El RPO se mide, no se asume**: `wal_durable_gap_seconds{volume}` y `wal_durable_gap_bytes{volume}` obligatorias; alerta si el gap se acerca a `max_unflushed_age`. La subida en background permanece activa para que el RPO típico sea de segundos, no el límite.
-3. **Fencing**: la regla de lease (§12.2) no aplica al ACK de FLUSH en modo `local` (el ACK es local). Sí aplica, idéntica, a publicar checkpoints, manifests y snapshots. Consecuencia operativa: **PG caído no degrada FLUSH de los volúmenes `local`** — la debilidad §29.2 aplica solo a volúmenes `remote`.
-4. **Recovery tras pérdida del host**: el punto durable sigue siendo el prefijo contiguo en S3 (§5.8); se pierden hasta `max_unflushed_age` de writes, incluidos FLUSHes ACKeados. Esto está en el contrato del modo y en la documentación al usuario, sin letra chica.
-5. **DST parametrizado por modo**: `remote` verifica ACK ⊆ prefijo durable; `local` verifica ACK ⊆ fdatasync local y gap ≤ límite.
-6. Los límites de unflushed (§5.7) y el backpressure aplican igual en ambos modos.
-
-Efecto colateral buscado: los volúmenes `local` reducen drásticamente la presión sobre el cliente S3 y el batcher (menos PUTs en el camino crítico), lo que también mejora el p99 de los volúmenes `remote` del mismo host.
+1. **El ACK es local.** `fdatasync` es una garantía real frente a la caída del proceso, del
+   Agent y de QEMU. La pérdida del host queda fuera, y eso es el RPO de §2.
+2. **S3 recibe el volumen al parar**, no en cada FLUSH: una subida por sesión, más una copia
+   por snapshot (§19). Es la única durabilidad que sale del host, y es la que un arranque
+   posterior o un clon leen.
+3. **Dos incarnaciones no pueden subir las dos.** Es lo único que el fencing tiene que
+   garantizar en V1 (§12): un compare-and-set sobre un objeto en el momento de parar. Dos
+   hosts subiendo es una pérdida de actualización silenciosa, y es la propiedad que no se
+   relaja al simplificar.
+4. **Los snapshots son completos en S3** (§19): `fsync` y una copia congelada en un número de
+   secuencia. Es el mecanismo para obtener un punto portable bajo demanda.
+5. Los límites de unflushed (§5.7) y el backpressure aplican igual.
+6. **El guest no puede detectar nada de esto.** El contrato es con el operador.
 
 ---
 

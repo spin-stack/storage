@@ -8,6 +8,28 @@
 > Empty means every ADR the code cites resolves here. Swap the pattern for `INV-` or
 > `DEV-` for the other two. This replaces the dated "up to date as of …" note that used
 > to serve the same purpose and could only ever be true on the day it was written.
+>
+> The same check for the architecture document, which matters while ADR-0026 removes
+> sections — a `§` the code cites must still exist:
+> ```
+> D=arquitectura_mvp_volumenes_remotos_v5.md
+> grep -rhoE '(virtio 1\.2 )?§[0-9]+(\.[0-9]+)*' --include='*.go' . |
+>   grep -v '^virtio' | sed 's/§//' | sort -u |
+>   while read s; do
+>     # §14.3.1 and §14.3.4 are numbered *rules inside* §14.3, and §29.4/§30.3 are
+>     # items inside a numbered list rather than headings — so a match on the parent
+>     # counts. Anything else that does not resolve is a citation left dangling by a
+>     # section this document no longer has.
+>     grep -qE "^#+ ${s%.*}[ .]|^#+ ${s}[ .]" "$D" || echo "dangling §${s}"
+>   done
+> ```
+> Two things it deliberately does *not* flag, and both would make it noise if it did: the
+> `virtio 1.2 §N` citations, which are a different specification entirely (see the warning
+> above), and sub-rule numbering. A check that cries wolf gets ignored, which is worse than
+> no check — this repository has learned that one more than once.
+>
+> Sections leave the document *with the code that cited them*, in the same commit, so this
+> stays empty rather than being repaired afterwards.
 
 The code carries **2.106 references** across 228 of its 264 Go files: `§14.4`, `INV-13`,
 `ADR-0017`, `DEV-0007`. They are deliberate — they are what lets a reader check that a
