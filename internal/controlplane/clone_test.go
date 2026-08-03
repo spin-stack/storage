@@ -9,6 +9,7 @@ import (
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -50,7 +51,8 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	clone, err := controlplane.Clone(ctx, md, store, term, snapID, cloneVol, cloneHostA, nil)
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
+	clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,11 +88,13 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"}, nil)
 	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID})
 
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
+
 	stale := term
 	if _, err := md.AcquireLeadership(ctx, "cp-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Clone(ctx, md, store, stale, snapID, cloneVol, cloneHostA, nil); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, stale, snapID, cloneVol); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("want ErrStaleTerm, got %v", err)
 	}
 }
@@ -98,7 +102,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 func TestCloneFromMissingSnapshotFails(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
-	if _, err := controlplane.Clone(ctx, md, store, term, "no-such-snap", cloneVol, cloneHostA, nil); !errors.Is(err, metadata.ErrNotFound) {
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, "no-such-snap", cloneVol); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("clone from a missing snapshot: want ErrNotFound, got %v", err)
 	}
 }
@@ -123,16 +127,95 @@ func TestResizeGrowsOnly(t *testing.T) {
 // TestAFailedCloneChargesNothing is ADR-0017's structural claim, kept as its regression
 // guard: the destination is charged when the volume row naming it exists, and a clone
 // that fails never writes one. There is no delta anybody has to remember to reverse.
+//
+// The refusal now comes from placement rather than from CreateVolume's predicate,
+// because Clone computes its own bound from the host it chose — so a bound the clone
+// cannot fit is a fleet with no room, and Choose says so first. The predicate itself is
+// covered where it lives, in metadatatest's capacity case.
 func TestAFailedCloneChargesNothing(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
-	if err := md.UpsertHost(ctx, term, metadata.Host{
-		HostID: cloneHostA, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
-	}); err != nil {
+	// A host with no room for the clone: total is smaller than the volume.
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<20)
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
+		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	// A bound the clone cannot fit: the write is refused by CreateVolume's own
-	// predicate, which is the authoritative check (§28.2).
+	createSnapshot(t, md, term, cloneHostA)
+
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol); !errors.Is(err, placement.ErrNoCapacity) {
+		t.Fatalf("want ErrNoCapacity, got %v", err)
+	}
+	if dst, _ := md.GetHost(ctx, cloneHostA); dst.NVMeCommittedBytes != 0 {
+		t.Fatalf("a refused clone leaked %d committed bytes", dst.NVMeCommittedBytes)
+	}
+	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("a refused clone must not create the volume: %v", err)
+	}
+}
+
+// §20's placement rule 1, and under ADR-0026 most of the boot-time story: a cross-host
+// clone pays a full download from the object store, a same-host clone reads local NVMe.
+// The host that took the snapshot is the one that still has the data, and it is a fact
+// rather than a guess because that host stamped it when it published (increment 3b).
+//
+// The second case is the half that must not be assumed away. Same-host is a preference:
+// the source can be cordoned, full or gone, and coupling scheduling to a host with no
+// obligation to be up would turn a fast path into an outage.
+func TestACloneStartsWhereTheDataAlreadyIs(t *testing.T) {
+	const sourceHost, otherHost = cloneHostA, "00000000-0000-7000-8000-0000000000d2"
+	tests := []struct {
+		name       string
+		sourceStat lifecycle.HostState
+		sourceCap  int64
+		want       string
+	}{
+		{"the source host holds the data", lifecycle.HostActive, 1 << 40, sourceHost},
+		// Emptier than the source, so a policy that merely balanced would pick it in
+		// both rows and this table would prove nothing.
+		{"the source is cordoned", lifecycle.HostCordoned, 1 << 40, otherHost},
+		{"the source is full", lifecycle.HostActive, 1 << 20, otherHost},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			md, store, term := cpStore(t)
+			addHost(t, md, term, sourceHost, tc.sourceStat, tc.sourceCap)
+			addHost(t, md, term, otherHost, lifecycle.HostActive, 1<<41)
+			if err := md.CreateVolume(ctx, term, metadata.Volume{
+				VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
+				State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+			}, nil); err != nil {
+				t.Fatal(err)
+			}
+			createSnapshot(t, md, term, sourceHost)
+
+			clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol)
+			if err != nil {
+				t.Fatalf("Clone: %v", err)
+			}
+			if clone.PrimaryHostID != tc.want {
+				t.Fatalf("clone placed on %s, want %s", clone.PrimaryHostID, tc.want)
+			}
+			// And the bytes are charged where it landed, not where it was asked for.
+			h, _ := md.GetHost(ctx, tc.want)
+			if h.NVMeCommittedBytes != 1<<30 {
+				t.Fatalf("host %s committed %d bytes, want the clone's %d", tc.want, h.NVMeCommittedBytes, 1<<30)
+			}
+		})
+	}
+}
+
+// A snapshot that is not PUBLISHED has nothing written for a clone to read: the objects
+// are still being uploaded, or the upload failed. Cloning it would produce a volume that
+// reads zeros for everything its parent wrote — DEV-0007's shape, reached through the
+// catalog instead of through a missing field.
+func TestCloneRefusesASnapshotThatWasNeverPublished(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
 		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
@@ -140,20 +223,35 @@ func TestAFailedCloneChargesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 1,
-		RootDigest: "d", State: lifecycle.SnapshotPublished, RequestID: reqID,
+		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1,
+		State: lifecycle.SnapshotCreating, RequestID: reqID,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := controlplane.Clone(ctx, md, store, term, snapID, cloneVol, cloneHostA,
-		&metadata.CapacityBound{HostID: cloneHostA, AddBytes: 1 << 30, Limit: 1})
-	if !errors.Is(err, metadata.ErrCapacityExceeded) {
-		t.Fatalf("want ErrCapacityExceeded, got %v", err)
-	}
-	if dst, _ := md.GetHost(ctx, cloneHostA); dst.NVMeCommittedBytes != 0 {
-		t.Fatalf("a refused clone leaked %d committed bytes", dst.NVMeCommittedBytes)
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol); err == nil {
+		t.Fatal("a snapshot that was never published was accepted as a clone source")
 	}
 	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("a refused clone must not create the volume: %v", err)
+	}
+}
+
+func addHost(t *testing.T, md metadata.Store, term int64, id string, state lifecycle.HostState, total int64) {
+	t.Helper()
+	if err := md.UpsertHost(t.Context(), term, metadata.Host{
+		HostID: id, State: state, NVMeTotalBytes: total,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createSnapshot(t *testing.T, md metadata.Store, term int64, sourceHost string) {
+	t.Helper()
+	if err := md.CreateSnapshot(t.Context(), term, metadata.Snapshot{
+		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10,
+		RootDigest: "abc", SourceHostID: sourceHost,
+		State: lifecycle.SnapshotPublished, RequestID: reqID,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

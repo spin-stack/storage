@@ -768,7 +768,7 @@ ADR-0016 and `REFERENCE.md`, where §12.6 is cited for what it actually says —
 lease is per host. `task dst` produces the same trace on the same seed, which is the
 point: nothing changed except where a reader is sent.
 
-## `placement.Policy` is implemented and the clone path does not call it
+## ~~`placement.Policy` is implemented and the clone path does not call it~~ *(closed 2026-08-03, increment 5)*
 
 Found while accepting ADR-0026, and it matters more under it than it did before.
 
@@ -1061,6 +1061,37 @@ be written six times for six requests. And the "stops being reported" property n
 *both* of its mechanisms broken to go red — Status answering only about the pending id,
 and the map being pruned — which is written next to the test rather than left as an
 implied stronger claim.
+
+## ADR-0026 increment 5 — a clone starts where its data already is, since 2026-08-03
+
+`controlplane.Clone` asks `placement.Policy.Choose` instead of being handed a host, and
+`control-plane -clone-snapshot` is the caller that makes either of them run in production.
+Both were previously reachable only from tests: `Choose`'s one production caller was the
+drain, deleted in increment 4, and `Clone`'s was never written.
+
+**Step 1 of §20 is now a fact rather than a guess.** The snapshot's `source_host_id` is
+stamped by the host that took it (increment 3b), and that host still holds the data on
+local NVMe — which under ADR-0026 is most of the boot-time story, because a cross-host
+clone pays a full download with no warm standby and no lazy loading to shorten it. The
+table-driven test pins both halves: the clone lands on the source host, and it lands
+*elsewhere* when that host is cordoned or full. The fallback host is deliberately emptier
+than the source, so a policy that merely balanced would pick it in every row and the table
+would prove nothing.
+
+**The bound is computed where the decision is taken.** `Choose` is pure and advisory
+(ADR-0017), so `Clone` hands `CreateVolume` the same `Limit` it admitted against, and the
+ceiling is a predicate of the statement that places the bytes rather than a check some
+steps before it.
+
+**A snapshot that is not PUBLISHED is refused.** Its objects may still be uploading, or
+the upload failed; cloning it produces a volume that reads zeros for everything its parent
+wrote — DEV-0007's shape, reached through the catalog instead of through a missing field.
+
+**The e2e lane found a real race in its own first version.** It waited for the snapshot
+manifest to appear in the *bucket* and then cloned, and the clone was refused: the object
+lands a reconcile cycle before the catalog row leaves CREATING. It now waits on the
+desired state — the pending id arriving and then clearing — which observes the whole round
+trip and is the honest definition of "the snapshot exists".
 
 ## Components with no production caller
 

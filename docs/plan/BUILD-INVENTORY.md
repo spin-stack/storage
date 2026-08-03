@@ -128,7 +128,11 @@ it went red is a stop signal.
 
 ---
 
-## Increment 5 — the clone starts where the data already is
+## Increment 5 — the clone starts where the data already is *(done 2026-08-03)*
+
+`Clone` takes a `placement.Policy` and no host; `control-plane -clone-snapshot` is the
+production caller both it and `Choose` were missing. The snapshot's `source_host_id` is
+what makes step 1 real, and increment 3b is what stamps it.
 
 | Piece | Where | Why |
 |---|---|---|

@@ -9,28 +9,68 @@ import (
 
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
+	"github.com/spin-stack/storage/internal/placement"
 )
 
-// Clone creates a new, independent volume from a parent snapshot as a same-host
-// clone (§20): it is pure metadata — a new active child at epoch 1 that reuses the
-// parent snapshot's already-durable objects, with no data copy. Cross-host
-// materialization is Phase 11. The clone inherits the parent's size, block size,
-// durability, and DEK (so it can read the shared base), and increments the chain
-// depth (§20.1). Returns the new volume's descriptor-shaped record.
+// Clone creates a new, independent volume from a parent snapshot (§20): it is pure
+// metadata — a new active child at epoch 1 that reuses the parent snapshot's
+// already-durable objects, with no data copy. The clone inherits the parent's size,
+// block size, durability, and DEK (so it can read the shared base), and increments the
+// chain depth (§20.1). Returns the new volume's descriptor-shaped record.
 //
-// bound is the §28.2 ceiling the new volume is placed under (ADR-0017): creating it
-// is what charges newHostID, so it is the write the bound belongs to. A same-host
-// clone that the caller has already admitted may pass nil.
-func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, term int64,
-	parentSnapshotID, newVolumeID, newHostID string, bound *metadata.CapacityBound,
+// **Where it lands is decided here, not passed in.** policy.Choose implements §20's
+// three steps — source host, a host with the data cached, any host with capacity — and
+// step 1 is most of the boot-time story under ADR-0026: a cross-host clone pays a full
+// download from the object store, with no warm standby and no lazy loading to shorten
+// it, while a same-host clone reads local NVMe. The snapshot's source_host_id is what
+// makes that possible, and it is a fact rather than a guess because the host that took
+// the snapshot stamped it (§19, increment 3b).
+//
+// Two things it deliberately is not. Same-host is a *preference*: Choose falls through
+// when that host is full, cordoned or gone, and making it mandatory would couple
+// scheduling to a host with no obligation to be up. And the locality is time-bounded —
+// the source host holds the data only while it still holds the volume, so once the
+// source stops, step 1 buys nothing and the clone pays the download.
+//
+// The §28.2 ceiling travels with the write rather than being checked here (ADR-0017):
+// Choose is pure and advisory, so two callers reading the same fleet pick the same
+// destination and both commit. Limit is the same number Choose admitted against, handed
+// to the statement that places the bytes.
+func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, policy placement.Policy,
+	term int64, parentSnapshotID, newVolumeID string,
 ) (metadata.Volume, error) {
 	snap, err := md.GetSnapshot(ctx, parentSnapshotID)
 	if err != nil {
 		return metadata.Volume{}, err
 	}
+	if snap.State != lifecycle.SnapshotPublished {
+		// A clone of a snapshot whose objects are not written yet reads zeros for
+		// everything its parent wrote — DEV-0007's shape, reached through the catalog
+		// instead of through a missing field.
+		return metadata.Volume{}, fmt.Errorf("controlplane: snapshot %s is %s, not PUBLISHED: nothing has been written for a clone to read",
+			parentSnapshotID, snap.State)
+	}
 	parent, err := md.GetVolume(ctx, snap.VolumeID)
 	if err != nil {
 		return metadata.Volume{}, err
+	}
+	hosts, err := md.ListHosts(ctx)
+	if err != nil {
+		return metadata.Volume{}, err
+	}
+	newHostID, err := policy.Choose(hosts, placement.Request{
+		SizeBytes: parent.SizeBytes,
+		// The host that took the snapshot still has its data on local NVMe.
+		SourceHostID: snap.SourceHostID,
+	})
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("controlplane: placing a clone of snapshot %s: %w", parentSnapshotID, err)
+	}
+	bound := &metadata.CapacityBound{HostID: newHostID, AddBytes: parent.SizeBytes}
+	for _, h := range hosts {
+		if h.HostID == newHostID {
+			bound.Limit = policy.Limit(h)
+		}
 	}
 	clone := metadata.Volume{
 		VolumeID:      newVolumeID,
