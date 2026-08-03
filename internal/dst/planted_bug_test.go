@@ -654,7 +654,6 @@ var plantedProofs = map[string]proofKind{
 	// Contributed by scenarios_agent.go; proof in planted_bug_agent_test.go.
 	"fenced-volume-not-served":       proofBehavioural,
 	"durable-range-survives-restart": proofBehavioural,
-	"checkpoint-requires-lease":      proofBehavioural,
 }
 
 // TestEveryCheckerHasAPlantedBugProof fails when a checker is added without one, so
@@ -681,7 +680,11 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 // sweeper. A decrease for any other reason is the weakening this test exists to catch,
 // and the comment is the difference between the two.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 15
+	// 15 -> 14 on 2026-08-02, and again the decrease is the shape this test allows: the
+	// checkpoint-lease checker was removed *with its subject*. ADR-0026 withdrew the
+	// durability scheduler, so nothing publishes a checkpoint and the checker could not
+	// fire. A decrease for any other reason is the weakening this exists to catch.
+	const wantBehavioural = 14
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {

@@ -19,7 +19,6 @@ import (
 	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/lifecycle"
-	"github.com/spin-stack/storage/internal/materialize"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -611,14 +610,6 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		"volume_id", id, "epoch", d.GetEpoch(), "socket", socket,
 		"resumed", resuming, "encrypted", enc != nil)
 
-	if err := m.checkpointsEnabled(); err != nil {
-		// Said once, at start, rather than every poll: a volume that will never reclaim
-		// a byte is worth one line explaining why.
-		slog.Info("no durability scheduler for this volume; local WAL will not be reclaimed",
-			"volume_id", id, "reason", err)
-	} else {
-		go m.checkpointLoop(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()))
-	}
 	return v, nil
 }
 
@@ -701,41 +692,52 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		"cloned_from", d.GetParentSnapshotId())
 }
 
-// parentView materializes the snapshot this volume was cloned from, or returns nil for
-// a volume that was created rather than cloned.
+// parentView loads the image of the volume this one was cloned from, or returns nil for
+// a volume that was created rather than cloned (§20).
 //
-// The ids come from the desired state rather than a lookup: ADR-0021 keeps this type
-// from knowing what a Control Plane is, so the Control Plane is what tells it.
+// It used to materialize the parent's *snapshot* from a checkpoint plus the WAL objects
+// after it. Under ADR-0026 a parent's state is its image, and reading it is the same
+// operation a boot performs — one manifest and its chunks, no replay.
+//
+// The ids come from the desired state rather than a lookup: ADR-0021 keeps this type from
+// knowing what a Control Plane is, so the Control Plane is what tells it.
 func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.DesiredVolume) (*cow.IntervalMap, error) {
 	snapID, parentVol := d.GetParentSnapshotId(), d.GetParentVolumeId()
 	if snapID == "" {
 		return nil, nil //nolint:nilnil // no parent is a shape, not a failure
 	}
 	if parentVol == "" {
-		// Half a link is worse than none: it would materialize nothing and install a
-		// base that silently reads as zeros for the parent's whole extent.
+		// Half a link is worse than none: it would load nothing and install a base that
+		// silently reads as zeros for the parent's whole extent.
 		return nil, fmt.Errorf("agent: volume %s names parent snapshot %s with no parent volume", v.id, snapID)
 	}
-	// The parent's records need the parent's Encryption, which is *not* this volume's
-	// even though the DEK is the same one. A clone inherits the parent's DEK and its
-	// version (controlplane.Clone: DEKWrapped, KEKID, DEKKeyID) precisely so the
-	// chain's objects stay readable — but crypto.deriveNonce and crypto.aad both bind
-	// the volume id, and Encryption.Decrypt opens with its own VolumeID rather than the
-	// record's. Handing v.enc here would fail Open on every record the parent wrote.
+	u, err := ids.Parse(parentVol)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s names parent volume %q, which is not a uuid: %w", v.id, parentVol, err)
+	}
+	// The parent's chunks are sealed under the parent's id, and a clone inherits the
+	// parent's DEK and its version (controlplane.Clone) precisely so the chain stays
+	// readable — but the AAD binds the volume id, so the key has to be re-bound. Handing
+	// this volume's own Encryption would fail to open every chunk the parent wrote.
 	penc, err := m.parentEncryption(v, parentVol)
 	if err != nil {
 		return nil, err
 	}
-	view, _, err := materialize.New(m.deps.Store, m.deps.IOClass, penc).
-		FromSnapshot(ctx, parentVol, snapID)
+	view, _, _, err := image.Load(ctx, m.deps.Store, penc, [16]byte(u))
+	if errors.Is(err, image.ErrNotPublished) {
+		// A parent that never stopped cleanly has no image. That is not this volume's
+		// failure to hide: a clone whose parent published nothing would read zeros for
+		// everything the parent wrote, which is DEV-0007's shape.
+		return nil, fmt.Errorf("agent: volume %s clones parent %s, which has published no image", v.id, parentVol)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("agent: materializing parent snapshot %s of volume %s: %w", snapID, parentVol, err)
+		return nil, fmt.Errorf("agent: loading the image of parent %s of volume %s: %w", parentVol, v.id, err)
 	}
 	return view, nil
 }
 
-// parentEncryption re-binds this volume's DEK to its parent's id, which is what opens
-// the objects the parent wrote. Returns nil for an unencrypted volume.
+// parentEncryption re-binds this volume's DEK to its parent's id, which is what opens the
+// chunks the parent wrote. Returns nil for an unencrypted volume.
 func (m *VolumeManager) parentEncryption(v *Volume, parentVol string) (*wal.Encryption, error) {
 	if v.enc == nil {
 		return nil, nil //nolint:nilnil // no encryption is a mode, not a failure — see encryptionFor

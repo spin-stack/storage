@@ -13,13 +13,13 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
-	"github.com/spin-stack/storage/internal/epoch"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
-	"github.com/spin-stack/storage/internal/snapshot"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -34,17 +34,15 @@ import (
 func agentScenarios() []MandatoryScenario {
 	return []MandatoryScenario{
 		{Name: "fenced-volume-stops-serving", Run: scenarioFencedVolumeStopsServing},
-		{Name: "lapsed-lease-stops-publishing", Run: scenarioLapsedLeaseStopsPublishing},
 		{Name: "crashed-flush-does-not-collide-on-restart", Run: scenarioCrashedFlushDoesNotCollideOnRestart},
 		{Name: "agent-encrypts-what-leaves-the-host", Run: scenarioAgentEncryptsWhatLeavesTheHost},
 		{Name: "a-stopped-volume-comes-back-from-its-image", Run: scenarioAStoppedVolumeComesBackFromItsImage},
-		{Name: "local-volume-drains-without-claiming", Run: scenarioLocalVolumeDrainsWithoutClaimingWithoutALease},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
 	}
 }
 
 func agentCheckers() []Checker {
-	return []Checker{NewFencedVolumeChecker(), NewDurableRangeChecker(), NewCheckpointLeaseChecker()}
+	return []Checker{NewFencedVolumeChecker(), NewDurableRangeChecker()}
 }
 
 // FencedVolumeChecker enforces the Agent's half of INV-10 (§16, §12.3): once the
@@ -290,215 +288,6 @@ func (c *DurableRangeChecker) Observe(e Event) {
 }
 
 func (c *DurableRangeChecker) Check() error { return c.violation }
-
-// CheckpointLeaseChecker enforces the *other* half of §12.2. The sentence names two
-// things a SELF_FENCED Agent stops doing — "deja de ACKear durabilidad, deja de publicar
-// checkpoints/manifests" — and only the first has ever had a checker
-// (DurableAckLeaseChecker, INV-06, on the FLUSH path). This watches the second: no
-// checkpoint object appears while the host's lease is invalid.
-//
-// It matters because the two gates protect different things. A durable ACK under a
-// lapsed lease tells a guest its data is safe when another writer may already own the
-// volume. A *checkpoint* under a lapsed lease is worse in one specific way: publishing
-// advances `published`, and advancing `published` is what authorises throwing away the
-// last local copy of the WAL (INV-13). A fenced host that publishes is a fenced host
-// deleting data the writer that replaced it may still need.
-type CheckpointLeaseChecker struct{ violation error }
-
-// NewCheckpointLeaseChecker returns a fresh checker.
-func NewCheckpointLeaseChecker() *CheckpointLeaseChecker { return &CheckpointLeaseChecker{} }
-
-func (c *CheckpointLeaseChecker) Name() string { return "checkpoint-requires-lease" }
-
-func (c *CheckpointLeaseChecker) Observe(e Event) {
-	if e.Kind == EventCheckpoint && e.PublishedWithoutLease && c.violation == nil {
-		c.violation = fmt.Errorf("volume %s published a checkpoint at step %d with an invalid lease (violates §12.2)",
-			e.Key, e.Step)
-	}
-}
-
-func (c *CheckpointLeaseChecker) Check() error { return c.violation }
-
-// scenarioLapsedLeaseStopsPublishing drives the durability scheduler across the moment
-// the host's lease expires.
-//
-// The volume is healthy in every other respect: the epoch object names this host, so
-// §12.4's ownership check inside checkpoint.Create *passes*, and the object store is
-// reachable and answers honestly. Nothing has taken the volume away — being fenced by a
-// lapsed lease is precisely the case where nobody has, yet. The single `if` at the top of
-// checkpointOnce is all that stands between this Agent and a published checkpoint, which
-// is what makes it worth a checker.
-func scenarioLapsedLeaseStopsPublishing(s *Sim) error {
-	return lapsedLeaseStopsPublishing(s, leaseAskedEveryTime)
-}
-
-const (
-	// leaseAskedEveryTime is the honest wiring: the lease is resolved per call, which is
-	// what agent.applyLease does and why volume.go warns against capturing a manager.
-	leaseAskedEveryTime = false
-	// leaseAnsweredFromASnapshot is the bug: the lease question asked once at start-up
-	// and never asked again. Not a hypothetical — it is the shortcut every other Agent
-	// scenario here takes, harmlessly, because their leases never lapse.
-	leaseAnsweredFromASnapshot = true
-)
-
-func lapsedLeaseStopsPublishing(s *Sim, cacheTheLease bool) error {
-	ctx := context.Background()
-	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
-	hostID := ids.NewAt(simEpoch*1000, s.Rand).String()
-
-	// §12.4: the epoch is granted to *this* host, so VerifyPublisher will let the
-	// checkpoint through. Without this the volume would have no epoch object and Create
-	// would allow the publish for a different reason (§22.5) — proving less.
-	es := epoch.NewStore(s.Store)
-	etag, err := es.Init(ctx, volumeID, 0)
-	if err != nil {
-		return fmt.Errorf("seeding the epoch object: %w", err)
-	}
-	if _, err := es.Grant(ctx, volumeID, etag, 1, hostID); err != nil {
-		return fmt.Errorf("granting epoch 1 to this host: %w", err)
-	}
-
-	const leaseTTL = 10 * time.Second // §10 `lease_ttl: 10s`
-	lm := lease.NewManager(s.Clock, leaseTTL)
-	lm.Grant()
-
-	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir: "/var/lib/spin", SocketDir: "/run/spin", HostID: hostID,
-		Limits: wal.Limits{SegmentBytes: 8192},
-	}, agent.VolumeManagerDeps{
-		Clock:   s.Clock,
-		Disk:    s.Disk,
-		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
-		Mapper:  simMapper{},
-		EventFD: simEventFD,
-		Store:   s.Store,
-		Lease: func() bool {
-			if cacheTheLease {
-				return true
-			}
-			return lm.Valid()
-		},
-	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = m.Close() }()
-
-	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
-		VolumeId: volumeID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_REMOTE,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
-	}}); err != nil {
-		return fmt.Errorf("starting the volume: %w", err)
-	}
-	dev, ok := m.Device(volumeID)
-	if !ok {
-		return errors.New("the volume is not being served")
-	}
-
-	// Under a valid lease: write, flush, and checkpoint. This half is the control — if
-	// the scheduler could not publish here, the silence after the lapse would prove
-	// nothing about the lease.
-	payload := bytes.Repeat([]byte{0x5A}, 4096)
-	for i := range 4 {
-		if _, err := dev.WriteAt(payload, int64(i)*4096); err != nil {
-			return fmt.Errorf("guest write %d: %w", i, err)
-		}
-	}
-	if err := dev.Flush(ctx); err != nil {
-		return fmt.Errorf("the FLUSH under a valid lease: %w", err)
-	}
-	// A read before the checkpoint, because the read is what waits for the base and a
-	// checkpoint taken while it is pending is declined (wal.BasePending). That used to
-	// apply only to a *resumed* volume; since a promoted destination turned out to need
-	// a base too, every volume with an object store waits for one — and a real Agent
-	// satisfies this ordering by itself, because the guest reads.
-	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
-		return fmt.Errorf("the read that waits for the base: %w", err)
-	}
-	s.Emit(Event{Kind: EventDurableAck, Durable: 4, LeaseValid: lm.Valid()})
-	if err := m.Checkpoint(ctx, volumeID); err != nil {
-		return fmt.Errorf("the checkpoint under a valid lease was refused: %w", err)
-	}
-	underLease, err := countCheckpoints(ctx, s, volumeID)
-	if err != nil {
-		return err
-	}
-	if underLease == 0 {
-		return errors.New("no checkpoint was published under a valid lease: the lapse below would prove nothing")
-	}
-	s.Notef("volume %s: %d checkpoint(s) published while the lease was valid", volumeID, underLease)
-
-	// The lease lapses. Nothing renews it — a partitioned Agent, a Control Plane that
-	// cannot reach Postgres (§23, "PostgreSQL caído"). The host is SELF_FENCED on its own monotonic clock,
-	// with no message from anyone.
-	s.Tick(leaseTTL + time.Second)
-	if lm.Valid() {
-		return errors.New("the lease did not lapse: the scenario advanced past its TTL")
-	}
-	s.Emit(Event{Kind: EventFault, Msg: "the host lease lapsed with no renewal (SELF_FENCED, §12.2)"})
-
-	// More guest writes, and a FLUSH that must fail. A scheduler that declined because
-	// there was nothing new to publish would look identical to one that declined because
-	// of the lease, so there has to be something new — and this is how a real partitioned
-	// Agent produces it. §14.4 orders the steps: the objects are uploaded (step 4) and
-	// *then* the lease is checked (step 5), so a lapsed lease leaves the WAL objects in
-	// S3 and refuses the ACK. The store can now prove a longer durable prefix than this
-	// volume ever ACKed, which is exactly the material a checkpoint publishes.
-	newBytes := bytes.Repeat([]byte{0xA5}, 4096)
-	for i := range 4 {
-		if _, err := dev.WriteAt(newBytes, int64(4+i)*4096); err != nil {
-			return fmt.Errorf("guest write after the lapse %d: %w", i, err)
-		}
-	}
-	if ferr := dev.Flush(ctx); ferr == nil {
-		// The ACK escaped. That is INV-06, not the property this scenario is named for —
-		// and a cached lease answer breaks both gates, because one function feeds both.
-		// It is emitted rather than returned so DurableAckLeaseChecker sees it too, and
-		// the scenario carries on to the gate it exists to watch.
-		s.Emit(Event{Kind: EventDurableAck, Durable: 8, LeaseValid: lm.Valid()})
-		s.Notef("the FLUSH was ACKed with a lapsed lease (§12.2/INV-06)")
-	} else {
-		s.Notef("the lapsed lease refused the durable ACK, and the objects are in the store anyway: %v", ferr)
-	}
-	err = m.Checkpoint(ctx, volumeID)
-
-	// The verdict comes from the store, not from the error. A gate that returned the
-	// right error and published anyway would satisfy an assertion on err; only counting
-	// objects can tell the difference.
-	after, cerr := countCheckpoints(ctx, s, volumeID)
-	if cerr != nil {
-		return cerr
-	}
-	published := after > underLease
-	s.Emit(Event{
-		Kind: EventCheckpoint, Key: volumeID,
-		LeaseValid:            lm.Valid(),
-		PublishedWithoutLease: published && !lm.Valid(),
-		Msg:                   fmt.Sprintf("objects=%d->%d refusal=%v", underLease, after, err),
-	})
-	if published {
-		return fmt.Errorf("volume %s published a checkpoint with a lapsed lease (%d objects, was %d) (§12.2)",
-			volumeID, after, underLease)
-	}
-	if err == nil {
-		return errors.New("the checkpoint reported success while publishing nothing: a refusal must be visible to its caller")
-	}
-	s.Notef("the lapsed lease refused the checkpoint: %v", err)
-	return nil
-}
-
-// countCheckpoints reports how many checkpoint objects exist for a volume. It reads the
-// store rather than the log's watermark on purpose: `published` is what the Agent
-// *believes*, and the question here is what it actually put in the bucket.
-func countCheckpoints(ctx context.Context, s *Sim, volumeID string) (int, error) {
-	objs, err := s.Store.List(ctx, "checkpoints/"+volumeID+"/")
-	if err != nil {
-		return 0, fmt.Errorf("listing the volume's checkpoints: %w", err)
-	}
-	return len(objs), nil
-}
 
 // scenarioCrashedFlushDoesNotCollideOnRestart pins ADR-0024 — a restarted Agent
 // re-attaches at the *same* epoch — against the one state that makes it interesting:
@@ -915,29 +704,22 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	}
 	parentVol := [16]byte(pu)
 
-	// The parent writes, flushes, and is snapshotted. Everything the clone will read
-	// lives under the parent's id from here on.
+	// The parent writes and publishes its image. Everything the clone will read lives
+	// under the parent's id from here on.
+	//
+	// Under ADR-0026 that publish *is* the snapshot: a parent's state in the object store
+	// is its image, and a clone reads it with the same operation a boot uses. It used to
+	// be a checkpoint plus the WAL objects after it, assembled into a snapshot manifest.
 	payload := bytes.Repeat([]byte{0x77}, 4096)
 	lm := lease.NewManager(s.Clock, time.Minute)
 	lm.Grant()
-	parent := wal.NewLog(s.Disk, "/var/lib/parent/wal", s.Clock, parentVol, 1, wal.Limits{})
-	parent.EnableRemote(wal.NewBatcher(s.Clock, parentVol, 1, 0, wal.DefaultBatchConfig()),
-		wal.NewUploader(s.Store, 3), leaseAlways{lm})
-	if _, err := parent.Write(0, payload, 0); err != nil {
-		return fmt.Errorf("the parent's write: %w", err)
-	}
-	if err := parent.Flush(ctx); err != nil {
-		return fmt.Errorf("the parent's flush: %w", err)
+	parentDone := cow.NewIntervalMap()
+	parentDone.Overwrite(0, payload)
+	if _, err := image.Publish(ctx, s.Store, s.Rand, nil, parentVol, parentDone, 1, ""); err != nil {
+		return fmt.Errorf("publishing the parent's image: %w", err)
 	}
 	snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
-	man, _, err := snapshot.NewSnapshotter(s.Store, s.Clock).Create(ctx, parent, parentVol, 1, snapID, "")
-	if err != nil {
-		return fmt.Errorf("snapshotting the parent: %w", err)
-	}
-	if err := parent.Close(); err != nil {
-		return err
-	}
-	s.Notef("parent %s snapshotted at sequence %d", parentID, man.TargetSequence)
+	s.Notef("parent %s published its image", parentID)
 
 	// The clone: its own volume id, its own empty WAL, and a desired state that names
 	// what it descends from.
@@ -1001,11 +783,6 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	return nil
 }
 
-// leaseAlways adapts a lease.Manager into the wal.LeaseChecker the Log wants.
-type leaseAlways struct{ m *lease.Manager }
-
-func (l leaseAlways) Valid() bool { return l.m.Valid() }
-
 // servedStatus reads one volume's reported status out of the manager.
 func servedStatus(m *agent.VolumeManager, volumeID string) agent.VolumeStatus {
 	vols, err := m.Volumes(context.Background())
@@ -1018,154 +795,6 @@ func servedStatus(m *agent.VolumeManager, volumeID string) agent.VolumeStatus {
 		}
 	}
 	return agent.VolumeStatus{}
-}
-
-// scenarioLocalVolumeDrainsWithoutClaimingWithoutALease is §14.8 rule 3 under the INV-06
-// checker that already governs every other way durable_sequence moves.
-//
-// The drain is a *second* path to advancing durable — the first is §14.4 step 6 — and a
-// second path is a second place for the lease rule to be forgotten. That is not
-// hypothetical here: the reading of §14.8 that this increment rejected ("the lease does
-// not gate durability in local mode") is a coherent sentence, and taking it would move a
-// watermark a promoted successor reads while this host is fenced.
-//
-// So the arm asserts the split the increment decided: the objects reach the store with no
-// lease at all, because a fenced host holds the only copy and refusing to upload would
-// turn fencing into data loss; and durable stands still until the lease is back.
-func scenarioLocalVolumeDrainsWithoutClaimingWithoutALease(s *Sim) error {
-	return localVolumeDrains(s, leaseResolvedPerCall)
-}
-
-const (
-	leaseResolvedPerCall  = false
-	leaseReadOnceAtStart  = true
-	localDrainVolumeBytes = 1 << 20
-)
-
-func localVolumeDrains(s *Sim, staleLease bool) error {
-	ctx := context.Background()
-	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
-
-	lm := lease.NewManager(s.Clock, time.Minute)
-	lm.Grant()
-	leaseValid := true
-
-	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
-		Limits: wal.Limits{SegmentBytes: 8192},
-		HostID: ids.NewAt(simEpoch*1000, s.Rand).String(),
-		// The scheduler's own loop must not run here, and finding out why cost a
-		// determinism failure: checkpointLoop drains local-mode volumes too, so with a
-		// live poll it races the explicit Drain calls below. Whether the loop's drain
-		// landed before or after `leaseValid` flipped decided which events were emitted,
-		// and the same seed produced two different traces — INV-02, caught by
-		// TestDeterministicReplay rather than by reasoning.
-		//
-		// A poll longer than anything this scenario simulates parks the loop on the
-		// simulated clock, which never advances on its own. The loop's *own* behaviour is
-		// covered by the checkpoint scenarios; what this one drives is drainOnce, and it
-		// drives it directly so the ordering is the scenario's rather than a race's.
-		CheckpointPoll: 24 * time.Hour,
-	}, agent.VolumeManagerDeps{
-		Clock:   s.Clock,
-		Disk:    s.Disk,
-		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
-		Mapper:  simMapper{},
-		EventFD: simEventFD,
-		Store:   s.Store,
-		// The planted bug's lever, and it is a shortcut a real wiring can take: a Lease
-		// that answers from a snapshot taken at construction instead of resolving the
-		// current one per call. Every other Agent scenario takes it harmlessly, because
-		// their leases never lapse. Here it makes the fenced drain claim durability.
-		Lease: func() bool {
-			if staleLease {
-				return true
-			}
-			return leaseValid && lm.Valid()
-		},
-	})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = m.Close() }()
-
-	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
-		VolumeId: volumeID, SizeBytes: localDrainVolumeBytes, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_LOCAL,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
-	}}); err != nil {
-		return fmt.Errorf("starting a local-durability volume: %w", err)
-	}
-	dev, ok := m.Device(volumeID)
-	if !ok {
-		return errors.New("the local-durability volume is not being served")
-	}
-
-	// Wait for the read view before touching the volume, by doing what waits for it: a
-	// read. fetchBase runs on its own goroutine and InstallBase *raises* watermarks, so
-	// driving the volume while it is still in flight means durable can move for a reason
-	// that is not this scenario's drain — and whether it landed before or after the lease
-	// flipped decided the trace. The same seed produced two outcomes until this line
-	// existed (INV-02, caught by TestDeterministicReplay).
-	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
-		return fmt.Errorf("waiting for the read view: %w", err)
-	}
-
-	// A guest write and its FLUSH. In local mode this ACKs on fdatasync and puts nothing
-	// in the store — that is the mode, not a failure.
-	pattern := bytes.Repeat([]byte{0x5A}, 4096)
-	for i := range 4 {
-		if _, err := dev.WriteAt(pattern, int64(i)*4096); err != nil {
-			return fmt.Errorf("guest write %d: %w", i, err)
-		}
-	}
-	if err := dev.Flush(ctx); err != nil {
-		return fmt.Errorf("the local-mode FLUSH: %w", err)
-	}
-	objs, err := s.Store.List(ctx, "wal/"+volumeID+"/")
-	if err != nil {
-		return err
-	}
-	if len(objs) != 0 {
-		return fmt.Errorf("a local-mode FLUSH put %d object(s) in the store; §14.8 says it ACKs on fdatasync alone", len(objs))
-	}
-
-	// Now fence the host and drain. The objects must land; the claim must not.
-	leaseValid = false
-	if err := m.Drain(ctx, volumeID); err != nil {
-		return fmt.Errorf("the fenced drain: %w", err)
-	}
-	objs, err = s.Store.List(ctx, "wal/"+volumeID+"/")
-	if err != nil {
-		return err
-	}
-	if len(objs) == 0 {
-		return errors.New("the fenced host uploaded nothing: its records exist nowhere else, so this turns fencing into data loss")
-	}
-	// Emitted only if the drain actually claimed something. An event saying "durable
-	// ACK" when nothing was ACKed would be a false entry in the trace, and LeaseValid
-	// carries the *ground truth* rather than what the (possibly stale) closure answered
-	// — the checker's job is to compare the claim against reality, so reality is what it
-	// has to be given.
-	if fencedDurable := m.WatermarksOf(volumeID).Durable; fencedDurable > 0 {
-		s.Emit(Event{Kind: EventDurableAck, Key: volumeID, Durable: fencedDurable, LeaseValid: leaseValid && lm.Valid()})
-	}
-
-	// And with the lease back, the claim it already earned.
-	leaseValid = true
-	if err := m.Drain(ctx, volumeID); err != nil {
-		return fmt.Errorf("the drain after the lease returned: %w", err)
-	}
-	after := m.WatermarksOf(volumeID).Durable
-	if after > 0 {
-		s.Emit(Event{Kind: EventDurableAck, Key: volumeID, Durable: after, LeaseValid: leaseValid && lm.Valid()})
-	}
-	if after == 0 {
-		return errors.New("durable never advanced once the lease was valid: the volume is stuck below its own objects")
-	}
-	s.Notef("volume %s: %d object(s) drained while fenced, durable advanced to %d only once the lease was back",
-		volumeID, len(objs), after)
-	return nil
 }
 
 // scenarioAStoppedVolumeComesBackFromItsImage is ADR-0026's contract as a guest

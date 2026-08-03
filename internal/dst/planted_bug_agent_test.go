@@ -42,37 +42,6 @@ func TestPlantedBugDurableRangeReadsZeros(t *testing.T) {
 	})
 }
 
-// §12.2's second obligation: a SELF_FENCED Agent "deja de publicar checkpoints/manifests".
-// The first — no durable ACK — has had a checker since the beginning; this one never did,
-// even though the gate is one `if` at the top of checkpointOnce.
-//
-// Planted by the wiring, not by a fault: a Lease function that answers from a snapshot
-// taken at start-up instead of resolving the lease per call. That is the shortcut every
-// other Agent scenario here takes — harmlessly, because their leases never lapse — and it
-// is the same category as DEV-0012 and the plaintext-WAL proof: not a broken algorithm, a
-// question that stopped being asked.
-//
-// Everything else stays honest. The epoch object names this host, so §12.4's ownership
-// check inside checkpoint.Create passes and the publish genuinely succeeds under the bug;
-// the verdict is read from the object store's contents rather than from the error the
-// call returned, because a gate that returns the right error and publishes anyway would
-// satisfy any assertion on err.
-func TestPlantedBugCheckpointPublishedWithoutLease(t *testing.T) {
-	requirePasses(t, 24, NewCheckpointLeaseChecker(), scenarioLapsedLeaseStopsPublishing)
-	plantedBug(t, 24, NewCheckpointLeaseChecker(), "checkpoint-requires-lease", func(s *Sim) error {
-		return lapsedLeaseStopsPublishing(s, leaseAnsweredFromASnapshot)
-	})
-
-	// One cached answer, both of §12.2's obligations gone: the same wiring that let the
-	// checkpoint out also let a FLUSH be ACKed as durable after the lease had expired.
-	// Asserted rather than left as a remark, because it is the reason the new checker is
-	// a second gate and not a duplicate of the old one — INV-06 sees the ACK, this sees
-	// the publish, and a host can lose the right to do the second while doing neither.
-	plantedBug(t, 24, NewDurableAckLeaseChecker(), "durable-ack-requires-lease", func(s *Sim) error {
-		return lapsedLeaseStopsPublishing(s, leaseAnsweredFromASnapshot)
-	})
-}
-
 // INV-15 (§5.10) at the Agent's seam rather than the WAL's. The existing proof
 // (TestPlantedBugPlaintextLeavesHost) drives wal.Log directly, so it can only ever show
 // that the *WAL* encrypts when handed a key. Until BUILD-INVENTORY increment 6 nothing
@@ -106,25 +75,5 @@ func TestPlantedBugACloneReadsZeros(t *testing.T) {
 	requirePasses(t, 26, NewDurableRangeChecker(), scenarioACloneReadsThroughItsParent)
 	plantedBug(t, 26, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
 		return aCloneReadsThroughItsParent(s, chainLinkDropped)
-	})
-}
-
-// INV-06 (§12.2) reaching the second path that can advance durable_sequence.
-//
-// §14.4 step 6 was the only one until §14.8's asynchronous drain landed, and the drain is
-// where the rule is easiest to lose: the mode's whole point is that the FLUSH ACK does
-// *not* wait for the lease, and reading that as "durability does not need the lease in
-// local mode" is a coherent sentence rather than a slip. It is the reading this increment
-// rejected, and this is what stops it coming back.
-//
-// Planted by the wiring, not by a fault, and by the same shortcut CheckpointLeaseChecker
-// uses: a Lease function that answers from a snapshot taken at construction instead of
-// resolving the current one per call. Every other Agent scenario takes that shortcut
-// harmlessly because their leases never lapse; here it makes a fenced host claim
-// durability for records it uploaded after losing the volume.
-func TestPlantedBugLocalDrainClaimsWithoutALease(t *testing.T) {
-	requirePasses(t, 31, NewDurableAckLeaseChecker(), scenarioLocalVolumeDrainsWithoutClaimingWithoutALease)
-	plantedBug(t, 31, NewDurableAckLeaseChecker(), "durable-ack-requires-lease", func(s *Sim) error {
-		return localVolumeDrains(s, leaseReadOnceAtStart)
 	})
 }

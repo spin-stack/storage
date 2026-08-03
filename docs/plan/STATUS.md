@@ -890,6 +890,34 @@ the methods one implementation happened to call.
 writing, the Agent stopping, the object appearing, a second Agent reading it back. The
 unit and DST levels cover the seam; the lane does not yet.
 
+## ADR-0026 increment 4.1 — the durability scheduler is gone
+
+`internal/agent/durability.go` and its tests: the checkpoint timer, `checkpointOnce`,
+`TruncateLocal`, and the §14.8 drain. Under ADR-0026 a volume's WAL lives one session and
+S3 receives the volume at stop, so there is nothing to reclaim mid-session and nothing to
+drain asynchronously. **The drain landed in this same session and was removed by the ADR
+accepted after it** — that churn is the cost of having accepted the ADR late, and it is
+cheaper than the alternative, which was building increments 3-8 on the withdrawn premise.
+
+`internal/agent` no longer imports `internal/checkpoint`, and `parentView` no longer
+imports `internal/materialize`: **a clone reads its parent's *image*** with the same
+operation a boot uses, rather than materializing a snapshot from a checkpoint plus the
+WAL objects after it. The two remaining production users of the durability chain are now
+`controlplane`'s drain, promotion and rebuild — increment 4.6.
+
+Two DST scenarios went with the scheduler (`lapsed-lease-stops-publishing`,
+`local-volume-drains-without-claiming`) and the `checkpoint-lease` checker with them; the
+planted-bug ratchet is 15 → 14 with the reason recorded next to the constant, which is the
+one shape of decrease that test allows.
+
+**The guest lane became the e2e observable increment 2 was missing.**
+`TestAGuestSurvivesCheckpointAndTruncation` is now
+`TestAGuestSurvivesAStopAndComesBackFromItsImage`: a real Linux kernel writes and
+`fsync`s, the Agent stops (which publishes), **the local WAL is deleted outright**, and a
+second Agent and a second boot read the same range back. Removing the WAL is a stronger
+statement than the truncation it replaced — the second boot has nothing but the image.
+Green against real QEMU.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,

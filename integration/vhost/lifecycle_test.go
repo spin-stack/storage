@@ -4,6 +4,7 @@ package vhost_test
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +56,12 @@ import (
 // test passed. Deleting the bucket between the two boots is the real one, and the guest
 // then reports `read-back mismatch at 1048576` — the bytes are gone from the only place
 // left holding them.
-func TestAGuestSurvivesCheckpointAndTruncation(t *testing.T) {
+//
+// Rewritten for ADR-0026. It used to publish a checkpoint and truncate; there is no
+// checkpoint now, and what a volume leaves behind is its image, published when it stops.
+// The local WAL is removed outright instead, which is a stronger statement of the same
+// thing: the second boot has nothing but the image to read from.
+func TestAGuestSurvivesAStopAndComesBackFromItsImage(t *testing.T) {
 	kernel, initramfs := testinfra.GuestImages(t)
 	_, _ = testinfra.QEMUPaths(t) // skip early if QEMU is missing, before anything is built
 
@@ -72,27 +78,31 @@ func TestAGuestSurvivesCheckpointAndTruncation(t *testing.T) {
 
 	before := segmentFiles(t, dir, volumeID)
 	if len(before) == 0 {
-		t.Fatal("the guest's write left no WAL segments, so there is nothing for a truncation to reclaim")
+		t.Fatal("the guest's write left no WAL segments, so there is nothing for the image to have to replace")
 	}
 
-	// (2) Checkpoint and truncate. Through the Agent's own scheduler entry point, which
-	// goes through the same lease and io-class gates the timer-driven path does.
-	if err := m.Checkpoint(ctx, volumeID); err != nil {
-		t.Fatalf("publishing a checkpoint: %v", err)
-	}
-	after := segmentFiles(t, dir, volumeID)
-	if len(after) >= len(before) {
-		t.Fatalf("truncation reclaimed nothing (%d segments, then %d): step 3 would prove nothing",
-			len(before), len(after))
-	}
-	t.Logf("checkpoint published; %d of %d segments reclaimed", len(before)-len(after), len(before))
-
-	// The Agent goes away with its WAL, exactly as a restart does.
+	// (2) Stopping the Agent is what publishes (ADR-0026). Nothing before this left the
+	// host: the guest's fsync ACKed on fdatasync alone.
 	if err := m.Close(); err != nil {
 		t.Fatalf("stopping the Agent: %v", err)
 	}
+	if len(imageObjects(t, dir)) == 0 {
+		t.Fatal("stopping the Agent published no image: the guest's data exists only in a WAL nobody will read")
+	}
 
-	// (3) A second Agent, a second boot, and the same range read back.
+	// (3) Take the local WAL away, so only the image can answer. This is what the
+	// checkpoint-and-truncate step used to do the long way round, and it is the whole
+	// point of the test: a second boot that read the segments would prove nothing about
+	// what left the host.
+	if err := os.RemoveAll(filepath.Join(dir, "wal")); err != nil {
+		t.Fatalf("removing the local WAL: %v", err)
+	}
+	if len(segmentFiles(t, dir, volumeID)) != 0 {
+		t.Fatal("the local WAL is still there; the next boot could answer from it")
+	}
+	t.Logf("%d segments removed; the image is the only copy left", len(before))
+
+	// (4) A second Agent, a second boot, and the same range read back.
 	m2, sock2 := startAgent(t, ctx, dir, volumeID)
 	defer func() { _ = m2.Close() }()
 
@@ -183,4 +193,20 @@ func segmentFiles(t *testing.T, dir, volumeID string) []string {
 		t.Fatal(err)
 	}
 	return matches
+}
+
+// imageObjects lists what the volume published, which is the artefact ADR-0026's whole
+// contract produces. Asserted on the bucket rather than on a call: a publish that
+// returned nil and wrote nothing satisfies any assertion on its error.
+func imageObjects(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	root := filepath.Join(dir, "bucket", "image")
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			out = append(out, p)
+		}
+		return nil
+	})
+	return out
 }
