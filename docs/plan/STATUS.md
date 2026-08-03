@@ -816,6 +816,34 @@ calls it.
   `NewPromoter` appears only in tests and DST. ADR-0024 already says so; this file did
   not. Failover therefore exists as a model, and nothing an operator can run performs it.
 
+## PAUSED — the data-path cleanup, pending ADR-0026
+
+**Increments 12, 13 and 14 of the cleanup plan are on hold**, and so is any further work
+on the remote durability chain. The reason is not the work: it is that **ADR-0026 may
+delete the code being cleaned**.
+
+§2 declares the primary use case ("flotas de VMs de desarrollo, CI y entornos efímeros")
+and the SLO ("RPO 0 bajo el modelo de fallas probado por DST") in the same section, and
+they pull against each other. The RPO-0 row is the single assumption that generates the
+entire remote durability chain — `recovery`, `gc`, `materialize`, `checkpoint`, `epoch`,
+`lease`, the remote half of `wal` and the fencing half of `controlplane`, on the order of
+half the production tree and the half that is expensive to reason about. It has never
+been checked against a stated requirement.
+
+**The question ADR-0026 needs answered, and cannot answer itself:** has anyone ever asked
+for a VM to survive the loss of its host mid-session, or is that an assumption of the
+design?
+
+Increment 12 (`WriteSummary` and its unbounded accumulator) was specced, the branch was
+chosen — delete the writer and the accumulator, keep `recovery.readSummary` — and then
+paused here rather than applied. It is a correct change under either answer, so it is
+cheap to resume; it is listed as paused rather than done so nobody reads the plan as
+finished.
+
+**What is *not* paused:** anything outside the durability chain. The transport, the block
+device, the read view, the guest lane and the documentation work are unaffected by
+ADR-0026 either way.
+
 ## Decisions waiting on a human
 
 - **ADR-0013 (device pressure) is still `Proposed`.** It carries DEV-0011 and the
@@ -843,7 +871,11 @@ calls it.
   choice between scheduling it and recording stage 1 as the final answer is not one an
   increment should make on its way past.
 - **DEV-0020**, above: whether a clone chain is walked at materialization or flattened at
-  clone time is a §19/§20 question, not an implementation detail.
+  clone time is a §19/§20 question, not an implementation detail. **Subsumed by ADR-0026
+  if that is accepted** — a chain that is only ever materialized at boot is a different
+  problem.
+- **ADR-0026 — does V1 accept an RPO of one session?** The largest open question in the
+  repository, and the only one that changes what half the code is for. See above.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
 
 ---
