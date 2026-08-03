@@ -358,6 +358,9 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			LocalSequence:     v.LocalSequence,
 			DurableSequence:   v.DurableSequence,
 			PublishedSequence: v.PublishedSequence,
+			SnapshotId:        v.SnapshotID,
+			SnapshotSequence:  v.SnapshotSequence,
+			SnapshotError:     v.SnapshotError,
 		})
 	}
 	resp, err := l.cp.ReportVolumeState(ctx, connect.NewRequest(&storagev1.ReportVolumeStateRequest{

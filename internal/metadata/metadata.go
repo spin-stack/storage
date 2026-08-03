@@ -453,6 +453,24 @@ type Store interface {
 	CreateSnapshot(ctx context.Context, term int64, s Snapshot) error
 	// GetSnapshot returns a snapshot by id.
 	GetSnapshot(ctx context.Context, snapshotID string) (Snapshot, error)
+	// ListPendingSnapshots returns the CREATING snapshots of the volumes hostID is
+	// primary for, oldest first (§19). It is how a snapshot request reaches an Agent:
+	// the Control Plane puts the oldest id in the volume's desired state, and the
+	// Agent converges on it.
+	//
+	// It follows the *volume*, not snapshots.source_host_id, because the request names
+	// a volume and only the host serving it can freeze it. source_host_id is stamped
+	// on completion by the host that actually took it, which is what §20's placement
+	// rule 1 reads later.
+	ListPendingSnapshots(ctx context.Context, hostID string) ([]Snapshot, error)
+	// PublishSnapshot moves CREATING → PUBLISHED, recording the three facts only the
+	// host that took it knows: the §19 sequence the copy was frozen at, the manifest
+	// it wrote, and which host did it (term-guarded).
+	//
+	// Reporting the same publication twice is a no-op, because the Agent keeps
+	// reporting until the request stops arriving. Reporting a *different* sequence at
+	// a published id is refused: INV-16.
+	PublishSnapshot(ctx context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error
 	// SetSnapshotState moves a snapshot through the §19 lifecycle (term-guarded,
 	// transition-guarded in the write). Without it a snapshot whose publication
 	// crashed stays CREATING forever and the catalog side of GC never sees it.

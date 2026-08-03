@@ -548,8 +548,22 @@ type DesiredVolume struct {
 	// the snapshot row, which is one lookup the Agent cannot perform.
 	ParentSnapshotId string `protobuf:"bytes,7,opt,name=parent_snapshot_id,json=parentSnapshotId,proto3" json:"parent_snapshot_id,omitempty"`
 	ParentVolumeId   string `protobuf:"bytes,8,opt,name=parent_volume_id,json=parentVolumeId,proto3" json:"parent_volume_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
+	// empty when there is nothing to take. It is the whole trigger: an Agent is never
+	// *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —
+	// so a snapshot request reaches it the only way anything does, as desired state it
+	// converges on.
+	//
+	// One id, not a list, and the oldest when several are outstanding: the Agent takes
+	// them one per cycle, which needs no batching and cannot reorder them.
+	//
+	// The field clears itself. The Control Plane stops sending an id once the snapshot
+	// leaves CREATING, so a host that missed the report, restarted, or came back after
+	// a partition converges by doing the same thing again — and doing it again is free,
+	// because the manifest is written create-only (INV-16).
+	PendingSnapshotId string `protobuf:"bytes,9,opt,name=pending_snapshot_id,json=pendingSnapshotId,proto3" json:"pending_snapshot_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DesiredVolume) Reset() {
@@ -634,6 +648,13 @@ func (x *DesiredVolume) GetParentSnapshotId() string {
 func (x *DesiredVolume) GetParentVolumeId() string {
 	if x != nil {
 		return x.ParentVolumeId
+	}
+	return ""
+}
+
+func (x *DesiredVolume) GetPendingSnapshotId() string {
+	if x != nil {
+		return x.PendingSnapshotId
 	}
 	return ""
 }
@@ -839,8 +860,25 @@ type VolumeReport struct {
 	PublishedSequence int64 `protobuf:"varint,5,opt,name=published_sequence,json=publishedSequence,proto3" json:"published_sequence,omitempty"`
 	// remote_gap_bytes is this volume's share of the device's remote backlog.
 	RemoteGapBytes int64 `protobuf:"varint,6,opt,name=remote_gap_bytes,json=remoteGapBytes,proto3" json:"remote_gap_bytes,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// snapshot_id is the pending snapshot this host has finished acting on, empty when
+	// it has nothing to say. The three fields below are one answer and are read
+	// together: an id plus a sequence is "published at N", an id plus an error is
+	// "FAILED, and here is what an operator needs to read".
+	//
+	// It is reported on the volume's own report rather than through a call of its own
+	// because the report is already the Agent's one channel for "what is true here",
+	// and a second channel would need its own retry, its own ordering against the
+	// watermarks, and its own way of being refused when the host has been fenced.
+	SnapshotId string `protobuf:"bytes,7,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// snapshot_sequence is the §19 sequence the copy was frozen at — the volume's
+	// local_sequence at the instant of the capture, and what makes the snapshot a
+	// point rather than an interval.
+	SnapshotSequence int64 `protobuf:"varint,8,opt,name=snapshot_sequence,json=snapshotSequence,proto3" json:"snapshot_sequence,omitempty"`
+	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
+	// that fails silently stays CREATING forever and nothing ever collects it.
+	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VolumeReport) Reset() {
@@ -913,6 +951,27 @@ func (x *VolumeReport) GetRemoteGapBytes() int64 {
 		return x.RemoteGapBytes
 	}
 	return 0
+}
+
+func (x *VolumeReport) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *VolumeReport) GetSnapshotSequence() int64 {
+	if x != nil {
+		return x.SnapshotSequence
+	}
+	return 0
+}
+
+func (x *VolumeReport) GetSnapshotError() string {
+	if x != nil {
+		return x.SnapshotError
+	}
+	return ""
 }
 
 type ReportVolumeStateRequest struct {
@@ -1085,7 +1144,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xc9\x02\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xf9\x02\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1098,7 +1157,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"durability\x18\x06 \x01(\x0e2\x1b.spin.storage.v1.DurabilityR\n" +
 	"durability\x12,\n" +
 	"\x12parent_snapshot_id\x18\a \x01(\tR\x10parentSnapshotId\x12(\n" +
-	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\"S\n" +
+	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\x12.\n" +
+	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +
@@ -1110,14 +1170,18 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xec\x01\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xe1\x02\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +
 	"\x0elocal_sequence\x18\x03 \x01(\x03R\rlocalSequence\x12)\n" +
 	"\x10durable_sequence\x18\x04 \x01(\x03R\x0fdurableSequence\x12-\n" +
 	"\x12published_sequence\x18\x05 \x01(\x03R\x11publishedSequence\x12(\n" +
-	"\x10remote_gap_bytes\x18\x06 \x01(\x03R\x0eremoteGapBytes\"l\n" +
+	"\x10remote_gap_bytes\x18\x06 \x01(\x03R\x0eremoteGapBytes\x12\x1f\n" +
+	"\vsnapshot_id\x18\a \x01(\tR\n" +
+	"snapshotId\x12+\n" +
+	"\x11snapshot_sequence\x18\b \x01(\x03R\x10snapshotSequence\x12%\n" +
+	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\"l\n" +
 	"\x18ReportVolumeStateRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x127\n" +
 	"\avolumes\x18\x02 \x03(\v2\x1d.spin.storage.v1.VolumeReportR\avolumes\"k\n" +

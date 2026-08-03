@@ -162,6 +162,20 @@ message DesiredVolume {
   // the snapshot row, which is one lookup the Agent cannot perform.
   string parent_snapshot_id = 7;
   string parent_volume_id = 8;
+  // pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
+  // empty when there is nothing to take. It is the whole trigger: an Agent is never
+  // *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —
+  // so a snapshot request reaches it the only way anything does, as desired state it
+  // converges on.
+  //
+  // One id, not a list, and the oldest when several are outstanding: the Agent takes
+  // them one per cycle, which needs no batching and cannot reorder them.
+  //
+  // The field clears itself. The Control Plane stops sending an id once the snapshot
+  // leaves CREATING, so a host that missed the report, restarted, or came back after
+  // a partition converges by doing the same thing again — and doing it again is free,
+  // because the manifest is written create-only (INV-16).
+  string pending_snapshot_id = 9;
 }
 
 message GetDesiredStateResponse {
@@ -216,6 +230,24 @@ message VolumeReport {
   int64 published_sequence = 5;
   // remote_gap_bytes is this volume's share of the device's remote backlog.
   int64 remote_gap_bytes = 6;
+
+  // snapshot_id is the pending snapshot this host has finished acting on, empty when
+  // it has nothing to say. The three fields below are one answer and are read
+  // together: an id plus a sequence is "published at N", an id plus an error is
+  // "FAILED, and here is what an operator needs to read".
+  //
+  // It is reported on the volume's own report rather than through a call of its own
+  // because the report is already the Agent's one channel for "what is true here",
+  // and a second channel would need its own retry, its own ordering against the
+  // watermarks, and its own way of being refused when the host has been fenced.
+  string snapshot_id = 7;
+  // snapshot_sequence is the §19 sequence the copy was frozen at — the volume's
+  // local_sequence at the instant of the capture, and what makes the snapshot a
+  // point rather than an interval.
+  int64 snapshot_sequence = 8;
+  // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
+  // that fails silently stays CREATING forever and nothing ever collects it.
+  string snapshot_error = 9;
 }
 
 message ReportVolumeStateRequest {

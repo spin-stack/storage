@@ -687,6 +687,62 @@ func (s *Store) GetSnapshot(ctx context.Context, snapshotID string) (metadata.Sn
 	if err != nil {
 		return metadata.Snapshot{}, notFound(err)
 	}
+	return snapshotFromRow(snap)
+}
+
+// ListPendingSnapshots returns the snapshots the host must take, oldest first.
+func (s *Store) ListPendingSnapshots(ctx context.Context, hostID string) ([]metadata.Snapshot, error) {
+	id, err := requireUUID("host", hostID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListPendingSnapshots(ctx, pgtype.UUID{Bytes: id, Valid: true})
+	if err != nil {
+		return nil, err
+	}
+	snaps := make([]metadata.Snapshot, 0, len(rows))
+	for _, row := range rows {
+		snap, err := snapshotFromRow(&row.Snapshot)
+		if err != nil {
+			return nil, err
+		}
+		snaps = append(snaps, snap)
+	}
+	return snaps, nil
+}
+
+// PublishSnapshot records what the host that took the snapshot observed.
+func (s *Store) PublishSnapshot(ctx context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error {
+	id, err := requireUUID("snapshot", snapshotID)
+	if err != nil {
+		return err
+	}
+	source, err := nullUUID("source host", sourceHostID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.PublishSnapshot(ctx, db.PublishSnapshotParams{
+		SnapshotID: id, TargetSequence: targetSequence, SourceHostID: source,
+		ManifestKey: text(manifestKey), Term: term,
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// A current term that wrote nothing means the snapshot is not CREATING. The two
+	// cases differ to an operator: a second report of the same publication is the
+	// convergence working, and anything else is a transition nobody may make (INV-16).
+	snap, gerr := s.GetSnapshot(ctx, snapshotID)
+	if gerr != nil {
+		return gerr
+	}
+	if snap.State == lifecycle.SnapshotPublished && snap.TargetSequence == targetSequence {
+		return nil
+	}
+	return fmt.Errorf("%w: snapshot %s is %s, not CREATING", lifecycle.ErrInvalidTransition, snapshotID, snap.State)
+}
+
+func snapshotFromRow(snap *db.Snapshot) (metadata.Snapshot, error) {
 	state, err := lifecycle.ParseSnapshotState(snap.State)
 	if err != nil {
 		return metadata.Snapshot{}, fmt.Errorf("snapshot %s: %w", snap.SnapshotID, err)

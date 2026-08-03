@@ -522,6 +522,62 @@ func (s *Store) SetSnapshotState(_ context.Context, term int64, snapshotID strin
 	return nil
 }
 
+// ListPendingSnapshots returns the CREATING snapshots of the volumes this host is
+// primary for, oldest first — the requests its desired state must carry.
+func (s *Store) ListPendingSnapshots(_ context.Context, hostID string) ([]metadata.Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []metadata.Snapshot
+	for _, snap := range s.snaps {
+		if snap.State != lifecycle.SnapshotCreating {
+			continue
+		}
+		// Through the volume, not through snap.SourceHostID: the request names a
+		// volume, and the host that can freeze it is whichever one serves it now.
+		if v, ok := s.vols[snap.VolumeID]; !ok || v.PrimaryHostID != hostID {
+			continue
+		}
+		out = append(out, snap)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SnapshotID < out[j].SnapshotID })
+	return out, nil
+}
+
+// PublishSnapshot records what the host that took the snapshot observed.
+func (s *Store) PublishSnapshot(_ context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error {
+	if err := requireID("snapshot", snapshotID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	snap, ok := s.snaps[snapshotID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	// A second report of the same publication is the convergence working — the Agent
+	// keeps reporting until the request stops arriving — so it is a no-op. A different
+	// sequence at the same id is not: INV-16 says PUBLISHED never changes.
+	if snap.State == lifecycle.SnapshotPublished {
+		if snap.TargetSequence == targetSequence {
+			return nil
+		}
+		return fmt.Errorf("%w: snapshot %s is PUBLISHED at sequence %d, reported at %d",
+			lifecycle.ErrInvalidTransition, snapshotID, snap.TargetSequence, targetSequence)
+	}
+	if err := snap.State.Transition(lifecycle.SnapshotPublished); err != nil {
+		return err
+	}
+	snap.State = lifecycle.SnapshotPublished
+	snap.TargetSequence = targetSequence
+	snap.SourceHostID = sourceHostID
+	snap.ManifestKey = manifestKey
+	s.snaps[snapshotID] = snap
+	return nil
+}
+
 func (s *Store) GetSnapshot(_ context.Context, snapshotID string) (metadata.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

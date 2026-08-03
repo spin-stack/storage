@@ -435,11 +435,12 @@ create-only so a retry converges on its own manifest and refuses a different one
 same id (`image.ErrSnapshotExists`), and the pause is measured where the capture is, not
 around the whole operation.
 
-**§19's two mandatory metrics are unrecorded again.** `internal/obs` registers
+**§19's two mandatory metrics are still unrecorded.** `internal/obs` registers
 `snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds`; the code that
-observed them was deleted with `internal/snapshot`, and `VolumeManager.Snapshot` does not
-observe them yet. It belongs with the trigger increment, because a metric nobody records
-is a metric that is missing during the first incident that needs it.
+observed them was deleted with `internal/snapshot`, and neither `ensureSnapshot` nor
+`snapshot` observes them. It is the one piece of §19 that increments 3 and 3b did not
+close, and a metric nobody records is a metric that is missing during the first incident
+that needs it.
 
 **Objectization, lazy loading and the cold-RTO work are withdrawn, not deferred to a spec.**
 `OBJECTIZATION-SPEC.md` described segments feeding `recovery` and `materialize`, both of
@@ -1018,6 +1019,49 @@ trigger is its own increment — a proto field each way, plus the volume column 
 Plane sets and clears — and it is listed below with the other callerless components rather
 than left implied by this section.
 
+## ADR-0026 increment 3b — a snapshot can be asked for, since 2026-08-03
+
+Increment 3 left `VolumeManager.Snapshot` with no production caller. It has one now, and
+it is not a call: **a snapshot request is desired state**. `DesiredVolume` carries
+`pending_snapshot_id`, `VolumeReport` carries the id, the sequence and an error back, and
+the loop closes when the Control Plane stops sending an id it has recorded. ADR-0021 is
+what forces that shape — the Agent cannot be *asked* anything, it can only be told — and
+it is also what makes the protocol convergent for free: a host that missed the report,
+restarted or came back from a partition simply does the same thing again.
+
+**No schema change.** `snapshots` already had `source_host_id`, `target_sequence`,
+`manifest_key` and the CREATING state; what was missing was two queries and the wiring
+between them. `ListPendingSnapshots` joins through `volumes.primary_host_id` rather than
+filtering on `snapshots.source_host_id` — the request names a *volume*, only the host
+serving it can freeze it, and `source_host_id` is stamped on completion by the host that
+actually did (which is what §20's placement rule 1 reads later).
+
+**The uploading is on a goroutine and the request is not.** An Agent that blocked its
+reconcile loop for the length of an upload would miss the heartbeat that renews its lease
+and be fenced for doing what it was told. An in-flight snapshot reports nothing at all —
+a half-taken snapshot is not a fact the catalog can hold — so the row stays CREATING and
+the request arrives again, which the per-volume map makes free.
+
+**A stale writer's report is dropped, not applied.** It runs after the epoch check: a host
+the fleet has moved past froze a view of a volume it no longer writes, and stamping its
+sequence would publish a snapshot of a superseded state. The row stays CREATING, so the
+volume's current writer still takes it. A *failed* snapshot is recorded FAILED rather than
+retried forever, because the failures that heal are already retried inside the session.
+
+**Observable, with real binaries** (`integration/e2e`,
+`TestASnapshotOfALiveVolumeIsPublished`): a real Linux guest writes and `fsync`s, an
+operator runs `control-plane -snapshot-volume <id>`, and the manifest appears in the
+bucket **while the Agent is still serving the volume** — the socket is still there when it
+lands. Everything else in that lane publishes at stop, so a snapshot that only appeared
+after the Agent exited would be the stop path wearing a different name.
+
+**Proven able to fail, three ways.** Dropping the one line that puts the id in the desired
+state times the e2e lane out (60s, no object). Removing the once-guard makes the manifest
+be written six times for six requests. And the "stops being reported" property needed
+*both* of its mechanisms broken to go red — Status answering only about the pending id,
+and the map being pruned — which is written next to the test rather than left as an
+implied stronger claim.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
@@ -1026,11 +1070,6 @@ listed here, in the file that tracks state, because until now each was recorded 
 inside the spec or ADR that built it — which is how a thing stays "done" while nothing
 calls it.
 
-- **`agent.VolumeManager.Snapshot` has no production caller** (increment 3, above). The
-  mechanism is complete and proven; the *request* path does not exist. Consistent with
-  ADR-0021 it can only be desired state — the Agent cannot be asked anything, it is told —
-  so the shape is a `pending_snapshot_id` on `DesiredVolume` and the id back on
-  `VolumeReport`, which reaches into `schema.sql` and is therefore its own increment.
 - **INV-17 has no path through the real Agent.** `VolumeManagerDeps.IOClass` is set by
   nothing outside `internal/agent/durability_internal_test.go`, and
   `ioclass.Scheduler.Begin`/`End` have no production caller at all — so even with a

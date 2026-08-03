@@ -89,6 +89,97 @@ func (q *Queries) GetSnapshot(ctx context.Context, snapshotID uuid.UUID) (*Snaps
 	return &i, err
 }
 
+const listPendingSnapshots = `-- name: ListPendingSnapshots :many
+SELECT s.snapshot_id, s.volume_id, s.parent_snapshot_id, s.epoch, s.target_sequence, s.root_digest, s.source_host_id, s.state, s.portable, s.manifest_key, s.request_id, s.created_at FROM snapshots s
+  JOIN volumes v ON v.volume_id = s.volume_id
+ WHERE v.primary_host_id = $1
+   AND s.state = 'CREATING'
+ ORDER BY s.snapshot_id
+`
+
+type ListPendingSnapshotsRow struct {
+	Snapshot Snapshot `json:"snapshot"`
+}
+
+// The snapshots a host has been asked to take (§19), for the desired state it is
+// handed. Joined through volumes rather than filtered on snapshots.source_host_id,
+// because the request names a *volume*: whichever host serves it when the request is
+// picked up is the one that can freeze it, and source_host_id is stamped on
+// completion by the host that actually did — which is what §20's placement rule 1
+// later reads.
+//
+// Ordered by snapshot_id so a host with several outstanding takes them oldest first
+// (UUIDv7 is time-ordered, INV-22) and two Control Planes answer identically (INV-02).
+func (q *Queries) ListPendingSnapshots(ctx context.Context, primaryHostID pgtype.UUID) ([]*ListPendingSnapshotsRow, error) {
+	rows, err := q.db.Query(ctx, listPendingSnapshots, primaryHostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*ListPendingSnapshotsRow{}
+	for rows.Next() {
+		var i ListPendingSnapshotsRow
+		if err := rows.Scan(
+			&i.Snapshot.SnapshotID,
+			&i.Snapshot.VolumeID,
+			&i.Snapshot.ParentSnapshotID,
+			&i.Snapshot.Epoch,
+			&i.Snapshot.TargetSequence,
+			&i.Snapshot.RootDigest,
+			&i.Snapshot.SourceHostID,
+			&i.Snapshot.State,
+			&i.Snapshot.Portable,
+			&i.Snapshot.ManifestKey,
+			&i.Snapshot.RequestID,
+			&i.Snapshot.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const publishSnapshot = `-- name: PublishSnapshot :execrows
+UPDATE snapshots
+   SET state = 'PUBLISHED',
+       target_sequence = $2,
+       source_host_id = $3,
+       manifest_key = $4
+ WHERE snapshot_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $5
+   AND state = 'CREATING'
+`
+
+type PublishSnapshotParams struct {
+	SnapshotID     uuid.UUID   `json:"snapshot_id"`
+	TargetSequence int64       `json:"target_sequence"`
+	SourceHostID   pgtype.UUID `json:"source_host_id"`
+	ManifestKey    pgtype.Text `json:"manifest_key"`
+	Term           int64       `json:"term"`
+}
+
+// CREATING → PUBLISHED, stamping the three facts only the host that took it knows:
+// the sequence the copy was frozen at, the manifest it wrote, and which host did it.
+// Term-guarded, and guarded on CREATING so a report replayed after the snapshot has
+// moved on cannot resurrect it (INV-16: PUBLISHED never changes).
+func (q *Queries) PublishSnapshot(ctx context.Context, arg PublishSnapshotParams) (int64, error) {
+	result, err := q.db.Exec(ctx, publishSnapshot,
+		arg.SnapshotID,
+		arg.TargetSequence,
+		arg.SourceHostID,
+		arg.ManifestKey,
+		arg.Term,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setSnapshotState = `-- name: SetSnapshotState :execrows
 UPDATE snapshots
    SET state = $2

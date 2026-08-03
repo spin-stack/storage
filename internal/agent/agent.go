@@ -49,6 +49,17 @@ type VolumeStatus struct {
 	// bytes no verified object covers yet, which no local truncation can reclaim
 	// (INV-13).
 	RemoteGapBytes int64
+
+	// SnapshotID is the snapshot this host was asked to take and has finished acting
+	// on, empty while there is nothing to say — including while an upload is still in
+	// flight, because a half-taken snapshot is not a fact the catalog can hold. The
+	// two fields below are its outcome: a sequence, or an error.
+	SnapshotID string
+	// SnapshotSequence is the §19 sequence the copy was frozen at.
+	SnapshotSequence int64
+	// SnapshotError is why it could not be taken. A snapshot that fails silently stays
+	// CREATING in the catalog forever.
+	SnapshotError string
 }
 
 // VolumeKeys is what a host needs to seal and open one volume's payloads (§15.1).

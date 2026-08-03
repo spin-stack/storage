@@ -75,6 +75,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"RecordOperationSeparatesDuplicateFromStaleTerm", recordOperation},
 		{"VolumeLifecycleIsExpressible", volumeLifecycle},
 		{"SnapshotLifecycleIsExpressible", snapshotLifecycle},
+		{"PendingSnapshotsFollowTheVolumeAndPublishOnce", pendingSnapshots},
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
@@ -269,6 +270,9 @@ func everyMutation() []mutation {
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return setSnapshotState(ctx, s, term, w.snap, lifecycle.SnapshotPublished)
 		}},
+		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.PublishSnapshot(ctx, term, w.snap, 7, w.host, "image/k/snapshots/s.json")
+		}},
 		{"RecordOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			_, err := s.RecordOperation(ctx, term, metadata.Operation{
 				OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
@@ -359,6 +363,9 @@ func missingRows(t *testing.T, s metadata.Store) {
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setSnapshotState(ctx, s, term, ghostSnap, lifecycle.SnapshotPublished)
+		}},
+		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.PublishSnapshot(ctx, term, ghostSnap, 7, "", "k")
 		}},
 		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.UpdateOperation(ctx, term, metadata.Operation{
@@ -782,6 +789,60 @@ func snapshotLifecycle(t *testing.T, s metadata.Store) {
 	}
 	if got, _ := s.GetSnapshot(ctx, other); got.State != lifecycle.SnapshotPublished {
 		t.Fatalf("a refused transition changed the state to %q", got.State)
+	}
+}
+
+// pendingSnapshots is the request half of §19: a CREATING snapshot is how a host is
+// asked to freeze a volume, and PublishSnapshot is how the answer comes back.
+//
+// The two things it pins are the ones a plausible implementation gets wrong. The list
+// follows the *volume's current primary*, not snapshots.source_host_id — which is empty
+// until somebody takes it, so filtering on it would list nothing for anyone. And a
+// second report of the same publication is a no-op rather than an error, because the
+// Agent keeps reporting until the request stops arriving; a different sequence at the
+// same id is refused, because INV-16 says a published snapshot never changes.
+func pendingSnapshots(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s) // w.snap is CREATING on w.vol, whose primary is w.host
+
+	pending, err := s.ListPendingSnapshots(ctx, w.host)
+	if err != nil {
+		t.Fatalf("ListPendingSnapshots: %v", err)
+	}
+	if len(pending) != 1 || pending[0].SnapshotID != w.snap {
+		t.Fatalf("pending = %+v, want just %s", pending, w.snap)
+	}
+	if other, err := s.ListPendingSnapshots(ctx, id()); err != nil || len(other) != 0 {
+		t.Fatalf("a host that serves nothing was asked for %d snapshots (err %v)", len(other), err)
+	}
+
+	const seq = 41
+	key := "image/vol/snapshots/snap.json"
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, seq, w.host, key); err != nil {
+		t.Fatalf("PublishSnapshot: %v", err)
+	}
+	got, err := s.GetSnapshot(ctx, w.snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != lifecycle.SnapshotPublished || got.TargetSequence != seq ||
+		got.SourceHostID != w.host || got.ManifestKey != key {
+		t.Fatalf("published snapshot = %+v", got)
+	}
+	// Published means no longer asked for: an Agent that kept being asked would keep
+	// answering, and the loop would never close.
+	if pending, err := s.ListPendingSnapshots(ctx, w.host); err != nil || len(pending) != 0 {
+		t.Fatalf("a published snapshot is still pending: %+v (err %v)", pending, err)
+	}
+
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, seq, w.host, key); err != nil {
+		t.Fatalf("re-reporting the same publication: %v", err)
+	}
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, seq+1, w.host, key); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("re-reporting at a different sequence: want ErrInvalidTransition, got %v", err)
+	}
+	if got, _ := s.GetSnapshot(ctx, w.snap); got.TargetSequence != seq {
+		t.Fatalf("a refused report moved the sequence to %d", got.TargetSequence)
 	}
 }
 
@@ -1410,6 +1471,9 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setSnapshotState(ctx, s, term, "", lifecycle.SnapshotPublished)
+		}},
+		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.PublishSnapshot(ctx, term, "", 7, "", "k")
 		}},
 		{"RecordOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			_, err := s.RecordOperation(ctx, term, metadata.Operation{

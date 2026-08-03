@@ -57,6 +57,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/wal"
 	"github.com/spin-stack/storage/internal/wal/format"
@@ -112,6 +113,18 @@ func chunkKey(volumeID [16]byte, digest string) string {
 // frequent cloning from snapshots — affordable.
 func SnapshotKey(volumeID [16]byte, snapshotID string) string {
 	return Prefix(volumeID) + "snapshots/" + snapshotID + ".json"
+}
+
+// SnapshotKeyFor is SnapshotKey for a caller that holds the volume id as a string —
+// the Control Plane, recording in the catalog where a host said it put the manifest.
+// It computes the key rather than believing a reported one so the catalog and the
+// writer cannot disagree about where a snapshot lives.
+func SnapshotKeyFor(volumeID, snapshotID string) (string, error) {
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return "", fmt.Errorf("image: volume %q is not a uuid: %w", volumeID, err)
+	}
+	return SnapshotKey([16]byte(u), snapshotID), nil
 }
 
 // ErrSnapshotExists means a snapshot with that id was already published. §5.2/INV-16: a

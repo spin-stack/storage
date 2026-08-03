@@ -474,7 +474,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 		return fmt.Errorf("the write before the snapshot: %w", err)
 	}
 	if !late {
-		if err := source.Snapshot(ctx, sourceID, snapID); err != nil {
+		if _, err := source.Snapshot(ctx, sourceID, snapID); err != nil {
 			return fmt.Errorf("snapshotting the live volume: %w", err)
 		}
 	}
@@ -484,7 +484,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	}
 	if late {
 		s.Emit(Event{Kind: EventFault, Msg: "the snapshot is taken from the live view, after the later writes"})
-		if err := source.Snapshot(ctx, sourceID, snapID); err != nil {
+		if _, err := source.Snapshot(ctx, sourceID, snapID); err != nil {
 			return fmt.Errorf("snapshotting the live volume: %w", err)
 		}
 	}

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
+	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 )
@@ -116,6 +118,20 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 	if err != nil {
 		return nil, rpcError(fmt.Errorf("cpserver: listing the volumes of %q: %w", hostID, err))
 	}
+	// One query for the whole host rather than one per volume: a poll that is mostly
+	// "nothing to do" should cost one round trip, and it is on the Agent's hot loop.
+	pending, err := s.md.ListPendingSnapshots(ctx, hostID)
+	if err != nil {
+		return nil, rpcError(fmt.Errorf("cpserver: listing the pending snapshots of %q: %w", hostID, err))
+	}
+	oldestPending := make(map[string]string, len(pending))
+	for _, snap := range pending {
+		// Oldest first, and the list is ordered, so the first id seen for a volume wins.
+		if _, ok := oldestPending[snap.VolumeID]; !ok {
+			oldestPending[snap.VolumeID] = snap.SnapshotID
+		}
+	}
+
 	out := make([]*storagev1.DesiredVolume, 0, len(vols))
 	for _, v := range vols {
 		d := &storagev1.DesiredVolume{
@@ -142,6 +158,7 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			d.ParentSnapshotId = v.ParentSnapshotID
 			d.ParentVolumeId = snap.VolumeID
 		}
+		d.PendingSnapshotId = oldestPending[v.VolumeID]
 		out = append(out, d)
 	}
 	return connect.NewResponse(&storagev1.GetDesiredStateResponse{Volumes: out}), nil
@@ -239,7 +256,47 @@ func (s *Server) applyReport(ctx context.Context, term int64, hostID string, r *
 	case err != nil:
 		return 0, fmt.Errorf("cpserver: updating the watermarks of %q: %w", r.GetVolumeId(), err)
 	}
+	if err := s.applySnapshotReport(ctx, term, hostID, r); err != nil {
+		return 0, err
+	}
 	return storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED, nil
+}
+
+// applySnapshotReport records the outcome of a snapshot this host was asked to take.
+//
+// It runs after the epoch check, and that is the point: a host the fleet has moved past
+// froze a view of a volume it no longer writes, and stamping its sequence into the
+// catalog would publish a snapshot of a state that was superseded. A stale report leaves
+// the row CREATING, which is the right answer — the volume's current writer still has
+// the request in its desired state.
+func (s *Server) applySnapshotReport(ctx context.Context, term int64, hostID string, r *storagev1.VolumeReport) error {
+	snapID := r.GetSnapshotId()
+	if snapID == "" {
+		return nil
+	}
+	if msg := r.GetSnapshotError(); msg != "" {
+		// FAILED is terminal, and it is what stops the request being re-sent. Leaving it
+		// CREATING so the Agent retries would loop forever on the failures that do not
+		// heal — a key that cannot open the parent, a store that refuses the write — and
+		// the ones that do heal are already covered, because the Agent retries within
+		// the session before it reports anything at all.
+		if err := s.md.SetSnapshotState(ctx, term, snapID, lifecycle.SnapshotFailed); err != nil {
+			return fmt.Errorf("cpserver: recording snapshot %q as failed: %w", snapID, err)
+		}
+		slog.WarnContext(ctx, "snapshot failed on its host",
+			"snapshot_id", snapID, "volume_id", r.GetVolumeId(), "host_id", hostID, "error", msg)
+		return nil
+	}
+	// Computed, not believed: the key is a function of the two ids, and taking the
+	// Agent's word for it would let the catalog point somewhere the reader does not look.
+	key, err := image.SnapshotKeyFor(r.GetVolumeId(), snapID)
+	if err != nil {
+		return fmt.Errorf("cpserver: snapshot %q: %w", snapID, err)
+	}
+	if err := s.md.PublishSnapshot(ctx, term, snapID, r.GetSnapshotSequence(), hostID, key); err != nil {
+		return fmt.Errorf("cpserver: publishing snapshot %q: %w", snapID, err)
+	}
+	return nil
 }
 
 // rpcError maps a store error onto a Connect code. The mapping matters at 3am: an

@@ -80,19 +80,62 @@ type Volume struct {
 	// got its base must not publish at all: its view is not a subset of the truth, it is
 	// a different thing.
 	baseFailed bool
+
+	// snapMu guards the snapshot bookkeeping below. It is its own lock because a
+	// snapshot's upload outlives the reconcile cycle that started it, and the manager's
+	// lock is held across starts and stops.
+	snapMu sync.Mutex
+	// pending is the snapshot the Control Plane currently asks for, empty when it asks
+	// for none. It is what Status reports about, so the answer the Agent sends is always
+	// about the request it was last given rather than about something it did once.
+	pending string
+	// snaps is what this session knows about each snapshot it was asked for. An entry
+	// with done=false is an upload in flight; the map is what stops a request that
+	// repeats every few seconds from starting a second one.
+	snaps map[string]*snapState
+	// snapWG counts the uploads in flight, so a volume being torn down finishes the
+	// snapshots it started. Not tidiness: the upload calls Freeze on the log this
+	// teardown is about to close, so without the wait a snapshot that was seconds from
+	// done is reported FAILED and the catalog records a failure that did not happen.
+	snapWG sync.WaitGroup
+}
+
+// snapState is one snapshot's outcome on this host.
+type snapState struct {
+	done     bool
+	sequence uint64
+	err      error
 }
 
 // Status is what the Agent reports about this volume: the watermarks the log actually
 // holds, qualified by the epoch they were produced under (§12.3).
 func (v *Volume) Status() VolumeStatus {
 	w := v.log.Watermarks()
-	return VolumeStatus{
+	st := VolumeStatus{
 		VolumeID:          v.id,
 		Epoch:             v.epoch,
 		LocalSequence:     int64(w.Local),
 		DurableSequence:   int64(w.Durable),
 		PublishedSequence: int64(w.Published),
 	}
+	// Only a *finished* snapshot is reported, and only the one currently asked for. An
+	// upload still in flight says nothing: the Control Plane's row stays CREATING, the
+	// request arrives again next cycle, and the entry below is what makes that a no-op
+	// rather than a second upload.
+	v.snapMu.Lock()
+	defer v.snapMu.Unlock()
+	if st.SnapshotID = v.pending; st.SnapshotID == "" {
+		return st
+	}
+	switch snap := v.snaps[st.SnapshotID]; {
+	case snap == nil, !snap.done:
+		st.SnapshotID = "" // nothing to say yet
+	case snap.err != nil:
+		st.SnapshotError = snap.err.Error()
+	default:
+		st.SnapshotSequence = int64(snap.sequence)
+	}
+	return st
 }
 
 // stop tears the runtime down and waits for the serve loop to leave. Closing the log
@@ -101,6 +144,9 @@ func (v *Volume) Status() VolumeStatus {
 func (v *Volume) stop() error {
 	v.cancel()
 	<-v.done
+	// Before the image and before the log closes: an in-flight snapshot is holding a
+	// frozen view of this log and is the only thing that can finish it.
+	v.snapWG.Wait()
 	v.publish()
 	return v.log.Close()
 }
@@ -375,7 +421,12 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 
 		if running {
 			if existing.epoch == d.GetEpoch() {
-				continue // already serving exactly this
+				// Already serving exactly this — which is the *common* case, and the one
+				// a snapshot request arrives in. Checking it only on the paths that
+				// start a runtime would mean a volume can be snapshotted at the moment
+				// it is attached and never again.
+				m.ensureSnapshot(existing, d.GetPendingSnapshotId())
+				continue
 			}
 			// Promoted. The old runtime is torn down before the new one opens, because
 			// both would otherwise want the same socket.
@@ -393,6 +444,7 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 		m.mu.Lock()
 		m.volumes[id] = v
 		m.mu.Unlock()
+		m.ensureSnapshot(v, d.GetPendingSnapshotId())
 	}
 
 	// Whatever the Control Plane no longer lists for this host: promoted away,
@@ -524,7 +576,8 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		id: id, epoch: d.GetEpoch(), root: root, socket: socket,
 		log: log, dev: dev, enc: enc,
 		vol: [16]byte(u), store: m.deps.Store, rnd: m.deps.Rand,
-		done: make(chan struct{}),
+		done:  make(chan struct{}),
+		snaps: map[string]*snapState{},
 	}
 
 	// One listener is opened here so a socket that cannot be bound fails Apply rather
@@ -864,7 +917,53 @@ func (m *VolumeManager) Close() error {
 
 var _ VolumeSource = (*VolumeManager)(nil)
 
-// Snapshot freezes a running volume under a name and publishes the frozen copy.
+// ensureSnapshot starts the snapshot the Control Plane asks for, at most once.
+//
+// The request repeats every few seconds until the catalog row leaves CREATING, so the
+// map is what makes the second, third and hundredth arrival free. The upload runs on its
+// own goroutine because the caller is the reconcile loop: an Agent that blocked there
+// for the length of an upload would miss the heartbeat that renews its lease, and be
+// fenced for doing what it was told.
+//
+// A snapshot id that is no longer asked for is dropped, which is the only thing that
+// keeps this map from growing for the life of the process.
+func (m *VolumeManager) ensureSnapshot(v *Volume, snapshotID string) {
+	v.snapMu.Lock()
+	defer v.snapMu.Unlock()
+	v.pending = snapshotID
+	for id := range v.snaps {
+		if id != snapshotID {
+			delete(v.snaps, id)
+		}
+	}
+	if snapshotID == "" {
+		return
+	}
+	if _, started := v.snaps[snapshotID]; started {
+		return
+	}
+	if m.deps.Store == nil {
+		// Nothing to publish into. Reported as a failure rather than left silent: a
+		// snapshot nobody can take is an operator's problem, and a row stuck in
+		// CREATING is how it stays invisible.
+		v.snaps[snapshotID] = &snapState{done: true, err: errors.New("agent: this host has no object store to snapshot into")}
+		return
+	}
+	v.snaps[snapshotID] = &snapState{}
+	v.snapWG.Add(1)
+	go func() {
+		defer v.snapWG.Done()
+		// Not the reconcile context: it is scoped to one cycle, and this outlives it.
+		seq, err := m.snapshot(context.Background(), v, snapshotID)
+		v.snapMu.Lock()
+		defer v.snapMu.Unlock()
+		if snap := v.snaps[snapshotID]; snap != nil {
+			snap.done, snap.sequence, snap.err = true, seq, err
+		}
+	}()
+}
+
+// snapshot freezes a running volume under a name and publishes the frozen copy.
 //
 // It is §19 end to end and it does not stop the guest: Freeze captures the sequence and
 // swaps the read view under the volume's lock, the guest carries on writing into a fresh
@@ -875,30 +974,52 @@ var _ VolumeSource = (*VolumeManager)(nil)
 // different lives: the image is where this volume resumes, the snapshot is a named point
 // others descend from. Coupling them would make taking a snapshot change what a restart
 // reads, which is not something anybody asked for.
-func (m *VolumeManager) Snapshot(ctx context.Context, volumeID, snapshotID string) error {
-	m.mu.Lock()
-	v, ok := m.volumes[volumeID]
-	m.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("agent: volume %s is not being served here", volumeID)
+func (m *VolumeManager) snapshot(ctx context.Context, v *Volume, snapshotID string) (uint64, error) {
+	if v.baseDone != nil {
+		// Same hazard publish() waits for, and worse here: a view frozen before the base
+		// lands is missing everything the volume held before this session, and it would
+		// be written down under a name other volumes clone from.
+		<-v.baseDone
 	}
-	if m.deps.Store == nil {
-		return fmt.Errorf("agent: volume %s has no object store to snapshot into", volumeID)
-	}
-	if v.log.BasePending() {
-		// Snapshotting before the base lands would freeze a view missing everything the
-		// volume held before this session — the same hazard Volume.publish waits for,
-		// and here it would be written down under a name others clone from.
-		return fmt.Errorf("agent: volume %s is still loading its read view", volumeID)
+	if v.baseFailed {
+		return 0, fmt.Errorf("agent: volume %s never resolved its read view, so a snapshot of it would be missing everything it held before this session", v.id)
 	}
 
 	frozen, seq, err := v.log.Freeze()
 	if err != nil {
-		return fmt.Errorf("agent: volume %s: freezing at a sequence: %w", volumeID, err)
+		return 0, fmt.Errorf("agent: volume %s: freezing at a sequence: %w", v.id, err)
 	}
 	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.vol, frozen, seq, snapshotID); err != nil {
-		return fmt.Errorf("agent: volume %s: publishing snapshot %s: %w", volumeID, snapshotID, err)
+		if !errors.Is(err, image.ErrSnapshotExists) {
+			return 0, fmt.Errorf("agent: volume %s: publishing snapshot %s: %w", v.id, snapshotID, err)
+		}
+		// Already published — this host restarted, or a previous incarnation got there.
+		// The manifest is immutable (INV-16), so the sequence to report is *its* one,
+		// not the one just frozen: reporting the later number would put a point in the
+		// catalog that no copy corresponds to.
+		_, man, lerr := image.LoadSnapshot(ctx, m.deps.Store, v.enc, v.vol, snapshotID)
+		if lerr != nil {
+			return 0, fmt.Errorf("agent: volume %s: snapshot %s exists but could not be read: %w", v.id, snapshotID, lerr)
+		}
+		seq = man.Sequence
 	}
-	slog.Info("snapshot published", "volume_id", volumeID, "snapshot_id", snapshotID, "sequence", seq)
-	return nil
+	slog.Info("snapshot published", "volume_id", v.id, "snapshot_id", snapshotID, "sequence", seq)
+	return seq, nil
+}
+
+// Snapshot takes one snapshot and waits for it, for a caller that holds the volume id
+// rather than the runtime. Production does not use it — the Control Plane asks through
+// desired state, and ensureSnapshot is what answers — so it exists for the lanes that
+// drive a snapshot directly and need the published fact before they assert on it.
+func (m *VolumeManager) Snapshot(ctx context.Context, volumeID, snapshotID string) (uint64, error) {
+	m.mu.Lock()
+	v, ok := m.volumes[volumeID]
+	m.mu.Unlock()
+	if !ok {
+		return 0, fmt.Errorf("agent: volume %s is not being served here", volumeID)
+	}
+	if m.deps.Store == nil {
+		return 0, fmt.Errorf("agent: volume %s has no object store to snapshot into", volumeID)
+	}
+	return m.snapshot(ctx, v, snapshotID)
 }

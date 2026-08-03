@@ -34,6 +34,7 @@ import (
 	"github.com/spin-stack/storage/internal/cpserver"
 
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/pg"
@@ -75,6 +76,11 @@ func run() error {
 		seedBlock  = flag.Int("seed-block-size", 4096, "with -seed-volume: logical block size")
 		seedLocal  = flag.Bool("seed-local-durability", false, "with -seed-volume: ACK FLUSH on fdatasync instead of on a verified object (§14.8)")
 		kekFile    = flag.String("kek-file", "", "file holding the 32-byte key-encryption key (required for -seed-volume)")
+
+		// snapshot-volume: record a snapshot request and exit, the same shape as
+		// -seed-volume and for the same reason. The snapshot itself is taken by the
+		// Agent that serves the volume — this only writes the row it converges on.
+		snapshotVolume = flag.String("snapshot-volume", "", "record a snapshot request for this volume and exit, instead of serving")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -128,6 +134,23 @@ func run() error {
 			HostID:     *seedHost,
 			Durability: durability,
 		}, leader.Term)
+	}
+
+	if *snapshotVolume != "" {
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("-snapshot-volume needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		// Both ids are generated here rather than taken as flags: the snapshot id is
+		// what the request is named by, and the request id is §18's idempotency key, so
+		// a retry of *this command* is a new request while a retry of the write is not.
+		snap, serr := controlplane.RequestSnapshot(ctx, md, leader.Term, *snapshotVolume, ids.New().String(), ids.New().String())
+		if serr != nil {
+			return serr
+		}
+		slog.Info("snapshot requested",
+			"snapshot_id", snap.SnapshotID, "volume_id", snap.VolumeID, "epoch", snap.Epoch)
+		return nil
 	}
 
 	// Fail closed on a missing store: without a witness outside PostgreSQL the Elector
