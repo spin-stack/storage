@@ -1,6 +1,6 @@
 # ADR-0026 — V1 accepts an RPO of one session, and uploads at stop
 
-- **Status:** **Proposed — needs human review.** Nothing in this ADR is implemented.
+- **Status:** **Accepted — 2026-08-02.** Nothing in it is implemented yet.
 - **Date:** 2026-08-02
 - **Deciders:** human owner (raised the question and must decide it), implementer agent
   (wrote it up)
@@ -32,19 +32,21 @@ served from, and none of that involves an object store. It is:
 
 > Make §14.8's `local` mode the only mode, and upload the volume once, at stop.
 
-## The question this ADR cannot answer for itself
+## The question, and its answer
 
 **Has anyone ever asked for a VM to survive the loss of its host mid-session, or is that
 an assumption of the design?**
 
-Everything below is conditional on that answer, and it is a product question, not an
-engineering one. If the answer is "no one has asked", this ADR should be accepted. If the
-answer is "yes, for a class of volumes we intend to sell", it should be rejected and §2's
-tension resolved the other way — by narrowing the primary use case rather than the SLO.
+**Answered by the human owner, 2026-08-02: no. "Es un wish, no un pedido."**
 
-It is stated here rather than assumed because the last time this repository assumed an
-answer instead of checking one, it produced three documents describing a lane no test
-performed (DEV-0018).
+That is what makes this ADR accepted rather than proposed. §2's RPO-0 row was an
+aspiration written next to a use case that does not need it, and it has been generating
+half the system. It is now §2's *first paragraph* that governs — development, CI and
+ephemeral fleets — and the SLO table that gets corrected.
+
+It was asked rather than assumed because the last time this repository assumed an answer
+instead of checking one, it produced three documents describing a lane no test performed
+(DEV-0018).
 
 ## Decision (proposed)
 
@@ -101,16 +103,60 @@ increment, every fencing invariant and most of the DST harness live.
    than what exists: a compare-and-set on one object at stop time, rather than a lease
    renewed every three seconds gating every ACK. `internal/epoch` shrinks; it does not
    disappear.
-2. **Snapshots.** §2 makes "clonado frecuente desde snapshots" a primary use case and
-   §14.8 requires a snapshot to be complete in S3 in every mode. Under upload-at-stop,
-   either a mid-session snapshot forces the upload path back into existence, or "snapshot"
-   comes to mean "the image left behind when the VM stopped". For CI the second is
-   probably enough — but it is a change to what the word means and it belongs in the
-   design document, not in an implementation note.
+2. **Snapshots — decided, 2026-08-02.** A snapshot of a *running* VM is an `fsync`
+   followed by the upload of a copy. It does not stop the VM and it does not require the
+   §14.4 chain: the guest's data is made durable locally, and one object is written that
+   is complete enough for another VM to start from.
+
+   **§19 survives this intact, and is what makes it work.** "A snapshot is a number, not
+   an event": the source VM keeps writing immediately after the `fsync`, so the copy must
+   be a frozen view rather than whatever the WAL holds when the upload finishes. A
+   sequence number is exactly that frozen view, and it costs no pause — which is also how
+   §2's "pausa de I/O por snapshot ~0" survives.
+
+   What this removes from the old shape: a snapshot no longer has to be assembled from a
+   checkpoint plus the WAL objects after it, because there are no checkpoints and no
+   per-FLUSH objects. It is one copy of the volume as of one sequence number.
 3. **The guest's `fsync` is not being lied to.** `fdatasync` is a real guarantee against
    an Agent crash, a QEMU crash and a guest crash. Only host loss is excluded. The promise
    narrows; it does not become false. This is worth stating plainly because it is the
    objection this ADR will attract first.
+
+## Locality: the clone starts where the data already is
+
+Raised with the acceptance, and it is not a new idea — **it is §20's placement rule 1**,
+already written:
+
+> ```
+> 1. source_host con capacidad
+> 2. host con snapshot cacheado (incluido el standby tibio)
+> 3. cualquier host con capacidad
+> ```
+> Same-host: sin descarga; reutiliza EROFS, checkpoint y WAL cacheado.
+
+Under this ADR that rule stops being an optimization and becomes most of the boot-time
+story, because a cross-host clone now pays a full download with no warm standby and no
+lazy loading to shorten it. A snapshot taken from a running VM leaves its data on that
+host's local disk; starting the clone there is the difference between reading local NVMe
+and pulling the volume from S3.
+
+**`placement.Policy.Choose` already implements all three steps, `SourceHostID` first.**
+What is missing is a caller: its only production caller is the drain
+(`controlplane/drain.go`), and the clone path takes the host as a parameter instead of
+asking the policy. That is the gap, and it is small.
+
+Two things not to assume away:
+
+- **It is a preference, not a constraint.** The source host can be full, cordoned or
+  dead, and `Choose` already falls through to steps 2 and 3. Making same-host mandatory
+  would couple scheduling to a host that has no obligation to be available.
+- **The locality is time-bounded.** The source host holds the data only while it still
+  holds the volume. Once the source VM stops and its local state is reclaimed, step 1 buys
+  nothing and the clone pays the download — which is correct, and worth measuring before
+  anyone promises a boot time.
+
+Wiring the clone path to `placement.Choose` is its own increment, outside this ADR's
+scope; recorded in `STATUS.md`.
 
 ## Alternatives considered
 

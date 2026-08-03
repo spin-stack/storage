@@ -793,6 +793,25 @@ ADR-0016 and `REFERENCE.md`, where §12.6 is cited for what it actually says —
 lease is per host. `task dst` produces the same trace on the same seed, which is the
 point: nothing changed except where a reader is sent.
 
+## `placement.Policy` is implemented and the clone path does not call it
+
+Found while accepting ADR-0026, and it matters more under it than it did before.
+
+`placement.Policy.Choose` implements §20's three-step order exactly — source host first,
+then a host with the snapshot cached, then any host with capacity — and its **only
+production caller is the drain** (`controlplane/drain.go`). `controlplane.Clone` takes the
+destination host as a parameter, so nothing consults the policy when a clone is placed.
+
+Under ADR-0026 that stops being a missed optimization. A cross-host clone now pays a full
+download with no warm standby and no lazy loading to shorten it, so "start the clone where
+the data already is" carries most of the boot-time story. The policy is written and
+correct; wiring the clone path to it is a small increment and it is not done.
+
+Two properties to preserve when it is: same-host is a *preference* (`Choose` already falls
+through when the source host is full, cordoned or gone — making it mandatory would couple
+scheduling to a host with no obligation to be up), and the locality is *time-bounded* (the
+source host holds the data only while it still holds the volume).
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
@@ -816,11 +835,15 @@ calls it.
   `NewPromoter` appears only in tests and DST. ADR-0024 already says so; this file did
   not. Failover therefore exists as a model, and nothing an operator can run performs it.
 
-## PAUSED — the data-path cleanup, pending ADR-0026
+## STOPPED — the data-path cleanup, superseded by ADR-0026
 
-**Increments 12, 13 and 14 of the cleanup plan are on hold**, and so is any further work
-on the remote durability chain. The reason is not the work: it is that **ADR-0026 may
-delete the code being cleaned**.
+**ADR-0026 is accepted (2026-08-02).** The question it was blocked on — has anyone ever
+asked for a VM to survive the loss of its host mid-session? — was answered by the owner:
+**no, it is a wish rather than a request.**
+
+So increments 12, 13 and 14 of the cleanup plan are **not paused, they are moot**: they
+polish code the accepted ADR removes. Cleaning it would be the most expensive way to be
+wrong.
 
 §2 declares the primary use case ("flotas de VMs de desarrollo, CI y entornos efímeros")
 and the SLO ("RPO 0 bajo el modelo de fallas probado por DST") in the same section, and
@@ -830,15 +853,14 @@ entire remote durability chain — `recovery`, `gc`, `materialize`, `checkpoint`
 half the production tree and the half that is expensive to reason about. It has never
 been checked against a stated requirement.
 
-**The question ADR-0026 needs answered, and cannot answer itself:** has anyone ever asked
-for a VM to survive the loss of its host mid-session, or is that an assumption of the
-design?
+Increment 12 (`WriteSummary` and its unbounded accumulator) was specced and its branch
+chosen — delete the writer and the accumulator — before the stop. It is subsumed: under
+ADR-0026 the whole summary mechanism goes, not just its writer.
 
-Increment 12 (`WriteSummary` and its unbounded accumulator) was specced, the branch was
-chosen — delete the writer and the accumulator, keep `recovery.readSummary` — and then
-paused here rather than applied. It is a correct change under either answer, so it is
-cheap to resume; it is listed as paused rather than done so nobody reads the plan as
-finished.
+**What replaces the cleanup plan** is ADR-0026's own work, which is a different shape and
+wants its own inventory: withdraw the remote chain, implement snapshot-as-`fsync`-plus-copy
+(§19's sequence number is the frozen view, so the ~0 pause survives), and reduce fencing
+to a compare-and-set at stop. None of it is started.
 
 **What is *not* paused:** anything outside the durability chain. The transport, the block
 device, the read view, the guest lane and the documentation work are unaffected by
@@ -874,8 +896,8 @@ ADR-0026 either way.
   clone time is a §19/§20 question, not an implementation detail. **Subsumed by ADR-0026
   if that is accepted** — a chain that is only ever materialized at boot is a different
   problem.
-- **ADR-0026 — does V1 accept an RPO of one session?** The largest open question in the
-  repository, and the only one that changes what half the code is for. See above.
+- ~~**ADR-0026 — does V1 accept an RPO of one session?**~~ **Answered 2026-08-02: yes.**
+  Recorded in the ADR with the reasoning; what remains is execution, not a decision.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
 
 ---
