@@ -1,12 +1,7 @@
 package dst
 
 import (
-	"bytes"
 	"testing"
-
-	"github.com/spin-stack/storage/internal/cow"
-	"github.com/spin-stack/storage/internal/wal"
-	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // INV-10's Agent half (§16): once the Control Plane has refused a volume's report, this
@@ -41,9 +36,9 @@ func TestPlantedBugFencedVolumeStillServed(t *testing.T) {
 // increment removed, reached through a fault in the simulated store rather than by
 // disabling the fix.
 func TestPlantedBugDurableRangeReadsZeros(t *testing.T) {
-	requirePasses(t, 23, NewDurableRangeChecker(), scenarioTruncatedVolumeSurvivesARestart)
+	requirePasses(t, 23, NewDurableRangeChecker(), scenarioAStoppedVolumeComesBackFromItsImage)
 	plantedBug(t, 23, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
-		return truncatedVolumeSurvivesARestart(s, storeHidesTheObjects)
+		return aStoppedVolumeComesBack(s, storeHidesTheImage)
 	})
 }
 
@@ -112,109 +107,6 @@ func TestPlantedBugACloneReadsZeros(t *testing.T) {
 	plantedBug(t, 26, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
 		return aCloneReadsThroughItsParent(s, chainLinkDropped)
 	})
-}
-
-// INV-09 where a guest can see it (§12.3): every write the fenced writer ACKed as durable
-// must be readable on the host that replaced it.
-//
-// The invariant was never in doubt in the object store — recovery.DurablePrefix finds the
-// data and the drain proves it. What nothing checked is whether the **Agent on the
-// destination ever asks**. It did not: a promoted volume has no local segments and no
-// parent snapshot, so the base fetch was skipped entirely and the destination served
-// zeros for its predecessor's whole volume, with no error anywhere. INV-09 held in S3 and
-// the guest still got nothing.
-//
-// Planted with a store that lists nothing for the volume — the destination has *only* the
-// object store, so a listing that comes back empty is the whole of its world, and it is
-// the same fault the truncated-restart arm uses. The read must then be refused, not
-// answered with zeros: a guest cannot tell those from a range nobody wrote.
-func TestPlantedBugAPromotedHostReadsZeros(t *testing.T) {
-	requirePasses(t, 27, NewDurableRangeChecker(), scenarioAPromotedHostReadsThePreviousEpoch)
-	plantedBug(t, 27, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
-		return aPromotedHostReadsThePreviousEpoch(s, destinationCannotList)
-	})
-}
-
-// §5.8/INV-08 from the guest's side, in the shape that is not zeros: a range the volume
-// ACKed as durable comes back as bytes the guest never wrote.
-//
-// This one is planted differently from every other bug in this file, and the difference
-// is the finding. The others inject a fault — an unversioned bucket, a store that lists
-// nothing, a lease read from a stale snapshot — because the code under them will do the
-// wrong thing when the world misbehaves. Here the production fix
-// (recovery.ErrSealedWithoutKey) makes the violation unreachable *through the world*:
-// there is no configuration, no fault and no missing flag that gets ciphertext into a
-// read view any more, because a sealed record with no key is refused rather than folded
-// in. Restarting the Agent with no KEK at all — the one lever that used to produce it —
-// now costs the volume its reads, which is asserted by the scenario itself.
-//
-// So the bug is planted by replaying the volume's own sealed objects exactly the way
-// internal/agent did before this increment: view.Overwrite with the undecrypted payload.
-// Not a hypothetical either — it is a transcription of the shipped call, which passed a
-// literal nil Encryption to recovery.RecoverOver for a volume whose DEK it had unwrapped
-// four lines earlier. What it proves is the thing that has to be true: had the checker
-// existed, it would have caught it. Its silence is the whole hazard — GCM leaves the
-// length intact, the plaintext CRC is never re-checked on this path, and every watermark
-// and every zero-check agreed the volume was fine.
-func TestPlantedBugRestartServesCiphertext(t *testing.T) {
-	requirePasses(t, 29, NewDurableRangeChecker(), scenarioEncryptedVolumeSurvivesARestart)
-
-	// The same seed and the same volume, read back the pre-fix way.
-	ctx := t.Context()
-	plantedBug(t, 29, NewDurableRangeChecker(), "durable-range-survives-restart", func(s *Sim) error {
-		if err := scenarioEncryptedVolumeSurvivesARestart(s); err != nil {
-			return err
-		}
-		objs, err := s.Store.List(ctx, "wal/")
-		if err != nil || len(objs) == 0 {
-			return err
-		}
-		view := cow.NewIntervalMap()
-		var volumeID string
-		for _, o := range objs {
-			body, err := s.Store.Get(ctx, o.Key)
-			if err != nil {
-				return err
-			}
-			recs, err := wal.Replay(body[format.ObjectHeaderSize:])
-			if err != nil {
-				return err
-			}
-			for _, rec := range recs {
-				if rec.Type != format.RecordWrite {
-					continue
-				}
-				volumeID = format.UUIDString(rec.VolumeID)
-				// The shipped line, verbatim: no key, so the ciphertext is the payload.
-				view.Overwrite(rec.Offset, rec.Payload)
-			}
-		}
-		pattern := bytes.Repeat([]byte{0xE7}, 4096)
-		got := make([]byte, len(pattern))
-		view.Read(0, got)
-		zeros := bytes.Equal(got, make([]byte, len(got)))
-		s.Emit(Event{Kind: EventDurableRead, Key: volumeID,
-			ZerosAfterRestart: zeros, ForeignBytesAfterRestart: !zeros && !bytes.Equal(got, pattern)})
-		return nil
-	})
-}
-
-// One missing flag must cost the volume its reads, not cost the guest its data.
-//
-// An Agent restarted without -kek-file is a supported mode (dev, and the QEMU lane run
-// in it) reached by leaving one flag off a command line, so it is not a fault to be
-// injected — it is a Tuesday. Before this increment it was the cheapest route to the
-// silent defect: no KMS means no Encryption, and the volume's own sealed objects were
-// replayed straight into the read view. Now the volume fails closed, and this is what
-// asserts that the failure is a refusal rather than an answer.
-func TestRestartWithoutTheKEKRefusesRatherThanAnswering(t *testing.T) {
-	res := Run(29, func(s *Sim) error {
-		return encryptedVolumeSurvivesARestart(s, restartWithoutTheKEK)
-	}, NewDurableRangeChecker())
-	if res.Err != nil {
-		t.Fatalf("restarting without the KEK must refuse the read, not violate: %v\n--- trace ---\n%s",
-			res.Err, res.TraceString())
-	}
 }
 
 // INV-06 (§12.2) reaching the second path that can advance durable_sequence.

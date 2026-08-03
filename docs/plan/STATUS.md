@@ -844,53 +844,51 @@ because the second existed only to tell a lying summary apart from a superseded 
 **If ADR-0026 is ever reversed**, this is a hole that comes back with it, and it should
 come back with a writer before it comes back with a test.
 
-## ADR-0026 increment 2 is half done, and the half that is missing is §15
+## ADR-0026 increment 2 is done — a volume is its image
 
-`internal/image` exists: the on-S3 format ADR-0026 chose — a manifest plus
-content-addressed chunks — with `cow.Ranges` under it (the flattened extents of a layered
-view, which the map did not expose), a §25.2 round-trip property test over arbitrary
-writes and discards, corruption tests for truncation and bit flips, and the
-compare-and-set that is the whole of V1's fencing. All green.
+**A volume is now uploaded when it stops, and booted from what it uploaded.** That is V1's
+whole durability contract, and `internal/agent` no longer imports `internal/recovery`:
+increment 4's largest deletion is now unblocked rather than theoretical.
 
-**Chunks are sealed (2026-08-02).** The first version wrote plaintext and its round-trip
-property test passed happily, which is why the assertion that matters is on the bucket:
-`TestPublishedChunksAreCiphertext` greps the published objects for the guest's bytes.
+`internal/image` is the format ADR-0026 chose — a manifest plus content-addressed chunks —
+with `cow.Ranges` under it (the flattened extents of a layered view, which the map did not
+expose). Chunks are sealed, and the nonce rule is the part to read twice: **it is drawn,
+never derived, and a chunk is sealed exactly once, ever**, because a chunk whose key
+already exists is skipped rather than re-sealed. Those two facts together make reuse
+impossible, and skipping is also what keeps dedup — one mechanism, not a trade.
 
-**The nonce is drawn, never derived, and a chunk is sealed exactly once — ever.** Those
-two together are what make reuse impossible: a nonce covers exactly one plaintext, because
-the plaintext that produced the key is the only one that will ever be sealed under it. A
-chunk whose key already exists is skipped rather than re-sealed, which is also what keeps
-dedup. `TestAnUnchangedChunkIsNeverResealed` pins the mechanism by republishing with a
-different random source and asserting the bytes did not move.
+**The compare-and-set on the manifest is the entirety of V1's fencing.** Two incarnations
+both publishing is a silent lost update, and one CAS on one key is all that stands
+against it. `internal/image`'s tests assert both directions: a second publisher is refused
+*and* the first host's bytes are still what the volume holds, because a refusal that had
+already replaced the manifest would satisfy an assertion on the error alone.
 
-Both derived alternatives were rejected: a generation counter is written *before* the
-compare-and-set that decides which writer wins, so two hosts at the same generation with
-different content would seal two plaintexts under one nonce; and the plaintext digest
-makes the nonce a function of the secret. The cost accepted is the one every deduplicating
-encrypted store pays — equality of plaintexts is observable within a volume, to someone
-who can already read the bucket.
+**What went from the DST set, and why each.** `truncated-volume-survives-a-restart` and
+`encrypted-volume-survives-a-restart` proved guest-visible properties through a replay of
+WAL objects; both properties are now proven by
+`a-stopped-volume-comes-back-from-its-image`, which is encrypted precisely because that
+seam is where the same property last broke (DEV-0019).
+`a-promoted-host-reads-the-previous-epoch` went with its mechanism: V1 performs no
+promotion.
 
-**Still not wired.** `Volume.stop` publishing and `fetchBase` loading are written and
-reverted once (see below); landing them is the rest of increment 2.
+**Two test doubles stopped modelling anything when the boot path moved**, and neither
+would have been noticed without a test going red:
 
-**What the reverted wiring also established**, and what the next attempt should expect:
+- `agent`'s `unreachableStore` overrode `List` and `Get` — the two methods the replay
+  called. `image.Load` asks `Head` first, which fell through to a real store, answered
+  `ErrNotFound`, and the Agent read that as "no image yet", installed an empty base and
+  served the guest **zeros**. It now fails every read method.
+- `dst`'s `hidingStore` hid a *listing*. The image path never lists; it reads a manifest
+  by key. The planted bug for the restart arm passed while proving nothing until the
+  double hid `Head` and `Get` too.
 
-- `internal/agent` stops importing `internal/recovery` once the boot path is the image.
-  That is increment 4's largest deletion becoming reachable, and it was reachable.
-- Two DST scenarios prove the *old* boot path and come with the change:
-  `truncated-volume-survives-a-restart` is rewritten as
-  `a-stopped-volume-comes-back-from-its-image` (same guest-visible property, different
-  machinery), and `a-promoted-host-reads-the-previous-epoch` goes, since V1 performs no
-  promotion.
-- The planted bug for the restart arm has to change with it. `hidingStore` hides a
-  *listing*, and the image path never lists — it reads the manifest by key. The fault that
-  makes the image unreachable is hiding the manifest.
-- `unreachableStore` in `internal/agent` overrode only `List` and `Get` — the two methods
-  the recovery path called — so the moment the boot path asked `Head` first, the double
-  silently stopped modelling anything: `Head` fell through to a real store, answered
-  `ErrNotFound`, and the Agent read that as "no image yet" and served the guest zeros.
-  Fixed in the same attempt; worth remembering as the fifth instance of a test that
-  proved nothing.
+That is the fifth and sixth assertion in this repository that proved nothing until
+something moved underneath it. The pattern is always the same: a double written against
+the methods one implementation happened to call.
+
+**Not done in increment 2, on purpose:** the e2e observable with real binaries — a guest
+writing, the Agent stopping, the object appearing, a second Agent reading it back. The
+unit and DST levels cover the seam; the lane does not yet.
 
 ## Components with no production caller
 

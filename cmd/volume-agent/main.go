@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -164,6 +165,9 @@ func run() error {
 		Store:   store,
 		Lease:   func() bool { return loop != nil && loop.LeaseValid() },
 		KMS:     kms,
+		// §15: the image chunk nonces. Real randomness in the binary; the DST
+		// harness injects a seeded reader so the same seed gives the same ciphertext.
+		Rand: rand.Reader,
 		// Read through the loop for the same reason the lease is: the loop is assigned
 		// below, and it owns the cache whose entries are evicted when a volume leaves
 		// this host's desired state.

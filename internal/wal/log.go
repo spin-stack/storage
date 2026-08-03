@@ -1011,6 +1011,24 @@ func (l *Log) UnflushedBytes() int64 {
 }
 
 // ViewBytes reports the read-view memory (active_map_bytes proxy for Phase 04).
+// ViewAtRest returns the read view and the sequence it stands at, for serialising the
+// volume into an image.
+//
+// **It is only valid once nothing can append** — after the serve loop has stopped, which
+// is where Volume.stop calls it. That precondition is in the name because both other
+// designs are wrong: a getter that took `mu` would hand back a pointer the lock stops
+// protecting the moment it returns, and a callback holding `mu` across image.Publish
+// would hold it across an object-store PUT, which this type's two-mutex design exists to
+// prevent (see the type comment).
+//
+// A snapshot of a *running* volume is a different problem and does not use this: the view
+// is moving, so the frozen point has to be a sequence number rather than a moment (§19).
+func (l *Log) ViewAtRest() (*cow.IntervalMap, uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.view, l.local
+}
+
 func (l *Log) ViewBytes() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()

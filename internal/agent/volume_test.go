@@ -852,9 +852,17 @@ func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
 }
 
 // unreachableStore is an object store that answers nothing, which is what a base that
-// cannot be recovered looks like from the Agent's side. It is backed by a real one so
-// every method it does not override still exists — a nil embedded interface would panic
-// instead of failing, and a panic is not the behaviour under test.
+// cannot be loaded looks like from the Agent's side. It is backed by a real one so every
+// method it does not override still exists — a nil embedded interface would panic instead
+// of failing, and a panic is not the behaviour under test.
+//
+// **Every read method is overridden, and that is the point.** It used to override only
+// List and Get, the two the recovery path called. When the boot path became image.Load —
+// which asks Head first — the double silently stopped modelling anything: Head fell
+// through to the real store, answered ErrNotFound, and the Agent read that as "this
+// volume has no image yet", installed an empty base and served the guest zeros. This test
+// went red and is the only reason it was noticed, which makes it the fifth assertion in
+// this repository that proved nothing until something moved underneath it.
 type unreachableStore struct{ objectstore.Store }
 
 func newUnreachableStore() unreachableStore { return unreachableStore{Store: sim.NewObjectStore()} }
@@ -867,4 +875,8 @@ func (unreachableStore) List(context.Context, string) ([]objectstore.ObjectInfo,
 
 func (unreachableStore) Get(context.Context, string) ([]byte, error) {
 	return nil, errStoreUnreachable
+}
+
+func (unreachableStore) Head(context.Context, string) (objectstore.ObjectInfo, error) {
+	return objectstore.ObjectInfo{}, errStoreUnreachable
 }

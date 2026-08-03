@@ -16,10 +16,10 @@ import (
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/ioclass"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/materialize"
-	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -58,6 +58,17 @@ type Volume struct {
 	// other way to reach it. Passing a literal nil there is the bug this field exists
 	// to make hard to write — see fetchBase.
 	enc *wal.Encryption
+	// vol is the volume id as the object store keys use it.
+	vol [16]byte
+	// imageETag is the manifest this volume booted from, and what its own publish CASes
+	// against (ADR-0026). Empty means there was none — a first boot — and publishing
+	// with an empty ETag is create-only, so a first boot racing another still produces
+	// one image and one refusal.
+	imageETag string
+	// store and rnd are kept here because publishing happens as the runtime tears down,
+	// which is after the manager has stopped tracking it.
+	store objectstore.Store
+	rnd   io.Reader
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -93,7 +104,40 @@ func (v *Volume) Status() VolumeStatus {
 func (v *Volume) stop() error {
 	v.cancel()
 	<-v.done
+	v.publish()
 	return v.log.Close()
+}
+
+// publish writes the volume's state to the object store. It is the whole durability
+// contract of V1 (ADR-0026): nothing else leaves the host, and what this writes is what
+// the next boot — or a clone — reads.
+//
+// It runs after the serve loop has gone, because that is the first moment nothing can
+// append, which is what makes ViewAtRest's precondition true and the image a point rather
+// than a smear.
+//
+// A failure is loud and does not stop the teardown. Refusing to close would leave a
+// volume neither serving nor released, and the data is still in the local WAL either way;
+// what an operator needs is to know this session did not reach the object store.
+func (v *Volume) publish() {
+	if v.store == nil {
+		return // local-only Agent: the local WAL is all there is, by design
+	}
+	view, seq := v.log.ViewAtRest()
+	// Not the serve context: that one is already cancelled by the time this runs, and a
+	// cancelled publish is exactly the silent data loss this function exists to prevent.
+	etag, err := image.Publish(context.Background(), v.store, v.rnd, v.enc, v.vol, view, seq, v.imageETag)
+	switch {
+	case errors.Is(err, image.ErrSuperseded):
+		slog.Error("this volume's image was published by another writer; this session's writes were NOT saved",
+			"volume_id", v.id, "sequence", seq)
+	case err != nil:
+		slog.Error("this volume's image could not be published; this session's writes were NOT saved",
+			"volume_id", v.id, "sequence", seq, "error", err)
+	default:
+		v.imageETag = etag
+		slog.Info("volume image published", "volume_id", v.id, "sequence", seq)
+	}
 }
 
 // ListenFunc opens the vhost-user socket for one volume. It is injected because a Unix
@@ -224,6 +268,13 @@ type VolumeManagerDeps struct {
 	// (§10, `background_nvme_budget: 30% de IOPS/BW`). Nil disables the gate, which is
 	// what a unit test with no contention wants.
 	IOClass *ioclass.Scheduler
+	// Rand is where the image's chunk nonces come from (§15, image.Publish). It is
+	// injected rather than reached for because INV-01 keeps randomness out of the data
+	// path's dependencies and because DST needs the same seed to produce the same
+	// ciphertext (INV-02). Production passes crypto/rand.Reader; nil means the volume
+	// cannot publish an encrypted image, which is refused at construction rather than
+	// discovered at the first stop.
+	Rand io.Reader
 }
 
 // VolumeManager owns the live runtimes and is the Agent's VolumeSource. Apply is the
@@ -264,6 +315,12 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		return nil, errors.New("agent: a memory mapper must be injected (ADR-0020)")
 	case deps.EventFD == nil:
 		return nil, errors.New("agent: an EventFD adapter must be injected (ADR-0020)")
+	case deps.Store != nil && deps.KMS != nil && deps.Rand == nil:
+		// An Agent that can encrypt and cannot draw a nonce would seal every image chunk
+		// with whatever a nil reader gives — which is nothing, so Publish would fail at
+		// the first stop, in the teardown path, where the data is already unreachable.
+		// Refused here instead (§15, image.Publish).
+		return nil, errors.New("agent: a random source must be injected when a KMS is (§15: image chunk nonces)")
 	case deps.Store != nil && deps.Lease == nil:
 		// wal.EnableRemote accepts a nil lease without complaining and the failure
 		// surfaces much later, as ErrNoLease inside durableStep — at the first FLUSH,
@@ -528,6 +585,7 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	v := &Volume{
 		id: id, epoch: d.GetEpoch(), root: root, socket: socket,
 		log: log, dev: dev, enc: enc,
+		vol: [16]byte(u), store: m.deps.Store, rnd: m.deps.Rand,
 		done: make(chan struct{}),
 	}
 
@@ -595,20 +653,43 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		return
 	}
 
-	// v.enc, not nil: these objects are this volume's own, sealed under this volume's
-	// id, and replaying them without the key folds GCM ciphertext into the read view
-	// at exactly the right length with no error (recovery.ErrSealedWithoutKey now
-	// refuses it rather than serving it, but the key belongs here regardless).
-	base, durable, err := recovery.RecoverOver(ctx, m.deps.Store, v.enc, volumeID, epoch, parent)
-	if err != nil {
+	// The volume's own state is one image, published when it last stopped (ADR-0026).
+	// This replaced replaying a chain of WAL objects: there is no chain, and no
+	// contiguous prefix to establish — the manifest resolves or it does not.
+	//
+	// v.enc, not nil: the chunks are sealed under this volume's DEK, and loading them
+	// without it would fold ciphertext into the read view (DEV-0019).
+	base, man, etag, err := image.Load(ctx, m.deps.Store, v.enc, volumeID)
+	switch {
+	case errors.Is(err, image.ErrNotPublished):
+		// A volume that has never stopped cleanly has no image, which is the first boot
+		// and must work. Its base is whatever its parent gives it, or nothing.
+		base, man = parent, image.Manifest{}
+		if base == nil {
+			base = cow.NewIntervalMap()
+		}
+	case err != nil:
 		// Refuse loudly rather than serve zeros. An empty view where data belongs is
-		// indistinguishable from a fresh volume, which is the failure this whole
-		// increment exists to make impossible.
-		slog.Error("the volume's read view could not be recovered; its reads will fail",
+		// indistinguishable from a fresh volume, and a guest cannot tell them apart.
+		slog.Error("the volume's image could not be loaded; its reads will fail",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)
 		v.log.FailBase(err)
 		return
+	default:
+		if parent != nil { // a clone reads through its parent, underneath its own image (§20)
+			if err := base.SetBase(parent); err != nil {
+				slog.Error("the clone's parent could not be layered under its image; its reads will fail",
+					"volume_id", v.id, "error", err)
+				v.log.FailBase(err)
+				return
+			}
+		}
 	}
+	// The ETag this volume CASes against when it publishes in turn. Carrying it is what
+	// makes the fence work: a host that never loaded the manifest publishes with an empty
+	// ETag, which is create-only, and loses to the one that did.
+	v.imageETag = etag
+	durable := man.Sequence
 	if err := v.log.InstallBase(base, durable); err != nil {
 		slog.Error("the recovered read view could not be installed",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)
