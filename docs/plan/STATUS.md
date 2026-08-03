@@ -844,6 +844,47 @@ because the second existed only to tell a lying summary apart from a superseded 
 **If ADR-0026 is ever reversed**, this is a hole that comes back with it, and it should
 come back with a writer before it comes back with a test.
 
+## ADR-0026 increment 2 is half done, and the half that is missing is §15
+
+`internal/image` exists: the on-S3 format ADR-0026 chose — a manifest plus
+content-addressed chunks — with `cow.Ranges` under it (the flattened extents of a layered
+view, which the map did not expose), a §25.2 round-trip property test over arbitrary
+writes and discards, corruption tests for truncation and bit flips, and the
+compare-and-set that is the whole of V1's fencing. All green.
+
+**Nothing calls it, and that is deliberate: the chunks are plaintext.** §15/INV-15 says
+nothing leaves the host in cleartext, so wiring it as it stands would put guest data in
+the bucket in the clear. The wiring was written, found this, and was reverted rather than
+landed.
+
+**The open question is the nonce**, and it is a review-zone decision. `crypto.DEK.Seal`
+derives its nonce from (volumeID, epoch, sequence) — unique per WAL record by
+construction. A chunk has no sequence. Deriving it from the chunk's plaintext digest is
+unique per content and keeps content-addressing working, so an unchanged region still
+costs nothing to re-publish; it also makes equality of plaintexts observable within a
+volume, which is a property to accept explicitly rather than arrive at. Nonce reuse across
+two plaintexts under one DEK is catastrophic in GCM, so this is decided before anything
+calls `Publish`.
+
+**What the reverted wiring also established**, and what the next attempt should expect:
+
+- `internal/agent` stops importing `internal/recovery` once the boot path is the image.
+  That is increment 4's largest deletion becoming reachable, and it was reachable.
+- Two DST scenarios prove the *old* boot path and come with the change:
+  `truncated-volume-survives-a-restart` is rewritten as
+  `a-stopped-volume-comes-back-from-its-image` (same guest-visible property, different
+  machinery), and `a-promoted-host-reads-the-previous-epoch` goes, since V1 performs no
+  promotion.
+- The planted bug for the restart arm has to change with it. `hidingStore` hides a
+  *listing*, and the image path never lists — it reads the manifest by key. The fault that
+  makes the image unreachable is hiding the manifest.
+- `unreachableStore` in `internal/agent` overrode only `List` and `Get` — the two methods
+  the recovery path called — so the moment the boot path asked `Head` first, the double
+  silently stopped modelling anything: `Head` fell through to a real store, answered
+  `ErrNotFound`, and the Agent read that as "no image yet" and served the guest zeros.
+  Fixed in the same attempt; worth remembering as the fifth instance of a test that
+  proved nothing.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
