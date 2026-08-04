@@ -262,6 +262,66 @@ func (q *Queries) ResizeVolume(ctx context.Context, arg ResizeVolumeParams) (int
 	return result.RowsAffected(), nil
 }
 
+const setVolumePrimaryHost = `-- name: SetVolumePrimaryHost :execrows
+UPDATE volumes
+   SET primary_host_id = $1::uuid,
+       state = CASE WHEN $1::uuid IS NULL
+                    THEN 'DETACHED' ELSE 'ACTIVE' END,
+       fencing_started_at = NULL,
+       updated_at = now()
+ WHERE volume_id = $2
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
+   AND state = ANY($4::text[])
+   AND (primary_host_id IS NULL
+        OR $1::uuid IS NULL
+        OR primary_host_id = $1::uuid)
+`
+
+type SetVolumePrimaryHostParams struct {
+	PrimaryHostID pgtype.UUID `json:"primary_host_id"`
+	VolumeID      uuid.UUID   `json:"volume_id"`
+	Term          int64       `json:"term"`
+	AllowedStates []string    `json:"allowed_states"`
+}
+
+// Place a volume on a host, or clear its placement (a NULL primary_host_id),
+// term-guarded. It is the only write of primary_host_id that is not a promotion:
+// CreateVolume's conflict path protects the column with COALESCE, so before this
+// query an attach was permanent.
+//
+// The state moves with the ownership, in this statement, because they are one fact:
+// a volume with no writer is DETACHED and a volume with one is ACTIVE. Two writes
+// have a window, and neither order is harmless — a volume left ACTIVE with no host is
+// one a snapshot request accepts and no Agent can ever take.
+//
+// Three predicates, and each refuses something different:
+//
+//   - the CP term (§7), so a zombie leader affects 0 rows;
+//   - `state = ANY($allowed_states)`, the §7 transition table as a predicate, exactly
+//     as SetVolumeState does it — in SQL rather than in Go so a read-modify-write
+//     cannot be split by a second Control Plane;
+//   - the placement guard, which admits a clear from anything, a place onto a volume
+//     that has no host, and a re-write of the placement a volume already has — and
+//     refuses only the straight hand-over A -> B. That one would give the destination
+//     the volume while the source is still serving it, because a host discovers it has
+//     lost a volume on its next GetDesiredState poll and not before.
+//
+// fencing_started_at is cleared for the same reason SetVolumeState clears it when
+// leaving FENCING_WAIT (ADR-0015): neither ACTIVE nor DETACHED is that state, and a
+// dwell left behind would be inherited by the next promotion instead of being waited.
+func (q *Queries) SetVolumePrimaryHost(ctx context.Context, arg SetVolumePrimaryHostParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setVolumePrimaryHost,
+		arg.PrimaryHostID,
+		arg.VolumeID,
+		arg.Term,
+		arg.AllowedStates,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setVolumeState = `-- name: SetVolumeState :execrows
 UPDATE volumes
    SET state = $2,

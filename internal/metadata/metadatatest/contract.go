@@ -77,6 +77,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"SnapshotLifecycleIsExpressible", snapshotLifecycle},
 		{"PendingSnapshotsFollowTheVolumeAndPublishOnce", pendingSnapshots},
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
+		{"VolumePlacementIsChangeableAndClearingIsIdempotent", volumePlacement},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
 		{"CapacityIsDerivedAndTheBoundIsAPredicateOfTheWrite", capacity},
@@ -261,6 +262,9 @@ func everyMutation() []mutation {
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return setVolumeState(ctx, s, term, w.vol, lifecycle.VolumePrimarySuspected)
 		}},
+		{"SetVolumePrimaryHost", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.SetVolumePrimaryHost(ctx, term, w.vol, "")
+		}},
 		{"CreateSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{
 				SnapshotID: id(), VolumeID: w.vol, Epoch: 1, TargetSequence: 1,
@@ -360,6 +364,9 @@ func missingRows(t *testing.T, s metadata.Store) {
 		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setVolumeState(ctx, s, term, ghostVol, lifecycle.VolumePrimarySuspected)
+		}},
+		{"SetVolumePrimaryHost", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.SetVolumePrimaryHost(ctx, term, ghostVol, w.host)
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setSnapshotState(ctx, s, term, ghostSnap, lifecycle.SnapshotPublished)
@@ -919,6 +926,150 @@ func concurrentBumps(t *testing.T, s metadata.Store) {
 			t.Fatalf("volume names %q as primary while %q won the epoch", v.PrimaryHostID, host)
 		}
 	}
+}
+
+// volumePlacement: primary_host_id used to be write-once. CreateVolume set it and its
+// converging upsert protected it with COALESCE, so a volume could never be detached,
+// never re-placed, and the volumes rebuild-metadata restores with no host could never
+// be given one.
+//
+// The observable throughout is ListVolumesByHost, not the column: that query is what
+// cpserver.GetDesiredState answers an Agent with, so "the volume left this host and
+// arrived at that one" is asserted as the two hosts' desired states changing. A store
+// that wrote the column and answered the listing from somewhere else would satisfy an
+// assertion on GetVolume alone and still leave the old Agent serving.
+func volumePlacement(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s)
+	other, third := id(), id()
+	for _, h := range []string{other, third} {
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{
+			HostID: h, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The epoch the volume starts at, so the "detach grants no epoch" assertions below
+	// compare against something the test did not assume.
+	start, err := s.GetVolume(ctx, w.vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// hostServes is the desired state of one host, as an Agent would receive it.
+	hostServes := func(t *testing.T, host string) bool {
+		t.Helper()
+		vols, err := s.ListVolumesByHost(ctx, host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vols {
+			if v.VolumeID == w.vol {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hostServes(t, w.host) {
+		t.Fatal("the fixture volume is not in its own host's desired state")
+	}
+
+	t.Run("a stale term cannot detach", func(t *testing.T) {
+		stale := w.term
+		term, err := s.AcquireLeadership(ctx, "cp-zombie")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetVolumePrimaryHost(ctx, stale, w.vol, ""); !errors.Is(err, metadata.ErrStaleTerm) {
+			t.Fatalf("detach under a stale term: want ErrStaleTerm, got %v", err)
+		}
+		if !hostServes(t, w.host) {
+			t.Fatal("a zombie Control Plane took the volume out of its host's desired state")
+		}
+		w.term = term
+	})
+
+	t.Run("detaching takes the volume out of its host's desired state", func(t *testing.T) {
+		if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, ""); err != nil {
+			t.Fatalf("detach: %v", err)
+		}
+		if hostServes(t, w.host) {
+			t.Fatal("the volume is still in the desired state of the host it was detached from")
+		}
+		v, err := s.GetVolume(ctx, w.vol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case v.PrimaryHostID != "":
+			t.Fatalf("the volume still names %q as its primary", v.PrimaryHostID)
+		case v.State != lifecycle.VolumeDetached:
+			// A volume with no writer that is still ACTIVE is one
+			// controlplane.RequestSnapshot accepts and no Agent can ever take.
+			t.Fatalf("a volume with no host is in state %q, want DETACHED", v.State)
+		case v.CurrentEpoch != start.CurrentEpoch:
+			// Detaching grants the fencing token to nobody, and the Agent's WAL lives
+			// under <volume>/<epoch>: a bump would abandon the local records of a
+			// volume that is meant to be re-attachable.
+			t.Fatalf("detaching moved the epoch from %d to %d", start.CurrentEpoch, v.CurrentEpoch)
+		}
+	})
+
+	t.Run("detaching twice is the state the caller asked for", func(t *testing.T) {
+		if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, ""); err != nil {
+			t.Fatalf("re-detaching an already detached volume must be a no-op, got %v", err)
+		}
+		v, err := s.GetVolume(ctx, w.vol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.PrimaryHostID != "" || v.State != lifecycle.VolumeDetached ||
+			v.CurrentEpoch != start.CurrentEpoch {
+			t.Fatalf("the second detach changed something: %+v", v)
+		}
+	})
+
+	t.Run("a detached volume can be placed again", func(t *testing.T) {
+		if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, other); err != nil {
+			t.Fatalf("place: %v", err)
+		}
+		if !hostServes(t, other) {
+			t.Fatal("the volume did not arrive in the new host's desired state")
+		}
+		if hostServes(t, w.host) {
+			t.Fatal("the volume is in two hosts' desired states at once")
+		}
+		v, err := s.GetVolume(ctx, w.vol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.State != lifecycle.VolumeActive || v.CurrentEpoch != start.CurrentEpoch {
+			t.Fatalf("placing a volume left it %+v", v)
+		}
+	})
+
+	t.Run("placing it where it already is changes nothing", func(t *testing.T) {
+		if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, other); err != nil {
+			t.Fatalf("re-placing on the same host must be a no-op, got %v", err)
+		}
+		if !hostServes(t, other) {
+			t.Fatal("the volume left the host it was re-placed on")
+		}
+	})
+
+	t.Run("a straight hand-over is refused and writes nothing", func(t *testing.T) {
+		err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, third)
+		if !errors.Is(err, metadata.ErrAlreadyPlaced) {
+			t.Fatalf("A -> B in one write: want ErrAlreadyPlaced, got %v", err)
+		}
+		if hostServes(t, third) {
+			t.Fatal("the refused hand-over still put the volume in the destination's desired state")
+		}
+		if !hostServes(t, other) {
+			t.Fatal("the refused hand-over took the volume away from the host that holds it")
+		}
+	})
 }
 
 // hostLeases: the lease is the Agent's authority to ACK a FLUSH (§12.2), and until

@@ -1463,6 +1463,58 @@ reader that is otherwise correct. The top-level `Durability` enum is deleted out
 proto3 has no file-scope `reserved`, so the note lives in `DesiredVolume` where the
 `reserved 6` is.
 
+**D2: a volume's placement is changeable, so attach is no longer permanent (2026-08-04).**
+`volumes.primary_host_id` was write-once. `CreateVolume` set it and its converging upsert
+protected it with `COALESCE(existing, excluded)`; `BumpVolumeEpoch` is the only other
+writer and has no production caller. So a volume could not be detached, could not be
+re-placed, and the volumes `-rebuild-metadata` restores with no host — which it says out
+loud on the way out — could never be given one. Three well-tested teardown paths had no
+condition in production that reached them: `VolumeManager.Apply`'s gone-branch,
+`VolumeManager.Fence`, and the `NOT_PRIMARY` report outcome. All three are now reachable.
+
+`metadata.Store.SetVolumePrimaryHost(ctx, term, volumeID, primaryHostID)` places a volume
+or clears its placement, in both implementations and one term-guarded statement, with
+`cmd/control-plane -detach-volume` and `-attach-volume`/`-attach-host` as the callers.
+Three decisions, each written at the code rather than here:
+
+- **The §7 state moves with the ownership, in the same write** (`metadata.PlacedState`):
+  no writer means `DETACHED`, a writer means `ACTIVE`. Two writes have a window and
+  neither order is harmless — a volume left `ACTIVE` with no host is one
+  `controlplane.RequestSnapshot` accepts (it checks only the state) and no Agent can ever
+  take, so the snapshot sits `CREATING` for ever.
+- **The epoch is not touched, in either direction.** An epoch is a fencing token granted
+  by a compare-and-set to a writer that won it; a detach grants it to nobody. Nothing
+  needs the bump either: `cpserver.applyReport` compares `primary_host_id` against the
+  reporting host *before* it looks at the epoch, so a cleared volume answers `NOT_PRIMARY`
+  — the outcome that makes the Agent fence and tear down — and `""` matches nobody
+  because the RPC refuses an empty `host_id` at the boundary. And a bump would cost a
+  re-attach its local data: the WAL lives at `<data-dir>/wal/<volume-id>/<epoch>`, so a
+  new epoch is a fresh empty root and detach has to be reversible.
+- **A straight hand-over A → B is refused** (`metadata.ErrAlreadyPlaced`); the caller
+  detaches, observes the host has stopped, and places. This is what keeps the increment
+  out of the mutual-exclusion review zone rather than dragging it in: a host serves what
+  `GetDesiredState` lists and learns it lost a volume on its *next* poll, so one write
+  naming a new owner would have two Agents serving one volume for a poll interval, both
+  publishing an image over the same manifest with one losing its session to the CAS. The
+  refusal does not make the two-step exclusion — an operator who re-places within a poll
+  interval rebuilds the window by hand — it only guarantees no single catalog write opens
+  it. Closing it properly is the §7 machine's job and is not done.
+
+No schema change: the column was already nullable with an FK. The contract case
+`VolumePlacementIsChangeableAndClearingIsIdempotent` asserts on `ListVolumesByHost` —
+what `GetDesiredState` answers an Agent with — rather than on the column, so a store that
+wrote the column and answered the listing from elsewhere would still fail. **Four planted
+bugs, each watched go red:** dropping the sim's `checkTerm` (stale-term subtest and both
+`everyMutation` sweeps), dropping the sim's hand-over guard (the A → B subtest), dropping
+the sim's `v.State = state` (the DETACHED assertions), and replacing the SQL term
+predicate with a tautology in the pg lane (stale-term subtest, `<nil>` instead of
+`ErrStaleTerm`). `task ci` and the pg integration lane are green.
+
+**Not proven end to end.** `integration/e2e` is track C's file set in this wave, so no lane
+drives `-detach-volume` against a running Agent and asserts the socket disappears and the
+image lands. That proof is the seam this repository keeps losing defects at, and it is
+owed.
+
 ## Track E — observability (open work, appended per increment)
 
 *Only track E appends here* — it owns `internal/obs`, `internal/vhost`,

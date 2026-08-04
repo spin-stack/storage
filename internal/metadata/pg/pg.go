@@ -561,6 +561,56 @@ func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, prima
 	return epoch, err
 }
 
+// SetVolumePrimaryHost places a volume on a host or clears its placement, with the §7
+// state that goes with it (metadata.PlacedState) in the same statement.
+//
+// The 0-row path is where the work is. The query has four ways to affect nothing and
+// they are four different instructions to the caller, so it re-reads to tell them
+// apart — on that path only, where the write is known not to have landed:
+//
+//	stale term      -> step down (`wrote` answers this first, and it must win)
+//	no such volume  -> stop reconciling this volume
+//	placed on B     -> detach it first (ErrAlreadyPlaced)
+//	illegal move    -> the §7 machine says no (lifecycle.ErrInvalidTransition)
+func (s *Store) SetVolumePrimaryHost(ctx context.Context, term int64, volumeID, primaryHostID string) error {
+	id, err := requireUUID("volume", volumeID)
+	if err != nil {
+		return err
+	}
+	// nullUUID, not requireUUID: empty is the clear, and it is the whole point of this
+	// method. A malformed id is still refused rather than coerced to NULL — that
+	// coercion would silently detach the volume the operator meant to place.
+	host, err := nullUUID("primary host", primaryHostID)
+	if err != nil {
+		return err
+	}
+	state := metadata.PlacedState(primaryHostID)
+	rows, err := s.q.SetVolumePrimaryHost(ctx, db.SetVolumePrimaryHostParams{
+		VolumeID: id, PrimaryHostID: host, Term: term,
+		AllowedStates: state.PredecessorNames(), // the §7 transition table, as a predicate
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	v, gerr := s.GetVolume(ctx, volumeID)
+	if gerr != nil {
+		return gerr
+	}
+	if v.PrimaryHostID != "" && primaryHostID != "" && v.PrimaryHostID != primaryHostID {
+		return fmt.Errorf("%w: volume %s is placed on %s, detach it before placing it on %s",
+			metadata.ErrAlreadyPlaced, volumeID, v.PrimaryHostID, primaryHostID)
+	}
+	if terr := v.State.Transition(state); terr != nil {
+		return terr
+	}
+	// Every diagnosis above was made from a read taken after the write, so a volume
+	// that has since been placed or moved leaves none of them true. Saying so is
+	// better than returning nil, which would tell the caller the placement it asked
+	// for is in the catalog when something else is.
+	return fmt.Errorf("%w: volume %s was placed concurrently", metadata.ErrAlreadyPlaced, volumeID)
+}
+
 func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error {
 	id, err := requireUUID("volume", volumeID)
 	if err != nil {

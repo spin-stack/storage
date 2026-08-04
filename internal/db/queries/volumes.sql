@@ -83,6 +83,45 @@ UPDATE volumes
    AND current_epoch = sqlc.arg(expected_epoch)
 RETURNING current_epoch;
 
+-- name: SetVolumePrimaryHost :execrows
+-- Place a volume on a host, or clear its placement (a NULL primary_host_id),
+-- term-guarded. It is the only write of primary_host_id that is not a promotion:
+-- CreateVolume's conflict path protects the column with COALESCE, so before this
+-- query an attach was permanent.
+--
+-- The state moves with the ownership, in this statement, because they are one fact:
+-- a volume with no writer is DETACHED and a volume with one is ACTIVE. Two writes
+-- have a window, and neither order is harmless — a volume left ACTIVE with no host is
+-- one a snapshot request accepts and no Agent can ever take.
+--
+-- Three predicates, and each refuses something different:
+--
+--   * the CP term (§7), so a zombie leader affects 0 rows;
+--   * `state = ANY($allowed_states)`, the §7 transition table as a predicate, exactly
+--     as SetVolumeState does it — in SQL rather than in Go so a read-modify-write
+--     cannot be split by a second Control Plane;
+--   * the placement guard, which admits a clear from anything, a place onto a volume
+--     that has no host, and a re-write of the placement a volume already has — and
+--     refuses only the straight hand-over A -> B. That one would give the destination
+--     the volume while the source is still serving it, because a host discovers it has
+--     lost a volume on its next GetDesiredState poll and not before.
+--
+-- fencing_started_at is cleared for the same reason SetVolumeState clears it when
+-- leaving FENCING_WAIT (ADR-0015): neither ACTIVE nor DETACHED is that state, and a
+-- dwell left behind would be inherited by the next promotion instead of being waited.
+UPDATE volumes
+   SET primary_host_id = sqlc.narg(primary_host_id)::uuid,
+       state = CASE WHEN sqlc.narg(primary_host_id)::uuid IS NULL
+                    THEN 'DETACHED' ELSE 'ACTIVE' END,
+       fencing_started_at = NULL,
+       updated_at = now()
+ WHERE volume_id = sqlc.arg(volume_id)
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
+   AND state = ANY(sqlc.arg(allowed_states)::text[])
+   AND (primary_host_id IS NULL
+        OR sqlc.narg(primary_host_id)::uuid IS NULL
+        OR primary_host_id = sqlc.narg(primary_host_id)::uuid);
+
 -- name: ResizeVolume :execrows
 -- Grow-only (§3: shrink is a non-goal). The size guard rejects a shrink at the DB.
 UPDATE volumes

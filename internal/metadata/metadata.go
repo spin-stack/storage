@@ -89,6 +89,22 @@ var (
 	// asserting that its writer is gone; handing it a fresh lease afterwards
 	// contradicts that assertion.
 	ErrHostNotServing = errors.New("metadata: host is not serving")
+	// ErrAlreadyPlaced means SetVolumePrimaryHost was asked to move a volume straight
+	// from one host to another. It is refused, and the reason is the only thing that
+	// keeps two writers off one volume today: a host serves exactly the volumes
+	// GetDesiredState lists for it, and it learns it has lost one on its *next* poll.
+	// A single write that named a new owner would therefore hand the volume to the
+	// destination while the source is still serving it, for a poll interval, with both
+	// guests writing and both Agents publishing an image over the same manifest — one
+	// of them silently losing its session to the CAS.
+	//
+	// The caller detaches first and places afterwards, which passes the volume through
+	// "no host" and gives the source the same teardown it gets on any other release
+	// (stop, publish, close). That is not exclusion either — an operator who places
+	// again within one poll interval has re-created the window by hand — and closing
+	// it properly is the §7 state machine's job, not this write's. What this refusal
+	// buys is that no *single* catalog write can open it.
+	ErrAlreadyPlaced = errors.New("metadata: volume is already placed on another host")
 
 	// ErrUnversionedDEK is a volume written with DEKKeyID 0 — see CheckDEKKeyID.
 	ErrUnversionedDEK = errors.New("metadata: a volume's DEK must carry a version")
@@ -123,6 +139,25 @@ func CheckDEKKeyID(keyID uint32) error {
 		return fmt.Errorf("%w: 0 is the plaintext marker, not a DEK version (§15.1)", ErrUnversionedDEK)
 	}
 	return nil
+}
+
+// PlacedState is the §7 volume state that belongs with an ownership write: a volume
+// with a writer is ACTIVE, a volume with none is DETACHED. It is here, next to
+// CheckWatermarkOrder and for the same reason, because both stores have to derive it
+// identically — and because it is the answer to "what does clearing the primary host
+// mean for the state".
+//
+// The two are one fact, so SetVolumePrimaryHost writes them together rather than
+// leaving the state to a second call. Two writes have a window, and the window is not
+// harmless in either order: a volume left ACTIVE with no host is one that
+// controlplane.RequestSnapshot accepts (it checks only the state) and that no Agent
+// can ever take, so the snapshot sits CREATING for ever; a volume left DETACHED while
+// a host still serves it is one the catalog says nobody is writing while a guest is.
+func PlacedState(primaryHostID string) lifecycle.VolumeState {
+	if primaryHostID == "" {
+		return lifecycle.VolumeDetached
+	}
+	return lifecycle.VolumeActive
 }
 
 // The lifecycle vocabularies (host/volume/snapshot/operation states, §7/§19/§28.1)
@@ -409,7 +444,7 @@ type Store interface {
 	// two operators running rebuild-metadata at once must both finish — but it never
 	// lowers current_epoch, shrinks size_bytes, rewinds a watermark, blanks an
 	// owner, or rewrites the lifecycle state. Ownership and state move only through
-	// BumpVolumeEpoch and SetVolumeState.
+	// BumpVolumeEpoch, SetVolumePrimaryHost and SetVolumeState.
 	//
 	// A volume with a primary host is a placement, so this is one of the two writes
 	// that carry the §28.2 bound (§28.2, ADR-0017): a non-nil bound makes the
@@ -432,6 +467,44 @@ type Store interface {
 	// primary_host_id, naming an owner that never won the S3 epoch object and never
 	// got a lease.
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
+	// SetVolumePrimaryHost places a volume on a host, or clears its placement when
+	// primaryHostID is empty (term-guarded). It writes the §7 state that goes with the
+	// ownership in the same statement — PlacedState says which, and why they must not
+	// be two writes.
+	//
+	// It is the only mutation of primary_host_id that is not a promotion. Until it
+	// existed the column was write-once: CreateVolume set it and its converging upsert
+	// protected it with COALESCE, so an attach was permanent — a volume could not be
+	// detached, could not be re-placed, and the volumes rebuild-metadata restores with
+	// no host could never be given one.
+	//
+	// **Moving straight from one host to another is refused with ErrAlreadyPlaced.**
+	// The caller clears first and places afterwards; that sentinel carries the reason.
+	//
+	// **The epoch is not touched, in either direction.** Three things say so:
+	//
+	//   - An epoch is a fencing token, granted by BumpVolumeEpoch's compare-and-set to
+	//     a writer that won it (§12.3). Detaching grants it to nobody, so incrementing
+	//     here would burn a token no host holds.
+	//   - Nothing needs it to. What stops a released host's reports being accepted is
+	//     the ownership check, not the epoch: cpserver.applyReport compares
+	//     primary_host_id against the reporting host *before* it looks at the epoch, so
+	//     a cleared volume answers NOT_PRIMARY — which is exactly the outcome that makes
+	//     the Agent fence the volume and tear it down. That is sufficient here, and it
+	//     is sufficient because "" can never be a reporting host: the RPC refuses an
+	//     empty host_id at the boundary, so a cleared owner matches nobody rather than
+	//     matching everybody.
+	//   - It would cost a re-attach its local data. The Agent's WAL lives at
+	//     <data-dir>/wal/<volume-id>/<epoch>, so a bumped epoch is a fresh empty root:
+	//     a volume detached and re-attached to the same host would abandon whatever the
+	//     teardown publish did not carry (publish failures are logged and continue).
+	//     Detach has to be reversible.
+	//
+	// A stale term is ErrStaleTerm, a missing volume ErrNotFound, a §7 move the table
+	// forbids lifecycle.ErrInvalidTransition. Re-writing the placement a volume already
+	// has is a no-op, not an error — the operator who re-runs the command after a
+	// timeout must not be told it failed.
+	SetVolumePrimaryHost(ctx context.Context, term int64, volumeID, primaryHostID string) error
 	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
 	// A report violating published ≤ durable ≤ local is ErrWatermarkOrder (INV-03).
 	// A report that is merely *late* — an epoch-N primary's, delivered after epoch

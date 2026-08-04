@@ -421,6 +421,43 @@ func (s *Store) BumpVolumeEpoch(_ context.Context, term int64, volumeID, primary
 	return v.CurrentEpoch, nil
 }
 
+// SetVolumePrimaryHost places a volume on a host or clears its placement, together
+// with the §7 state that goes with it (metadata.PlacedState). The order of the guards
+// is the contract's: term, then existence, then the domain — and within the domain the
+// hand-over is diagnosed before the transition, because "detach it first" is an
+// instruction the caller can act on and "invalid transition" is not.
+func (s *Store) SetVolumePrimaryHost(_ context.Context, term int64, volumeID, primaryHostID string) error {
+	if err := requireID("volume", volumeID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	v, ok := s.vols[volumeID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	if v.PrimaryHostID != "" && primaryHostID != "" && v.PrimaryHostID != primaryHostID {
+		return fmt.Errorf("%w: volume %s is placed on %s, detach it before placing it on %s",
+			metadata.ErrAlreadyPlaced, volumeID, v.PrimaryHostID, primaryHostID)
+	}
+	state := metadata.PlacedState(primaryHostID)
+	if err := v.State.Transition(state); err != nil {
+		return err
+	}
+	v.PrimaryHostID = primaryHostID
+	v.State = state
+	// Neither ACTIVE nor DETACHED is FENCING_WAIT, and leaving that state clears the
+	// dwell record (ADR-0015) so the next promotion waits its own. Same rule as
+	// SetVolumeState's, spelled here rather than shared: there are two lines of it and
+	// a helper would hide which write owns the field.
+	v.FencingStartedAt = time.Time{}
+	s.vols[volumeID] = v
+	return nil
+}
+
 func (s *Store) UpdateWatermarks(_ context.Context, term int64, volumeID string, local, durable, published int64) error {
 	if err := requireID("volume", volumeID); err != nil {
 		return err

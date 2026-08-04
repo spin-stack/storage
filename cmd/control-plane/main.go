@@ -92,6 +92,22 @@ func run() error {
 		// PostgreSQL is unrecoverable even though every byte of every volume is intact.
 		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
 		oversubscribe   = flag.Float64("max-oversubscription", 1.0, "with -clone-snapshot: committed/total ceiling a host may reach (§28.2)")
+
+		// detach-volume / attach-volume: the two halves of a volume's placement, the
+		// same one-shot shape as the flags above. They exist because primary_host_id
+		// was write-once — CreateVolume set it and its converging upsert protected it —
+		// so an attach was permanent, and the volumes -rebuild-metadata restores with
+		// no host (it says so on the way out) could never be given one.
+		//
+		// They are two flags rather than one because the store refuses a straight
+		// hand-over (metadata.ErrAlreadyPlaced carries the reason: a host learns it has
+		// lost a volume only on its next poll, so a single write would have two Agents
+		// serving it). Detaching is what makes the release safe — the Agent's teardown
+		// publishes the session's image before it drops the socket — and an operator
+		// re-placing the volume has to wait for that to have happened.
+		detachVolume = flag.String("detach-volume", "", "clear this volume's placement and exit, instead of serving")
+		attachVolume = flag.String("attach-volume", "", "place this volume on -attach-host and exit, instead of serving")
+		attachHost   = flag.String("attach-host", "", "with -attach-volume: the host that will serve it (a UUIDv7)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -180,6 +196,46 @@ func run() error {
 		// the fleet to start serving them.
 		slog.Info("catalog rebuilt from the object store; no volume has a primary host — place them to resume serving",
 			"volumes", sum.Volumes, "snapshots", sum.Snapshots)
+		return nil
+	}
+
+	if *detachVolume != "" || *attachVolume != "" {
+		if *detachVolume != "" && *attachVolume != "" {
+			return errors.New("-detach-volume and -attach-volume are two separate runs: a volume moves host by being detached, observed to have stopped, and then placed")
+		}
+		// Under the current term, like every other admin command here: a placement
+		// change is not a leader taking over, and AcquireLeadership would leave the
+		// serving Control Plane's writes refused as stale.
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("changing a volume's placement needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		volumeID, host := *detachVolume, ""
+		if *attachVolume != "" {
+			if *attachHost == "" {
+				return errors.New("-attach-volume needs -attach-host: there is no default host, and a volume placed nowhere is a volume nobody serves")
+			}
+			volumeID, host = *attachVolume, *attachHost
+			// Read the host before writing it. primary_host_id has a foreign key, so a
+			// typo is caught either way — but as a driver-level 23503 naming a
+			// constraint, which tells an operator nothing about what they mistyped.
+			if _, herr := md.GetHost(ctx, host); herr != nil {
+				return fmt.Errorf("-attach-host %s: %w", host, herr)
+			}
+		}
+		if err := md.SetVolumePrimaryHost(ctx, leader.Term, volumeID, host); err != nil {
+			return err
+		}
+		if host == "" {
+			// The Agent finds out on its next GetDesiredState poll, and its teardown is
+			// what puts this session's bytes in the object store. Said out loud because
+			// an operator who reads "detached" and immediately re-places the volume has
+			// re-created the window this command exists to avoid.
+			slog.Info("volume detached; its host stops serving it on its next poll, and publishes the session's image as it does",
+				"volume_id", volumeID)
+			return nil
+		}
+		slog.Info("volume placed", "volume_id", volumeID, "host_id", host)
 		return nil
 	}
 
