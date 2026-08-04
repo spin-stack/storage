@@ -1325,6 +1325,36 @@ ADR-0026 either way.
 - ~~**ADR-0026 — does V1 accept an RPO of one session?**~~ **Answered 2026-08-02: yes.**
   Recorded in the ADR with the reasoning; what remains is execution, not a decision.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
+- **`SHUTDOWN-PUBLISH-SPEC.md` is written and unreviewed** (durability zone). It is the
+  one item whose failure loses a guest's session on a routine restart, and it ends with a
+  question that is a judgement rather than a consequence: should a host that cannot
+  publish refuse to release its data-directory lock instead of exiting non-zero? The spec
+  chooses exit-and-release; say if that is wrong.
+- **The descriptor's on-S3 format changed without a spec (2026-08-04, `f8c70c9`).** D1
+  removed the `durability` field from `descriptor.json` while deleting the mode end to
+  end. Formats are a human-review zone even under "formats change in place", and no spec
+  preceded it. **Recommendation: keep it.** The field had no reader, §25.2's property
+  test (truncate at every byte + bit flip) was updated with the shape and is green, and a
+  descriptor already in a bucket still parses and still verifies its digest — `Read` uses
+  plain `json.Unmarshal`, which ignores the extra key, and the digest is over the bytes as
+  stored. It is four lines to revert if the answer is no.
+- **`internal/blockdev/doc.go` now states a narrower FLUSH promise** (E4). Flagged by its
+  own author for whoever reviews the ACK-rule zone.
+
+## Integration log — the wave owner's notes
+
+**Wave 1 (2026-08-04) is green: `task ci:full` exit 0, production coverage 90.2%.** Four
+lanes, fourteen commits, and the parallelism held everywhere except one place worth more
+than the fourteen: **track E committed two files it did not own, from a stale copy, and
+wholesale reverted the fix track C had just landed** — an assertion that could not fail,
+restored to being unable to fail. Track C noticed and restored it (`96c1cbd`); nothing but
+that noticing stood between the wave and shipping the defect it had just removed. Track D
+had anticipated exactly this and committed by explicit pathspec, saying so. That is now
+the rule in `PARALLEL-PLAN.md`, along with the four files no track owned.
+
+**The margin to watch: production coverage is 90.2% against a 90% floor**, after nine
+deletions of tested production code. The next deletion-heavy increment trips it, and the
+answer is to write the tests the surviving code lacks — not to move the floor.
 
 ## Track A — the documents (open work, appended per increment)
 

@@ -60,6 +60,23 @@ single file or a hand-maintained registry.
 | **D — the catalog** | A volume can be detached, re-placed and deleted; a host can be cordoned | `internal/controlplane`, `internal/cpserver`, `internal/metadata/**`, `internal/db`, `internal/schema`, `internal/lifecycle`, `api/` |
 | **E — observability** | A metric leaves the process, or the machinery that pretends to emit one is deleted | `internal/obs`, `internal/vhost`, `internal/blockdev`, `internal/cow` |
 
+**Files no track owned, added after wave 1 found them the hard way.**
+`internal/dst/scenarios_agent.go` (edited by D and C), `cmd/control-plane/main.go` (D
+only, but unassigned), `integration/vhost/lifecycle_test.go` (edited by *three* lanes in
+one wave), and `internal/descriptor`. Assignment: `scenarios_agent.go` and
+`integration/vhost/lifecycle_test.go` to **C**, `cmd/control-plane/main.go` and
+`internal/descriptor` to **D**. A file with no owner is a file every lane feels entitled
+to.
+
+**Wave 1's real lesson: ownership by file is necessary and not sufficient.** Track E
+committed two files it did not own (`internal/agent/publish_test.go`,
+`snapshot_test.go`) from a *stale pre-edit copy*, wholesale reverting the fix track C had
+just landed — an assertion that could not fail, restored to being unable to fail. C
+noticed and restored it; nothing but that noticing stood between the wave and shipping the
+defect it had just removed. The rule that would have prevented it is mechanical, not
+social: **stage by explicit pathspec, and never `git commit -a` or `git add` a directory**
+while another agent is working. Track D did exactly that on purpose and said so.
+
 **Track D has no exploitable internal parallelism.** Seven of its eight items edit
 `metadata.go` + `sim.go` + `pg.go` + `metadatatest/contract.go` together, and five of them
 edit `schema.sql` and regenerate `internal/db`. Plan it as one sequential lane.
