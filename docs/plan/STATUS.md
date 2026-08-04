@@ -1743,6 +1743,85 @@ Each correction quotes the text it replaces, in the file and in the commit messa
   INV-07 row is already correct ("Six steps became two"); it is `REFERENCE.md`'s one-line
   resolution that still sends a reader to the deleted chain.
 
+### E2 — a metric leaves the process (2026-08-04)
+
+`obs.NewProvider(name, exporter)` is the production Provider, and
+`real.NewOTLPMetricExporter(ctx, endpoint)` is the OTLP/HTTP exporter behind it. Nine
+metrics were being recorded and none of them left either binary: `obs` had only
+`NewTestProvider`, so both mains passed `Recorder: nil` — honestly, with a comment saying
+that passing the test provider "would export the metrics to memory and look like
+observability from the outside".
+
+The socket-opening half is in `internal/simio/real/otlp.go` and nowhere else. That is
+INV-01, not tidiness: building the exporter inside `internal/obs` would have needed an
+exemption in **both** `.golangci.yml` and the `simulable` analyzer, which is the widening
+those two exist to prevent. `obs` takes an `sdkmetric.Exporter` and knows nothing about
+transports.
+
+**A nil exporter is a working Provider that exports nothing**, and an unset endpoint
+returns exactly that nil — so a binary needs no conditional and an Agent with no collector
+starts and runs as it does today. Two smaller decisions are written at the code: a
+malformed endpoint is *refused* at startup (the exporter's own behaviour on a bad URL is
+to keep its defaults and quietly export to localhost), and exporter retries are **off**,
+because the export that matters is the one `Shutdown` flushes while a volume is stopping —
+the default one-minute retry would add a minute to every Agent's shutdown when a collector
+is down, delaying the publish that carries V1's whole RPO. Nothing is lost by dropping it:
+OTLP metrics are cumulative, so the next successful export restates the totals.
+
+**Verified against a real receiver, not against a constructor returning non-nil.**
+`TestOTLPExporterDeliversARecordedMetricToACollector` stands up an OTLP/HTTP server,
+records `lease_renewal_failures_total{host=host-a} += 3` through the Recorder production
+code holds, and asserts the collector decoded the name, the value 3, the label, the
+resource's `service.name=volume-agent`, and the POST path `/v1/metrics`. **Three planted
+bugs, each watched go red:** dropping the reader in `NewProvider` so the exporter is
+ignored (`the collector received no lease_renewal_failures_total; it saw map[]`), dropping
+the `Shutdown` flush (same line), and pointing the exporter at `http://127.0.0.1:1`
+(`Shutdown: failed to upload metrics: … connect: connection refused`, returned in under a
+second — which is also the retries-off decision proving itself).
+
+**The handoff — track C owns `cmd/volume-agent/main.go`, so this lane did not wire it.**
+Five lines, and they are exactly these:
+
+```go
+otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+    "OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
+// …after signal.NotifyContext:
+exporter, err := real.NewOTLPMetricExporter(ctx, *otlpEndpoint) // (nil, nil) when unset
+if err != nil {
+    return err
+}
+metrics, err := obs.NewProvider("volume-agent", exporter)
+if err != nil {
+    return err
+}
+defer func() {
+    // context.WithoutCancel: the flush must outlive the SIGTERM that started the shutdown.
+    // Logged, never fatal — a collector that is down must not change the Agent's exit code.
+    if err := metrics.Shutdown(context.WithoutCancel(ctx)); err != nil {
+        slog.Error("flushing metrics", "error", err)
+    }
+}()
+```
+
+then `Recorder: metrics.Recorder(),` in `agent.Deps` in place of `Recorder: nil` and its
+three-line comment. `cmd/control-plane` is the same change with `"control-plane"` as the
+name. What this lane could *not* make one line is the `defer`: a periodic reader holds up
+to a minute of samples, so a process that exits without flushing exports nothing at all —
+which is the same defect this item removed, in a different place. It is deliberately
+`metrics.Recorder()` and not `obs.NewRecorder(metrics.Metrics)` so the wiring is one
+expression.
+
+`go.mod` grew `go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp` (v1.39.0,
+matching the pinned core) and, through it, `go.opentelemetry.io/proto/otlp` v1.9.0; MVS
+pulled `golang.org/x/crypto` 0.43.0 → 0.49.0 and added `golang.org/x/net`. `task ci` green;
+`task cover` 90.1% against the 90% floor.
+
+**Still not proven end to end**, and it is the seam this repository loses defects at: no
+lane starts the real Agent binary with `-otlp-endpoint` pointed at a receiver and asserts a
+series arrives. That belongs in `integration/e2e`, which is track C's file set this wave.
+Until it exists, "a metric leaves the process" is proven for the exporter and the provider,
+not for the binary.
+
 ---
 
 # Specs for work not started
