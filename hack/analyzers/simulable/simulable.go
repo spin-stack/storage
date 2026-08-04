@@ -73,24 +73,82 @@ var forbidden = map[string]map[string]bool{
 //     thing no test here can otherwise reach. "Under integration/" is not what
 //     earned it: the host-side lane that drives QEMU is ordinary code, is not
 //     exempt, and has a fixture proving it.
+//   - internal/testinfra is the build-tagged harness that starts containers and
+//     subprocesses for the integration and e2e lanes (DEV-0016). Every file in it
+//     carries `//go:build integration || e2e`, so none of it is linked into a
+//     binary this repository ships. There is no clock to inject into another
+//     *process*: a harness that waited on a simulated one would be measuring
+//     nothing, and the whole point of the lanes is that the real world decides.
 var exemptPathFragments = []string{
 	"internal/simio",
 	"internal/vhost/hostio",
 	"integration/guestinit",
+	"internal/testinfra",
+}
+
+// hasPathSegments reports whether the slash-separated path p contains frag as a
+// complete run of path segments.
+//
+// Plain strings.Contains would also match a longer sibling — "internal/testinfra" is
+// a prefix of a hypothetical "internal/testinfradriver", and "integration" of
+// "integrationhelpers" — so a package could inherit an exemption purely from how
+// somebody named it. That is silent widening, the failure this analyzer exists to
+// prevent, and it is invisible: nothing fails when a check stops checking. Anchoring
+// at both ends costs a few lines and has a fixture.
+func hasPathSegments(p, frag string) bool {
+	for i := 0; ; {
+		j := strings.Index(p[i:], frag)
+		if j < 0 {
+			return false
+		}
+		start, end := i+j, i+j+len(frag)
+		if (start == 0 || p[start-1] == '/') && (end == len(p) || p[end] == '/') {
+			return true
+		}
+		i = start + 1
+	}
 }
 
 func run(pass *analysis.Pass) (any, error) {
 	for _, frag := range exemptPathFragments {
-		if strings.Contains(pass.Pkg.Path(), frag) {
+		if hasPathSegments(pass.Pkg.Path(), frag) {
 			return nil, nil
 		}
 	}
+
+	// The harness exemption (DEV-0016) is per *file*, not per package, and it is the
+	// only per-file rule there is — so the position lookup below is hoisted behind
+	// this and never runs for the rest of the tree.
+	//
+	// Per-file is the entire point. The lanes' harnesses under integration/ start
+	// QEMU, Postgres and our own binaries and then wait for them: there is no clock
+	// to inject into another process, and a harness that waited on a simulated one
+	// would be measuring nothing. But integration/vhost also holds ordinary
+	// host-side code, and a package-level exemption would have carried it along —
+	// so a non-test file in the very same directory stays flagged, and a fixture
+	// holds both kinds of file side by side to prove it.
+	//
+	// It matches .golangci.yml's `(^|/)integration/.*_test\.go$` exactly, on
+	// purpose: the two INV-01 layers still differ in two places (`cmd/` for depguard
+	// only, and the golden fixtures), and every difference is one more thing a
+	// reader has to hold in their head before widening either.
+	underIntegration := hasPathSegments(pass.Pkg.Path(), "integration")
 
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	nodeFilter := []ast.Node{(*ast.SelectorExpr)(nil)}
 
 	insp.Preorder(nodeFilter, func(n ast.Node) {
 		sel := n.(*ast.SelectorExpr)
+
+		// The `_test.go` suffix, not a build tag, is what is checked: build
+		// constraints are already resolved by the time the analyzer sees a file (an
+		// untagged file is simply not in the package), so testing for one here would
+		// test nothing. The suffix is also what keeps ordinary unit tests governed —
+		// a time.Now() smuggled into a test beside simulable production code is
+		// precisely how that code stops being simulable.
+		if underIntegration && strings.HasSuffix(pass.Fset.Position(sel.Pos()).Filename, "_test.go") {
+			return
+		}
 
 		// Resolve what the selected identifier refers to. Function references
 		// (called or taken as values) resolve to a *types.Func whose package and

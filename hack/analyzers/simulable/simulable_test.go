@@ -50,6 +50,32 @@ func TestIntegrationItselfIsNotExempt(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "notexempt/integration/vhost")
 }
 
+// TestExemptTestInfra asserts the fourth exemption (DEV-0016): internal/testinfra is
+// the build-tagged harness that starts containers and subprocesses for the lanes.
+// There is no clock to inject into another process, and nothing here is linked into a
+// binary this repository ships.
+func TestExemptTestInfra(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/internal/testinfra")
+}
+
+// TestTestInfraSiblingIsNotExempt is the narrowness proof for that fragment. Under a
+// substring match, a package merely *named* like the exempt one inherits its
+// exemption, and nothing anywhere goes red — the analyzer just quietly stops checking
+// a package. Every call in the fixture must still be flagged.
+func TestTestInfraSiblingIsNotExempt(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "notexempt/internal/testinfradriver")
+}
+
+// TestHarnessExemptionIsPerFile is the narrowness proof for the per-file half of
+// DEV-0016, and it asserts both directions at once because both live in one package:
+// the build-tagged harness `fixture_test.go` produces no diagnostics, and its non-test
+// neighbour `helper.go` — same directory, same package — is flagged on every line.
+// A package-level exemption, or a rule that read "under integration/", would exempt
+// both and this test is the only thing that would notice.
+func TestHarnessExemptionIsPerFile(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "harness/integration/e2e")
+}
+
 // TestVHostItselfIsNotExempt is the narrowness proof. An exemption that leaked
 // to the parent package would make the whole vhost-user backend — protocol,
 // virtqueue, request handling — unsimulable without anything failing, which is

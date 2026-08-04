@@ -505,7 +505,17 @@ tasks:
   lint:simulable:
     desc: Run the authoritative simulable-interfaces analyzer over all packages.
     cmds:
-      - go run {{.SIMULABLE}} ./...
+      # Same build tags as lint:golangci, for the same reason (DEV-0016) and one
+      # step later. Without them the analyzer's package loader never parses a file
+      # under `integration/` or `internal/testinfra` — so INV-01's *authoritative*
+      # layer was checking a smaller tree than its belt-and-suspenders layer, and
+      # the surface where a real clock, a real socket and a real process meet our
+      # code was governed only by golangci-lint's exclusion list.
+      #
+      # `-tags` on the analyzer binary is deprecated and does nothing; the flag that
+      # reaches go/packages' `go list` child is GOFLAGS, which is why the tags are
+      # set as environment and not as an argument.
+      - GOFLAGS=-tags=integration,e2e go run {{.SIMULABLE}} ./...
 
   dst:
     desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1, §25.2).
