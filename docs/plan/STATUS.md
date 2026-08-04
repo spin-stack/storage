@@ -1378,6 +1378,31 @@ visible — and `guest-lane` is a container job, whose image is pulled before an
 so no `docker login` step could ever authenticate it and it had no `container.credentials`.
 Both fixed. None of it is executed: these workflows have never run.
 
+**B9: a guest that stays alive (2026-08-03, `0ee78a6`).** `RunLinuxGuest` ended in
+`cmd.Run()`, so **no test in this repository had ever had a live guest concurrent with any
+other event** — every snapshot, restart and clone in the lanes happened over a device whose
+guest had already powered off, and the e2e lane's "live" snapshot is requested thirteen
+lines after the guest is gone. `testinfra.StartLinuxGuest` returns while QEMU runs (on the
+same `Process` the binaries use, so the console is waitable line by line, with no second
+copy of the pump), and `RunLinuxGuest` is now the thin blocking wrapper — its `ctx`
+parameter went with the rewrite, because a guest that is killed by the test's own cleanup
+has no use for one; the five call sites in `integration/{e2e,vhost}` are the only edits
+outside this track's files. `integration/guestinit` grew `spin.mode=hold`: write, fsync,
+print `GUESTINIT-ALIVE <n>`, repeat, and stop when the **host** sends `GUESTCTL-STOP` down
+the other direction of the serial line — a channel rather than a signal to QEMU, because
+killing the VM proves nothing about the guest and leaves the volume mid-write. An
+unrecognised `spin.mode=` is now an error instead of falling back to the write path.
+
+`TestAGuestStaysAliveWhileTheHostWatchesItWrite` is the deliverable: it asserts liveness
+three ways — the WAL's durable watermark moves *after* the host read it, a heartbeat
+numbered above any seen before that arrives afterwards, and the guest answers the stop by
+powering off and reporting `GUESTINIT-PASS`. **Both planted bugs go red**: a `hold()` that
+returns after one iteration fails at "the WAL to grow under a running guest" (the first
+heartbeat and the first watermark still arrive, which is why one observation would not
+have been enough), and a guest deaf to the console keeps printing heartbeats until `Stop`
+gives up. What this unblocks is track C's snapshot-mid-write, an Agent restart under an
+attached guest, and RISK-10's reconnect path; none of them are written here.
+
 ## Track C — the agent data path (open work, appended per increment)
 
 *Only track C appends here* — it owns `internal/agent`, `internal/wal`,
