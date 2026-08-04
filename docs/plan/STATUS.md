@@ -1338,11 +1338,67 @@ integration, by this track; no other track edits them.
 `internal/testinfra`, `integration/guestinit` and `integration/vhost/guest_test.go`. The
 head tables are recounted once, at integration, by track A.
 
+**Wave 0: the mandatory DST set cannot select nothing (2026-08-03, `d58c19c`).**
+`go test -run TestNoSuchNameAtAll ./internal/dst/` exits 0 — "ok, no tests to run" — and
+`task dst` selected its scenarios with `-run` regexes, so a renamed test or a mistyped
+pattern turned the mandatory gate into a no-op that reported success. The set is now
+pinned by **name** (`internal/dst/mandatory_set_test.go`, 17 entries) rather than by a
+count, because a count is one integer every future branch bumps.
+
+**And the fix found a second no-op underneath it.** `internal/dst`'s `TestMain` audits,
+after the package runs, that every default checker was actually shown to catch a planted
+bug — and it skips that audit whenever `-run` is non-empty, so a single-test invocation is
+not spuriously red. `task dst` always passed `-run`. **The gate whose purpose is running
+the DST proofs was the one place the "these checkers can fire" audit was switched off.**
+Removing the filter entirely — rather than making it fail on an empty selection — costs
+0.02s and re-enables it.
+
+**Wave 0: the simulable analyzer sees the build-tagged surface (2026-08-03, `2d75842`).**
+INV-01's authoritative layer ran without build tags, so every file under `integration/`
+and `internal/testinfra` was invisible to it. Two things were not what the task assumed:
+the analyzer's `-tags` flag is a deprecated no-op in `singlechecker` (tags reach it only
+through `GOFLAGS`, which the `go list` child inherits), and there were **zero real
+findings** — all 15 sites are build-tagged harnesses already exempt under DEV-0016, so the
+exemption was ported to the analyzer rather than the code being fixed. The net new
+coverage under `integration/` is therefore zero files; what it *did* buy is that tagged
+code elsewhere — `internal/metadata/pg`'s integration tests, for one — is now governed by
+the authoritative layer for the first time. The exemption is per **file**, not per
+package, because `integration/vhost` holds host-side non-test code beside its harnesses,
+and the fragment matching was changed to segment-anchored: plain `strings.Contains` would
+have handed the exemption to any package merely *named* like an exempt one.
+
+**Wave 0: the workflow calls `task ci:full` (2026-08-03, `784404f`).** The premise was
+wrong in a way worth recording — CI's 13 steps were already set-equal to `ci:full`, so
+nothing was missing; the defect was structural, two copies of the gate with nothing
+holding them equal. Doing the permissions work found two real ones instead, both in the
+guest lane's registry access: `guest-lane-image` logs in to ghcr.io with only
+`contents: read`, so against a private package the lookup fails closed and the lane
+disables itself **silently** — the exact failure ADR-0025's preflight exists to make
+visible — and `guest-lane` is a container job, whose image is pulled before any step runs,
+so no `docker login` step could ever authenticate it and it had no `container.credentials`.
+Both fixed. None of it is executed: these workflows have never run.
+
 ## Track C — the agent data path (open work, appended per increment)
 
 *Only track C appends here* — it owns `internal/agent`, `internal/wal`,
 `cmd/volume-agent`, `integration/e2e` and `integration/vhost/{lifecycle,wal}_test.go`. The
 head tables are recounted once, at integration, by track A.
+
+**Wave 0: `integration/e2e/e2e_test.go` is nine files (2026-08-03, `a5b3024`).** Eight
+future increments each land an assertion in what was one 820-line file, and each also
+mutates the shared deployment fixture inside it — eight three-way merges, or one split
+now. Behaviour-identical, and proven so rather than assumed: the set of `func Test*` and
+of unexported helpers is byte-identical to the parent commit, every file kept its
+`//go:build e2e`, and the nine tests were run verbosely to confirm **PASS and not SKIP** —
+a dropped build tag or an orphaned helper surfaces as a silent skip, not a failure, so
+the exit code alone would have proved nothing.
+
+**The spec for the shutdown publish is written and waiting on a human**
+(`SHUTDOWN-PUBLISH-SPEC.md`, review zone: durability). Writing it surfaced a second path
+to the same loss that no auditor had found: `stop()` cancels the context `fetchBase` runs
+under and *then* waits on `baseDone`, so a volume stopped while its base is loading is
+dropped — correctly, since the view would be incomplete — because the Agent cancelled its
+own read.
 
 ## Track D — the catalog (open work, appended per increment)
 
