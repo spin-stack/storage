@@ -177,7 +177,7 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0010 | One S3 client wrapper; RustFS is the certified dev backend. | Accepted |
 | ADR-0011 | The Control-Plane term is anchored **outside PostgreSQL**, in a create-only S3 claim. | Accepted |
 | ADR-0012 | GC anchors: every WAL object of a closed epoch is a root; Phase 12 is born with a by-key index. | **Withdrawn** — ADR-0026 (`internal/gc` deleted; INV-14 pending) |
-| ADR-0013 | Local device pressure: a device budget, a reserve, and who may react. | **Proposed** |
+| ADR-0013 | Local device pressure: a device budget, thresholds, and who may react. | Accepted 2026-08-03, *as amended* — segments shipped, the reclaim-chain half is moot under ADR-0026, the device budget + thresholds + authority split stand |
 | ADR-0014 | Volume quota: soft, per-lineage, content-addressed snapshots, and squash. | **Withdrawn** — ADR-0026 (no squash, no lineage ledger; the soft/hard distinction survives) |
 | ADR-0015 | The fencing wait is a **monotonic dwell**, not a comparison of wall clocks. | Amended — nothing promotes; the durable half (`fencing_started_at`) survives |
 | ADR-0016 | Fencing granularity: a revocation window bounded to one promotion. | Amended — the lease is liveness only; the per-host granularity stands |

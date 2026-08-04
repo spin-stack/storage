@@ -1,7 +1,7 @@
 # ADR-0013 — Local device pressure: a device budget, a reserve, and who is allowed to react
 
-- **Status:** Proposed (needs human review — durability/fencing zone, and it changes
-  the on-disk WAL layout)
+- **Status:** **Accepted — 2026-08-03** (human owner). Accepted *as amended below*: half
+  of what it proposed has shipped, and half of it was about machinery ADR-0026 withdrew.
 - **Date:** 2026-07-26
 - **Deciders:** human (to decide), implementer agent (proposes)
 - **Implements/Extends:** §5.7 (backpressure rather than silently filling NVMe), §14.8
@@ -15,6 +15,46 @@
 > limit on the write path and the only source of an ENOSPC a guest can see. That raises
 > the stakes on §1 and §4 below — a soft quota deliberately does not stop a runaway
 > writer, which makes the device budget the thing that does.
+
+## Amendment, 2026-08-03 — what accepting it means under ADR-0026
+
+This ADR was written on 2026-07-26, before ADR-0026. Read against the code today, its six
+gaps split three ways, and the approval covers **only the third group**.
+
+**Already shipped.** §4, the largest piece it proposed: the WAL *is* a sequence of segment
+files, `TruncateLocal` unlinks whole segments, and `wal-segments-survive-a-crash-at-every-boundary`
+is a mandatory DST scenario with a planted bug. Gap 1 — "TruncateLocal almost never
+reclaims anything" — is closed by that, and gap 6's limitation is recorded where it lives.
+
+**Moot, because the mechanism is gone.** The chain this ADR opens with —
+`upload → verified object → checkpoint → AdvancePublished → TruncateLocal` — does not
+exist: nothing uploads mid-session, nothing publishes, and `published_sequence` is
+permanently 0. So `MaxRemoteGapBytes` (gap 2) went with the uploader in increment 4.5, and
+the **reserve** of §2 has no users left: its three named consumers were the checkpoint, the
+recovery point and the summary object, all deleted. A reserve protecting a reclaim path
+that does not exist would be headroom nobody spends.
+
+**Still real, and this is what is approved:**
+
+1. **Device-level backpressure, not per-volume** (gap 2's surviving half). N volumes on one
+   device each with their own unflushed bound can exceed it together, and nothing sums
+   them. Under ADR-0026 the pressure is different but not smaller — a session's whole WAL
+   stays local until the volume stops, so the device holds *everything every attached
+   volume has written*, with no mid-session reclaim at all. That makes the device budget
+   more load-bearing than when this was written, not less.
+2. **Admission counts committed bytes, not used ones** (gap 3). `nvme_used_bytes` is
+   written by the heartbeat now, so the input exists; nothing reads it for admission.
+3. **The thresholds and the feedback loop** (gaps 4–5, §3 and §5). Cordon on device
+   pressure, refuse attaches locally, and the division of authority: the Agent gets local
+   defensive powers only — backpressure, refusing attaches, marking itself degraded — and
+   moving volumes stays exclusively the Control Plane's. That division is the part of this
+   ADR with the longest shelf life, and it is unaffected by ADR-0026.
+
+**What the reserve becomes.** Not deleted, re-aimed: the write that must still be possible
+on a full device is now the **image publish at stop**, because a volume that cannot publish
+loses its whole session (ADR-0026). That is a different consumer with the same shape, and
+it is the one place the 5%/1 GiB floor still earns its keep.
+
 
 ## Context
 
