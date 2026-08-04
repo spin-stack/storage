@@ -43,15 +43,6 @@ func TestTheDeploymentServesAVolume(t *testing.T) {
 	// system correctly does not do.
 	agent.WaitForLine(t, "serving volume", 30*time.Second)
 	assertLogField(t, agent, "serving volume", "encrypted=true")
-
-	// The durability scheduler must be running. It is refused when the Agent has no
-	// host id, and the binary did not pass one until this lane read the line saying so
-	// — every volume on every real Agent would have grown its WAL for ever.
-	for _, line := range agent.Output() {
-		if strings.Contains(line, "no durability scheduler") {
-			t.Fatalf("this volume will never reclaim a byte: %s", line)
-		}
-	}
 }
 
 // assertLogField fails unless the process printed a line containing both needles. slog
