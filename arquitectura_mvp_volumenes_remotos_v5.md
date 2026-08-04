@@ -1128,31 +1128,42 @@ Ver §6.1; bloqueante para cada versión de MinIO/RustFS/S3 que se habilite.
 
 ### 26.2 Métricas
 
-**WAL local**: `wal_append_latency_seconds`, `wal_fdatasync_latency_seconds`, `wal_unflushed_bytes`, `wal_oldest_unflushed_age_seconds`, `wal_{local,durable,published}_sequence`.
+> **Recortado con ADR-0026 (2026-08-03).** La taxonomía anterior declaraba unas cuarenta
+> series y tres cuartas partes nombraban mecanismos que ADR-0026 retiró: los lotes y PUTs
+> del WAL remoto, los checkpoints, la objectización y compactación, el GC, la espera de
+> fencing, la recuperación a media sesión y el standby tibio. Un catálogo que declara lo
+> retirado se lee como un plan, y `internal/obs.Catalog()` es esta lista. Lo que se fue
+> vuelve con su mecanismo, desde git.
 
-**WAL remoto**: `wal_batch_size_bytes`, `wal_batch_age_seconds`, `wal_put_latency_seconds`, `wal_put_retries_total`, `wal_small_batch_ratio`, `wal_durable_gap` (bytes) y `wal_durable_gap_seconds` (RPO efectivo por volumen, crítico en modo `local`), `wal_objects_total{volume}`.
+**WAL local**: `wal_append_latency_seconds`, `wal_fdatasync_latency_seconds`,
+`wal_unflushed_bytes`, `wal_oldest_unflushed_age_seconds`, `wal_{local,durable}_sequence`,
+`wal_out_of_space` (1 mientras el dispositivo rechaza appends por espacio, §5.7).
 
-**Fencing y leases** (nuevo): `lease_remaining_seconds`, `lease_renewal_failures_total`, `self_fenced_total`, `fencing_wait_duration_seconds`, `clock_offset_seconds` (chrony).
+`wal_published_sequence` se retira con el checkpoint: en V1 nada publica, así que sería
+una serie permanentemente en 0.
 
-**Snapshots** (nuevo): `snapshot_publish_duration_seconds`, `snapshot_pause_duration_seconds` (~0 esperado).
+**Imagen y snapshots**: `image_publish_duration_seconds` (lo que tarda en salir del host
+al parar: en V1 es el único momento en que algo sale, así que es el coste de una sesión),
+`snapshot_publish_duration_seconds`, `snapshot_pause_duration_seconds` (~0 esperado; se
+mide alrededor del *congelado*, no de la subida).
 
-**Objectization/compactación/GC**: `checkpoint_duration_seconds`, `objectization_pending_bytes`, `compaction_bytes_total`, `orphan_objects_total`, `gc_reclaimed_bytes_total`, `chain_depth`, `discarded_bytes_total`.
+**Leases** (liveness, ya no durabilidad): `lease_remaining_seconds`,
+`lease_renewal_failures_total`, `clock_offset_seconds` (chrony).
 
-**Recovery/standby**: `recovery_duration_seconds`, `standby_checkpoint_lag_bytes`, `bytes_downloaded_before_boot`, `s3_errors_total{type}`.
+**Fleet**: `host_nvme_committed_ratio`, `clone_{same,cross}_host_total`, `chain_depth`,
+`discarded_bytes_total`.
 
-**Agent** (nuevo): `agent_memory_bytes{component}`, `active_map_bytes`, `io_class_bytes_total{class}`, `io_class_throttled_seconds`, `vhost_reconnects_total`, `inflight_recovered_total`.
+**Agent**: `agent_memory_bytes{component}`, `vhost_reconnects_total`,
+`inflight_recovered_total`.
 
-**Fleet** (nuevo): `host_nvme_committed_ratio`, `clone_{same,cross}_host_total`.
-
-**Cliente S3**: ver §24.
+**Cliente S3**: `s3_errors_total{type}` y lo de §24.
 
 ### 26.3 Alertas mínimas
 
 - `wal_unflushed_bytes > 80%` del límite; `wal_oldest_unflushed_age > 20 s`.
-- `wal_put_latency p99 > 500 ms`.
-- `lease_renewal_failures_total` creciendo; cualquier `self_fenced_total`.
+- Cualquier `wal_out_of_space` en 1: el dispositivo está rechazando escrituras.
+- `lease_renewal_failures_total` creciendo.
 - `clock_offset_seconds > 0.5`.
-- `standby_checkpoint_lag_bytes` sobre umbral.
 - `host_nvme_committed_ratio` sobre la política.
 - Certificados mTLS a < 30 días.
 - Cualquier error de checksum, GCM o divergencia (severidad máxima).

@@ -63,10 +63,12 @@ type Volume struct {
 	// with an empty ETag is create-only, so a first boot racing another still produces
 	// one image and one refusal.
 	imageETag string
-	// store and rnd are kept here because publishing happens as the runtime tears down,
-	// which is after the manager has stopped tracking it.
+	// store, rnd, clk and rec are kept here because publishing happens as the runtime
+	// tears down, which is after the manager has stopped tracking it.
 	store objectstore.Store
 	rnd   io.Reader
+	clk   clock.Clock
+	rec   *obs.Recorder
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -182,7 +184,17 @@ func (v *Volume) publish() {
 	view, seq := v.log.ViewAtRest()
 	// Not the serve context: that one is already cancelled by the time this runs, and a
 	// cancelled publish is exactly the silent data loss this function exists to prevent.
-	etag, err := image.Publish(context.Background(), v.store, v.rnd, v.enc, v.vol, view, seq, v.imageETag)
+	ctx := context.Background()
+	// Under ADR-0026 this is the *only* moment anything leaves the host, so its duration
+	// is the cost of a whole session rather than one step among many — and it is what an
+	// operator watching a slow shutdown needs (§26.2). Recorded for a failed publish too:
+	// how long it took to fail is the more interesting number.
+	start := v.clk.Now()
+	defer func() {
+		v.rec.Observe(ctx, "image_publish_duration_seconds", v.clk.Now().Sub(start).Seconds(),
+			obs.String("volume", v.id))
+	}()
+	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.vol, view, seq, v.imageETag)
 	switch {
 	case errors.Is(err, image.ErrSuperseded):
 		slog.Error("this volume's image was published by another writer; this session's writes were NOT saved",
@@ -584,6 +596,7 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		id: id, epoch: d.GetEpoch(), root: root, socket: socket,
 		log: log, dev: dev, enc: enc,
 		vol: [16]byte(u), store: m.deps.Store, rnd: m.deps.Rand,
+		clk: m.deps.Clock, rec: m.deps.Recorder,
 		done:  make(chan struct{}),
 		snaps: map[string]*snapState{},
 	}

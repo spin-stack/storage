@@ -13,10 +13,15 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
+	"github.com/spin-stack/storage/internal/lifecycle"
+	"github.com/spin-stack/storage/internal/metadata"
+	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
@@ -36,6 +41,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
 		{Name: "a-snapshot-of-a-live-volume-is-frozen", Run: scenarioASnapshotOfALiveVolumeIsFrozen},
 		{Name: "two-hosts-cannot-both-publish-an-image", Run: scenarioTwoHostsCannotBothPublishAnImage},
+		{Name: "a-rebuilt-catalog-can-serve-its-volumes", Run: scenarioARebuiltCatalogCanServeItsVolumes},
 	}
 }
 
@@ -393,6 +399,180 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 		return fmt.Errorf("clone read %x, the parent wrote %x", got[:8], payload[:8])
 	}
 	s.Notef("clone %s read its parent's bytes through the snapshot, with no data copy", cloneID)
+	return nil
+}
+
+// scenarioARebuiltCatalogCanServeItsVolumes is INV-20 stated as the thing an operator
+// would actually need on the worst day: the database is gone, the bucket is intact, and
+// the question is whether a guest can be handed its volume back.
+//
+// It is not "the rows came back". A rebuild that recreated a volume with the wrong
+// wrapped DEK, or the right key and the wrong version, produces rows that look perfect
+// and a volume nothing can open — and the failure would surface at the guest's first
+// read, a long way from here. So the assertion goes the whole way: a *new* Agent, on a
+// data directory that has never seen this volume, using only key material the rebuilt
+// catalog supplies, must serve the bytes the original guest wrote.
+//
+// The volume is encrypted for exactly that reason. Unencrypted, every field the rebuild
+// could get wrong is unused.
+func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
+	ctx := context.Background()
+	pattern := bytes.Repeat([]byte{0x5A}, 4096)
+
+	var kek [crypto.DEKSize]byte
+	if _, err := io.ReadFull(s.Rand, kek[:]); err != nil {
+		return err
+	}
+	kms := crypto.NewDevKMS(kek, "kek-dst")
+
+	// The fleet as it was: a leader, a host, one provisioned volume. Provisioning is what
+	// writes the descriptor, so the bucket is populated by production code rather than by
+	// the scenario.
+	md := metasim.New(s.Clock.Wall)
+	term, err := md.AcquireLeadership(ctx, "cp-a")
+	if err != nil {
+		return err
+	}
+	host := ids.NewAt(simEpoch*1000, s.Rand).String()
+	if err := md.UpsertHost(ctx, term, metadata.Host{
+		HostID: host, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		return err
+	}
+	// Provisioned by hand rather than through controlplane.Provisioner, for one reason:
+	// the Provisioner allocates its volume id with ids.New(), which reads the wall clock,
+	// so a scenario built on it produces a different trace every run (INV-02). Everything
+	// else here is the production path — the same DEK wrap, the same descriptor writer,
+	// the same catalog write — because those are what the rebuild reads back.
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	dek, err := crypto.GenerateDEK(s.Rand, 3)
+	if err != nil {
+		return err
+	}
+	wrapped, err := kms.WrapDEK(s.Rand, dek)
+	if err != nil {
+		return err
+	}
+	vol := metadata.Volume{
+		VolumeID: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512,
+		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
+		PrimaryHostID: host, CurrentEpoch: 1,
+		DEKWrapped: wrapped, KEKID: "kek-dst", DEKKeyID: dek.KeyID,
+	}
+	if err := md.CreateVolume(ctx, term, vol, nil); err != nil {
+		return err
+	}
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: vol.VolumeID, SizeBytes: vol.SizeBytes, BlockSize: vol.BlockSize,
+		Durability: vol.Durability, CurrentEpoch: vol.CurrentEpoch,
+		KEKID: vol.KEKID, DEKWrapped: vol.DEKWrapped, DEKKeyID: vol.DEKKeyID,
+	}); err != nil {
+		return err
+	}
+
+	// A session: the guest writes, the Agent stops, the image is published.
+	keysFrom := func(cat metadata.Store) agent.KeysFunc {
+		return func(ctx context.Context, volumeID string) (agent.VolumeKeys, error) {
+			v, err := cat.GetVolume(ctx, volumeID)
+			if err != nil {
+				return agent.VolumeKeys{}, err
+			}
+			return agent.VolumeKeys{
+				VolumeID: v.VolumeID, DEKWrapped: v.DEKWrapped, KEKID: v.KEKID, DEKKeyID: v.DEKKeyID,
+			}, nil
+		}
+	}
+	start := func(dataDir string, keys agent.KeysFunc) (*agent.VolumeManager, error) {
+		return agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: dataDir, SocketDir: "/run/spin",
+			Limits:         wal.Limits{SegmentBytes: 8192},
+			HostID:         host,
+			CheckpointPoll: 24 * time.Hour,
+		}, agent.VolumeManagerDeps{
+			Clock:   s.Clock,
+			Disk:    s.Disk,
+			Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+			Mapper:  simMapper{},
+			EventFD: simEventFD,
+			Store:   s.Store,
+			KMS:     kms,
+			Rand:    s.Rand,
+			Keys:    keys,
+		})
+	}
+	desired := []*storagev1.DesiredVolume{{
+		VolumeId: vol.VolumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}
+
+	first, err := start("/var/lib/spin", keysFrom(md))
+	if err != nil {
+		return err
+	}
+	if err := first.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("starting the volume: %w", err)
+	}
+	dev, ok := first.Device(vol.VolumeID)
+	if !ok {
+		return errors.New("the volume is not being served")
+	}
+	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
+		return fmt.Errorf("waiting for the read view: %w", err)
+	}
+	if _, err := dev.WriteAt(pattern, 0); err != nil {
+		return fmt.Errorf("the guest write: %w", err)
+	}
+	if err := first.Close(); err != nil {
+		return fmt.Errorf("stopping the volume: %w", err)
+	}
+
+	// The catastrophe: the catalog is gone. Not emptied of one table — a database that
+	// has never heard of this fleet, which is what a restore from nothing looks like.
+	s.Emit(Event{Kind: EventFault, Msg: "the control-plane database is gone"})
+	rebuilt := metasim.New(s.Clock.Wall)
+	newTerm, err := rebuilt.AcquireLeadership(ctx, "cp-b")
+	if err != nil {
+		return err
+	}
+	sum, err := controlplane.RebuildMetadata(ctx, rebuilt, s.Store, newTerm)
+	if err != nil {
+		return fmt.Errorf("rebuilding the catalog: %w", err)
+	}
+	if sum.Volumes != 1 {
+		return fmt.Errorf("the rebuild recorded %d volumes, want 1", sum.Volumes)
+	}
+	s.Notef("catalog rebuilt from the bucket: %d volume(s)", sum.Volumes)
+
+	// And the answer that matters: a new Agent, a data directory that has never seen this
+	// volume, and key material that comes only from the rebuilt rows.
+	second, err := start("/var/lib/spin-restored", keysFrom(rebuilt))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = second.Close() }()
+	if err := second.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("serving the rebuilt volume: %w", err)
+	}
+	dev2, ok := second.Device(vol.VolumeID)
+	if !ok {
+		return errors.New("the rebuilt volume is not being served")
+	}
+	got := make([]byte, len(pattern))
+	_, readErr := dev2.ReadAt(got, 0)
+	zeros := readErr == nil && bytes.Equal(got, make([]byte, len(got)))
+	foreign := readErr == nil && !zeros && !bytes.Equal(got, pattern)
+	s.Emit(Event{Kind: EventDurableRead, Key: vol.VolumeID,
+		ZerosAfterRestart: zeros, ForeignBytesAfterRestart: foreign})
+	switch {
+	case readErr != nil:
+		return fmt.Errorf("the rebuilt volume's read: %w", readErr)
+	case zeros:
+		return fmt.Errorf("volume %s read zeros after its catalog was rebuilt (§22.5/INV-20)", vol.VolumeID)
+	case foreign:
+		return fmt.Errorf("volume %s was served bytes it never wrote after its catalog was rebuilt", vol.VolumeID)
+	}
+	s.Notef("volume %s served its own bytes from a catalog rebuilt out of the bucket", vol.VolumeID)
 	return nil
 }
 

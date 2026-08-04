@@ -56,12 +56,12 @@ record each increment next to what it removed.
   metrics that *are* recorded (the WAL's watermarks and device state, the lease, and since
   2026-08-03 §19's two snapshot histograms) are proven by tests through `obs.NewTestProvider`
   and observed by nobody in production. **The §26.2 catalog is also stale**: about
-  three quarters of its entries name mechanisms ADR-0026 withdrew — batches, PUT retries,
-  checkpoints, objectization, compaction, GC, orphans, fencing wait. Trimming it means
-  editing §26.2 of the architecture document, so it is recorded as a divergence rather
-  than done quietly (DEV-0022).
-- **Nothing reads a descriptor** (INV-20), and it is a format decision waiting on a human:
-  write the reader, or stop writing them. See "Components with no production caller".
+  three quarters of its entries named mechanisms ADR-0026 withdrew; the catalog and §26.2
+  were trimmed together on 2026-08-03 (~~DEV-0022~~).
+- **A rebuilt catalog cannot tell you who was serving what.** `-rebuild-metadata` brings
+  back volumes and snapshots from the bucket (INV-20, since 2026-08-03) but no placement,
+  because no object records one. After losing the database you know what exists, not who
+  was running it.
 - **A host that dies mid-session loses everything written since the volume attached.**
   That is ADR-0026's accepted trade, not a defect, and it is what "what would reverse it"
   in that ADR is for.
@@ -1094,7 +1094,7 @@ promotes), `NoLostAckedWriteChecker` (there is no failover) and `ImmutableSnapsh
 (INV-16 is structural now — `image.PublishSnapshot` is create-only). The event kinds and
 `Event` fields only they read went with them.
 
-## DEV-0022 — the §26.2 metric catalog describes a system that was withdrawn
+## ~~DEV-0022~~ — the §26.2 metric catalog described a system that was withdrawn *(closed 2026-08-03)*
 
 `internal/obs.Catalog()` is the §26.2 taxonomy, declared up front in Phase 01 so later
 phases would start incrementing existing series rather than inventing names. About three
@@ -1104,11 +1104,10 @@ quarters of its entries now name mechanisms ADR-0026 removed: the WAL-remote blo
 `recovery_duration_seconds`, `standby_checkpoint_lag_bytes`,
 `bytes_downloaded_before_boot`, and the io-class pair.
 
-It is the same shape as the invariants file before 2026-08-03: a declaration a reader
-takes for a plan. It is recorded as a divergence rather than fixed quietly because the
-catalog *is* §26.2 — trimming it edits the architecture document, which is the owner's,
-and because a pre-declared taxonomy is a deliberate design (the comment on `Catalog` says
-so) rather than an oversight.
+It was the same shape as the invariants file before 2026-08-03: a declaration a reader
+takes for a plan. **Closed by the owner's decision to cut both together** — the catalog
+*is* §26.2, so `internal/obs.Catalog()` and the architecture document were trimmed in one
+commit rather than left to diverge.
 
 **Six entries are recorded today**: `wal_local_sequence`, `wal_durable_sequence`,
 `wal_published_sequence` (permanently 0 — see the callerless list), `wal_unflushed_bytes`,
@@ -1117,6 +1116,49 @@ so) rather than an oversight.
 **None of them reaches a collector**: `cmd/volume-agent` passes `Recorder: nil` on purpose,
 because there is no exporter and `obs.NewTestProvider` in production would look like
 observability from the outside without being it.
+
+## INV-20 is active again — the catalog can be rebuilt from the bucket, since 2026-08-03
+
+`descriptor.Write` had two callers and no reader since increment 4 deleted the previous
+`RebuildMetadata`. The owner's call was to write the reader rather than stop writing the
+descriptors, and the result is much smaller than what was deleted: a volume's state in S3
+is one descriptor plus one manifest, so the rebuild reads two objects per volume with no
+epoch chain to walk and no contiguous prefix to reassemble. `control-plane
+-rebuild-metadata` is the caller.
+
+**It needs no key material.** The manifest is structural (§15.3), so `ReadSnapshotManifest`
+was added rather than reusing `LoadSnapshot` — which would download and decrypt every
+chunk to learn a sequence number that is in the manifest. An operator with the bucket and
+no KEK can still rebuild the catalog.
+
+**Three passes, because the schema is circular.** `volumes.parent_snapshot_id` references
+`snapshots`, and `snapshots.volume_id` references `volumes`. So: volumes without their
+parent link, then snapshots, then the clones again with the link — which the catalog's own
+upsert was already built for (`parent_snapshot_id = COALESCE(existing, excluded)`, never
+cleared by a converging write). Proven by planting the one-pass version, which fails on
+the parent-snapshot lookup.
+
+**What it deliberately does not restore.** Placement — no object records a primary host,
+and inventing one would make a rebuilt catalog claim somebody is writing when nobody is.
+Snapshot lineage depth, which is not in any manifest. And `source_host_id`, so §20's
+placement rule 1 falls through to steps 2 and 3 for a clone taken after a rebuild, which
+is what those steps are for.
+
+**The assertion is not "the rows came back".** A rebuild that recreated a volume with the
+right wrapped DEK and the wrong version produces rows that look perfect and a volume
+nothing can open, and the failure would surface at the guest's first read. So the DST arm
+goes the whole way: a new Agent, a data directory that has never seen the volume, key
+material only from the rebuilt catalog, and the bytes the original guest wrote. Its
+planted bug is that off-by-one version.
+
+**The §26.2 catalog was trimmed with it (DEV-0022, closed).** About three quarters of its
+entries named mechanisms ADR-0026 withdrew; `internal/obs.Catalog()` and §26.2 of the
+architecture document were cut together, in the same commit, because the catalog *is*
+§26.2. `wal_published_sequence` went for a smaller reason worth writing down: nothing
+publishes in V1, so it was a gauge that could only ever read 0 — one an operator has to
+learn to ignore. One entry was *added*, `image_publish_duration_seconds`, and it is
+recorded: publishing at stop is the only moment anything leaves the host, so its duration
+is the cost of a whole session rather than one step among many.
 
 ## Components with no production caller
 
@@ -1133,15 +1175,6 @@ calls it.
   `TruncateLocal` enforces (`ErrTruncateAboveDurable`) is the part that is easy to get
   wrong, and reclamation returns with any long-lived volume. Recorded so nobody reads
   INV-03's first `≤` as a live property.
-- **Nothing reads a descriptor.** `descriptor.Write` has two callers — provisioning and
-  clone — and no reader anywhere in the tree, because `controlplane.RebuildMetadata` went
-  with the recovery chain in increment 4. INV-20 is the property they exist for, and it
-  is `pending` rather than withdrawn: the inputs are still being written, and a rebuild
-  under ADR-0026 would be far simpler than the one that was deleted (a descriptor plus
-  `image/<vol>/manifest.json`, with no epoch chain to walk). **The decision is write the
-  reader or stop writing the descriptors**, and it is a format decision, so it is a
-  human-review zone and its own increment. Leaving it as-is is the one option with no
-  argument for it: a bucket that describes volumes nothing can read back.
 - **`metadata.BumpVolumeEpoch` has no caller outside tests.** `controlplane.Promoter`
   went with the fencing half in increment 4.6; the store's compare-and-set on the epoch
   stayed, because it is what would grant one if promotion returns (ADR-0024). INV-11 is

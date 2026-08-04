@@ -37,8 +37,8 @@ func TestMetricsCatalogWellFormed(t *testing.T) {
 	}
 	// A few load-bearing names must exist (typo/regression guard).
 	for _, want := range []string{
-		"wal_durable_gap_seconds",         // RPO in local mode (§14.8)
-		"self_fenced_total",               // fencing (§26.2)
+		"wal_out_of_space",                // the device is refusing writes (§5.7)
+		"image_publish_duration_seconds",  // the cost of a session leaving the host (ADR-0026)
 		"snapshot_pause_duration_seconds", // ~0 invariant (§19)
 		"s3_request_latency_seconds",      // tail latency (§24)
 		"clock_offset_seconds",            // drift alert (§23)
@@ -56,14 +56,14 @@ func TestMetricsRegistration(t *testing.T) {
 		t.Fatalf("registered %d instruments, catalog has %d", got, want)
 	}
 	// Spot-check retrieval by the correct kind.
-	if _, ok := p.Metrics.Counter("self_fenced_total"); !ok {
-		t.Fatal("self_fenced_total should be a counter")
+	if _, ok := p.Metrics.Counter("lease_renewal_failures_total"); !ok {
+		t.Fatal("lease_renewal_failures_total should be a counter")
 	}
-	if _, ok := p.Metrics.Histogram("wal_put_latency_seconds"); !ok {
-		t.Fatal("wal_put_latency_seconds should be a histogram")
+	if _, ok := p.Metrics.Histogram("image_publish_duration_seconds"); !ok {
+		t.Fatal("image_publish_duration_seconds should be a histogram")
 	}
-	if _, ok := p.Metrics.Gauge("wal_durable_gap_seconds"); !ok {
-		t.Fatal("wal_durable_gap_seconds should be a gauge")
+	if _, ok := p.Metrics.Gauge("wal_unflushed_bytes"); !ok {
+		t.Fatal("wal_unflushed_bytes should be a gauge")
 	}
 }
 

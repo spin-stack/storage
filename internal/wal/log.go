@@ -238,7 +238,9 @@ func (l *Log) recordWatermarks(ctx context.Context) {
 	vol := obs.String("volume", l.volLabel)
 	l.rec.Gauge(ctx, "wal_local_sequence", float64(l.local), vol)
 	l.rec.Gauge(ctx, "wal_durable_sequence", float64(l.durable), vol)
-	l.rec.Gauge(ctx, "wal_published_sequence", float64(l.published), vol)
+	// No wal_published_sequence: nothing publishes in V1 (ADR-0026), so it would be a
+	// series permanently at 0 — and a gauge that can only read 0 is one an operator has
+	// to learn to ignore. It returns with whatever advances the published point.
 	l.rec.Gauge(ctx, "wal_unflushed_bytes", float64(l.unflushedBytes), vol)
 	// The gap is what S3 cannot reproduce, not what fdatasync has not seen. A
 	// `local` volume ACKs on fdatasync, so its unflushed count is 0 while its RPO

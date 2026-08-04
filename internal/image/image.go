@@ -263,24 +263,44 @@ func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, vol
 // Every failure is closed. A manifest that names a chunk which is not there is a *broken*
 // image, not an empty one, and the difference matters: an empty view reads as zeros, and
 // a guest cannot tell those from a range it never wrote.
-func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, key string) (*cow.IntervalMap, Manifest, string, error) {
+// ReadSnapshotManifest returns a snapshot's manifest without materialising its data —
+// what it covers and at which sequence, not the bytes. It needs no key: the manifest is
+// structural metadata and carries no guest data (§15.3), so a catalog rebuilt from a
+// bucket does not need the KEK, while reading the chunks would.
+func ReadSnapshotManifest(ctx context.Context, store objectstore.Store, volumeID [16]byte, snapshotID string) (Manifest, error) {
+	man, _, err := readManifest(ctx, store, volumeID, SnapshotKey(volumeID, snapshotID))
+	return man, err
+}
+
+// readManifest fetches and validates a manifest object. The volume-id check is here
+// rather than at the call sites because it is what catches a bucket copied under the
+// wrong prefix, and every reader needs it.
+func readManifest(ctx context.Context, store objectstore.Store, volumeID [16]byte, key string) (Manifest, string, error) {
 	head, err := store.Head(ctx, key)
 	if errors.Is(err, objectstore.ErrNotFound) {
-		return nil, Manifest{}, "", ErrNotPublished
+		return Manifest{}, "", ErrNotPublished
 	}
 	if err != nil {
-		return nil, Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
+		return Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
 	}
 	body, err := store.Get(ctx, key)
 	if err != nil {
-		return nil, Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
+		return Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
 	}
 	var man Manifest
 	if err := json.Unmarshal(body, &man); err != nil {
-		return nil, Manifest{}, "", fmt.Errorf("image: parsing %s: %w", key, err)
+		return Manifest{}, "", fmt.Errorf("image: parsing %s: %w", key, err)
 	}
 	if man.VolumeID != format.UUIDString(volumeID) {
-		return nil, Manifest{}, "", fmt.Errorf("image: manifest at %s describes volume %s", key, man.VolumeID)
+		return Manifest{}, "", fmt.Errorf("image: manifest at %s describes volume %s", key, man.VolumeID)
+	}
+	return man, head.ETag, nil
+}
+
+func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, key string) (*cow.IntervalMap, Manifest, string, error) {
+	man, etag, err := readManifest(ctx, store, volumeID, key)
+	if err != nil {
+		return nil, Manifest{}, "", err
 	}
 
 	view := cow.NewIntervalMap()
@@ -306,7 +326,7 @@ func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encrypt
 		}
 		view.Overwrite(c.Offset, plain)
 	}
-	return view, man, head.ETag, nil
+	return view, man, etag, nil
 }
 
 func min64(a, b uint64) uint64 {

@@ -88,7 +88,12 @@ func run() error {
 		// point of that order is that an operator naming a host would override the one
 		// decision that makes a clone boot quickly.
 		cloneSnapshot = flag.String("clone-snapshot", "", "create a volume from this snapshot and exit, instead of serving")
-		oversubscribe = flag.Float64("max-oversubscription", 1.0, "with -clone-snapshot: committed/total ceiling a host may reach (§28.2)")
+
+		// rebuild-metadata: reconstruct the catalog from the bucket and exit (§22.5,
+		// INV-20). It is why descriptors are written at all — without it a lost
+		// PostgreSQL is unrecoverable even though every byte of every volume is intact.
+		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
+		oversubscribe   = flag.Float64("max-oversubscription", 1.0, "with -clone-snapshot: committed/total ceiling a host may reach (§28.2)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -158,6 +163,26 @@ func run() error {
 		}
 		slog.Info("snapshot requested",
 			"snapshot_id", snap.SnapshotID, "volume_id", snap.VolumeID, "epoch", snap.Epoch)
+		return nil
+	}
+
+	if *rebuildMetadata {
+		// Under the *current* term, like the other admin commands: a rebuild is not a
+		// leader taking over, and incrementing the term would leave the serving Control
+		// Plane's writes refused as stale.
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("-rebuild-metadata needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		sum, rerr := controlplane.RebuildMetadata(ctx, md, store, leader.Term)
+		if rerr != nil {
+			return rerr
+		}
+		// Placement is not in any object, so nothing comes back with a host. Said out
+		// loud because an operator reading "rebuilt 40 volumes" would otherwise expect
+		// the fleet to start serving them.
+		slog.Info("catalog rebuilt from the object store; no volume has a primary host — place them to resume serving",
+			"volumes", sum.Volumes, "snapshots", sum.Snapshots)
 		return nil
 	}
 

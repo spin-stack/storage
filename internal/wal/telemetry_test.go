@@ -43,10 +43,11 @@ func TestFlushRecordsTheWatermarkMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{
-		"wal_local_sequence", "wal_durable_sequence", "wal_published_sequence",
-		// wal_durable_gap_bytes went with the uploader (ADR-0026 increment 4.5): with
-		// nothing uploading there is no distance to S3 to report. STATUS.md records
-		// that nothing measures what a host would lose if it died mid-session.
+		"wal_local_sequence", "wal_durable_sequence",
+		// Two absences, both deliberate and both recorded in STATUS.md:
+		// wal_durable_gap_bytes went with the uploader (increment 4.5) — with nothing
+		// uploading there is no distance to S3 to report — and wal_published_sequence
+		// went with the checkpoint, because nothing advances the published point.
 		"wal_unflushed_bytes",
 	} {
 		if !got[name] {

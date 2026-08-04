@@ -238,4 +238,18 @@ func TestASnapshotRecordsItsPauseAndPublishDuration(t *testing.T) {
 			t.Errorf("taking a snapshot recorded no %s", want)
 		}
 	}
+
+	// And stopping records the other one. Under ADR-0026 publishing at stop is the only
+	// moment anything leaves the host, so its duration is the cost of the whole session —
+	// which is the number an operator watching a slow shutdown is looking for.
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	collected, err = p.CollectedMetrics(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !collected["image_publish_duration_seconds"] {
+		t.Error("stopping the volume recorded no image_publish_duration_seconds")
+	}
 }
