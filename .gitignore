@@ -38,3 +38,8 @@ cover.raw
 # were committed by accident (2026-08-01, 2026-08-02) before this line existed. A case
 # worth keeping permanently belongs in the test as a named example.
 testdata/rapid/
+
+# go-task's checksum cache. Committing it makes any `task build:guest` dirty the
+# tree, and the value is a function of the machine that produced it, not of the
+# sources — it was committed once by accident and was already stale by the next run.
+/.task/
