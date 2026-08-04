@@ -1431,6 +1431,34 @@ bug (the `baseFailed` guard deleted, in a scratch copy of HEAD, never in the tre
 *"a volume whose base never resolved published image/<vol>/manifest.json naming 1 chunk(s)
 at sequence 1"*.
 
+### C4 — three things that described a mechanism ADR-0026 deleted (2026-08-03)
+
+**The e2e assertion is deleted, not repointed** (`263c26e`). `TestTheDeploymentServesAVolume`
+scanned the Agent's output for `"no durability scheduler"` and failed the lane on it. No
+code emits that string — the only occurrences in the tree were two comments — so the loop
+body had been unreachable since increment 4.1 removed the scheduler. Proven rather than
+argued: the check was inverted in place to fail when the string is *absent*, the lane was
+run against the real binaries, and it failed on that line alone with everything else green.
+**What is no longer covered: nothing.** It existed because `-host-id` was missing from the
+binary and `checkpointsEnabled` refused a scheduler without one; there is no scheduler to
+refuse, and the host id's remaining consumer — the heartbeat that creates the host row —
+is already blocking four lines earlier in `waitForHost`, where a wrong id fails on the
+foreign key.
+
+**Five `VolumeManagerConfig` fields had no reader outside the code setting them**
+(`1313296`): `UploadAttempts`, `HostID`, `CheckpointBytes`, `CheckpointInterval`,
+`CheckpointPoll`. `DataDir`, `SocketDir` and `Limits` have one and stay. The call sites went
+with them, which is the part that read as live configuration: `cmd/volume-agent` carried
+an eight-line comment saying `HostID` is what stops the NVMe filling, four DST scenarios
+set `CheckpointPoll: 24 * time.Hour` so a poller they no longer have would not fire, and
+`integration/vhost/lifecycle_test.go` minted a UUIDv7 per run for a field that discarded
+it. Dropping the DST host ids removes four draws from the seeded source, so ids downstream
+of them change in those traces; the mandatory set is green.
+
+**`-data-dir` stopped promising checkpoints** (`8750e3c`) — it names the WAL and
+`agent.lock`, which are the only things in there. Verified from `volume-agent -h`, not from
+the source. No other flag help in that binary describes withdrawn behaviour.
+
 ## Track D — the catalog (open work, appended per increment)
 
 *Only track D appends here* — it owns `internal/controlplane`, `internal/cpserver`,
