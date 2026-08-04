@@ -20,48 +20,68 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 ### RISK-01 — FLUSH/FUA latency coupled to the object store
 - Source: §29.1 (the most important residual)
 - Owner: Implementer (Track B) + Adversary
-- Trigger: `wal_put_latency` p99 > 500 ms in any DST/HW run; fsync-heavy workload test.
-- Mitigation: parallel PUT pipeline on FLUSH (§14.4); same-region backend; `local`
-  durability mode (§14.8); WAL-object compaction (§21.2); p99 measured from day 1 with
-  injected latency. Documented write-back contract to the user (§2).
-- Status: open (inherent to the no-host-to-host-replication model).
+- Trigger: —. It was `wal_put_latency` p99 > 500 ms, and **no such series exists**:
+  `internal/obs.Catalog()` was trimmed with §26.2 (DEV-0022) and the WAL-remote block went
+  with it. A trigger naming a metric nothing registers cannot fire.
+- Mitigation: was a parallel PUT pipeline, a same-region backend, the `local` mode and
+  WAL-object compaction — all of them V2 machinery.
+- Status: **withdrawn 2026-08-04 with ADR-0026.** The object store is not in the FLUSH
+  path at all: the ACK is a local `fdatasync` (§14.8, INV-18 — `wal.Log` structurally has
+  no object store). The latency that remains is `image_publish_duration_seconds`, paid
+  once when the volume stops, and it is not on any guest's I/O path. Comes back with the
+  remote durability chain, which is what would put a PUT back in front of an ACK.
 
 ### RISK-02 — Durability availability coupled to PostgreSQL via leases
 - Source: §29.2 (introduced by the fencing fix)
 - Owner: Control Plane Implementer (Track C)
-- Trigger: PG outage drill; any `self_fenced_total` spike tied to PG unavailability.
-- Mitigation: accepted trade-off for correct fencing without self-hosted consensus; in
-  v5.1 affects only `remote` volumes — `local` volumes (§14.8) do not depend on the
-  lease for FLUSH ACK. PG standby + PITR; degraded mode and its timings in the runbook.
-  Future option: S3-CAS-object lease renewal as a secondary path (§14, post-MVP §30.14).
-- Status: accepted (documented degraded mode).
+- Trigger: —. It was a `self_fenced_total` spike, and that series went with the rest of
+  the WAL-remote block (DEV-0022); so did `ErrSelfFenced` on the ACK path.
+- Mitigation: was the `remote`/`local` split, which no longer exists.
+- Status: **withdrawn 2026-08-04 with ADR-0026.** No FLUSH ACK consults a lease, so a
+  PostgreSQL outage cannot degrade durability — it stops attach, clone, snapshot and
+  every other control operation, which is RISK-06 and a different failure. The lease
+  survives as the Control Plane's liveness view and gates nothing on the data path.
 
 ### RISK-03 — Promotion depends on a clock-drift bound
 - Source: §29.3
 - Owner: Control Plane Implementer + Harness agent
-- Trigger: `clock_offset_seconds > 0.5` alert; DST drift-injection scenario.
-- Mitigation: old-writer safety uses **monotonic** clock only (independent of the bound);
-  chrony monitored, alert at 500 ms; hosts over `max_clock_skew` ineligible for
-  promotion; DST injects drift beyond the bound and asserts the only effect is waiting
-  longer, never losing writes (INV-11).
-- Status: open. **Not for the reason this line used to give.** It cited DEV-0004 (fail-open fencing, non-atomic promotion), which `REFERENCE.md` records as resolved at `6d5655e`/`f9f5885` — fencing fails closed and promotion is resumable. What keeps it open is that all of it is *modelled*: the drift injection lives in DST against a simulated clock, and no host has ever been observed crossing `max_clock_skew` with chrony running. Closes on a measurement, not on code.
+- Trigger: `clock_offset_seconds > 0.5` alert — the one part of this risk with a live
+  subject: the series is still in `internal/obs.Catalog()` and §26.3 still alerts on it.
+- Mitigation: chrony monitored, alert at 500 ms.
+- Status: **withdrawn 2026-08-04 with ADR-0026** — nothing promotes. `controlplane.Promoter`
+  and `PromotionWaitChecker` are deleted and INV-11 is withdrawn, so there is no
+  `FENCING_WAIT` to size against `max_clock_skew` and no promotion for a drifted host to
+  be ineligible for. **What this risk said is worth having back when promotion returns**,
+  which is why it is amended rather than deleted: old-writer safety must use the monotonic
+  clock only, and the wall clock may only ever make the system *wait longer*. The old
+  status is preserved by the same argument — all of it was modelled in DST against a
+  simulated clock and never measured on a host.
 
-### RISK-04 — Cold cross-host materialization RTO
+### RISK-04 — Cold cross-host clone RTO
 - Source: §29.4
 - Owner: Implementer (Track A/Phase 11) + operators
-- Trigger: cross-host clone test; drain drill.
-- Mitigation: warm standby for volumes that matter (RTO in minutes, Phase 12); cold RTO
-  published per-GiB in the runbook; lazy loading designed and format-compatible
-  (post-MVP §22.4).
-- Status: open.
+- Trigger: cross-host clone test. (There is no drain drill: the drain went with ADR-0026.)
+- Mitigation: **start the clone where the data already is.** `placement.Choose` puts
+  `SourceHostID` first and the clone path calls it since 2026-08-03, so the common case
+  downloads nothing (§20). What is left has no mitigation: the warm standby and lazy
+  loading that used to be the answer are both V2, so a clone that cannot land on the
+  source host pays a full download of the volume.
+- Status: **open, and larger than it was.** ADR-0026 removed the two mitigations and made
+  the remaining one time-bounded — the source host holds the data only while it still
+  holds the volume. Nobody has measured the per-GiB cost, which is what §2's "descarga
+  completa; medido por GiB, no prometido" row is waiting for.
 
 ### RISK-05 — Dependence on S3-compatible semantics (CAS, versioning, Object Lock)
 - Source: §29.5
 - Owner: Harness agent (conformance suite) + operators
 - Trigger: enabling/upgrading any backend (MinIO/RustFS/S3) version.
-- Mitigation: blocking backend conformance suite per version (§6.1); specified graceful
-  degradation to lease-only if CAS is absent (§12.4); minimum on-prem durability
-  requirement removes the single-node case (§6.1).
+- Mitigation: blocking backend conformance suite per version (§6.1); minimum on-prem
+  durability requirement removes the single-node case (§6.1). **The "degrade gracefully to
+  lease-only if CAS is absent" clause is withdrawn with ADR-0026 and must not come back by
+  habit:** the manifest's compare-and-set *is* V1's whole fencing (§12), so a backend
+  without preconditions has no fallback — it has a lost update. That is exactly what
+  `scenarioTwoHostsCannotBothPublishAnImage`'s planted bug is (a backend that ignores
+  preconditions), and it is why the §6.1 suite is blocking per backend.
 - Status: mitigated for the certified dev backend (the §6.1 suite runs via `task backend:conformance`, ADR-0010); open for the production multi-node backends.
 
 ### RISK-06 — PostgreSQL as a single point of control
@@ -86,10 +106,16 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Source: §29.8, §21.1, INV-13
 - Owner: Implementer (Phase 10) + Harness agent
 - Trigger: any WAL-truncation code; checkpoint publication path.
-- Mitigation: strict ordering + DST/fault injection at each step + never truncate above
-  a verified `published_sequence` + GC-cannot-permanently-delete as the final net
-  (INV-13, INV-14).
-- Status: open. DEV-0006 is resolved at `cd17e0b`: the GC marks reversibly and the store no longer exposes permanent deletion. The ordering property is proven in DST with a planted bug. It stays open because the final net has only ever been tested against *simulated* faults — no real backend has been made to lose a listing or reorder a delete mid-sweep, and §6.1's conformance suite does not cover a sweep.
+- Mitigation: strict ordering + never truncate above a verified `published_sequence`
+  (`wal.TruncateLocal` still refuses, with `ErrTruncateAboveDurable`).
+- Status: **withdrawn 2026-08-04 with ADR-0026**, and both halves of its subject are gone:
+  nothing objectizes or truncates mid-session (INV-13 withdrawn, `TruncateLocal` has no
+  production caller) and `internal/gc` is deleted (INV-14 back to pending). What survives
+  is enforced at construction instead of by a sweep — `real.NewS3Store` refuses an
+  unversioned bucket, so a delete marker stays reversible (`TestRequireVersioning`). One
+  caveat outlives the risk and belongs to whoever rebuilds the sweep: **no real backend has
+  ever been made to lose a listing or reorder a delete mid-sweep**, and §6.1's suite does
+  not cover one.
 
 ## Planning / execution risks
 
@@ -132,9 +158,14 @@ What it proved:
   `RawFile.ReadAt` return zeros turns the lane red.
 - **FLUSH is not covered by *this* lane** — SeaBIOS's INT 13h has no flush verb, so the
   boot-sector lane never issues one. **A separate lane does cover it, since 2026-08-02**:
-  `TestALinuxGuestIssuesFLUSH` boots the pinned Linux kernel and a real `fsync(2)`
-  becomes a verified object, and `TestAGuestSurvivesCheckpointAndTruncation` carries it
-  through a checkpoint, a truncation and a reboot.
+  `TestALinuxGuestIssuesFLUSH` boots the pinned Linux kernel and a real `fsync(2)` is
+  answered by the backend, and `TestAGuestSurvivesAStopAndComesBackFromItsImage` carries
+  the same volume through a stop and a second boot that has only the image to read from.
+
+  **Corrected 2026-08-04.** This said the `fsync` "becomes a verified object" and named
+  `TestAGuestSurvivesCheckpointAndTruncation`. Under ADR-0026 a FLUSH puts **zero** objects
+  in the bucket — the ACK is a local `fdatasync` (§14.8, INV-18) — and that test was
+  renamed with the checkpoint it no longer performs.
 
   **The reason recorded here for why that was impossible was wrong, and is corrected in
   place rather than deleted** — a wrong reason that is merely removed gets rediscovered.

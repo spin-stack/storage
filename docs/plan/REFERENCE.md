@@ -31,11 +31,18 @@
 > Sections leave the document *with the code that cited them*, in the same commit, so this
 > stays empty rather than being repaired afterwards.
 
-The code carries **2.106 references** across 228 of its 264 Go files: `§14.4`, `INV-13`,
-`ADR-0017`, `DEV-0007`. They are deliberate — they are what lets a reader check that a
-comment about fencing says what §12.4 actually says, and they are how four audits found
-real bugs. What they lacked was a way to *resolve* one without opening a 1.455-line
-Spanish document.
+The code is full of references — `§14.4`, `INV-13`, `ADR-0017`, `DEV-0007` — and they are
+deliberate: they are what lets a reader check that a comment about fencing says what §12.4
+actually says, and they are how four audits found real bugs. What they lacked was a way to
+*resolve* one without opening a long Spanish document.
+
+> How many there are is a command, not a sentence. This paragraph used to open with
+> "2.106 references across 228 of its 264 Go files" and "a 1.455-line Spanish document",
+> and on 2026-08-04 the real numbers were 1.377, 188, 222 and 1.406 — every one of them
+> wrong, in a file whose own INV table says a count is the part that rots first. So:
+> ```
+> grep -rhoE '(§[0-9]+(\.[0-9]+)*|INV-[0-9]{2}|ADR-[0-9]{4}|DEV-[0-9]{4})' --include='*.go' . | wc -l
+> ```
 
 That is this file. One line per symbol. If one line is not enough, the last column says
 where the full answer lives.
@@ -56,7 +63,7 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §1 | Executive summary: the shape of the whole system. |
 | §2 | Use case and target SLOs. |
 | §3 | MVP objectives, and the explicit non-objectives. |
-| §4 | Principal decisions (EROFS + CoW + vhost-user-blk + PostgreSQL + WAL in S3). |
+| §4 | Principal decisions. **Half its rows are V2 since ADR-0026** — the section says which; the two that stated the withdrawn ACK contract in the present tense are corrected in place. |
 | §5 | **The invariants.** The subsections below are the ones the code cites. |
 | §5.2 | Snapshots are immutable once PUBLISHED (→ INV-16). |
 | §5.3 | S3 does not participate in every WRITE (→ INV-18). |
@@ -72,12 +79,12 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §6.1 | **Object-store backend requirements** — the conformance suite (`task backend:conformance`). |
 | §6.2 | Execution modes. |
 | §7 | **Control Plane + PostgreSQL**: the verified term, and the volume failover states. The most-cited section in the code (96 references). |
-| §8 | The minimal PostgreSQL model (tables). |
+| §8 | The minimal PostgreSQL model (tables). Illustrative, not the schema: the declared state is `internal/schema/schema.sql`. Its `durability` column went with ADR-0026, in both places. |
 | §9 | Guest layout: the three devices and OverlayFS. |
 | §10 | The Volume Agent. |
 | §10.1 | The Agent's memory budget. |
 | §11 | Internal I/O classes (foreground / flush / background). |
-| §12 | **Fencing and leases — the full protocol.** |
+| §12 | **Fencing.** Reduced by ADR-0026 to the one obligation that can still lose data silently: two incarnations must not both publish, enforced by a compare-and-set on the manifest at stop (`image.ErrSuperseded`). The full lease/promotion protocol below is V2 and lives in git. |
 | §12.1 | Explicit assumptions (chiefly: the monotonic clock is the only trusted one). |
 | §12.2 | The lease cycle, Agent side: no durable ACK without a valid lease (→ INV-06). |
 | §12.3 | Promotion, Control-Plane side: the FENCING_WAIT before granting epoch N+1 (→ INV-11). |
@@ -91,11 +98,11 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §14.1 | WAL Record layout (header is **104 bytes**, not the doc's 96 — ADR-0005). |
 | §14.2 | WAL Object layout (the remote batch). |
 | §14.3 | Batch close + PUT rules. The `.N` suffixes are the numbered rules in that list: **§14.3.1** = close immediately on FLUSH/FUA; **§14.3.4** = close on age. |
-| §14.4 | **The order of operations in FLUSH/FUA.** Six steps, and the reason ACK is last (→ INV-07). |
+| §14.4 | **The order of operations in FLUSH/FUA.** Six steps, and the reason ACK is last (→ INV-07). **Four of the six went with ADR-0026**; the surviving contract is §14.8 and §17. |
 | §14.5 | PUT idempotency (→ INV-21). |
 | §14.6 | DISCARD and space reclamation. |
 | §14.7 | The WAL's local layout (now a directory of segments — `WAL-SEGMENTS-SPEC.md`). |
-| §14.8 | **Per-volume durability modes** (`remote` / `local`) and what each ACK means. |
+| §14.8 | **The ACK contract, and there is one** (ADR-0026): FLUSH/FUA → local `fdatasync` → ACK, no upload and no lease check. The volume reaches the object store when it stops. The former `remote`/`local` pair is withdrawn. |
 | §15 | Encryption at rest. |
 | §15.1 | Key model (DEK per volume, KEK in the KMS). |
 | §15.2 | Data encryption (AES-256-GCM). |
@@ -105,15 +112,15 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §19 | Pause-free snapshots: a snapshot is a number, not an event. |
 | §20 | Clone, locality and chains. |
 | §20.1 | Chain flattening. |
-| §21 | Objectization, compaction and GC. |
-| §21.1 | **Objectization**: checkpoint first, then truncate — never the reverse (→ INV-13). |
-| §21.3 | **Safe GC**: mark-and-sweep with no direct deletion (→ INV-14). |
-| §22 | Recovery, standby and reconstruction. |
-| §22.1 | Determining the durable point, authority S3: the longest contiguous prefix (→ INV-08). |
-| §22.3 | Host loss, with a warm standby. |
-| §22.4 | Lazy loading — designed now, implemented later. |
-| §22.5 | `rebuild-metadata`: rebuilding PostgreSQL from S3 (→ INV-20). |
-| §23 | Edge cases. |
+| §21 | Objectization, compaction and GC — **withdrawn by ADR-0026, V2**. |
+| §21.1 | **Objectization**: checkpoint first, then truncate — never the reverse (→ INV-13, now withdrawn). Nothing checkpoints or truncates mid-session; the rule survives inside `wal.Log` with no production caller. |
+| §21.3 | **Safe GC**: mark-and-sweep with no direct deletion (→ INV-14, now pending). `internal/gc` is deleted; what survives is `real.NewS3Store` refusing an unversioned bucket. |
+| §22 | Recovery, standby and reconstruction — **withdrawn by ADR-0026, V2**, except §22.5. |
+| §22.1 | Determining the durable point, authority S3: the longest contiguous prefix (→ INV-08). Withdrawn: there is no prefix to establish, there is a manifest that resolves or does not. INV-08 survives as *boot* authority. |
+| §22.3 | Host loss, with a warm standby. Withdrawn — it needs continuous remote durability. |
+| §22.4 | Lazy loading — designed, never implemented, and not needed for the case it was for: a clone on the source host downloads nothing (§20). |
+| §22.5 | `rebuild-metadata`: rebuilding PostgreSQL from S3 (→ INV-20). **The one part of §22 that is alive**, far smaller: two objects per volume, no epoch chain, no key material. |
+| §23 | Edge cases. Half of them are V2 since ADR-0026 (the section's banner says which); the four that still hold are the lost PUT response, the unrecorded manifest, a full NVMe and an Agent crash with requests in flight. |
 | §24 | The S3 client as a subsystem (hedged GET, retry budget, circuit breaker). |
 | §25.1 | **Deterministic Simulation Testing** and the simulable-interfaces rule (→ INV-01, INV-02). |
 | §25.2 | WAL property tests (→ INV-05). |
@@ -137,29 +144,34 @@ pending") is gone rather than refreshed. A count is the part that rots first and
 nothing checks; the per-row state below is resolved against `INVARIANTS.md`, which is the
 file that owns it.
 
+> **The State column is a copy, and `INVARIANTS.md` owns the original.** On 2026-08-04
+> seven rows here still said `active` for invariants that file had marked withdrawn or
+> pending on 2026-08-03 — the same rot the paragraph above warns about, one table lower.
+> When the two disagree, `INVARIANTS.md` is right.
+
 | INV | One line | State |
 |---|---|---|
 | INV-01 | Simulable interfaces only — no `time.Now()`/sockets/syscalls outside `simio`. Three exemptions, all narrow and all with a fixture proving they did not widen: `internal/vhost/hostio` (host code, ADR-0020), `integration/guestinit` (not host code — PID 1 inside the guest, DEV-0013), and build-tagged test harnesses (`integration/**/*_test.go`, `internal/testinfra` — they drive real processes and containers, so there is no clock to inject; DEV-0016). | active |
 | INV-02 | Deterministic replay: same seed ⇒ identical trace. | active |
-| INV-03 | Ordered watermarks: `published ≤ durable ≤ local`. | active |
+| INV-03 | Ordered watermarks: `published ≤ durable ≤ local`. | active (two terms; `published` is permanently 0) |
 | INV-04 | Unflushed bounds: backpressure rather than a silent NVMe fill. | active |
 | INV-05 | WAL serialize/replay is total and safe — corruption is detected, never applied. | active |
-| INV-06 | No durable ACK without a valid lease at the instant of ACK (`remote` mode). | active |
-| INV-07 | FLUSH/FUA ordering — ACK only after the six §14.4 steps. | active |
-| INV-08 | S3 is the recovery authority; the durable point is the longest contiguous prefix. | active |
-| INV-09 | No ACKed-durable write is lost across a failover. | active |
+| INV-06 | No durable ACK without a valid lease at the instant of ACK. | **withdrawn** — ADR-0026 |
+| INV-07 | FLUSH/FUA ordering — ACK only after the records are durable. Two steps now, not §14.4's six. | active |
+| INV-08 | The object store is the authority for what a volume holds — the **boot** authority (one manifest and its chunks), not the recovery authority it was. | active |
+| INV-09 | No ACKed-durable write is lost across a failover. | **withdrawn** — ADR-0026 (there is no failover) |
 | INV-10 | Effective single writer: a stale-epoch writer publishes nothing. | active |
-| INV-11 | Promotion waits `lease_ttl + max_clock_skew` before granting epoch N+1. | active |
-| INV-12 | The recovery point is the epoch boundary; late PUTs fall outside it. | active |
-| INV-13 | **Never truncate local WAL above a verified `published_sequence`.** | active |
-| INV-14 | The GC cannot permanently delete — it marks; the bucket lifecycle removes. | active |
+| INV-11 | Promotion waits `lease_ttl + max_clock_skew` before granting epoch N+1. | **withdrawn** — ADR-0026 (nothing promotes) |
+| INV-12 | The recovery point is the epoch boundary; late PUTs fall outside it. | **withdrawn** — DEV-0021 (the floor it defended was fictional) |
+| INV-13 | **Never truncate local WAL above a verified `published_sequence`.** | **withdrawn** — ADR-0026; the rule survives in `wal.Log` with no production caller |
+| INV-14 | The GC cannot permanently delete — it marks; the bucket lifecycle removes. | **pending** — its subject went with `internal/gc` |
 | INV-15 | Nothing leaves the host in cleartext. | active |
 | INV-16 | Published snapshots are immutable (compaction may replace objects with logically-equal ones). | active |
-| INV-17 | Background I/O always yields to foreground/flush. | active |
+| INV-17 | Background I/O always yields to foreground/flush. | **withdrawn** — ADR-0026 (no background data path left) |
 | INV-18 | S3 is not in the WRITE path — only FLUSH/FUA touch it. | active |
 | INV-19 | Fleet-mixed format gating: no writer at format v+1 until every host can read it. | **pending** |
-| INV-20 | `rebuild-metadata` reconstructs PostgreSQL from S3. | active |
-| INV-21 | PUT idempotency: one sequence span, one object. | active |
+| INV-20 | `rebuild-metadata` reconstructs the volume and snapshot catalog from S3 — not placement, which no object records. | active |
+| INV-21 | PUT idempotency: a duplicate data PUT has no double effect — now structural, since a chunk's key is its content digest. | active |
 | INV-22 | **Every UUID is v7** — `internal/ids` only, enforced by lint and a DB domain. | active |
 
 ## `ADR-` — the decisions
@@ -206,13 +218,14 @@ commit named is where the fix landed.
 | DEV-0004 | Fencing was fail-open, and promotion was neither atomic nor resumable. | resolved `6d5655e`, `f9f5885` |
 | DEV-0005 | Not every Control-Plane mutation was term-guarded. | resolved `93b70aa`, `15cb1e2` |
 | DEV-0006 | The object store exposed permanent deletion; the GC did not mark. | resolved `cd17e0b` |
-| DEV-0007 | Several phases marked done are partial models — the spine. | **ADR-0018's chain closed 2026-08-02** (`TestAGuestSurvivesCheckpointAndTruncation`: a real guest writes, fsyncs, the Agent checkpoints and truncates, and a second boot reads it back from S3). The rest — background snapshot sealing, the clone chain link, segment objects, cross-host materialization — is still open → STATUS.md |
+| DEV-0007 | Several phases marked done are partial models — the spine. | **ADR-0018's chain closed 2026-08-02**, and ADR-0026 then changed what closes it. The test is `TestAGuestSurvivesAStopAndComesBackFromItsImage` (it was `…CheckpointAndTruncation`; there are no checkpoints): a real guest writes, `fsync`s, the Agent stops and publishes the volume's image, and a second boot on a *fresh data directory* reads the bytes back — so only the object store can have answered. Of the rest, snapshot sealing landed with ADR-0026 increments 3/3b, segment objects and cross-host materialization are V2, and what is still open is the clone chain link → DEV-0020 |
 | DEV-0008 | The drain was not idempotent across every crash boundary. | resolved `f9f5885` |
 | DEV-0009 | `rebuild-metadata` rebuilt volumes only. | resolved `2b09d1e` |
 | DEV-0010 | Observability was registered but never recorded. | resolved `fc02579` |
 | DEV-0011 | A segment's space is charged as used, not reserved at creation. | **open** → STATUS.md |
+| DEV-0022 | The §26.2 metric catalog declared a system that was withdrawn: about three quarters of `internal/obs.Catalog()` named the WAL-remote block, the fencing wait, objectization/compaction/GC, mid-session recovery, the warm standby and the io-class pair. A catalog reads as a plan — the same failure mode as INVARIANTS.md before it was rewritten. | resolved `352d4c5` — the catalog *is* §26.2, so the Go file and the architecture document were trimmed in one commit rather than left to diverge |
 | DEV-0012 | A self-fenced log still accepts WRITEs and still serves reads. | resolved 2026-08-02 — not a divergence: §12.2 delegates it to policy, and the policy is now written at `wal.Log`'s `fenced` field |
-| DEV-0020 | A clone chain deeper than one link cannot be materialized: `materialize.FromSnapshot` resolves only the objects the parent's manifest lists, all under the parent's own id, so a clone of a clone never fetches its grandparent's extents. Unrelated to encryption — the same hole exists for a plaintext volume. | open — §19/§20 must say whether a chain is walked or flattened |
+| DEV-0020 | A clone chain deeper than one link cannot be read through. `materialize.FromSnapshot`, which the original entry named, went with ADR-0026; the mechanism now is `image.uploadChunks` iterating `view.Ranges()` over a `cow` view that merges the base with the layer, under `chunkKey(volumeID, …)` — so a clone's first stop re-uploads its whole parent dataset under its own id, and **that flattening is the only reason a depth-2 clone reads anything but zeros**. Removing the cost without building the chain read turns a cost defect into silent zeros. | open — §19/§20 must say whether a chain is walked or flattened; `controlplane.Clone` still does `ChainDepth: parent.ChainDepth + 1` with no refusal |
 | DEV-0019 | A restarted encrypted volume served its guest **ciphertext**: `agent.fetchBase` passed a literal `nil` `*wal.Encryption` to `recovery.RecoverOver` for a volume whose DEK it had just unwrapped, and `ApplyRecord` folded the sealed payload into the read view at exactly the plaintext's length, with no error anywhere. | resolved 2026-08-02 — `recovery.ErrSealedWithoutKey` makes it unrepresentable; `Volume` carries its `enc`; `parentView` re-binds the DEK to the parent's id; mandatory DST arm `encrypted-volume-survives-a-restart` |
 | DEV-0018 | Three documents claimed a Linux-guest lane that no test performed — every `integration/vhost` test boots a 512-byte SeaBIOS boot sector, and INT 13h has no flush verb. Writing the lane found a real hang: a guest re-initialises the device (firmware → OS hand-off) with a **new kick eventfd**, and the queue loop stayed parked on the first one. | resolved 2026-08-02 — `queueLoop.ensure` restarts on a new kick; `TestAReinitialisedDeviceIsStillServed` + `TestALinuxGuestIssuesFLUSH` |
 | DEV-0017 | `cmd/volume-agent` rooted its Disk at `--data-dir` *and* passed the same absolute path as `DataDir`, so every WAL landed under `<data-dir>/<data-dir>/wal/...`. | resolved 2026-08-02 — the binary passes `DataDir: "."`; the e2e lane asserts the doubled directory does not exist |
