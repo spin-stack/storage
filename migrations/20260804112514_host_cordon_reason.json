@@ -1,0 +1,32 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-08-04T08:25:14-03:00",
+  "source_fingerprint": {
+    "hash": "d6c3519694d3e9586f85d3affe75430d8a1073d42c83c05fb44ed63d4f3f6c13"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE hosts\nADD COLUMN cordon_reason text DEFAULT '' NOT NULL CONSTRAINT hosts_cordon_reason_check CHECK (cordon_reason IN (''::text, 'OPERATOR'::text, 'DEVICE_PRESSURE'::text));",
+          "type": "table.column",
+          "operation": "create",
+          "path": "public.hosts.cordon_reason"
+        },
+        {
+          "sql": "ALTER TABLE hosts\nADD CONSTRAINT hosts_cordon_reason_belongs_to_a_cordon CHECK (state = 'CORDONED'::text OR cordon_reason = ''::text) NOT VALID;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.hosts.hosts_cordon_reason_belongs_to_a_cordon"
+        },
+        {
+          "sql": "ALTER TABLE hosts VALIDATE CONSTRAINT hosts_cordon_reason_belongs_to_a_cordon;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.hosts.hosts_cordon_reason_belongs_to_a_cordon"
+        }
+      ]
+    }
+  ]
+}

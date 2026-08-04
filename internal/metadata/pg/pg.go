@@ -335,8 +335,12 @@ func hostFromRow(h *db.Host, committed int64) (metadata.Host, error) {
 	if err != nil {
 		return metadata.Host{}, fmt.Errorf("host %s: %w", h.HostID, err)
 	}
+	reason, err := lifecycle.ParseCordonReason(h.CordonReason)
+	if err != nil {
+		return metadata.Host{}, fmt.Errorf("host %s: %w", h.HostID, err)
+	}
 	return metadata.Host{
-		HostID: h.HostID.String(), State: state, AgentVersion: h.AgentVersion,
+		HostID: h.HostID.String(), State: state, CordonReason: reason, AgentVersion: h.AgentVersion,
 		MaxFormatVersion: h.MaxFormatVersion, NVMeTotalBytes: h.NvmeTotalBytes,
 		NVMeUsedBytes: h.NvmeUsedBytes, RemoteBacklogBytes: h.NvmeRemoteBacklogBytes,
 		NVMeCommittedBytes: committed,
@@ -360,7 +364,7 @@ func (s *Store) ListHosts(ctx context.Context) ([]metadata.Host, error) {
 	return hosts, nil
 }
 
-func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState) error {
+func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState, reason lifecycle.CordonReason) error {
 	id, err := requireUUID("host", hostID)
 	if err != nil {
 		return err
@@ -368,21 +372,38 @@ func (s *Store) SetHostState(ctx context.Context, term int64, hostID string, sta
 	if !state.Valid() {
 		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, state)
 	}
+	if !reason.Authority() {
+		return fmt.Errorf("%w: cordon reason %q is not an authority", lifecycle.ErrUnknownState, reason)
+	}
+	// The stored reason is derived here rather than by a CASE in the statement: the
+	// rule "a reason belongs to a cordon" is already stated by the table constraint
+	// and by the Go type, and a third copy in SQL is a third place it can drift.
+	stored := lifecycle.CordonNone
+	if state == lifecycle.HostCordoned {
+		stored = reason
+	}
 	rows, err := s.q.SetHostState(ctx, db.SetHostStateParams{
 		HostID: id, State: state.String(), Term: term,
-		AllowedStates: state.PredecessorNames(), // the §28.1 transition table, as a predicate
+		AllowedStates:       state.PredecessorNames(), // the §28.1 transition table, as a predicate
+		CordonReason:        stored.String(),
+		OverwritableReasons: reason.OverwritableNames(), // ADR-0013 §5's authority split, as a predicate
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
 		return err
 	}
-	// Still the leader, so 0 rows means a missing host or an illegal transition.
+	// Still the leader, so 0 rows means a missing host, an illegal transition, or a
+	// cordon this writer does not outrank.
 	h, gerr := s.GetHost(ctx, hostID)
 	if gerr != nil {
 		return gerr
 	}
 	if terr := h.State.Transition(state); terr != nil {
 		return terr
+	}
+	if !reason.MayOverwrite(h.CordonReason) {
+		return fmt.Errorf("%w: host %s is cordoned by %s, %s may not change it",
+			lifecycle.ErrCordonHeld, hostID, h.CordonReason, reason)
 	}
 	// The row looks legal now: it moved between the write and this read. The write
 	// did not land, and saying so beats reporting success.

@@ -123,7 +123,7 @@ func TestHeartbeatDoesNotUncordon(t *testing.T) {
 	if _, err := f.heartbeat(t, &storagev1.HeartbeatRequest{HostId: hostA, AgentVersion: "0.1.0", Device: &storagev1.DeviceStatus{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.md.SetHostState(t.Context(), f.term, hostA, lifecycle.HostCordoned); err != nil {
+	if err := f.md.SetHostState(t.Context(), f.term, hostA, lifecycle.HostCordoned, lifecycle.CordonOperator); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := f.heartbeat(t, &storagev1.HeartbeatRequest{HostId: hostA, AgentVersion: "0.1.0", Device: &storagev1.DeviceStatus{}})
@@ -148,7 +148,7 @@ func TestHeartbeatOfADeadHostRefusesTheLease(t *testing.T) {
 	if _, err := f.heartbeat(t, &storagev1.HeartbeatRequest{HostId: hostA, AgentVersion: "0.1.0", Device: &storagev1.DeviceStatus{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.md.SetHostState(t.Context(), f.term, hostA, lifecycle.HostDead); err != nil {
+	if err := f.md.SetHostState(t.Context(), f.term, hostA, lifecycle.HostDead, lifecycle.CordonOperator); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := f.heartbeat(t, &storagev1.HeartbeatRequest{HostId: hostA, AgentVersion: "0.1.0", Device: &storagev1.DeviceStatus{}})

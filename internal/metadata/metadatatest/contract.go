@@ -72,6 +72,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"RecreatingASnapshotIsANoOp", snapshotRecreate},
 		{"WatermarksAreOrderedAndNeverGoBackwards", watermarks},
 		{"UpsertHostDoesNotClobberStateOrCapacity", upsertHost},
+		{"ACordonRecordsWhoPlacedItAndOutranksThePressureLoop", cordonAuthority},
 		{"RecordOperationSeparatesDuplicateFromStaleTerm", recordOperation},
 		{"VolumeLifecycleIsExpressible", volumeLifecycle},
 		{"SnapshotLifecycleIsExpressible", snapshotLifecycle},
@@ -229,7 +230,7 @@ func everyMutation() []mutation {
 			return s.UpsertHost(ctx, term, metadata.Host{HostID: w.host, State: lifecycle.HostActive})
 		}},
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.SetHostState(ctx, term, w.host, lifecycle.HostCordoned)
+			return s.SetHostState(ctx, term, w.host, lifecycle.HostCordoned, lifecycle.CordonOperator)
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.RenewHostLease(ctx, term, w.host, 10)
@@ -338,7 +339,7 @@ func missingRows(t *testing.T, s metadata.Store) {
 
 	tests := []mutation{
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.SetHostState(ctx, term, ghostHost, lifecycle.HostCordoned)
+			return s.SetHostState(ctx, term, ghostHost, lifecycle.HostCordoned, lifecycle.CordonOperator)
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
@@ -436,7 +437,7 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 			return err
 		}},
 		{"illegal host transition under a stale term", func() error {
-			return s.SetHostState(ctx, stale, w.host, lifecycle.HostActive)
+			return s.SetHostState(ctx, stale, w.host, lifecycle.HostActive, lifecycle.CordonOperator)
 		}},
 	}
 	for _, tc := range tests {
@@ -663,7 +664,7 @@ func upsertHost(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s) // one ACTIVE host holding one 1 GiB volume
 	const held = int64(1) << 30
-	if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned); err != nil {
+	if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned, lifecycle.CordonOperator); err != nil {
 		t.Fatal(err)
 	}
 
@@ -683,6 +684,12 @@ func upsertHost(t *testing.T, s metadata.Store) {
 	switch {
 	case h.State != lifecycle.HostCordoned:
 		t.Fatalf("a heartbeat un-cordoned the host: state = %q", h.State)
+	case h.CordonReason != lifecycle.CordonOperator:
+		// The reason has to survive the heartbeat for the same reason the state
+		// does: a CORDONED host whose reason a routine upsert blanked is a host an
+		// operator cannot tell from one the 70% rule cordoned, and the pressure loop
+		// would then be free to un-cordon it (ADR-0013 §3).
+		t.Fatalf("a heartbeat erased the cordon reason: reason = %q", h.CordonReason)
 	case h.NVMeCommittedBytes != held:
 		t.Fatalf("a heartbeat changed the committed capacity: committed = %d, want %d", h.NVMeCommittedBytes, held)
 	case h.AgentVersion != "v2" || h.MaxFormatVersion != 3 || h.NVMeTotalBytes != 1<<41 || h.NVMeUsedBytes != 123:
@@ -693,6 +700,90 @@ func upsertHost(t *testing.T, s metadata.Store) {
 		// the rows that say who holds what and is the Control Plane's (ADR-0017).
 		t.Fatalf("a heartbeat did not update the remote backlog: %+v", h)
 	}
+}
+
+// cordonAuthority: ADR-0013 §3 makes the Control Plane cordon a host whose device
+// passes 70% used, which means state = 'CORDONED' stopped being evidence that a human
+// meant it. Two properties follow, and both are about what the *store* refuses,
+// because the rule has to be a predicate of the write: a read-then-write in the
+// caller leaves a window in which an operator's cordon lands between the two and is
+// cleared anyway, which is the one outcome the reason column exists to prevent.
+func cordonAuthority(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s)
+
+	t.Run("a cordon records who placed it", func(t *testing.T) {
+		if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned, lifecycle.CordonPressure); err != nil {
+			t.Fatal(err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.State != lifecycle.HostCordoned || h.CordonReason != lifecycle.CordonPressure {
+			t.Fatalf("state = %q reason = %q, want CORDONED / DEVICE_PRESSURE", h.State, h.CordonReason)
+		}
+	})
+
+	t.Run("an operator outranks the pressure loop", func(t *testing.T) {
+		// Re-stamping an existing cordon is how an operator takes ownership of one
+		// the fleet placed: the host does not move, the authority does.
+		if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned, lifecycle.CordonOperator); err != nil {
+			t.Fatal(err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.CordonReason != lifecycle.CordonOperator {
+			t.Fatalf("reason = %q, want OPERATOR", h.CordonReason)
+		}
+	})
+
+	t.Run("the pressure loop may not clear an operator's cordon", func(t *testing.T) {
+		err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostActive, lifecycle.CordonPressure)
+		if !errors.Is(err, lifecycle.ErrCordonHeld) {
+			t.Fatalf("un-cordoning an operator's cordon: want ErrCordonHeld, got %v", err)
+		}
+		h, gerr := s.GetHost(ctx, w.host)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		// The error is not the property; the row is. A store that returns the right
+		// error and writes anyway satisfies any assertion on err.
+		if h.State != lifecycle.HostCordoned || h.CordonReason != lifecycle.CordonOperator {
+			t.Fatalf("the refused write landed anyway: state = %q reason = %q", h.State, h.CordonReason)
+		}
+	})
+
+	t.Run("leaving CORDONED clears the reason", func(t *testing.T) {
+		if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostActive, lifecycle.CordonOperator); err != nil {
+			t.Fatal(err)
+		}
+		h, err := s.GetHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A reason that outlives its cordon is a reason the next reader will believe,
+		// and the next reader is the pressure loop deciding whether it may act.
+		if h.State != lifecycle.HostActive || h.CordonReason != lifecycle.CordonNone {
+			t.Fatalf("state = %q reason = %q, want ACTIVE and no reason", h.State, h.CordonReason)
+		}
+	})
+
+	t.Run("a write with no authority is refused", func(t *testing.T) {
+		err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostCordoned, lifecycle.CordonNone)
+		if !errors.Is(err, lifecycle.ErrUnknownState) {
+			t.Fatalf("cordoning with no reason: want ErrUnknownState, got %v", err)
+		}
+		h, gerr := s.GetHost(ctx, w.host)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if h.State != lifecycle.HostActive {
+			t.Fatalf("an authorless cordon landed: state = %q", h.State)
+		}
+	})
 }
 
 // recordOperation: the one mutation whose whole purpose is admin idempotency
@@ -1113,7 +1204,7 @@ func hostLeases(t *testing.T, s metadata.Store) {
 	})
 
 	t.Run("a dead host cannot renew", func(t *testing.T) {
-		if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostDead); err != nil {
+		if err := s.SetHostState(ctx, w.term, w.host, lifecycle.HostDead, lifecycle.CordonOperator); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.RenewHostLease(ctx, w.term, w.host, 10); !errors.Is(err, metadata.ErrHostNotServing) {
@@ -1126,7 +1217,7 @@ func hostLeases(t *testing.T, s metadata.Store) {
 		// still serving the volumes they hold: taking their lease away for the whole
 		// evacuation would stop the ACKs of volumes nobody is moving (ADR-0016).
 		for _, state := range []lifecycle.HostState{lifecycle.HostCordoned, lifecycle.HostDraining} {
-			if err := s.SetHostState(ctx, w.term, w.host, state); err != nil {
+			if err := s.SetHostState(ctx, w.term, w.host, state, lifecycle.CordonOperator); err != nil {
 				t.Fatal(err)
 			}
 			if err := s.RenewHostLease(ctx, w.term, w.host, 10); err != nil {
@@ -1745,7 +1836,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			return s.UpsertHost(ctx, term, metadata.Host{HostID: "", State: lifecycle.HostActive})
 		}},
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.SetHostState(ctx, term, "", lifecycle.HostCordoned)
+			return s.SetHostState(ctx, term, "", lifecycle.HostCordoned, lifecycle.CordonOperator)
 		}},
 		{"RenewHostLease", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.RenewHostLease(ctx, term, "", 10)

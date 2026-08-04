@@ -177,13 +177,13 @@ func TestPGFleetSurface(t *testing.T) {
 	}
 
 	// Cordon (§28.1).
-	if err := store.SetHostState(ctx, term, hostA, lifecycle.HostCordoned); err != nil {
+	if err := store.SetHostState(ctx, term, hostA, lifecycle.HostCordoned, lifecycle.CordonOperator); err != nil {
 		t.Fatal(err)
 	}
 	if h, _ := store.GetHost(ctx, hostA); h.State != lifecycle.HostCordoned {
 		t.Fatalf("state = %q, want CORDONED", h.State)
 	}
-	if err := store.SetHostState(ctx, term, ids.New().String(), lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
+	if err := store.SetHostState(ctx, term, ids.New().String(), lifecycle.HostCordoned, lifecycle.CordonOperator); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("SetHostState on a missing host: want ErrNotFound, got %v", err)
 	}
 
@@ -497,6 +497,18 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 			t.Fatalf("host state %q rejected by the DB: %v", s, err)
 		}
 	}
+	// cordon_reason is the same drift risk one column over: a reason Go declares and
+	// the CHECK does not is a cordon the Control Plane can never record, and a host
+	// nobody can tell from one an operator cordoned (ADR-0013 §3). The host is put
+	// into CORDONED first because the table constraint ties a reason to a cordon.
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET state='CORDONED' WHERE host_id=$1`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range lifecycle.CordonReasons() {
+		if _, err := pool.Exec(ctx, `UPDATE hosts SET cordon_reason=$1 WHERE host_id=$2`, r.String(), hostID); err != nil {
+			t.Fatalf("cordon reason %q rejected by the DB: %v", r, err)
+		}
+	}
 	for _, s := range lifecycle.VolumeStates() {
 		if _, err := pool.Exec(ctx, `UPDATE volumes SET state=$1 WHERE volume_id=$2`, s.String(), volID); err != nil {
 			t.Fatalf("volume state %q rejected by the DB: %v", s, err)
@@ -546,6 +558,11 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 	}{
 		{"host state", `UPDATE hosts SET state=$1 WHERE host_id='` + hostID + `'`, "ZOMBIE"},
 		{"volume state", `UPDATE volumes SET state=$1 WHERE volume_id='` + volID + `'`, "REBUILT"},
+		{"cordon reason", `UPDATE hosts SET state='CORDONED', cordon_reason=$1 WHERE host_id='` + hostID + `'`, "BECAUSE"},
+		// The other half of the cordon rule, and the one a script is most likely to
+		// break: a reason that outlives its cordon is a reason the next reader — the
+		// pressure loop deciding whether it may act — will believe (ADR-0013 §3).
+		{"a reason without a cordon", `UPDATE hosts SET state='ACTIVE', cordon_reason=$1 WHERE host_id='` + hostID + `'`, "OPERATOR"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

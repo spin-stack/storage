@@ -36,7 +36,7 @@ func (q *Queries) BlockHostRenewals(ctx context.Context, arg BlockHostRenewalsPa
 }
 
 const getHost = `-- name: GetHost :one
-SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.nvme_remote_backlog_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
+SELECT h.host_id, h.state, h.cordon_reason, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.nvme_remote_backlog_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
   JOIN host_committed_bytes c ON c.host_id = h.host_id
  WHERE h.host_id = $1
@@ -66,6 +66,7 @@ func (q *Queries) GetHost(ctx context.Context, hostID uuid.UUID) (*GetHostRow, e
 	err := row.Scan(
 		&i.Host.HostID,
 		&i.Host.State,
+		&i.Host.CordonReason,
 		&i.Host.AgentVersion,
 		&i.Host.MaxFormatVersion,
 		&i.Host.NvmeTotalBytes,
@@ -106,7 +107,7 @@ func (q *Queries) HostExists(ctx context.Context, hostID uuid.UUID) (bool, error
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT h.host_id, h.state, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.nvme_remote_backlog_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
+SELECT h.host_id, h.state, h.cordon_reason, h.agent_version, h.max_format_version, h.nvme_total_bytes, h.nvme_used_bytes, h.nvme_remote_backlog_bytes, h.last_heartbeat, h.renewals_blocked_until, COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
   JOIN host_committed_bytes c ON c.host_id = h.host_id
  ORDER BY h.host_id
@@ -130,6 +131,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]*ListHostsRow, error) {
 		if err := rows.Scan(
 			&i.Host.HostID,
 			&i.Host.State,
+			&i.Host.CordonReason,
 			&i.Host.AgentVersion,
 			&i.Host.MaxFormatVersion,
 			&i.Host.NvmeTotalBytes,
@@ -265,29 +267,47 @@ func (q *Queries) RevokeHostLease(ctx context.Context, arg RevokeHostLeaseParams
 
 const setHostState = `-- name: SetHostState :execrows
 UPDATE hosts
-   SET state = $2
+   SET state = $2, cordon_reason = $4
  WHERE host_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
-   AND state = ANY($4::text[])
+   AND state = ANY($5::text[])
+   AND cordon_reason = ANY($6::text[])
 `
 
 type SetHostStateParams struct {
-	HostID        uuid.UUID `json:"host_id"`
-	State         string    `json:"state"`
-	Term          int64     `json:"term"`
-	AllowedStates []string  `json:"allowed_states"`
+	HostID              uuid.UUID `json:"host_id"`
+	State               string    `json:"state"`
+	Term                int64     `json:"term"`
+	CordonReason        string    `json:"cordon_reason"`
+	AllowedStates       []string  `json:"allowed_states"`
+	OverwritableReasons []string  `json:"overwritable_reasons"`
 }
 
-// cordon / drain / mark dead (§28.1), term-guarded and transition-guarded: $4 is the
-// set of states that may legally become $2, taken from the lifecycle table. Doing it
-// in the predicate keeps the check atomic (no read-modify-write race) and means the
-// rule holds even for a client that skipped the Go layer.
+// cordon / drain / mark dead (§28.1), term-guarded and transition-guarded: the
+// allowed_states array is the set of states that may legally become $2, taken from
+// the lifecycle table. Doing it in the predicate keeps the check atomic (no
+// read-modify-write race) and means the rule holds even for a client that skipped
+// the Go layer.
+//
+// The third predicate is the same move for cordon authority (ADR-0013 §3, §5):
+// overwritable_reasons is what a write made for this reason may replace, so the
+// pressure loop's write simply does not match a host an operator cordoned. In Go it
+// would be a read, a comparison and then a write, and an operator's cordon landing
+// between the read and the write would be cleared anyway — which is the single
+// outcome the reason column exists to prevent.
+//
+// cordon_reason is set from an argument the caller derives rather than from a CASE on
+// $2 here, because "the reason is empty unless the state is CORDONED" is the same
+// rule the table constraint states and the Go type states; a third copy in SQL is a
+// third place it can drift.
 func (q *Queries) SetHostState(ctx context.Context, arg SetHostStateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setHostState,
 		arg.HostID,
 		arg.State,
 		arg.Term,
+		arg.CordonReason,
 		arg.AllowedStates,
+		arg.OverwritableReasons,
 	)
 	if err != nil {
 		return 0, err

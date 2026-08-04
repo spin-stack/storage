@@ -196,7 +196,15 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 			if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h", State: lifecycle.HostActive}); err != nil {
 				return err
 			}
-			return s.SetHostState(ctx, term, "h", lifecycle.HostState("PUBLISHED"))
+			return s.SetHostState(ctx, term, "h", lifecycle.HostState("PUBLISHED"), lifecycle.CordonOperator)
+		}},
+		{"SetHostState with no authority to write it", func(s *sim.Store, term int64) error {
+			if err := s.UpsertHost(ctx, term, metadata.Host{HostID: "h", State: lifecycle.HostActive}); err != nil {
+				return err
+			}
+			// CordonNone is a state a host can be in, not an actor that can ask for
+			// one: a cordon with no recorded author is one no operator can interpret.
+			return s.SetHostState(ctx, term, "h", lifecycle.HostCordoned, lifecycle.CordonNone)
 		}},
 		{"CreateVolume with the zero state", func(s *sim.Store, term int64) error {
 			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v"}, nil)
@@ -299,7 +307,7 @@ func TestSetHostState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.SetHostState(ctx, term, "h1", lifecycle.HostCordoned); err != nil {
+	if err := s.SetHostState(ctx, term, "h1", lifecycle.HostCordoned, lifecycle.CordonOperator); err != nil {
 		t.Fatal(err)
 	}
 	h, _ := s.GetHost(ctx, "h1")
@@ -310,7 +318,7 @@ func TestSetHostState(t *testing.T) {
 	// A zombie CP cannot cordon or uncordon (§7).
 	stale := term
 	_, _ = s.AcquireLeadership(ctx, "cp-b")
-	if err := s.SetHostState(ctx, stale, "h1", lifecycle.HostActive); !errors.Is(err, metadata.ErrStaleTerm) {
+	if err := s.SetHostState(ctx, stale, "h1", lifecycle.HostActive, lifecycle.CordonOperator); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("stale SetHostState: want ErrStaleTerm, got %v", err)
 	}
 	if h, _ := s.GetHost(ctx, "h1"); h.State != lifecycle.HostCordoned {
@@ -390,7 +398,7 @@ func TestDerivedCapacity(t *testing.T) {
 	}, &metadata.CapacityBound{HostID: "absent", AddBytes: 1, Limit: 1000}); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("bound on a missing host: want ErrNotFound, got %v", err)
 	}
-	if err := s.SetHostState(ctx, term, "absent", lifecycle.HostCordoned); !errors.Is(err, metadata.ErrNotFound) {
+	if err := s.SetHostState(ctx, term, "absent", lifecycle.HostCordoned, lifecycle.CordonOperator); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("missing host SetHostState: want ErrNotFound, got %v", err)
 	}
 }

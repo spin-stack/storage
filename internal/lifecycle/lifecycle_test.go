@@ -276,6 +276,75 @@ func TestPredecessorsOfAnUnknownStateIsEmpty(t *testing.T) {
 	}
 }
 
+// TestCordonAuthorityIsAsymmetric is ADR-0013 §5 as a table: a human outranks the
+// pressure loop and the pressure loop does not outrank a human. It is stated once
+// here because both stores read it — the sim as a Go check, Postgres as the
+// OverwritableNames predicate of the UPDATE — and a symmetric table would let the
+// 70%-used rule return a host to service that an operator took out of it.
+func TestCordonAuthorityIsAsymmetric(t *testing.T) {
+	tests := []struct {
+		name    string
+		writer  lifecycle.CordonReason
+		current lifecycle.CordonReason
+		want    bool
+	}{
+		{"an operator may cordon a host nobody cordoned", lifecycle.CordonOperator, lifecycle.CordonNone, true},
+		{"an operator may take over a pressure cordon", lifecycle.CordonOperator, lifecycle.CordonPressure, true},
+		{"an operator may replace an operator's", lifecycle.CordonOperator, lifecycle.CordonOperator, true},
+		{"pressure may cordon a host nobody cordoned", lifecycle.CordonPressure, lifecycle.CordonNone, true},
+		{"pressure may change its own cordon", lifecycle.CordonPressure, lifecycle.CordonPressure, true},
+		{"pressure may not touch an operator's", lifecycle.CordonPressure, lifecycle.CordonOperator, false},
+		{"nobody writes with no authority", lifecycle.CordonNone, lifecycle.CordonNone, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.writer.MayOverwrite(tc.current); got != tc.want {
+				t.Fatalf("%q.MayOverwrite(%q) = %v, want %v", tc.writer, tc.current, got, tc.want)
+			}
+			// The SQL predicate is generated from the same table, so it has to agree
+			// with the Go answer for every pair — that is the point of deriving it
+			// rather than writing the reason list into the query by hand.
+			var inNames bool
+			for _, n := range tc.writer.OverwritableNames() {
+				if n == tc.current.String() {
+					inNames = true
+				}
+			}
+			if inNames != tc.want {
+				t.Fatalf("%q.OverwritableNames() = %v, disagrees with MayOverwrite(%q)",
+					tc.writer, tc.writer.OverwritableNames(), tc.current)
+			}
+		})
+	}
+}
+
+// TestCordonNoneIsNotAnAuthority: the zero value is a state a host can be in, never
+// an actor that can ask for one. A store handed it must refuse rather than write a
+// cordon with no recorded author, which is the one cordon nobody can safely undo.
+func TestCordonNoneIsNotAnAuthority(t *testing.T) {
+	for _, r := range lifecycle.CordonReasons() {
+		want := r != lifecycle.CordonNone
+		if got := r.Authority(); got != want {
+			t.Fatalf("%q.Authority() = %v, want %v", r, got, want)
+		}
+		if !r.Valid() {
+			t.Fatalf("%q is returned by CordonReasons but is not Valid", r)
+		}
+		if got, err := lifecycle.ParseCordonReason(r.String()); err != nil || got != r {
+			t.Fatalf("CordonReason %q: got %q err=%v", r, got, err)
+		}
+	}
+	// CordonNone parses (it is what an uncordoned row stores); nonsense does not.
+	for _, raw := range []string{"operator", "OPERATOR ", "PRESSURE", "nonsense"} {
+		if _, err := lifecycle.ParseCordonReason(raw); !errors.Is(err, lifecycle.ErrUnknownState) {
+			t.Fatalf("ParseCordonReason(%q): want ErrUnknownState, got %v", raw, err)
+		}
+	}
+	if got := lifecycle.CordonReason("NOPE").OverwritableNames(); len(got) != 0 {
+		t.Fatalf("an unknown reason must overwrite nothing, got %v", got)
+	}
+}
+
 // TestParseRejectsAnythingElse: values arriving from outside Go (a DB row, a JSON
 // descriptor, a CLI flag) are parsed, so a bad value fails at the boundary.
 func TestParseRejectsAnythingElse(t *testing.T) {

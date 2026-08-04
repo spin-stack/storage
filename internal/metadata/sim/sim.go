@@ -110,9 +110,17 @@ func (s *Store) UpsertHost(_ context.Context, term int64, h metadata.Host) error
 	// caller put in the field is dropped rather than stored.
 	if cur, exists := s.hosts[h.HostID]; exists {
 		h.State = cur.State
+		// The reason travels with the state it explains, or a heartbeat would leave
+		// a CORDONED host with an empty cordon_reason and an operator with no way to
+		// tell why it is out of service (ADR-0013 §3).
+		h.CordonReason = cur.CordonReason
 		// Nor may it close a revocation window that is fencing one of its volumes
 		// (ADR-0016): that is the Control Plane's write, not the Agent's.
 		h.RenewalsBlockedUntil = cur.RenewalsBlockedUntil
+	} else {
+		// A host introducing itself is ACTIVE, and ACTIVE carries no reason. The
+		// caller's field is dropped for the same reason its State is only read here.
+		h.CordonReason = lifecycle.CordonNone
 	}
 	h.NVMeCommittedBytes = 0
 	h.LastHeartbeat = s.now()
@@ -202,12 +210,15 @@ func (s *Store) boundLocked(b *metadata.CapacityBound) error {
 	return nil
 }
 
-func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state lifecycle.HostState) error {
+func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state lifecycle.HostState, reason lifecycle.CordonReason) error {
 	if err := requireID("host", hostID); err != nil {
 		return err
 	}
 	if !state.Valid() {
 		return fmt.Errorf("%w: host state %q", lifecycle.ErrUnknownState, state)
+	}
+	if !reason.Authority() {
+		return fmt.Errorf("%w: cordon reason %q is not an authority", lifecycle.ErrUnknownState, reason)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -221,7 +232,20 @@ func (s *Store) SetHostState(_ context.Context, term int64, hostID string, state
 	if err := h.State.Transition(state); err != nil {
 		return err
 	}
+	// The authority check is here, next to the transition check, for the same reason
+	// the pg store puts it in the UPDATE's predicate: it decides whether the write
+	// happens at all, so it must not be something a caller could forget to do first.
+	if !reason.MayOverwrite(h.CordonReason) {
+		return fmt.Errorf("%w: host %s is cordoned by %s, %s may not change it",
+			lifecycle.ErrCordonHeld, hostID, h.CordonReason, reason)
+	}
 	h.State = state
+	// A reason belongs to a cordon and dies with it: a host that has just gone back
+	// to ACTIVE carrying "DEVICE_PRESSURE" is a row the next reader will believe.
+	h.CordonReason = lifecycle.CordonNone
+	if state == lifecycle.HostCordoned {
+		h.CordonReason = reason
+	}
 	s.hosts[hostID] = h
 	return nil
 }

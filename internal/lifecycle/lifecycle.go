@@ -182,6 +182,99 @@ func (s HostState) Predecessors() []HostState { return hostMachine.predecessors(
 // PredecessorNames is Predecessors as stored strings — the store's SQL guard.
 func (s HostState) PredecessorNames() []string { return names(s.Predecessors()) }
 
+// --- Why a host is cordoned, and who may change it (ADR-0013 §3, §5) ---
+
+// CordonReason is why a host is CORDONED, and — because in this system the reason
+// and the actor are the same thing — the authority a write to hosts.state carries.
+//
+// It exists because cordon stopped being something only a human does. ADR-0013 §3
+// makes the Control Plane cordon a host whose device passes 70% used, so an operator
+// looking at a CORDONED host can no longer assume somebody meant it; and, in the
+// other direction, the automatic loop must never clear a cordon a human put there
+// for a reason it cannot see (a failing NIC, a kernel it is about to reboot).
+// A cordon with no recorded cause is a cordon nobody can safely undo.
+//
+// One value serves both questions on purpose. A second column — `cordoned_by`
+// alongside `cordon_reason` — was rejected: two columns that must agree are two
+// columns that can disagree, and nothing in this system would ever set them to
+// different things. There is exactly one automatic actor and exactly one human one.
+type CordonReason string
+
+// Cordon reasons. The zero value means "not cordoned": it is a stored value, never
+// an argument, so a caller that forgot to say who it is fails rather than silently
+// writing a cordon with no cause (see Authority).
+const (
+	CordonNone     CordonReason = ""
+	CordonOperator CordonReason = "OPERATOR"
+	CordonPressure CordonReason = "DEVICE_PRESSURE"
+)
+
+var cordonReasons = []CordonReason{CordonNone, CordonOperator, CordonPressure}
+
+// cordonOverwrite is the authority table: for a write made *for* the key reason,
+// the stored reasons it may replace.
+//
+// The asymmetry is the whole point. A human outranks the pressure loop, so an
+// operator write lands whatever the host currently says. The pressure loop does not
+// outrank a human, so it may only touch a host that is uncordoned or that it
+// cordoned itself — which is what stops the 70% rule from un-cordoning a host a
+// human took out of service deliberately.
+var cordonOverwrite = map[CordonReason][]CordonReason{
+	CordonOperator: {CordonNone, CordonOperator, CordonPressure},
+	CordonPressure: {CordonNone, CordonPressure},
+}
+
+// ErrCordonHeld means a write was refused because the host's cordon was placed by an
+// authority this writer does not outrank — in practice, the pressure loop meeting a
+// cordon an operator set.
+var ErrCordonHeld = errors.New("lifecycle: cordon held by a higher authority")
+
+// CordonReasons returns every stored reason, including CordonNone.
+func CordonReasons() []CordonReason { return cordonReasons }
+
+// ParseCordonReason converts a stored value, rejecting anything else.
+func ParseCordonReason(raw string) (CordonReason, error) {
+	r := CordonReason(raw)
+	if !r.Valid() {
+		return "", fmt.Errorf("%w: cordon reason %q", ErrUnknownState, raw)
+	}
+	return r, nil
+}
+
+func (r CordonReason) String() string { return string(r) }
+
+// Valid reports whether r is a declared reason (CordonNone included).
+func (r CordonReason) Valid() bool {
+	for _, candidate := range cordonReasons {
+		if candidate == r {
+			return true
+		}
+	}
+	return false
+}
+
+// Authority reports whether r may be given as the reason for a write. CordonNone
+// cannot: "nobody" is a state a host can be in, not an actor that can ask for one.
+func (r CordonReason) Authority() bool { return len(cordonOverwrite[r]) > 0 }
+
+// MayOverwrite reports whether a write made for reason r may replace a host whose
+// cordon currently records `current`.
+func (r CordonReason) MayOverwrite(current CordonReason) bool {
+	for _, allowed := range cordonOverwrite[r] {
+		if allowed == current {
+			return true
+		}
+	}
+	return false
+}
+
+// OverwritableNames is MayOverwrite as stored strings — the store's SQL predicate,
+// the same move PredecessorNames makes for the transition table. The rule has to be
+// *in* the statement that writes the state: a read-then-write in Go leaves a window
+// in which an operator's cordon lands between the two and the pressure loop clears
+// it anyway, which is the one outcome this whole type exists to prevent.
+func (r CordonReason) OverwritableNames() []string { return names(cordonOverwrite[r]) }
+
 // --- Volume ownership state, Control Plane side (§7) ---
 
 // VolumeState is the Control Plane's view of a volume's writer ownership (§7).

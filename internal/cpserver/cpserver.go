@@ -4,10 +4,16 @@
 // transitions, the watermark ordering — is enforced inside metadata.Store's writes,
 // which is where a second Control Plane cannot get between a read and a write.
 //
-// What lives here that lives nowhere else is the *epoch qualification* of a volume
-// report (§12.3): metadata.UpdateWatermarks is monotonic per column but has no
-// notion of who is reporting, so refusing a fenced writer's report is done here, by
-// comparing what the report claims against what the volume says.
+// Two things live here that live nowhere else, and both are reactions to what a host
+// reports rather than rules about a write:
+//
+//   - the *epoch qualification* of a volume report (§12.3): metadata.UpdateWatermarks
+//     is monotonic per column but has no notion of who is reporting, so refusing a
+//     fenced writer's report is done here, by comparing what the report claims
+//     against what the volume says;
+//   - the *device-pressure cordon* (ADR-0013 §3): the heartbeat carries the only
+//     measurement of the device there is, and the fleet's answer to it — cordon at
+//     70% used — is the Control Plane's alone (ADR-0013 §5). See pressure.go.
 package cpserver
 
 import (
@@ -88,6 +94,16 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[storagev1.H
 		return nil, rpcError(fmt.Errorf("cpserver: reading host %q: %w", msg.GetHostId(), err))
 	}
 
+	// The device measurement the host just reported is the only one the fleet has,
+	// and cordoning on it is the Control Plane's job alone (ADR-0013 §5): the Agent
+	// gets local defensive powers — backpressure, refusing attaches — and moving
+	// volumes stays here, because two actors evacuating one host is the bug two
+	// earlier waves spent their effort closing. See pressure.go for the band.
+	state, err := s.applyPressure(ctx, term, host)
+	if err != nil {
+		return nil, rpcError(err)
+	}
+
 	// A DEAD host is refused a lease rather than an answer. The Agent needs to tell
 	// "the Control Plane is unreachable" from "the Control Plane will not renew me":
 	// the first is a network problem it retries through, the second is a fence it
@@ -103,7 +119,7 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[storagev1.H
 
 	return connect.NewResponse(&storagev1.HeartbeatResponse{
 		LeaseTtlSeconds: int32(ttl / time.Second),
-		State:           hostState(host.State),
+		State:           hostState(state),
 		Term:            term,
 	}), nil
 }

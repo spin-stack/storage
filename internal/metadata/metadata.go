@@ -173,8 +173,14 @@ type Leader struct {
 
 // Host is a compute host (§8).
 type Host struct {
-	HostID           string
-	State            lifecycle.HostState
+	HostID string
+	State  lifecycle.HostState
+	// CordonReason is why the host is CORDONED, and empty in every other state
+	// (ADR-0013 §3). It is what tells an operator's cordon from the one the Control
+	// Plane places when the device passes 70% used, and — read back through
+	// lifecycle.CordonReason.MayOverwrite — what stops the automatic loop from
+	// clearing the operator's.
+	CordonReason     lifecycle.CordonReason
 	AgentVersion     string
 	MaxFormatVersion int32
 	NVMeTotalBytes   int64
@@ -416,7 +422,16 @@ type Store interface {
 	// SetHostState transitions a host's fleet state (term-guarded, §28.1). The move
 	// is checked against the lifecycle table: an unknown value is
 	// lifecycle.ErrUnknownState, an illegal move lifecycle.ErrInvalidTransition.
-	SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState) error
+	//
+	// reason says who is asking (ADR-0013 §3, §5). It is recorded as the host's
+	// cordon_reason when state is CORDONED and cleared otherwise, and it is also the
+	// authority the write carries: a lifecycle.CordonPressure write is refused with
+	// lifecycle.ErrCordonHeld against a host an operator cordoned, so the automatic
+	// 70%-used loop can never take a host out of a cordon a human put it in for a
+	// cause the fleet cannot see. lifecycle.CordonNone is not an actor and is
+	// rejected — a state change with no recorded author is one no operator can
+	// interpret afterwards.
+	SetHostState(ctx context.Context, term int64, hostID string, state lifecycle.HostState, reason lifecycle.CordonReason) error
 	// RenewHostLease renews (or grants) a host's lease with the given TTL
 	// (term-guarded). A host the fleet has recorded as DEAD is refused with
 	// ErrHostNotServing: that state is the Control Plane asserting the writer is

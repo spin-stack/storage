@@ -19,6 +19,7 @@ type ControlPlaneLeader struct {
 type Host struct {
 	HostID                 uuid.UUID          `json:"host_id"`
 	State                  string             `json:"state"`
+	CordonReason           string             `json:"cordon_reason"`
 	AgentVersion           string             `json:"agent_version"`
 	MaxFormatVersion       int32              `json:"max_format_version"`
 	NvmeTotalBytes         int64              `json:"nvme_total_bytes"`

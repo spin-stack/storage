@@ -42,6 +42,20 @@ CREATE TABLE control_plane_leader (
 CREATE TABLE hosts (
     host_id              UUIDV7 PRIMARY KEY,
     state                TEXT NOT NULL CHECK (state IN ('ACTIVE', 'CORDONED', 'DRAINING', 'DEAD')),
+    -- Why the host is CORDONED, empty for every other state (ADR-0013 §3).
+    --
+    -- Cordon stopped being something only a human does: the Control Plane cordons a
+    -- host whose device passes 70% used, so an operator reading state = 'CORDONED'
+    -- can no longer assume somebody meant it. The column is what tells the two
+    -- apart, and it is also what stops the automatic loop from clearing a cordon a
+    -- human set for a cause the fleet cannot see — the pressure writer may only
+    -- replace '' or 'DEVICE_PRESSURE' (lifecycle.CordonReason.OverwritableNames,
+    -- applied in SetHostState's predicate).
+    --
+    -- It is emptied rather than left behind when the host leaves CORDONED, because a
+    -- reason that outlives its cordon is a reason the next reader will believe.
+    cordon_reason        TEXT NOT NULL DEFAULT ''
+                           CHECK (cordon_reason IN ('', 'OPERATOR', 'DEVICE_PRESSURE')),
     agent_version        TEXT NOT NULL DEFAULT '',
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
@@ -78,7 +92,13 @@ CREATE TABLE hosts (
     -- mid-promotion runs no closing write at all, and a host that can never renew
     -- again is worse than the bug this fixes. The deadline is the backstop: at most
     -- one lease_ttl + max_clock_skew per volume moved, whatever happens to the CP.
-    renewals_blocked_until TIMESTAMPTZ
+    renewals_blocked_until TIMESTAMPTZ,
+    -- A reason belongs to a cordon and dies with it. Stated as a table constraint
+    -- because it spans two columns: a column-level CHECK reading another column is
+    -- accepted by PostgreSQL and silently promoted to one anyway, which hides from
+    -- the reader that dropping either column takes this rule with it.
+    CONSTRAINT hosts_cordon_reason_belongs_to_a_cordon
+        CHECK (state = 'CORDONED' OR cordon_reason = '')
 );
 
 -- Lease POR HOST (§12.6): one grouped renewal per host, not per volume. Each volume

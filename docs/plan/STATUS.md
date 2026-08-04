@@ -1846,6 +1846,66 @@ where the defect is real detects every time.
 loop, both track C's uncommitted work in progress. `task test` for every package this
 branch touches is green, as is `task lint` apart from that one file.
 
+**D5: a cordon on device pressure has an actor, a reason and hysteresis (2026-08-04).**
+ADR-0013 §3's first row, the last of the three the amendment approved. Nothing cordoned on
+pressure: `SetHostState` had no non-production caller at all, and no code path read a
+device measurement to decide anything. `cpserver.Heartbeat` now does — the heartbeat
+carries the only measurement of the device that exists, and reacting to it is the Control
+Plane's alone (ADR-0013 §5: the Agent gets local defensive powers only, and moving volumes
+stays here, because two actors evacuating one host is the class of bug two earlier waves
+closed). The Agent-local half — refusing attaches at 85%, the reserve — is deliberately
+not here; it is `internal/agent`'s and a later increment's.
+
+**The hysteresis is a band, not a dwell** (`cpserver.CordonUsedRatio` = 0.70,
+`UncordonUsedRatio` = 0.65). One threshold is a flapping cordon: a host sitting on the line
+crosses it in both directions on consecutive heartbeats, and every crossing is a write, a
+state every placement decision in the fleet reads, and a line in whatever an operator is
+watching — placement becomes non-deterministic for reasons nothing records. A Schmitt
+trigger fixes that with **no state at all**: the decision is a pure function of the host
+row, because the previous decision is read back from the state and the reason it wrote.
+Coming back requires freeing 5% of the device, which heartbeat jitter does not produce; the
+5%–gap dead zone (a host cordoned while admission's 85% ceiling would still take it) is the
+price, and the band is deliberately the *smallest* gap that is unambiguously real.
+**A dwell was rejected**: "clear for N heartbeats" needs a per-host timestamp, which is
+either a column written on every heartbeat of every host — the busiest RPC there is — or
+memory a leader change discards, so a failing-over CP would hold hosts cordoned
+indefinitely with each new leader restarting the count. It also puts a clock into a
+decision that is otherwise two numbers already in the row (INV-01 makes every clock an
+injected dependency). What it catches and the band does not is a device that frees 5% and
+refills it between two heartbeats — not noise, a host doing exactly what the cordon is for.
+
+**The reason is also the authority** (`lifecycle.CordonReason`, `hosts.cordon_reason`,
+`migrations/20260804112514_host_cordon_reason.{sql,json}`, planned against and applied to
+the dev database; `task db:verify` green). `CORDONED` stopped being evidence that a human
+meant it, so an operator needs the cause — and, in the other direction, the automatic loop
+must never clear a cordon set for a cause the fleet cannot see. One column serves both:
+`OPERATOR` outranks `DEVICE_PRESSURE`, `DEVICE_PRESSURE` may only replace `''` or itself,
+and `CordonReasons().OverwritableNames()` is that table as the `SetHostState` predicate —
+in Go it would be read, compare, write, and an operator's cordon landing between the read
+and the write would be cleared anyway. A second `cordoned_by` column was rejected: two
+columns that must agree are two columns that can disagree. `SetHostState` gains the
+parameter; `CordonNone` is not an actor and is refused, so no write is authorless. A table
+constraint (`state = 'CORDONED' OR cordon_reason = ''`) keeps a reason from outliving its
+cordon, because the next reader of a stale reason is the pressure loop deciding whether it
+may act.
+
+**Three planted bugs, each watched go red.** `UncordonUsedRatio = 0.70` (the hysteresis
+gone) reddens `TestHeartbeatCordonsAndUncordonsAcrossTheBand` on a one-byte oscillation:
+`after 769658139443/1099511627776 used: state = "ACTIVE" reason = "", want "CORDONED"` —
+one byte off a 1 TiB device flips the fleet state. Adding `CordonOperator` to
+`cordonOverwrite[CordonPressure]` reddens the contract case in both lanes
+(`un-cordoning an operator's cordon: want ErrCordonHeld, got <nil>`), and passing
+`CordonOperator.OverwritableNames()` in the pg params reddens it in the pg lane alone —
+which is where the rule is actually enforced, since pg's Go check only diagnoses a 0-row
+write. Dropping the reason clause from `pressureTarget` on top of the first reddens
+`TestPressureNeverTouchesAnOperatorsCordon` (`a heartbeat cleared an operator's cordon`);
+either alone leaves it green, which is the defence in depth working and is why the store
+half has its own case.
+
+No DST scenario: this is neither data path nor fencing nor GC, and it adds no checker (the
+merge protocol allows one per window). `task ci`, `task cover` (90.0%) and
+`go test -tags integration ./internal/metadata/pg` are green.
+
 ## Track E — observability (open work, appended per increment)
 
 *Only track E appends here* — it owns `internal/obs`, `internal/vhost`,
