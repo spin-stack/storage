@@ -92,6 +92,15 @@ func run() error {
 		// PostgreSQL is unrecoverable even though every byte of every volume is intact.
 		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
 		oversubscribe   = flag.Float64("max-oversubscription", 1.0, "with -clone-snapshot: committed/total ceiling a host may reach (§28.2)")
+		// The second ceiling is the measured one (ADR-0013 §3): what the host's last
+		// heartbeat said its device holds, which is what actually runs out. It is a
+		// separate flag rather than a share of the one above because the two are not
+		// the same quantity — promises are oversubscribed on purpose and bytes are
+		// not — and because the right value depends on the deployment: a dedicated
+		// NVMe per host tolerates a higher fill than a filesystem shared with logs
+		// and images, whose other tenants no truncation of ours can reclaim.
+		maxUsedRatio = flag.Float64("max-used-ratio", placement.DefaultMaxUsedRatio,
+			"with -clone-snapshot: used/total a host may already measure and still receive a volume (ADR-0013)")
 
 		// detach-volume / attach-volume: the two halves of a volume's placement, the
 		// same one-shot shape as the flags above. They exist because primary_host_id
@@ -244,7 +253,8 @@ func run() error {
 		if lerr != nil {
 			return fmt.Errorf("-clone-snapshot needs a Control Plane to be leading (start one first): %w", lerr)
 		}
-		vol, cerr := controlplane.Clone(ctx, md, store, placement.Policy{MaxOversubscription: *oversubscribe},
+		vol, cerr := controlplane.Clone(ctx, md, store,
+			placement.Policy{MaxOversubscription: *oversubscribe, MaxUsedRatio: *maxUsedRatio},
 			leader.Term, *cloneSnapshot, ids.New().String())
 		if cerr != nil {
 			return cerr

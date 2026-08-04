@@ -227,10 +227,16 @@ type HostLease struct {
 // Re-checking in Go only narrows that window; the bound is a bound only when the
 // statement that places the bytes evaluates it. So it travels *with* the write:
 //
-//	committed(HostID) + AddBytes <= Limit
+//	committed(HostID) + AddBytes <= Limit   and   used(HostID) <= UsedLimit
 //
 // where committed is the derived value (ADR-0017) as it stands immediately before
-// the write. A write that carries no bound is not a placement decision —
+// the write and used is the host's own last measurement of its device. The second
+// half is the ADR-0013 gap: the first bounds what the fleet has *promised* the host,
+// which is not what fills it — under ADR-0026 a session's WAL stays local until the
+// volume stops, and no reservation covers a byte of it. Both travel together because
+// both are the same decision, taken once by placement.Policy.Bound.
+//
+// A write that carries no bound is not a placement decision —
 // rebuild-metadata recreating volumes that already occupy their hosts, a progress
 // save that reserves nothing new — and a bound is never applied to a write that
 // gives capacity back: a host can be over its ceiling for reasons that have nothing
@@ -247,6 +253,18 @@ type CapacityBound struct {
 	// direction: a caller that cannot name a bound has not been told the host can
 	// hold anything.
 	Limit int64
+	// UsedLimit is the highest *measured* used value the host may already show and
+	// still take the write (placement.Policy.UsedLimit). It charges AddBytes
+	// nothing: a volume does not occupy its declared size the moment it is placed,
+	// and assuming it does is the assumption oversubscription exists to deny — the
+	// reasoning is at placement.Policy.Admits, which evaluates the same rule.
+	//
+	// Zero is fail-closed the same way Limit is, and here it bites in production
+	// rather than in a test: every real device measures something, so a bound built
+	// by hand without this field refuses every placement. That is the intended
+	// direction — Policy.Bound is what builds these, and a second builder is the
+	// second copy of the rule.
+	UsedLimit int64
 }
 
 // PlanReservation is one entry of the "volumes" array an operation records in its

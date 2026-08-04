@@ -1332,6 +1332,97 @@ func capacity(t *testing.T, s metadata.Store) {
 		}
 	})
 
+	t.Run("the fill ceiling is a predicate of that write too", func(t *testing.T) {
+		// ADR-0013's second gap: the §28.2 arm above bounds what a host has been
+		// *promised*, and this host has been promised nothing at all — while its own
+		// report says 900 of its 1024 GiB are gone. Under ADR-0026 that is the
+		// ordinary case rather than a corner: a session's WAL stays on the device
+		// until the volume stops, and no reservation covers a byte of it. The used
+		// bytes of other tenants of that filesystem count too, deliberately: no
+		// truncation of ours frees them.
+		full := id()
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{
+			HostID: full, State: lifecycle.HostActive,
+			NVMeTotalBytes: total, NVMeUsedBytes: 900 * gib,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		vol := metadata.Volume{DEKKeyID: 1,
+			VolumeID: id(), SizeBytes: gib, BlockSize: 65536, State: lifecycle.VolumeActive,
+			PrimaryHostID: full, DEKWrapped: []byte{1}, KEKID: "k",
+		}
+		// Room enough for a thousand of these under the promise ceiling, and no room
+		// on the device: the two arms have to be asked separately.
+		err := s.CreateVolume(ctx, w.term, vol, &metadata.CapacityBound{
+			HostID: full, AddBytes: gib, Limit: total, UsedLimit: 850 * gib,
+		})
+		if !errors.Is(err, metadata.ErrCapacityExceeded) {
+			t.Fatalf("CreateVolume onto a device at 900/1024 GiB = %v, want ErrCapacityExceeded", err)
+		}
+		if _, gerr := s.GetVolume(ctx, vol.VolumeID); !errors.Is(gerr, metadata.ErrNotFound) {
+			t.Fatalf("a placement refused by the fill ceiling wrote the volume anyway: %v", gerr)
+		}
+		// A bound that names no fill ceiling refuses everything a real device could
+		// report. That is the fail-closed direction and it is load-bearing: bounds
+		// are built by placement.Policy.Bound, and a hand-built one that forgot this
+		// number must not silently place unbounded.
+		if err := s.CreateVolume(ctx, w.term, vol, &metadata.CapacityBound{
+			HostID: full, AddBytes: gib, Limit: total,
+		}); !errors.Is(err, metadata.ErrCapacityExceeded) {
+			t.Fatalf("CreateVolume under a bound with no fill ceiling = %v, want ErrCapacityExceeded", err)
+		}
+		// Raise the ceiling above what the host measures and the same write lands:
+		// what changed is the policy, not the promises.
+		if err := s.CreateVolume(ctx, w.term, vol, &metadata.CapacityBound{
+			HostID: full, AddBytes: gib, Limit: total, UsedLimit: 950 * gib,
+		}); err != nil {
+			t.Fatalf("a placement onto a device inside its fill ceiling was refused: %v", err)
+		}
+		if got := committed(t, full); got != gib {
+			t.Fatalf("destination committed = %d, want %d", got, gib)
+		}
+		// The measured arm reads the host's own report at the instant of the write,
+		// not a copy the caller took: the next heartbeat says the device is fuller,
+		// and the same bound that admitted a volume a moment ago stops admitting one.
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{
+			HostID: full, State: lifecycle.HostActive,
+			NVMeTotalBytes: total, NVMeUsedBytes: 960 * gib,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
+			VolumeID: id(), SizeBytes: gib, BlockSize: 65536, State: lifecycle.VolumeActive,
+			PrimaryHostID: full, DEKWrapped: []byte{1}, KEKID: "k",
+		}, &metadata.CapacityBound{
+			HostID: full, AddBytes: gib, Limit: total, UsedLimit: 950 * gib,
+		}); !errors.Is(err, metadata.ErrCapacityExceeded) {
+			t.Fatalf("CreateVolume after a heartbeat past the ceiling = %v, want ErrCapacityExceeded", err)
+		}
+		// The other write that reserves bytes is a drain's plan entry, and it carries
+		// the same two-armed bound: a destination that is out of device is no
+		// destination, whatever the fleet promised it. Without this the ceiling would
+		// hold for a clone and not for an evacuation — and an evacuation is the one
+		// that moves whole hosts' worth of data at once.
+		drain := id()
+		if _, err := s.RecordOperation(ctx, w.term, metadata.Operation{
+			OperationID: drain, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
+			HostID: full, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
+			OperationID: drain, Phase: lifecycle.OpRunning,
+			CurrentState: plan(w.vol, full, "MOVING"),
+		}, &metadata.CapacityBound{
+			HostID: full, AddBytes: gib, Limit: total, UsedLimit: 950 * gib,
+		}); !errors.Is(err, metadata.ErrCapacityExceeded) {
+			t.Fatalf("a plan reserving space on a device past its fill ceiling = %v, want ErrCapacityExceeded", err)
+		}
+		if got := committed(t, full); got != gib {
+			t.Fatalf("a refused reservation charged the destination: committed = %d, want %d", got, gib)
+		}
+	})
+
 	t.Run("the bound is a predicate of the write that records a plan", func(t *testing.T) {
 		// `other` now holds 2 GiB. A plan that would add the world's 1 GiB volume
 		// under a 2 GiB ceiling has to be refused, progress and all: the entry *is*

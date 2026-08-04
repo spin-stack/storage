@@ -129,18 +129,18 @@ func (s *Store) staleIfZero(ctx context.Context, term, rows int64, err error) er
 	return nil
 }
 
-// boundParams turns the optional §28.2 bound into the three query parameters the
+// boundParams turns the optional capacity bound into the four query parameters the
 // guarded writes take. A nil bound is a NULL host, which the predicate reads as
 // "this write is not a placement decision".
-func boundParams(b *metadata.CapacityBound) (pgtype.UUID, int64, int64, error) {
+func boundParams(b *metadata.CapacityBound) (pgtype.UUID, int64, int64, int64, error) {
 	if b == nil {
-		return pgtype.UUID{}, 0, 0, nil
+		return pgtype.UUID{}, 0, 0, 0, nil
 	}
 	id, err := requireUUID("bound host", b.HostID)
 	if err != nil {
-		return pgtype.UUID{}, 0, 0, err
+		return pgtype.UUID{}, 0, 0, 0, err
 	}
-	return pgtype.UUID{Bytes: id, Valid: true}, b.AddBytes, b.Limit, nil
+	return pgtype.UUID{Bytes: id, Valid: true}, b.AddBytes, b.Limit, b.UsedLimit, nil
 }
 
 // boundRefused diagnoses a 0-row write that carried a bound, on the 0-row path only:
@@ -157,6 +157,15 @@ func (s *Store) boundRefused(ctx context.Context, b *metadata.CapacityBound) err
 	if after := h.NVMeCommittedBytes + b.AddBytes; after > b.Limit {
 		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
 			metadata.ErrCapacityExceeded, b.HostID, after, b.Limit)
+	}
+	// The measured arm (ADR-0013): what the host reported about its own device at its
+	// last heartbeat, which is what actually runs out. Diagnosed second because a host
+	// that is over both should be reported as over its promises first — that is the
+	// number an operator can act on by moving volumes, while the fill is whatever the
+	// guests and the other tenants of that filesystem have written.
+	if h.NVMeUsedBytes > b.UsedLimit {
+		return fmt.Errorf("%w: host %s measures %d used bytes, the policy takes new volumes below %d",
+			metadata.ErrCapacityExceeded, b.HostID, h.NVMeUsedBytes, b.UsedLimit)
 	}
 	return nil
 }
@@ -451,7 +460,7 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if err != nil {
 		return err
 	}
-	boundHost, addBytes, limit, err := boundParams(bound)
+	boundHost, addBytes, limit, usedLimit, err := boundParams(bound)
 	if err != nil {
 		return err
 	}
@@ -464,6 +473,7 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence, Term: term,
 		BoundHost: boundHost, BoundAddBytes: addBytes, BoundLimit: limit,
+		BoundUsedLimit: usedLimit,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
@@ -864,17 +874,18 @@ func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Ope
 	if !op.Phase.Valid() {
 		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
 	}
-	boundHost, addBytes, limit, err := boundParams(bound)
+	boundHost, addBytes, limit, usedLimit, err := boundParams(bound)
 	if err != nil {
 		return err
 	}
 	rows, err := s.q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
 		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
-		AllowedPhases: op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
-		Term:          term,                        // and the §7 term guard
-		BoundHost:     boundHost,                   // and the §28.2 bound (ADR-0017)
-		BoundAddBytes: addBytes,
-		BoundLimit:    limit,
+		AllowedPhases:  op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
+		Term:           term,                        // and the §7 term guard
+		BoundHost:      boundHost,                   // and the capacity bound (ADR-0017, ADR-0013)
+		BoundAddBytes:  addBytes,
+		BoundLimit:     limit,
+		BoundUsedLimit: usedLimit,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {

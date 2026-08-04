@@ -136,33 +136,39 @@ UPDATE operations
    -- a view and what it sums. A bound naming a host nobody registered admits
    -- nothing: no row in the view, a NULL comparison, no write.
    AND ($7::uuid IS NULL
-       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = $7::uuid)
+       OR (EXISTS (SELECT 1 FROM hosts
+                    WHERE host_id = $7::uuid
+                      AND nvme_used_bytes <= $8::bigint)
            AND (SELECT c.committed_bytes FROM host_committed_bytes c
                  WHERE c.host_id = $7::uuid)
-               + $8::bigint <= $9::bigint))
+               + $9::bigint <= $10::bigint))
 `
 
 type UpdateOperationPhaseParams struct {
-	OperationID   uuid.UUID   `json:"operation_id"`
-	CurrentState  []byte      `json:"current_state"`
-	Phase         string      `json:"phase"`
-	Error         pgtype.Text `json:"error"`
-	Term          int64       `json:"term"`
-	AllowedPhases []string    `json:"allowed_phases"`
-	BoundHost     pgtype.UUID `json:"bound_host"`
-	BoundAddBytes int64       `json:"bound_add_bytes"`
-	BoundLimit    int64       `json:"bound_limit"`
+	OperationID    uuid.UUID   `json:"operation_id"`
+	CurrentState   []byte      `json:"current_state"`
+	Phase          string      `json:"phase"`
+	Error          pgtype.Text `json:"error"`
+	Term           int64       `json:"term"`
+	AllowedPhases  []string    `json:"allowed_phases"`
+	BoundHost      pgtype.UUID `json:"bound_host"`
+	BoundUsedLimit int64       `json:"bound_used_limit"`
+	BoundAddBytes  int64       `json:"bound_add_bytes"`
+	BoundLimit     int64       `json:"bound_limit"`
 }
 
 // Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
 // terminal operation cannot be resurrected even by a buggy caller.
 //
-// It also carries the §28.2 oversubscription bound (ADR-0017), because an operation's
-// recorded progress *is* its reservation: the plan entry a drain writes here is what
-// charges the destination for a volume that is not primary there yet. The bound is
+// It also carries the capacity bound (ADR-0017), because an operation's recorded
+// progress *is* its reservation: the plan entry a drain writes here is what charges
+// the destination for a volume that is not primary there yet. The bound is
 // evaluated against the derived value as it stands before this write, plus the bytes
 // this write is about to reserve, so two operations that chose the same destination
 // against the same fleet read produce one reservation and one ErrCapacityExceeded.
+// Its second arm is the destination's own measurement of its device (ADR-0013): a
+// drain that evacuates a host must not fill the next one, and being inside the
+// §28.2 promises says nothing about that — volumes.sql carries the reasoning.
 // A write with no bound reserves nothing new (a progress save, a phase change).
 // The outer column references are qualified because the capacity predicate below
 // reads `operations` again (every in-flight plan, this one included): unqualified
@@ -176,6 +182,7 @@ func (q *Queries) UpdateOperationPhase(ctx context.Context, arg UpdateOperationP
 		arg.Term,
 		arg.AllowedPhases,
 		arg.BoundHost,
+		arg.BoundUsedLimit,
 		arg.BoundAddBytes,
 		arg.BoundLimit,
 	)

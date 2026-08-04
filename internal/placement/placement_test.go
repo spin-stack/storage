@@ -283,3 +283,135 @@ func TestAdmitsIsTheBoundChooseUsed(t *testing.T) {
 		})
 	}
 }
+
+// filling is a host that has *measured* used bytes on its device, which is the input
+// admission ignored until ADR-0013's second surviving gap was closed: the heartbeat
+// has always shipped it and nothing read it.
+func filling(id string, total, committed, used int64) metadata.Host {
+	h := host(id, lifecycle.HostActive, total, committed)
+	h.NVMeUsedBytes = used
+	return h
+}
+
+// TestAdmitsCountsWhatTheHostIsUsing: the promise and the measurement are two
+// different questions, and a host can pass one while failing the other. Under
+// ADR-0026 a session's whole WAL stays on the device until the volume stops, so
+// what fills a host is what its guests write — a quantity no reservation covers and
+// no committed byte predicts.
+func TestAdmitsCountsWhatTheHostIsUsing(t *testing.T) {
+	const total = 100 * gib
+
+	tests := []struct {
+		name   string
+		policy placement.Policy
+		host   metadata.Host
+		size   int64
+		want   bool
+	}{
+		{
+			// The case the oversubscription bound alone cannot see: nothing has been
+			// promised here at all, and the device is nearly gone.
+			name:   "well inside its promises and nearly out of device",
+			policy: placement.Policy{MaxOversubscription: 2.0},
+			host:   filling("h", total, 0, 90*gib),
+			size:   gib,
+		},
+		{
+			name:   "exactly at the fill ceiling still takes work",
+			policy: placement.Policy{MaxOversubscription: 2.0},
+			host:   filling("h", total, 0, 85*gib),
+			size:   gib,
+			want:   true,
+		},
+		{
+			name:   "one byte past the fill ceiling does not",
+			policy: placement.Policy{MaxOversubscription: 2.0},
+			host:   filling("h", total, 0, 85*gib+1),
+			size:   gib,
+		},
+		{
+			// The zero value is the ADR-0013 ceiling, not "unbounded": a policy
+			// written before the field existed never decided that a full device may
+			// keep receiving volumes.
+			name:   "the zero policy still refuses a filling device",
+			policy: placement.Policy{},
+			host:   filling("h", total, 0, 86*gib),
+			size:   gib,
+		},
+		{
+			name:   "an operator may declare that a device fills completely",
+			policy: placement.Policy{MaxUsedRatio: 1.0},
+			host:   filling("h", total, 0, 99*gib),
+			size:   gib,
+			want:   true,
+		},
+		{
+			// Trap: "used == 0 means we have not measured yet, so refuse" would
+			// refuse the emptiest host in the fleet. There is no such state — total
+			// and used are one statfs in one heartbeat — and the host that has never
+			// reported is already refused by the total below.
+			name:   "a device measured empty is the best host there is",
+			policy: placement.Policy{MaxOversubscription: 2.0},
+			host:   filling("h", total, 0, 0),
+			size:   gib,
+			want:   true,
+		},
+		{
+			name:   "a host that never measured its device is refused, as before",
+			policy: placement.Policy{MaxOversubscription: 2.0},
+			host:   filling("h", 0, 0, 0),
+			size:   gib,
+		},
+		{
+			// The measurement arm charges the request nothing, so a volume larger
+			// than the remaining physical headroom is still placeable on a device
+			// that is not yet filling. Charging it would assume a thin volume
+			// occupies its declared size on arrival, which is the assumption
+			// oversubscription exists to deny.
+			name:   "a volume bigger than the free space lands on a device with room to spare",
+			policy: placement.Policy{MaxOversubscription: 2.0},
+			host:   filling("h", total, 0, 50*gib),
+			size:   80 * gib,
+			want:   true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.policy.Admits(tc.host, tc.size); got != tc.want {
+				t.Fatalf("Admits = %v, want %v", got, tc.want)
+			}
+			// Choose must agree, and so must the numbers handed to the write: one
+			// rule, evaluated in three places, is the whole arrangement.
+			_, err := tc.policy.Choose([]metadata.Host{tc.host}, placement.Request{SizeBytes: tc.size})
+			if chose := err == nil; chose != tc.want {
+				t.Fatalf("Choose admitted %v while Admits said %v", chose, tc.want)
+			}
+			b := tc.policy.Bound(tc.host, tc.size)
+			fits := tc.host.NVMeCommittedBytes+b.AddBytes <= b.Limit && tc.host.NVMeUsedBytes <= b.UsedLimit
+			if tc.host.NVMeTotalBytes > 0 && fits != tc.want {
+				t.Fatalf("the bound handed to the write admits %v while Admits said %v (%+v)", fits, tc.want, b)
+			}
+		})
+	}
+}
+
+// TestChooseSkipsAFillingHost is the same rule reached through the §20 order: the
+// source host holds the data, so step 1 wants it, and a source whose device is
+// filling has to fall through exactly as a cordoned one does. Its data being local
+// is worth nothing if writing to it is what breaks the host.
+func TestChooseSkipsAFillingHost(t *testing.T) {
+	policy := placement.Policy{MaxOversubscription: 2.0}
+	hosts := []metadata.Host{
+		filling("h-source", 100*gib, 0, 95*gib),
+		filling("h-other", 100*gib, 50*gib, 10*gib),
+	}
+	got, err := policy.Choose(hosts, placement.Request{SizeBytes: gib, SourceHostID: "h-source"})
+	if err != nil || got != "h-other" {
+		t.Fatalf("Choose = %q (%v), want h-other: a source host at 95%% of its device takes no new volume", got, err)
+	}
+	// And with nowhere to fall through to, the answer is no capacity rather than a
+	// host that cannot hold it.
+	if _, err := policy.Choose(hosts[:1], placement.Request{SizeBytes: gib, SourceHostID: "h-source"}); !errors.Is(err, placement.ErrNoCapacity) {
+		t.Fatalf("Choose on a filling fleet = %v, want ErrNoCapacity", err)
+	}
+}

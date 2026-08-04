@@ -32,10 +32,11 @@ import (
 // the source host holds the data only while it still holds the volume, so once the
 // source stops, step 1 buys nothing and the clone pays the download.
 //
-// The §28.2 ceiling travels with the write rather than being checked here (ADR-0017):
-// Choose is pure and advisory, so two callers reading the same fleet pick the same
-// destination and both commit. Limit is the same number Choose admitted against, handed
-// to the statement that places the bytes.
+// The capacity ceilings travel with the write rather than being checked here
+// (ADR-0017): Choose is pure and advisory, so two callers reading the same fleet pick
+// the same destination and both commit. policy.Bound hands the statement that places
+// the bytes the same two numbers Choose admitted against — §28.2 on what the host has
+// been promised, and ADR-0013's fill ceiling on what it measured itself using.
 func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, policy placement.Policy,
 	term int64, parentSnapshotID, newVolumeID string,
 ) (metadata.Volume, error) {
@@ -66,11 +67,19 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 	if err != nil {
 		return metadata.Volume{}, fmt.Errorf("controlplane: placing a clone of snapshot %s: %w", parentSnapshotID, err)
 	}
-	bound := &metadata.CapacityBound{HostID: newHostID, AddBytes: parent.SizeBytes}
+	var bound *metadata.CapacityBound
 	for _, h := range hosts {
 		if h.HostID == newHostID {
-			bound.Limit = policy.Limit(h)
+			bound = policy.Bound(h, parent.SizeBytes)
 		}
+	}
+	if bound == nil {
+		// Unreachable: Choose returns a host from this slice. Said out loud because
+		// the failure mode of "leave the bound nil" is silence — an unbounded write
+		// is how the catalog reads "not a placement decision", so a clone would be
+		// placed with no ceiling at all rather than refused.
+		return metadata.Volume{}, fmt.Errorf("controlplane: placing a clone of snapshot %s: chose host %s, which is not in the fleet it was chosen from",
+			parentSnapshotID, newHostID)
 	}
 	clone := metadata.Volume{
 		VolumeID:      newVolumeID,

@@ -63,23 +63,35 @@ INSERT INTO volumes (volume_id, size_bytes, block_size, current_epoch, state,
 SELECT $1, $2, $3, $4, $5, $6, $7, $15::bigint, $8, $9, $10,
        $16::uuid, $11, $12, $13
 WHERE EXISTS (SELECT 1 FROM valid)
-  -- The §28.2 oversubscription bound, as a predicate of the write that places the
-  -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
-  -- read that another operation shared lands here, against the derived value, and
+  -- The capacity bound, as a predicate of the write that places the volume
+  -- (ADR-0017). A clone admitted by a pure placement.Choose against a fleet read
+  -- that another operation shared lands here, against the derived value, and
   -- affects 0 rows instead of taking the destination past its declared ceiling.
   -- A write with no bound is not a placement decision: rebuild-metadata recreates
   -- volumes that already exist and already occupy the host, and bounding it would
   -- refuse to record reality.
+  -- Two ceilings, because they answer different questions (placement.Policy.Admits
+  -- carries the reasoning): §28.2 bounds what the host has been *promised*, and
+  -- ADR-0013 bounds what it reported *using* at its last heartbeat. Promises are
+  -- deliberately oversubscribed — volumes are thin — so nothing about them says the
+  -- device has room, and under ADR-0026 what fills it is a WAL no reservation covers.
+  -- The measured arm charges bound_add_bytes nothing on purpose: a volume does not
+  -- occupy its declared size the moment it is placed. It reads the column rather
+  -- than a caller's copy of it so the freshest heartbeat wins, and it is folded into
+  -- the same EXISTS because "this host is registered" and "this host has room" are
+  -- one lookup of one row.
   -- The derived value is the host_committed_bytes view; schema.sql says why it is
   -- a view and what it sums.
   -- A bound naming a host nobody registered admits nothing: the view has no row for
   -- it, the scalar subquery is NULL, and a NULL comparison admits no write. The
   -- EXISTS says so explicitly rather than leaving it to be re-derived by the reader.
   AND ($17::uuid IS NULL
-       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = $17::uuid)
+       OR (EXISTS (SELECT 1 FROM hosts
+                    WHERE host_id = $17::uuid
+                      AND nvme_used_bytes <= $18::bigint)
            AND (SELECT c.committed_bytes FROM host_committed_bytes c
                  WHERE c.host_id = $17::uuid)
-               + $18::bigint <= $19::bigint))
+               + $19::bigint <= $20::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       block_size = EXCLUDED.block_size,
@@ -119,6 +131,7 @@ type CreateVolumeParams struct {
 	DekKeyID          int64       `json:"dek_key_id"`
 	ParentSnapshotID  pgtype.UUID `json:"parent_snapshot_id"`
 	BoundHost         pgtype.UUID `json:"bound_host"`
+	BoundUsedLimit    int64       `json:"bound_used_limit"`
 	BoundAddBytes     int64       `json:"bound_add_bytes"`
 	BoundLimit        int64       `json:"bound_limit"`
 }
@@ -152,6 +165,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.DekKeyID,
 		arg.ParentSnapshotID,
 		arg.BoundHost,
+		arg.BoundUsedLimit,
 		arg.BoundAddBytes,
 		arg.BoundLimit,
 	)

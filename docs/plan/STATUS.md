@@ -1676,6 +1676,52 @@ drives `-detach-volume` against a running Agent and asserts the socket disappear
 image lands. That proof is the seam this repository keeps losing defects at, and it is
 owed.
 
+**D4: admission counts what a host is using, not only what it was promised (2026-08-04).**
+ADR-0013's second surviving gap (its amendment of 2026-08-03). The Agent has always
+shipped the measured `UsedBytes` — a `statfs` of the filesystem holding `--data-dir` — and
+`cpserver` has always stored it in `hosts.nvme_used_bytes`; **nothing read it**. So the
+§28.2 bound protected against over-promising and not at all against filling, and under
+ADR-0026 that is worse than when the ADR was written: a session's whole WAL stays local
+until the volume stops, so the device holds everything every attached volume has written,
+with no mid-session reclaim and no reservation covering a byte of it.
+
+`placement.Policy` gains `MaxUsedRatio` (zero means `DefaultMaxUsedRatio` = ADR-0013 §3's
+85%, never "unbounded" — a policy literal written before the field existed never decided
+that a full device may keep receiving volumes), and `metadata.CapacityBound` gains
+`UsedLimit`. Both arms travel with the write (ADR-0017): the SQL predicate now reads
+`nvme_used_bytes` from the same `hosts` row lookup that already proved the host exists, in
+both `CreateVolume` and `UpdateOperationPhase` — a drain's plan entry is a reservation too,
+and it moves whole hosts' worth of data. `placement.Policy.Bound` is the only builder of a
+bound, so the two ceilings are derived together; `cmd/control-plane` exposes
+`-max-used-ratio` next to `-max-oversubscription`.
+
+**The rule, and what it is not.** The measured arm charges the request *nothing*:
+`used <= UsedLimit`, a gate, not an accounting. `used + size <= UsedLimit` was rejected
+because it assumes a volume occupies its declared size the moment it is placed, which is
+the assumption oversubscription exists to deny — a 1 TiB volume would be unplaceable on a
+half-empty 2 TiB device. A single occupancy number over `max(committed, used)` was
+rejected because the physical ceiling is *below* the promise ceiling by construction, so it
+subsumes it and `MaxOversubscription` stops meaning anything. And the catalog cannot
+predict what a volume adds physically anyway: what lands is what the guest writes.
+`best()` still ranks on committed, deliberately — the measurement lags placement by a
+heartbeat plus however long a guest takes to write, so a host handed ten volumes still
+measures empty and a used-bytes ranking would keep choosing it.
+
+**Two traps, both decided rather than tripped.** `used` includes the other tenants of that
+filesystem, which is the point (`agent.DiskUsage`): no truncation of ours frees them. And
+"the host has not measured yet" is *not* a third state — total and used come from one
+`statfs` in one heartbeat, and `DiskUsage.Usage` returns an error rather than a zero when
+it fails, so the existing `NVMeTotalBytes <= 0` guard already refuses the unmeasured host.
+Reading `used == 0` as "unknown, refuse" would have refused the emptiest host in the fleet.
+
+**Four planted bugs, each watched go red.** Dropping the `&& h.NVMeUsedBytes <=
+p.UsedLimit(h)` from `Admits` (`Admits = true, want false` in three table cases, and
+`Choose = "h-source"` where a source host at 95% must fall through); `if false &&` on the
+sim's arm and `>= -1 *` on each of the two SQL predicates (`CreateVolume onto a device at
+900/1024 GiB = <nil>, want ErrCapacityExceeded`, and the same for the plan entry, in both
+the sim and pg lanes). `task ci` and `go test -tags integration ./internal/metadata/pg`
+are green.
+
 ## Track E — observability (open work, appended per increment)
 
 *Only track E appends here* — it owns `internal/obs`, `internal/vhost`,

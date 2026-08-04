@@ -36,12 +36,15 @@ SELECT * FROM operations
 -- Transition-guarded (§7): $5 is the set of phases that may legally become $3, so a
 -- terminal operation cannot be resurrected even by a buggy caller.
 --
--- It also carries the §28.2 oversubscription bound (ADR-0017), because an operation's
--- recorded progress *is* its reservation: the plan entry a drain writes here is what
--- charges the destination for a volume that is not primary there yet. The bound is
+-- It also carries the capacity bound (ADR-0017), because an operation's recorded
+-- progress *is* its reservation: the plan entry a drain writes here is what charges
+-- the destination for a volume that is not primary there yet. The bound is
 -- evaluated against the derived value as it stands before this write, plus the bytes
 -- this write is about to reserve, so two operations that chose the same destination
 -- against the same fleet read produce one reservation and one ErrCapacityExceeded.
+-- Its second arm is the destination's own measurement of its device (ADR-0013): a
+-- drain that evacuates a host must not fill the next one, and being inside the
+-- §28.2 promises says nothing about that — volumes.sql carries the reasoning.
 -- A write with no bound reserves nothing new (a progress save, a phase change).
 -- The outer column references are qualified because the capacity predicate below
 -- reads `operations` again (every in-flight plan, this one included): unqualified
@@ -55,7 +58,9 @@ UPDATE operations
    -- a view and what it sums. A bound naming a host nobody registered admits
    -- nothing: no row in the view, a NULL comparison, no write.
    AND (sqlc.narg(bound_host)::uuid IS NULL
-       OR (EXISTS (SELECT 1 FROM hosts WHERE host_id = sqlc.narg(bound_host)::uuid)
+       OR (EXISTS (SELECT 1 FROM hosts
+                    WHERE host_id = sqlc.narg(bound_host)::uuid
+                      AND nvme_used_bytes <= sqlc.arg(bound_used_limit)::bigint)
            AND (SELECT c.committed_bytes FROM host_committed_bytes c
                  WHERE c.host_id = sqlc.narg(bound_host)::uuid)
                + sqlc.arg(bound_add_bytes)::bigint <= sqlc.arg(bound_limit)::bigint));

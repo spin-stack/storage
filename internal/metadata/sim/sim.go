@@ -175,18 +175,29 @@ func (s *Store) committedLocked(hostID string) int64 {
 	return total
 }
 
-// boundLocked is the §28.2 ceiling evaluated where the write happens, against the
-// derived value as it stands before it. Nil is not a placement decision.
+// boundLocked is the §28.2 ceiling and the ADR-0013 fill ceiling evaluated where
+// the write happens — against the derived committed value and the host's last
+// measurement as they stand immediately before it. Nil is not a placement decision.
+//
+// Both arms are here rather than one here and one in the caller: a host inside its
+// promises and out of device is admitted by the first and refused by the second, and
+// the two questions are answered from the same row at the same instant only if they
+// are asked in the same place.
 func (s *Store) boundLocked(b *metadata.CapacityBound) error {
 	if b == nil {
 		return nil
 	}
-	if _, ok := s.hosts[b.HostID]; !ok {
+	h, ok := s.hosts[b.HostID]
+	if !ok {
 		return metadata.ErrNotFound
 	}
 	if after := s.committedLocked(b.HostID) + b.AddBytes; after > b.Limit {
 		return fmt.Errorf("%w: host %s would hold %d committed bytes, the policy admits %d",
 			metadata.ErrCapacityExceeded, b.HostID, after, b.Limit)
+	}
+	if h.NVMeUsedBytes > b.UsedLimit {
+		return fmt.Errorf("%w: host %s measures %d used bytes, the policy takes new volumes below %d",
+			metadata.ErrCapacityExceeded, b.HostID, h.NVMeUsedBytes, b.UsedLimit)
 	}
 	return nil
 }
