@@ -520,8 +520,30 @@ tasks:
   dst:
     desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1, §25.2).
     cmds:
-      - go test -race -count=1 -run 'TestMandatoryScenarios|TestDeterministicReplay|TestPlantedBug|TestEveryCheckerHasAPlantedBugProof' ./internal/dst/
-      - go test -race -count=1 -run 'TestWALReplayProperty|TestWALSegmentReplayProperty' ./internal/wal/
+      # No `-run` filter, deliberately. `go test -run <regex>` exits 0 and prints
+      # "[no tests to run]" when the regex matches nothing, so the test names this
+      # target used to list were a silent single point of failure: rename one, mistype
+      # one, and the mandatory gate reports success having proven nothing. That is the
+      # same class of defect as a checker that cannot fire, which this repository has
+      # already paid for twice.
+      #
+      # The obvious fix was a preflight asserting that each alternative selects at least
+      # one test (`go test -list`). Rejected: it writes the same test names down a second
+      # time, so it rots in exactly the situation it exists to catch — and in
+      # ./internal/dst it does not even work. That package's TestMain audits, after
+      # m.Run(), that every default checker was shown to catch a planted bug, and it
+      # skips that audit whenever `test.run` is non-empty; `-list` leaves `test.run`
+      # empty while running no tests, so `go test -list` there exits 1 on its own.
+      #
+      # Naming nothing beats naming things twice: with no filter there is no selection
+      # to go stale, and what the gate proves is the whole package. It also switches the
+      # TestMain audit back on here — for as long as this target filtered, the one check
+      # that proves the checkers can fire never executed in the gate that exists to run
+      # them. Measured cost of running both packages whole rather than filtered: 0.02s.
+      # `-count=1` stays: a cached "ok" is the other way a gate reports success without
+      # running.
+      - go test -race -count=1 ./internal/dst/
+      - go test -race -count=1 ./internal/wal/
 
   fmt:
     desc: Format code with the pinned golangci-lint formatters (gofmt + goimports).
