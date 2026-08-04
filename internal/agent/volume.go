@@ -17,6 +17,7 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
@@ -300,6 +301,13 @@ type VolumeManagerDeps struct {
 	// cannot publish an encrypted image, which is refused at construction rather than
 	// discovered at the first stop.
 	Rand io.Reader
+	// Recorder is where the §26.2 metrics this manager owns are written. Nil is a
+	// working no-op, which is what production passes today — `cmd/volume-agent` has no
+	// exporter to send them to, and wiring one is a deploy concern nobody has landed.
+	// The metrics are recorded anyway because §19 names two of them as mandatory and
+	// because the alternative is discovering, during the first incident, that the code
+	// to record them was never written.
+	Recorder *obs.Recorder
 }
 
 // VolumeManager owns the live runtimes and is the Agent's VolumeSource. Apply is the
@@ -985,10 +993,23 @@ func (m *VolumeManager) snapshot(ctx context.Context, v *Volume, snapshotID stri
 		return 0, fmt.Errorf("agent: volume %s never resolved its read view, so a snapshot of it would be missing everything it held before this session", v.id)
 	}
 
+	// §19's two mandatory metrics (§26.2). The pause is what the guest experiences —
+	// Freeze holds the volume's lock — and it is measured around *Freeze alone*, not
+	// around the whole operation: an earlier version of this code measured a function
+	// that captured and uploaded, and reported a pause of zero because the simulated
+	// clock only advances when something works. A pause metric that cannot distinguish
+	// the capture from the upload is the metric an incident needs and does not have.
+	vol := obs.String("volume", v.id)
+	pauseStart := m.deps.Clock.Now()
 	frozen, seq, err := v.log.Freeze()
+	m.deps.Recorder.Observe(ctx, "snapshot_pause_duration_seconds", m.deps.Clock.Now().Sub(pauseStart).Seconds(), vol)
 	if err != nil {
 		return 0, fmt.Errorf("agent: volume %s: freezing at a sequence: %w", v.id, err)
 	}
+	publishStart := m.deps.Clock.Now()
+	defer func() {
+		m.deps.Recorder.Observe(ctx, "snapshot_publish_duration_seconds", m.deps.Clock.Now().Sub(publishStart).Seconds(), vol)
+	}()
 	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.vol, frozen, seq, snapshotID); err != nil {
 		if !errors.Is(err, image.ErrSnapshotExists) {
 			return 0, fmt.Errorf("agent: volume %s: publishing snapshot %s: %w", v.id, snapshotID, err)

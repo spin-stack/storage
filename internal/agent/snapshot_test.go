@@ -2,14 +2,17 @@ package agent_test
 
 import (
 	"context"
+	"crypto/rand"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -182,5 +185,57 @@ func TestASnapshotWithNowhereToGoIsReportedAsFailed(t *testing.T) {
 	st := waitForSnapshotReport(t, m, d.GetVolumeId())
 	if !strings.Contains(st.SnapshotError, "object store") {
 		t.Fatalf("error = %q, want it to name the missing object store", st.SnapshotError)
+	}
+}
+
+// §19's two mandatory metrics (§26.2). They were registered in Phase 01 and recorded by
+// nothing: `internal/snapshot` observed them and was deleted with the checkpoint chain,
+// after which nothing did. A metric nobody records is a metric that is missing during the
+// first incident that needs it — and the incident it is for is "the guest stalled when we
+// took a snapshot", which is unanswerable without the pause.
+//
+// The assertion is on the collected series, not on a field: the recorder drops
+// unregistered names silently (deliberately, so a typo cannot become a series nobody
+// alerts on), so a misspelt name here looks exactly like working code.
+func TestASnapshotRecordsItsPauseAndPublishDuration(t *testing.T) {
+	p, err := obs.NewTestProvider("agent-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newListenerFactory()
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+	}, agent.VolumeManagerDeps{
+		Clock:    sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+		Disk:     sim.NewDisk(),
+		Listen:   f.listen,
+		Mapper:   unusedMapper{},
+		EventFD:  unusedEventFD,
+		Store:    sim.NewObjectStore(),
+		Rand:     rand.Reader,
+		Recorder: obs.NewRecorder(p.Metrics),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = m.Close() }()
+
+	d := desiredVolume(t, 1)
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	writeOneBlock(t, m, d.GetVolumeId())
+	if _, err := m.Snapshot(t.Context(), d.GetVolumeId(), ids.New().String()); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	collected, err := p.CollectedMetrics(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"snapshot_pause_duration_seconds", "snapshot_publish_duration_seconds"} {
+		if !collected[want] {
+			t.Errorf("taking a snapshot recorded no %s", want)
+		}
 	}
 }

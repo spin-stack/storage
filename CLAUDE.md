@@ -63,7 +63,7 @@ called only by its own test.
       arbitrary truncations and bit corruptions (§25.2).
 
 **Stop signals** — halt, record in `STATUS.md`, escalate to a human: a `sleep`/magic timeout/infinite retry instead of a
-simulable interface; code touching durability, fencing or GC with no DST scenario;
+simulable interface; code in a human-review zone (below) with no DST scenario;
 "I did it differently from the doc because it was simpler" with nothing written down.
 
 ## Principles
@@ -293,7 +293,28 @@ which is exactly when compatibility starts costing something real.
 
 ## Human-review zones (data-loss)
 
-On-disk / on-S3 **formats**, **fencing/leases**, **durability** (ACK rules, FLUSH/FUA
-ordering), and **GC**. Changes here get a human review of the increment spec *before*
-implementation and of the diff before merge, plus an associated DST scenario. Never
-touch durability/fencing/GC without one.
+Three, and they are narrower than they were — **ADR-0026 deleted two of the four**
+(2026-08-03). GC no longer exists; the durability zone was an ACK gated on a lease, six
+FLUSH steps and a checkpoint chain, and is now one `fdatasync`.
+
+- **On-disk / on-S3 formats.** The WAL record and segment layout, `image/<vol>/manifest.json`,
+  the chunk sealing (`<nonce:12><ct><tag:16>`), the snapshot manifest, `descriptor.json`.
+  A change here also needs the §25.2 property test — serialize/replay with arbitrary
+  truncations and bit corruptions.
+- **Mutual exclusion at publish.** The compare-and-set on a volume's manifest, and the
+  create-only write of a snapshot's. This is *all* that is left of fencing, and it is the
+  one thing that stops two hosts silently overwriting each other's session with no error
+  anywhere. Its DST arm is `two-hosts-cannot-both-publish-an-image`, whose planted bug is
+  a backend that ignores preconditions — which is why `task backend:conformance` is
+  blocking per backend.
+- **The FLUSH/FUA ACK rule.** Small now — capture the sequence, `fdatasync`, advance
+  `durable_sequence` — and still the sentence a guest's `fsync` rests on. Widening what
+  an ACK claims is a review-zone change even when the diff is three lines.
+
+Changes here get a human review of the increment spec *before* implementation and of the
+diff before merge, plus an associated DST scenario.
+
+**Not review zones any more, and saying so is the point:** the reconciliation loop,
+placement, the catalog's own state machines, and everything the Control Plane does with a
+term guard. Those are ordinary increments. A review zone that covers half the tree is a
+signal nobody can act on.

@@ -4,111 +4,67 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-08-02 · **Branch:** everything is on `main` — `guest-kernel-pinning`
-  merged `--ff-only` at `283f1dd`, then `checkpoint-lease-checker` at `b5bd268`, each
-  after a full `task ci:full`. `origin` (`/home/aledbf/spin-storage.git`, bare) is level
-  with `main`: `git ls-remote origin` reports `1a7f75d` for `refs/heads/main` and that is
-  `HEAD`. Nothing is unpushed.
+- **Date:** 2026-08-03 · **Branch:** everything is on `main`. `git ls-remote origin`
+  (`/home/aledbf/spin-storage.git`, bare) reports `88d309a` for `refs/heads/main`, and
+  local `main` is ahead of it — the ADR-0026 increment 5 and invariants commits are
+  unpushed.
 
-  This line has now been wrong twice, in opposite directions, and both times because it
-  was written from memory. It claimed `origin` was seventeen commits *behind* at
-  `be84619`; corrected, it then claimed `origin` stopped at `4f6e125` with one commit
-  unpushed, while `origin` was in fact seventeen commits *ahead* of `4f6e125`. The rule
-  this file needs is not "check before writing", which was already the rule — it is that
-  a claim about another system belongs next to the command that produced it. Here that
-  command is `git ls-remote origin`.
-- **Gate:** `task ci:full` green, 2026-08-02.
-  Green *on a developer machine, and nowhere else*: `task cover` 90.6%
-  (floor 90 — the margin is thin because the binary wiring increments 0 and 1 added is
-  not reached by unit tests), `task test:integration` green on PostgreSQL 18,
-  `task backend:conformance` green against the pinned RustFS, `task build:qemu` +
-  `task qemu:verify` + `task guest:verify` green — all of that is one machine's word.
-  **CI has never run.** `origin` is a local bare repo, so the GitHub workflows have
-  never executed on a runner. Treat every green claim here as reproducible-by-you, not
-  as defended by a gate (`BUILD-INVENTORY.md`, increment 8). Two of the three reasons
-  the guest lane could not run there are now gone (2026-07-28): the kernel is fetched
-  and pinned rather than read out of a sibling checkout (**ADR-0022**), and
-  `test:integration:qemu` skips loudly instead of hard-failing when `_output` has no
-  QEMU. The third — how a runner obtains QEMU at all — was decided on 2026-08-02 by
-  **ADR-0025** and implemented as a container job. So nothing is *missing*; what is
-  missing is a run.
+  This line has been wrong twice, in opposite directions, and both times because it was
+  written from memory. The rule this file needs is not "check before writing", which was
+  already the rule — it is that **a claim about another system belongs next to the command
+  that produced it**. Here that command is `git ls-remote origin`.
+- **Gate:** `task ci:full` green, 2026-08-03, production coverage 90.3%.
+  Green *on a developer machine, and nowhere else*. **CI has never run**: `origin` is a
+  local bare repo, so the GitHub workflows have never executed on a runner. Treat every
+  green claim here as reproducible-by-you, not as defended by a gate. Nothing is
+  *missing* for that — ADR-0022 pins the kernel, ADR-0025 decided how a runner obtains
+  QEMU — what is missing is a run.
 - **Where this is going:** storage integrates into **spin** (`github.com/aledbf/spin`),
   which already has a control plane and a per-host runner — **ADR-0021**. spin imports
   storage, never the reverse; `cmd/control-plane` and `cmd/volume-agent` are test
   harnesses that must stay runnable end to end and will not be deployed.
-- **The road to something finished:** `BUILD-INVENTORY.md` — nine increments from here
-  to one volume served end to end by real binaries, ordered by dependency, from an
-  eleven-agent audit of what exists versus what does not. **Increments 0 and 1 are
-  done, and increment 2 — the keystone — is done, review-zone half included**
-  (`RUNTIME-FENCING-SPEC.md` records each decision). **Increment 5, view adoption, is
-  done** (2026-08-01, `VIEW-ADOPTION-SPEC.md`): the seam is in `cow.IntervalMap`, `wal`
-  can adopt a base lazily, the Agent resumes, and a DST arm restarts a truncated volume
-  through the Agent on every seed. **Increment 3, checkpoint and truncate, is now
-  done** (2026-08-01, `DURABILITY-SCHEDULER-SPEC.md` + **ADR-0023**):
-  `internal/agent/durability.go` checkpoints at 256 MiB of WAL or two minutes (§21.1),
-  behind a valid lease (§12.2) and the background io-class budget (INV-17), then
-  truncates to *published*. **Local WAL is reclaimed for the first time in this
-  repository's history** — before it, `published` stayed 0 for the life of the process.
-  The DST arm drives the scheduler on every seed. One note below: the planted bug the
-  spec asked for turned out to be unreachable, and this arm uses a different one.
 
 ## Pick up here
 
-**The keystone landed on 2026-07-29, minus its review-zone half.**
-`internal/agent/volume.go` holds a `Volume` runtime per volume — `{wal.Log,
-blockdev.Device, vhost.Server}` on its own socket — and a `VolumeManager` that diffs the
-desired state and owns them. `readDesiredState` no longer assigns a field nothing reads:
-it hands the desired state to the manager, and the report that goes back carries what the
-live logs actually observe. `cmd/volume-agent` grew `-vhost-socket-dir` and serves from
-the manager instead of an empty `VolumeSet`.
+**ADR-0026 is implemented, all six increments.** V1 accepts an RPO of one session: a
+volume is uploaded once when it stops, a snapshot is an `fsync` plus a copy frozen at a
+§19 sequence, and a clone starts where its data already is. Roughly half the system was
+deleted to get there — the remote durability chain, promotion and failover, checkpoints
+and truncation, GC, the io-class scheduler, the lease-gated ACK — and the sections below
+record each increment next to what it removed.
 
-Conventions fixed by it, both asserted by tests: the WAL root is
-`<data-dir>/wal/<volume-id>/<epoch>` (the epoch is in the path so a promoted writer
-cannot append into the segments of the epoch it replaced) and the socket is
-`<socket-dir>/<volume-id>.sock` (no epoch — it is the guest's attachment point and
-survives promotion).
+**What a guest can do today, driven by the real binaries in `integration/e2e`:**
 
-**The three review-zone pieces were reviewed and answered on 2026-07-29 and are now
-implemented** (`RUNTIME-FENCING-SPEC.md` records each decision next to the question it
-answers):
+1. boot off a vhost-user-blk device the Agent binds, write, and `fsync` — the ACK is
+   local `fdatasync` and puts **zero** objects in the bucket (INV-18, asserted with a real
+   kernel in the loop);
+2. stop the Agent and have the volume's image appear in the object store, sealed
+   (INV-15), CASed over the manifest it booted from (INV-10);
+3. start again and read its own bytes back, on a fresh data directory so only the image
+   can answer;
+4. be snapshotted **while still serving** — `control-plane -snapshot-volume` writes a
+   catalog row, the Agent finds it in its desired state, freezes at a sequence and
+   publishes; the socket is still there when the manifest lands;
+5. be cloned from that snapshot with `control-plane -clone-snapshot`, which asks
+   `placement.Choose` and lands the clone on the host that took the snapshot.
 
-1. **The lease adapter** — the host lease gates every volume's durable ACK. It is a
-   function resolved per call, never a captured `*lease.Manager`, because `applyLease`
-   allocates a new manager on a TTL change and a Log holding the old one would self-fence
-   a healthy host and never recover. A store with no lease is refused at construction.
-   `EnableRemote` is now called, so a FLUSH is the §14.4 path.
-2. **Fencing tears the runtime down** — the safe side, throughout: log, socket and device
-   all go, so neither reads nor writes are answered and the guest's I/O stalls rather
-   than being served by a host with no authority. **Resolves DEV-0012's Agent half** — the
-   log's own self-fencing stops the durable path only, which §12.2 permits and
-   `wal.Log`'s `fenced` field now records as the policy. The half that is
-   easy to miss: the Control Plane refuses the *report* while `GetDesiredState` may keep
-   listing the volume, so a fenced epoch is remembered and only a *higher* epoch — the
-   Control Plane granting the volume again — restarts it.
-3. **The blockdev mutex is gone.** `Log.Flush` captures its target under the same lock
-   `Log.Write` appends under, which is the property that made the mutex redundant rather
-   than load-bearing.
+**What is not there, in the order it matters:**
 
-**One is closed, one is open, and both were named in that spec rather than implied:**
-
-- ~~The fencing teardown has no DST arm.~~ **Closed 2026-08-01.** `internal/dst` now
-  models the Agent: `scenarios_agent.go` drives the real `agent.VolumeManager` on the
-  simulated clock, disk and socket, and `FencedVolumeChecker` watches every seed. Its
-  planted bug is the Agent not acting on the refusal — DEV-0012 as it actually stood —
-  and the event the checker reads is the manager's own answer to "do you still have a
-  device for this volume?", not a hand-written one. INV-10 is now proven at both levels.
-- **A FLUSH still blocks a guest's READs**, and the spec had named the wrong cause. It is
-  not the blockdev mutex (removed, with a regression test): `vhost.Device.ProcessQueue`
-  serves the ring serially under its own mutex, one request at a time. Concurrent
-  dispatch means out-of-order used-ring completion and collides with increment 3.3's
-  inflight tracking and RISK-10 — its own spec, its own review.
-
-One thing the keystone's first test found and fixed on the way: `Reconcile` reported the
-volume set it had read *before* reconciling, so every volume was one cycle late in the
-Control Plane's view and a volume started and stopped inside one cycle was never reported
-at all. The report now re-reads after `readDesiredState`; the heartbeat still uses the
-earlier picture, and must, because it is anchored to the instant the lease was renewed
-at (§12.2).
+- **Nothing is deployed and CI has never run.** Every claim above is one machine's word.
+- **No metric reaches anywhere.** `cmd/volume-agent` passes `Recorder: nil` deliberately —
+  there is no OTLP exporter, and wiring one is a deploy concern nobody has landed. The
+  metrics that *are* recorded (the WAL's watermarks and device state, the lease, and since
+  2026-08-03 §19's two snapshot histograms) are proven by tests through `obs.NewTestProvider`
+  and observed by nobody in production. **The §26.2 catalog is also stale**: about
+  three quarters of its entries name mechanisms ADR-0026 withdrew — batches, PUT retries,
+  checkpoints, objectization, compaction, GC, orphans, fencing wait. Trimming it means
+  editing §26.2 of the architecture document, so it is recorded as a divergence rather
+  than done quietly (DEV-0022).
+- **Nothing reads a descriptor** (INV-20), and it is a format decision waiting on a human:
+  write the reader, or stop writing them. See "Components with no production caller".
+- **A host that dies mid-session loses everything written since the volume attached.**
+  That is ADR-0026's accepted trade, not a defect, and it is what "what would reverse it"
+  in that ADR is for.
 
 ## Maturity, not "done"
 
@@ -118,14 +74,17 @@ at (§12.2).
 | **integrated** | Wired into a running binary through the real interfaces, exercised end to end. |
 | **production-verified** | Real hardware/backends under fault injection, telemetry recorded, runbook times measured. |
 
-**One path is integrated; nothing is production-verified.** The spine exists — `api/`
-over Connect, an Agent that pulls, two `cmd/` binaries — and a real QEMU 11.0.2 guest
-boots off a device whose bytes come from a `wal.Log`, writing records through the same
-interfaces production would use, and since the keystone that device is one the *Agent*
-binds and owns rather than one a test assembled. That is the **write** half of one volume
-on one host.
-Everything downstream — FLUSH's ACK path, the uploader, checkpoints, truncation — is
-still exercised only by tests, and there is no deployment.
+**The V1 path is integrated end to end; nothing is production-verified.** The spine
+exists — `api/` over Connect, an Agent that pulls, two `cmd/` binaries — and a real QEMU
+11.0.2 guest boots off a device the *Agent* binds and owns, writes, `fsync`s, and reads
+its own bytes back after a stop and a restart. Snapshot and clone are driven by the real
+Control Plane binary in the same lane.
+
+What is *not* verified is everything about running it: no deployment, no CI run, no
+exporter for the metrics, no fault injection against real hardware, and no measured
+runbook times. "Integrated" here means the seams are exercised by processes rather than
+by tests constructing the types themselves — which is the bar this project kept missing —
+not that anything has met a load.
 
 ## How far is "functional" — and why the phase table does not answer that
 
@@ -1134,6 +1093,30 @@ Three checkers were deleted with the subjects they watched: `PromotionWaitChecke
 promotes), `NoLostAckedWriteChecker` (there is no failover) and `ImmutableSnapshotChecker`
 (INV-16 is structural now — `image.PublishSnapshot` is create-only). The event kinds and
 `Event` fields only they read went with them.
+
+## DEV-0022 — the §26.2 metric catalog describes a system that was withdrawn
+
+`internal/obs.Catalog()` is the §26.2 taxonomy, declared up front in Phase 01 so later
+phases would start incrementing existing series rather than inventing names. About three
+quarters of its entries now name mechanisms ADR-0026 removed: the WAL-remote block
+(batches, PUT latency and retries, the small-batch ratio, the durable gap, object counts),
+`fencing_wait_duration_seconds`, the whole objectization/compaction/GC block,
+`recovery_duration_seconds`, `standby_checkpoint_lag_bytes`,
+`bytes_downloaded_before_boot`, and the io-class pair.
+
+It is the same shape as the invariants file before 2026-08-03: a declaration a reader
+takes for a plan. It is recorded as a divergence rather than fixed quietly because the
+catalog *is* §26.2 — trimming it edits the architecture document, which is the owner's,
+and because a pre-declared taxonomy is a deliberate design (the comment on `Catalog` says
+so) rather than an oversight.
+
+**Six entries are recorded today**: `wal_local_sequence`, `wal_durable_sequence`,
+`wal_published_sequence` (permanently 0 — see the callerless list), `wal_unflushed_bytes`,
+`wal_out_of_space`, `lease_remaining_seconds`, `lease_renewal_failures_total`, and since
+2026-08-03 `snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds`.
+**None of them reaches a collector**: `cmd/volume-agent` passes `Recorder: nil` on purpose,
+because there is no exporter and `obs.NewTestProvider` in production would look like
+observability from the outside without being it.
 
 ## Components with no production caller
 
