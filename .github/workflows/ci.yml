@@ -4,6 +4,21 @@ on:
   push:
   pull_request:
 
+# One run per branch, not one per event. A push to a branch that already has an open
+# pull request fires both triggers and produces two identical runs; keying the group on
+# `head_ref || ref_name` gives both the same string ("my-branch"), so they collapse.
+# Keying on `github.ref` — the obvious choice — does not: a pull_request run is
+# `refs/pull/N/merge` and a push run is `refs/heads/my-branch`, two groups, nothing
+# de-duplicated. `cancel-in-progress` then makes a new push supersede its predecessor,
+# on main as well: the gate's answer is about the tip, and a run against a commit that
+# is already history is spending a runner to answer a question nobody asked.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+# Least privilege by default: the gate reads the tree and nothing else. The two jobs
+# that touch GitHub Packages raise it to `packages: read` themselves, at the job, so
+# the reason is next to the need.
 permissions:
   contents: read
 
@@ -15,6 +30,15 @@ jobs:
   # job's output as the reason (ADR-0025).
   guest-lane-image:
     runs-on: ubuntu-latest
+    # A `docker login` and one manifest lookup. Anything slower than this is a hung
+    # registry call, and the default six-hour ceiling would hold a runner for all of it.
+    timeout-minutes: 5
+    # Reading a package from ghcr.io needs read:packages; the default GITHUB_TOKEN does
+    # not carry it unless the job asks. Without it the lookup below fails closed — which
+    # reads as "no image published" and silently disables the guest lane forever.
+    permissions:
+      contents: read
+      packages: read
     outputs:
       exists: ${{ steps.check.outputs.exists }}
       image: ${{ steps.check.outputs.image }}
@@ -36,9 +60,15 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
           if docker manifest inspect "${image}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "guest lane: running against ${image}" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "::notice::${image} is not published; the guest lane will be skipped. Run the QEMU workflow to build it."
+            # The notice is an annotation on *this* job, and the skipped job downstream
+            # is a grey box with no explanation of its own. The run summary is the one
+            # place a reader looking at a green gate will see that a lane did not run,
+            # which is the difference between skipping loudly and being absent.
+            echo "**SKIPPED: the QEMU guest lane.** \`${image}\` is not published — run the QEMU workflow to build it." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # The one test that proves a *real Linux kernel* issues VIRTIO_BLK_T_FLUSH and that our
@@ -54,8 +84,26 @@ jobs:
     needs: guest-lane-image
     if: needs.guest-lane-image.outputs.exists == 'true'
     runs-on: ubuntu-latest
+    # No /dev/kvm on a hosted runner, so the guest boots under TCG and the lane's own
+    # `-timeout 15m` is the binding constraint; the rest is a kernel download, an
+    # initramfs build and a Go build. A lane that has not finished in this long is hung,
+    # and a hung TCG guest produces no output to notice it by.
+    timeout-minutes: 45
+    # A container job pulls its image before any step runs, and ghcr.io packages are
+    # private by default. `credentials` below spends this scope.
+    permissions:
+      contents: read
+      packages: read
     container:
       image: ${{ needs.guest-lane-image.outputs.image }}
+      # The preflight job authenticates to ghcr.io with `docker login`; this job has no
+      # step that could, because the pull happens first. Without credentials the pull
+      # fails on a private package *after* the preflight said the image exists — a red
+      # gate that means "the registry is private", which is exactly the class of failure
+      # ADR-0025 built the preflight to avoid.
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
       # The image's ENTRYPOINT is qemu-system-x86_64; a job needs a shell instead.
       options: --entrypoint /bin/bash
     steps:
@@ -95,8 +143,27 @@ jobs:
       - name: Guest lane (a real Linux kernel issues FLUSH)
         run: task test:integration:qemu
 
+  # The merge gate, run as the one target a developer runs before pushing.
+  #
+  # This job used to hand-list the steps, and the list happened to match `ci:full`'s
+  # composition exactly. Nothing held them equal: adding a target to `ci:full` left CI
+  # running yesterday's list, and the divergence is invisible precisely because both
+  # sides stay green — the gate a human is told to satisfy and the gate that guards the
+  # branch would simply be different gates. Naming the aggregate is the only version of
+  # this file that cannot drift from the Taskfile.
+  #
+  # The cost, stated rather than discovered: a failure arrives as one red step called
+  # "The gate" instead of a red step called "Lint". go-task prefixes every command with
+  # `task: [<target>] ...`, so the failing target is still on the line above the error —
+  # cheaper than keeping a second definition of what the gate contains.
   ci:
     runs-on: ubuntu-latest
+    # Measured against nothing — these workflows have never executed (STATUS.md) — so
+    # this is a ceiling, not a budget: enough for the race suite, the coverage run and
+    # three Docker-backed lanes (e2e alone allows itself 15m) on a two-core runner, and
+    # far below the six-hour default that would let one wedged TestContainer hold a
+    # runner for a working day.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -110,75 +177,33 @@ jobs:
       - name: Set up Task
         uses: go-task/setup-task@v2
 
-      # Every other tool (sqlc, pgschema, golangci-lint) is pinned in the Taskfile and
-      # installed into ./.tools/bin by `task tools` — the same command a developer
-      # runs locally, so CI and laptops cannot drift.
+      # Every other tool (sqlc, pgschema, golangci-lint, buf and the proto plugins) is
+      # pinned in the Taskfile and installed into ./.tools/bin by `task tools` — the same
+      # command a developer runs locally, so CI and laptops cannot drift.
       - name: Cache pinned tools
         uses: actions/cache@v4
         with:
           path: .tools
           key: tools-${{ runner.os }}-${{ hashFiles('Taskfile.yml') }}
 
+      # The gate's own targets declare these as `deps`, so this step is not what makes
+      # them present; it is what makes a toolchain download fail under its own name and
+      # populates the cache above.
       - name: Install pinned tools
         run: task tools
 
-      # The standard gate (CLAUDE.md, "The gate"): format, generated-code freshness,
-      # build, lint (incl. the custom simulable analyzer / INV-01), test, DST.
-      - name: Format check
-        run: task fmt:check
-
-      - name: Generated code is current (sqlc)
-        run: task generate:check
-
-      - name: Build
-        run: task build
-
-      - name: Lint (golangci + simulable / INV-01)
-        run: task lint
-
-      - name: Test
-        run: task test
-
-      - name: Coverage (90% floor on production code)
-        run: task cover
-
-      - name: DST (mandatory scenario set)
-        run: task dst
-
-      # The schema is state-based (ADR-0019): there is no checksum chain to verify.
-      # Instead, build the database the way production would — apply schema.sql to an
-      # empty Postgres 18 — and assert a plan against the result has nothing left to
-      # do. It fails on anything pgschema can apply but not read back, which a
-      # checksum over file bytes could never see.
-      - name: Schema verify (pgschema, ADR-0019)
-        run: task db:verify
-
-      # The binaries the e2e lane runs as processes. `test:e2e` depends on this
-      # target, so this step is belt and braces — it fails here, with its own name,
-      # rather than inside a lane about something else.
-      - name: Build the binaries
-        run: task build:cmd
-
-      # TestContainers Postgres integration; ubuntu runners have Docker.
+      # `task ci:full` — the merge gate defined in Taskfile.yml. Read it there, not here.
       #
-      # The QEMU guest lane is inside this target and skips loudly when _output holds
-      # no QEMU — which is the case in *this* job: qemu.yml builds and publishes the
-      # image on its own schedule (tens of minutes), and this job does not pull it.
-      # The lane runs in the `guest-lane` job above instead, inside that published
-      # image (ADR-0025), so it is covered here by skipping rather than by absence.
-      - name: Integration (TestContainers Postgres)
-        run: task test:integration
-
-      # §6.1: the object-store conformance suite against the pinned RustFS image.
-      # Blocking per backend version — every durability proof in this repo assumes
-      # the properties this suite certifies (conditional writes, versioning, a
-      # strongly consistent LIST), so a backend that loses one must not merge.
-      - name: Object-store conformance (RustFS, §6.1)
-        run: task backend:conformance
-
-      # The deployment, not the library: both binaries as processes against a real
-      # Postgres and the pinned RustFS. It is the only lane that can catch the two
-      # of them disagreeing — a key file each parses differently, a flag main never
-      # passes — because every other lane drives Go types in-process.
-      - name: End to end (real binaries, §6.2)
-        run: task test:e2e
+      # All of it runs for real on a hosted runner: Docker is present, so the
+      # TestContainers lanes (Postgres 18 for the metadata adapter and for `db:verify`,
+      # the digest-pinned RustFS for the conformance suite) and the e2e lane that runs
+      # both binaries as processes do their actual work.
+      #
+      # One piece cannot: the QEMU guest lane reached through `test:integration`. This
+      # job does not pull the runtime image — that is the `guest-lane` job above, per
+      # ADR-0025 — so the Taskfile prints `SKIP: no QEMU in _output` and names the
+      # command that would produce one. It is skipped out loud and in the same list as
+      # everything else, which is the point: a lane that is merely absent from a
+      # hand-written list looks identical to a lane that passed.
+      - name: The gate (task ci:full)
+        run: task ci:full

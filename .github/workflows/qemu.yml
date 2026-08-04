@@ -31,6 +31,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A cold QEMU build is tens of minutes and a warm one is a cache restore, so the
+    # spread is wide and the ceiling has to sit above the cold case. What it is really
+    # for is the other end: the default is six hours, and a `configure` that stops on a
+    # prompt or a registry that never answers would hold a runner for all of them
+    # without ever printing a failure.
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v6
