@@ -1,5 +1,15 @@
 # ADR-0014 — A volume's quota charges what it wrote and what its snapshots retain, and space is reclaimed by squash
 
+> **Withdrawn by ADR-0026 (2026-08-03).** Squash is compaction, compaction went with
+> objectization, and the per-lineage accounting it describes has no producer: there are no
+> segment objects and no GC. `internal/image` content-addresses chunks by their plaintext
+> digest, which is the one piece of this ADR that shipped — a snapshot of an unchanged
+> volume uploads nothing — but it does so without a quota, a lineage ledger or a squash.
+>
+> **The distinction it drew is the part to keep**: a quota is a soft allocation control
+> and never fails a guest write, while the hard limit is ADR-0013's device budget, which
+> is physical and returns ENOSPC. That separation is still correct and still unimplemented.
+
 - **Status:** Accepted 2026-07-26 (the four open questions are answered in the second
   amendment; implementation waits on Phase 12 for squash and on DEV-0007 for anything
   guest-facing)

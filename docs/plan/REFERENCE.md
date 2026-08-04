@@ -123,7 +123,7 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §26.1 | Distributed tracing. |
 | §26.2 | **The metrics catalog** — the names `internal/obs` registers. |
 | §27 | **Format versioning and a mixed fleet** (→ INV-19, still pending). |
-| §28.1 | Cordon / drain (→ ADR-0008, ADR-0016). |
+| §28.1 | Cordon / drain (→ ADR-0008, ADR-0016). **The drain is withdrawn with ADR-0026**; cordon survives in `placement.Admits`, which never places on a cordoned host. |
 | §28.2 | Capacity and placement (→ ADR-0017). |
 | §29.4 | Residual weakness: cold cross-host materialization RTO (→ RISK-04). |
 | §30.3 | Roadmap item 3 — vhost-user, whence Phase 03. |
@@ -172,15 +172,15 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0003 | The simulable-interfaces rule is enforced by a custom analyzer, not by intent. | Accepted |
 | ADR-0005 | **WAL headers are 104 bytes**, not the doc's 96 — every field is load-bearing. | Accepted |
 | ADR-0007 | PostgreSQL 18 + UUIDv7. *(Its tooling half — Atlas — is superseded by ADR-0019.)* | Partly superseded |
-| ADR-0008 | A drain moves a volume from its **durable prefix in S3**, not from a snapshot. | Accepted |
+| ADR-0008 | A drain moves a volume from its **durable prefix in S3**, not from a snapshot. | **Withdrawn** — ADR-0026 (no drain, no durable prefix) |
 | ADR-0009 | Lifecycles are typed (`internal/lifecycle`): compile time, store boundary, DB CHECK. | Accepted |
 | ADR-0010 | One S3 client wrapper; RustFS is the certified dev backend. | Accepted |
 | ADR-0011 | The Control-Plane term is anchored **outside PostgreSQL**, in a create-only S3 claim. | Accepted |
-| ADR-0012 | GC anchors: every WAL object of a closed epoch is a root; Phase 12 is born with a by-key index. | Accepted (+ amendment) |
+| ADR-0012 | GC anchors: every WAL object of a closed epoch is a root; Phase 12 is born with a by-key index. | **Withdrawn** — ADR-0026 (`internal/gc` deleted; INV-14 pending) |
 | ADR-0013 | Local device pressure: a device budget, a reserve, and who may react. | **Proposed** |
-| ADR-0014 | Volume quota: soft, per-lineage, content-addressed snapshots, and squash. | Accepted |
-| ADR-0015 | The fencing wait is a **monotonic dwell**, not a comparison of wall clocks. | Accepted |
-| ADR-0016 | Fencing granularity: a revocation window bounded to one promotion. | Accepted |
+| ADR-0014 | Volume quota: soft, per-lineage, content-addressed snapshots, and squash. | **Withdrawn** — ADR-0026 (no squash, no lineage ledger; the soft/hard distinction survives) |
+| ADR-0015 | The fencing wait is a **monotonic dwell**, not a comparison of wall clocks. | Amended — nothing promotes; the durable half (`fencing_started_at`) survives |
+| ADR-0016 | Fencing granularity: a revocation window bounded to one promotion. | Amended — the lease is liveness only; the per-host granularity stands |
 | ADR-0017 | **Capacity is derived from state, not an incremental ledger.** | Accepted |
 | ADR-0018 | The spine: Agent first, Connect RPC in `api/`, the Agent pulls and the CP never pushes. | Accepted |
 | ADR-0019 | Schema tooling is **pgschema**, not Atlas; `schema.sql` is the declared state. | Accepted |
@@ -188,8 +188,8 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0021 | storage integrates into **spin**; spin imports storage and never the reverse. The two binaries are test harnesses that must stay runnable end to end. spin migrates to pgschema. | Accepted |
 | ADR-0026 | V1 accepts an RPO of one session: §14.8 local becomes the only ACK contract, a volume is uploaded once at stop, and a snapshot is an fsync plus a copy at a §19 sequence number. Withdraws the remote durability chain. The product question behind it — has anyone asked for a VM to survive host loss mid-session? — was answered no. | Accepted |
 | ADR-0025 | The QEMU guest lane runs **inside the published runtime image** (`ghcr.io/<repo>/qemu:<version>`) as a CI container job, rather than installing QEMU's dynamic dependencies on a bare runner, so the dependency set has one definition in `Dockerfile.qemu`. The job is gated on the image existing and skips with a notice rather than failing the gate. | Accepted |
-| ADR-0024 | A restarted Agent re-attaches at the **same epoch** — no bump, no CP round trip, no FENCING_WAIT. Safe because a crash leaves S3 a prefix (never a gap), `DurablePoint`+`InstallBase` resume *above* everything in the bucket, `VerifyAgreement` checks any overlap record by record, and INV-21 hard-fails a divergent PUT. Does not cover two *live* Agents on one data dir — that is DEV-0014, a mutual-exclusion problem, not an epoch policy. | Accepted |
-| ADR-0023 | The object store is a fencing witness the data path may act on: a checkpoint that proves a second writer in this epoch tears the runtime down and records the fenced epoch, even while the Control Plane still lists the volume as this host's. | Accepted |
+| ADR-0024 | A restarted Agent re-attaches at the **same epoch** — no bump, no CP round trip, no FENCING_WAIT. **Its justification was rewritten with ADR-0026**: not a prefix in S3 and a record-by-record agreement check, but the simpler fact that nothing leaves the host mid-session, so a second incarnation has nothing to overwrite until it stops — where the manifest CAS catches it. Two *live* Agents on one data dir are the flock's job (DEV-0014), not an epoch policy. | Accepted (amended) |
+| ADR-0023 | The object store is a fencing witness the data path may act on. **The witness moved with ADR-0026**: not a checkpoint mid-session but the manifest's compare-and-set at stop, which tells a host its predecessor published while it was running (`image.ErrSuperseded`) instead of letting it overwrite. | Accepted (amended) |
 | ADR-0022 | The guest kernel is pinned by sha256 and obtained by `task fetch:kernel` into `_output/guest/vmlinux` — never resolved from a sibling checkout's path. storage may *mirror* spinbox's artefact into a registry; mirroring is not building (ADR-0021 stands). | Accepted |
 
 ## `DEV-` — doc↔code divergences

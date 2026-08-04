@@ -1,5 +1,21 @@
 # ADR-0023 — the object store is a fencing witness the data path may act on
 
+> **Amended by ADR-0026 (2026-08-03): the principle survives, the witness moved.** The
+> witness this ADR describes is a *checkpoint* that finds another writer's durable point
+> mid-session, and there are no checkpoints. What replaced it is smaller and answers the
+> same question: `image.Publish` writes the volume's manifest with a compare-and-set on
+> the ETag it booted from, so a host whose predecessor published while it was running is
+> told so by the object store (`image.ErrSuperseded`) and refuses rather than overwriting.
+>
+> That is still "the object store is a fencing witness the data path may act on" — the
+> data path acts on it at stop instead of every checkpoint, which is the only moment V1
+> writes anything. Its DST arm is `two-hosts-cannot-both-publish-an-image`, and its
+> planted bug is a backend that ignores preconditions, because that is what turns this
+> witness off. **`Log.BasePending`, which existed so the scheduler could not act on a
+> *false* witness, was deleted with the scheduler (2026-08-03) — with no mid-session
+> publication there is no window in which a resumed log reports a durable point it does
+> not yet know.**
+
 - **Status:** Accepted — 2026-08-01
 - **Date:** 2026-08-01
 - **Deciders:** human owner (approved the increment plan), implementer agent (proposed)

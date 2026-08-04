@@ -1,5 +1,18 @@
 # ADR-0016 — Revoke inside a bounded window now; fence per volume once the Agent exists
 
+> **Amended by ADR-0026 (2026-08-03): the lease no longer fences anything.** With the
+> durable ACK gate gone (INV-06 withdrawn) and nothing promoting (INV-11 withdrawn), the
+> host lease is a *liveness* signal the Control Plane reads and the data path never
+> consults — `VolumeManagerDeps.Lease` was removed in increment 4.5 because its last
+> reader was the constructor guard that checked it existed.
+>
+> **The granularity decision stands and is why that was safe.** A lease per *host* rather
+> than per volume is what makes revocation an operation on one row, and it is still the
+> unit `Loop` renews. What this ADR bounded — the window in which a revocation affects
+> volumes it was not aimed at — is currently empty, because a revocation stops nothing on
+> the data path. It becomes load-bearing again the moment a durability tier gates an ACK
+> on the lease.
+
 - **Status:** Accepted 2026-07-26 (two-stage: the window now, per-volume fencing with
   the Agent)
 - **Date:** 2026-07-26

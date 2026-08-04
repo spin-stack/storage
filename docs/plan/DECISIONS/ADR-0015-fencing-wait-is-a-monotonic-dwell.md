@@ -1,5 +1,17 @@
 # ADR-0015 — The fencing wait is a monotonic dwell, not a timestamp comparison
 
+> **Amended by ADR-0026 (2026-08-03): the dwell has no consumer.** V1 does not promote —
+> `controlplane.Promoter` went with the fencing half in increment 4.6 — so nothing waits
+> out `last_renewal + lease_ttl + max_clock_skew`, and INV-11 is `withdrawn`.
+>
+> **The durable half survives, deliberately.** `volumes.fencing_started_at` is still a
+> column, `metadata.Volume.FencingStartedAt` still carries it, and the state machine still
+> has FENCING_WAIT. Keeping them costs nothing and they are the part that is expensive to
+> get right: the reason the instant is *stored* is that a Control Plane which restarts
+> mid-fence has no memory of having observed anything, and a dwell restarted from scratch
+> is the failure mode this ADR exists to prevent. The reasoning below is what a future
+> promotion must be rebuilt on.
+
 - **Status:** Accepted 2026-07-26
 - **Date:** 2026-07-26
 - **Deciders:** human (decided), implementer agent (proposed the options)

@@ -1,5 +1,12 @@
 # ADR-0012 — The GC gets no snapshot index; a listing-derived ceiling stops being a licence to destroy
 
+> **Withdrawn by ADR-0026 (2026-08-03).** `internal/gc` was deleted in increment 1: with
+> no continuous upload there are no orphans to collect, and INV-14 is `pending` rather
+> than active because nothing issues a delete for a checker to catch. The anchor rule and
+> the by-key index return with the sweeper. **What survives is enforced at construction
+> instead**: `real.NewS3Store` refuses an unversioned bucket, so any future delete is a
+> reversible marker.
+
 - **Status:** Accepted 2026-07-25 for the half that narrows the sweep (implemented in
   this increment); the half that would add a new on-S3 object — a per-sweep
   LIST-freshness probe — is written up under "Deferred" and is **not** implemented,

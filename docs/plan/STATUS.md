@@ -1160,6 +1160,51 @@ learn to ignore. One entry was *added*, `image_publish_duration_seconds`, and it
 recorded: publishing at stop is the only moment anything leaves the host, so its duration
 is the cost of a whole session rather than one step among many.
 
+## The decisions stop describing deleted machinery, 2026-08-03
+
+Same pass as the invariants, one layer up. Six of the 22 ADRs described mechanisms
+ADR-0026 removed, and an ADR is read as a *current* decision — the file's whole purpose is
+to be the bridge for a reader comparing code against the design doc, so one describing
+code that is gone misleads more than a missing one would.
+
+**Withdrawn, with what survives named in each:** ADR-0008 (a drain moves from the durable
+prefix — there is no drain and no durable prefix; what survives is the *shape* of the
+question, that an evacuation moves from something the destination can verify itself),
+ADR-0012 (GC anchors — `internal/gc` is deleted, and what survives is enforced at
+construction: `real.NewS3Store` refuses an unversioned bucket), and ADR-0014 (quota and
+squash — no compaction, no lineage ledger; the distinction it drew between a *soft*
+allocation control and ADR-0013's *hard* device budget is the part to keep).
+
+**Amended, because the decision outlived its justification:**
+
+- **ADR-0023** — the object store is still a fencing witness the data path acts on, but
+  the witness moved from a checkpoint mid-session to the manifest's compare-and-set at
+  stop. That is the same principle at the only moment V1 writes anything.
+- **ADR-0024** — same-epoch re-attach still holds, for a simpler reason than the one it
+  was argued on. Three of its four mechanisms (`DurablePoint`, `VerifyAgreement`, the
+  divergent-PUT hard fail) are deleted; what makes it safe now is that **nothing leaves
+  the host mid-session**, so a second incarnation has nothing to overwrite until it stops,
+  where the CAS catches it. `InstallBase` is the one piece unchanged and still
+  load-bearing.
+- **ADR-0015** — nothing promotes, so nothing waits out the dwell. `fencing_started_at`
+  stays in the schema on purpose: the reason to *store* the instant is that a Control
+  Plane restarting mid-fence has no memory of having observed anything, which is the
+  failure a future promotion must be rebuilt on.
+- **ADR-0016** — the lease is liveness only; the per-host granularity stands and is still
+  what `Loop` renews. The window this ADR bounded is currently empty because a revocation
+  stops nothing on the data path.
+
+**And one more thing with no caller went with them.** `wal.Log.BasePending` existed so the
+durability scheduler could not act on a *false* ADR-0023 witness — a resumed log reports
+`durable = 0` until its base lands, and a checkpoint in that window would conclude another
+writer held the epoch and fence a healthy host on every restart. With no mid-session
+publication there is no such window, and the method had only its own test.
+
+**ADR-0013 is still `Proposed` and is the most-cited ADR in the tree after ADR-0026** (32
+citations). It carries DEV-0011 (a segment's space charged as used rather than reserved),
+and ADR-0014's amendment above leans on it for the hard limit. It is a decision waiting on
+a human, not a divergence.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,

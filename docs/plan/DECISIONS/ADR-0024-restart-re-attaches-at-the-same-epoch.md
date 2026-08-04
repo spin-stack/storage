@@ -1,5 +1,19 @@
 # ADR-0024 — a restarted writer re-attaches at the same epoch
 
+> **Amended by ADR-0026 (2026-08-03): the decision stands, its justification is new.** The
+> four mechanisms this ADR rested on — `recovery.DurablePoint`, `InstallBase`,
+> `VerifyAgreement` and INV-21's divergent-PUT failure — are three-quarters deleted. A
+> restarted Agent does not reconstruct a durable point from a prefix of WAL objects any
+> more; it reads one manifest (`image.Load`) and replays its own local WAL over it.
+>
+> Same-epoch re-attach is still right, and now for a simpler reason: **there is nothing a
+> second incarnation can silently overwrite until it stops.** Two live Agents on one data
+> directory are refused by the flock (DEV-0014's fix), and two on *different* hosts are
+> caught at publish time by the manifest CAS (ADR-0023 as amended, INV-10). Nothing
+> mid-session leaves the host, so the window the old argument had to close no longer
+> exists. `InstallBase` is the one mechanism below that is unchanged and still
+> load-bearing.
+
 - **Status:** Accepted — 2026-08-01
 - **Date:** 2026-08-01
 - **Deciders:** human owner (approved the increment plan), implementer agent (proposed)

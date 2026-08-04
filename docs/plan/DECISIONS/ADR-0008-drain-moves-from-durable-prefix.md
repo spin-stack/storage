@@ -1,5 +1,13 @@
 # ADR-0008 — Drain moves a volume from the durable prefix, not from a snapshot
 
+> **Withdrawn by ADR-0026 (2026-08-03).** There is no drain: `controlplane/drain.go` and
+> `internal/materialize` went with the remote chain, and a volume no longer has a
+> "durable prefix in S3" to move from — its state is one manifest and its chunks. The
+> decision below is still the right one for the mechanism it describes, and it comes back
+> from git with cross-host evacuation. **What survives of it is the shape of the
+> question**: an evacuation must move a volume from something the destination can verify
+> on its own, never from a snapshot the source claims is current.
+
 - **Status:** Accepted (Phase 11 / Increment 11.3). Human review of the fencing diff
   done 2026-07-25, after the wave-2 changes that touch it: the superseded-epoch ceiling
   in `recovery` (so FromEpoch(prevEpoch) returns exactly recovered_up_to) and the
