@@ -149,6 +149,42 @@ func (q *Queries) ListHosts(ctx context.Context) ([]*ListHostsRow, error) {
 	return items, nil
 }
 
+const lockHostPlacement = `-- name: LockHostPlacement :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 0))
+`
+
+// Serialize the placements aimed at one host, for the duration of one transaction.
+//
+// The capacity bound is a predicate of the write that places the bytes (ADR-0017),
+// which is necessary and — in PostgreSQL — not sufficient. READ COMMITTED fixes a
+// statement's snapshot before the statement runs, and the derived committed value is
+// an aggregate over rows the statement does not lock, so two INSERTs that overlap in
+// time each evaluate the bound against a fleet that does not contain the other. Both
+// affect one row and the destination lands at twice its ceiling. Measured, not
+// feared: two psql sessions, one bound of 100 bytes, two 100-byte volumes, 200
+// committed afterwards.
+//
+// An advisory lock taken *inside* that statement would change nothing — the snapshot
+// is already taken. It has to be its own statement in the same transaction, because
+// READ COMMITTED gives the next statement a fresh snapshot: the loser blocks here,
+// and the INSERT it then runs sees the winner's row and refuses itself.
+//
+// Chosen over SERIALIZABLE, which would push a retry loop into every caller of the
+// Store for a conflict that is a two-row hot spot, and over `SELECT ... FOR UPDATE`
+// on the host row, which locks the wrong thing: every heartbeat writes that row, and
+// the rows being counted are in volumes and operations.
+//
+// (Wording note, not a style rule: TestEveryMutatingQueryIsTermGuarded classifies a
+// query by matching INSERT/UPDATE/DELETE over the whole chunk, comments included, so
+// prose here that names one of those verbs makes this read look like a write.)
+//
+// The key is a hash of the host id, so two hosts never wait for each other and a
+// collision costs one placement a wait and nothing else.
+func (q *Queries) LockHostPlacement(ctx context.Context, hostID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, lockHostPlacement, hostID)
+	return err
+}
+
 const renewHostLease = `-- name: RenewHostLease :execrows
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $3

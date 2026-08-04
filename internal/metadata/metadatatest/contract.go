@@ -1458,6 +1458,79 @@ func capacity(t *testing.T, s metadata.Store) {
 			t.Fatalf("destination committed = %d, want %d", got, 2*gib)
 		}
 	})
+
+	t.Run("placements racing for the last slot leave the host inside its ceiling", func(t *testing.T) {
+		// This is the case the bound exists for, and the only one that can tell a
+		// predicate of the write from a check in front of it. Every caller reads the
+		// fleet before any of them has placed anything — placement.Choose is pure and
+		// advisory, so they agree on the destination — and then they write at the same
+		// instant. A check the store performs in Go passes for all of them, because at
+		// the moment each one looks, nobody else's volume is there yet.
+		//
+		// It is not a store-implementation detail either. In PostgreSQL the predicate
+		// alone is not enough: READ COMMITTED fixes each statement's snapshot before it
+		// runs and the derived capacity is an aggregate over rows the statement does not
+		// lock, so two overlapping INSERTs each affect one row and the host lands at
+		// twice its ceiling. That is what the pg store's advisory lock is for, and this
+		// case is what says so.
+		//
+		// Several rounds of many racers, because a scheduler is not an oracle: one round
+		// can serialize by luck and prove nothing, and the point of the case is that
+		// nothing is left to luck. Each round is a fresh host, so a round that fails
+		// says which one did.
+		for round := range 5 {
+			racer := id()
+			if err := s.UpsertHost(ctx, w.term, metadata.Host{
+				HostID: racer, State: lifecycle.HostActive, NVMeTotalBytes: total,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var (
+				wg    sync.WaitGroup
+				start = make(chan struct{})
+				errs  = make([]error, 32)
+			)
+			for i := range errs {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					// Room for exactly one of them, and every one of them was told so.
+					bound := &metadata.CapacityBound{
+						HostID: racer, AddBytes: gib, Limit: gib, UsedLimit: total,
+					}
+					vol := metadata.Volume{DEKKeyID: 1,
+						VolumeID: id(), SizeBytes: gib, BlockSize: 65536, State: lifecycle.VolumeActive,
+						PrimaryHostID: racer, DEKWrapped: []byte{1}, KEKID: "k",
+					}
+					<-start
+					errs[i] = s.CreateVolume(ctx, w.term, vol, bound)
+				}()
+			}
+			close(start)
+			wg.Wait()
+
+			placed := 0
+			for _, err := range errs {
+				switch {
+				case err == nil:
+					placed++
+				case errors.Is(err, metadata.ErrCapacityExceeded):
+				default:
+					t.Fatalf("round %d: a racing placement failed for the wrong reason: %v", round, err)
+				}
+			}
+			if placed != 1 {
+				t.Fatalf("round %d: %d of %d racing placements landed, want exactly 1", round, placed, len(errs))
+			}
+			// The observable that matters is not which caller won but what the host
+			// ends up holding: a destination past the ceiling it was placed against is
+			// the defect, whatever the callers were told.
+			if got := committed(t, racer); got != gib {
+				t.Fatalf("round %d: the destination holds %d committed bytes against a ceiling of %d",
+					round, got, gib)
+			}
+		}
+	})
 }
 
 // plan builds the current_state a drain records for one volume in flight.

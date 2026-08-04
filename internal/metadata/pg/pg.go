@@ -23,10 +23,73 @@ import (
 // Store adapts the generated db.Queries to the metadata.Store interface.
 type Store struct {
 	q *db.Queries
+	// conn is kept alongside the queries for one reason: a bounded write needs two
+	// statements in one transaction (see placing). db.DBTX is sqlc's generated
+	// interface and cannot open one.
+	conn db.DBTX
 }
 
 // New returns a Store over any pgx DBTX (pool, conn, or tx).
-func New(conn db.DBTX) *Store { return &Store{q: db.New(conn)} }
+func New(conn db.DBTX) *Store { return &Store{q: db.New(conn), conn: conn} }
+
+// beginner is the part of a pool, a connection or a transaction that can open a
+// (nested) transaction. Declared where it is consumed rather than added to db.DBTX,
+// which sqlc generates and regenerates.
+type beginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// placing runs a write that carries a capacity bound: one transaction that takes the
+// destination's advisory lock first, so the bound's predicate cannot be evaluated by
+// two placements against a fleet neither of them is in yet.
+//
+// The bound being a predicate of the write (ADR-0017) is necessary and not
+// sufficient here. READ COMMITTED fixes a statement's snapshot before it runs, and
+// the derived committed value is an aggregate over rows the statement does not lock;
+// two INSERTs that overlap in time each see a fleet without the other, both affect
+// one row, and the host lands at twice its ceiling. That was measured against a real
+// PostgreSQL before this existed, not inferred. The lock's own reasoning — and why
+// it is a separate statement, and why not SERIALIZABLE or FOR UPDATE — is in
+// hosts.sql next to the query.
+//
+// An unbounded write is not a placement decision and pays nothing: no transaction,
+// no lock, the same single statement as before.
+func (s *Store) placing(ctx context.Context, b *metadata.CapacityBound, write func(*db.Queries) (int64, error)) (int64, error) {
+	if b == nil {
+		return write(s.q)
+	}
+	hostID, err := requireUUID("bound host", b.HostID)
+	if err != nil {
+		return 0, err
+	}
+	conn, ok := s.conn.(beginner)
+	if !ok {
+		// Fail closed rather than silently falling back to the unserialized write:
+		// the caller would get a bound that holds under test and races in production,
+		// which is the failure this whole arrangement exists to remove.
+		return 0, fmt.Errorf("metadata/pg: a bounded write needs a connection that can open a transaction, got %T", s.conn)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("metadata/pg: opening the placement transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // a no-op once Commit has run
+	q := s.q.WithTx(tx)
+	if err := q.LockHostPlacement(ctx, hostID); err != nil {
+		return 0, fmt.Errorf("metadata/pg: locking placement on host %s: %w", b.HostID, err)
+	}
+	rows, err := write(q)
+	if err != nil {
+		return 0, err
+	}
+	// Committed even when the bound refused the write: zero rows changed nothing, and
+	// the caller's diagnosis (boundRefused) reads the same rows the next placement
+	// will. Rolling back would say the same thing more slowly.
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("metadata/pg: committing the placement: %w", err)
+	}
+	return rows, nil
+}
 
 var _ metadata.Store = (*Store)(nil)
 
@@ -464,16 +527,18 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if err != nil {
 		return err
 	}
-	rows, err := s.q.CreateVolume(ctx, db.CreateVolumeParams{
-		VolumeID: id, SizeBytes: v.SizeBytes,
-		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
-		DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
-		ParentSnapshotID: parentSnap,
-		PrimaryHostID:    primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
-		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
-		PublishedSequence: v.PublishedSequence, Term: term,
-		BoundHost: boundHost, BoundAddBytes: addBytes, BoundLimit: limit,
-		BoundUsedLimit: usedLimit,
+	rows, err := s.placing(ctx, bound, func(q *db.Queries) (int64, error) {
+		return q.CreateVolume(ctx, db.CreateVolumeParams{
+			VolumeID: id, SizeBytes: v.SizeBytes,
+			BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
+			DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
+			ParentSnapshotID: parentSnap,
+			PrimaryHostID:    primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
+			LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
+			PublishedSequence: v.PublishedSequence, Term: term,
+			BoundHost: boundHost, BoundAddBytes: addBytes, BoundLimit: limit,
+			BoundUsedLimit: usedLimit,
+		})
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
@@ -878,14 +943,16 @@ func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Ope
 	if err != nil {
 		return err
 	}
-	rows, err := s.q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
-		OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
-		AllowedPhases:  op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
-		Term:           term,                        // and the §7 term guard
-		BoundHost:      boundHost,                   // and the capacity bound (ADR-0017, ADR-0013)
-		BoundAddBytes:  addBytes,
-		BoundLimit:     limit,
-		BoundUsedLimit: usedLimit,
+	rows, err := s.placing(ctx, bound, func(q *db.Queries) (int64, error) {
+		return q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
+			OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
+			AllowedPhases:  op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
+			Term:           term,                        // and the §7 term guard
+			BoundHost:      boundHost,                   // and the capacity bound (ADR-0017, ADR-0013)
+			BoundAddBytes:  addBytes,
+			BoundLimit:     limit,
+			BoundUsedLimit: usedLimit,
+		})
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {

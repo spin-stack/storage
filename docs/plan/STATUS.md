@@ -1722,6 +1722,47 @@ sim's arm and `>= -1 *` on each of the two SQL predicates (`CreateVolume onto a 
 the sim and pg lanes). `task ci` and `go test -tags integration ./internal/metadata/pg`
 are green.
 
+**D4b: the bound was a predicate of the write and still not a bound (2026-08-04).** Found
+while writing D4's verification, and it is the reason that case exists. ADR-0017 moved the
+§28.2 ceiling into the statement that places the bytes, and the claim written next to it —
+"two operations that chose the same destination against the same fleet read produce one
+reservation and one `ErrCapacityExceeded`" — **is false in PostgreSQL**. READ COMMITTED
+fixes a statement's snapshot before the statement runs, and the derived committed value is
+an aggregate over rows the statement does not lock, so two `INSERT`s that overlap in time
+each evaluate the bound against a fleet the other is not in yet. Measured before anything
+was written: two `psql` sessions, one 100-byte ceiling, two 100-byte volumes, 200 committed
+afterwards. Nothing in the repository could have caught it — every capacity case was
+sequential, and a sequential case cannot tell a predicate of the write from a check in
+front of it.
+
+`internal/db/queries/hosts.sql` gains `LockHostPlacement`
+(`pg_advisory_xact_lock(hashtextextended(host))`) and `pg.Store.placing` runs every bounded
+write as *two* statements in one transaction: the lock, then the write. The lock has to be
+its own statement — an advisory lock taken inside the INSERT would change nothing, because
+that statement's snapshot is already taken — and READ COMMITTED is what makes it work: the
+loser blocks on the lock and the INSERT it then runs takes a fresh snapshot containing the
+winner's row, so it refuses itself. Rejected: SERIALIZABLE (a retry loop in every caller of
+the Store for a two-row hot spot) and `SELECT ... FOR UPDATE` on the host row (locks the
+wrong rows — every heartbeat writes that one, and the counted rows are in `volumes` and
+`operations`). An unbounded write is not a placement decision and pays nothing: no
+transaction, no lock.
+
+The contract case is `placements racing for the last slot leave the host inside its
+ceiling` — five rounds of 32 concurrent `CreateVolume`s onto a host with room for one,
+asserting the host's committed bytes afterwards rather than which caller won. Rounds and
+racers because a scheduler is not an oracle. **Planted in both lanes:** replacing `placing`
+with `boundRefused` in Go followed by the write reddens the pg lane 5 runs out of 5
+(`round 0: 2 of 32 racing placements landed, want exactly 1`); moving the sim's
+`boundLocked` out of its critical section reddens the sim lane 16 runs out of 20 — the
+sim's window is a mutex hand-off, so its detection is high but not certain, while the lane
+where the defect is real detects every time.
+
+`internal/metadata/pg` (`-tags integration`, the whole package) and `task dst` are green.
+`task ci` is **not** green in this tree, for a reason this branch did not cause:
+`cmd/volume-agent/main.go` is unformatted and `internal/agent` hangs in a publish retry
+loop, both track C's uncommitted work in progress. `task test` for every package this
+branch touches is green, as is `task lint` apart from that one file.
+
 ## Track E — observability (open work, appended per increment)
 
 *Only track E appends here* — it owns `internal/obs`, `internal/vhost`,
