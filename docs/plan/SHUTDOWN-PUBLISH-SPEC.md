@@ -7,6 +7,96 @@ this one does not.
 **The one thing it makes true:** an Agent that stops either saves every session it was
 serving, or says so — loudly, in its exit code, and in time for an operator to act.
 
+## REVIEWED AND DECIDED — 2026-08-04, human owner
+
+**The open question is answered the other way: a host that cannot publish refuses to
+release its data-directory lock.** The spec below argued for exit-and-release; the owner
+chose hold-and-retry. What follows replaces §1, §2 and §3 of the decisions; everything
+else stands.
+
+**The mechanical consequence, and it is the whole decision.** A flock is released when
+the process exits — the kernel does that, not us. So "refuse to release the lock" can
+only mean **"do not exit"**. The Agent stays alive, keeps the volume's local WAL, keeps
+the directory, and keeps trying.
+
+**This is better than what the spec proposed, for a reason the spec undervalued.** An
+Agent that exits non-zero is *indistinguishable from one that crashed*: the fleet sees a
+dead host and cannot tell whether it is holding a session nobody has. An Agent that stays
+up and says "I am holding unpublished data for volume X, attempt 14, last error: the
+store refused the manifest" is a thing an operator can act on and the Control Plane can
+still see, because the host keeps heartbeating. The exit code was honest; staying alive is
+*legible*, which is what an incident needs.
+
+### 1′. There is no give-up deadline — `-shutdown-grace` bounds one attempt, not the wait
+
+`-shutdown-grace` (default 60s) becomes the timeout of a **single publish attempt**, so
+one hung PUT cannot block forever. When an attempt fails the Agent retries with backoff,
+**indefinitely**, and does not exit. It is not a budget after which data is abandoned;
+nothing in this design abandons data.
+
+### 2′. The process does not exit on failure — and what that costs
+
+The teardown stops serving, publishes what it can, and then **blocks in a retry loop for
+whatever is left**, holding the lock. It logs each attempt. It keeps heartbeating so the
+Control Plane, and any operator watching the fleet, sees a host that is up and stuck
+rather than a host that is gone.
+
+**The cost, stated plainly because it is real:** a store outage leaves every affected
+Agent alive and refusing to stop, so a rolling restart hangs fleet-wide until the store
+comes back. That is the trade the owner accepted, and it is the right way round — a fleet
+that will not restart during an outage is an operational problem with an obvious cause,
+while a fleet that restarted and dropped a session each is a data problem with none.
+
+**Three escapes, in order of preference:**
+
+- **A second signal** still abandons and exits non-zero. It is now an explicit operator
+  override rather than a convenience, and the line it prints says exactly which volumes'
+  sessions are being left unpublished.
+- **`SIGKILL`** (systemd's `TimeoutStopSec` will eventually send it) releases the flock
+  and loses nothing: the records are on disk, and the next Agent on that host re-attaches
+  at the same epoch (ADR-0024) and publishes them. Worth stating because it means the
+  operational escape hatch is safe, which is what makes holding the lock affordable.
+- **The store comes back** and the retry succeeds, which is the case this exists for.
+
+### 3′. `ErrSuperseded` is the one failure that exits
+
+Another writer published over us. Retrying would overwrite a newer image with an older
+one, which is the single thing INV-10 exists to prevent — so this failure must **not** be
+retried, and holding the lock buys nothing, because the volume has moved on to a host that
+does not care what this directory contains. Exit **2**, release, and say so.
+
+That asymmetry is the sharp edge of this decision: *every* failure is retried forever
+except the one where retrying would destroy someone else's data.
+
+### What an operator sees, revised
+
+```
+volume image publish started   volume_id=… attempt=1
+volume image publish failed    volume_id=… attempt=1 error=… retry_in=2s
+agent is holding unpublished data and will not release its data directory
+                               volumes=2 attempts=14 oldest_wait=3m21s data_dir=…
+```
+
+The third line repeats, on a bounded interval, for as long as the condition lasts. A
+process that is deliberately refusing to die must say so on a schedule; one that says it
+once and goes quiet is indistinguishable from one that hung.
+
+### The observables, revised
+
+Observable (2) changes and gets sharper — it no longer tests an exit code, it tests that
+the Agent **does not** exit:
+
+> The object store is made unreachable and the Agent is SIGTERM'd. It **stays alive**,
+> keeps the data-directory lock (a second Agent on that directory is still refused), and
+> prints the holding line more than once. Then the store comes back **without the Agent
+> being touched**, and the image appears — and *only then* does the Agent exit 0.
+
+Its planted bug: let the teardown return on the first failure, and watch the Agent exit
+while the bucket is still empty — which is today's behaviour, so the plant is a
+regression test for the defect itself.
+
+
+
 ## What is broken, verified
 
 Under ADR-0026, `Volume.publish()` at stop is the *entire* durability contract: nothing
@@ -155,14 +245,12 @@ defect itself.
   later.)*
 - **No change to what a FLUSH promises.** The guest's `fsync` contract is untouched.
 
-## The question for review
+## ~~The question for review~~ — answered 2026-08-04
 
-The one that is genuinely a judgement call rather than a consequence: **should a host that
-cannot publish refuse to release its data directory lock and keep the volume attached,
-rather than exiting?** It would make "the data is still here" enforceable instead of
-advisory — nothing could start a second Agent on that directory and the operator would
-have to deal with it. It would also mean a store outage leaves hosts that will not stop,
-which is a worse operational failure than a non-zero exit. **The spec above chooses to
-exit non-zero and release**, on the grounds that the local WAL plus same-epoch re-attach
-already make the retry work, and that a process which refuses to die is the harder thing
-to reason about at 3am. Say if that trade is wrong.
+The judgement call was whether a host that cannot publish should refuse to release its
+data-directory lock rather than exit. **The owner chose refuse.** The reasoning and every
+consequence are in "REVIEWED AND DECIDED" at the top of this file, which supersedes
+decisions 1, 2 and 3 below. The argument this section made for exiting — that a process
+which refuses to die is harder to reason about at 3am — is answered by making it *say* so
+on a schedule, and by the two escapes (a second signal, and `SIGKILL`, which is safe
+because the records are on disk and a restart republishes them).

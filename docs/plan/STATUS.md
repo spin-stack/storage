@@ -1325,19 +1325,19 @@ ADR-0026 either way.
 - ~~**ADR-0026 — does V1 accept an RPO of one session?**~~ **Answered 2026-08-02: yes.**
   Recorded in the ADR with the reasoning; what remains is execution, not a decision.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
-- **`SHUTDOWN-PUBLISH-SPEC.md` is written and unreviewed** (durability zone). It is the
-  one item whose failure loses a guest's session on a routine restart, and it ends with a
-  question that is a judgement rather than a consequence: should a host that cannot
-  publish refuse to release its data-directory lock instead of exiting non-zero? The spec
-  chooses exit-and-release; say if that is wrong.
-- **The descriptor's on-S3 format changed without a spec (2026-08-04, `f8c70c9`).** D1
-  removed the `durability` field from `descriptor.json` while deleting the mode end to
-  end. Formats are a human-review zone even under "formats change in place", and no spec
-  preceded it. **Recommendation: keep it.** The field had no reader, §25.2's property
-  test (truncate at every byte + bit flip) was updated with the shape and is green, and a
-  descriptor already in a bucket still parses and still verifies its digest — `Read` uses
-  plain `json.Unmarshal`, which ignores the extra key, and the digest is over the bytes as
-  stored. It is four lines to revert if the answer is no.
+- ~~**`SHUTDOWN-PUBLISH-SPEC.md` is written and unreviewed**~~ **Reviewed and decided
+  2026-08-04: a host that cannot publish refuses to release its data-directory lock** —
+  the opposite of what the spec recommended. Since a flock is released by process exit,
+  that can only mean the Agent does not exit: it holds the directory, keeps the local WAL,
+  and retries indefinitely. `-shutdown-grace` becomes the timeout of one attempt rather
+  than a budget after which data is abandoned. `ErrSuperseded` is the single exception
+  that still exits, because retrying it would overwrite a newer image with an older one.
+- ~~**The descriptor's on-S3 format changed without a spec**~~ **Reviewed 2026-08-04:
+  kept.** D1 removed the `durability` field from `descriptor.json`; the field had no
+  reader, §25.2's property test was updated with the shape and is green, and a descriptor
+  already in a bucket still parses and still verifies its digest. The protocol breach —
+  a format change with no preceding spec — is recorded rather than excused: the next one
+  gets its spec first.
 - **`internal/blockdev/doc.go` now states a narrower FLUSH promise** (E4). Flagged by its
   own author for whoever reviews the ACK-rule zone.
 
