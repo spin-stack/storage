@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
@@ -481,9 +480,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 	start := func(dataDir string, keys agent.KeysFunc) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits:         wal.Limits{SegmentBytes: 8192},
-			HostID:         host,
-			CheckpointPoll: 24 * time.Hour,
+			Limits: wal.Limits{SegmentBytes: 8192},
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -609,9 +606,7 @@ func twoHostsCannotBothPublish(s *Sim, ignorePreconditions bool) error {
 	start := func(dataDir string) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits:         wal.Limits{SegmentBytes: 8192},
-			HostID:         ids.NewAt(simEpoch*1000, s.Rand).String(),
-			CheckpointPoll: 24 * time.Hour,
+			Limits: wal.Limits{SegmentBytes: 8192},
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -738,9 +733,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	start := func(dataDir string) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits:         wal.Limits{SegmentBytes: 8192},
-			HostID:         ids.NewAt(simEpoch*1000, s.Rand).String(),
-			CheckpointPoll: 24 * time.Hour,
+			Limits: wal.Limits{SegmentBytes: 8192},
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -888,9 +881,7 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 	start := func(dataDir string, store objectstore.Store) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits:         wal.Limits{SegmentBytes: 8192},
-			HostID:         ids.NewAt(simEpoch*1000, s.Rand).String(),
-			CheckpointPoll: 24 * time.Hour,
+			Limits: wal.Limits{SegmentBytes: 8192},
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,

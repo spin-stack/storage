@@ -9,7 +9,6 @@ import (
 	"path"
 	"sort"
 	"sync"
-	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/blockdev"
@@ -266,20 +265,6 @@ type VolumeManagerConfig struct {
 	SocketDir string
 	// Limits bound the local WAL (§5.7). The zero value is legal and unbounded.
 	Limits wal.Limits
-	// UploadAttempts is how many times an object PUT is retried before the FLUSH that
-	// needed it fails. Zero means 3.
-	UploadAttempts int
-	// HostID is this host's fleet identity. A checkpoint names the host publishing it,
-	// which is what stops a second host publishing into an epoch it merely knows the
-	// number of (§12.3–12.4). Without it no durability scheduler runs.
-	HostID string
-	// CheckpointBytes and CheckpointInterval are the two triggers of §21.1: 256 MiB of
-	// local WAL, or two minutes, whichever comes first. Zero means the design's value.
-	CheckpointBytes    int64
-	CheckpointInterval time.Duration
-	// CheckpointPoll is how often the byte trigger is examined. Not a design number —
-	// see durability.go.
-	CheckpointPoll time.Duration
 }
 
 // VolumeManagerDeps are the injected collaborators (INV-01).

@@ -149,13 +149,6 @@ func run() error {
 		// nowhere near where the operator was told to look.
 		DataDir:   ".",
 		SocketDir: *socketDir,
-		// Without it no volume on this host ever runs a durability scheduler: a
-		// checkpoint names the host publishing it (§12.3-12.4), and checkpointsEnabled
-		// refuses to start one that cannot. The consequence is not subtle — `published`
-		// stays 0 for the life of the process, not one byte of local WAL is ever
-		// reclaimed, and the NVMe fills. It was missing until the e2e lane started the
-		// real binary and read the line it logs about it.
-		HostID: *hostID,
 	}, agent.VolumeManagerDeps{
 		Clock:   real.NewClock(),
 		Disk:    disk,

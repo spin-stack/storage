@@ -137,7 +137,6 @@ func startAgent(t *testing.T, ctx context.Context, dir, volumeID string) (*agent
 		// namespace, and passing dir here is DEV-0017.
 		DataDir:   ".",
 		SocketDir: dir,
-		HostID:    ids.New().String(),
 		// Segments small enough to seal, because reclaim only unlinks sealed ones — a
 		// truncation that unlinks nothing would make step 3 vacuous.
 		Limits: wal.Limits{SegmentBytes: 8 << 10},
