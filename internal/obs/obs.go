@@ -1,8 +1,28 @@
-// Package obs provides the observability substrate mandated from day 1 (§26):
-// OpenTelemetry tracing, structured logging keyed on request_id/operation_id, and
-// the full §26.2 metric-name registry. Phase 01 wires the plumbing and registers
-// every metric name as a no-op/zero instrument; later phases attach real values,
-// so cardinality is fixed and stable up front.
+// Package obs is the metric substrate: the §26.2 name catalog, the instruments built
+// from it, and the Recorder production code writes through without importing
+// OpenTelemetry.
+//
+// **It used to also carry tracing and correlation-keyed logging, and on 2026-08-03 that
+// half was deleted.** §26.1 describes a trace context propagating CP → Agent → object
+// store → KMS, and the code for it existed — a W3C propagator, InjectContext /
+// ExtractContext over a JSON header, five context keys (request_id, operation_id,
+// volume_id, epoch, host_id), NewLogger and LoggerFrom to stamp them onto a slog record.
+// None of it had a single caller outside this package's own tests. No RPC injected a
+// header, no handler extracted one, no binary built a Tracer, and no line anywhere in the
+// tree was logged through LoggerFrom. What the tests proved was that the OpenTelemetry
+// propagator propagates, which is OTel's test to write.
+//
+// The alternative was to wire it: one span around a Connect handler and one around
+// `Volume.publish`. That was rejected because it is not one line and it is not this
+// package's to make. The injection point is `api/`+`internal/cpserver`'s interceptor and
+// the extraction point is the Agent's loop; until those two exist, keeping the machinery
+// here means "registered and unused" — the exact shape this repository has spent three
+// passes removing (DEV-0010 was the same finding about the metric catalog). Git holds the
+// deleted code; when the CP grows an interceptor, that increment brings back the six
+// functions it actually calls, and not the five context keys nothing will carry.
+//
+// Metrics stayed because they have real callers: the WAL's watermarks and out-of-space
+// gauge, the Agent's lease counters, and §19's snapshot histograms.
 //
 // obs depends on the OTel SDK, whose internal timestamping is not our concern for
 // §25.1/INV-01: our own code never calls the time package (the simulable analyzer
@@ -12,32 +32,29 @@ package obs
 import (
 	"context"
 
-	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-// Provider bundles the tracer and metric registry with their SDK providers. Use
-// NewTestProvider in tests to inspect recorded spans and metrics; production
-// wiring (OTLP exporters) is a deploy concern for a later phase.
+// Provider bundles the registered metric set with the SDK meter provider behind it.
+// NewTestProvider is the only constructor: production wiring (an OTLP exporter) does not
+// exist yet, and `cmd/volume-agent` passes `Recorder: nil` on purpose until it does.
+//
+// There is deliberately no Meter accessor. One existed, "for ad-hoc instrument creation
+// in tests", used by exactly one test that created a counter and added 1 to it. It was a
+// hole in the property the Recorder exists to hold — an unregistered name is dropped, not
+// created (§26.2) — handed out to anyone who asked. A metric worth recording goes in
+// Catalog().
 type Provider struct {
-	Tracer  *Tracer
 	Metrics *Metrics
 
-	tp     *sdktrace.TracerProvider
 	mp     *sdkmetric.MeterProvider
-	spans  *tracetest.SpanRecorder
 	reader *sdkmetric.ManualReader
 }
 
-// NewTestProvider builds a Provider that records spans in memory and exposes a
-// manual metric reader, so tests can assert on both. name labels the tracer/meter.
+// NewTestProvider builds a Provider over a manual reader, so a test can collect and
+// assert on what a code path actually recorded. name labels the meter.
 func NewTestProvider(name string) (*Provider, error) {
-	spans := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans))
-
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
@@ -46,29 +63,11 @@ func NewTestProvider(name string) (*Provider, error) {
 		return nil, err
 	}
 
-	return &Provider{
-		Tracer:  NewTracer(tp, name),
-		Metrics: metrics,
-		tp:      tp,
-		mp:      mp,
-		spans:   spans,
-		reader:  reader,
-	}, nil
+	return &Provider{Metrics: metrics, mp: mp, reader: reader}, nil
 }
 
-// RecordedSpans returns the spans captured so far (test provider only).
-func (p *Provider) RecordedSpans() []sdktrace.ReadOnlySpan { return p.spans.Ended() }
-
-// Meter exposes a meter for ad-hoc instrument creation in tests.
-func (p *Provider) Meter(name string) metric.Meter { return p.mp.Meter(name) }
-
-// Shutdown flushes and stops the SDK providers.
-func (p *Provider) Shutdown(ctx context.Context) error {
-	if err := p.tp.Shutdown(ctx); err != nil {
-		return err
-	}
-	return p.mp.Shutdown(ctx)
-}
+// Shutdown flushes and stops the SDK provider.
+func (p *Provider) Shutdown(ctx context.Context) error { return p.mp.Shutdown(ctx) }
 
 // CollectedMetrics returns the set of metric names that actually carry data, which
 // is what a test asserting "this path records telemetry" needs: the registry always

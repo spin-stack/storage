@@ -1413,6 +1413,42 @@ track A.
 `internal/blockdev` and `internal/cow`. The head tables are recounted once, at integration,
 by track A.
 
+### E1 — `internal/obs`'s logging and tracing half is deleted (2026-08-03)
+
+`obs` had two halves and only one of them was connected. The metrics half has real
+callers — the WAL's watermarks and `wal_out_of_space`, the Agent's lease counter and
+gauge, §19's two snapshot histograms — all reaching an instrument through `obs.Recorder`.
+The other half had none. `Tracer`, `NewTracer`, `InjectContext`/`ExtractContext`, the five
+correlation context keys with `WithRequestID` and friends, `NewLogger`, `LoggerFrom` and
+`Provider.RecordedSpans` were referenced **only inside `internal/obs` and its own tests**:
+no RPC injected a header, no handler extracted one, no binary constructed a `Tracer`, and
+not one line in the tree was logged through `LoggerFrom`. §26.1's CP → Agent → S3 → KMS
+trace propagation was a package that propagated between two halves of its own test.
+
+Deleted rather than wired. Wiring is not one line and it is not this package's to make:
+the injection point is an interceptor in `api/`/`internal/cpserver` that does not exist,
+and the extraction point is the Agent's loop. Keeping the machinery until they do means
+"registered and unused" — the same finding as DEV-0010, which was about this very package's
+metric catalog. Git holds it; the increment that grows the interceptor brings back the
+functions it calls.
+
+`Provider.Meter` went with them, for a related reason worth separating: it existed "for
+ad-hoc instrument creation in tests" and was used by one test that made a counter and
+added 1 to it. It handed out the ability to create a series outside `Catalog()`, which is
+the one property `Recorder` exists to hold (§26.2). Three tests went with the code:
+`TestTracePropagationAcrossBoundary`, `TestStructuredLogHasCorrelationFields`,
+`TestNestedSpansShareTrace`, plus `TestMeterRecords`.
+
+Net: −144 lines of production code, −64 of test. `go mod tidy` moved
+`go.opentelemetry.io/otel/sdk` and `go.opentelemetry.io/otel/trace` from direct to
+indirect requirements — nothing imports them any more.
+
+**For track A, not edited here:** §26.1 of `arquitectura_mvp_volumenes_remotos_v5.md`
+describes a mechanism the tree no longer contains — it needs the ADR-0026 treatment the
+other withdrawn sections got, not a deletion. `REFERENCE.md:123` (`§26.1 | Distributed
+tracing.`) resolves the *document* section and stays accurate as written; it is listed
+only so track A decides deliberately rather than by omission.
+
 ---
 
 # Specs for work not started
