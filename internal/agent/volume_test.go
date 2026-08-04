@@ -144,7 +144,11 @@ func newTestManager(t *testing.T) (*agent.VolumeManager, *listenerFactory, *sim.
 	if err != nil {
 		t.Fatalf("NewVolumeManager: %v", err)
 	}
-	t.Cleanup(func() { _ = m.Close() })
+	// context.Background and not t.Context: the test context is cancelled just
+	// before cleanups run, and a cancelled context is how an operator says "abandon
+	// the publish". A cleanup that abandons would make every test's teardown the
+	// interesting path rather than the ordinary one.
+	t.Cleanup(func() { _ = m.Close(context.Background()) }) //nolint:usetesting // see above
 	return m, f, d
 }
 
@@ -546,7 +550,7 @@ func TestCloseStopsEverything(t *testing.T) {
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{desiredVolume(t, 1), desiredVolume(t, 1)}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if err := m.Close(); err != nil {
+	if err := m.Close(t.Context()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	for _, s := range f.socketPaths() {
@@ -672,13 +676,13 @@ func TestARestartedVolumeReadsBackWhatWasFlushed(t *testing.T) {
 	if err := dev.Flush(t.Context()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	if err := first.Close(); err != nil {
+	if err := first.Close(t.Context()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
 	// The restart: a new manager, the same disk and store, the same desired state.
 	second := newManager()
-	t.Cleanup(func() { _ = second.Close() })
+	t.Cleanup(func() { _ = second.Close(context.Background()) }) //nolint:usetesting // a cancelled context abandons the publish; see newTestManager
 	if err := second.Apply(t.Context(), desired); err != nil {
 		t.Fatalf("Apply after restart: %v", err)
 	}
@@ -726,7 +730,7 @@ func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 	writeOneBlock(t, first, v.GetVolumeId())
-	if err := first.Close(); err != nil {
+	if err := first.Close(t.Context()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
@@ -742,7 +746,7 @@ func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewVolumeManager: %v", err)
 	}
-	t.Cleanup(func() { _ = second.Close() })
+	t.Cleanup(func() { _ = second.Close(context.Background()) }) //nolint:usetesting // a cancelled context abandons the publish; see newTestManager
 	if err := second.Apply(t.Context(), desired); err != nil {
 		t.Fatalf("Apply after restart: %v", err)
 	}

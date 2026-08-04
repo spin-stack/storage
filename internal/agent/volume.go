@@ -9,6 +9,7 @@ import (
 	"path"
 	"sort"
 	"sync"
+	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/blockdev"
@@ -147,60 +148,78 @@ func (v *Volume) Status() VolumeStatus {
 	return st
 }
 
-// stop tears the runtime down and waits for the serve loop to leave. Closing the log
-// last is the ordering that matters: the server must stop answering before the thing it
-// answers from goes away.
+// quiesce stops serving and waits for everything that could still append to the log.
+// After it returns nothing can write to this volume, which is exactly publish's
+// precondition — it is what makes ViewAtRest's view a point rather than a smear.
 //
-// The base fetch is released *last*, after publish has used its result. Cancelling it
-// here, next to v.cancel(), is the shape this used to have and it lost data: see start.
-func (v *Volume) stop() error {
+// It is separate from release (below) because between the two the image has to reach the
+// object store, and that can take a very long time: see VolumeManager.Close, which
+// quiesces every volume, then retries their publishes for as long as it takes. It is
+// idempotent, so a second call during a teardown that was already under way is free.
+func (v *Volume) quiesce() {
 	v.cancel()
 	<-v.done
 	// Before the image and before the log closes: an in-flight snapshot is holding a
 	// frozen view of this log and is the only thing that can finish it.
 	v.snapWG.Wait()
-	v.publish()
+}
+
+// release gives up the volume's local resources: the base fetch's context and the log.
+//
+// It is called only once this volume's session is settled — published, or explicitly
+// given up on — because closing the log is what ends this host's ability to publish it
+// at all. Nothing here deletes a segment: the records stay on disk exactly as they were,
+// which is what makes "restart and it republishes" true (ADR-0024, and the reason
+// SHUTDOWN-PUBLISH-SPEC §6 pins it with a test).
+func (v *Volume) release() error {
 	if v.baseCancel != nil {
 		// Nothing is waiting on the fetch any more, so whatever it is still doing is
 		// work nobody will read. The goroutine has already ended in every path that got
-		// here — publish waits on baseDone — so this is releasing the context's
+		// here — the publish waits on baseDone — so this is releasing the context's
 		// resources rather than stopping anything (SHUTDOWN-PUBLISH-SPEC §5).
 		v.baseCancel()
 	}
 	return v.log.Close()
 }
 
+// ErrNoReadView is a volume that never resolved its base: publishing it would write down
+// a view that is not a subset of the truth but a different thing, so it is refused.
+//
+// It is a sentinel because the shutdown path has to tell it apart from a store that is
+// merely unreachable. Both mean "this session is not in the object store", but only the
+// second is worth retrying — the fetch that failed is over, and this Volume will never
+// attempt another one. Holding the data directory for it would be a wait with no event
+// that can end it; a restart is what re-fetches the base and republishes.
+var ErrNoReadView = errors.New("agent: the volume's read view never resolved, so its image would be missing everything it held before this session")
+
 // publish writes the volume's state to the object store. It is the whole durability
 // contract of V1 (ADR-0026): nothing else leaves the host, and what this writes is what
 // the next boot — or a clone — reads.
 //
-// It runs after the serve loop has gone, because that is the first moment nothing can
-// append, which is what makes ViewAtRest's precondition true and the image a point rather
-// than a smear.
+// It runs after quiesce, because that is the first moment nothing can append.
 //
-// A failure is loud and does not stop the teardown. Refusing to close would leave a
-// volume neither serving nor released, and the data is still in the local WAL either way;
-// what an operator needs is to know this session did not reach the object store.
-func (v *Volume) publish() {
+// It returns its error instead of logging it, which it used to do. The difference is the
+// whole of SHUTDOWN-PUBLISH-SPEC: a caller that is told the publish failed can retry it,
+// hold the data directory while it does, and exit non-zero if it never succeeds. A caller
+// that reads slog cannot do any of those things, and the process exited 0 with the
+// session in nobody's bucket.
+func (v *Volume) publish(ctx context.Context) error {
 	if v.store == nil {
-		return // local-only Agent: the local WAL is all there is, by design
+		return nil // local-only Agent: the local WAL is all there is, by design
 	}
 	if v.baseDone != nil {
 		// The fetch runs on its own goroutine and is not covered by v.done, which waits
 		// for the serve loop. Publishing without waiting is how a race becomes data loss:
 		// the view would be missing everything the base holds, and the CAS would install
-		// that over the manifest the base came from.
+		// that over the manifest the base came from. Whoever bounded that wait has
+		// already done so (see VolumeManager.awaitBase); this is the guard that makes
+		// publish correct on its own rather than by convention.
 		<-v.baseDone
 	}
 	if v.baseFailed {
-		slog.Warn("not publishing this volume's image: its read view never resolved, so the image would be missing everything it held before this session",
-			"volume_id", v.id)
-		return
+		return fmt.Errorf("%w: volume %s", ErrNoReadView, v.id)
 	}
 	view, seq := v.log.ViewAtRest()
-	// Not the serve context: that one is already cancelled by the time this runs, and a
-	// cancelled publish is exactly the silent data loss this function exists to prevent.
-	ctx := context.Background()
 	// Under ADR-0026 this is the *only* moment anything leaves the host, so its duration
 	// is the cost of a whole session rather than one step among many — and it is what an
 	// operator watching a slow shutdown needs (§26.2). Recorded for a failed publish too:
@@ -211,17 +230,12 @@ func (v *Volume) publish() {
 			obs.String("volume", v.id))
 	}()
 	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.vol, view, seq, v.imageETag)
-	switch {
-	case errors.Is(err, image.ErrSuperseded):
-		slog.Error("this volume's image was published by another writer; this session's writes were NOT saved",
-			"volume_id", v.id, "sequence", seq)
-	case err != nil:
-		slog.Error("this volume's image could not be published; this session's writes were NOT saved",
-			"volume_id", v.id, "sequence", seq, "error", err)
-	default:
-		v.imageETag = etag
-		slog.Info("volume image published", "volume_id", v.id, "sequence", seq)
+	if err != nil {
+		return fmt.Errorf("agent: volume %s: publishing its image at sequence %d: %w", v.id, seq, err)
 	}
+	v.imageETag = etag
+	slog.Info("volume image published", "volume_id", v.id, "sequence", seq)
+	return nil
 }
 
 // ListenFunc opens the vhost-user socket for one volume. It is injected because a Unix
@@ -278,10 +292,46 @@ type VolumeManagerConfig struct {
 	// where its operator was told to look. A rooted Disk wants "." here; a Disk
 	// spanning a whole filesystem (every test, and the DST harness) wants the path.
 	DataDir string
+	// DataDirLabel is that same directory spelled the way the operator spelled it, and it
+	// exists for one reason: in production DataDir is the string ".", so every message
+	// naming it named nothing. The Agent's real Disk is rooted at --data-dir precisely so
+	// the process cannot write outside it, which makes "." the correct value for the field
+	// above and a useless one for a human — and the message that matters most is the one
+	// that says "I am holding this directory and will not let go", whose whole purpose is
+	// to tell an operator which directory, on which host, is stuck.
+	//
+	// Found by running the binaries: the holding line printed `data_dir=.`. Nothing
+	// in-process could see it, because every test hands the manager a Disk spanning a
+	// whole filesystem, where the two spellings agree — which is the same blind spot that
+	// hid --data-dir being applied twice.
+	//
+	// Empty means "use DataDir", so a test or the DST harness needs no second string.
+	DataDirLabel string
 	// SocketDir holds one vhost-user socket per volume: <socket-dir>/<volume-id>.sock.
 	SocketDir string
 	// Limits bound the local WAL (§5.7). The zero value is legal and unbounded.
 	Limits wal.Limits
+	// ShutdownGrace bounds **one** publish attempt, and one wait for a read view, during
+	// a teardown. It is not a budget after which data is abandoned: when an attempt is
+	// cut short Close retries it, and nothing in this type ever gives a session up on a
+	// timer (SHUTDOWN-PUBLISH-SPEC, "REVIEWED AND DECIDED"). What it exists for is the
+	// one failure a retry cannot survive — a PUT that neither succeeds nor fails, which
+	// without a bound is a teardown that hangs with nothing printed and no way in.
+	//
+	// The zero value is legal and means unbounded, which is what every in-process caller
+	// wants: a test and the DST harness have no operator behind them, and a timer armed
+	// on the simulated clock would be one more thing the harness has to advance past to
+	// reach the behaviour it is actually driving. `cmd/volume-agent` sets it from
+	// -shutdown-grace, whose default (60s) mirrors cmd/control-plane's.
+	ShutdownGrace time.Duration
+}
+
+// dataDir is the directory this Agent claims, spelled for a human. See DataDirLabel.
+func (c VolumeManagerConfig) dataDir() string {
+	if c.DataDirLabel != "" {
+		return c.DataDirLabel
+	}
+	return c.DataDir
 }
 
 // VolumeManagerDeps are the injected collaborators (INV-01).
@@ -386,9 +436,9 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 	if err != nil {
 		if errors.Is(err, disk.ErrLocked) {
 			return nil, fmt.Errorf("agent: another Volume Agent is already using %s (§10: one Agent per host): %w",
-				cfg.DataDir, err)
+				cfg.dataDir(), err)
 		}
-		return nil, fmt.Errorf("agent: claiming %s: %w", cfg.DataDir, err)
+		return nil, fmt.Errorf("agent: claiming %s: %w", cfg.dataDir(), err)
 	}
 	return &VolumeManager{
 		cfg: cfg, deps: deps, lock: lock,
@@ -452,7 +502,7 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 			}
 			// Promoted. The old runtime is torn down before the new one opens, because
 			// both would otherwise want the same socket.
-			if err := m.remove(id); err != nil {
+			if err := m.remove(ctx, id); err != nil {
 				errs = append(errs, fmt.Errorf("agent: replacing volume %s at epoch %d: %w", id, d.GetEpoch(), err))
 				continue
 			}
@@ -480,7 +530,7 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 	}
 	m.mu.Unlock()
 	for _, id := range gone {
-		if err := m.remove(id); err != nil {
+		if err := m.remove(ctx, id); err != nil {
 			errs = append(errs, fmt.Errorf("agent: stopping volume %s: %w", id, err))
 		}
 	}
@@ -870,7 +920,7 @@ func (m *VolumeManager) supervise(ctx context.Context, v *Volume, first vhost.Li
 //
 // A volume re-granted to this host at a higher epoch starts a fresh runtime on the next
 // Apply, under the new epoch's WAL root, and the guest's pending reconnect succeeds.
-func (m *VolumeManager) Fence(_ context.Context, volumeIDs []string) error {
+func (m *VolumeManager) Fence(ctx context.Context, volumeIDs []string) error {
 	var errs []error
 	for _, id := range volumeIDs {
 		m.mu.Lock()
@@ -884,7 +934,7 @@ func (m *VolumeManager) Fence(_ context.Context, volumeIDs []string) error {
 		}
 		slog.Warn("volume fenced; tearing its runtime down",
 			"volume_id", id, "epoch", v.epoch)
-		if err := m.remove(id); err != nil {
+		if err := m.remove(ctx, id); err != nil {
 			errs = append(errs, fmt.Errorf("agent: fencing volume %s: %w", id, err))
 		}
 	}
@@ -893,7 +943,23 @@ func (m *VolumeManager) Fence(_ context.Context, volumeIDs []string) error {
 
 // remove stops one runtime and drops it. It is safe to call for a volume that is not
 // running.
-func (m *VolumeManager) remove(id string) error {
+//
+// This is the *reconciliation* teardown — a promotion, a fence, a volume the Control
+// Plane stopped listing — and it makes exactly one publish attempt. It deliberately does
+// **not** hold the way Close does, and does not return the publish's error either:
+//
+//   - it runs on the reconcile goroutine, so a retry loop here is a heartbeat not sent,
+//     a lease not renewed, and every *other* volume on this host fenced for the sake of
+//     one that has already left it;
+//   - and in every case that reaches here the volume has moved on. A fenced or promoted
+//     volume belongs to another host now, which is the same reason ErrSuperseded is not
+//     retried: refusing to release buys nothing, because nobody is coming back for this
+//     directory's copy.
+//
+// Returning the error instead of logging it would stop the promotion it is part of —
+// Apply skips starting the new epoch's runtime when remove fails — so a store having a
+// bad minute would leave the host serving neither epoch.
+func (m *VolumeManager) remove(ctx context.Context, id string) error {
 	m.mu.Lock()
 	v, ok := m.volumes[id]
 	if ok {
@@ -903,7 +969,16 @@ func (m *VolumeManager) remove(id string) error {
 	if !ok {
 		return nil
 	}
-	return v.stop()
+	v.quiesce()
+	// WithoutCancel: ctx here is the reconcile cycle's, and this publish must outlive
+	// the cycle rather than be cancelled by it — a cancelled publish is the silent data
+	// loss the whole spec is about (same rule as the base fetch's context, see start).
+	m.awaitBase(context.WithoutCancel(ctx), v)
+	if err := m.publishAttempt(context.WithoutCancel(ctx), v); err != nil {
+		slog.Error("this volume's image could not be published; this session's writes are only in this host's local WAL, and this host is no longer the volume's writer",
+			"volume_id", id, "epoch", v.epoch, "data_dir", m.cfg.dataDir(), "error", err)
+	}
+	return v.release()
 }
 
 // Volumes implements VolumeSource over the live runtimes, ordered by volume id
@@ -931,34 +1006,240 @@ func (m *VolumeManager) Device(volumeID string) (*blockdev.Device, bool) {
 	return v.dev, true
 }
 
-// Close stops every runtime. It is idempotent.
-func (m *VolumeManager) Close() error {
+// Close stops every runtime, publishes every session it was serving, and **does not
+// return until it has** — holding this host's claim on the data directory for as long as
+// that takes. It is idempotent.
+//
+// That is the decision in SHUTDOWN-PUBLISH-SPEC's "REVIEWED AND DECIDED", and its
+// mechanism is this function's shape: a flock is released by the kernel when the process
+// exits, so "refuse to release the lock" can only mean "do not exit", which can only mean
+// "do not return from here". Everything else follows — the retries, the holding line, and
+// the fact that a store outage stops a rolling restart fleet-wide rather than silently
+// costing a session per host.
+//
+// ctx is the operator's override and nothing else: cancelling it abandons whatever has
+// not published, names it, and returns ErrPublishAbandoned. `cmd/volume-agent` wires it
+// to the *second* signal. Abandoning is safe — the records are on disk and the next
+// incarnation re-attaches at the same epoch (ADR-0024) and republishes — which is why
+// the escape can exist at all; what is not safe is abandoning silently.
+func (m *VolumeManager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
-	ids := make([]string, 0, len(m.volumes))
-	for id := range m.volumes {
-		ids = append(ids, id)
+	held := make([]*Volume, 0, len(m.volumes))
+	for _, v := range m.volumes {
+		held = append(held, v)
 	}
 	m.mu.Unlock()
+	// INV-02: the order volumes are published in is the order an operator reads about
+	// them, and a map's is a different one every run.
+	sort.Slice(held, func(i, j int) bool { return held[i].id < held[j].id })
 
-	var errs []error
-	for _, id := range ids {
-		if err := m.remove(id); err != nil {
-			errs = append(errs, err)
-		}
+	// Every volume stops serving *first*, before any of them publishes. A guest whose
+	// host is going away should lose its device at the moment the host decided to go,
+	// not after some other volume's upload — and until this loop has run, a volume later
+	// in the list is still taking writes that its own ViewAtRest would then have to
+	// include.
+	for _, v := range held {
+		v.quiesce()
 	}
-	// Released last, after every runtime is down: while any of them is still writing,
-	// this Agent still owns the directory.
+
+	errs := m.publishHeld(ctx, held)
+	// Released last, after every runtime is down and every image is settled: while this
+	// Agent still has a session that only exists here, it still owns the directory.
 	if m.lock != nil {
 		if err := m.lock.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("agent: releasing %s: %w", m.cfg.DataDir, err))
+			errs = append(errs, fmt.Errorf("agent: releasing %s: %w", m.cfg.dataDir(), err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ErrPublishAbandoned means an operator told this Agent to stop waiting while sessions
+// were still unpublished. The data is in the local WAL and a restart republishes it,
+// which is what makes the process's non-zero exit an instruction rather than an epitaph.
+var ErrPublishAbandoned = errors.New("agent: the shutdown publish was abandoned; these sessions exist only in this host's local WAL")
+
+// publishRetryInitial and publishRetryMax bound the wait between rounds. The cap is what
+// makes the holding line a heartbeat rather than a countdown that goes quiet: at 30s an
+// operator watching a stuck host gets a line every half minute for as long as it lasts,
+// and the store's own timeouts already dominate the cost of an attempt.
+const (
+	publishRetryInitial = 2 * time.Second
+	publishRetryMax     = 30 * time.Second
+)
+
+// publishHeld publishes every quiesced volume, retrying until each one is either in the
+// object store or is a failure retrying cannot fix.
+//
+// **A round tries every volume that is still unpublished, one at a time, and then waits.**
+// The two alternatives were rejected for different reasons. Publishing them concurrently
+// multiplies the bandwidth a stopping host takes from the ones still serving, and there
+// is no io-class scheduler left to bound it (deleted in ADR-0026 4.5); worse, the
+// per-volume lines interleave, and "which volume is stuck" is the first question an
+// incident asks. Publishing them one *to completion* before starting the next — which is
+// what a naive loop over stop() does — strands every other volume's image behind the
+// slowest one, so a failure specific to volume A means volume B is never even attempted
+// and the operator hears nothing about it.
+func (m *VolumeManager) publishHeld(ctx context.Context, held []*Volume) []error {
+	var errs []error
+	remaining := held
+	backoff := publishRetryInitial
+	since := m.deps.Clock.Now()
+
+	for attempt := 1; ; attempt++ {
+		var stuck []*Volume
+		for _, v := range remaining {
+			if v.store != nil {
+				// What makes a hang attributable to a volume rather than to "the Agent is
+				// stuck". A local-only Agent says nothing, because it publishes nothing.
+				slog.Info("volume image publish started",
+					"volume_id", v.id, "attempt", attempt, "volumes_remaining", len(remaining))
+			}
+			m.awaitBase(ctx, v)
+			err := m.publishAttempt(ctx, v)
+			switch {
+			case err == nil:
+				errs = append(errs, m.drop(v))
+			case errors.Is(err, image.ErrSuperseded), errors.Is(err, ErrNoReadView):
+				// The two failures a retry cannot survive, and they are opposites.
+				// ErrSuperseded: another writer published over us, so retrying would
+				// replace a newer image with an older one — the single thing INV-10
+				// exists to prevent — and holding this directory buys nothing, because
+				// the volume is being served by a host that does not care what is in it.
+				// ErrNoReadView: the fetch that would have made the image complete is
+				// already over, and nothing in this process will attempt another.
+				slog.Error("this volume's image will not be published by this Agent; its session stays in the local WAL",
+					"volume_id", v.id, "epoch", v.epoch, "data_dir", m.cfg.dataDir(), "error", err)
+				errs = append(errs, err, m.drop(v))
+			default:
+				slog.Error("volume image publish failed",
+					"volume_id", v.id, "attempt", attempt, "retry_in", backoff, "error", err)
+				stuck = append(stuck, v)
+			}
+		}
+		remaining = stuck
+		if len(remaining) == 0 {
+			return errs
+		}
+
+		// A process that is deliberately refusing to die must say so on a schedule. One
+		// that says it once and goes quiet is indistinguishable from one that hung, and
+		// the whole reason the owner chose holding over exiting is that a stuck host
+		// should be *legible* — this line and the heartbeat are the two things that make
+		// it so.
+		slog.Warn("agent is holding unpublished data and will not release its data directory",
+			"volumes", len(remaining), "volume_ids", volumeIDs(remaining),
+			"attempts", attempt, "oldest_wait", m.deps.Clock.Now().Sub(since),
+			"data_dir", m.cfg.dataDir())
+
+		if err := m.deps.Clock.Sleep(ctx, backoff); err != nil {
+			// The operator's override (a second signal), or a caller that gave up on us.
+			// Named, one line per volume, because "which sessions did I just agree to
+			// leave behind" is the only question this moment is about.
+			for _, v := range remaining {
+				w := v.log.Watermarks()
+				slog.Error("abandoning this volume's unpublished session on request; it stays in this host's local WAL and a restart republishes it",
+					"volume_id", v.id, "epoch", v.epoch, "local_sequence", w.Local,
+					"data_dir", m.cfg.dataDir(),
+					// Relative to data_dir, because that is how this process addresses its
+					// own disk: everything it opens is inside the Disk rooted there.
+					"wal", wal.SegmentDir(v.root, v.vol, uint64(v.epoch)))
+				errs = append(errs, fmt.Errorf("%w: volume %s at sequence %d", ErrPublishAbandoned, v.id, w.Local), m.drop(v))
+			}
+			return errs
+		}
+		if backoff *= 2; backoff > publishRetryMax {
+			backoff = publishRetryMax
+		}
+	}
+}
+
+// drop takes a settled volume out of the served set and releases it. Out of the map
+// first: until it leaves, Volumes still reports it — which is deliberate while it is
+// being held (see Volumes) and wrong the instant its log is closed.
+func (m *VolumeManager) drop(v *Volume) error {
+	m.mu.Lock()
+	delete(m.volumes, v.id)
+	m.mu.Unlock()
+	return v.release()
+}
+
+func volumeIDs(vs []*Volume) []string {
+	out := make([]string, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, v.id)
+	}
+	return out
+}
+
+// awaitBase waits for the volume's read view to resolve, bounded by ShutdownGrace.
+//
+// The wait itself is not optional: publishing before the base lands writes an image
+// missing everything the volume held before this session, over the manifest that base
+// came from. What is new here is the bound. A fetch against a store that answers nothing
+// — not refusing, just never replying — would otherwise make the teardown wait forever
+// with nothing printed, which is the one shape "hold and retry" cannot tell apart from
+// "hung". When the grace runs out the fetch is cancelled, fetchBase records a failed view,
+// and the volume is reported as one this Agent will not publish (ErrNoReadView) rather
+// than published incomplete.
+func (m *VolumeManager) awaitBase(ctx context.Context, v *Volume) {
+	if v.baseDone == nil {
+		return
+	}
+	select {
+	case <-v.baseDone:
+		return
+	default:
+	}
+	slog.Info("waiting for this volume's read view before publishing its image",
+		"volume_id", v.id, "grace", m.cfg.ShutdownGrace)
+
+	var expired <-chan clock.Instant
+	if m.cfg.ShutdownGrace > 0 {
+		t := m.deps.Clock.NewTimer(m.cfg.ShutdownGrace)
+		defer t.Stop()
+		expired = t.C()
+	}
+	select {
+	case <-v.baseDone:
+	case <-expired:
+		v.baseCancel()
+		<-v.baseDone // it owes the log a FailBase; waiting is what makes baseFailed true
+	case <-ctx.Done():
+		v.baseCancel()
+		<-v.baseDone
+	}
+}
+
+// publishAttempt makes one bounded attempt to put a volume's image in the object store.
+//
+// The bound is armed on the *injected* clock rather than with context.WithTimeout, which
+// reads the real one: a deadline the DST harness cannot advance is a deadline that either
+// never fires in simulation or fires by wall-clock accident, and INV-01 exists precisely
+// so time is one of the things a scenario drives. A zero ShutdownGrace arms nothing,
+// which is what leaves every in-process caller's behaviour exactly as it was.
+func (m *VolumeManager) publishAttempt(ctx context.Context, v *Volume) error {
+	if m.cfg.ShutdownGrace <= 0 {
+		return v.publish(ctx)
+	}
+	actx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	t := m.deps.Clock.NewTimer(m.cfg.ShutdownGrace)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-t.C():
+			cancel()
+		case <-done:
+			t.Stop()
+		}
+	}()
+	return v.publish(actx)
 }
 
 var _ VolumeSource = (*VolumeManager)(nil)

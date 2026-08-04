@@ -47,7 +47,7 @@ func waitForSnapshotReport(t *testing.T, m *agent.VolumeManager, volumeID string
 // back on the volume's own report. Nothing calls the Agent — it is told (ADR-0021).
 func TestAPendingSnapshotInTheDesiredStateIsTaken(t *testing.T) {
 	r := newPublishRig(t, sim.NewObjectStore())
-	defer func() { _ = r.m.Close() }()
+	defer func() { _ = r.m.Close(t.Context()) }()
 	d := desiredVolume(t, 1)
 	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -111,7 +111,7 @@ func TestARepeatedSnapshotRequestIsTakenOnce(t *testing.T) {
 	// such store behind a double. The evidence here is the double itself — how many times
 	// the Put was attempted — so the manager alone is what this test needs.
 	m := newPublishManager(t, counting)
-	defer func() { _ = m.Close() }()
+	defer func() { _ = m.Close(t.Context()) }()
 	d := desiredVolume(t, 1)
 	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -153,7 +153,7 @@ func TestARepeatedSnapshotRequestIsTakenOnce(t *testing.T) {
 // breaking both is what turns it red, which is the honest description of what it proves.
 func TestASnapshotNoLongerAskedForIsNotReported(t *testing.T) {
 	r := newPublishRig(t, sim.NewObjectStore())
-	defer func() { _ = r.m.Close() }()
+	defer func() { _ = r.m.Close(t.Context()) }()
 	d := desiredVolume(t, 1)
 	d.PendingSnapshotId = ids.New().String()
 	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
@@ -221,7 +221,7 @@ func TestASnapshotRecordsItsPauseAndPublishDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = m.Close() }()
+	defer func() { _ = m.Close(t.Context()) }()
 
 	d := desiredVolume(t, 1)
 	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
@@ -245,7 +245,7 @@ func TestASnapshotRecordsItsPauseAndPublishDuration(t *testing.T) {
 	// And stopping records the other one. Under ADR-0026 publishing at stop is the only
 	// moment anything leaves the host, so its duration is the cost of the whole session —
 	// which is the number an operator watching a slow shutdown is looking for.
-	if err := m.Close(); err != nil {
+	if err := m.Close(t.Context()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	collected, err = p.CollectedMetrics(t.Context())

@@ -106,7 +106,7 @@ func TestAVolumeWhoseKeysAreUnusableIsNotServed(t *testing.T) {
 			if merr != nil {
 				t.Fatal(merr)
 			}
-			defer func() { _ = m.Close() }()
+			defer func() { _ = m.Close(t.Context()) }()
 
 			id := ids.New().String()
 			err := m.Apply(t.Context(), []*storagev1.DesiredVolume{{
@@ -173,14 +173,14 @@ func TestOneAgentPerDataDir(t *testing.T) {
 	}
 
 	// Released by Close, or a supervisor could never restart an Agent in place.
-	if err := first.Close(); err != nil {
+	if err := first.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	second, err := newManager()
 	if err != nil {
 		t.Fatalf("after the holder closed: %v", err)
 	}
-	if err := second.Close(); err != nil {
+	if err := second.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,7 +197,7 @@ func TestOneAgentPerDataDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a different data directory must be claimable: %v", err)
 	}
-	if err := other.Close(); err != nil {
+	if err := other.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }

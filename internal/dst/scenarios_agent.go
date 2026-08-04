@@ -150,7 +150,7 @@ func fencedVolumeStopsServing(s *Sim, ignoreFencing bool) error {
 	if err != nil {
 		return fmt.Errorf("building the volume manager: %w", err)
 	}
-	defer func() { _ = m.Close() }()
+	defer func() { _ = m.Close(context.Background()) }()
 
 	// A deterministic id: same seed, same volume, same trace (INV-02).
 	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
@@ -355,7 +355,7 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = m.Close() }()
+	defer func() { _ = m.Close(context.Background()) }()
 
 	desired := &storagev1.DesiredVolume{
 		VolumeId: cloneID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
@@ -516,7 +516,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 	if _, err := dev.WriteAt(pattern, 0); err != nil {
 		return fmt.Errorf("the guest write: %w", err)
 	}
-	if err := first.Close(); err != nil {
+	if err := first.Close(ctx); err != nil {
 		return fmt.Errorf("stopping the volume: %w", err)
 	}
 
@@ -543,7 +543,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = second.Close() }()
+	defer func() { _ = second.Close(context.Background()) }()
 	if err := second.Apply(ctx, desired); err != nil {
 		return fmt.Errorf("serving the rebuilt volume: %w", err)
 	}
@@ -655,23 +655,31 @@ func twoHostsCannotBothPublish(s *Sim, ignorePreconditions bool) error {
 	}
 
 	// Stopping is what publishes (ADR-0026).
-	if err := first.Close(); err != nil {
+	if err := first.Close(ctx); err != nil {
 		return fmt.Errorf("stopping the first incarnation: %w", err)
 	}
 	firstETag, err := etagOf(ctx, s, volumeID)
 	if err != nil {
 		return err
 	}
-	if err := second.Close(); err != nil {
+	// The second incarnation loses the compare-and-set, and since C5 that refusal is
+	// *returned* rather than logged: ErrSuperseded is the one publish failure the Agent
+	// neither retries nor holds its data directory for, because retrying would replace a
+	// newer image with an older one. Under the injected fault the store accepts the write
+	// regardless, so there is no error to see and the ETag below is what catches it.
+	switch err := second.Close(ctx); {
+	case ignorePreconditions && err != nil:
 		return fmt.Errorf("stopping the second incarnation: %w", err)
+	case !ignorePreconditions && !errors.Is(err, image.ErrSuperseded):
+		return fmt.Errorf("the second incarnation's publish should have been refused as superseded; Close returned %v", err)
 	}
 	secondETag, err := etagOf(ctx, s, volumeID)
 	if err != nil {
 		return err
 	}
 
-	// The observable is the object, not the error: publish() logs its refusal and returns
-	// nothing, deliberately, because a failed publish must not block a teardown. So what
+	// The observable is the object, not the error. A publish that returns the right
+	// refusal and moves the manifest anyway would satisfy any assertion on err, so what
 	// says whether the second host won is whether the manifest moved under it.
 	overwritten := firstETag != secondETag
 	s.Emit(Event{Kind: EventStalePublsh, StalePublishOK: overwritten})
@@ -753,7 +761,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	// The source VM stays up for the whole scenario, including while the clone reads. A
 	// snapshot that only works once its parent has stopped is the stop-and-upload path
 	// with extra steps.
-	defer func() { _ = source.Close() }()
+	defer func() { _ = source.Close(context.Background()) }()
 	if err := source.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: sourceID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
 		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
@@ -794,7 +802,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = clone.Close() }()
+	defer func() { _ = clone.Close(context.Background()) }()
 	if err := clone.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
@@ -923,7 +931,7 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 		}
 	}
 	// Stopping is what publishes (ADR-0026). Nothing before this leaves the host.
-	if err := first.Close(); err != nil {
+	if err := first.Close(ctx); err != nil {
 		return fmt.Errorf("stopping the volume: %w", err)
 	}
 
@@ -959,7 +967,7 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = second.Close() }()
+	defer func() { _ = second.Close(context.Background()) }()
 	if err := second.Apply(ctx, desired); err != nil {
 		return fmt.Errorf("restarting the volume: %w", err)
 	}
@@ -1116,7 +1124,7 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 	if _, err := dev.WriteAt(fromTheBase, 0); err != nil {
 		return fmt.Errorf("the first session's write: %w", err)
 	}
-	if err := first.Close(); err != nil {
+	if err := first.Close(ctx); err != nil {
 		return fmt.Errorf("stopping the first session: %w", err)
 	}
 	s.Notef("session one published an image for volume %s", volumeID)
@@ -1152,7 +1160,7 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 	s.Emit(Event{Kind: EventFault, Msg: "the volume is stopped with its base read still in flight"})
 
 	stopped := make(chan error, 1)
-	go func() { stopped <- second.Close() }()
+	go func() { stopped <- second.Close(ctx) }()
 	ln := <-listeners
 	<-ln.closed // the teardown has begun, and it has cancelled the serve context
 	close(gate.release)
@@ -1166,7 +1174,7 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = third.Close() }()
+	defer func() { _ = third.Close(context.Background()) }()
 	if err := third.Apply(ctx, desired); err != nil {
 		return fmt.Errorf("starting the third session: %w", err)
 	}

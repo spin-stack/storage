@@ -27,6 +27,7 @@ import (
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
@@ -43,11 +44,37 @@ const maxFormatVersion = 1
 func main() {
 	if err := run(); err != nil {
 		slog.Error("volume-agent exited", "error", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 }
 
-func run() error {
+// exitCode turns the teardown's outcome into the number a supervisor reads. It is the
+// only thing that tells systemd whether restarting this unit is the fix or the harm.
+//
+//	0  every session this host was serving is in the object store
+//	1  something is not: restart, and the next incarnation re-attaches at the same epoch
+//	   (ADR-0024) with the local WAL intact and publishes it
+//	2  another writer published over us: this host's copy is *older* than what is in the
+//	   bucket, so do not restart — a restart would only try to lose that race again
+//
+// Abandonment is checked first, and the order is the decision. A teardown can end with
+// one volume superseded and another abandoned by an impatient operator, and those two
+// want opposite things from a supervisor. Restarting is safe for the superseded volume —
+// it re-reads the manifest, finds itself behind, and refuses again — while *not*
+// restarting leaves the abandoned session on a disk nothing will ever read. So the code
+// that asks for a restart wins whenever both are true.
+func exitCode(err error) int {
+	switch {
+	case errors.Is(err, agent.ErrPublishAbandoned):
+		return 1
+	case errors.Is(err, image.ErrSuperseded):
+		return 2
+	default:
+		return 1
+	}
+}
+
+func run() (err error) {
 	var (
 		hostID       = flag.String("host-id", "", "fleet identity of this host: a UUIDv7 (required; mint one with `uuidgen` only if it is v7)")
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
@@ -57,7 +84,9 @@ func run() error {
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
-		kekFile      = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
+		grace        = flag.Duration("shutdown-grace", 60*time.Second,
+			"bound on ONE publish attempt at shutdown, not on the shutdown: an Agent that cannot publish keeps its data directory and retries until it can, or until a second signal")
+		kekFile = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -147,8 +176,17 @@ func run() error {
 		// inside that namespace. Passing the operator's absolute path here put every
 		// WAL under <data-dir>/<data-dir>/wal/... — consistent, restart-safe, and
 		// nowhere near where the operator was told to look.
-		DataDir:   ".",
-		SocketDir: *socketDir,
+		DataDir: ".",
+		// The same directory, spelled for the human who has to find it. Without it the
+		// line that says "I am holding this directory and will not let go" said
+		// `data_dir=.`, which is true of every Agent that has ever run and useful to
+		// nobody — see DataDirLabel.
+		DataDirLabel: *dataDir,
+		SocketDir:    *socketDir,
+		// One attempt's bound, not the teardown's: see -shutdown-grace, and
+		// SHUTDOWN-PUBLISH-SPEC's "REVIEWED AND DECIDED" for why there is no budget
+		// after which this process gives a session up.
+		ShutdownGrace: *grace,
 	}, agent.VolumeManagerDeps{
 		Clock:   real.NewClock(),
 		Disk:    disk,
@@ -173,9 +211,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// The teardown is deferred so that every path out of run() — including the wiring
+	// failures below — releases this host's claim on the data directory. Its error is
+	// *joined into run's*, which is the whole point and used not to be: the old shape
+	// logged it from a deferred function, and a deferred function cannot change the
+	// process's exit status, so the Agent exited 0 whether or not the session it was
+	// serving ever reached the bucket.
 	defer func() {
-		if err := volumes.Close(); err != nil {
-			slog.Error("stopping the volume runtimes", "error", err)
+		err = errors.Join(err, shutdown(volumes, loop))
+		if err == nil {
+			// Printed here, after the images are settled, so "stopped" means stopped
+			// rather than "asked to stop". An operator greps for this line to tell a
+			// clean shutdown from a disappearance.
+			slog.Info("volume-agent stopped")
 		}
 	}()
 
@@ -207,6 +255,42 @@ func run() error {
 	if err := loop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	slog.Info("volume-agent stopped")
 	return nil
+}
+
+// shutdown publishes every session this host was serving and does not come back until it
+// has — holding the data-directory lock, and therefore this process's life, for as long
+// as that takes (SHUTDOWN-PUBLISH-SPEC, "REVIEWED AND DECIDED").
+//
+// Two things make that legible instead of merely stubborn, and they are both here:
+//
+//   - **the second signal**, which is the operator's override. It is registered *now* and
+//     not at start-up, because the first one is what got us here and a context registered
+//     before it would already be cancelled. Catching it is safe: signal.Notify delivers to
+//     every registered channel, and run's own handler is still installed (its stop() is
+//     deferred earlier, so it runs after this), which is what keeps the next signal from
+//     killing the process outright while it is holding data.
+//   - **the heartbeat**, which keeps running while we hold. Without it the Control Plane
+//     sees a host that stopped talking — indistinguishable from a crashed one — at exactly
+//     the moment the interesting fact is that the host is alive and stuck. Not the whole
+//     reconcile loop: reading the desired state again would start runtimes this teardown
+//     has just stopped.
+func shutdown(volumes *agent.VolumeManager, loop *agent.Loop) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if loop == nil {
+		return volumes.Close(ctx) // a wiring failure: there are no runtimes and nobody to tell
+	}
+	sustainCtx, done := context.WithCancel(context.Background())
+	sustained := make(chan struct{})
+	go func() {
+		defer close(sustained)
+		loop.Sustain(sustainCtx)
+	}()
+
+	err := volumes.Close(ctx)
+	done()
+	<-sustained // joined rather than left running: it logs, and run() is about to return
+	return err
 }

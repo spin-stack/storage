@@ -83,7 +83,7 @@ func TestAGuestSurvivesAStopAndComesBackFromItsImage(t *testing.T) {
 
 	// (2) Stopping the Agent is what publishes (ADR-0026). Nothing before this left the
 	// host: the guest's fsync ACKed on fdatasync alone.
-	if err := m.Close(); err != nil {
+	if err := m.Close(t.Context()); err != nil {
 		t.Fatalf("stopping the Agent: %v", err)
 	}
 	if len(imageObjects(t, dir)) == 0 {
@@ -104,7 +104,7 @@ func TestAGuestSurvivesAStopAndComesBackFromItsImage(t *testing.T) {
 
 	// (4) A second Agent, a second boot, and the same range read back.
 	m2, sock2 := startAgent(t, ctx, dir, volumeID)
-	defer func() { _ = m2.Close() }()
+	defer func() { _ = m2.Close(t.Context()) }()
 
 	_, out := testinfra.RunLinuxGuest(t, sock2, kernel, initramfs, "spin.mode=verify")
 	switch {

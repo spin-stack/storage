@@ -76,7 +76,7 @@ func TestStoppingAVolumePublishesItsImage(t *testing.T) {
 	}
 	writeOneBlock(t, r.m, v.GetVolumeId())
 
-	if err := r.m.Close(); err != nil {
+	if err := r.m.Close(t.Context()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
@@ -135,8 +135,14 @@ func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
 		t.Fatalf("WriteAt: %v", err)
 	}
 
-	if err := r.m.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	// The refusal is *returned* now, and it is the specific one: since C5 the teardown
+	// tells its caller which sessions did not reach the object store, and ErrNoReadView is
+	// the flavour that must never be retried — the fetch that would have completed the
+	// image is over, so holding the data directory for it would be a wait with no event
+	// that could end it. A store that is merely unreachable is the retried kind.
+	err := r.m.Close(t.Context())
+	if !errors.Is(err, agent.ErrNoReadView) {
+		t.Fatalf("Close reported %v; a volume whose base never resolved must be reported as one this Agent will not publish", err)
 	}
 
 	uu, err := ids.Parse(v.GetVolumeId())
@@ -175,7 +181,7 @@ func TestThePublishedImageHoldsWhatTheGuestWrote(t *testing.T) {
 	if _, err := dev.WriteAt(pattern, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.m.Close(); err != nil {
+	if err := r.m.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 

@@ -129,6 +129,55 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 }
 
+// Sustain keeps this host visible to the Control Plane while the Agent is shutting down
+// and cannot yet let go — a publish that keeps failing holds the data directory, and this
+// is what keeps the fleet able to see the difference between a host that is stuck and a
+// host that is gone (SHUTDOWN-PUBLISH-SPEC, "REVIEWED AND DECIDED"). It returns when ctx
+// is done, which is when the teardown has finished one way or another.
+//
+// It is a *reduced* cycle, and each omission is deliberate:
+//
+//   - it heartbeats, because a lease that lapses is what makes a host look dead;
+//   - it reports the volumes still being held, because a held volume is still this host's
+//     — the epoch has not moved and the Control Plane still names this host its primary,
+//     so the report is accepted and the operator can see the sequence that has not
+//     reached the object store. A volume that has published is out of the served set by
+//     then and simply stops being reported, which is the honest end state;
+//   - it does **not** read the desired state, because applying it would start runtimes
+//     the teardown has just stopped, and this loop would fight the shutdown it is
+//     supposed to narrate;
+//   - it does **not** fence on a refused report. There is nothing left to stop — every
+//     runtime is already quiesced — and the one decision a refusal could inform, whether
+//     to publish, is made by the manifest's compare-and-set, which is authoritative and
+//     cannot be raced by a slower answer over HTTP.
+func (l *Loop) Sustain(ctx context.Context) {
+	for {
+		if err := l.clk.Sleep(ctx, l.cfg.HeartbeatInterval); err != nil {
+			return
+		}
+		usage, err := l.dev.Usage(ctx)
+		if err != nil {
+			slog.Warn("reading the device while shutting down", "error", err, "host_id", l.cfg.HostID)
+			continue
+		}
+		vols, err := l.vols.Volumes(ctx)
+		if err != nil {
+			slog.Warn("reading the volumes still held while shutting down", "error", err, "host_id", l.cfg.HostID)
+			continue
+		}
+		if err := l.heartbeat(ctx, usage, vols); err != nil {
+			// Warned and retried, never returned: the Control Plane being unreachable is
+			// not a reason to stop saying we are here, and this loop's exit condition is
+			// the teardown finishing rather than anything about the fleet.
+			slog.Warn("heartbeat while shutting down", "error", err, "host_id", l.cfg.HostID)
+			continue
+		}
+		if err := l.report(ctx, vols); err != nil {
+			slog.Warn("reporting the volumes still held", "error", err, "host_id", l.cfg.HostID)
+		}
+	}
+}
+
 // nextDelay records the outcome of a cycle and returns how long to wait before the
 // next one: the plain interval after a success, an exponential backoff capped at the
 // interval while failures continue. The cap matters — the Control Plane must hear
