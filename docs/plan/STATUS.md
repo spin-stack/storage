@@ -1362,6 +1362,47 @@ answer is to write the tests the surviving code lacks — not to move the floor.
 `REFERENCE.md`, `RISKS.md` and `INVARIANTS.md`. The head tables are recounted once, at
 integration, by this track; no other track edits them.
 
+### A1 — the architecture document stops contradicting itself (2026-08-04)
+
+`98e38b6` (the document), `725b75e` (`REFERENCE.md` + `RISKS.md`).
+
+**Four lines stated a withdrawn contract in the present tense** and are corrected where
+they stood: the v5.1 changelog bullet announcing the dual durability mode, §4's two ACK
+rows, §8's `durability TEXT NOT NULL DEFAULT 'remote'` (the declared schema dropped that
+column, with the reasoning at `internal/schema/schema.sql:96-102`), and §31's criteria
+3/3b. **Four sections got a banner instead of a rewrite** — §23, §29, §31, §32 — matching
+what §12, §21, §22 and `INVARIANTS.md` already do, and each banner names which parts of
+its own section are still true.
+
+**§17 got line fixes rather than the banner the audit suggested, deliberately.** Its
+*WRITE normal* and *DISCARD* blocks are exactly what the code does; only the FLUSH
+pointer (to §14.4's six steps) and the closing "every FLUSHed write survives host loss"
+were false — and that last one contradicted §2 and §14.8 inside the same file. A banner
+saying "this section is V2" would have been as wrong as the two lines were.
+
+**What is still stale and was deliberately left**, so the next increment has an inventory
+rather than a rediscovery: §5.8 (S3 as recovery authority — INV-08 is boot authority now),
+§11 (I/O classes; `internal/ioclass` is deleted), §14.2/§14.3/§14.4/§14.5 (the remote
+batch and its rules), §16 (the state machine's `SELF_FENCED`/`RECOVERING` arms), §24 (the
+S3 client subsystem), §30's roadmap items 6, 8, 10, 11 and 12. None of them contradicts
+§14.8 in the way §17 and §23 did; all of them describe V2 in the present tense.
+
+**Two claims in files this track does not own were checked and are wrong**, both about
+tests: `integration/vhost/lifecycle_test.go`'s doc comment still describes checkpoints,
+truncation and §21.1 above a function renamed `TestAGuestSurvivesAStopAndComesBackFromItsImage`,
+and `integration/vhost/guest_test.go:38` still says a guest's FLUSH is answered by "our
+§14.4 ACK path — the object verified and the lease valid at the instant of the ACK", when
+`integration/e2e/guest_test.go:75` asserts that same `fsync` publishes **zero** objects.
+The bodies of `## ~~DEV-0007~~` and `## ~~DEV-0022~~` in this file's open-work region name
+the old test too. Track C owns the first, track B the second, and the owner the third.
+
+**`task ci` was red before and after this change**, at `fmt:check` on
+`internal/metadata/pg/pg.go` — another lane's uncommitted gofmt alignment. This increment
+changed three Markdown files. What it is accountable to are the four self-checks in
+`REFERENCE.md`'s header (dangling `§`, and every `ADR-`/`INV-`/`DEV-` the code cites
+resolving), which were run and are all empty; adding the missing `DEV-0022` row is what
+made the last one so.
+
 ## Track B — the gate runs (open work, appended per increment)
 
 *Only track B appends here* — it owns `.github/workflows/`, `Taskfile.yml`, `hack/`,
