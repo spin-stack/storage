@@ -1514,6 +1514,43 @@ of them change in those traces; the mandatory set is green.
 `agent.lock`, which are the only things in there. Verified from `volume-agent -h`, not from
 the source. No other flag help in that binary describes withdrawn behaviour.
 
+### C2 — stop no longer cancels the read it then waits for (2026-08-04)
+
+SHUTDOWN-PUBLISH-SPEC §5, implemented after the human review of 2026-08-04. `fetchBase`
+ran under the serve context, and `stop()` cancels that context and *then* waits on
+`baseDone` — so a volume stopped while its base was still loading cancelled its own read,
+`fetchBase` recorded a failed view, and `publish()` correctly refused to write an image
+missing everything the volume held before this session. The whole session was dropped with
+one log line. It now runs under `context.WithCancel(context.WithoutCancel(ctx))`, released
+by `stop()` *after* publish has used its result. `WithoutCancel` and not `Background`: the
+values (a trace span) are worth keeping and only the cancellation is wrong for this work —
+and not a child of `ctx` either, because that is the Agent loop's context, which SIGTERM
+cancels before `Close()` runs at all.
+
+**What bounds the fetch now: nothing this increment owns.** `-shutdown-grace` does not
+exist yet (the next increment of the same spec), so a stop waits on the store's own
+timeouts. That is the safe direction of the two — a stop that waits too long is visible
+and recoverable, a stop that publishes an image with a hole in it is neither — and it is
+recorded here rather than discovered by whoever meets it.
+
+The proof is a new mandatory DST scenario, `a-volume-stopped-mid-fetch-still-publishes`,
+and it asserts what a *later guest reads back*, not that a context survived. Three
+sessions: one writes and stops so there is a base worth waiting for; the second writes and
+is stopped with its manifest read **blocked inside the store**; the third is a fresh Agent
+on a data directory that has never seen the volume, so only the bucket can answer — and it
+must answer with both patterns. Determinism comes from the release of the blocked read
+being triggered by the *listener closing*, which happens only after the teardown has
+cancelled the serve context; no sleep and no timeout. The hold is a `gatedStore` in the
+scenario rather than a new `sim.ObjectStore` injector: every injector there returns an
+answer, which is a fetch that has already finished, and `sim.ObjectStore`'s methods ignore
+the context by design, so it could not model the cancellation half at all.
+
+Planted bug (restored `context.WithCancel(serveCtx)`, reverted): red on all six seeds —
+*"volume … read zeros at 4096: the image published by the interrupted session is missing
+what the interrupted session wrote"*, with the Agent's own line above it reading *"the
+volume's image could not be loaded … the read of image/…/manifest.json was cancelled while
+it was in flight: context canceled"*.
+
 ## Track D — the catalog (open work, appended per increment)
 
 *Only track D appends here* — it owns `internal/controlplane`, `internal/cpserver`,

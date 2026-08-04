@@ -54,6 +54,7 @@ var pinnedMandatorySet = []string{
 	"a-snapshot-of-a-live-volume-is-frozen",
 	"two-hosts-cannot-both-publish-an-image",
 	"a-rebuilt-catalog-can-serve-its-volumes",
+	"a-volume-stopped-mid-fetch-still-publishes",
 }
 
 // TestMandatorySetIsPinnedByName fails when MandatoryScenarios() and the pinned list

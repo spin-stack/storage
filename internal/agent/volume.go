@@ -71,6 +71,13 @@ type Volume struct {
 
 	cancel context.CancelFunc
 	done   chan struct{}
+	// baseCancel releases the base fetch's context. It is deliberately *not* v.cancel:
+	// stop() cancels the serve context and then waits on baseDone, so a fetch running
+	// under the serve context is cancelled by the very teardown that is about to depend
+	// on its result — see start, where the two contexts are separated, and stop, which
+	// calls this only once publish has consumed what the fetch produced. nil when this
+	// Agent has no object store.
+	baseCancel context.CancelFunc
 	// baseDone is closed once fetchBase has resolved the read view, whether it installed
 	// a base or failed one. stop() waits on it, and the reason is not tidiness: the base
 	// is everything the volume held before this session, so publishing before it lands
@@ -143,6 +150,9 @@ func (v *Volume) Status() VolumeStatus {
 // stop tears the runtime down and waits for the serve loop to leave. Closing the log
 // last is the ordering that matters: the server must stop answering before the thing it
 // answers from goes away.
+//
+// The base fetch is released *last*, after publish has used its result. Cancelling it
+// here, next to v.cancel(), is the shape this used to have and it lost data: see start.
 func (v *Volume) stop() error {
 	v.cancel()
 	<-v.done
@@ -150,6 +160,13 @@ func (v *Volume) stop() error {
 	// frozen view of this log and is the only thing that can finish it.
 	v.snapWG.Wait()
 	v.publish()
+	if v.baseCancel != nil {
+		// Nothing is waiting on the fetch any more, so whatever it is still doing is
+		// work nobody will read. The goroutine has already ended in every path that got
+		// here — publish waits on baseDone — so this is releasing the context's
+		// resources rather than stopping anything (SHUTDOWN-PUBLISH-SPEC §5).
+		v.baseCancel()
+	}
 	return v.log.Close()
 }
 
@@ -599,9 +616,32 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
 	if needsBase {
 		v.baseDone = make(chan struct{})
+		// **Not the serve context, and not a child of ctx either** (SHUTDOWN-PUBLISH-SPEC
+		// §5). Both are cancelled by the thing that then waits for this fetch's result:
+		// stop() cancels the serve context and *then* blocks on baseDone, and ctx here is
+		// the Agent loop's context, which SIGTERM cancels before Close() runs at all. So
+		// a volume stopped while its base was still loading cancelled its own read, set
+		// baseFailed, and publish() then correctly refused to write an image missing
+		// everything the volume held before this session — the whole session dropped,
+		// silently, and reachable by nothing worse than a volume attached shortly before a
+		// restart, a large image, or a slow store.
+		//
+		// context.WithoutCancel keeps the values (a trace span, the deadline-free lineage)
+		// and drops only the cancellation, which is the one thing about the parent that is
+		// wrong for this work. Rejected: context.Background(), which would also discard the
+		// values, and re-deriving from the parent with a longer deadline, which cannot
+		// help — the parent is cancelled, not expired.
+		//
+		// What bounds it, then: today, only the store's own timeouts and the operator's
+		// stop timeout, because the shutdown deadline this should hang off does not exist
+		// yet (-shutdown-grace, the next increment of the same spec). That is deliberate
+		// and it is the safe direction of the two: a stop that waits too long is visible
+		// and recoverable, a stop that publishes an image with a hole in it is neither.
+		baseCtx, baseCancel := context.WithCancel(context.WithoutCancel(ctx))
+		v.baseCancel = baseCancel
 		go func() {
 			defer close(v.baseDone)
-			m.fetchBase(serveCtx, v, [16]byte(u), uint64(d.GetEpoch()), d)
+			m.fetchBase(baseCtx, v, [16]byte(u), uint64(d.GetEpoch()), d)
 		}()
 	}
 	// One line per volume this host starts serving. Everything else the manager logs

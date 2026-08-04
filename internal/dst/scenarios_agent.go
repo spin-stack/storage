@@ -41,6 +41,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "a-snapshot-of-a-live-volume-is-frozen", Run: scenarioASnapshotOfALiveVolumeIsFrozen},
 		{Name: "two-hosts-cannot-both-publish-an-image", Run: scenarioTwoHostsCannotBothPublishAnImage},
 		{Name: "a-rebuilt-catalog-can-serve-its-volumes", Run: scenarioARebuiltCatalogCanServeItsVolumes},
+		{Name: "a-volume-stopped-mid-fetch-still-publishes", Run: scenarioAVolumeStoppedMidFetchStillPublishes},
 	}
 }
 
@@ -991,5 +992,214 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 		return fmt.Errorf("read after restart: %w", readErr)
 	}
 	s.Notef("the restarted volume decrypted its own image and read back what it wrote")
+	return nil
+}
+
+// gatedStore holds one Get — the volume's manifest — until the scenario lets it go, and
+// refuses it outright if the context it was handed has been cancelled meanwhile.
+//
+// It is the fault a `sim.ObjectStore` injector cannot express. Every injector there
+// returns an *answer* (throttled, stale, not found), which is a fetch that has already
+// finished; this scenario needs one that is genuinely **in flight** across another
+// event, because the defect it proves is about what happens to a read while the teardown
+// runs. Adding a hold to sim.ObjectStore was rejected for two reasons: its methods
+// deliberately ignore the context (`_ context.Context`), so it could not model the
+// cancellation half at all, and blocking inside the shared store would stall every
+// unrelated key.
+//
+// The cancellation check is after the wait rather than inside the select, and that is
+// what keeps the scenario deterministic (INV-02). A select with both `ctx.Done()` and
+// `release` ready picks at random, so a bug that cancels this read would be caught only
+// on some runs; re-reading ctx.Err() after either wakes it makes cancellation win
+// whenever it happened at all, which is the outcome the scenario asserts on.
+type gatedStore struct {
+	objectstore.Store
+	key     string
+	arrived chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func newGatedStore(store objectstore.Store, key string) *gatedStore {
+	return &gatedStore{
+		Store: store, key: key,
+		arrived: make(chan struct{}), release: make(chan struct{}),
+	}
+}
+
+func (g *gatedStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if key != g.key {
+		return g.Store.Get(ctx, key)
+	}
+	g.once.Do(func() { close(g.arrived) })
+	select {
+	case <-ctx.Done():
+	case <-g.release:
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("the read of %s was cancelled while it was in flight: %w", key, err)
+	}
+	return g.Store.Get(ctx, key)
+}
+
+// scenarioAVolumeStoppedMidFetchStillPublishes is SHUTDOWN-PUBLISH-SPEC §5, from the
+// only side that can tell: what a later guest reads back.
+//
+// The Agent's base fetch used to run under the serve context, and `stop()` cancels that
+// context and *then* waits for the fetch's result — so a volume stopped while its base
+// was still loading cancelled its own read. `fetchBase` recorded a failed view,
+// `publish()` correctly refused to write an image missing everything the volume held
+// before this session, and the entire session was dropped with nothing but a log line.
+// Every ingredient is ordinary: a volume attached shortly before a restart, an image
+// large enough to take a moment, or a store having a slow minute.
+//
+// The three sessions are the shape of the proof. The first writes and stops, so there is
+// a base worth waiting for. The second writes and is stopped **with its manifest read
+// blocked in the store**, which is the moment the defect lives in. The third is a fresh
+// Agent on a data directory that has never seen this volume, so only the object store
+// can answer it — and it must answer with *both* patterns: the one the base carried and
+// the one the interrupted session wrote. A published image missing either is the loss.
+//
+// Ordering, and it is what makes this deterministic rather than a race the scenario wins
+// most of the time: the release of the blocked read is triggered by the *listener
+// closing*, which happens only after the teardown has cancelled the serve context. Under
+// the defect the read is therefore already cancelled by the time it is released, and
+// under the fix it is not — no sleep, no timeout, and the same trace on every run.
+func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return err
+	}
+	fromTheBase := bytes.Repeat([]byte{0xC3}, 4096)
+	fromTheInterruptedSession := bytes.Repeat([]byte{0x5E}, 4096)
+	const interruptedOffset = 4096
+
+	desired := []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}
+	start := func(dataDir string, store objectstore.Store, listen agent.ListenFunc) (*agent.VolumeManager, error) {
+		return agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: dataDir, SocketDir: "/run/spin",
+			Limits: wal.Limits{SegmentBytes: 8192},
+		}, agent.VolumeManagerDeps{
+			Clock:   s.Clock,
+			Disk:    s.Disk,
+			Listen:  listen,
+			Mapper:  simMapper{},
+			EventFD: simEventFD,
+			Store:   store,
+			Rand:    s.Rand,
+		})
+	}
+	anyListener := func(string) (vhost.Listener, error) { return newSimListener(), nil }
+
+	// Session one: something for the base to hold.
+	first, err := start("/var/lib/spin-midfetch-1", s.Store, anyListener)
+	if err != nil {
+		return err
+	}
+	if err := first.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("starting the volume: %w", err)
+	}
+	dev, ok := first.Device(volumeID)
+	if !ok {
+		return errors.New("the volume is not being served")
+	}
+	// The read is what waits for the base; driving the volume before it lands makes the
+	// trace depend on a goroutine's timing (INV-02).
+	if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
+		return fmt.Errorf("waiting for the read view: %w", err)
+	}
+	if _, err := dev.WriteAt(fromTheBase, 0); err != nil {
+		return fmt.Errorf("the first session's write: %w", err)
+	}
+	if err := first.Close(); err != nil {
+		return fmt.Errorf("stopping the first session: %w", err)
+	}
+	s.Notef("session one published an image for volume %s", volumeID)
+
+	// Session two, on its own data directory, with the manifest read held in the store.
+	gate := newGatedStore(s.Store, image.ManifestKey([16]byte(u)))
+	listeners := make(chan *simListener, 1)
+	second, err := start("/var/lib/spin-midfetch-2", gate, func(string) (vhost.Listener, error) {
+		ln := newSimListener()
+		select {
+		case listeners <- ln:
+		default: // only the first one is the volume's; supervise re-listens after a session ends
+		}
+		return ln, nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := second.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("starting the second session: %w", err)
+	}
+	dev2, ok := second.Device(volumeID)
+	if !ok {
+		return errors.New("the second session is not being served")
+	}
+	// A write, deliberately without a read first: writes do not wait for the base, which
+	// is what makes this session worth saving while its base is still in flight. Reading
+	// here would park until the gate opened and there would be no defect left to catch.
+	if _, err := dev2.WriteAt(fromTheInterruptedSession, interruptedOffset); err != nil {
+		return fmt.Errorf("the interrupted session's write: %w", err)
+	}
+	<-gate.arrived
+	s.Emit(Event{Kind: EventFault, Msg: "the volume is stopped with its base read still in flight"})
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- second.Close() }()
+	ln := <-listeners
+	<-ln.closed // the teardown has begun, and it has cancelled the serve context
+	close(gate.release)
+	if err := <-stopped; err != nil {
+		return fmt.Errorf("stopping the second session: %w", err)
+	}
+
+	// Session three: a fresh Agent on a directory that has never seen this volume, so the
+	// object store is the only thing that can answer it.
+	third, err := start("/var/lib/spin-midfetch-3", s.Store, anyListener)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = third.Close() }()
+	if err := third.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("starting the third session: %w", err)
+	}
+	dev3, ok := third.Device(volumeID)
+	if !ok {
+		return errors.New("the third session is not being served")
+	}
+
+	for _, want := range []struct {
+		what   string
+		offset int64
+		bytes  []byte
+	}{
+		{"the base the interrupted session was still loading", 0, fromTheBase},
+		{"what the interrupted session wrote", interruptedOffset, fromTheInterruptedSession},
+	} {
+		got := make([]byte, len(want.bytes))
+		_, readErr := dev3.ReadAt(got, want.offset)
+		zeros := readErr == nil && bytes.Equal(got, make([]byte, len(got)))
+		foreign := readErr == nil && !zeros && !bytes.Equal(got, want.bytes)
+		s.Emit(Event{Kind: EventDurableRead, Key: volumeID,
+			ZerosAfterRestart: zeros, ForeignBytesAfterRestart: foreign})
+		switch {
+		case readErr != nil:
+			return fmt.Errorf("reading %s at %d: %w", want.what, want.offset, readErr)
+		case zeros:
+			return fmt.Errorf("volume %s read zeros at %d: the image published by the interrupted session is missing %s",
+				volumeID, want.offset, want.what)
+		case foreign:
+			return fmt.Errorf("volume %s read %x… at %d, where %s is %x…",
+				volumeID, got[:8], want.offset, want.what, want.bytes[:8])
+		}
+	}
+	s.Notef("the volume stopped mid-fetch published a complete image: both the base and the session's own write came back")
 	return nil
 }
