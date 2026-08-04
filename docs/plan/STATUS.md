@@ -1592,6 +1592,89 @@ what the interrupted session wrote"*, with the Agent's own line above it reading
 volume's image could not be loaded … the read of image/…/manifest.json was cancelled while
 it was in flight: context canceled"*.
 
+### C5 — the shutdown publish holds the data directory and retries (2026-08-04)
+
+SHUTDOWN-PUBLISH-SPEC's "REVIEWED AND DECIDED", implemented as the owner decided it and
+**not** as the spec below that block proposed: a host that cannot publish does not exit
+non-zero, it refuses to let go. The mechanism is forced — a flock is released by the
+kernel when the process exits, so "refuse to release the lock" can only mean "do not
+exit", which in this code means `VolumeManager.Close` does not return. It quiesces every
+volume, then retries their publishes in rounds, indefinitely, holding the directory and
+the process.
+
+`-shutdown-grace` (new, 60s, mirroring `cmd/control-plane`) is the bound on **one
+attempt**, not on the wait, and nothing here abandons data on a timer. It is armed on the
+injected clock rather than with `context.WithTimeout`, which reads the real one — a
+deadline the DST harness cannot advance either never fires in simulation or fires by
+wall-clock accident. Zero means unbounded, which is what every in-process caller passes,
+so no test or scenario gained a timer.
+
+**Where the loop lives, and why the other two places are wrong.** In the `VolumeManager`.
+Not in `Volume`: the decision is about the *data directory*, which a Volume cannot even
+name, and a per-volume loop inside `stop()` would publish one volume to completion before
+attempting the next, stranding every other session behind the slowest one. Not in `main`:
+`Close` joins its errors, so `main` would have to re-derive which volumes were left, and
+anything that lives only in `main` is what spin's runner does not inherit when it takes
+the manager without the loop (ADR-0021) — which is exactly how `HostID` went missing.
+
+**Volumes retry together, not one at a time.** A round tries every still-unpublished
+volume once, serially within the round, then backs off (2s doubling to 30s). Concurrent
+publishing multiplies the bandwidth a stopping host takes from the ones still serving,
+with no io-class scheduler left to bound it, and interleaves the per-volume lines an
+incident reads. One-to-completion is worse: a failure specific to volume A means volume B
+is never attempted and the operator hears nothing about it.
+
+**Three failures do not retry.** `image.ErrSuperseded` — another writer published over us,
+so retrying would replace a newer image with an older one, which is the one thing INV-10
+exists to prevent, and holding buys nothing because the volume has moved to a host that
+does not care what this directory holds. Exit **2**, meaning *do not restart*. The new
+`agent.ErrNoReadView` — the fetch that would have completed the image is over and this
+process will not attempt another, so holding would be a wait with no event that could end
+it. And the reconciliation teardown (`remove`, i.e. a fence or a promotion) makes exactly
+one attempt and never holds: it runs on the reconcile goroutine, where a retry loop is a
+lease not renewed and every *other* volume on the host fenced.
+
+**The heartbeat keeps running while it holds** (`Loop.Sustain`), because "up and stuck" and
+"gone" must not look the same to the fleet — that legibility is the whole reason the owner
+chose holding over exiting. It is a reduced cycle: heartbeat plus a report of the volumes
+still held (a held volume is still this host's, so the report is accepted), and
+deliberately no `GetDesiredState` — applying it would restart the runtimes the teardown
+just stopped — and no fencing, since nothing is left to stop and the manifest's CAS is the
+authority anyway.
+
+The proof is `integration/e2e/hold_test.go`, with the real binaries: the object store is
+made unreachable by a TCP proxy the test can break (not by stopping the container, which
+would come back on a different port the Agent was never told about), the Agent is
+SIGTERM'd, and it **stays alive** — the holding line appears twice, a second Agent on that
+directory is still refused by the kernel, the bucket is still empty, and the host's
+`last_heartbeat` keeps advancing in the catalog. Then the proxy is restored, nothing
+touches the Agent, the image appears and only then does it exit 0.
+
+Planted bug (teardown returns on the first failure, which is what this increment replaced):
+red, *"agent-1 exited (exit status 1) having printed "agent is holding unpublished data and
+will not release its data directory" 0 time(s), wanted 2"* — a regression test for the
+defect itself. The three unit arms in `internal/agent/hold_test.go` were planted
+separately: giving up on the first failure ("*the bucket still holds no manifest*"),
+retrying `ErrSuperseded` ("*the teardown waited to retry a superseded publish*"), and
+reclaiming the local WAL on the strength of a publish that did not happen ("*…/wal/…/1 is
+empty after an abandoned publish*" — SHUTDOWN-PUBLISH-SPEC §6, pinned).
+
+**A defect the lane found by running the binaries.** The holding line printed
+`data_dir=.`. In production `VolumeManagerConfig.DataDir` *is* `"."` — the Agent's real
+Disk is rooted at `--data-dir` so the process cannot write outside it — so every message
+naming the directory named nothing, on the one line whose entire purpose is to tell an
+operator which directory on which host is stuck. Fixed with `DataDirLabel`, the same
+directory spelled the way the operator spelled it. No in-process test could have seen it:
+they all hand the manager a Disk spanning a whole filesystem, where the two spellings
+agree — the same blind spot that hid `--data-dir` being applied twice.
+
+**Not done here, and deliberately.** No DST scenario for the hold: the harness advances
+its clock on quiescence, so a loop that retries forever is a scenario that never ends, and
+the property under test ("the process is still there and the lock is still refused") is
+about a process and a kernel, which is `integration/e2e`'s job. The retry's *effects* on
+the data path — what publishes, what refuses, what stays in the WAL — are covered by the
+unit arms above and by the existing publish scenarios.
+
 ## Track D — the catalog (open work, appended per increment)
 
 *Only track D appends here* — it owns `internal/controlplane`, `internal/cpserver`,
