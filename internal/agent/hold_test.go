@@ -41,11 +41,19 @@ const holdDataDir = "/var/lib/spin"
 
 func newHoldRig(t *testing.T, store *failingStore, onSleep func(n int)) *holdRig {
 	t.Helper()
+	return newHoldRigWithGrace(t, store, onSleep, 0)
+}
+
+// newHoldRigWithGrace is newHoldRig with an attempt bounded on the simulated clock. Zero
+// — what every other test here passes — arms no timer at all, which is the value that
+// leaves an in-process caller's behaviour exactly as it was.
+func newHoldRigWithGrace(t *testing.T, store *failingStore, onSleep func(n int), grace time.Duration) *holdRig {
+	t.Helper()
 	d := sim.NewDisk()
 	f := newListenerFactory()
 	clk := &steppingClock{Clock: sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), onSleep: onSleep}
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir: holdDataDir, SocketDir: "/run/spin",
+		DataDir: holdDataDir, SocketDir: "/run/spin", ShutdownGrace: grace,
 	}, agent.VolumeManagerDeps{
 		Clock:   clk,
 		Disk:    d,
@@ -195,6 +203,35 @@ func TestASupersededPublishIsNotRetried(t *testing.T) {
 	}
 }
 
+// The one thing -shutdown-grace exists for: a PUT that neither succeeds nor fails. Every
+// other failure mode ends by itself, and a retry loop needs no help with those; a request
+// that hangs would make the teardown wait forever with nothing printed, which is the one
+// shape "holding" cannot be told apart from "hung".
+//
+// The grace cuts the attempt, the loop retries, and the image lands — so the bound is on
+// the attempt and not on the wait, which is the distinction the whole design rests on.
+func TestAHungPublishIsCutShortByTheGraceAndRetried(t *testing.T) {
+	store := &failingStore{Store: sim.NewObjectStore()}
+	r := newHoldRigWithGrace(t, store, nil, 30*time.Second)
+	// The hang, and it is armed for one attempt only. It advances the clock itself
+	// because that is what a real one does while a request sits there: without it the
+	// simulated clock stands still and the grace is a deadline that can never arrive.
+	store.hang = func(ctx context.Context) error {
+		store.hang = nil
+		r.clk.Advance(30 * time.Second)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	v := r.serve(t)
+
+	if err := r.m.Close(t.Context()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := store.Get(t.Context(), r.manifestKey(t, v.GetVolumeId())); err != nil {
+		t.Fatalf("the image never landed after an attempt was cut short by the grace: %v", err)
+	}
+}
+
 // steppingClock is a simulated clock whose Sleep advances time instead of parking until a
 // harness advances it. The retry loop's waits are what a test would otherwise have to
 // spend real seconds on, and a real sleep in a test is the flake CLAUDE.md calls a stop
@@ -238,6 +275,11 @@ var _ clock.Clock = (*steppingClock)(nil)
 type failingStore struct {
 	objectstore.Store
 
+	// hang, when set, is called instead of writing: it models a request that neither
+	// succeeds nor fails until its context says so. Set and cleared by the test that uses
+	// it, before Close is called and from the goroutine that then calls it.
+	hang func(context.Context) error
+
 	mu       sync.Mutex
 	failPuts int
 	failures int
@@ -246,6 +288,9 @@ type failingStore struct {
 var errStoreRefused = errors.New("the object store refused the write")
 
 func (s *failingStore) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	if s.hang != nil {
+		return objectstore.PutResult{}, s.hang(ctx)
+	}
 	s.mu.Lock()
 	fail := s.failPuts != 0
 	if fail {
