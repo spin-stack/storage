@@ -153,6 +153,19 @@ from that audit.
 
 # Open work
 
+**How this region is written while five tracks run at once (from 2026-08-03).**
+`PARALLEL-PLAN.md` splits the remaining 31 increments into five tracks that share one
+working tree, and every increment in every track ends by appending a section here. They
+would all append at the same place — the end of this log — which is a five-way conflict on
+every merge, for a file where a conflict is pure noise: nobody's paragraph contradicts
+anyone else's. So this region **ends with one empty subsection per track**, and a track
+appends only inside its own. The alternative, a `STATUS-<track>.md` per track, was rejected
+because CLAUDE.md makes this the *only* file that tracks state — five files would have to
+be merged into it at integration anyway, having lost the single place a reader looks first.
+The tables at the head of the file are deliberately **not** part of this: they are counters,
+every branch would bump the same integers, and they are recounted once, at integration, by
+track A.
+
 Three deviations, one gap, and one latent correctness hole found by the 2026-07-26
 audit. The build order for all of it is `BUILD-INVENTORY.md`.
 
@@ -1312,6 +1325,37 @@ ADR-0026 either way.
 - ~~**ADR-0026 — does V1 accept an RPO of one session?**~~ **Answered 2026-08-02: yes.**
   Recorded in the ADR with the reasoning; what remains is execution, not a decision.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
+
+## Track A — the documents (open work, appended per increment)
+
+*Only track A appends here* — it owns the architecture document, the head of this file,
+`REFERENCE.md`, `RISKS.md` and `INVARIANTS.md`. The head tables are recounted once, at
+integration, by this track; no other track edits them.
+
+## Track B — the gate runs (open work, appended per increment)
+
+*Only track B appends here* — it owns `.github/workflows/`, `Taskfile.yml`, `hack/`,
+`internal/testinfra`, `integration/guestinit` and `integration/vhost/guest_test.go`. The
+head tables are recounted once, at integration, by track A.
+
+## Track C — the agent data path (open work, appended per increment)
+
+*Only track C appends here* — it owns `internal/agent`, `internal/wal`,
+`cmd/volume-agent`, `integration/e2e` and `integration/vhost/{lifecycle,wal}_test.go`. The
+head tables are recounted once, at integration, by track A.
+
+## Track D — the catalog (open work, appended per increment)
+
+*Only track D appends here* — it owns `internal/controlplane`, `internal/cpserver`,
+`internal/metadata/**`, `internal/db`, `internal/schema`, `internal/lifecycle` and `api/`,
+and it runs as one sequential lane. The head tables are recounted once, at integration, by
+track A.
+
+## Track E — observability (open work, appended per increment)
+
+*Only track E appends here* — it owns `internal/obs`, `internal/vhost`,
+`internal/blockdev` and `internal/cow`. The head tables are recounted once, at integration,
+by track A.
 
 ---
 
