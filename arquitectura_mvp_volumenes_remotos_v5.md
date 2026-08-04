@@ -28,7 +28,7 @@
 
 **Cambios v5.1 (decisiones de construcción — esto se construye, no se sigue recortando alcance)**
 
-- **Modo de durabilidad dual por volumen** (`remote` | `local`): en `local`, el ACK de FLUSH ocurre tras `fdatasync` local y S3 es asíncrono con RPO acotado y **medido**. Los snapshots mantienen semántica idéntica en ambos modos (siempre completos en S3). Ver §14.8.
+- ~~**Modo de durabilidad dual por volumen** (`remote` | `local`)~~ — **retirado por ADR-0026 (2026-08-02).** Hay un solo contrato de ACK y es el que se llamaba `local`: FLUSH → `fdatasync` local → ACK, sin esperar a S3 y sin consultar el lease (§14.8). El volumen entero sube **al parar**. La columna `durability` que guardaba el modo tampoco existe: el esquema declarado la borró en vez de dejarla con un valor que nada consulta (`internal/schema/schema.sql`, líneas 96-102). Lo que sobrevive de este punto son los snapshots — siguen siendo completos en el object store (§19).
 - **Lease por volumen como fase transitoria** (fleets < 50–100 hosts), con renovación **agrupada por host en una sola transacción** desde el día 1. La regla de ACK con reloj monotónico (§12.2) es idéntica en ambas fases. Migración a lease por host = colapso de esquema, no cambio de protocolo.
 - **Object Lock diferido**: versioning + lifecycle desde el día 1; el GC sin permisos de borrado permanente desde el día 1 (delete markers reversibles); Object Lock governance como gate antes del primer dato de producción real.
 - **DST focalizado**: interfaces simulables + property tests del WAL + checkers de invariantes en el harness desde el commit 1; el set obligatorio de escenarios (fencing, partición, PUT perdido) verde en cada PR. El volumen de semillas crece incrementalmente.
@@ -140,6 +140,15 @@ Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un
 
 ## 4. Decisiones principales
 
+> **Parte de esta tabla es V2 desde ADR-0026 (2026-08-02).** Las filas que describen la
+> cadena de durabilidad remota se quedan porque siguen siendo la decisión de V2, no la de
+> V1: autoridad de recovery en S3, WAL remoto y sus tamaños y reglas de cierre de batch,
+> compactación, segmento objectizado, checkpoints, cross-host por materialización y
+> standby tibio, y el lease como puerta del ACK. En V1 el ACK es `fdatasync` local
+> (§14.8), el volumen sube al parar, y del fencing queda un compare-and-set sobre el
+> manifiesto (§12). Las dos filas que afirmaban lo contrario **en presente** están
+> corregidas aquí abajo; el resto se lee contra §14.8.
+
 | Área | Decisión MVP |
 |---|---|
 | Control Plane | Servicio single-active con `term` verificado por transacción |
@@ -151,7 +160,7 @@ Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un
 | Volumen durable | Un ext4 persistente (grow online soportado) |
 | Datos reconstruibles | Un ext4 efímero |
 | Writer | Single writer |
-| **Modo de durabilidad (por volumen)** | **`remote` (default: FLUSH→S3, RPO 0) \| `local` (FLUSH→fdatasync local; S3 async, RPO ≤ unflushed_age, medido)** |
+| **Modo de durabilidad** | **Uno solo, para todos los volúmenes: FLUSH → `fdatasync` local → ACK (§14.8). El par `remote`/`local` y la columna que lo guardaba se retiraron con ADR-0026** |
 | Fencing | Lease + epoch + espera de promoción (TTL + skew); regla de ACK idéntica en ambos modos de lease |
 | Granularidad del lease | **Fase A (< 50–100 hosts): por volumen, renovación agrupada por host. Fase B: por host (§12.6)** |
 | Cota de deriva de reloj asumida | **2 s** (NTP/chrony obligatorio y monitoreado) |
@@ -166,7 +175,7 @@ Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un
 | Compactación de WAL objects | Background, objetivo 64–128 MiB por objeto compactado |
 | Segmento CoW objectized | 128 MiB objetivo |
 | ACK de WRITE normal | Después de append local |
-| ACK de FUA/FLUSH | **Verificación de lease vigente** + `fdatasync` local + PUT remoto verificado |
+| ACK de FUA/FLUSH | **`fdatasync` local, y nada más** (§14.8). Era lease vigente + PUT remoto verificado; eso es V2 |
 | Snapshot | Crash-consistent, captura atómica de sequence, sin pausa; freeze opcional |
 | Profundidad máxima de cadena | 5 niveles → aplanado en background |
 | Queues | Una |
@@ -410,7 +419,11 @@ Operación: PITR obligatorio (WAL-G o pgBackRest hacia el mismo object store), r
 CREATE TABLE volumes (
     volume_id          TEXT PRIMARY KEY,
     size_bytes         BIGINT NOT NULL,          -- mutable: resize grow
-    durability         TEXT NOT NULL DEFAULT 'remote',  -- 'remote' | 'local' (§14.8)
+    -- Sin columna `durability`: ADR-0026 retiró el par 'remote'/'local' y con él la
+    -- columna, en vez de dejarla por defecto en 'remote' — un catálogo que dice
+    -- 'remote' afirma una durabilidad que el data path ya no da, y el que la lee no
+    -- tiene cómo saber que es decoración. El esquema declarado real es
+    -- `internal/schema/schema.sql` (líneas 96-102), que escribe esta misma razón.
     block_size         INTEGER NOT NULL,          -- granularidad de segmentos (64 KiB)
     current_epoch      BIGINT NOT NULL DEFAULT 0,
     state              TEXT NOT NULL,
@@ -904,7 +917,8 @@ Crash/deploy del Agent: las requests en vuelo se recuperan de la inflight shared
 ```text
 Guest WRITE (extent real)
 → append al WAL local (cifrado)
-→ actualizar interval map / active map
+→ actualizar el interval map (`cow.IntervalMap`; el active map de §13.3 se construyó
+  y se borró el 2026-08-02 sin haber tenido nunca un usuario)
 → ACK
 ```
 
@@ -912,7 +926,15 @@ Puede perderse si el host se pierde antes de FLUSH/FUA/snapshot (write-back anun
 
 ### WRITE + FUA / FLUSH
 
-Ver §14.4 (incluye la verificación de lease previa al ACK).
+```text
+Guest FLUSH/FUA
+→ fdatasync local
+→ ACK
+```
+
+Ver **§14.8**, que es el contrato vigente. §14.4 describe los seis pasos de V2 — cerrar el
+batch, PUTs verificados, verificación de lease — retirados por ADR-0026. No hay nada del
+object store ni del lease en este camino.
 
 ### DISCARD / WRITE_ZEROES
 
@@ -923,7 +945,11 @@ Guest DISCARD
 → ACK
 ```
 
-> Todo write cubierto por FLUSH/FUA sobrevive a la pérdida completa del host, **incluida la partición del writer** (garantizado por §12).
+> **Corregido por ADR-0026 (2026-08-02); decía lo contrario de §14.8 dentro de este mismo
+> archivo.** Un write cubierto por FLUSH/FUA sobrevive a la caída del proceso, del Agent y
+> de QEMU. **No sobrevive a la pérdida del host**: ése es el RPO de una sesión que declara
+> §2. Y lo que §12 garantiza hoy no es eso — es que dos incarnaciones del mismo volumen no
+> publiquen las dos al parar.
 
 ---
 
@@ -1018,6 +1044,21 @@ todavía cita se resuelven aquí:
   ningún lector. Registrado en `STATUS.md`, no resuelto aquí.
 
 ## 23. Edge cases
+
+> **Mitad retirada por ADR-0026 (2026-08-02), y no reescrita.** Los casos que describen la
+> cadena de durabilidad remota describen **V2**, y hasta que vuelva contradicen §14.8:
+> *S3 caído* (en V1 S3 no está en el camino de ningún ACK — §14.8, INV-18 — así que un
+> FLUSH completa con el backend caído y lo que falla es parar y publicar), *PostgreSQL
+> caído* (ningún FLUSH depende del lease, y los modos `remote`/`local` que su excepción
+> cita no existen), *WAL remoto subido / manifest no publicado* (no hay WAL remoto ni GC),
+> y *Old writer vuelve* (no hay lease que vencer ni checkpoints que rechazar; queda el CAS
+> del manifiesto al parar, §12).
+>
+> Siguen vigentes tal cual: *PUT exitoso con respuesta perdida*, *Manifest publicado /
+> PostgreSQL no actualizado* y *Crash del Agent con requests en vuelo*. *NVMe lleno*
+> conserva del 3 en adelante — sus dos primeros pasos nombran la objectización y los
+> batches pendientes. *Reloj con deriva excesiva* conserva la alerta y pierde la
+> inelegibilidad para promoción, porque nada promociona.
 
 ### S3 caído
 
@@ -1210,6 +1251,15 @@ Failover de writer, restore de PG (PITR + rebuild-metadata), pérdida de nodo de
 
 Actualizado: se eliminan las resueltas por diseño en v5 y se agregan las nuevas que v5 introduce.
 
+> **Cuatro de las ocho se fueron con ADR-0026 (2026-08-02), no se resolvieron.** Son
+> debilidades *de la cadena de durabilidad remota* y vuelven con ella: la **1** (el FLUSH
+> ya no paga red ni PUT — el ACK es `fdatasync`, §14.8), la **2** (ningún ACK depende del
+> lease, así que PostgreSQL caído no degrada durabilidad), la **3** (nada promociona) y la
+> **8** (no hay objectización ni truncado a media sesión). La **4** cambia de forma: un
+> clon en otro host paga la descarga completa, y sin standby tibio ni lazy loading la
+> mitigación que queda es arrancar el clon en el host de origen (§20). **5, 6 y 7 siguen
+> en pie.** El estado de cada una vive en `docs/plan/RISKS.md`, no aquí.
+
 ### 1. Latencia de FLUSH/FUA ligada al object store (sigue siendo la más importante)
 
 **Problema**: workloads con fsync frecuente pagan red + PUT por commit. Es inherente al modelo sin réplica host-to-host.
@@ -1275,10 +1325,18 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 
 ## 31. Criterios de éxito del MVP
 
+> **Cuatro criterios son de V2 desde ADR-0026 (2026-08-02)** y no se pueden cumplir ni
+> fallar en V1, porque su sujeto no existe: el **4** (ningún ACK con lease vencido), el
+> **8** (stale writer incapaz de confirmar durabilidad tras `lease_ttl`), el **10**
+> (recovery cuyo punto durable se determina desde S3) y el **14** (WAL no eliminado antes
+> de durabilidad remota verificada; GC). El **7** conserva el clon cross-host y pierde el
+> standby tibio; el **15** nombra `wal_objects`, que ya no existen, y habrá que decir
+> sobre qué se mide antes de poder cumplirlo. El resto sigue siendo el criterio de V1, y
+> el **3** —que decía en presente el contrato retirado— está reescrito.
+
 1. Boot con los tres dispositivos.
 2. Docker/containerd solo en efímero.
-3. FLUSH exitoso en modo `remote` sobrevive a pérdida del host **y a la partición del writer** (demostrado por el harness DST con checkers de invariantes; el volumen de semillas crece incrementalmente).
-3b. En modo `local`: RPO medido ≤ `max_unflushed_age` en el test de pérdida de host, y snapshots siempre completos en S3.
+3. Un FLUSH ACKeado sobrevive a la caída del proceso, del Agent y de QEMU; el volumen entero llega al object store al parar y un arranque posterior lo lee de vuelta. **La pérdida del host pierde la sesión** (RPO de una sesión, §2, ADR-0026). Demostrado por el harness DST con checkers de invariantes y por el lane de guest real.
 4. Ningún ACK de durabilidad emitido con lease vencido (invariante DST).
 5. Snapshot portable, crash-consistent, con `snapshot_pause_duration ≈ 0`.
 6. Clone same-host sin transferencia significativa.
@@ -1299,6 +1357,15 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 ---
 
 ## 32. Conclusión
+
+> **Es el resumen del sistema completo, y su mitad remota está retirada (ADR-0026,
+> 2026-08-02).** En V1: el lease manager no gobierna ningún ACK (es liveness, §14.8); no
+> hay objectizer, compactador ni standby hidrator; el object store no guarda WAL objects,
+> checkpoints, summary ni recovery-points, y no es la autoridad de ningún punto durable —
+> guarda **una imagen por volumen y sus snapshots**, escritos al parar; y el fencing es un
+> compare-and-set sobre el manifiesto en ese momento (§12), no una ventana cerrada por
+> leases. Sigue exacto todo lo demás: los tres dispositivos, el CoW, el cifrado de todo lo
+> que sale del host, el WAL local, y que **no existe replicación host-to-host**.
 
 ```text
 PostgreSQL
@@ -1329,8 +1396,8 @@ S3 (backend con durabilidad exigida; versioning + Object Lock en prod)
 ```text
 WRITE normal   → WAL local (extent real, cifrado) → ACK
 DISCARD        → record sin payload → ACK
-FLUSH / FUA    → fdatasync local → PUTs paralelos verificados
-               → lease vigente (reloj monotónico) → durable_sequence → ACK
+FLUSH / FUA    → fdatasync local → durable_sequence → ACK      (§14.8)
+STOP           → la imagen del volumen sale al object store, CAS del manifiesto
 SNAPSHOT       → capturar N → publicar en background → pausa ≈ 0
 ```
 
