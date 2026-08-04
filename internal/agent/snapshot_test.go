@@ -107,32 +107,35 @@ func (c *countingStore) puts() int {
 func TestARepeatedSnapshotRequestIsTakenOnce(t *testing.T) {
 	snapID := ids.New().String()
 	counting := &countingStore{Store: sim.NewObjectStore()}
-	r := newPublishRig(t, counting)
-	defer func() { _ = r.m.Close() }()
+	// Not newPublishRig: a rig hands back the store the manager wrote to, and there is no
+	// such store behind a double. The evidence here is the double itself — how many times
+	// the Put was attempted — so the manager alone is what this test needs.
+	m := newPublishManager(t, counting)
+	defer func() { _ = m.Close() }()
 	d := desiredVolume(t, 1)
-	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	writeOneBlock(t, r.m, d.GetVolumeId())
+	writeOneBlock(t, m, d.GetVolumeId())
 
 	counting.key = "image/" + d.GetVolumeId() + "/snapshots/" + snapID + ".json"
 	d.PendingSnapshotId = snapID
 	for range 5 {
-		if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
+		if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
 	}
-	st := waitForSnapshotReport(t, r.m, d.GetVolumeId())
+	st := waitForSnapshotReport(t, m, d.GetVolumeId())
 	if st.SnapshotError != "" {
 		t.Fatalf("a repeated request produced an error: %s", st.SnapshotError)
 	}
 
 	// And it applies again after the answer is in, which is what the Control Plane does
 	// until it has recorded the report.
-	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{d}); err != nil {
 		t.Fatalf("Apply after the answer: %v", err)
 	}
-	again := waitForSnapshotReport(t, r.m, d.GetVolumeId())
+	again := waitForSnapshotReport(t, m, d.GetVolumeId())
 	if again.SnapshotSequence != st.SnapshotSequence || again.SnapshotError != "" {
 		t.Fatalf("the answer changed on a repeat: %+v then %+v", st, again)
 	}

@@ -3,6 +3,8 @@ package agent_test
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -21,9 +23,27 @@ type publishRig struct {
 	store *sim.ObjectStore
 }
 
-func newPublishRig(t *testing.T, store objectstore.Store) *publishRig {
+// newPublishRig takes the concrete *sim.ObjectStore rather than the objectstore.Store
+// interface, and that is the whole fix for an assertion that could not fail. A rig exists
+// to hand a test back the very store the manager wrote through, because every check in
+// this file is about what is *in the bucket*. The earlier signature took the interface and
+// kept the concrete store only if a type assertion happened to succeed (`sto, _ :=`), so a
+// caller passing a double got a nil one — and the test below quietly listed a *freshly
+// constructed* store instead: an empty bucket, and a pass whatever the code did.
+// Narrowing the parameter makes that unrepresentable rather than merely corrected.
+//
+// A test that needs a double takes newPublishManager and asserts through the double.
+func newPublishRig(t *testing.T, store *sim.ObjectStore) *publishRig {
 	t.Helper()
-	sto, _ := store.(*sim.ObjectStore)
+	return &publishRig{m: newPublishManager(t, store), store: store}
+}
+
+// newPublishManager is the manager on its own, for a test whose evidence is not the
+// bucket's contents — it wraps the store in something that counts or fails calls, and
+// asserts on that. It returns no rig deliberately: there is no store such a test could
+// honestly read back.
+func newPublishManager(t *testing.T, store objectstore.Store) *agent.VolumeManager {
+	t.Helper()
 	f := newListenerFactory()
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
@@ -39,7 +59,7 @@ func newPublishRig(t *testing.T, store objectstore.Store) *publishRig {
 	if err != nil {
 		t.Fatalf("NewVolumeManager: %v", err)
 	}
-	return &publishRig{m: m, store: sto}
+	return m
 }
 
 // Stopping a volume is V1's entire durability contract (ADR-0026): nothing else leaves
@@ -69,17 +89,39 @@ func TestStoppingAVolumePublishesItsImage(t *testing.T) {
 	}
 }
 
-// A volume whose read view never resolved must not publish, and this is the sharp edge:
-// its view is missing everything the base held, and publishing CASes that partial view
-// **over the manifest the base came from**. It would replace the volume's history with a
-// subset of it — worse than not publishing at all.
+// A volume whose read view never resolved must not publish: its view is not a subset of
+// the truth, it is a different thing, and writing it down makes it the truth.
+//
+// The fixture is a **clone whose parent snapshot was never published**, and that choice is
+// the test. It is the shape of the failure that nothing else refuses: the clone has no
+// image of its own, so `image.Publish` CASes with an empty ETag — create-only — and it
+// *succeeds*. What lands is a manifest claiming to be this volume's whole state while
+// naming only the chunks this session happened to write; the next boot resolves it with no
+// error anywhere and serves a volume missing everything it inherited.
+//
+// The obvious alternative fixture — an object store that answers nothing, so the volume's
+// *own* manifest cannot be read — was rejected twice over. It cannot fail: such a volume
+// has a manifest in the bucket, so the create-only Put loses the compare-and-set and the
+// bucket is identical with or without the guard; and a store that fails every read also
+// fails `uploadChunks`'s Head, so the publish would die of the double rather than of the
+// rule under test.
+//
+// The volume writes a block before it stops for the same reason: with an empty view a
+// wrong publish has nothing to carry, and an assertion about a bucket nobody could have
+// written to proves nothing about the guard. What is asserted is the manifest — its
+// absence, and on failure the chunk count it named, which is the fact that separates
+// "published a partial view" from "correctly published nothing".
 func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
-	r := newPublishRig(t, newUnreachableStore())
+	r := newPublishRig(t, sim.NewObjectStore())
 	v := desiredVolume(t, 1)
+	// Cloned (§20) from a snapshot that is not in this bucket: fetchBase cannot
+	// materialize the parent, so it fails the read view rather than layering an empty one
+	// underneath — which would read as zeros for the parent's whole extent.
+	v.ParentSnapshotId, v.ParentVolumeId = ids.New().String(), ids.New().String()
 	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	// The read is what waits for the base, and it must fail: the store answers nothing.
+	// The read is what waits for the base, and it must fail: the parent resolves to nothing.
 	dev, ok := r.m.Device(v.GetVolumeId())
 	if !ok {
 		t.Fatal("no device")
@@ -87,14 +129,32 @@ func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
 	if _, err := dev.ReadAt(make([]byte, testBlockSize), 0); err == nil {
 		t.Fatal("a read was answered with no recoverable base")
 	}
+	// The bytes a wrong publish would put in the bucket. Writes do not wait on the base —
+	// only reads do — so this volume takes them and has a view to publish.
+	if _, err := dev.WriteAt(bytes.Repeat([]byte{0x5C}, testBlockSize), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
 
 	if err := r.m.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// Nothing was written — asserted against a real store underneath the unreachable
-	// facade, so this checks what was stored rather than what the facade reported.
-	if objs, _ := sim.NewObjectStore().List(t.Context(), "image/"); len(objs) != 0 {
-		t.Fatal("a volume with no base published anyway")
+
+	uu, err := ids.Parse(v.GetVolumeId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := image.ManifestKey([16]byte(uu))
+	body, err := r.store.Get(t.Context(), key)
+	switch {
+	case err == nil:
+		var man image.Manifest
+		if perr := json.Unmarshal(body, &man); perr != nil {
+			t.Fatalf("a volume with no base published %s, and it does not parse: %v", key, perr)
+		}
+		t.Fatalf("a volume whose base never resolved published %s naming %d chunk(s) at sequence %d: that manifest is now the volume's entire state, and everything it inherited from snapshot %s is unreachable",
+			key, len(man.Chunks), man.Sequence, v.GetParentSnapshotId())
+	case !errors.Is(err, objectstore.ErrNotFound):
+		t.Fatalf("reading %s: %v", key, err)
 	}
 }
 
