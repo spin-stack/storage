@@ -17,13 +17,22 @@
 // It is PID 1 in an initramfs, so there is no libc, no shell, no mount table and nothing
 // to clean up after it. It never returns: PID 1 exiting panics the kernel, which reads as
 // a crash rather than a verdict, so it always powers the machine off itself.
+//
+// Three modes, chosen by `spin.mode=` on the kernel command line and described where they
+// are declared below. The third — hold — is the one that makes a guest something a host
+// test can act *upon* rather than wait for: it keeps writing until the host tells it to
+// stop, over the return direction of the same serial line the verdicts go out on.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // The device the backend serves over vhost-user-blk. virtio_blk is compiled into the
@@ -50,12 +59,29 @@ const (
 	stride = 64 << 10
 )
 
+// Where the long-running mode writes. Past the range above, on purpose: a hold-mode run
+// and a write/verify run of the same volume must not be able to satisfy each other's
+// assertions, and overlapping ranges are how that happens by accident.
+const (
+	holdOffset = 2 << 20
+	holdBlocks = 8
+)
+
 // verdict lines the host test greps for. The prefix is unlikely to appear in kernel
 // output, and the host asserts on the exact strings — a lane that "passes" because its
 // pattern stopped matching is the failure mode this guards against.
 const (
 	verdictPass = "GUESTINIT-PASS"
 	verdictFail = "GUESTINIT-FAIL"
+	// verdictAlive is the heartbeat of the long-running mode, printed after each
+	// iteration's fsync and never before it, so a host that saw one knows a FLUSH was
+	// answered rather than knowing that time passed.
+	verdictAlive = "GUESTINIT-ALIVE"
+	// stopCommand is what the host sends down the serial line to end a hold-mode run.
+	// The guest powers itself off in response, which is the difference between "the
+	// test stopped the VM" and "the guest finished": only the second leaves the volume
+	// in a state something inside the guest agreed to.
+	stopCommand = "GUESTCTL-STOP"
 )
 
 func main() {
@@ -72,7 +98,7 @@ func main() {
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	openConsole()
 
-	if err := run(verifyOnly()); err != nil {
+	if err := run(mode()); err != nil {
 		report("%s %v", verdictFail, err)
 	} else {
 		report("%s", verdictPass)
@@ -80,22 +106,52 @@ func main() {
 	powerOff()
 }
 
-// verifyOnly reports whether the host asked this boot to *check* the device rather than
-// write to it, via `spin.mode=verify` on the kernel command line.
+// The three things a boot can be asked to do, via `spin.mode=` on the kernel command
+// line.
+const (
+	// modeWrite writes, fsyncs and reads back, then powers off. The default, and what
+	// the FLUSH proof needs.
+	modeWrite = "write"
+	// modeVerify checks the device without writing to it. The second boot of a volume
+	// is the only way to prove what the host left behind: the first boot writes and
+	// fsyncs, the host publishes, and this boot reads the same range back. Doing it in
+	// one boot would prove nothing — the data would still be in the page cache and in
+	// the local WAL.
+	modeVerify = "verify"
+	// modeHold keeps writing until the host says stop. It exists so that something else
+	// can happen while a guest is running: until it did, every guest in this repository
+	// wrote once and powered off, and so every snapshot, restart and clone the lanes
+	// exercised happened over a device nobody was using.
+	modeHold = "hold"
+)
+
+// holdInterval paces the hold loop.
 //
-// The second boot of a volume is the only way to prove what a checkpoint and a
-// truncation left behind: the first boot writes and fsyncs, the host publishes and
-// reclaims, and this boot reads the same range back. Doing it in one boot would prove
-// nothing — the data would still be in the page cache and in the local WAL.
-func verifyOnly() bool {
+// A sleep in this repository is normally a stop signal, and it is not one here for a
+// reason that does not generalise: this program runs inside the VM, on the far side of
+// the interface simio models (DEV-0013), and there is no injected clock to reach. What
+// the pacing buys is the loop being *observable* — unpaced, a 4 KiB write and an fsync
+// per iteration bury the heartbeat the host is waiting for under thousands of lines a
+// second and fill the host's WAL with hundreds of megabytes of a pattern nobody reads.
+const holdInterval = 50 * time.Millisecond
+
+// mode reports what this boot was asked to do. An unrecognised value is an error rather
+// than a fall-back to the default: `spin.mode=hodl` silently doing the write-and-verify
+// run would leave a lane green while testing something else entirely.
+func mode() string {
 	cmdline, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
-		return false
+		return modeWrite
 	}
-	return bytes.Contains(cmdline, []byte("spin.mode=verify"))
+	for _, word := range strings.Fields(string(cmdline)) {
+		if v, ok := strings.CutPrefix(word, "spin.mode="); ok {
+			return v
+		}
+	}
+	return modeWrite
 }
 
-func run(verify bool) error {
+func run(m string) error {
 	// Plain O_RDWR: no O_SYNC, no O_DIRECT. Either would make the write durable on its
 	// own and leave fsync nothing to do — which would prove less, not more. The point
 	// is that a *buffered* write plus fsync produces a FLUSH, because that is what a
@@ -111,14 +167,19 @@ func run(verify bool) error {
 		pattern[i] = byte('A' + (i % 23))
 	}
 
-	if verify {
+	switch m {
+	case modeVerify:
 		// Nothing written and nothing synced: whatever comes back was put there by a
 		// previous boot and survived whatever the host did in between.
-		return readBack(pattern)
+		return readBack(pattern, writeOffsets()...)
+	case modeHold:
+		return hold(f, pattern)
+	case modeWrite:
+	default:
+		return fmt.Errorf("unknown spin.mode=%s on the kernel command line", m)
 	}
 
-	for i := range blocks {
-		off := int64(writeOffset + i*stride)
+	for _, off := range writeOffsets() {
 		if _, err := f.WriteAt(pattern, off); err != nil {
 			return fmt.Errorf("writing at %d: %w", off, err)
 		}
@@ -135,12 +196,82 @@ func run(verify bool) error {
 		return fmt.Errorf("fsync (the FLUSH this lane exists for): %w", err)
 	}
 
-	return readBack(pattern)
+	return readBack(pattern, writeOffsets()...)
 }
 
-// readBack re-reads the range through a *fresh* descriptor, so the answer cannot come
-// from this process's own page cache.
-func readBack(pattern []byte) error {
+// writeOffsets is where the write/verify pair puts its pattern.
+func writeOffsets() []int64 {
+	offs := make([]int64, blocks)
+	for i := range offs {
+		offs[i] = int64(writeOffset + i*stride)
+	}
+	return offs
+}
+
+// hold writes and fsyncs the pattern in a loop, announcing each one, until the host says
+// stop. It is what a "live guest" means on this side: a device with real virtio traffic
+// on it at the moment the host does something else.
+//
+// The stop is checked *after* an iteration rather than before, so a run always leaves at
+// least one write behind however quickly the host stops it — an assertion about what a
+// live guest wrote must not be able to pass over a guest that wrote nothing.
+func hold(f *os.File, pattern []byte) error {
+	stopped, err := watchForStop()
+	if err != nil {
+		return err
+	}
+	for i := 1; ; i++ {
+		off := int64(holdOffset + ((i-1)%holdBlocks)*stride)
+		if _, err := f.WriteAt(pattern, off); err != nil {
+			return fmt.Errorf("hold: writing at %d: %w", off, err)
+		}
+		// Per iteration, and it is the point: the heartbeat below is printed only after
+		// a FLUSH the host answered, so "the guest is alive" is a statement about the
+		// backend serving it and not about a loop spinning.
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("hold: fsync at %d: %w", off, err)
+		}
+		report("%s %d %d", verdictAlive, i, off)
+
+		if stopped.Load() {
+			// Read back what this run last wrote, through a fresh descriptor. Without
+			// it a hold run could report PASS having written to a device that answered
+			// every request with nothing.
+			return readBack(pattern, off)
+		}
+		time.Sleep(holdInterval)
+	}
+}
+
+// watchForStop reads the console — the other direction of the serial line the verdicts
+// go out on — and latches the host's stop command.
+//
+// A whole channel for one word looks like a lot; the alternatives were worse. Killing
+// QEMU proves nothing about the guest and leaves a write half-issued; a fixed iteration
+// count makes the guest's lifetime a race against whatever the host is doing; and a
+// sentinel the host writes into the block device would need the host to reach around the
+// Agent that owns it.
+func watchForStop() (*atomic.Bool, error) {
+	var stopped atomic.Bool
+	in, err := os.OpenFile("/dev/console", os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening the console to listen for %s: %w", stopCommand, err)
+	}
+	go func() {
+		sc := bufio.NewScanner(in)
+		for sc.Scan() {
+			if strings.Contains(sc.Text(), stopCommand) {
+				stopped.Store(true)
+				return
+			}
+		}
+	}()
+	return &stopped, nil
+}
+
+// readBack re-reads the given offsets through a *fresh* descriptor, so the answer cannot
+// come from this process's own page cache.
+func readBack(pattern []byte, offsets ...int64) error {
 	g, err := os.Open(device)
 	if err != nil {
 		return fmt.Errorf("reopening %s: %w", device, err)
@@ -148,8 +279,7 @@ func readBack(pattern []byte) error {
 	defer func() { _ = g.Close() }()
 
 	got := make([]byte, patternBytes)
-	for i := range blocks {
-		off := int64(writeOffset + i*stride)
+	for _, off := range offsets {
 		if _, err := g.ReadAt(got, off); err != nil {
 			return fmt.Errorf("reading back at %d: %w", off, err)
 		}

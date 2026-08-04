@@ -72,7 +72,7 @@ func TestAGuestSurvivesAStopAndComesBackFromItsImage(t *testing.T) {
 	m, sock := startAgent(t, ctx, dir, volumeID)
 
 	// (1) The guest writes and fsyncs.
-	if _, out := testinfra.RunLinuxGuest(t, ctx, sock, kernel, initramfs); !strings.Contains(out, "GUESTINIT-PASS") {
+	if _, out := testinfra.RunLinuxGuest(t, sock, kernel, initramfs); !strings.Contains(out, "GUESTINIT-PASS") {
 		t.Fatalf("the first boot did not report a pass:\n%s", testinfra.VerdictLines(out))
 	}
 
@@ -106,7 +106,7 @@ func TestAGuestSurvivesAStopAndComesBackFromItsImage(t *testing.T) {
 	m2, sock2 := startAgent(t, ctx, dir, volumeID)
 	defer func() { _ = m2.Close() }()
 
-	_, out := testinfra.RunLinuxGuest(t, ctx, sock2, kernel, initramfs, "spin.mode=verify")
+	_, out := testinfra.RunLinuxGuest(t, sock2, kernel, initramfs, "spin.mode=verify")
 	switch {
 	case strings.Contains(out, "GUESTINIT-FAIL"):
 		t.Fatalf("after a checkpoint and a truncation the guest could not read its own data:\n%s",

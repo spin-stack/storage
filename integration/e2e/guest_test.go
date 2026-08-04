@@ -62,7 +62,7 @@ func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
 			len(keys), volumeID, keys)
 	}
 
-	code, out := testinfra.RunLinuxGuest(t, t.Context(), sock, kernel, initramfs)
+	code, out := testinfra.RunLinuxGuest(t, sock, kernel, initramfs)
 	switch {
 	case strings.Contains(out, "GUESTINIT-FAIL"):
 		t.Fatalf("the guest reported a failure:\n%s", testinfra.VerdictLines(out))

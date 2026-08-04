@@ -42,7 +42,7 @@ func TestASnapshotOfALiveVolumeIsPublished(t *testing.T) {
 	})
 	agent.WaitForLine(t, "serving volume", 30*time.Second)
 
-	code, out := testinfra.RunLinuxGuest(t, t.Context(), sock, kernel, initramfs)
+	code, out := testinfra.RunLinuxGuest(t, sock, kernel, initramfs)
 	if !strings.Contains(out, "GUESTINIT-PASS") {
 		t.Fatalf("the guest never reported a verdict (exit %d):\n%s", code, testinfra.VerdictLines(out))
 	}

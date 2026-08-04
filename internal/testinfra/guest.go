@@ -3,8 +3,6 @@
 package testinfra
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -72,13 +70,118 @@ func QEMUPaths(t *testing.T) (bin, bios string) {
 	return bin, bios
 }
 
-// RunLinuxGuest boots kernel+initramfs against sock and returns QEMU's exit code and the
-// guest's console output.
-func RunLinuxGuest(t *testing.T, ctx context.Context, sock, kernel, initramfs string, extraCmdline ...string) (int, string) {
+// The contract with integration/guestinit, from the host's side. guestinit is a `main`
+// package, so these strings cannot be shared as constants with the program that reads and
+// prints them — they are written down here instead, next to the code that depends on
+// them, rather than spelled out again in every lane.
+const (
+	// GuestHold puts guestinit in its long-running mode: it writes and fsyncs a pattern
+	// in a loop, prints GuestAlive after each one, and stops when it is told to.
+	//
+	// It exists because every guest this repository ever booted wrote once and powered
+	// off, so nothing could ever be observed *while* a guest was running — every
+	// snapshot, restart and clone in these lanes happened over a device whose guest had
+	// already gone.
+	GuestHold = "spin.mode=hold"
+
+	// GuestAlive is the heartbeat, printed after the fsync of each iteration and never
+	// before it. Waiting for one is therefore waiting for a FLUSH this backend answered,
+	// which is what makes it evidence rather than a timer.
+	GuestAlive = "GUESTINIT-ALIVE"
+
+	// guestStop is what Guest.Stop sends down the serial line. A word rather than a
+	// signal to QEMU: SIGINT tears the machine down from outside, which proves nothing
+	// about the guest and leaves the volume mid-write. This has to travel *through* the
+	// guest — it is read by a process inside the VM, which then powers the machine off
+	// itself — so a guest that answers it was demonstrably alive at that instant.
+	guestStop = "GUESTCTL-STOP"
+)
+
+// Guest is a QEMU that is still running. It is the whole reason this file changed shape:
+// the previous entry point ended in cmd.Run(), so a test could have a guest or have
+// something else happen, never both.
+type Guest struct {
+	proc *Process
+}
+
+// StartLinuxGuest boots kernel+initramfs against sock and returns while the guest is
+// still running. The caller drives it through the console — waiting for a line it
+// printed, telling it to stop — and QEMU is killed by the test's cleanup regardless.
+func StartLinuxGuest(t *testing.T, sock, kernel, initramfs string, extraCmdline ...string) *Guest {
 	t.Helper()
 	bin, bios := QEMUPaths(t)
+	return &Guest{proc: Start(t, ProcessConfig{
+		Name: "guest",
+		Path: bin,
+		Args: guestArgs(bios, sock, kernel, initramfs, extraCmdline),
+		// The return channel. `-serial stdio` is bidirectional and this half of it was
+		// never used: the guest's ttyS0 input is this pipe, which is how Stop reaches a
+		// program running inside the VM.
+		Stdin: true,
+	})}
+}
 
-	args := []string{
+// WaitForLine blocks until the guest's console has carried a line containing want.
+func (g *Guest) WaitForLine(t *testing.T, want string, timeout time.Duration) {
+	t.Helper()
+	g.proc.WaitForLine(t, want, timeout)
+}
+
+// Console is everything the guest has printed so far — the kernel's log and guestinit's
+// verdicts, in the order the serial port carried them.
+func (g *Guest) Console() string { return strings.Join(g.proc.Output(), "\n") }
+
+// Stop tells the guest to finish and waits for the machine to go down, returning the
+// console output.
+//
+// Deliberately not a kill: what a test wants to know after driving a live guest is that
+// the volume was left in a state the guest agreed to, and a QEMU killed from outside
+// leaves a half-written block and a WAL nobody promised anything about. The guest powers
+// itself off, so what this waits for is QEMU exiting because the machine did.
+func (g *Guest) Stop(t *testing.T, timeout time.Duration) string {
+	t.Helper()
+	g.proc.WriteLine(t, guestStop)
+	code, out := g.Wait(t, timeout)
+	if code != 0 {
+		t.Fatalf("the guest was told to stop and QEMU exited %d:\n%s", code, tailOf(out, 40))
+	}
+	return out
+}
+
+// Wait blocks until QEMU exits and returns its status and the guest's console output.
+func (g *Guest) Wait(t *testing.T, timeout time.Duration) (int, string) {
+	t.Helper()
+	err := g.proc.Wait(t, timeout)
+	out := g.Console()
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		return 0, out
+	case errors.As(err, &exitErr):
+		return exitErr.ExitCode(), out
+	default:
+		// Either QEMU never got started, or it outlived the deadline and was killed —
+		// both are "the guest did not finish", and neither is a verdict.
+		t.Fatalf("the guest did not finish within %s (TCG is slow, but not this slow): %v\n%s",
+			timeout, err, tailOf(out, 40))
+		return -1, ""
+	}
+}
+
+// RunLinuxGuest boots kernel+initramfs against sock and returns QEMU's exit code and the
+// guest's console output once the guest has powered itself off.
+//
+// It is the blocking form, kept because most lanes want exactly it: a guest that writes,
+// verifies and goes away. Everything it does now happens through the handle above, so
+// there is one QEMU command line and one place a boot can be debugged from.
+func RunLinuxGuest(t *testing.T, sock, kernel, initramfs string, extraCmdline ...string) (int, string) {
+	t.Helper()
+	return StartLinuxGuest(t, sock, kernel, initramfs, extraCmdline...).Wait(t, GuestBootTimeout)
+}
+
+// guestArgs is the QEMU command line, in one place because two entry points now use it.
+func guestArgs(bios, sock, kernel, initramfs string, extraCmdline []string) []string {
+	return []string{
 		"-L", bios,
 		"-machine", "q35,accel=kvm:tcg,memory-backend=mem",
 		"-m", "256M",
@@ -103,28 +206,6 @@ func RunLinuxGuest(t *testing.T, ctx context.Context, sock, kernel, initramfs st
 		"-vga", "none",
 		"-net", "none",
 		"-no-reboot",
-	}
-
-	cctx, cancel := context.WithTimeout(ctx, GuestBootTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, bin, args...)
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-
-	err := cmd.Run()
-	if cctx.Err() != nil {
-		t.Fatalf("the guest did not finish within %s (TCG is slow, but not this slow):\n%s",
-			GuestBootTimeout, tailOf(out.String(), 40))
-	}
-	var exitErr *exec.ExitError
-	switch {
-	case err == nil:
-		return 0, out.String()
-	case errors.As(err, &exitErr):
-		return exitErr.ExitCode(), out.String()
-	default:
-		t.Fatalf("QEMU: %v\n%s", err, out.String())
-		return -1, ""
 	}
 }
 
