@@ -13,20 +13,18 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
 // Descriptor is the durable, self-describing metadata of a volume (§8, §22.5).
 type Descriptor struct {
-	VolumeID     string               `json:"volume_id"`
-	SizeBytes    int64                `json:"size_bytes"`
-	BlockSize    int32                `json:"block_size"`
-	Durability   lifecycle.Durability `json:"durability"`
-	CurrentEpoch int64                `json:"current_epoch"` // last known; the epoch object is authoritative
-	ChainDepth   int32                `json:"chain_depth"`
-	KEKID        string               `json:"kek_id"`
-	DEKWrapped   []byte               `json:"dek_wrapped"`
+	VolumeID     string `json:"volume_id"`
+	SizeBytes    int64  `json:"size_bytes"`
+	BlockSize    int32  `json:"block_size"`
+	CurrentEpoch int64  `json:"current_epoch"` // last known; the epoch object is authoritative
+	ChainDepth   int32  `json:"chain_depth"`
+	KEKID        string `json:"kek_id"`
+	DEKWrapped   []byte `json:"dek_wrapped"`
 	// DEKKeyID is the DEK's version (§15.1). It is here and not only in the catalog
 	// because §22.5's rebuild-metadata reads this object to reconstruct a volume the
 	// database no longer describes — and a volume rebuilt with its wrapped DEK but

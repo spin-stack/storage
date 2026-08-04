@@ -36,7 +36,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
-		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, Durability: lifecycle.DurabilityRemote,
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		// Deliberately not 1. A parent at the first version would let an implementation
 		// that hardcodes "the first version" pass this test — which one did, until the
 		// assertion below was checked against a planted bug.

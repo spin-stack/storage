@@ -199,12 +199,7 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 			return s.SetHostState(ctx, term, "h", lifecycle.HostState("PUBLISHED"))
 		}},
 		{"CreateVolume with the zero state", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v", Durability: lifecycle.DurabilityRemote}, nil)
-		}},
-		{"CreateVolume with an unknown durability", func(s *sim.Store, term int64) error {
-			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
-				VolumeID: "v", State: lifecycle.VolumeActive, Durability: lifecycle.Durability("cheap"),
-			}, nil)
+			return s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v"}, nil)
 		}},
 		{"CreateSnapshot with an unknown state", func(s *sim.Store, term int64) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: "s", State: lifecycle.SnapshotState("DONE")})

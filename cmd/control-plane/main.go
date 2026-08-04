@@ -35,7 +35,6 @@ import (
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/pg"
 	"github.com/spin-stack/storage/internal/placement"
@@ -75,7 +74,6 @@ func run() error {
 		seedHost   = flag.String("seed-host", "", "with -seed-volume: the host that will serve it (a UUIDv7)")
 		seedSize   = flag.Int64("seed-size", 1<<30, "with -seed-volume: capacity in bytes (a whole number of 512-byte sectors)")
 		seedBlock  = flag.Int("seed-block-size", 4096, "with -seed-volume: logical block size")
-		seedLocal  = flag.Bool("seed-local-durability", false, "with -seed-volume: ACK FLUSH on fdatasync instead of on a verified object (§14.8)")
 		kekFile    = flag.String("kek-file", "", "file holding the 32-byte key-encryption key (required for -seed-volume)")
 
 		// snapshot-volume: record a snapshot request and exit, the same shape as
@@ -137,15 +135,14 @@ func run() error {
 			return fmt.Errorf("-seed-volume needs a Control Plane to be leading (start one first): %w", lerr)
 		}
 		slog.Info("seeding under the current term", "holder_id", leader.HolderID, "term", leader.Term)
-		durability := lifecycle.DurabilityRemote
-		if *seedLocal {
-			durability = lifecycle.DurabilityLocal
-		}
+		// No -seed-local-durability: ADR-0026 left one ACK contract, so the flag
+		// selected between a mode that exists and a mode that does not. Keeping it as
+		// a no-op would be worse than removing it — an operator who passes it is told
+		// nothing, and believes they changed what a FLUSH means.
 		return seed(ctx, md, store, *kekFile, controlplane.VolumeSpec{
-			SizeBytes:  *seedSize,
-			BlockSize:  int32(*seedBlock),
-			HostID:     *seedHost,
-			Durability: durability,
+			SizeBytes: *seedSize,
+			BlockSize: int32(*seedBlock),
+			HostID:    *seedHost,
 		}, leader.Term)
 	}
 
@@ -262,7 +259,7 @@ func seed(ctx context.Context, md metadata.Store, store objectstore.Store, kekFi
 	}
 	slog.Info("volume provisioned",
 		"volume_id", vol.VolumeID, "host_id", spec.HostID,
-		"size_bytes", spec.SizeBytes, "durability", spec.Durability, "dek_key_id", vol.KeyID)
+		"size_bytes", spec.SizeBytes, "dek_key_id", vol.KeyID)
 	return nil
 }
 

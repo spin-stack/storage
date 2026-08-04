@@ -82,14 +82,6 @@ enum VolumeState {
   VOLUME_STATE_DETACHED = 6;
 }
 
-// Durability mirrors internal/lifecycle.Durability — the per-volume FLUSH/FUA
-// ACK contract (§14.8).
-enum Durability {
-  DURABILITY_UNSPECIFIED = 0;
-  DURABILITY_REMOTE = 1;
-  DURABILITY_LOCAL = 2;
-}
-
 // DeviceStatus is what the Agent observes about the NVMe device it owns
 // (ADR-0013). All three numbers are needed and none is derivable from the
 // others: total and used give the pressure thresholds, and the remote backlog is
@@ -147,7 +139,13 @@ message DesiredVolume {
   // reports about this volume is qualified by it.
   int64 epoch = 4;
   VolumeState state = 5;
-  Durability durability = 6;
+  // 6 was `Durability durability`, the per-volume §14.8 FLUSH/FUA ACK contract.
+  // ADR-0026 withdrew the remote mode, so the local ACK is the only contract and
+  // there is nothing for the Agent to be told; it never read the field. Reserved
+  // rather than reused because a peer built before this change decodes field 6 as
+  // an enum, and a new field with a different type at the same number is the one
+  // way a wire format lies to a reader that is otherwise doing everything right.
+  reserved 6;
   // parent_snapshot_id and parent_volume_id name the snapshot this volume was
   // cloned from (§20), and the volume that snapshot belongs to. Both empty for a
   // volume that was created rather than cloned.

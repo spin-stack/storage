@@ -93,8 +93,13 @@ CREATE TABLE host_leases (
 CREATE TABLE volumes (
     volume_id          UUIDV7 PRIMARY KEY,              -- = on-disk VolumeID [16]byte
     size_bytes         BIGINT NOT NULL,                 -- mutable: resize grow
-    durability         TEXT NOT NULL DEFAULT 'remote'
-                         CHECK (durability IN ('remote', 'local')),   -- §14.8
+    -- There is no durability column. §14.8 once stored a per-volume FLUSH ACK
+    -- contract here ('remote' | 'local'); ADR-0026 withdrew the remote half, leaving
+    -- the local ACK as the only contract and the column as a value every write set,
+    -- every read parsed, and nothing ever branched on. Dropping it rather than
+    -- leaving it defaulted is deliberate: a column that still says 'remote' is a
+    -- catalog claiming a durability the data path no longer provides, and the next
+    -- reader has no way to tell it is decoration.
     block_size         INTEGER NOT NULL,                -- CoW segment granularity (64 KiB)
     current_epoch      BIGINT NOT NULL DEFAULT 0,
     state              TEXT NOT NULL                                  -- §7 failover states

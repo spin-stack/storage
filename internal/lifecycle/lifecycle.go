@@ -430,32 +430,13 @@ func (p OperationPhase) Predecessors() []OperationPhase { return phaseMachine.pr
 // PredecessorNames is Predecessors as stored strings — the store's SQL guard.
 func (p OperationPhase) PredecessorNames() []string { return names(p.Predecessors()) }
 
-// --- Durability mode (§14.8) ---
-
-// Durability is the per-volume FLUSH/FUA ACK contract as the Control Plane stores it
-// (§14.8). The data path's counterpart is wal.DurabilityMode; wal owns the single
-// mapping between the two so they cannot drift.
-type Durability string
-
-// Durability modes (§14.8).
-const (
-	DurabilityRemote Durability = "remote"
-	DurabilityLocal  Durability = "local"
-)
-
-var durabilityMachine = newMachine("durability",
-	[]Durability{DurabilityRemote, DurabilityLocal}, nil)
-
-// Durabilities returns every durability mode.
-func Durabilities() []Durability { return durabilityMachine.all }
-
-// ParseDurability converts a stored value, rejecting anything else.
-func ParseDurability(raw string) (Durability, error) { return durabilityMachine.parse(raw) }
-
-func (d Durability) String() string { return string(d) }
-
-// Valid reports whether d is a declared durability mode.
-func (d Durability) Valid() bool { return durabilityMachine.valid(d) }
-
-// Remote reports whether FLUSH/FUA ACKs require verified S3 durability (§14.8).
-func (d Durability) Remote() bool { return d == DurabilityRemote }
+// There is no durability mode here any more. §14.8 once let a volume choose between
+// ACKing a FLUSH on the local fdatasync and ACKing it only once a verified object
+// existed; ADR-0026 withdrew the remote half, so the local ACK is the *only* contract
+// and there is nothing left to select. The enum outlived it by a whole increment —
+// stored in a column, carried on the wire, written into the descriptor, validated at
+// three boundaries — and no reader anywhere branched on it. A mode nobody can select
+// is not an option kept open, it is a second contract that has to be kept correct for
+// free, and the day someone re-reads it the code will silently promise durability the
+// data path stopped providing. Reintroducing a choice means reintroducing the
+// mechanism that honours it, and that is ADR-0026's decision to reopen, not a field's.

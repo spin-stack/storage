@@ -436,13 +436,6 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if err != nil {
 		return err
 	}
-	durability := v.Durability
-	if durability == "" {
-		durability = lifecycle.DurabilityRemote
-	}
-	if !durability.Valid() {
-		return fmt.Errorf("%w: durability %q", lifecycle.ErrUnknownState, v.Durability)
-	}
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
@@ -463,7 +456,7 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 		return err
 	}
 	rows, err := s.q.CreateVolume(ctx, db.CreateVolumeParams{
-		VolumeID: id, SizeBytes: v.SizeBytes, Durability: durability.String(),
+		VolumeID: id, SizeBytes: v.SizeBytes,
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
 		DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
 		ParentSnapshotID: parentSnap,
@@ -484,18 +477,14 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 }
 
 // volumeFromRow converts a generated row to the interface type, parsing its state
-// and durability rather than trusting the column.
+// rather than trusting the column.
 func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 	state, err := lifecycle.ParseVolumeState(v.State)
 	if err != nil {
 		return metadata.Volume{}, fmt.Errorf("volume %s: %w", v.VolumeID, err)
 	}
-	durability, err := lifecycle.ParseDurability(v.Durability)
-	if err != nil {
-		return metadata.Volume{}, fmt.Errorf("volume %s: %w", v.VolumeID, err)
-	}
 	return metadata.Volume{
-		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes, Durability: durability,
+		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes,
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: state,
 		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
 		ChainDepth: v.ChainDepth, ParentSnapshotID: fromNullUUID(v.ParentSnapshotID),

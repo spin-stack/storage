@@ -71,7 +71,6 @@ type Snapshot struct {
 type Volume struct {
 	VolumeID          uuid.UUID          `json:"volume_id"`
 	SizeBytes         int64              `json:"size_bytes"`
-	Durability        string             `json:"durability"`
 	BlockSize         int32              `json:"block_size"`
 	CurrentEpoch      int64              `json:"current_epoch"`
 	State             string             `json:"state"`

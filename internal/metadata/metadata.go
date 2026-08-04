@@ -255,7 +255,6 @@ func PlanReservations(currentState []byte) []PlanReservation {
 type Volume struct {
 	VolumeID      string
 	SizeBytes     int64
-	Durability    lifecycle.Durability // §14.8
 	BlockSize     int32
 	CurrentEpoch  int64
 	State         lifecycle.VolumeState

@@ -148,57 +148,6 @@ func (VolumeState) EnumDescriptor() ([]byte, []int) {
 	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{1}
 }
 
-// Durability mirrors internal/lifecycle.Durability — the per-volume FLUSH/FUA
-// ACK contract (§14.8).
-type Durability int32
-
-const (
-	Durability_DURABILITY_UNSPECIFIED Durability = 0
-	Durability_DURABILITY_REMOTE      Durability = 1
-	Durability_DURABILITY_LOCAL       Durability = 2
-)
-
-// Enum value maps for Durability.
-var (
-	Durability_name = map[int32]string{
-		0: "DURABILITY_UNSPECIFIED",
-		1: "DURABILITY_REMOTE",
-		2: "DURABILITY_LOCAL",
-	}
-	Durability_value = map[string]int32{
-		"DURABILITY_UNSPECIFIED": 0,
-		"DURABILITY_REMOTE":      1,
-		"DURABILITY_LOCAL":       2,
-	}
-)
-
-func (x Durability) Enum() *Durability {
-	p := new(Durability)
-	*p = x
-	return p
-}
-
-func (x Durability) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (Durability) Descriptor() protoreflect.EnumDescriptor {
-	return file_spin_storage_v1_control_plane_proto_enumTypes[2].Descriptor()
-}
-
-func (Durability) Type() protoreflect.EnumType {
-	return &file_spin_storage_v1_control_plane_proto_enumTypes[2]
-}
-
-func (x Durability) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use Durability.Descriptor instead.
-func (Durability) EnumDescriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{2}
-}
-
 // ReportOutcome says what happened to one report. A refusal is information the
 // Agent acts on — STALE_EPOCH or NOT_PRIMARY means this host is no longer the
 // writer and must stop behaving like one.
@@ -250,11 +199,11 @@ func (x ReportOutcome) String() string {
 }
 
 func (ReportOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_spin_storage_v1_control_plane_proto_enumTypes[3].Descriptor()
+	return file_spin_storage_v1_control_plane_proto_enumTypes[2].Descriptor()
 }
 
 func (ReportOutcome) Type() protoreflect.EnumType {
-	return &file_spin_storage_v1_control_plane_proto_enumTypes[3]
+	return &file_spin_storage_v1_control_plane_proto_enumTypes[2]
 }
 
 func (x ReportOutcome) Number() protoreflect.EnumNumber {
@@ -263,7 +212,7 @@ func (x ReportOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ReportOutcome.Descriptor instead.
 func (ReportOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{3}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{2}
 }
 
 // DeviceStatus is what the Agent observes about the NVMe device it owns
@@ -531,9 +480,8 @@ type DesiredVolume struct {
 	BlockSize int32                  `protobuf:"varint,3,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
 	// epoch is the volume's current epoch (§12.3). Everything the Agent later
 	// reports about this volume is qualified by it.
-	Epoch      int64       `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	State      VolumeState `protobuf:"varint,5,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
-	Durability Durability  `protobuf:"varint,6,opt,name=durability,proto3,enum=spin.storage.v1.Durability" json:"durability,omitempty"`
+	Epoch int64       `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	State VolumeState `protobuf:"varint,5,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
 	// parent_snapshot_id and parent_volume_id name the snapshot this volume was
 	// cloned from (§20), and the volume that snapshot belongs to. Both empty for a
 	// volume that was created rather than cloned.
@@ -629,13 +577,6 @@ func (x *DesiredVolume) GetState() VolumeState {
 		return x.State
 	}
 	return VolumeState_VOLUME_STATE_UNSPECIFIED
-}
-
-func (x *DesiredVolume) GetDurability() Durability {
-	if x != nil {
-		return x.Durability
-	}
-	return Durability_DURABILITY_UNSPECIFIED
 }
 
 func (x *DesiredVolume) GetParentSnapshotId() string {
@@ -1144,7 +1085,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xf9\x02\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xc2\x02\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1152,13 +1093,10 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\n" +
 	"block_size\x18\x03 \x01(\x05R\tblockSize\x12\x14\n" +
 	"\x05epoch\x18\x04 \x01(\x03R\x05epoch\x122\n" +
-	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x12;\n" +
-	"\n" +
-	"durability\x18\x06 \x01(\x0e2\x1b.spin.storage.v1.DurabilityR\n" +
-	"durability\x12,\n" +
+	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x12,\n" +
 	"\x12parent_snapshot_id\x18\a \x01(\tR\x10parentSnapshotId\x12(\n" +
 	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\x12.\n" +
-	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\"S\n" +
+	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotIdJ\x04\b\x06\x10\a\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +
@@ -1203,12 +1141,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x19VOLUME_STATE_FENCING_WAIT\x10\x03\x12\"\n" +
 	"\x1eVOLUME_STATE_RECOVERY_REQUIRED\x10\x04\x12\x1b\n" +
 	"\x17VOLUME_STATE_RECOVERING\x10\x05\x12\x19\n" +
-	"\x15VOLUME_STATE_DETACHED\x10\x06*U\n" +
-	"\n" +
-	"Durability\x12\x1a\n" +
-	"\x16DURABILITY_UNSPECIFIED\x10\x00\x12\x15\n" +
-	"\x11DURABILITY_REMOTE\x10\x01\x12\x14\n" +
-	"\x10DURABILITY_LOCAL\x10\x02*\xd0\x01\n" +
+	"\x15VOLUME_STATE_DETACHED\x10\x06*\xd0\x01\n" +
 	"\rReportOutcome\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REPORT_OUTCOME_ACCEPTED\x10\x01\x12\x1e\n" +
@@ -1234,48 +1167,46 @@ func file_spin_storage_v1_control_plane_proto_rawDescGZIP() []byte {
 	return file_spin_storage_v1_control_plane_proto_rawDescData
 }
 
-var file_spin_storage_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_spin_storage_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_spin_storage_v1_control_plane_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_spin_storage_v1_control_plane_proto_goTypes = []any{
 	(HostState)(0),                    // 0: spin.storage.v1.HostState
 	(VolumeState)(0),                  // 1: spin.storage.v1.VolumeState
-	(Durability)(0),                   // 2: spin.storage.v1.Durability
-	(ReportOutcome)(0),                // 3: spin.storage.v1.ReportOutcome
-	(*DeviceStatus)(nil),              // 4: spin.storage.v1.DeviceStatus
-	(*HeartbeatRequest)(nil),          // 5: spin.storage.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),         // 6: spin.storage.v1.HeartbeatResponse
-	(*GetDesiredStateRequest)(nil),    // 7: spin.storage.v1.GetDesiredStateRequest
-	(*DesiredVolume)(nil),             // 8: spin.storage.v1.DesiredVolume
-	(*GetDesiredStateResponse)(nil),   // 9: spin.storage.v1.GetDesiredStateResponse
-	(*GetVolumeKeysRequest)(nil),      // 10: spin.storage.v1.GetVolumeKeysRequest
-	(*GetVolumeKeysResponse)(nil),     // 11: spin.storage.v1.GetVolumeKeysResponse
-	(*VolumeReport)(nil),              // 12: spin.storage.v1.VolumeReport
-	(*ReportVolumeStateRequest)(nil),  // 13: spin.storage.v1.ReportVolumeStateRequest
-	(*VolumeReportResult)(nil),        // 14: spin.storage.v1.VolumeReportResult
-	(*ReportVolumeStateResponse)(nil), // 15: spin.storage.v1.ReportVolumeStateResponse
+	(ReportOutcome)(0),                // 2: spin.storage.v1.ReportOutcome
+	(*DeviceStatus)(nil),              // 3: spin.storage.v1.DeviceStatus
+	(*HeartbeatRequest)(nil),          // 4: spin.storage.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),         // 5: spin.storage.v1.HeartbeatResponse
+	(*GetDesiredStateRequest)(nil),    // 6: spin.storage.v1.GetDesiredStateRequest
+	(*DesiredVolume)(nil),             // 7: spin.storage.v1.DesiredVolume
+	(*GetDesiredStateResponse)(nil),   // 8: spin.storage.v1.GetDesiredStateResponse
+	(*GetVolumeKeysRequest)(nil),      // 9: spin.storage.v1.GetVolumeKeysRequest
+	(*GetVolumeKeysResponse)(nil),     // 10: spin.storage.v1.GetVolumeKeysResponse
+	(*VolumeReport)(nil),              // 11: spin.storage.v1.VolumeReport
+	(*ReportVolumeStateRequest)(nil),  // 12: spin.storage.v1.ReportVolumeStateRequest
+	(*VolumeReportResult)(nil),        // 13: spin.storage.v1.VolumeReportResult
+	(*ReportVolumeStateResponse)(nil), // 14: spin.storage.v1.ReportVolumeStateResponse
 }
 var file_spin_storage_v1_control_plane_proto_depIdxs = []int32{
-	4,  // 0: spin.storage.v1.HeartbeatRequest.device:type_name -> spin.storage.v1.DeviceStatus
+	3,  // 0: spin.storage.v1.HeartbeatRequest.device:type_name -> spin.storage.v1.DeviceStatus
 	0,  // 1: spin.storage.v1.HeartbeatResponse.state:type_name -> spin.storage.v1.HostState
 	1,  // 2: spin.storage.v1.DesiredVolume.state:type_name -> spin.storage.v1.VolumeState
-	2,  // 3: spin.storage.v1.DesiredVolume.durability:type_name -> spin.storage.v1.Durability
-	8,  // 4: spin.storage.v1.GetDesiredStateResponse.volumes:type_name -> spin.storage.v1.DesiredVolume
-	12, // 5: spin.storage.v1.ReportVolumeStateRequest.volumes:type_name -> spin.storage.v1.VolumeReport
-	3,  // 6: spin.storage.v1.VolumeReportResult.outcome:type_name -> spin.storage.v1.ReportOutcome
-	14, // 7: spin.storage.v1.ReportVolumeStateResponse.results:type_name -> spin.storage.v1.VolumeReportResult
-	5,  // 8: spin.storage.v1.ControlPlaneService.Heartbeat:input_type -> spin.storage.v1.HeartbeatRequest
-	7,  // 9: spin.storage.v1.ControlPlaneService.GetDesiredState:input_type -> spin.storage.v1.GetDesiredStateRequest
-	13, // 10: spin.storage.v1.ControlPlaneService.ReportVolumeState:input_type -> spin.storage.v1.ReportVolumeStateRequest
-	10, // 11: spin.storage.v1.ControlPlaneService.GetVolumeKeys:input_type -> spin.storage.v1.GetVolumeKeysRequest
-	6,  // 12: spin.storage.v1.ControlPlaneService.Heartbeat:output_type -> spin.storage.v1.HeartbeatResponse
-	9,  // 13: spin.storage.v1.ControlPlaneService.GetDesiredState:output_type -> spin.storage.v1.GetDesiredStateResponse
-	15, // 14: spin.storage.v1.ControlPlaneService.ReportVolumeState:output_type -> spin.storage.v1.ReportVolumeStateResponse
-	11, // 15: spin.storage.v1.ControlPlaneService.GetVolumeKeys:output_type -> spin.storage.v1.GetVolumeKeysResponse
-	12, // [12:16] is the sub-list for method output_type
-	8,  // [8:12] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	7,  // 3: spin.storage.v1.GetDesiredStateResponse.volumes:type_name -> spin.storage.v1.DesiredVolume
+	11, // 4: spin.storage.v1.ReportVolumeStateRequest.volumes:type_name -> spin.storage.v1.VolumeReport
+	2,  // 5: spin.storage.v1.VolumeReportResult.outcome:type_name -> spin.storage.v1.ReportOutcome
+	13, // 6: spin.storage.v1.ReportVolumeStateResponse.results:type_name -> spin.storage.v1.VolumeReportResult
+	4,  // 7: spin.storage.v1.ControlPlaneService.Heartbeat:input_type -> spin.storage.v1.HeartbeatRequest
+	6,  // 8: spin.storage.v1.ControlPlaneService.GetDesiredState:input_type -> spin.storage.v1.GetDesiredStateRequest
+	12, // 9: spin.storage.v1.ControlPlaneService.ReportVolumeState:input_type -> spin.storage.v1.ReportVolumeStateRequest
+	9,  // 10: spin.storage.v1.ControlPlaneService.GetVolumeKeys:input_type -> spin.storage.v1.GetVolumeKeysRequest
+	5,  // 11: spin.storage.v1.ControlPlaneService.Heartbeat:output_type -> spin.storage.v1.HeartbeatResponse
+	8,  // 12: spin.storage.v1.ControlPlaneService.GetDesiredState:output_type -> spin.storage.v1.GetDesiredStateResponse
+	14, // 13: spin.storage.v1.ControlPlaneService.ReportVolumeState:output_type -> spin.storage.v1.ReportVolumeStateResponse
+	10, // 14: spin.storage.v1.ControlPlaneService.GetVolumeKeys:output_type -> spin.storage.v1.GetVolumeKeysResponse
+	11, // [11:15] is the sub-list for method output_type
+	7,  // [7:11] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_spin_storage_v1_control_plane_proto_init() }
@@ -1288,7 +1219,7 @@ func file_spin_storage_v1_control_plane_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_spin_storage_v1_control_plane_proto_rawDesc), len(file_spin_storage_v1_control_plane_proto_rawDesc)),
-			NumEnums:      4,
+			NumEnums:      3,
 			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,

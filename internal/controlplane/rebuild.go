@@ -33,7 +33,7 @@ type RebuildSummary struct {
 //
 // # What it restores, and what it cannot
 //
-// It restores what the objects state: geometry, durability, the wrapped DEK with the
+// It restores what the objects state: geometry, the wrapped DEK with the
 // version that names it, the chain depth and the parent link, and the snapshots that
 // exist under each volume's prefix. It does **not** restore placement — no volume comes
 // back with a primary host — because no object records one. A rebuilt catalog therefore
@@ -99,10 +99,9 @@ func RebuildMetadata(ctx context.Context, md metadata.Store, store objectstore.S
 
 func volumeFromDescriptor(d descriptor.Descriptor) metadata.Volume {
 	return metadata.Volume{
-		VolumeID:   d.VolumeID,
-		SizeBytes:  d.SizeBytes,
-		BlockSize:  d.BlockSize,
-		Durability: d.Durability,
+		VolumeID:  d.VolumeID,
+		SizeBytes: d.SizeBytes,
+		BlockSize: d.BlockSize,
 		// Authoritative now: the epoch object this used to defer to went with the
 		// fencing chain (ADR-0026). It is still the fencing token a later promotion
 		// would build on, so it must not come back lower than it was — which the

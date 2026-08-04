@@ -289,7 +289,6 @@ func TestParseRejectsAnythingElse(t *testing.T) {
 		{"SnapshotState", func(s string) error { _, err := lifecycle.ParseSnapshotState(s); return err }},
 		{"OperationPhase", func(s string) error { _, err := lifecycle.ParseOperationPhase(s); return err }},
 		{"OperationKind", func(s string) error { _, err := lifecycle.ParseOperationKind(s); return err }},
-		{"Durability", func(s string) error { _, err := lifecycle.ParseDurability(s); return err }},
 	}
 	bad := []string{"", " ", "active", "ACTIVE ", "nonsense", "0"}
 	for _, tc := range tests {
@@ -336,11 +335,6 @@ func TestParseRoundTripsEveryValue(t *testing.T) {
 			t.Fatalf("OperationKind %q: got %q err=%v", k, got, err)
 		}
 	}
-	for _, d := range lifecycle.Durabilities() {
-		if got, err := lifecycle.ParseDurability(d.String()); err != nil || got != d {
-			t.Fatalf("Durability %q: got %q err=%v", d, got, err)
-		}
-	}
 }
 
 // TestValidRejectsTheZeroValue: a struct field nobody set must not look like a state.
@@ -352,23 +346,11 @@ func TestValidRejectsTheZeroValue(t *testing.T) {
 		s  lifecycle.SnapshotState
 		p  lifecycle.OperationPhase
 		k  lifecycle.OperationKind
-		d  lifecycle.Durability
-		ok = []bool{h.Valid(), v.Valid(), a.Valid(), s.Valid(), p.Valid(), k.Valid(), d.Valid()}
+		ok = []bool{h.Valid(), v.Valid(), a.Valid(), s.Valid(), p.Valid(), k.Valid()}
 	)
 	for i, valid := range ok {
 		if valid {
 			t.Fatalf("zero value %d reported itself valid", i)
 		}
-	}
-}
-
-// TestDurabilityIsRemoteByDefaultOnlyWhenAsked documents the §14.8 pair; the mapping
-// to the data path's mode is asserted in the wal package.
-func TestDurability(t *testing.T) {
-	if !lifecycle.DurabilityRemote.Remote() || lifecycle.DurabilityLocal.Remote() {
-		t.Fatal("Remote() must distinguish the two §14.8 modes")
-	}
-	if len(lifecycle.Durabilities()) != 2 {
-		t.Fatalf("§14.8 defines exactly two modes, got %v", lifecycle.Durabilities())
 	}
 }

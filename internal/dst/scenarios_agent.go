@@ -156,12 +156,11 @@ func fencedVolumeStopsServing(s *Sim, ignoreFencing bool) error {
 	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
 	desired := func(epoch int64) []*storagev1.DesiredVolume {
 		return []*storagev1.DesiredVolume{{
-			VolumeId:   volumeID,
-			SizeBytes:  1 << 20,
-			BlockSize:  512,
-			Epoch:      epoch,
-			Durability: storagev1.Durability_DURABILITY_REMOTE,
-			State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+			VolumeId:  volumeID,
+			SizeBytes: 1 << 20,
+			BlockSize: 512,
+			Epoch:     epoch,
+			State:     storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 		}}
 	}
 
@@ -360,7 +359,6 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 
 	desired := &storagev1.DesiredVolume{
 		VolumeId: cloneID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
-		Durability:       storagev1.Durability_DURABILITY_REMOTE,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 		ParentSnapshotId: snapID,
 		ParentVolumeId:   parentID,
@@ -454,8 +452,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 		return err
 	}
 	vol := metadata.Volume{
-		VolumeID: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512,
-		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
+		VolumeID: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, State: lifecycle.VolumeActive,
 		PrimaryHostID: host, CurrentEpoch: 1,
 		DEKWrapped: wrapped, KEKID: "kek-dst", DEKKeyID: dek.KeyID,
 	}
@@ -463,8 +460,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 		return err
 	}
 	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
-		VolumeID: vol.VolumeID, SizeBytes: vol.SizeBytes, BlockSize: vol.BlockSize,
-		Durability: vol.Durability, CurrentEpoch: vol.CurrentEpoch,
+		VolumeID: vol.VolumeID, SizeBytes: vol.SizeBytes, BlockSize: vol.BlockSize, CurrentEpoch: vol.CurrentEpoch,
 		KEKID: vol.KEKID, DEKWrapped: vol.DEKWrapped, DEKKeyID: vol.DEKKeyID,
 	}); err != nil {
 		return err
@@ -502,8 +498,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 	}
 	desired := []*storagev1.DesiredVolume{{
 		VolumeId: vol.VolumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_REMOTE,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}
 
 	first, err := start("/var/lib/spin", keysFrom(md))
@@ -609,8 +604,7 @@ func twoHostsCannotBothPublish(s *Sim, ignorePreconditions bool) error {
 	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
 	desired := []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_REMOTE,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}
 	start := func(dataDir string) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
@@ -768,8 +762,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	defer func() { _ = source.Close() }()
 	if err := source.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: sourceID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_REMOTE,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		return fmt.Errorf("starting the source volume: %w", err)
 	}
@@ -810,7 +803,6 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	defer func() { _ = clone.Close() }()
 	if err := clone.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
-		Durability:       storagev1.Durability_DURABILITY_REMOTE,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 		ParentSnapshotId: snapID,
 		ParentVolumeId:   sourceID,
@@ -890,8 +882,7 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 
 	desired := []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_REMOTE,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}
 
 	start := func(dataDir string, store objectstore.Store) (*agent.VolumeManager, error) {

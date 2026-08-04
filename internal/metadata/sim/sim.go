@@ -318,12 +318,6 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, b
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
-	if v.Durability == "" {
-		v.Durability = lifecycle.DurabilityRemote // the §14.8 default, as in the DB
-	}
-	if !v.Durability.Valid() {
-		return fmt.Errorf("%w: durability %q", lifecycle.ErrUnknownState, v.Durability)
-	}
 	// INV-03 at birth: a row created out of order can never be repaired, because
 	// every later report only moves each watermark forward.
 	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {

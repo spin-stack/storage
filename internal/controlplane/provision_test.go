@@ -66,10 +66,9 @@ func TestProvisionCreatesTheRowTheKeyAndTheDescriptor(t *testing.T) {
 	p := controlplane.NewProvisioner(md, store, kms, &ramp{})
 
 	vol, err := p.Provision(t.Context(), term, controlplane.VolumeSpec{
-		SizeBytes:  1 << 30,
-		BlockSize:  4096,
-		HostID:     host,
-		Durability: lifecycle.DurabilityRemote,
+		SizeBytes: 1 << 30,
+		BlockSize: 4096,
+		HostID:    host,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -148,11 +147,7 @@ func TestProvisionRefusesGeometryNoAgentCanServe(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			spec := tc.spec
-			if spec.Durability == "" {
-				spec.Durability = lifecycle.DurabilityRemote
-			}
-			if _, err := p.Provision(t.Context(), term, spec); err == nil {
+			if _, err := p.Provision(t.Context(), term, tc.spec); err == nil {
 				t.Fatal("Provision accepted a volume no Agent could serve")
 			}
 		})
@@ -180,7 +175,7 @@ func TestProvisionUnderAStaleTermLeavesNothingBehind(t *testing.T) {
 
 	p := controlplane.NewProvisioner(md, store, testKMS(t), &ramp{})
 	vol, err := p.Provision(t.Context(), term, controlplane.VolumeSpec{
-		SizeBytes: 1 << 30, BlockSize: 4096, HostID: host, Durability: lifecycle.DurabilityRemote,
+		SizeBytes: 1 << 30, BlockSize: 4096, HostID: host,
 	})
 	if !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("err = %v, want ErrStaleTerm", err)
@@ -223,7 +218,6 @@ func TestTheKeyVersionSurvivesEveryBoundary(t *testing.T) {
 	p := controlplane.NewProvisioner(md, store, kms, &ramp{})
 	vol, err := p.Provision(ctx, term, controlplane.VolumeSpec{
 		SizeBytes: 1 << 30, BlockSize: 4096, HostID: host,
-		Durability: lifecycle.DurabilityRemote,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)

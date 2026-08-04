@@ -15,7 +15,7 @@ import (
 // Clone creates a new, independent volume from a parent snapshot (§20): it is pure
 // metadata — a new active child at epoch 1 that reuses the parent snapshot's
 // already-durable objects, with no data copy. The clone inherits the parent's size,
-// block size, durability, and DEK (so it can read the shared base), and increments the
+// block size, and DEK (so it can read the shared base), and increments the
 // chain depth (§20.1). Returns the new volume's descriptor-shaped record.
 //
 // **Where it lands is decided here, not passed in.** policy.Choose implements §20's
@@ -75,7 +75,6 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 	clone := metadata.Volume{
 		VolumeID:      newVolumeID,
 		SizeBytes:     parent.SizeBytes,
-		Durability:    parent.Durability,
 		BlockSize:     parent.BlockSize,
 		CurrentEpoch:  1, // a fresh active child
 		State:         lifecycle.VolumeActive,
@@ -112,7 +111,6 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 		VolumeID:         clone.VolumeID,
 		SizeBytes:        clone.SizeBytes,
 		BlockSize:        clone.BlockSize,
-		Durability:       clone.Durability,
 		CurrentEpoch:     clone.CurrentEpoch,
 		ChainDepth:       clone.ChainDepth,
 		KEKID:            clone.KEKID,

@@ -453,7 +453,7 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 		t.Fatal(err)
 	}
 	want := metadata.Volume{DEKKeyID: 1,
-		VolumeID: id(), SizeBytes: 1 << 33, Durability: lifecycle.DurabilityLocal,
+		VolumeID: id(), SizeBytes: 1 << 33,
 		BlockSize: 65536, CurrentEpoch: 7, State: lifecycle.VolumeDetached,
 		PrimaryHostID: w.host, StandbyHostID: standby, ChainDepth: 3,
 		DEKWrapped: []byte{9, 8, 7}, KEKID: "kek-7",
@@ -466,7 +466,7 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.SizeBytes != want.SizeBytes || got.Durability != want.Durability ||
+	if got.SizeBytes != want.SizeBytes ||
 		got.BlockSize != want.BlockSize || got.CurrentEpoch != want.CurrentEpoch ||
 		got.State != want.State || got.PrimaryHostID != want.PrimaryHostID ||
 		got.StandbyHostID != want.StandbyHostID || got.ChainDepth != want.ChainDepth ||

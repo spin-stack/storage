@@ -1438,6 +1438,31 @@ at sequence 1"*.
 and it runs as one sequential lane. The head tables are recounted once, at integration, by
 track A.
 
+**D1: the per-volume durability mode is gone, end to end (2026-08-04).** ADR-0026 made
+§14.8's local ACK the only contract; the enum outlived the mechanism by a whole increment,
+in nine places — `lifecycle.Durability`, `volumes.durability` with its CHECK, the proto's
+`Durability` enum and `DesiredVolume.durability`, `metadata.Volume.Durability`, the
+descriptor's `durability` field, `controlplane.VolumeSpec.Durability`, the
+`-seed-local-durability` flag, and about thirty fixtures. **The claim that nothing reads
+it was checked before anything was deleted, not after**: `Durability.Remote()` had exactly
+one caller and it was its own test; `DesiredVolume.GetDurability()` had exactly one caller
+and it was `cpserver`'s own test; the Agent never looked at the field it was sent. The
+three remaining reads were the validations of a value nobody consumed — `Valid()` in
+`provision.validate`, and the default-then-validate in each of the two `CreateVolume`s.
+`wal.DurabilityMode`, which `lifecycle.Durability`'s doc comment named as its data-path
+counterpart, had already been deleted; the comment was the last thing describing it.
+
+**−220 lines of hand-written code and SQL** (−347 counting the regenerated `api/gen` and
+`internal/db`). The schema change is `ALTER TABLE volumes DROP COLUMN durability`
+(`migrations/20260804020927_drop_volume_durability.{sql,json}`, planned against the dev
+database and applied to it); `task db:verify` and `task test:integration` are green, so
+the column is gone from both the declared state and the database the pg contract runs on.
+Proto field 6 is `reserved`, not renumbered — a peer built before this change decodes 6 as
+an enum, and a later field reusing the number is the one way a wire format lies to a
+reader that is otherwise correct. The top-level `Durability` enum is deleted outright:
+proto3 has no file-scope `reserved`, so the note lives in `DesiredVolume` where the
+`reserved 6` is.
+
 ## Track E — observability (open work, appended per increment)
 
 *Only track E appends here* — it owns `internal/obs`, `internal/vhost`,

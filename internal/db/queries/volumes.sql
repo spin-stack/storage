@@ -10,14 +10,14 @@
 -- columns keep the higher/existing value, and `state` is not touched at all — the
 -- §7 lifecycle moves only through SetVolumeState.
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $15
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $14
 )
-INSERT INTO volumes (volume_id, size_bytes, durability, block_size, current_epoch, state,
+INSERT INTO volumes (volume_id, size_bytes, block_size, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
                      chain_depth, parent_snapshot_id,
                      local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, sqlc.arg(dek_key_id)::bigint, $9, $10, $11,
-       sqlc.narg(parent_snapshot_id)::uuid, $12, $13, $14
+SELECT $1, $2, $3, $4, $5, $6, $7, sqlc.arg(dek_key_id)::bigint, $8, $9, $10,
+       sqlc.narg(parent_snapshot_id)::uuid, $11, $12, $13
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The §28.2 oversubscription bound, as a predicate of the write that places the
   -- volume (ADR-0017). A clone admitted by a pure placement.Choose against a fleet
@@ -38,7 +38,6 @@ WHERE EXISTS (SELECT 1 FROM valid)
                + sqlc.arg(bound_add_bytes)::bigint <= sqlc.arg(bound_limit)::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
-      durability = EXCLUDED.durability,
       block_size = EXCLUDED.block_size,
       current_epoch = GREATEST(volumes.current_epoch, EXCLUDED.current_epoch),
       dek_wrapped = EXCLUDED.dek_wrapped,

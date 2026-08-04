@@ -13,7 +13,6 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -25,12 +24,9 @@ import (
 func genDescriptor(t *rapid.T) descriptor.Descriptor {
 	wrapped := rapid.SliceOfN(rapid.Byte(), 1, 64).Draw(t, "dek_wrapped")
 	return descriptor.Descriptor{
-		VolumeID:  ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "ms")), rand.Reader).String(),
-		SizeBytes: int64(rapid.IntRange(1, 1<<40).Draw(t, "size")),
-		BlockSize: int32(rapid.IntRange(512, 1<<20).Draw(t, "block")),
-		Durability: rapid.SampledFrom([]lifecycle.Durability{
-			lifecycle.DurabilityRemote, lifecycle.DurabilityLocal,
-		}).Draw(t, "durability"),
+		VolumeID:     ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "ms")), rand.Reader).String(),
+		SizeBytes:    int64(rapid.IntRange(1, 1<<40).Draw(t, "size")),
+		BlockSize:    int32(rapid.IntRange(512, 1<<20).Draw(t, "block")),
 		CurrentEpoch: int64(rapid.IntRange(0, 1<<20).Draw(t, "epoch")),
 		ChainDepth:   int32(rapid.IntRange(0, 32).Draw(t, "chain")),
 		KEKID:        rapid.StringMatching(`[a-z0-9-]{1,16}`).Draw(t, "kek_id"),
@@ -144,7 +140,7 @@ func TestADescriptorWithNoDigestIsRefused(t *testing.T) {
 	store := sim.NewObjectStore()
 	d := descriptor.Descriptor{
 		VolumeID: ids.New().String(), SizeBytes: 1 << 30, BlockSize: 4096,
-		Durability: lifecycle.DurabilityRemote, KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
+		KEKID: "k", DEKWrapped: []byte{1}, DEKKeyID: 1,
 	}
 	body, err := json.Marshal(d) // marshalled directly: bare JSON, with no digest line
 	if err != nil {

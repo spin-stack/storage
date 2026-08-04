@@ -154,8 +154,7 @@ func startAgent(t *testing.T, ctx context.Context, dir, volumeID string) (*agent
 	}
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: volumeID, SizeBytes: deviceSize, BlockSize: 512, Epoch: 1,
-		Durability: storagev1.Durability_DURABILITY_REMOTE,
-		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}}); err != nil {
 		t.Fatalf("starting the volume: %v", err)
 	}

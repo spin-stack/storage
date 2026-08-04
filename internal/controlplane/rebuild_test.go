@@ -29,7 +29,7 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 
 	p := controlplane.NewProvisioner(md, store, testKMS(t), &ramp{})
 	v, err := p.Provision(ctx, term, controlplane.VolumeSpec{
-		SizeBytes: 1 << 30, BlockSize: 4096, HostID: cloneHostA, Durability: lifecycle.DurabilityRemote,
+		SizeBytes: 1 << 30, BlockSize: 4096, HostID: cloneHostA,
 	})
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
@@ -92,7 +92,7 @@ func TestRebuildMetadataFromTheBucket(t *testing.T) {
 	// together: a wrapped key paired with another key's version is a volume nothing can
 	// open, and the failure would surface on the guest's first write.
 	if got.SizeBytes != before.SizeBytes || got.BlockSize != before.BlockSize ||
-		got.Durability != before.Durability || got.KEKID != before.KEKID ||
+		got.KEKID != before.KEKID ||
 		got.DEKKeyID != before.DEKKeyID || string(got.DEKWrapped) != string(before.DEKWrapped) {
 		t.Fatalf("rebuilt volume = %+v, original = %+v", got, before)
 	}

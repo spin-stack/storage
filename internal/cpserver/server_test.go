@@ -54,9 +54,6 @@ func (f *fixture) createVolume(t *testing.T, v metadata.Volume) {
 	if v.State == "" {
 		v.State = lifecycle.VolumeActive
 	}
-	if v.Durability == "" {
-		v.Durability = lifecycle.DurabilityRemote
-	}
 	if v.DEKKeyID == 0 {
 		// Every real volume has one (§15.1) and the store refuses a row without it.
 		// The default is here rather than in twenty literals, but a case that cares
@@ -189,7 +186,7 @@ func TestStaleTermIsAborted(t *testing.T) {
 func TestGetDesiredStateListsThisHostsVolumes(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-b", SizeBytes: 2 << 30, BlockSize: 4096, CurrentEpoch: 5, PrimaryHostID: hostA})
-	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 512, CurrentEpoch: 1, PrimaryHostID: hostA, Durability: lifecycle.DurabilityLocal})
+	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-a", SizeBytes: 1 << 30, BlockSize: 512, CurrentEpoch: 1, PrimaryHostID: hostA})
 	f.createVolume(t, metadata.Volume{DEKKeyID: 1, VolumeID: "vol-z", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 1, PrimaryHostID: hostB})
 
 	resp, err := f.srv.GetDesiredState(t.Context(), connect.NewRequest(&storagev1.GetDesiredStateRequest{HostId: hostA}))
@@ -205,9 +202,6 @@ func TestGetDesiredStateListsThisHostsVolumes(t *testing.T) {
 	}
 	if vols[0].GetBlockSize() != 512 || vols[0].GetSizeBytes() != 1<<30 || vols[0].GetEpoch() != 1 {
 		t.Fatalf("volume geometry not carried: %+v", vols[0])
-	}
-	if vols[0].GetDurability() != storagev1.Durability_DURABILITY_LOCAL {
-		t.Errorf("durability = %v, want LOCAL", vols[0].GetDurability())
 	}
 	if vols[1].GetState() != storagev1.VolumeState_VOLUME_STATE_ACTIVE {
 		t.Errorf("state = %v, want ACTIVE", vols[1].GetState())

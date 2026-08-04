@@ -135,12 +135,11 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 	out := make([]*storagev1.DesiredVolume, 0, len(vols))
 	for _, v := range vols {
 		d := &storagev1.DesiredVolume{
-			VolumeId:   v.VolumeID,
-			SizeBytes:  v.SizeBytes,
-			BlockSize:  v.BlockSize,
-			Epoch:      v.CurrentEpoch,
-			State:      volumeState(v.State),
-			Durability: durability(v.Durability),
+			VolumeId:  v.VolumeID,
+			SizeBytes: v.SizeBytes,
+			BlockSize: v.BlockSize,
+			Epoch:     v.CurrentEpoch,
+			State:     volumeState(v.State),
 		}
 		// A clone reads through its parent's objects (§20), and the Agent cannot look
 		// the chain up itself (ADR-0021). The parent's *volume* id lives on the
@@ -348,16 +347,5 @@ func volumeState(s lifecycle.VolumeState) storagev1.VolumeState {
 		return storagev1.VolumeState_VOLUME_STATE_DETACHED
 	default:
 		return storagev1.VolumeState_VOLUME_STATE_UNSPECIFIED
-	}
-}
-
-func durability(d lifecycle.Durability) storagev1.Durability {
-	switch d {
-	case lifecycle.DurabilityRemote:
-		return storagev1.Durability_DURABILITY_REMOTE
-	case lifecycle.DurabilityLocal:
-		return storagev1.Durability_DURABILITY_LOCAL
-	default:
-		return storagev1.Durability_DURABILITY_UNSPECIFIED
 	}
 }

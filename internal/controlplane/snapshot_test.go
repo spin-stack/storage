@@ -28,8 +28,7 @@ func TestRequestSnapshotRecordsWhatOnlyTheControlPlaneKnows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
-		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 3,
-		Durability: lifecycle.DurabilityRemote, State: lifecycle.VolumeActive,
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 3, State: lifecycle.VolumeActive,
 		PrimaryHostID: cloneHostA, CurrentEpoch: 7, ParentSnapshotID: olderSnap,
 	}, nil); err != nil {
 		t.Fatal(err)
@@ -84,8 +83,7 @@ func TestRequestSnapshotRefusesAVolumeWithNoLiveWriter(t *testing.T) {
 			ctx := t.Context()
 			md, _, term := cpStore(t)
 			if err := md.CreateVolume(ctx, term, metadata.Volume{
-				VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 3,
-				Durability: lifecycle.DurabilityRemote, State: tc.state,
+				VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 3, State: tc.state,
 				PrimaryHostID: tc.primary, CurrentEpoch: 1,
 			}, nil); err != nil {
 				t.Fatal(err)

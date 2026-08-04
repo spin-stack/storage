@@ -30,8 +30,6 @@ type VolumeSpec struct {
 	// names no host is one no Agent will ever see (GetDesiredState filters by
 	// primary_host_id).
 	HostID string
-	// Durability selects the FLUSH ACK contract (§14.8).
-	Durability lifecycle.Durability
 }
 
 // ProvisionedVolume is what provisioning produced.
@@ -111,7 +109,6 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 		VolumeID:      volumeID,
 		SizeBytes:     spec.SizeBytes,
 		BlockSize:     spec.BlockSize,
-		Durability:    spec.Durability,
 		CurrentEpoch:  1,
 		State:         lifecycle.VolumeActive,
 		PrimaryHostID: spec.HostID,
@@ -127,7 +124,6 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 		VolumeID:     volumeID,
 		SizeBytes:    spec.SizeBytes,
 		BlockSize:    spec.BlockSize,
-		Durability:   spec.Durability,
 		CurrentEpoch: 1,
 		KEKID:        p.kms.KEKID(),
 		DEKWrapped:   wrapped,
@@ -154,8 +150,6 @@ func (s VolumeSpec) validate() error {
 		return fmt.Errorf("controlplane: size %d is not a whole number of %d-byte sectors: no Agent can serve it", s.SizeBytes, sectorSize)
 	case s.BlockSize <= 0 || int64(s.BlockSize)%sectorSize != 0:
 		return fmt.Errorf("controlplane: block size %d is not a multiple of %d", s.BlockSize, sectorSize)
-	case !s.Durability.Valid():
-		return fmt.Errorf("controlplane: durability %q is not one of the §14.8 modes: it decides what a FLUSH ACK means", s.Durability)
 	}
 	return nil
 }

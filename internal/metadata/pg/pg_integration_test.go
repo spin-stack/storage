@@ -502,11 +502,6 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 			t.Fatalf("volume state %q rejected by the DB: %v", s, err)
 		}
 	}
-	for _, d := range lifecycle.Durabilities() {
-		if _, err := pool.Exec(ctx, `UPDATE volumes SET durability=$1 WHERE volume_id=$2`, d.String(), volID); err != nil {
-			t.Fatalf("durability %q rejected by the DB: %v", d, err)
-		}
-	}
 	for _, s := range lifecycle.SnapshotStates() {
 		if _, err := pool.Exec(ctx, `UPDATE snapshots SET state=$1 WHERE snapshot_id=$2`, s.String(), snapID); err != nil {
 			t.Fatalf("snapshot state %q rejected by the DB: %v", s, err)
@@ -551,7 +546,6 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 	}{
 		{"host state", `UPDATE hosts SET state=$1 WHERE host_id='` + hostID + `'`, "ZOMBIE"},
 		{"volume state", `UPDATE volumes SET state=$1 WHERE volume_id='` + volID + `'`, "REBUILT"},
-		{"durability", `UPDATE volumes SET durability=$1 WHERE volume_id='` + volID + `'`, "eventual"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1025,9 +1019,9 @@ func TestPGRejectsAnUnversionedDEK(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := pool.Exec(ctx, `
-				INSERT INTO volumes (volume_id, size_bytes, durability, block_size,
+				INSERT INTO volumes (volume_id, size_bytes, block_size,
 				                     current_epoch, state, dek_wrapped, kek_id, dek_key_id)
-				VALUES ($1, 1, 'remote', 65536, 0, 'ACTIVE', '\x01', 'k', $2)`,
+				VALUES ($1, 1, 65536, 0, 'ACTIVE', '\x01', 'k', $2)`,
 				ids.New().String(), tc.keyID)
 			if err == nil {
 				t.Fatalf("Postgres accepted dek_key_id = %d", tc.keyID)
