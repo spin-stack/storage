@@ -1,8 +1,13 @@
 // Package cow implements the copy-on-write read side: an interval map of the
-// not-yet-objectized WAL extents (§13.2) and, in Increment 4.4, the 64 KiB segment
-// active map. The interval map stores only live written extents (newest wins);
-// DISCARD/WRITE_ZEROES clear the range so it reads back as zero (§14.6), which keeps
-// memory proportional to the working set, not to the volume size.
+// not-yet-objectized WAL extents (§13.2). It stores only live written extents (newest
+// wins); DISCARD/WRITE_ZEROES clear the range so it reads back as zero (§14.6), which
+// keeps memory proportional to the working set, not to the volume size.
+//
+// This sentence used to promise a second structure — "and, in Increment 4.4, the 64 KiB
+// segment active map" (§13.3). `cow.ActiveMap` was built and then deleted on 2026-08-02
+// with `SegmentIndex` and the roaring-bitmap dependency: nothing outside its own tests
+// ever read one. A package doc that still lists it sends a reader looking for a file
+// that is not here, which is the cheapest kind of wrong and the easiest to leave.
 package cow
 
 import (

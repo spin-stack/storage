@@ -16,16 +16,29 @@
 // restored from S3 also needs the materialized base image underneath, and that fetch
 // belongs here — behind the same four methods — rather than inside either neighbour.
 //
-// # What a guest is promised, and what it is not (INV-18, §14.4)
+// # What a guest is promised, and what it is not (INV-18, §14.8, ADR-0026)
 //
 // A WRITE completes when the record is in the local WAL. It is not durable, and it
 // issues no object-store PUT: the device advertises a write-back cache
-// (VIRTIO_BLK_F_FLUSH, §2) and the guarantee against losing the host arrives only with
-// a FLUSH. So WriteAt maps to wal.Log.Write and nothing else, and Flush maps to
-// wal.Log.Flush — which in `remote` mode returns only after every covering object is
-// verified in S3 and the lease is confirmed valid on the monotonic clock. A Flush that
-// cannot establish both returns an error, and the guest sees the request fail. Nothing
-// here ever reports success for durability the object store cannot produce.
+// (VIRTIO_BLK_F_FLUSH, §2), so the guest is told to send a FLUSH for anything it wants
+// to keep. So WriteAt maps to wal.Log.Write and nothing else, and Flush maps to
+// wal.Log.Flush.
+//
+// What that FLUSH buys is one fdatasync of the local WAL segments and nothing else.
+// After it returns, the guest's writes survive this process, the Agent and QEMU dying;
+// they do **not** survive the host dying. §14.8 and ADR-0026 chose that rather than
+// paying for the difference on every commit, and the volume reaches the object store
+// once, when it stops (agent.Volume.publish).
+//
+// This paragraph claimed the larger promise until 2026-08-03, and the claim is what
+// makes it worth recording: it said Flush "in `remote` mode returns only after every
+// covering object is verified in S3 and the lease is confirmed valid on the monotonic
+// clock". Both halves — the upload-and-verify chain and the lease gate — were deleted
+// in ADR-0026 increment 4.5, and a device whose doc still described them was telling a
+// reader that a guest's fsync meant something the code underneath had stopped doing.
+//
+// A Flush that cannot complete returns an error and the guest sees the request fail.
+// Nothing here ever reports success for a durability step that did not happen.
 //
 // # FUA
 //
@@ -64,17 +77,24 @@
 // operator and for the Agent, because the three have nothing in common but their
 // status byte:
 //
-//   - wal.ErrSelfFenced (§12.2, §16) — this host's lease lapsed and it has lost the
-//     authority to ACK. No local action clears it; the Control Plane promotes someone
-//     else. Sticky by construction: every later FLUSH fails immediately.
-//   - wal.ErrBackpressure (§5.7) — the unflushed or un-remote-durable backlog hit its
-//     bound. Transient and self-clearing: a successful FLUSH resumes writes. This is
-//     the error the design chose over silently filling the host's NVMe.
+//   - wal.ErrLogBroken — a failed rollback left the log unable to say what its tail
+//     holds, so it will not confirm anything against it. No local action clears it;
+//     the volume needs a new epoch. Sticky by construction: every later request fails
+//     immediately.
+//   - wal.ErrBackpressure (§5.7) — the unflushed backlog hit its bound. Transient and
+//     self-clearing: a successful FLUSH resumes writes. This is the error the design
+//     chose over silently filling the host's NVMe.
 //   - ErrDeviceFull — the local device is out of space (wal.Degraded() reports
-//     OUT_OF_SPACE). Local and recoverable — truncate after a checkpoint, grow the
-//     device, restore S3 so the remote gap can close — and explicitly *not* a fencing
-//     condition: handing a volume to another host because a disk filled would turn a
-//     local problem into a failover.
+//     OUT_OF_SPACE). Local and recoverable — truncate after a checkpoint or grow the
+//     device — and explicitly *not* a fencing condition: handing a volume to another
+//     host because a disk filled would turn a local problem into a failover.
+//
+// The first bullet used to be `wal.ErrSelfFenced (§12.2, §16) — this host's lease
+// lapsed and it has lost the authority to ACK. No local action clears it; the Control
+// Plane promotes someone else.` That sentinel does not exist: it went with the
+// lease-gated ACK in ADR-0026 increment 4.5, and `wal.Log`'s `fenced` flag became
+// `broken` with one meaning left. `refuse` in blockdev.go has branched on
+// wal.ErrLogBroken since; this list had not caught up.
 //
 // # DISCARD and WRITE_ZEROES
 //

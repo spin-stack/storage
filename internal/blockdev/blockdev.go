@@ -28,17 +28,18 @@ var ErrDeviceFull = errors.New("the local WAL device is out of space")
 // tell a guest. Use New.
 //
 // It holds no lock of its own. That is a statement about where the invariants live,
-// not an omission: wal.Log owns them and is safe for concurrent use, with two mutexes
-// and a documented rule that neither is held across an object-store PUT. A mutex here
-// could only re-serialize what the Log already serializes correctly — and, held across
-// Flush, it would put S3 latency back into the guest's read path through the door the
-// Log's design exists to close.
+// not an omission: wal.Log owns them and is safe for concurrent use, behind two
+// mutexes whose split is documented on the type. A mutex here could only re-serialize
+// what the Log already serializes correctly, and it would serialize a guest's READ
+// behind its FLUSH for no gain.
 //
 // The hazard a lock here would have been for is real and is handled in wal: a WRITE
 // arriving in the middle of a FLUSH must not be ACKed by that FLUSH. Log.Flush captures
 // its target sequence under the same mutex Log.Write appends under, so a WRITE that
-// returns afterwards has a strictly higher sequence and advanceDurable(target) cannot
-// reach it (`TestAGuestWriteCompletesWhileAFlushIsUploading`).
+// returns afterwards has a strictly higher sequence and the durable step cannot reach
+// it. `TestConcurrentRequestsDoNotRaceTheLog` in this package drives the three request
+// types at the device concurrently under -race; the sequence argument itself is wal's
+// to prove.
 type Device struct {
 	log *wal.Log
 	cap int64
@@ -110,14 +111,13 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
-// Flush implements vhost.Backend, and it is the guest's VIRTIO_BLK_T_FLUSH. It is the
-// §14.4 ACK path and not an fsync: in `remote` mode it returns only after every
-// covering object is verified in the object store and the lease is confirmed valid on
-// the monotonic clock (INV-06, INV-07).
+// Flush implements vhost.Backend, and it is the guest's VIRTIO_BLK_T_FLUSH. It returns
+// after one fdatasync of the local WAL segments and nothing else (§14.8, ADR-0026) —
+// see the package doc for what that does and does not promise the guest.
 //
 // A failure is returned, never swallowed. The guest completes the request with IOERR
-// and knows its writes are not safe; a Flush that reported success on a lapsed lease
-// or an unreachable store would be the one lie this whole design exists to prevent.
+// and knows its writes are not safe; a Flush that reported success on a durable step
+// that did not happen would be the one lie this whole design exists to prevent.
 func (d *Device) Flush(ctx context.Context) error {
 	if err := d.log.Flush(ctx); err != nil {
 		return d.refuse("FLUSH", 0, 0, err)
@@ -166,6 +166,8 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 	return fmt.Errorf("blockdev: %s failed: %w", where, err)
 }
 
-// blockdev.Device is what a guest is served from; hostio.RawFile is the scaffolding it
-// replaces.
+// blockdev.Device is the Backend a real guest is served from. hostio.RawFile still
+// exists and is not what it replaced: it is the file-backed Backend the QEMU lane
+// serves, so that a real kernel can be driven against the transport with no WAL
+// underneath it.
 var _ vhost.Backend = (*Device)(nil)
