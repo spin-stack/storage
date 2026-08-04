@@ -51,7 +51,7 @@ func run() error {
 	var (
 		hostID       = flag.String("host-id", "", "fleet identity of this host: a UUIDv7 (required; mint one with `uuidgen` only if it is v7)")
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
-		dataDir      = flag.String("data-dir", "", "directory holding this Agent's WAL and checkpoints (required)")
+		dataDir      = flag.String("data-dir", "", "directory holding this Agent's WAL, and the lock that keeps one Agent per host (required)")
 		socketDir    = flag.String("vhost-socket-dir", "", "directory this Agent binds one vhost-user socket per volume in (required)")
 		interval     = flag.Duration("heartbeat-interval", 5*time.Second, "reconciliation cadence")
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
