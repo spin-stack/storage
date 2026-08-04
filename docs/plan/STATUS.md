@@ -1400,6 +1400,37 @@ under and *then* waits on `baseDone`, so a volume stopped while its base is load
 dropped — correctly, since the view would be incomplete — because the Agent cancelled its
 own read.
 
+### C1 — the publish assertion is made against the store the manager wrote to (2026-08-03)
+
+`TestAVolumeWhoseBaseFailedDoesNotPublish` listed a **freshly constructed**
+`sim.NewObjectStore()` rather than the store the rig handed the manager, so it asserted
+that an empty bucket was empty and passed whatever `publish()` did. It was green with
+`if v.baseFailed { return }` deleted — proven, not assumed.
+
+Two things made it possible and both are fixed. `newPublishRig` took an
+`objectstore.Store` and kept the concrete one only if a type assertion happened to succeed
+(`sto, _ :=`), so a caller passing a double silently got `rig.store == nil`; it now takes
+`*sim.ObjectStore`, which makes that unrepresentable. A test that genuinely needs a double
+takes the new `newPublishManager` and asserts through the double it built — which is what
+`TestARepeatedSnapshotRequestIsTakenOnce` already did with `countingStore`.
+
+The fixture changed too, because the old one could not have failed even pointed at the
+right store: the volume never wrote anything, and an object store that answers nothing
+also fails `image.uploadChunks`' Head, so a wrong publish would have died of the double
+rather than of the missing guard. The volume is now a **clone whose parent snapshot was
+never published** — the shape of base failure that nothing else refuses, because the clone
+has no image of its own and its publish CASes with an empty ETag, which is create-only and
+*succeeds*. The other shape (the volume's own manifest unreadable) is unfalsifiable here:
+that volume has a manifest in the bucket, so create-only loses the CAS and the bucket is
+identical with or without the guard.
+
+It writes a block before it stops, and the assertion is the absence of
+`image/<vol>/manifest.json` — reporting, on failure, the chunk count it named, which is the
+fact that separates "published a partial view" from "correctly published nothing". Planted
+bug (the `baseFailed` guard deleted, in a scratch copy of HEAD, never in the tree):
+*"a volume whose base never resolved published image/<vol>/manifest.json naming 1 chunk(s)
+at sequence 1"*.
+
 ## Track D — the catalog (open work, appended per increment)
 
 *Only track D appends here* — it owns `internal/controlplane`, `internal/cpserver`,
