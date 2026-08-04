@@ -35,6 +35,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "a-stopped-volume-comes-back-from-its-image", Run: scenarioAStoppedVolumeComesBackFromItsImage},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
 		{Name: "a-snapshot-of-a-live-volume-is-frozen", Run: scenarioASnapshotOfALiveVolumeIsFrozen},
+		{Name: "two-hosts-cannot-both-publish-an-image", Run: scenarioTwoHostsCannotBothPublishAnImage},
 	}
 }
 
@@ -393,6 +394,137 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	}
 	s.Notef("clone %s read its parent's bytes through the snapshot, with no data copy", cloneID)
 	return nil
+}
+
+// scenarioTwoHostsCannotBothPublishAnImage is INV-10 in the only form it still takes.
+//
+// ADR-0026 removed the lease-gated ACK, the epochs racing for one prefix and the
+// promotion protocol; what survives is one sentence: **two incarnations of a volume must
+// not both publish an image.** They would not conflict — the second simply overwrites the
+// first, and everything the first host's guest wrote disappears with no error anywhere,
+// which is the worst shape a durability bug can take.
+//
+// The guard is a compare-and-set on the manifest's ETag, and this drives it through two
+// real VolumeManagers on separate data directories against one object store: both serve
+// the same volume id, both write, both stop. Exactly one image may exist afterwards, and
+// the loser must be refused rather than merged.
+//
+// The fault the planted arm injects is not a code change but a *backend*: an object store
+// that ignores preconditions. That is why `task backend:conformance` is blocking per
+// backend (§6.1) — every claim on this page rests on If-Match meaning what it says, and a
+// store that quietly accepts a stale ETag turns this invariant off with nothing failing.
+func scenarioTwoHostsCannotBothPublishAnImage(s *Sim) error {
+	return twoHostsCannotBothPublish(s, honestPreconditions)
+}
+
+const (
+	honestPreconditions = false
+	// preconditionsIgnored is the backend that accepts every conditional write — the
+	// hazard §6.1's conformance suite exists to keep out of production.
+	preconditionsIgnored = true
+)
+
+func twoHostsCannotBothPublish(s *Sim, ignorePreconditions bool) error {
+	ctx := context.Background()
+	volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	desired := []*storagev1.DesiredVolume{{
+		VolumeId: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
+		Durability: storagev1.Durability_DURABILITY_REMOTE,
+		State:      storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}}
+	start := func(dataDir string) (*agent.VolumeManager, error) {
+		return agent.NewVolumeManager(agent.VolumeManagerConfig{
+			DataDir: dataDir, SocketDir: "/run/spin",
+			Limits:         wal.Limits{SegmentBytes: 8192},
+			HostID:         ids.NewAt(simEpoch*1000, s.Rand).String(),
+			CheckpointPoll: 24 * time.Hour,
+		}, agent.VolumeManagerDeps{
+			Clock:   s.Clock,
+			Disk:    s.Disk,
+			Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+			Mapper:  simMapper{},
+			EventFD: simEventFD,
+			Store:   s.Store,
+			Rand:    s.Rand,
+		})
+	}
+
+	// Both hosts start before either stops: each reads the same absent manifest, so each
+	// holds the same empty ETag. That is the race — not two hosts at different times, but
+	// two that believe the same thing about the object store.
+	first, err := start("/var/lib/spin-a")
+	if err != nil {
+		return err
+	}
+	second, err := start("/var/lib/spin-b")
+	if err != nil {
+		return err
+	}
+	for i, m := range []*agent.VolumeManager{first, second} {
+		if err := m.Apply(ctx, desired); err != nil {
+			return fmt.Errorf("starting incarnation %d: %w", i, err)
+		}
+		dev, ok := m.Device(volumeID)
+		if !ok {
+			return fmt.Errorf("incarnation %d is not serving the volume", i)
+		}
+		// The read waits for the base; driving before it lands makes the trace depend on
+		// a goroutine's timing (INV-02).
+		if _, err := dev.ReadAt(make([]byte, 512), 0); err != nil {
+			return fmt.Errorf("incarnation %d waiting for its read view: %w", i, err)
+		}
+		// Different bytes, so "one image survived" is a statement about *which* one.
+		if _, err := dev.WriteAt(bytes.Repeat([]byte{byte(0xC0 + i)}, 4096), 0); err != nil {
+			return fmt.Errorf("incarnation %d writing: %w", i, err)
+		}
+	}
+
+	if ignorePreconditions {
+		s.Store.InjectIgnorePreconditions()
+		s.Emit(Event{Kind: EventFault, Msg: "the object store accepts every conditional write"})
+	}
+
+	// Stopping is what publishes (ADR-0026).
+	if err := first.Close(); err != nil {
+		return fmt.Errorf("stopping the first incarnation: %w", err)
+	}
+	firstETag, err := etagOf(ctx, s, volumeID)
+	if err != nil {
+		return err
+	}
+	if err := second.Close(); err != nil {
+		return fmt.Errorf("stopping the second incarnation: %w", err)
+	}
+	secondETag, err := etagOf(ctx, s, volumeID)
+	if err != nil {
+		return err
+	}
+
+	// The observable is the object, not the error: publish() logs its refusal and returns
+	// nothing, deliberately, because a failed publish must not block a teardown. So what
+	// says whether the second host won is whether the manifest moved under it.
+	overwritten := firstETag != secondETag
+	s.Emit(Event{Kind: EventStalePublsh, StalePublishOK: overwritten})
+	if overwritten {
+		return fmt.Errorf("volume %s: the second incarnation overwrote the first's image (%s -> %s), losing everything its guest wrote (§12.4/INV-10)",
+			volumeID, firstETag, secondETag)
+	}
+	s.Notef("volume %s: one image survived two incarnations", volumeID)
+	return nil
+}
+
+// etagOf reads the volume manifest's ETag, which is the identity of the image the object
+// store currently holds.
+func etagOf(ctx context.Context, s *Sim, volumeID string) (string, error) {
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return "", err
+	}
+	info, err := s.Store.Head(ctx, image.ManifestKey([16]byte(u)))
+	if err != nil {
+		return "", fmt.Errorf("reading the manifest of %s: %w", volumeID, err)
+	}
+	return info.ETag, nil
 }
 
 // scenarioASnapshotOfALiveVolumeIsFrozen is §19 as a guest experiences it, and the only

@@ -40,16 +40,10 @@ const (
 	EventRecovery    EventKind = "recovery"
 	EventWatermark   EventKind = "watermark"
 	EventLeavesHost  EventKind = "leaves-host"
-	EventDurableAck  EventKind = "durable-ack"
-	EventPromotion   EventKind = "promotion"
 	EventStalePublsh EventKind = "stale-publish"
-	EventFailover    EventKind = "failover"
-	EventSnapshot    EventKind = "snapshot"
 	EventTruncate    EventKind = "truncate"
-	EventIOClass     EventKind = "io-class"
 	EventVolumeServe EventKind = "volume-serve"
 	EventDurableRead EventKind = "durable-read"
-	EventCheckpoint  EventKind = "checkpoint"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -70,29 +64,13 @@ type Event struct {
 	// LeavesHost events (§5.10): true if cleartext guest data was detected in bytes
 	// bound for outside the host (a violation).
 	ClearLeak bool
-	// DurableAck events (§12.2): whether the host lease was valid at the instant a
-	// FLUSH was ACKed as durable. Must always be true (INV-06).
-	LeaseValid bool
-	// Promotion events (§12.3): whether epoch N+1 was granted before FENCING_WAIT
-	// elapsed. Must always be false (INV-11).
-	EarlyGrant bool
-	// StalePublish events (§12.4): whether a fenced/stale-epoch writer managed to
-	// publish. Must always be false (INV-10).
+	// StalePublish events (§12.4): whether a second incarnation of a volume managed to
+	// publish over the first's image. Must always be false — under ADR-0026 this is all
+	// that is left of INV-10, and it is a compare-and-set on one object.
 	StalePublishOK bool
-	// Failover events (§12): the fenced writer's ACKed-durable sequence and the
-	// promoted writer's recovered prefix. Recovered must be >= AckedDurable (INV-09).
-	AckedDurable uint64
-	Recovered    uint64
-	// Snapshot events (§5.2, §19): whether a published snapshot was later observed to
-	// change (must be false, INV-16).
-	SnapshotMutated bool
 	// Truncate events (§21.1): the sequence local WAL was reclaimed to, and the
 	// verified published point. TruncatedUpTo must be <= Published (INV-13).
 	TruncatedUpTo uint64
-	// IOClass events (§5.9): whether a background op was granted while a
-	// foreground/flush op was in flight. Granted-while-high must never be true (INV-17).
-	BgGranted    bool
-	HighInFlight bool
 	// VolumeServe events (§16, §12.3): whether the Agent still had something to answer
 	// a fenced volume's requests with. Must always be false (INV-10's Agent half).
 	ServedAfterFence bool
@@ -105,11 +83,6 @@ type Event struct {
 	// undecrypted ciphertext being the case that shipped, since GCM leaves the length
 	// intact and nothing downstream re-checks the plaintext CRC. Must always be false.
 	ForeignBytesAfterRestart bool
-	// Checkpoint events (§12.2): whether a checkpoint object appeared in the store while
-	// the host's lease was invalid. Must always be false — a SELF_FENCED Agent "deja de
-	// publicar checkpoints/manifests". This is INV-06's other half: LeaseValid above
-	// covers the FLUSH ACK, this covers the publish.
-	PublishedWithoutLease bool
 }
 
 // String renders an event deterministically for the trace.
@@ -123,16 +96,8 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d watermark pub=%d dur=%d loc=%d", e.Step, e.Published, e.Durable, e.Local)
 	case EventLeavesHost:
 		return fmt.Sprintf("%04d leaves-host clear_leak=%t %s", e.Step, e.ClearLeak, e.Msg)
-	case EventDurableAck:
-		return fmt.Sprintf("%04d durable-ack seq=%d lease_valid=%t", e.Step, e.Durable, e.LeaseValid)
-	case EventPromotion:
-		return fmt.Sprintf("%04d promotion early_grant=%t %s", e.Step, e.EarlyGrant, e.Msg)
 	case EventStalePublsh:
 		return fmt.Sprintf("%04d stale-publish succeeded=%t", e.Step, e.StalePublishOK)
-	case EventFailover:
-		return fmt.Sprintf("%04d failover acked_durable=%d recovered=%d", e.Step, e.AckedDurable, e.Recovered)
-	case EventSnapshot:
-		return fmt.Sprintf("%04d snapshot mutated=%t %s", e.Step, e.SnapshotMutated, e.Msg)
 	case EventTruncate:
 		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
 	case EventDurableRead:
@@ -140,11 +105,6 @@ func (e Event) String() string {
 			e.Step, e.Key, e.ZerosAfterRestart, e.ForeignBytesAfterRestart)
 	case EventVolumeServe:
 		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
-	case EventCheckpoint:
-		return fmt.Sprintf("%04d checkpoint vol=%s lease_valid=%t published_without_lease=%t %s",
-			e.Step, e.Key, e.LeaseValid, e.PublishedWithoutLease, e.Msg)
-	case EventIOClass:
-		return fmt.Sprintf("%04d io-class bg_granted=%t high_in_flight=%t", e.Step, e.BgGranted, e.HighInFlight)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

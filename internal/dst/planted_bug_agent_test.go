@@ -77,3 +77,18 @@ func TestPlantedBugASnapshotIsNotFrozen(t *testing.T) {
 		return aSnapshotOfALiveVolumeIsFrozen(s, snapshotTakenLate)
 	})
 }
+
+// INV-10 in the only form ADR-0026 leaves it: two incarnations of a volume must not both
+// publish an image. They do not conflict — the second overwrites the first and everything
+// the first host's guest wrote disappears with no error anywhere.
+//
+// Planted by a *backend*, not by a code change: an object store that accepts every
+// conditional write. That is the hazard §6.1's conformance suite exists to keep out of
+// production, and it is worth planting exactly this way — the invariant is one If-Match
+// away from being off, with nothing in this tree failing to say so.
+func TestPlantedBugTwoHostsBothPublish(t *testing.T) {
+	requirePasses(t, 37, NewSingleWriterChecker(), scenarioTwoHostsCannotBothPublishAnImage)
+	plantedBug(t, 37, NewSingleWriterChecker(), "effective-single-writer", func(s *Sim) error {
+		return twoHostsCannotBothPublish(s, preconditionsIgnored)
+	})
+}

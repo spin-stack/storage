@@ -1093,6 +1093,48 @@ lands a reconcile cycle before the catalog row leaves CREATING. It now waits on 
 desired state — the pending id arriving and then clearing — which observes the whole round
 trip and is the honest definition of "the snapshot exists".
 
+## The invariants were rewritten against the code, 2026-08-03
+
+`INVARIANTS.md` had gone on describing checkers, scenarios and packages ADR-0026 deleted.
+A row naming code that no longer exists is worse than a missing row — it is the reason a
+reader believes a property is proven — so every row was checked against a symbol that
+exists, and `withdrawn` was added as a state distinct from `pending`: pending means the
+checker was never written, withdrawn means the *mechanism* is gone. Each withdrawn row
+says what survives of it and what would bring it back, which is the part deleting the rows
+would lose.
+
+**The bookkeeping itself was lying, and that is the finding.** `plantedProofs` claimed six
+behavioural proofs; two were fiction. `effective-single-writer` claimed one while **nothing
+emitted the event its checker reads** — the scenario that did went with promotion — and
+`watermark-order` claimed one that was never written. `TestEveryCheckerHasAPlantedBugProof`
+could not see either, because it asserted the *map* matched the checker list rather than
+asserting the proofs exist. That is the same failure mode as a checker that cannot fire,
+one level up.
+
+Closed three ways. `plantedBug` now records what it actually proved and a `TestMain`
+asserts, after the package runs, that every default checker was exercised — guarded on
+`-run` being empty, so a single-test invocation is not spuriously red, which is how a check
+like this gets switched off. `watermark-order` is reclassified `proofLiteral` with a proof
+that runs: the ordering is enforced at the source (`ErrWatermarkOrder`), so no fault in the
+simulated disk, store or clock can make production emit an out-of-order triple. And
+`effective-single-writer` got a real driver, below.
+
+**INV-10 has a scenario again, and it is the only fencing left.**
+`two-hosts-cannot-both-publish-an-image` runs two real `VolumeManager`s on separate data
+directories against one object store: both serve the same volume, both write different
+bytes, both stop. Exactly one image may exist afterwards. The observable is the manifest's
+ETag rather than an error, because `publish()` logs its refusal and returns nothing — a
+failed publish must not block a teardown. **Its planted bug is a backend, not a code
+change:** an object store that ignores preconditions. Every claim about fencing in V1 rests
+on `If-Match` meaning what it says, and a store that quietly accepts a stale ETag turns the
+invariant off with nothing in this tree failing — which is exactly why
+`task backend:conformance` is blocking per backend (§6.1).
+
+Three checkers were deleted with the subjects they watched: `PromotionWaitChecker` (nothing
+promotes), `NoLostAckedWriteChecker` (there is no failover) and `ImmutableSnapshotChecker`
+(INV-16 is structural now — `image.PublishSnapshot` is create-only). The event kinds and
+`Event` fields only they read went with them.
+
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
@@ -1101,16 +1143,26 @@ listed here, in the file that tracks state, because until now each was recorded 
 inside the spec or ADR that built it — which is how a thing stays "done" while nothing
 calls it.
 
-- **INV-17 has no path through the real Agent.** `VolumeManagerDeps.IOClass` is set by
-  nothing outside `internal/agent/durability_internal_test.go`, and
-  `ioclass.Scheduler.Begin`/`End` have no production caller at all — so even with a
-  scheduler injected, `HighActive()` would be 0 and the background budget would never
-  see a foreground request to yield to. The invariant is enforced against a condition
-  nothing can produce. **Deciding between marking the data path and deleting the field
-  with its gate is a durability-zone change** and gets its own increment.
-- **`controlplane.Promoter`/`BumpVolumeEpoch` are not wired into any binary.**
-  `NewPromoter` appears only in tests and DST. ADR-0024 already says so; this file did
-  not. Failover therefore exists as a model, and nothing an operator can run performs it.
+- **`wal.TruncateLocal` and `wal.AdvancePublished` have no production caller.** The
+  durability scheduler that called them went in increment 4.1, so `published_sequence`
+  is permanently 0 and nothing reclaims a segment mid-session — which is correct under
+  ADR-0026, since the WAL lives one session. Both are kept deliberately: the rule
+  `TruncateLocal` enforces (`ErrTruncateAboveDurable`) is the part that is easy to get
+  wrong, and reclamation returns with any long-lived volume. Recorded so nobody reads
+  INV-03's first `≤` as a live property.
+- **Nothing reads a descriptor.** `descriptor.Write` has two callers — provisioning and
+  clone — and no reader anywhere in the tree, because `controlplane.RebuildMetadata` went
+  with the recovery chain in increment 4. INV-20 is the property they exist for, and it
+  is `pending` rather than withdrawn: the inputs are still being written, and a rebuild
+  under ADR-0026 would be far simpler than the one that was deleted (a descriptor plus
+  `image/<vol>/manifest.json`, with no epoch chain to walk). **The decision is write the
+  reader or stop writing the descriptors**, and it is a format decision, so it is a
+  human-review zone and its own increment. Leaving it as-is is the one option with no
+  argument for it: a bucket that describes volumes nothing can read back.
+- **`metadata.BumpVolumeEpoch` has no caller outside tests.** `controlplane.Promoter`
+  went with the fencing half in increment 4.6; the store's compare-and-set on the epoch
+  stayed, because it is what would grant one if promotion returns (ADR-0024). INV-11 is
+  withdrawn, not pending.
 
 ## STOPPED — the data-path cleanup, superseded by ADR-0026
 

@@ -93,23 +93,6 @@ func (c *NoPlaintextLeavesHostChecker) Observe(e Event) {
 
 func (c *NoPlaintextLeavesHostChecker) Check() error { return c.violation }
 
-// PromotionWaitChecker enforces INV-11 (§12.3): no epoch N+1 is granted before
-// FENCING_WAIT elapses.
-type PromotionWaitChecker struct{ violation error }
-
-// NewPromotionWaitChecker returns a fresh checker.
-func NewPromotionWaitChecker() *PromotionWaitChecker { return &PromotionWaitChecker{} }
-
-func (c *PromotionWaitChecker) Name() string { return "promotion-fencing-wait" }
-
-func (c *PromotionWaitChecker) Observe(e Event) {
-	if e.Kind == EventPromotion && e.EarlyGrant && c.violation == nil {
-		c.violation = fmt.Errorf("epoch granted before FENCING_WAIT elapsed at step %d (violates §12.3/INV-11)", e.Step)
-	}
-}
-
-func (c *PromotionWaitChecker) Check() error { return c.violation }
-
 // SingleWriterChecker enforces INV-10 (§12.4): a fenced/stale-epoch writer never
 // publishes.
 type SingleWriterChecker struct{ violation error }
@@ -126,42 +109,6 @@ func (c *SingleWriterChecker) Observe(e Event) {
 }
 
 func (c *SingleWriterChecker) Check() error { return c.violation }
-
-// NoLostAckedWriteChecker enforces INV-09 (§12): across a partition + failover, the
-// promoted writer's recovered prefix must cover everything the fenced writer ACKed
-// as durable.
-type NoLostAckedWriteChecker struct{ violation error }
-
-// NewNoLostAckedWriteChecker returns a fresh checker.
-func NewNoLostAckedWriteChecker() *NoLostAckedWriteChecker { return &NoLostAckedWriteChecker{} }
-
-func (c *NoLostAckedWriteChecker) Name() string { return "no-lost-acked-write" }
-
-func (c *NoLostAckedWriteChecker) Observe(e Event) {
-	if e.Kind == EventFailover && e.Recovered < e.AckedDurable && c.violation == nil {
-		c.violation = fmt.Errorf("recovered prefix %d < ACKed-durable %d at step %d (violates §12/INV-09)",
-			e.Recovered, e.AckedDurable, e.Step)
-	}
-}
-
-func (c *NoLostAckedWriteChecker) Check() error { return c.violation }
-
-// ImmutableSnapshotChecker enforces INV-16 (§5.2): a published snapshot never
-// changes.
-type ImmutableSnapshotChecker struct{ violation error }
-
-// NewImmutableSnapshotChecker returns a fresh checker.
-func NewImmutableSnapshotChecker() *ImmutableSnapshotChecker { return &ImmutableSnapshotChecker{} }
-
-func (c *ImmutableSnapshotChecker) Name() string { return "immutable-snapshots" }
-
-func (c *ImmutableSnapshotChecker) Observe(e Event) {
-	if e.Kind == EventSnapshot && e.SnapshotMutated && c.violation == nil {
-		c.violation = fmt.Errorf("a published snapshot changed at step %d (violates §5.2/INV-16)", e.Step)
-	}
-}
-
-func (c *ImmutableSnapshotChecker) Check() error { return c.violation }
 
 // TruncateBelowPublishedChecker enforces INV-13 (§21.1): local WAL is never
 // truncated above the verified published point.

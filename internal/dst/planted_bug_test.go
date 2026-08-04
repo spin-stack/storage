@@ -2,6 +2,9 @@ package dst
 
 import (
 	"errors"
+	"flag"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -50,6 +53,7 @@ var (
 // whether the event stream carries the violation.
 func plantedBug(t *testing.T, seed int64, checker Checker, wantName string, sc Scenario) {
 	t.Helper()
+	proven[wantName] = true
 	res := Run(seed, func(s *Sim) error { _ = sc(s); return nil }, checker)
 	if res.Err == nil {
 		t.Fatalf("%s did not catch the planted violation", wantName)
@@ -120,21 +124,70 @@ const (
 	proofLiteral
 )
 
-// plantedProofs is the registry TestEveryCheckerHasAPlantedBugProof holds to the
-// checker list. It shrank with ADR-0026: every entry removed went with the checker it
-// named, and every one of those checkers went with its subject.
+// plantedProofs is the registry the checks below hold to the checker list. It shrank
+// with ADR-0026: every entry removed went with the checker it named, and every one of
+// those checkers went with its subject.
+//
+// **It is no longer only a declaration.** It used to be a map nothing cross-checked
+// against the tests, and on 2026-08-03 two of its six entries were fiction:
+// `effective-single-writer` claimed a behavioural proof while nothing emitted the event
+// its checker reads — the scenario that did had gone with promotion — and
+// `watermark-order` claimed one that was never written. A registry of claims about
+// proofs is the same failure mode as a checker that cannot fire, which is this project's
+// oldest lesson, and it survived because the test asserted the *map* matched the checker
+// list rather than asserting the proofs exist. TestMain now closes that: plantedBug
+// records what it actually proved, and a checker nobody exercised fails the package.
 var plantedProofs = map[string]proofKind{
 	"effective-single-writer":  proofBehavioural,
 	"no-plaintext-leaves-host": proofBehavioural,
 	"monotonic-clock":          proofBehavioural,
-	"watermark-order":          proofBehavioural,
+	// Literal, and honestly so: the ordering is enforced at the source
+	// (Log.AdvanceDurable/AdvancePublished return ErrWatermarkOrder, unit-tested), so no
+	// fault in the simulated disk, store or clock can make production emit an
+	// out-of-order triple. The checker is a backstop against a *reporting* path that
+	// computes them separately, and the only way to reach it is to plant the event.
+	"watermark-order": proofLiteral,
 	// Contributed by scenarios_agent.go; proofs in planted_bug_agent_test.go.
 	"fenced-volume-not-served":       proofBehavioural,
 	"durable-range-survives-restart": proofBehavioural,
 }
 
-// TestEveryCheckerHasAPlantedBugProof fails when a checker is added without one, so
-// this file cannot fall behind DefaultCheckers again.
+// proven records which checkers a plantedBug call actually exercised in this run.
+var proven = map[string]bool{}
+
+// TestMain asserts, after every test in the package has run, that each default checker
+// was shown to catch a planted violation. Checking after the run rather than inside a
+// test is what makes it independent of the order Go happens to execute them in.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code != 0 {
+		os.Exit(code)
+	}
+	// Only when the whole package ran. Under a -run filter the proofs are simply absent
+	// rather than missing, and failing there would make every single-test invocation red
+	// — which is how a check like this gets switched off.
+	if f := flag.Lookup("test.run"); f == nil || f.Value.String() != "" {
+		os.Exit(code)
+	}
+	var missing []string
+	for _, c := range DefaultCheckers() {
+		if !proven[c.Name()] {
+			missing = append(missing, c.Name())
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		fmt.Fprintf(os.Stderr, "checkers with no planted-bug proof that actually ran: %v\n"+
+			"A checker that has never been shown to catch a violation proves nothing (CLAUDE.md stop signal).\n",
+			missing)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+// TestEveryCheckerHasAPlantedBugProof fails when a checker is added without a registry
+// entry. TestMain is what proves the entry is true; this is what keeps the registry —
+// and its proofKind, which nothing else records — from falling behind DefaultCheckers.
 func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 	for _, c := range DefaultCheckers() {
 		if _, ok := plantedProofs[c.Name()]; !ok {
@@ -146,26 +199,37 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 	}
 }
 
+// The watermark backstop, planted literally — see the registry entry for why that is the
+// only way in, and internal/wal's ErrWatermarkOrder tests for where it is really enforced.
+func TestPlantedBugWatermarkOrder(t *testing.T) {
+	ordered := func(s *Sim) error {
+		s.Emit(Event{Kind: EventWatermark, Local: 30, Durable: 20, Published: 10})
+		return nil
+	}
+	requirePasses(t, 41, NewWatermarkOrderChecker(), ordered)
+	plantedBug(t, 41, NewWatermarkOrderChecker(), "watermark-order", func(s *Sim) error {
+		s.Emit(Event{Kind: EventWatermark, Local: 10, Durable: 20, Published: 30})
+		return nil
+	})
+}
+
 // TestPlantedBugCoverageIsNotSilentlyWeakened pins the number of behavioural proofs.
 // Converting a literal proof to a behavioural one is progress and raises this number;
 // a checker quietly downgraded to a hand-written Emit is not, and fails here.
 //
-// It went 16 -> 15 on 2026-08-02, which is the one shape of decrease this test is not
-// meant to stop: `no-permanent-delete` was removed *with its subject*. ADR-0026 deleted
-// internal/gc, nothing issues a delete any more, and a checker that cannot fire proves
-// nothing. INV-14 is `pending` rather than dropped — the number goes back up with the
-// sweeper. A decrease for any other reason is the weakening this test exists to catch,
-// and the comment is the difference between the two.
+// The history of the decreases matters more than the number, because a decrease is the
+// one thing this test cannot distinguish from the weakening it exists to catch:
+//
+//   - 16 -> 15 (2026-08-02): `no-permanent-delete` removed *with its subject* —
+//     ADR-0026 deleted internal/gc, so nothing issues a delete.
+//   - 15 -> 14 (2026-08-02): the checkpoint-lease checker, same shape — the durability
+//     scheduler was withdrawn, so nothing publishes a checkpoint.
+//   - 8 -> 7 (2026-08-02): `durable-ack-requires-lease` (INV-06), with the lease-gated ACK.
+//   - 7 -> 6, then 6 -> 5 (2026-08-03): `watermark-order` was *reclassified*, not
+//     removed. It had claimed a behavioural proof that did not exist; it is literal now
+//     and has a proof that runs. The number went down because the record became true.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	// 15 -> 14 on 2026-08-02, and again the decrease is the shape this test allows: the
-	// checkpoint-lease checker was removed *with its subject*. ADR-0026 withdrew the
-	// durability scheduler, so nothing publishes a checkpoint and the checker could not
-	// fire. A decrease for any other reason is the weakening this exists to catch.
-	// 8 -> 7 with ADR-0026 increment 4.5: durable-ack-requires-lease (INV-06) went with
-	// the lease-gated ACK. Every decrease in this constant so far has been a checker
-	// removed *with its subject*, which is the one shape this test allows — the comment
-	// beside it is what separates that from the weakening it exists to catch.
-	const wantBehavioural = 6
+	const wantBehavioural = 5
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {
