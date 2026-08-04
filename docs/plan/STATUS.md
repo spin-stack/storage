@@ -1505,6 +1505,72 @@ other withdrawn sections got, not a deletion. `REFERENCE.md:123` (`§26.1 | Dist
 tracing.`) resolves the *document* section and stays accurate as written; it is listed
 only so track A decides deliberately rather than by omission.
 
+### E3+E4 — the fake leaves the production surface, and four doc comments stop lying (2026-08-03)
+
+Two commits, no behaviour change, `task ci` green on each.
+
+**E3.** `vhost.RawDevice` — an in-memory Backend whose own comment said it exists "so the
+unit tests can prove the transport" — lived in `internal/vhost/backend.go`, a production
+file. It now lives in `internal/vhost/rawdevice_test.go`. The proof there was never a
+production caller is that `go build ./...` still succeeds with it gone from the production
+surface; `backend.go` is down to the `Backend` interface and `ErrOutOfRange`, and lost
+three imports. An `internal/vhost/vhosttest` package was rejected: it buys cross-package
+reuse nobody has asked for and puts the fake back on the production surface under another
+name.
+
+The item's premise that `hostio.RawFile` "is gone, surviving only in two doc comments" is
+**wrong** — `internal/vhost/hostio/rawfile.go` is 180 lines and
+`integration/vhost/qemu_test.go:226` calls `CreateRawFile` to serve a real kernel a
+Backend with no WAL underneath it. It is the same shape of scaffolding as `RawDevice` and
+it cannot make the same move: `integration/vhost` is a different package and Go has no way
+to import another package's tests. Left where it is; the two doc comments were corrected
+to describe it accurately instead of deleted. Nothing else matched
+`fake|stub|noop|dummy` outside a `_test.go` file in the four packages.
+
+**E4.** Every `pkg.Symbol`, `Err*` and `Test*` identifier in the doc comments of
+`internal/{obs,vhost,vhost/hostio,blockdev,cow}`'s production files was grepped out and
+looked up. Four did not resolve, and the interesting part is that three of them were one
+thing: the deleted remote durability chain, still describing what a guest is promised.
+
+- `wal.ErrSelfFenced` in `blockdev/doc.go`'s error list — gone with the lease-gated ACK
+  (ADR-0026 4.5). Replaced by `wal.ErrLogBroken`, which `refuse` has branched on since.
+- The same file's FLUSH paragraph promised "the guarantee against losing the host arrives
+  only with a FLUSH" and a `remote` mode that "returns only after every covering object is
+  verified in S3 and the lease is confirmed valid on the monotonic clock". `durableStep`
+  is one `fdatasync`. The doc now says a FLUSH survives the process, the Agent and QEMU,
+  and **not** the host. Narrowing a doc to what the code does is not an ACK-rule change and
+  no code moved — but this comment *is* where the guest-facing promise is written down, so
+  it is flagged for the human who reviews that zone.
+- `TestAGuestWriteCompletesWhileAFlushIsUploading`, cited by `Device`'s comment as the
+  proof a concurrent WRITE cannot be ACKed by a FLUSH, exists nowhere in the tree. Now
+  cites `TestConcurrentRequestsDoNotRaceTheLog`, which does exist here, and says the
+  sequence argument is wal's to prove rather than borrowing a name for it.
+- `cow.ActiveMap`, promised by `internal/cow`'s package doc ("and, in Increment 4.4, the
+  64 KiB segment active map"), was deleted 2026-08-02.
+
+Each correction quotes the text it replaces, in the file and in the commit message.
+
+**For other tracks, seen and not edited:**
+
+- **Track C — `wal.Log.Flush`'s own doc comment (`internal/wal/log.go:575`) is stale in
+  exactly the way `blockdev/doc.go` was**: it still lists "remote (default): upload +
+  verify every covering object, VERIFY the lease… (§12.2, INV-06)" and a `local` mode,
+  twenty lines above `durableStep`, which says both were deleted. Same for `Log`'s
+  concurrency comment ("mu … is **never held across an object-store PUT**", "flushMu
+  serializes durable steps (Flush, WriteFUA)" — `WriteFUA` is gone) and
+  `ErrFUAOnWrite`'s "fdatasync, verified PUT, valid lease".
+- **Track C — `wal.Log.AdvancePublished` has no production caller** (only
+  `internal/dst/scenarios_wal.go:313`), so `published` never advances for a live volume
+  and `TruncateLocal` can reclaim nothing. That is why `blockdev.go:163`'s operator-facing
+  string still offers "restore the object store" as a remedy for a full device: it is
+  wrong, but what replaces it depends on the truncation story. Left alone deliberately —
+  the same phrase is in `internal/wal/degraded.go:15` and `internal/simio/disk/disk.go:21`.
+- **Track A — `REFERENCE.md` still resolves `§14.4` as "**The order of operations in
+  FLUSH/FUA.** Six steps" and `INV-07` as "ACK only after the six §14.4 steps | active",
+  and `§14.8` as "Per-volume durability modes (`remote` / `local`)". `INVARIANTS.md`'s
+  INV-07 row is already correct ("Six steps became two"); it is `REFERENCE.md`'s one-line
+  resolution that still sends a reader to the deleted chain.
+
 ---
 
 # Specs for work not started
