@@ -561,22 +561,16 @@ tasks:
       - task: qemu:verify
       - task: guest:verify
 
-  guest:proofs:
-    desc: >-
-      Only the lanes a real guest boots in, with skipping disabled. This is what CI's
-      guest jobs run: a hosted runner cannot hold both Docker and the pinned QEMU in one
-      job (ADR-0025), so there the merge gate is assembled from separate jobs, and
-      `task ci:full` is the single-machine form of the same claim.
-    cmds:
-      - task: test:integration:qemu
-        vars: { REQUIRE_PROOFS: "1" }
-      # The whole e2e lane, not a `-run` selection of its two guest-backed scenarios.
-      # Naming tests in a target is what wave 0 removed from `task dst`, for the reason
-      # that applies verbatim here: `go test -run` exits 0 having run nothing when the
-      # regex matches nothing, so a renamed test turns the gate into a no-op that reports
-      # success.
-      - task: test:e2e
-        vars: { REQUIRE_PROOFS: "1" }
+  # `guest:proofs` was here: the two guest-backed lanes with skipping disabled, described
+  # as "what CI's guest jobs run". Deleted 2026-08-05 because that sentence was false and
+  # nothing called it. CI cannot run both lanes in one job — a hosted runner has the
+  # pinned QEMU or a Docker daemon, not both (ADR-0025) — so `.github/workflows/ci.yml`
+  # invokes `test:integration:qemu` and `test:e2e` in two separate container jobs, each
+  # with REQUIRE_PROOFS=1, and neither ever named this target. A target that describes
+  # itself as the thing CI runs, that CI does not run, is the same defect as a gate that
+  # reports success for a proof it skipped, one level down: it is read, believed, and
+  # wrong. On one machine `task ci:full` already runs both lanes and is the honest name
+  # for that claim.
 
   vhost:bootsector:
     desc: >-
@@ -689,6 +683,13 @@ tasks:
     cmds:
       - "{{.TOOLS_BIN}}/golangci-lint fmt --diff ./..."
 
+  workflows:verify:
+    desc: >-
+      Assert every `task <name>` in .github/workflows resolves against this Taskfile.
+      No workflow here has ever executed, so this is the only thing that checks them.
+    cmds:
+      - TASK_EXE={{.TASK_EXE}} bash hack/workflow-tasks.sh
+
   ci:
     desc: Fast local gate — format, build, lint, test, dst. No Docker required.
     cmds:
@@ -697,6 +698,13 @@ tasks:
       - task: lint
       - task: test
       - task: dst
+      # Half a second, and it is in the *fast* gate rather than only in `ci:full`
+      # because renaming a Taskfile target is a local edit whose only victim is a
+      # workflow file — and the person renaming it runs `task ci`, not `task ci:full`.
+      # The alternative, leaving it to CI, means the report arrives from the one runner
+      # that cannot answer it: the guest jobs fail on a missing target long before they
+      # reach the proof they exist for, and their logs read like an infrastructure fault.
+      - task: workflows:verify
 
   # --- the merge gate ----------------------------------------------------------
   #
