@@ -324,3 +324,81 @@ Proven able to fail, four plants:
   WRITE with <nil>`.
 
 Production coverage after the increment: **90.1%** (`task cover`, floor 90%).
+
+### C8 — an empty desired state is not a teardown order (2026-08-05)
+
+`VolumeManager.Apply` stopped every volume the desired state did not list. That is right
+for a volume missing from a list that names others, and it is the wrong reading of a list
+that names *none* — and an empty list is not exotic. A Control Plane brought up against
+an empty database sends it, a `GetDesiredState` that returns no rows for a reason that
+has nothing to do with this host sends it, and an Agent whose `-host-id` stopped matching
+after a config change is sent it too. Under ADR-0026 stopping a volume is what publishes
+it, so a spurious empty list made a host upload every session it held and take every
+guest's device away in one cycle, with nothing reporting an error anywhere; with wave 2's
+holding rule, a host that then could not publish would hold its data directory and refuse
+to stop as well.
+
+**The rule is `len(live) == 0 && len(gone) > 0` stops nothing**, argued at the guard in
+`Apply` together with the case where it is wrong. `live` and not `desired`, because a
+list whose every entry `validateDesired` refused named nothing usable either, and reading
+it as a full inventory would tear the host down on the strength of what it had just
+rejected. A list that names something is unchanged: it is proof the Control Plane knows
+this host and is deciding volume by volume, so an absence *inside* it is a decision about
+that volume.
+
+**This does not make a drain impossible, and that is checkable rather than hopeful.**
+`cpserver.GetDesiredState` lists on `volumes.primary_host_id` and `cpserver.applyReport`
+refuses on the same column, so every real detach, promotion or deletion that empties this
+host's desired state also refuses this host's *report* of those volumes — and `Loop.fence`
+tears them down in the same cycle, through the door that names the volume instead of the
+one that names nothing. Where the rule is wrong is written at the guard: a desired-state
+filter the report path does not share would leave a volume served here until something
+names it (bounded, because handing it to another host is what changes `primary_host_id`),
+and a Control Plane whose catalog is *gone* refuses every report anyway, so the guard buys
+nothing in that case rather than harming.
+
+**The guard took on a debt, and it is paid in the same commit.** A detach used to reach
+this host as a shrinking desired state and be carried out by `Apply`, which sets no
+fencing memory; now it arrives as a refused report, so `Fence` records the epoch. Since
+`controlplane.Place` re-places a volume without bumping its epoch, `-detach-volume X`
+then `-attach-volume X` naming this same host would arrive at exactly the remembered
+epoch and be skipped for the life of the process — a guest whose device never returns,
+silently. `Apply` therefore forgets the fencing memory of any volume the Control Plane
+has stopped listing, which keeps DEV-0012's rule intact (there the volume *is* still
+listed, so the entry survives).
+
+Proven able to fail, three plants:
+
+- the guard's condition forced false — the e2e arm
+  (`TestAnEmptyDesiredStateDoesNotTearDownTheHost`, real binaries, real Postgres and
+  RustFS, with a reverse proxy that answers only `GetDesiredState` with an empty
+  response so the heartbeat and the report still reach the real Control Plane) went red
+  in under four seconds with `the Control Plane listed no volumes and the Agent stopped
+  volume ... and published [image/.../manifest.json] — an empty list is not a detach
+  order, and this host is still the volume's writer`. The unit arm
+  (`TestAnEmptyDesiredStateStopsNothing`, nil / empty / only-unparseable-entries) failed
+  all three cases with `serving [] after a desired state that named nothing`.
+- `Loop.fence` short-circuited — the counterweight
+  (`TestADetachedVolumeIsStillStoppedAndPublished`, a real `control-plane
+  -detach-volume`) went red with `timed out after 1m0s waiting for the detached volume's
+  image to reach the bucket`. Without that scenario the guard would be
+  indistinguishable from "this Agent never lets go".
+- the fencing-memory forget removed —
+  `TestAFencedVolumeIsForgottenOnceItLeavesTheDesiredState` failed with `volume ... has
+  no device after being detached and attached back to this host: the fencing memory
+  outlived the placement that caused it`. Its middle desired state names another volume
+  rather than nothing, so it proves the forgetting on its own rather than through the
+  empty-list path.
+
+The Agent also *says* so, every cycle rather than once at the transition — the same
+reasoning as `publishHeld`'s holding line: an operator arriving hours later needs the
+state to still be announcing itself. `TestAnEmptyDesiredStateDoesNotTearDownTheHost`
+waits for the line to repeat and then waits for it to stop once the Control Plane names
+the volume again, which is what separates a guard from a permanent refusal to reconcile.
+
+Production coverage at the last `task cover` run that completed during this increment:
+**90.0%** against the same 90% floor, measured with the guard and both e2e scenarios in
+place. The repeat run after `TestAFencedVolumeIsForgottenOnceItLeavesTheDesiredState` was
+added could not build the tree at all — `internal/metadata/metadatatest` was mid-edit in
+another lane — and a test that only adds exercised lines cannot lower the figure. Track A
+recounts it at integration, which is the only place it means anything.
