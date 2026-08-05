@@ -2103,6 +2103,61 @@ needs a store the test owns, and over RustFS the equivalent is a paused TCP prox
 trades the deterministic window for an S3 client timeout — with the snapshot then failing
 and never being retried (`ensureSnapshot` starts one at most once per id).
 
+### C3 — the device budget on the Agent (2026-08-04)
+
+`grep -rn "Limits" cmd/` returned nothing: **no Agent this repository has ever run had a
+write-path bound of any kind**, while eight unit tests proved backpressure against limits
+they set themselves. `agent.Budget` (`internal/agent/budget.go`) is the missing half —
+`cmd/volume-agent` measures the device (`agent.NewDiskUsage(disk).Usage`, a statfs of
+`--data-dir`'s filesystem), divides it by `-max-volumes` (default 16), and every `wal.Log`
+the manager builds gets that share as its bound. An Agent with no budget does not start:
+`NewVolumeManager` refuses `Budget.Share() <= 0`, in the manager and not in `main`, for
+the reason the data-directory lock lives there.
+
+**The quantity bounded is not `MaxUnflushedBytes`, and that is the point.** `Sync` clears
+it on every guest fsync, so on any workload that fsyncs it reads zero while the segments
+grow — it bounds a burst, not a session, and under ADR-0026 a session's whole WAL stays
+local until the volume stops. The new `Limits.MaxLocalBytes` bounds the retained segments,
+enforced against a counter `segments` maintains at the four places the number can change
+(a created header, an accepted append, a reclaimed segment, an adopted directory);
+`LocalBytes()` still stats the disk and is what the tests assert on, so a counter that
+drifted fails rather than quietly loosens the bound.
+
+**The reserve is subtraction, not a pool, and this is a departure from the ADR worth
+reading.** The amendment re-aims it at the image publish at stop — but `image.Publish`
+writes **no local byte**: it reads the view and PUTs. There is no machinery here to let one
+writer spend what another may not, and building one would be exactly the "reserve nobody
+can spend" the amendment warns against. So the guest budget is bounded strictly below the
+device (`GuestRatio` 0.85, `ReserveRatio` 0.05) and a device full *for guests* still has
+free blocks — which is what the stop's `fdatasync` needs on a delayed-allocation
+filesystem (ADR-0013 gap 6, the one part DST cannot model) and what the filesystem's own
+metadata needs. The ADR's **1 GiB floor is dropped** with the objects it was sized for;
+keeping it would give every device under 20 GiB a budget of zero.
+
+Two consequences that are decisions, not side effects. The share is **static** — dividing
+among the volumes actually attached is retroactive (a volume that arrives puts another
+volume's healthy guest into backpressure) — and because a share only bounds a device if
+the number of shares does, `start` refuses the volume past `-max-volumes` (a local,
+defensive power, ADR-0013 §5; the volume stays in the desired state and `Apply` retries).
+
+Proven able to fail, four plants:
+
+- `Share()` returning the whole budget — the DST arm `device-budget-holds-across-volumes`
+  (four volumes on a simulated 4 MiB device, budget derived through `agent.NewBudget`):
+  `volume ... met the device's ENOSPC after 819200 bytes: the budget did not bound it, the
+  device did`, after the first volume held 3268608 of a 3355443-byte budget. The same plant
+  turns the e2e arm (`integration/e2e/budget_test.go`, which reads the Agent's own start-up
+  line) red with `each of 16 volumes may hold 13148287795 bytes of a 13148287795-byte
+  budget: the budget is not divided`.
+- the `MaxLocalBytes` check removed: `a thousand records fit inside the bound; the test
+  proves nothing`.
+- reclaim's accounting removed: `a WRITE after 4080 bytes were reclaimed: wal:
+  backpressure`.
+- adopt's accounting removed: `a log resumed over 8160 bytes of its 8192-byte share took a
+  WRITE with <nil>`.
+
+Production coverage after the increment: **90.1%** (`task cover`, floor 90%).
+
 ## Track D — the catalog (open work, appended per increment)
 
 *Only track D appends here* — it owns `internal/controlplane`, `internal/cpserver`,
