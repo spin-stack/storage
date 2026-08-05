@@ -58,14 +58,36 @@ type Limits struct {
 	// cleared by Sync.
 	MaxUnflushedBytes int64
 	MaxUnflushedAge   time.Duration
+	// MaxLocalBytes bounds what this log may occupy on the device: every retained
+	// segment, header included, minus what truncation has unlinked. Crossing it fails
+	// the WRITE with ErrBackpressure — an error a guest understands — instead of
+	// letting the device reach ENOSPC, which arrives as a partial append and after
+	// which every WRITE fails with an I/O error nothing can act on. 0 means unbounded,
+	// which is what a log with no device behind it (a unit test) wants; the Agent
+	// always sets it, because it is the volume's share of the device budget
+	// (agent.Budget, ADR-0013 §1 as amended 2026-08-03).
+	//
+	// It is a *second* bound and not a replacement for MaxUnflushedBytes, because the
+	// two measure different things and only this one measures the device. Sync clears
+	// the unflushed count on every guest fsync, so under any workload that fsyncs —
+	// which is every workload that cares about its data — MaxUnflushedBytes is at zero
+	// while the segments keep growing. It bounds a burst; it cannot bound a session,
+	// and under ADR-0026 a session's whole WAL stays local until the volume stops.
+	//
+	// Nothing clears this one during a session, and that is the honest shape of V1: no
+	// mid-session reclaim exists, so a volume that has written its share is a volume
+	// that stays in backpressure until it stops and publishes. The alternative — let
+	// it keep writing and take the device down for every other volume on the host — is
+	// the failure ADR-0013 §1 exists for.
+	MaxLocalBytes int64
 	// SegmentBytes is the size at which a WAL segment is sealed and the next one
 	// started. 0 means SegmentBytes, the 32 MiB default.
 	//
-	// It is configurable because ADR-0013 wants it derived from the volume's share of
-	// the device budget (clamp(share/8, 8 MiB, 64 MiB)) once the Agent computes one,
-	// and because a test that has to write 32 MiB to cross one boundary tests the
-	// same code more slowly. It is not a correctness knob: nothing below depends on
-	// the value, only on it being the same for the life of a log.
+	// It is configurable because ADR-0013 has it derived from the volume's share of the
+	// device budget — agent.Budget.Limits does that now, an eighth of the share — and
+	// because a test that has to write 32 MiB to cross one boundary tests the same code
+	// more slowly. It is not a correctness knob: nothing below depends on the value,
+	// only on it being the same for the life of a log.
 	SegmentBytes int64
 }
 
@@ -299,6 +321,21 @@ func NewLogAfter(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, e
 }
 
 func (l *Log) backpressure(add int) error {
+	// The device bound first, because it is the one whose breach costs the whole host:
+	// a log at its share refuses one volume's WRITE, a device at ENOSPC refuses every
+	// volume's. Measured against the retained segments, not against what this log has
+	// ever appended — truncation gives bytes back, and a bound that ignored that would
+	// throttle a volume whose data is no longer on the device.
+	//
+	// A segment header is charged on every WRITE although only a rotation writes one.
+	// It costs a fixed 64 bytes of the share and never accumulates, where counting
+	// headers only when they are written would mean the record that rotates a segment
+	// is the one record the bound does not cover — which is precisely the record that
+	// makes the log exceed it.
+	if l.limits.MaxLocalBytes > 0 &&
+		l.segs.retained()+int64(add)+int64(format.SegmentHeaderSize) > l.limits.MaxLocalBytes {
+		return ErrBackpressure
+	}
 	if l.limits.MaxUnflushedBytes > 0 && l.unflushedBytes+int64(add) > l.limits.MaxUnflushedBytes {
 		return ErrBackpressure
 	}

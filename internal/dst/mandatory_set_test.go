@@ -55,6 +55,7 @@ var pinnedMandatorySet = []string{
 	"two-hosts-cannot-both-publish-an-image",
 	"a-rebuilt-catalog-can-serve-its-volumes",
 	"a-volume-stopped-mid-fetch-still-publishes",
+	"device-budget-holds-across-volumes",
 }
 
 // TestMandatorySetIsPinnedByName fails when MandatoryScenarios() and the pinned list

@@ -27,7 +27,6 @@ import (
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/testinfra"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
-	"github.com/spin-stack/storage/internal/wal"
 )
 
 // ADR-0018's definition of done, and DEV-0007's: one volume, one host, a real QEMU guest
@@ -156,9 +155,14 @@ func startAgentOn(t *testing.T, ctx context.Context, dir, volumeID string, store
 		// namespace, and passing dir here is DEV-0017.
 		DataDir:   ".",
 		SocketDir: dir,
-		// Segments small enough to seal, because reclaim only unlinks sealed ones — a
-		// truncation that unlinks nothing would make step 3 vacuous.
-		Limits: wal.Limits{SegmentBytes: 8 << 10},
+		// A budget rather than a raw wal.Limits: production has no other way to bound a
+		// log any more, so a lane that set the limits itself would be testing a wiring
+		// no Agent uses (ADR-0013 §1). The share is 1 MiB, which Budget turns into
+		// 128 KiB segments — small enough to seal several times under the 512 KiB this
+		// guest writes, because reclaim only unlinks sealed segments and a truncation
+		// that unlinks nothing would make step 3 vacuous, and large enough that the
+		// guest is never the one refused.
+		Budget: agent.Budget{DeviceBytes: 8 << 20, ReserveBytes: 1 << 20, GuestBytes: 1 << 20, MaxVolumes: 1},
 	}, agent.VolumeManagerDeps{
 		Clock:   real.NewClock(),
 		Disk:    d,

@@ -54,6 +54,7 @@ func newHoldRigWithGrace(t *testing.T, store *failingStore, onSleep func(n int),
 	clk := &steppingClock{Clock: sim.NewClock(time.Unix(1_700_000_000, 0).UTC()), onSleep: onSleep}
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: holdDataDir, SocketDir: "/run/spin", ShutdownGrace: grace,
+		Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   clk,
 		Disk:    d,

@@ -92,6 +92,7 @@ func TestAVolumeWhoseKeysAreUnusableIsNotServed(t *testing.T) {
 			f := newListenerFactory()
 			m, merr := agent.NewVolumeManager(agent.VolumeManagerConfig{
 				DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+				Budget: testBudget(),
 			}, agent.VolumeManagerDeps{
 				Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
 				Disk:    sim.NewDisk(),
@@ -129,6 +130,7 @@ func TestAKMSNeedsASourceOfKeys(t *testing.T) {
 	var kek [crypto.DEKSize]byte
 	_, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/data", SocketDir: "/run",
+		Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   sim.NewClock(time.Unix(0, 0).UTC()),
 		Disk:    sim.NewDisk(),
@@ -155,6 +157,7 @@ func TestOneAgentPerDataDir(t *testing.T) {
 	newManager := func() (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+			Budget: testBudget(),
 		}, agent.VolumeManagerDeps{
 			Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
 			Disk:    d,
@@ -187,6 +190,7 @@ func TestOneAgentPerDataDir(t *testing.T) {
 	// A different directory on the same host is a different claim.
 	other, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/spin-other", SocketDir: "/run/spin",
+		Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
 		Disk:    d,

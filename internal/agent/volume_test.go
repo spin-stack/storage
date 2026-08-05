@@ -127,6 +127,18 @@ func unusedEventFD(*os.File) (vhost.EventFD, error) {
 	return nil, errors.New("no front-end in a unit test")
 }
 
+// testBudget is the device budget a unit test's manager runs on (ADR-0013 §1).
+//
+// Every manager needs one now — NewVolumeManager refuses a zero budget, because an
+// Agent with no budget has no write-path bound at all — and no test here is about the
+// bound: 1 MiB per volume is orders of magnitude more than any of them writes, so
+// none of them meets backpressure by accident. The proof that the bound holds is in
+// the DST harness (device-budget-holds-across-volumes), where a simulated device can
+// be filled and the assertion can be made against what the device reports.
+func testBudget() agent.Budget {
+	return agent.Budget{DeviceBytes: 8 << 20, ReserveBytes: 1 << 20, GuestBytes: 4 << 20, MaxVolumes: 4}
+}
+
 func newTestManager(t *testing.T) (*agent.VolumeManager, *listenerFactory, *sim.Disk) {
 	t.Helper()
 	d := sim.NewDisk()
@@ -134,6 +146,7 @@ func newTestManager(t *testing.T) (*agent.VolumeManager, *listenerFactory, *sim.
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir:   "/var/lib/spin",
 		SocketDir: "/run/spin",
+		Budget:    testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
 		Disk:    d,
@@ -649,6 +662,7 @@ func TestARestartedVolumeReadsBackWhatWasFlushed(t *testing.T) {
 		f := newListenerFactory()
 		m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+			Budget: testBudget(),
 		}, agent.VolumeManagerDeps{
 			Clock: clk, Disk: d, Listen: f.listen,
 			Mapper: unusedMapper{}, EventFD: unusedEventFD,
@@ -719,6 +733,7 @@ func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
 	f := newListenerFactory()
 	first, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+		Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock: clk, Disk: d, Listen: f.listen,
 		Mapper: unusedMapper{}, EventFD: unusedEventFD,
@@ -738,6 +753,7 @@ func TestARestartedVolumeRefusesToReadWhenTheStoreIsGone(t *testing.T) {
 	f2 := newListenerFactory()
 	second, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+		Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock: clk, Disk: d, Listen: f2.listen,
 		Mapper: unusedMapper{}, EventFD: unusedEventFD,

@@ -47,6 +47,7 @@ func newPublishManager(t *testing.T, store objectstore.Store) *agent.VolumeManag
 	f := newListenerFactory()
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/spin", SocketDir: "/run/spin",
+		Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
 		Disk:    sim.NewDisk(),

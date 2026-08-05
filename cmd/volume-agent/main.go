@@ -89,7 +89,9 @@ func run() (err error) {
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
 		grace = flag.Duration("shutdown-grace", 60*time.Second,
 			"bound on ONE publish attempt at shutdown, not on the shutdown: an Agent that cannot publish keeps its data directory and retries until it can, or until a second signal")
-		kekFile = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
+		kekFile    = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
+		maxVolumes = flag.Int("max-volumes", agent.DefaultMaxVolumes,
+			"how many volumes this host serves at once, and what its device budget is divided by: each volume's WAL is bounded by that share (ADR-0013 §1)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -154,6 +156,25 @@ func run() (err error) {
 		return fmt.Errorf("opening the data directory: %w", err)
 	}
 
+	// The device budget, before any volume can be served (ADR-0013 §1). It is measured
+	// and divided here because there is no honest default: an Agent that started with
+	// no budget would run with no write-path bound of any kind — which is what every
+	// Agent this repository has ever run did, since nothing set wal.Limits — and the
+	// first thing it would do about a filling device is take it to ENOSPC in the
+	// middle of a guest's WRITE.
+	//
+	// The failure to *measure* is fatal for the same reason DiskUsage refuses to
+	// smooth it into a zero: an unreadable device that looks empty reads as headroom
+	// to every rule downstream.
+	usage, err := agent.NewDiskUsage(disk).Usage(ctx)
+	if err != nil {
+		return err
+	}
+	budget, err := agent.NewBudget(usage, *maxVolumes)
+	if err != nil {
+		return err
+	}
+
 	// The object store is what FLUSH makes a write durable in (§14.4) and what a
 	// restart recovers from (§5.8). The Agent has never had one — which is why it
 	// could heartbeat and never upload a byte — so it is opened here, at startup,
@@ -214,6 +235,8 @@ func run() (err error) {
 		// SHUTDOWN-PUBLISH-SPEC's "REVIEWED AND DECIDED" for why there is no budget
 		// after which this process gives a session up.
 		ShutdownGrace: *grace,
+		// Every Log this manager builds is bounded by its share of this (ADR-0013 §1).
+		Budget: budget,
 	}, agent.VolumeManagerDeps{
 		Clock:   real.NewClock(),
 		Disk:    disk,
@@ -273,10 +296,16 @@ func run() (err error) {
 		return err
 	}
 
+	// The budget is printed with the rest of the wiring, and it is the line an operator
+	// reads to find out why a guest is getting backpressure on a device that looks
+	// half empty: the share, not the device, is what bounds one volume.
 	slog.Info("volume-agent starting",
 		"host_id", cfg.HostID, "version", version, "control_plane", *cpURL,
 		"data_dir", *dataDir, "vhost_socket_dir", *socketDir,
-		"heartbeat_interval", cfg.HeartbeatInterval)
+		"heartbeat_interval", cfg.HeartbeatInterval,
+		"device_bytes", budget.DeviceBytes, "guest_budget_bytes", budget.GuestBytes,
+		"reserve_bytes", budget.ReserveBytes, "max_volumes", budget.MaxVolumes,
+		"volume_share_bytes", budget.Share())
 
 	if err := loop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err

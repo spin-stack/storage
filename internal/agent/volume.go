@@ -309,8 +309,19 @@ type VolumeManagerConfig struct {
 	DataDirLabel string
 	// SocketDir holds one vhost-user socket per volume: <socket-dir>/<volume-id>.sock.
 	SocketDir string
-	// Limits bound the local WAL (§5.7). The zero value is legal and unbounded.
-	Limits wal.Limits
+	// Budget is this device divided among the volumes this host serves (ADR-0013 §1).
+	// It is required: an Agent whose logs have no MaxLocalBytes has no write-path
+	// bound at all, and the first thing it does about a filling device is take it to
+	// ENOSPC — which arrives as a partial append, in the middle of a guest's WRITE,
+	// for every volume on the host at once. That was the state of the production
+	// binary until this existed, and it was invisible because every test set the
+	// limits it wanted itself.
+	//
+	// It lives here rather than in `main` for the reason the data-directory lock does:
+	// a step left to `main` is a step spin's runner does not inherit (ADR-0021), and
+	// this repository has already shipped an Agent that never set HostID because one
+	// field in one binary was forgotten.
+	Budget Budget
 	// ShutdownGrace bounds **one** publish attempt, and one wait for a read view, during
 	// a teardown. It is not a budget after which data is abandoned: when an attempt is
 	// cut short Close retries it, and nothing in this type ever gives a session up on a
@@ -402,6 +413,14 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		return nil, errors.New("agent: a data directory is required to hold the WALs")
 	case cfg.SocketDir == "":
 		return nil, errors.New("agent: a socket directory is required to serve volumes")
+	case cfg.Budget.Share() <= 0:
+		// Refused here, at start-up, rather than discovered when the device fills.
+		// A zero budget is not "unbounded by choice", it is a wiring omission: the
+		// binary measures its device (NewDiskUsage) and divides it (NewBudget), and
+		// both of those fail loudly on a device that cannot be measured. See
+		// VolumeManagerConfig.Budget.
+		return nil, fmt.Errorf("agent: a device budget is required to serve volumes (ADR-0013 §1): %d bytes for %d volumes leaves no share",
+			cfg.Budget.GuestBytes, cfg.Budget.MaxVolumes)
 	case deps.Clock == nil:
 		return nil, errors.New("agent: a clock must be injected (INV-01)")
 	case deps.Disk == nil:
@@ -565,6 +584,26 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		return nil, fmt.Errorf("agent: volume id %q: %w", id, err)
 	}
 
+	// The fan-out the budget was divided by is also the number of volumes this host
+	// serves, and it has to be refused here or the division means nothing: every log
+	// gets a share of GuestBytes/MaxVolumes, so serving MaxVolumes+1 of them is a host
+	// whose volumes can hold more than its budget between them — the exact failure
+	// ADR-0013 §1 exists for, arrived at through the only door left.
+	//
+	// Refusing an attach is a local, defensive power the Agent already has (ADR-0013
+	// §5); moving volumes is the Control Plane's, and this does not do that. The
+	// volume stays in the desired state and Apply retries it every cycle, so a
+	// detach elsewhere lets it in without anyone intervening — and the Control Plane
+	// sees the failure in the report, which is where an operator finds out that this
+	// host's -max-volumes disagrees with what the fleet placed on it.
+	m.mu.Lock()
+	running := len(m.volumes)
+	m.mu.Unlock()
+	if running >= m.cfg.Budget.MaxVolumes {
+		return nil, fmt.Errorf("agent: volume %s: this host already serves %d volumes, the fan-out its %d-byte device budget was divided by (-max-volumes)",
+			id, running, m.cfg.Budget.GuestBytes)
+	}
+
 	// The root is <data-dir>/wal and nothing more: wal.SegmentDir appends the volume
 	// and the epoch itself, so passing an already-namespaced path produced
 	// <data-dir>/wal/<id>/<epoch>/<id>/<epoch>. It went unnoticed because sim.Disk.List
@@ -622,12 +661,12 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		// is known. Until then the log reports durable = 0 — an understatement, which
 		// is the safe direction for every rule that reads it.
 		log, err = wal.ResumeAwaitingBase(m.deps.Disk, root, m.deps.Clock,
-			[16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits, enc)
+			[16]byte(u), uint64(d.GetEpoch()), m.cfg.Budget.Limits(), enc)
 		if err != nil {
 			return nil, fmt.Errorf("agent: volume %s: resuming the WAL in %s: %w", id, dir, err)
 		}
 	} else {
-		log = wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Limits)
+		log = wal.NewLog(m.deps.Disk, root, m.deps.Clock, [16]byte(u), uint64(d.GetEpoch()), m.cfg.Budget.Limits())
 		if enc != nil {
 			log.EnableEncryption(enc)
 		}

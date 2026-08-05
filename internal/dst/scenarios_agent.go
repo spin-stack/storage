@@ -22,6 +22,7 @@ import (
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -42,6 +43,29 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "two-hosts-cannot-both-publish-an-image", Run: scenarioTwoHostsCannotBothPublishAnImage},
 		{Name: "a-rebuilt-catalog-can-serve-its-volumes", Run: scenarioARebuiltCatalogCanServeItsVolumes},
 		{Name: "a-volume-stopped-mid-fetch-still-publishes", Run: scenarioAVolumeStoppedMidFetchStillPublishes},
+		{Name: "device-budget-holds-across-volumes", Run: scenarioDeviceBudgetHoldsAcrossVolumes},
+	}
+}
+
+// scenarioBudget is the device budget the agent scenarios hand their managers: a
+// literal, not a measurement, because these scenarios are about fencing, publishing
+// and cloning and each one wants a share it can reason about rather than whatever an
+// eighth of a simulated device happens to be.
+//
+// 128 KiB per volume, so Budget.Limits derives 16 KiB segments — small enough that a
+// scenario writing a few 4 KiB records crosses a segment boundary (which is where the
+// interesting crash cases are) and far more than any of them writes, so nothing here
+// meets backpressure by accident. The scenario that *is* about the bound —
+// device-budget-holds-across-volumes — takes the opposite route and derives its budget
+// from a measured device through agent.NewBudget, because there the production
+// derivation is the subject.
+func scenarioBudget(volumes int) agent.Budget {
+	const share = 128 << 10
+	return agent.Budget{
+		DeviceBytes:  int64(volumes) * share * 2,
+		ReserveBytes: int64(volumes) * share / 2,
+		GuestBytes:   int64(volumes) * share,
+		MaxVolumes:   volumes,
 	}
 }
 
@@ -140,6 +164,7 @@ func fencedVolumeStopsServing(s *Sim, ignoreFencing bool) error {
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir:   "/var/lib/spin",
 		SocketDir: "/run/spin",
+		Budget:    scenarioBudget(1),
 	}, agent.VolumeManagerDeps{
 		Clock:   s.Clock,
 		Disk:    s.Disk,
@@ -344,6 +369,7 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	// what it descends from.
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: "/var/lib/clone", SocketDir: "/run/spin",
+		Budget: scenarioBudget(1),
 	}, agent.VolumeManagerDeps{
 		Clock:   s.Clock,
 		Disk:    s.Disk,
@@ -481,7 +507,7 @@ func scenarioARebuiltCatalogCanServeItsVolumes(s *Sim) error {
 	start := func(dataDir string, keys agent.KeysFunc) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits: wal.Limits{SegmentBytes: 8192},
+			Budget: scenarioBudget(2),
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -607,7 +633,7 @@ func twoHostsCannotBothPublish(s *Sim, ignorePreconditions bool) error {
 	start := func(dataDir string) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits: wal.Limits{SegmentBytes: 8192},
+			Budget: scenarioBudget(2),
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -742,7 +768,7 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	start := func(dataDir string) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits: wal.Limits{SegmentBytes: 8192},
+			Budget: scenarioBudget(2),
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -890,7 +916,7 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 	start := func(dataDir string, store objectstore.Store) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits: wal.Limits{SegmentBytes: 8192},
+			Budget: scenarioBudget(2),
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -1091,7 +1117,7 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 	start := func(dataDir string, store objectstore.Store, listen agent.ListenFunc) (*agent.VolumeManager, error) {
 		return agent.NewVolumeManager(agent.VolumeManagerConfig{
 			DataDir: dataDir, SocketDir: "/run/spin",
-			Limits: wal.Limits{SegmentBytes: 8192},
+			Budget: scenarioBudget(2),
 		}, agent.VolumeManagerDeps{
 			Clock:   s.Clock,
 			Disk:    s.Disk,
@@ -1209,5 +1235,140 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 		}
 	}
 	s.Notef("the volume stopped mid-fetch published a complete image: both the base and the session's own write came back")
+	return nil
+}
+
+// scenarioDeviceBudgetHoldsAcrossVolumes is ADR-0013 §1's property, and the one thing
+// a per-volume limit cannot give: **the sum of what N volumes hold on one device stays
+// inside the device's budget**, and a WRITE past it is refused with backpressure rather
+// than met by the device's own ENOSPC.
+//
+// The difference is what a guest can do about it. ErrBackpressure fails one request
+// with an error the guest understands and the volume survives; ENOSPC arrives as a
+// partial append, in the middle of a WRITE, and after it every WRITE on *every* volume
+// on that device fails with an I/O error nothing can act on — one greedy volume takes
+// the host down with it. Under ADR-0026 that is the ordinary case rather than a corner:
+// a session's whole WAL stays local until the volume stops, so nothing reclaims a byte
+// while these four volumes are running.
+//
+// It is deliberately the production derivation end to end: a measured device
+// (Disk.Usage, the simulated statfs), agent.NewBudget dividing it, agent.VolumeManager
+// handing each Log its share, and the guest's own WriteAt as the thing that is refused.
+// A scenario that set wal.Limits itself would prove the WAL enforces a number somebody
+// gave it — which eight unit tests already do — and would say nothing about whether a
+// real Agent ever gives it one. It did not: `grep -rn "Limits" cmd/` returned nothing.
+//
+// The assertions are on the device, not on the Agent: what the simulated statfs
+// reports after every volume is in backpressure. A counter the Agent keeps could agree
+// with itself while the disk filled underneath it.
+func scenarioDeviceBudgetHoldsAcrossVolumes(s *Sim) error {
+	ctx := context.Background()
+
+	// Small enough to fill in a few hundred writes, and sized so the four shares are
+	// comfortably inside it: the point is that the *sum* is bounded, and a device that
+	// only just fits its own budget could not tell a budget that holds from one that
+	// is saved by rounding.
+	const device = 4 << 20
+	s.Disk.SetDeviceBudget(device)
+
+	usage, err := s.Disk.Usage()
+	if err != nil {
+		return fmt.Errorf("measuring the simulated device: %w", err)
+	}
+	budget, err := agent.NewBudget(usage, 4)
+	if err != nil {
+		return fmt.Errorf("dividing a %d-byte device: %w", device, err)
+	}
+	s.Notef("device %d bytes: %d for guests, %d reserved, %d per volume",
+		budget.DeviceBytes, budget.GuestBytes, budget.ReserveBytes, budget.Share())
+
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin", Budget: budget,
+	}, agent.VolumeManagerDeps{
+		Clock:  s.Clock,
+		Disk:   s.Disk,
+		Listen: func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper: simMapper{}, EventFD: simEventFD,
+		// No object store, and that is the honest shape of the case: with one, these
+		// volumes would publish and the interesting question would become how much the
+		// upload reclaims — which is nothing (ADR-0026 reclaims at stop, not during a
+		// session). What is under test is the device while four guests are writing.
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close(context.Background()) }()
+
+	desired := make([]*storagev1.DesiredVolume, 0, budget.MaxVolumes)
+	for i := range budget.MaxVolumes {
+		desired = append(desired, &storagev1.DesiredVolume{
+			VolumeId:  ids.NewAt(simEpoch*1000+int64(i), s.Rand).String(),
+			SizeBytes: device, BlockSize: 512, Epoch: 1,
+			State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		})
+	}
+	if err := m.Apply(ctx, desired); err != nil {
+		return fmt.Errorf("starting %d volumes: %w", len(desired), err)
+	}
+
+	// Every volume writes until the host stops it. The cap is what makes the scenario
+	// terminate if the bound is missing entirely — without it a lost bound is an
+	// endless loop rather than a failure anybody can read.
+	block := bytes.Repeat([]byte{0xD1}, 4096)
+	maxWrites := int(device/int64(len(block))) + 1
+	for _, d := range desired {
+		dev, ok := m.Device(d.GetVolumeId())
+		if !ok {
+			return fmt.Errorf("volume %s is not being served", d.GetVolumeId())
+		}
+		held := 0
+		for i := range maxWrites {
+			_, werr := dev.WriteAt(block, int64(i)*int64(len(block)))
+			if werr == nil {
+				held += len(block)
+				continue
+			}
+			if errors.Is(werr, sim.ErrNoSpace) {
+				return fmt.Errorf("volume %s met the device's ENOSPC after %d bytes: the budget did not bound it, the device did",
+					d.GetVolumeId(), held)
+			}
+			if !errors.Is(werr, wal.ErrBackpressure) {
+				return fmt.Errorf("volume %s: WRITE %d failed with %v, want backpressure", d.GetVolumeId(), i, werr)
+			}
+			// EventDisk and not a new EventKind: the trace's vocabulary is shared by
+			// every lane, and one more kind for one scenario is a registry entry
+			// nobody else reads.
+			s.Emit(Event{Kind: EventDisk, Key: d.GetVolumeId(),
+				Msg: fmt.Sprintf("backpressure at %d bytes held, share %d", held, budget.Share())})
+			break
+		}
+		if held == 0 {
+			return fmt.Errorf("volume %s took no write at all; the arm proves nothing", d.GetVolumeId())
+		}
+		if held >= maxWrites*len(block) {
+			return fmt.Errorf("volume %s wrote the whole device without being refused: it has no bound", d.GetVolumeId())
+		}
+	}
+
+	// The property. Four volumes, each stopped at its own share, and the device they
+	// share still inside what the Agent said it would use.
+	after, err := s.Disk.Usage()
+	if err != nil {
+		return fmt.Errorf("measuring the device after the fill: %w", err)
+	}
+	if after.UsedBytes > budget.GuestBytes {
+		return fmt.Errorf("the volumes hold %d bytes together, past the %d-byte guest budget of a %d-byte device",
+			after.UsedBytes, budget.GuestBytes, budget.DeviceBytes)
+	}
+	// And the reserve is still there. Nothing withdraws from it — the publish at stop
+	// writes no local byte — so what it has to be is untouched: a device that is full
+	// for guests is not a full device, which is what leaves the stop's fdatasync and
+	// the filesystem's own metadata somewhere to go (agent.ReserveRatio).
+	if after.AvailBytes < budget.ReserveBytes {
+		return fmt.Errorf("the guests left %d bytes free on the device, inside the %d-byte reserve",
+			after.AvailBytes, budget.ReserveBytes)
+	}
+	s.Notef("four volumes in backpressure hold %d bytes of a %d-byte budget; %d bytes free, reserve %d",
+		after.UsedBytes, budget.GuestBytes, after.AvailBytes, budget.ReserveBytes)
 	return nil
 }

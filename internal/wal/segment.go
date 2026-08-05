@@ -270,6 +270,19 @@ type segments struct {
 	// state: the next record creates the next file.
 	open disk.File
 	size int64 // bytes in the open segment, header included
+	// retainedBytes is what the retained segments occupy on the device, maintained as
+	// they are written and unlinked rather than measured.
+	//
+	// It exists because bytes() below — which opens and stats every segment — is the
+	// honest answer and the wrong one to put on the WRITE path: the device bound
+	// (Limits.MaxLocalBytes) is evaluated on every append, and paying a stat per
+	// segment per guest write would put the cost of the whole log into each record.
+	// The counter is maintained at the four places the number can change (a created
+	// header, an accepted append, a reclaimed segment, an adopted directory) and
+	// nowhere else, and the DST scenario that fills a device asserts on what the
+	// device reports rather than on this — so a counter that drifted from the disk
+	// would fail there rather than silently loosen the bound it enforces.
+	retainedBytes int64
 }
 
 func newSegments(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch uint64, segBytes int64) *segments {
@@ -334,9 +347,13 @@ func (s *segments) create(first uint64) error {
 		return errors.Join(err, f.Close())
 	}
 	s.open, s.size = f, int64(len(b))
+	s.retainedBytes += int64(len(b))
 	s.firsts = append(s.firsts, first)
 	return nil
 }
+
+// retained reports what the retained segments occupy on the device. See the field.
+func (s *segments) retained() int64 { return s.retainedBytes }
 
 // seal closes the newest segment for good. It writes nothing: sealing is the absence
 // of further appends, and the next record creates the next file. That is what keeps a
@@ -401,6 +418,7 @@ func (s *segments) appendRecord(seq uint64, enc []byte) (err, rollbackErr error)
 		return err, nil
 	}
 	s.size += int64(n)
+	s.retainedBytes += int64(n)
 	return nil, nil
 }
 
@@ -453,6 +471,7 @@ func (s *segments) reclaim(upTo uint64) (int64, error) {
 		}
 		s.firsts = s.firsts[1:]
 		freed += size
+		s.retainedBytes -= size
 	}
 	return freed, nil
 }
@@ -513,7 +532,13 @@ func (s *segments) adopt(scan scanResult) error {
 	}
 	for _, seg := range scan.segs {
 		s.firsts = append(s.firsts, seg.first)
+		s.retainedBytes += seg.size
 	}
+	// The newest segment's torn tail is about to be cut off, so the bytes it holds are
+	// cleanLen and not the size the scan measured. Counting the tail would leave a
+	// resumed log believing it occupies more of its share than it does — a bound that
+	// tightens itself a little on every crash.
+	s.retainedBytes -= newest.size - scan.cleanLen
 	f, err := s.d.Open(newest.name)
 	if err != nil {
 		return err
