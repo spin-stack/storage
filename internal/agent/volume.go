@@ -472,7 +472,9 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 const lockFile = "agent.lock"
 
 // Apply makes the running set match desired: start what is new, stop what left, and
-// replace what was promoted to a new epoch.
+// replace what was promoted to a new epoch. With one exception, argued where it is
+// implemented below: an *empty* desired state stops nothing, because it is the one
+// message a confused Control Plane and a fully drained host both send.
 //
 // Failures are collected rather than returned at the first one. A volume whose socket
 // is taken must not stop the others from being served — the loop retries the whole
@@ -547,7 +549,80 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 			gone = append(gone, id)
 		}
 	}
+	// The fencing memory exists to outlast a desired state that **still lists** a volume
+	// whose report the Control Plane refused (DEV-0012): without it the very next Apply
+	// finds no runtime and starts one, serving a volume this host was just told it lost.
+	// Once the Control Plane has stopped listing the volume at all, there is nothing left
+	// for the memory to outlast — and keeping it is not free.
+	//
+	// It became not-free with the guard below. A detach used to reach this host as an
+	// empty desired state and stop the volume here, setting no fencing memory; now the
+	// empty list stops nothing and the *report* is what is refused, so the same detach
+	// goes through Fence and does set it. `controlplane.Place` re-places a volume without
+	// bumping its epoch, so `-detach-volume X` followed by `-attach-volume X` naming this
+	// same host would land at the epoch this host is remembered as fenced out of, and be
+	// skipped forever — a guest with a device that never comes back and no error anywhere.
+	// Forgetting on "no longer listed" is what keeps DEV-0012's rule (the Control Plane
+	// keeps listing it, so the entry survives) without that.
+	for id := range m.fencedEpoch {
+		if !live[id] {
+			delete(m.fencedEpoch, id)
+		}
+	}
 	m.mu.Unlock()
+	// INV-02: this is the order the volumes are stopped, published and named in, and a
+	// map's is a different one every run.
+	sort.Strings(gone)
+
+	// **An absence inside a list is information; an empty list is not.** Stopping a
+	// volume is what publishes it (ADR-0026), so obeying an empty desired state means a
+	// host uploads every session it holds and takes every guest's device away at once —
+	// and an empty list is exactly what a Control Plane produces when it comes up
+	// against an empty database, when the query behind GetDesiredState returns no rows
+	// for a reason that has nothing to do with this host, or when a config change leaves
+	// this Agent asking about a host id nobody ever placed anything on. None of those is
+	// distinguishable from "you have been detached from everything" by looking at the
+	// message, so the message alone stops nothing.
+	//
+	// A list that names *something* is a different kind of statement: it is proof the
+	// Control Plane knows this host and is deciding volume by volume, so a volume
+	// missing from it is a decision about that volume. That case is unchanged — a
+	// partial list still stops what it leaves out.
+	//
+	// The test is len(live) and not len(desired), because a desired state whose every
+	// entry this host could not parse (no id, not a UUID, a negative epoch — see
+	// validateDesired) is a message that named nothing usable either, and treating it as
+	// a full inventory would tear the host down on the strength of what it just refused.
+	//
+	// **This does not make a real drain impossible, and that is checkable rather than
+	// hopeful.** `cpserver.GetDesiredState` lists on `volumes.primary_host_id` and
+	// `cpserver.applyReport` refuses on that same column, so every genuine detach,
+	// promotion or deletion that empties this host's desired state also refuses this
+	// host's *report* of those volumes — and `Loop.fence` then calls Fence, which is the
+	// same teardown, in the same cycle. The empty list was never the only signal for a
+	// legitimate teardown; it was the one that carries no name.
+	//
+	// **Where the rule is wrong, and what happens then.** Two cases, and neither is
+	// hypothetical enough to leave unwritten. (1) If the desired state ever grows a
+	// filter the report path does not share — a volume state, a host in maintenance — a
+	// volume dropped by it keeps being served here until something names it. That is
+	// bounded rather than permanent: the fleet cannot hand that volume to anyone else
+	// without changing `primary_host_id`, which is precisely what makes the next report
+	// refuse it. (2) A Control Plane whose catalog is *gone* refuses every report too,
+	// so Fence tears this host down anyway and this guard buys nothing at all. It closes
+	// the door where an absence is an order; it deliberately does not teach the Agent to
+	// second-guess a refusal that names a volume, because that refusal is the only thing
+	// standing between two hosts serving one volume.
+	if len(live) == 0 && len(gone) > 0 {
+		// Every cycle, not once: an Agent whose Control Plane has stopped naming its
+		// volumes is in a state somebody has to fix, and it ends the moment the Control
+		// Plane says anything at all. A line on the transition would be one line, hours
+		// before whoever is looking arrives — the same reasoning as the holding line in
+		// publishHeld.
+		slog.Warn("the control plane listed no volumes for this host; the ones already being served are kept, because an empty desired state names nothing",
+			"serving", len(gone), "volume_ids", gone, "listed", len(desired))
+		return errors.Join(errs...)
+	}
 	for _, id := range gone {
 		if err := m.remove(ctx, id); err != nil {
 			errs = append(errs, fmt.Errorf("agent: stopping volume %s: %w", id, err))

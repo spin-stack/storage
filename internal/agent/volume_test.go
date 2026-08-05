@@ -276,6 +276,82 @@ func TestAFencedVolumeDoesNotComeBackAtTheSameEpoch(t *testing.T) {
 	}
 }
 
+// TestAFencedVolumeIsForgottenOnceItLeavesTheDesiredState is the debt C8's guard took
+// on, paid where it was taken on.
+//
+// Before the guard a detach reached this host as a shrinking desired state and was
+// carried out by Apply, which sets no fencing memory. Now the empty half of that message
+// stops nothing, so the detach arrives through the report the Control Plane refuses, and
+// `Loop.fence` → `Fence` *does* record the epoch this host was fenced out of.
+// `controlplane.Place` re-places a volume without bumping its epoch, so a
+// `-detach-volume X` followed by an `-attach-volume X` naming this same host again would
+// arrive at exactly the remembered epoch and be skipped by the check in Apply — for as
+// long as the process lives, with no error printed and a guest whose device never comes
+// back.
+//
+// The memory only ever needed to outlast a desired state that *still lists* the volume
+// (DEV-0012, and TestAFencedVolumeDoesNotComeBackAtTheSameEpoch is that case); once the
+// Control Plane has stopped listing it there is nothing left for it to outlast, because
+// the Control Plane cannot list the volume for this host again without having made this
+// host its writer again.
+//
+// The middle desired state here names another volume rather than nothing, so this proves
+// the forgetting on its own — a version that only forgot on the empty list would pass an
+// assertion written against the empty one and still strand every real re-attach.
+func TestAFencedVolumeIsForgottenOnceItLeavesTheDesiredState(t *testing.T) {
+	t.Parallel()
+	m, f, _ := newTestManager(t)
+	ctx := t.Context()
+
+	v, other := desiredVolume(t, 1), desiredVolume(t, 1)
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{v, other}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := m.Fence(ctx, []string{v.GetVolumeId()}); err != nil {
+		t.Fatalf("Fence: %v", err)
+	}
+
+	// The detach lands in the catalog: the Control Plane stops listing the volume for
+	// this host, while still listing the other one, so this is not the empty-list path.
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{other}); err != nil {
+		t.Fatalf("Apply without the detached volume: %v", err)
+	}
+
+	// And the operator attaches it back here. Place does not bump the epoch, so this is
+	// the same number the fencing remembered.
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{v, other}); err != nil {
+		t.Fatalf("Apply re-attaching the volume: %v", err)
+	}
+
+	if _, ok := m.Device(v.GetVolumeId()); !ok {
+		t.Fatalf("volume %s has no device after being detached and attached back to this host: the fencing memory outlived the placement that caused it, and this guest's device never comes back",
+			v.GetVolumeId())
+	}
+	// And the socket a guest reconnects to was opened a second time. The listener the
+	// fencing closed is gone; asserting on its close count would pass on a manager that
+	// never re-opened anything, which is the state this test exists to catch.
+	socket := socketFor(t, f, v.GetVolumeId())
+	if got := countPaths(f, socket); got != 2 {
+		t.Errorf("%s was opened %d time(s), want 2 — once before the fencing and once for the re-attached volume", socket, got)
+	}
+	if got := f.listenerFor(socket).closeCount(); got != 0 {
+		t.Errorf("the re-attached volume's listener is already closed (%d time(s)): nothing is listening for the guest", got)
+	}
+}
+
+// countPaths is how many times a socket was opened. socketPaths() is an append-only
+// record of every listen, so a path that appears twice was served, torn down and served
+// again — which is the difference between "still running from before" and "re-attached".
+func countPaths(f *listenerFactory, socket string) int {
+	n := 0
+	for _, p := range f.socketPaths() {
+		if p == socket {
+			n++
+		}
+	}
+	return n
+}
+
 // TestReconcileServesWhatTheControlPlaneAsksFor is the keystone's point, end to end
 // through the loop: readDesiredState used to assign a field nothing read. One cycle
 // against a Control Plane that lists a volume must leave that volume actually served —
@@ -422,31 +498,123 @@ func TestApplyIsIdempotent(t *testing.T) {
 // TestVolumeLeavingTheDesiredStateIsStopped is the other half of the diff. A volume the
 // Control Plane no longer lists for this host has been promoted away, detached or
 // fenced; in every case this host must stop serving it and let go of its socket.
+//
+// The second desired state is *not* empty, and the difference is the whole of C8: an
+// empty list is what a Control Plane sends when it has lost its catalog as well as when
+// it has taken every volume away, so Apply stops nothing on it. A list that still names
+// another volume is proof the Control Plane is deciding volume by volume, and the
+// absence in it is then a decision about the volume that is missing.
 func TestVolumeLeavingTheDesiredStateIsStopped(t *testing.T) {
 	t.Parallel()
 	m, f, _ := newTestManager(t)
 	ctx := t.Context()
 
-	v := desiredVolume(t, 1)
-	if err := m.Apply(ctx, []*storagev1.DesiredVolume{v}); err != nil {
+	leaving, staying := desiredVolume(t, 1), desiredVolume(t, 1)
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{leaving, staying}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	socket := f.socketPaths()[0]
+	socket := socketFor(t, f, leaving.GetVolumeId())
 
-	if err := m.Apply(ctx, nil); err != nil {
-		t.Fatalf("Apply(nil): %v", err)
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{staying}); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
 
 	vols, err := m.Volumes(ctx)
 	if err != nil {
 		t.Fatalf("Volumes: %v", err)
 	}
-	if len(vols) != 0 {
-		t.Fatalf("still serving %d volumes after they left the desired state", len(vols))
+	if len(vols) != 1 || vols[0].VolumeID != staying.GetVolumeId() {
+		t.Fatalf("serving %+v after %s left the desired state, want only %s",
+			vols, leaving.GetVolumeId(), staying.GetVolumeId())
 	}
 	if got := f.listenerFor(socket).closeCount(); got == 0 {
 		t.Error("the listener was never closed: the socket outlives the volume")
 	}
+}
+
+// TestAnEmptyDesiredStateStopsNothing is C8's unit arm. `Apply` used to stop every
+// volume the desired state did not list, which is right for a volume missing from a
+// list that names others and catastrophic for a list that names none: a Control Plane
+// restarted against an empty database, a GetDesiredState that returns no rows because
+// of a bug, or an Agent whose host id stopped matching after a config change all send
+// exactly that, and under ADR-0026 stopping a volume is what publishes it — so the host
+// would upload every session it holds and take every guest's device away, on the
+// strength of a message that names nothing.
+//
+// The e2e arm is where this is proven against the binaries
+// (integration/e2e/desired_test.go); this one pins the rule at the type, including the
+// case that makes the rule a rule rather than a special case for nil.
+func TestAnEmptyDesiredStateStopsNothing(t *testing.T) {
+	tests := []struct {
+		name    string
+		desired func(t *testing.T) []*storagev1.DesiredVolume
+	}{
+		{
+			name:    "nil",
+			desired: func(*testing.T) []*storagev1.DesiredVolume { return nil },
+		},
+		{
+			name:    "empty",
+			desired: func(*testing.T) []*storagev1.DesiredVolume { return []*storagev1.DesiredVolume{} },
+		},
+		{
+			// A list whose every entry this host refused named nothing usable either,
+			// and treating it as an inventory would stop the volumes on the strength of
+			// what Apply had just rejected.
+			name: "only entries this host cannot parse",
+			desired: func(*testing.T) []*storagev1.DesiredVolume {
+				return []*storagev1.DesiredVolume{{VolumeId: "not-a-uuid", SizeBytes: testVolumeSize, BlockSize: testBlockSize}}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m, f, _ := newTestManager(t)
+			ctx := t.Context()
+
+			v := desiredVolume(t, 1)
+			if err := m.Apply(ctx, []*storagev1.DesiredVolume{v}); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			socket := socketFor(t, f, v.GetVolumeId())
+
+			// The error is deliberately not asserted on: an unparseable entry is
+			// reported as one, and a gate that returns the right error while doing the
+			// wrong thing satisfies any assertion on err. What is asserted is the
+			// device the guest is served from.
+			_ = m.Apply(ctx, tc.desired(t))
+
+			vols, err := m.Volumes(ctx)
+			if err != nil {
+				t.Fatalf("Volumes: %v", err)
+			}
+			if len(vols) != 1 || vols[0].VolumeID != v.GetVolumeId() {
+				t.Fatalf("serving %+v after a desired state that named nothing, want volume %s still served",
+					vols, v.GetVolumeId())
+			}
+			if _, ok := m.Device(v.GetVolumeId()); !ok {
+				t.Error("the guest's device is gone: an empty desired state was obeyed as a detach order")
+			}
+			if got := f.listenerFor(socket).closeCount(); got != 0 {
+				t.Errorf("the socket was closed %d time(s): the guest lost its device to a message that named no volume", got)
+			}
+		})
+	}
+}
+
+// socketFor is the socket a volume was opened on. Tests that start more than one volume
+// cannot index socketPaths() — Apply walks the desired state in order, but a test that
+// later reorders it would silently assert about the wrong volume.
+func socketFor(t *testing.T, f *listenerFactory, volumeID string) string {
+	t.Helper()
+	for _, p := range f.socketPaths() {
+		if path.Base(p) == volumeID+".sock" {
+			return p
+		}
+	}
+	t.Fatalf("no socket was opened for volume %s; opened %v", volumeID, f.socketPaths())
+	return ""
 }
 
 // TestEpochChangeReplacesTheRuntime. An epoch bump means this host was granted the
