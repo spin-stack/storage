@@ -10,7 +10,6 @@ package pg_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"regexp"
 	"strconv"
@@ -100,51 +99,6 @@ func TestPGZombieCPCannotMutate(t *testing.T) {
 	v, _ := store.GetVolume(ctx, volID)
 	if v.CurrentEpoch != 1 || v.PrimaryHostID != hostB {
 		t.Fatalf("volume state wrong: %+v", v)
-	}
-}
-
-func TestPGOperationIdempotency(t *testing.T) {
-	ctx := t.Context()
-	store := pg.New(startPostgres(t))
-	term, err := store.AcquireLeadership(ctx, "cp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	op := metadata.Operation{
-		OperationID:  ids.New().String(),
-		Kind:         lifecycle.OpAttach,
-		DesiredState: []byte(`{"x":1}`),
-		CurrentState: []byte(`{}`),
-		Phase:        lifecycle.OpPending,
-	}
-	rec, err := store.RecordOperation(ctx, term, op)
-	if err != nil || !rec {
-		t.Fatalf("first record: rec=%v err=%v", rec, err)
-	}
-	rec, err = store.RecordOperation(ctx, term, op)
-	if err != nil || rec {
-		t.Fatalf("duplicate should report rec=false: rec=%v err=%v", rec, err)
-	}
-
-	// Visible progress of a long-running operation (§28.1).
-	op.Phase = lifecycle.OpRunning
-	op.CurrentState = []byte(`{"total":2,"moved":1}`)
-	op.Error = "waiting for fencing"
-	if err := store.UpdateOperation(ctx, term, op, nil); err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.GetOperation(ctx, op.OperationID)
-	if err != nil || got.Phase != lifecycle.OpRunning || got.Error != "waiting for fencing" {
-		t.Fatalf("operation after update: %+v err=%v", got, err)
-	}
-	// jsonb round-trips by value, not byte-for-byte.
-	var state map[string]int
-	if err := json.Unmarshal(got.CurrentState, &state); err != nil || state["total"] != 2 || state["moved"] != 1 {
-		t.Fatalf("current_state = %s err=%v", got.CurrentState, err)
-	}
-	op.OperationID = ids.New().String()
-	if err := store.UpdateOperation(ctx, term, op, nil); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("update of a missing operation: want ErrNotFound, got %v", err)
 	}
 }
 
@@ -280,12 +234,6 @@ func TestPGRejectsNonV7OnEveryIdentityColumn(t *testing.T) {
 			insert: `INSERT INTO snapshots (snapshot_id, volume_id, epoch, target_sequence, root_digest, state, request_id)
 			         VALUES ($2, $3, 1, 1, 'd', 'CREATING', $1)`,
 			row: func(id string) []any { return []any{id, ids.New().String(), seedVolume} },
-		},
-		{
-			name: "operations.operation_id",
-			insert: `INSERT INTO operations (operation_id, kind, desired_state, current_state, phase)
-			         VALUES ($1, 'drain', '{}', '{}', 'PENDING')`,
-			row: func(id string) []any { return []any{id} },
 		},
 	}
 
@@ -483,13 +431,6 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	opID := ids.New().String()
-	if _, err := store.RecordOperation(ctx, term, metadata.Operation{
-		OperationID: opID, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	// Raw SQL on purpose: this asserts the constraint, not the Go guard.
 	for _, s := range lifecycle.HostStates() {
@@ -517,16 +458,6 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 	for _, s := range lifecycle.SnapshotStates() {
 		if _, err := pool.Exec(ctx, `UPDATE snapshots SET state=$1 WHERE snapshot_id=$2`, s.String(), snapID); err != nil {
 			t.Fatalf("snapshot state %q rejected by the DB: %v", s, err)
-		}
-	}
-	for _, k := range lifecycle.OperationKinds() {
-		if _, err := pool.Exec(ctx, `UPDATE operations SET kind=$1 WHERE operation_id=$2`, k.String(), opID); err != nil {
-			t.Fatalf("operation kind %q rejected by the DB: %v", k, err)
-		}
-	}
-	for _, p := range lifecycle.OperationPhases() {
-		if _, err := pool.Exec(ctx, `UPDATE operations SET phase=$1 WHERE operation_id=$2`, p.String(), opID); err != nil {
-			t.Fatalf("operation phase %q rejected by the DB: %v", p, err)
 		}
 	}
 }
@@ -573,39 +504,6 @@ func TestPGRejectsValuesOutsideTheVocabulary(t *testing.T) {
 	}
 }
 
-// TestPGOperationPhaseGuardIsAtomic: the phase transition is enforced by the UPDATE
-// predicate itself, so a terminal operation cannot be resurrected even under
-// concurrent writers.
-func TestPGOperationPhaseGuardIsAtomic(t *testing.T) {
-	ctx := t.Context()
-	store := pg.New(startPostgres(t))
-	term, _ := store.AcquireLeadership(ctx, "cp")
-
-	op := metadata.Operation{
-		OperationID: ids.New().String(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
-	}
-	if _, err := store.RecordOperation(ctx, term, op); err != nil {
-		t.Fatal(err)
-	}
-	op.Phase = lifecycle.OpRunning
-	if err := store.UpdateOperation(ctx, term, op, nil); err != nil {
-		t.Fatal(err)
-	}
-	op.Phase = lifecycle.OpSucceeded
-	if err := store.UpdateOperation(ctx, term, op, nil); err != nil {
-		t.Fatal(err)
-	}
-	op.Phase = lifecycle.OpRunning
-	if err := store.UpdateOperation(ctx, term, op, nil); !errors.Is(err, lifecycle.ErrInvalidTransition) {
-		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
-	}
-	got, _ := store.GetOperation(ctx, op.OperationID)
-	if got.Phase != lifecycle.OpSucceeded {
-		t.Fatalf("phase = %q after a refused transition", got.Phase)
-	}
-}
-
 // TestPGEveryForeignKeyHasAnIndex is the structural rule from schema.sql: Postgres
 // indexes the referenced side of a foreign key (the primary key) but never the
 // referencing column, so without an explicit index every parent DELETE/UPDATE — a
@@ -626,9 +524,10 @@ SELECT c.conrelid::regclass::text AS child_table, a.attname AS column_name, c.co
         WHERE i.indrelid = c.conrelid
           AND i.indkey[0] = c.conkey[1]
           -- A partial index does not do this job: the parent DELETE has to find
-          -- *every* child row, and rows outside the predicate are not in it. Since
-          -- the schema now carries partial indexes over the same leading columns
-          -- (the live-operation ones), saying so is no longer hypothetical.
+          -- *every* child row, and rows outside the predicate are not in it. The
+          -- schema carries no partial index today (the live-operation ones went with
+          -- the operations table), and the clause stays because the next one to
+          -- arrive must not be counted as covering a foreign key.
           AND i.indpred IS NULL
    )
  ORDER BY 1, 2`
@@ -690,167 +589,16 @@ func TestPGListVolumesByHostUsesItsIndex(t *testing.T) {
 		`EXPLAIN SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id`, hotHost)
 }
 
-// TestPGListLiveOperationsByHostUsesItsPartialIndex is the same rule as the volumes
-// one, for the query that runs before every pass of every drain. The table it reads
-// only grows — completed operations are history and nothing deletes them — so the
-// index that matters is the one over the live ones: a full index on (host_id,
-// operation_id) still walks every operation the host has ever had.
-func TestPGListLiveOperationsByHostUsesItsPartialIndex(t *testing.T) {
-	ctx := t.Context()
-	pool := startPostgres(t)
-	store := pg.New(pool)
-	term, _ := store.AcquireLeadership(ctx, "cp")
-
-	hotHost, coldHost := ids.New().String(), ids.New().String()
-	for _, h := range []string{hotHost, coldHost} {
-		if err := store.UpsertHost(ctx, term, metadata.Host{HostID: h, State: lifecycle.HostActive}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// History, plus a couple of live operations on the hot host: the shape the drain
-	// actually meets, where "what is happening here" is two rows inside thousands.
-	for i := range fleetOperations {
-		host := coldHost
-		if i%400 == 0 {
-			host = hotHost
-		}
-		op := metadata.Operation{
-			OperationID: ids.New().String(), Kind: lifecycle.OpAttach, HostID: host,
-			Phase: lifecycle.OpSucceeded, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-		}
-		if i == 0 || i == 400 {
-			op.Phase = lifecycle.OpPending
-		}
-		if _, err := store.RecordOperation(ctx, term, op); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := pool.Exec(ctx, `ANALYZE operations`); err != nil {
-		t.Fatal(err)
-	}
-
-	assertIndexed(t, pool, "operations_live_by_host_idx", "operations",
-		`EXPLAIN SELECT * FROM operations
-		  WHERE host_id = $1 AND phase NOT IN ('SUCCEEDED', 'CANCELED')
-		  ORDER BY operation_id`, hotHost)
-}
-
-// TestPGLivePhaseSetsAgreeWithTheLifecycle is the price of the two partial indexes,
-// paid in a test. "Live" is now written in two places — the transition table in
-// internal/lifecycle, which is the authority, and the predicates of the indexes —
-// and a schema that disagrees with the vocabulary is worse than no index at all: the
-// planner would silently stop using it (an operation whose phase the predicate does
-// not cover is invisible to the index), and the uniqueness that stops a second drain
-// would stop applying to exactly the phase that drifted.
-//
-// It does not parse the predicate: it asks PostgreSQL to *evaluate* the real one,
-// once per value of the vocabulary, and compares the answer with lifecycle's own.
-func TestPGLivePhaseSetsAgreeWithTheLifecycle(t *testing.T) {
-	ctx := t.Context()
-	pool := startPostgres(t)
-
-	predicate := func(index string) string {
-		var expr string
-		if err := pool.QueryRow(ctx,
-			`SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = $1::regclass`,
-			index).Scan(&expr); err != nil {
-			t.Fatalf("%s has no partial predicate to read: %v", index, err)
-		}
-		return expr
-	}
-	// Evaluating the predicate against a one-row relation that supplies the columns
-	// it names is what makes this an agreement test rather than a spelling test.
-	holds := func(expr, kind string, phase lifecycle.OperationPhase) bool {
-		var ok bool
-		q := `SELECT ` + expr + ` FROM (SELECT $1::text AS kind, $2::text AS phase) o`
-		if err := pool.QueryRow(ctx, q, kind, phase.String()).Scan(&ok); err != nil {
-			t.Fatalf("evaluating %q: %v", expr, err)
-		}
-		return ok
-	}
-
-	live := predicate("operations_live_by_host_idx")
-	drain := predicate("operations_one_live_drain_per_host_idx")
-	for _, phase := range lifecycle.OperationPhases() {
-		for _, kind := range lifecycle.OperationKinds() {
-			if got, want := holds(live, kind.String(), phase), !phase.Terminal(); got != want {
-				t.Errorf("%s covers phase %s = %v, lifecycle says live = %v\n  %s",
-					"operations_live_by_host_idx", phase, got, want, live)
-			}
-			want := !phase.Terminal() && kind == lifecycle.OpDrain
-			if got := holds(drain, kind.String(), phase); got != want {
-				t.Errorf("one-live-drain covers (%s, %s) = %v, want %v\n  %s",
-					kind, phase, got, want, drain)
-			}
-		}
-	}
-}
-
-// TestPGOneLiveDrainPerHostUnderConcurrency is the race the Control Plane's own
-// check cannot close. Wave 3 read the host's operations and then wrote, which is not
-// exclusion: two goroutines inside one leader can both pass the read. Here they
-// both write, at once, and the database has to make exactly one of them win — with
-// an error the loser can act on rather than an integrity code it can only log.
-func TestPGOneLiveDrainPerHostUnderConcurrency(t *testing.T) {
-	ctx := t.Context()
-	store := pg.New(startPostgres(t))
-	term, _ := store.AcquireLeadership(ctx, "cp")
-
-	host := ids.New().String()
-	if err := store.UpsertHost(ctx, term, metadata.Host{HostID: host, State: lifecycle.HostActive}); err != nil {
-		t.Fatal(err)
-	}
-
-	const racers = 8
-	start := make(chan struct{})
-	errs := make(chan error, racers)
-	ids_ := make([]string, racers)
-	for i := range racers {
-		ids_[i] = ids.New().String()
-		go func() {
-			<-start
-			_, err := store.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: ids_[i], Kind: lifecycle.OpDrain, HostID: host,
-				Phase: lifecycle.OpPending, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-			})
-			errs <- err
-		}()
-	}
-	close(start)
-
-	var won int
-	for range racers {
-		switch err := <-errs; {
-		case err == nil:
-			won++
-		case errors.Is(err, metadata.ErrDrainInProgress):
-		default:
-			t.Errorf("the loser must be told why, not handed an opaque error: %v", err)
-		}
-	}
-	if won != 1 {
-		t.Fatalf("%d of %d concurrent drains were recorded, want exactly 1", won, racers)
-	}
-
-	live, err := store.ListLiveOperationsByHost(ctx, host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(live) != 1 {
-		t.Fatalf("the host holds %d live operations, want 1", len(live))
-	}
-}
-
 // TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet is the plan assertion the
 // host_committed_bytes view has to earn. The derivation used to be inlined in four
 // queries; as a view it is written once, and the risk that trade brings is that a
 // reader asking about *one* host silently pays for all of them — a view whose
-// aggregate is computed before the filter is applied is exactly that shape, and the
-// drain reads this on every pass, for every host it considers.
+// aggregate is computed before the filter is applied is exactly that shape, and
+// every placement decision reads this once per host it considers.
 //
-// So the assertion is not "an index is used" (this derivation has never used one:
-// both sums scan, and did before the view too — see the sibling index tests for the
-// queries that do). It is that the filtered read costs a fraction of the fleet-wide
+// So the assertion is not "an index is used" (this derivation has never used one: the
+// sum scans, and did before the view too — see the sibling index test for a query
+// that does). It is that the filtered read costs a fraction of the fleet-wide
 // one. If the filter stops being pushed into the derivation, the two converge and
 // this fails.
 func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
@@ -859,8 +607,8 @@ func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
 	store := pg.New(pool)
 	term, _ := store.AcquireLeadership(ctx, "cp")
 
-	// A fleet of a couple of hundred hosts, one of them holding volumes and one
-	// in-flight plan aimed at it — the §28.2 numbers the drain reads.
+	// A fleet of a couple of hundred hosts, one of them holding volumes — the §28.2
+	// number every placement decision reads.
 	hot := ids.New().String()
 	fleet := []string{hot}
 	for range fleetHosts - 1 {
@@ -873,34 +621,16 @@ func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var inFlight string
 	for i := range fleetVolumes {
-		id := ids.New().String()
-		host := fleet[i%len(fleet)]
 		if err := store.CreateVolume(ctx, term, metadata.Volume{
-			VolumeID: id, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
-			PrimaryHostID: host, DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
+			VolumeID: ids.New().String(), SizeBytes: 1 << 30, BlockSize: 65536,
+			State: lifecycle.VolumeActive, PrimaryHostID: fleet[i%len(fleet)],
+			DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
 		}, nil); err != nil {
 			t.Fatal(err)
 		}
-		if i == 1 {
-			inFlight = id // a volume on somebody else, being moved to hot
-		}
 	}
-	plan := `{"volumes":[{"volume_id":"` + inFlight + `","to_host":"` + hot + `","stage":"MOVING"}]}`
-	for i := range fleetOperations {
-		op := metadata.Operation{
-			OperationID: ids.New().String(), Kind: lifecycle.OpDrain, HostID: fleet[i%len(fleet)],
-			Phase: lifecycle.OpSucceeded, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-		}
-		if i == 0 {
-			op.Phase, op.CurrentState = lifecycle.OpRunning, []byte(plan)
-		}
-		if _, err := store.RecordOperation(ctx, term, op); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := pool.Exec(ctx, `ANALYZE hosts; ANALYZE volumes; ANALYZE operations`); err != nil {
+	if _, err := pool.Exec(ctx, `ANALYZE hosts; ANALYZE volumes`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -909,9 +639,8 @@ func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	own := int64(fleetVolumes/len(fleet)) << 30
-	if h.NVMeCommittedBytes < own+(1<<30) {
-		t.Fatalf("committed = %d, want at least its own volumes plus the one in flight", h.NVMeCommittedBytes)
+	if own := int64(fleetVolumes/len(fleet)) << 30; h.NVMeCommittedBytes != own {
+		t.Fatalf("committed = %d, want %d (the volumes it holds)", h.NVMeCommittedBytes, own)
 	}
 
 	one := explainBuffers(t, pool,
@@ -933,12 +662,11 @@ func TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet(t *testing.T) {
 }
 
 // Fleet shape for the plan tests: hundreds of hosts (§28.2 says the fleet is that
-// size), thousands of volumes and operations, so the planner sees a table worth
-// making a decision about rather than one small enough that every plan is equal.
+// size) and thousands of volumes, so the planner sees a table worth making a
+// decision about rather than one small enough that every plan is equal.
 const (
-	fleetHosts      = 200
-	fleetVolumes    = 2000
-	fleetOperations = 2000
+	fleetHosts   = 200
+	fleetVolumes = 2000
 )
 
 // explainBuffers runs an EXPLAIN (ANALYZE, BUFFERS) and returns the total buffers

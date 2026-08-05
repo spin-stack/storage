@@ -30,9 +30,9 @@ ON CONFLICT (host_id) DO UPDATE
 -- copy of that number is exactly what ADR-0017 removed the copy to prevent.
 --
 -- The derivation itself is the host_committed_bytes view (schema.sql), which is
--- where its reasoning lives; three other queries read the same view (ListHosts
--- below, and the bound predicates in volumes.sql and operations.sql). It used to be
--- copied into all four, for a tooling reason ADR-0019 removed.
+-- where its reasoning lives; two other queries read the same view (ListHosts below,
+-- and the bound predicate in volumes.sql). It used to be copied into each of them,
+-- for a tooling reason ADR-0019 removed.
 --
 -- It runs at placement time, not on the data path, over a fleet of hundreds of rows.
 -- Joined rather than read as a scalar subquery: both plans push the host filter
@@ -162,7 +162,7 @@ UPDATE hosts
 -- Chosen over SERIALIZABLE, which would push a retry loop into every caller of the
 -- Store for a conflict that is a two-row hot spot, and over `SELECT ... FOR UPDATE`
 -- on the host row, which locks the wrong thing: every heartbeat writes that row, and
--- the rows being counted are in volumes and operations.
+-- the rows being counted are in volumes.
 --
 -- (Wording note, not a style rule: TestEveryMutatingQueryIsTermGuarded classifies a
 -- query by matching INSERT/UPDATE/DELETE over the whole chunk, comments included, so

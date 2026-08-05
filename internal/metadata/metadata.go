@@ -1,6 +1,6 @@
 // Package metadata is the Control Plane's authority for leases, epochs, ownership,
-// snapshots, hosts/capacity, reconciliation operations, and CP terms (§7, §8). It is
-// NOT the authority for the durable point of data (that is S3, §5.8).
+// snapshots, hosts/capacity, and CP terms (§7, §8). It is NOT the authority for the
+// durable point of data (that is S3, §5.8).
 //
 // It is reached through a Store interface with two implementations, and the reason is
 // not symmetry:
@@ -21,7 +21,6 @@ package metadata
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -71,19 +70,6 @@ var (
 	// waits is the durable ACK, for at most one lease_ttl + max_clock_skew per volume
 	// moved. A caller that reads this should retry, not conclude the host is gone.
 	ErrRenewalsBlocked = errors.New("metadata: host lease renewals are blocked by a revocation window")
-	// ErrDrainInProgress means the host already has a live drain operation and this
-	// one was not recorded (§28.1). Two evacuations of one host each capture their
-	// own plan and promote the same volumes; whichever loses a race is left holding
-	// a destination reservation nobody will release, because releasing it is the
-	// losing operation's own next step and that step now fails for ever (§28.2).
-	//
-	// The Control Plane refuses this before it writes, and that check is where the
-	// useful message comes from — it names the operation that owns the host. This
-	// sentinel is the store closing the window the check leaves: a read followed by
-	// a write is not exclusion, and two goroutines inside one leader can both pass
-	// it. A caller that sees it should reconcile the drain that already exists, not
-	// retry its own.
-	ErrDrainInProgress = errors.New("metadata: the host already has a live drain operation")
 	// ErrHostNotServing means the operation needs a host the fleet still considers a
 	// writer, and this one is DEAD (§28.1). Marking a host dead is the Control Plane
 	// asserting that its writer is gone; handing it a fresh lease afterwards
@@ -201,8 +187,11 @@ type Host struct {
 	// the store on every read, and never stored anywhere (ADR-0017):
 	//
 	//	committed(host) = Σ size_bytes of the volumes whose primary is host
-	//	                + Σ size_bytes reserved by in-flight operation plans
-	//	                  targeting host
+	//
+	// ADR-0017's second term — what an in-flight operation plan had reserved on the
+	// host but not yet placed — went with the operations table it was read from
+	// (internal/schema/schema.sql carries the reasoning, including what it does and
+	// does not cost).
 	//
 	// It is therefore ignored on the way in: UpsertHost cannot set it, and neither
 	// can anything else. A number S3 or SQL can recompute is a cache, never an
@@ -242,12 +231,16 @@ type HostLease struct {
 // volume stops, and no reservation covers a byte of it. Both travel together because
 // both are the same decision, taken once by placement.Policy.Bound.
 //
-// A write that carries no bound is not a placement decision —
-// rebuild-metadata recreating volumes that already occupy their hosts, a progress
-// save that reserves nothing new — and a bound is never applied to a write that
-// gives capacity back: a host can be over its ceiling for reasons that have nothing
-// to do with the caller (a tightened policy, a device that came back smaller), and
-// refusing the write that brings it down would wedge every drain of that host.
+// A write that carries no bound is not a placement decision — rebuild-metadata
+// recreating volumes that already occupy their hosts — and a bound is never applied
+// to a write that gives capacity back: a host can be over its ceiling for reasons
+// that have nothing to do with the caller (a tightened policy, a device that came
+// back smaller), and refusing the write that brings it down would wedge every
+// release of that host.
+//
+// CreateVolume is the only write that takes one today. SetVolumePrimaryHost — the
+// other way a volume comes to occupy a host — takes none, which is an open gap and
+// not a decision (recorded against D6 in docs/plan/tracks/TRACK-D.md).
 type CapacityBound struct {
 	// HostID is the host being placed on.
 	HostID string
@@ -271,43 +264,6 @@ type CapacityBound struct {
 	// direction — Policy.Bound is what builds these, and a second builder is the
 	// second copy of the rule.
 	UsedLimit int64
-}
-
-// PlanReservation is one entry of the "volumes" array an operation records in its
-// current_state: a volume this operation has committed to place on ToHost. It is the
-// second term of ADR-0017's derived capacity — "reserved but not yet primary" — and
-// it is declared here, next to CapacityBound, because three things have to agree on
-// it: the drain that writes it, the sim store that sums it in Go, and the
-// host_committed_bytes view that sums it in SQL. A shape that lived only in
-// internal/controlplane would be a shape the accounting had to guess at.
-//
-// It is decoded leniently. A plan nobody can read reserves nothing, which makes the
-// destination look emptier than it is (ADR-0017 says so explicitly) — but a plan
-// that made every capacity read fail would take the fleet down instead.
-type PlanReservation struct {
-	VolumeID string `json:"volume_id"`
-	ToHost   string `json:"to_host"`
-	Stage    string `json:"stage"`
-}
-
-// settledStages are the stages of a plan entry that reserve nothing: the move is
-// finished, or it turned out to belong to somebody else.
-var settledStages = map[string]bool{"DONE": true, "FOREIGN": true}
-
-// Reserves reports whether this entry still charges its destination.
-func (r PlanReservation) Reserves() bool {
-	return r.ToHost != "" && r.VolumeID != "" && !settledStages[r.Stage]
-}
-
-// PlanReservations decodes the reservation entries of an operation's current_state.
-func PlanReservations(currentState []byte) []PlanReservation {
-	var plan struct {
-		Volumes []PlanReservation `json:"volumes"`
-	}
-	if err := json.Unmarshal(currentState, &plan); err != nil {
-		return nil
-	}
-	return plan.Volumes
 }
 
 // Volume is the durable-volume record (§8). Watermarks are informative (§5.8).
@@ -368,18 +324,6 @@ type Snapshot struct {
 	RequestID        string
 }
 
-// Operation is a reconciliation operation, idempotent by OperationID (§7, §18).
-type Operation struct {
-	OperationID  string
-	Kind         lifecycle.OperationKind
-	VolumeID     string
-	HostID       string
-	DesiredState []byte // JSON
-	CurrentState []byte // JSON
-	Phase        lifecycle.OperationPhase
-	Error        string
-}
-
 // Store is the Control Plane metadata authority. Every implementation answers the
 // same way; the shared contract lives in metadata/metadatatest and runs against
 // both (sim in the unit lane, pg in the integration lane). In summary:
@@ -413,7 +357,7 @@ type Store interface {
 	// Plane (SetHostState),
 	// and a routine heartbeat that carried it would un-cordon a draining host.
 	// Committed capacity is not carried either, and could not be: it is derived
-	// from the volumes and plans that name the host (ADR-0017). Term-guarded.
+	// from the volumes that name the host (ADR-0017). Term-guarded.
 	UpsertHost(ctx context.Context, term int64, h Host) error
 	// GetHost returns a host.
 	GetHost(ctx context.Context, hostID string) (Host, error)
@@ -615,38 +559,16 @@ type Store interface {
 	// transition-guarded in the write). Without it a snapshot whose publication
 	// crashed stays CREATING forever and the catalog side of GC never sees it.
 	SetSnapshotState(ctx context.Context, term int64, snapshotID string, state lifecycle.SnapshotState) error
-
-	// RecordOperation records an admin operation idempotently (term-guarded, §7/§18);
-	// recorded is false if the operation_id already existed (a duplicate request).
-	//
-	// A drain of a host that already has a live one is ErrDrainInProgress and is not
-	// recorded (§28.1): two evacuations of one host strand a reservation nobody will
-	// release. The refusal is the store's, so a Control Plane that checked first and
-	// then wrote — which is not exclusion — cannot end up with two.
-	RecordOperation(ctx context.Context, term int64, op Operation) (recorded bool, err error)
-	// GetOperation returns a recorded operation.
-	GetOperation(ctx context.Context, operationID string) (Operation, error)
-	// ListLiveOperationsByHost returns the operations still under way on hostID —
-	// every phase but the terminal ones — ordered by operation id (deterministic,
-	// INV-02). It is how a reconciler asks what is already happening to a host
-	// before starting something else: an operation id is the only handle
-	// GetOperation offers, and a second drain arrives with a new one (§7, §28.1).
-	//
-	// Finished operations are excluded by the store, not by the caller. Nothing
-	// deletes them, so the set of operations a host has ever had only grows, and a
-	// listing that carried the history would make the question that runs before
-	// every drain pass more expensive for the rest of the cluster's life. A caller
-	// that wants a specific past operation has its id and GetOperation.
-	ListLiveOperationsByHost(ctx context.Context, hostID string) ([]Operation, error)
-	// UpdateOperation stores an operation's phase, current state, and error — the
-	// visible progress of a long-running reconciled operation (§7, §28.1). It is
-	// term-guarded, and the phase move is guarded by the lifecycle table, so a
-	// terminal operation is never resurrected (lifecycle.ErrInvalidTransition).
-	//
-	// It is also the write that records a reservation, because an operation's
-	// progress *is* its plan: a drain entry naming a destination charges that host
-	// for a volume which is not primary there yet (ADR-0017). So it is the second
-	// write carrying the §28.2 bound; a non-nil bound that the derived value cannot
-	// admit is ErrCapacityExceeded with nothing written, including the progress.
-	UpdateOperation(ctx context.Context, term int64, op Operation, bound *CapacityBound) error
 }
+
+// There are no operation methods. §7's reconciliation operations —
+// RecordOperation, UpdateOperation, GetOperation, ListLiveOperationsByHost, and the
+// `operations` table under them — were the interface of the drain, the promotion and
+// the recovery ADR-0026 withdrew, and after it nothing wrote a row: each of the four
+// had exactly one caller and it was the contract test. They are deleted rather than
+// kept for the mechanism's return, because a store method with a lifecycle, a
+// capacity bound and a duplicate-request rule reads as something the Control Plane
+// uses, and the next reader has no way to tell that it does not.
+//
+// What comes back with cross-host movement is ADR-0017's second capacity term (see
+// internal/schema/schema.sql), and it comes back with the writer that populates it.

@@ -24,7 +24,7 @@ import (
 func TestATermIsNeverIssuedTwiceAcrossADatabaseRestore(t *testing.T) {
 	ctx := t.Context()
 	pool := startPostgres(t)
-	if _, err := pool.Exec(ctx, `TRUNCATE operations, snapshots, volumes, host_leases, hosts, control_plane_leader`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE snapshots, volumes, host_leases, hosts, control_plane_leader`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 	store := pg.New(pool)

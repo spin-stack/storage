@@ -27,7 +27,6 @@ type Store struct {
 	hosts  map[string]metadata.Host
 	leases map[string]metadata.HostLease
 	vols   map[string]metadata.Volume
-	ops    map[string]metadata.Operation
 	snaps  map[string]metadata.Snapshot
 }
 
@@ -38,7 +37,6 @@ func New(now func() time.Time) *Store {
 		hosts:  map[string]metadata.Host{},
 		leases: map[string]metadata.HostLease{},
 		vols:   map[string]metadata.Volume{},
-		ops:    map[string]metadata.Operation{},
 		snaps:  map[string]metadata.Snapshot{},
 	}
 }
@@ -152,32 +150,20 @@ func (s *Store) ListHosts(_ context.Context) ([]metadata.Host, error) {
 }
 
 // committedLocked is ADR-0017's derived §28.2 capacity, computed the same way the
-// host_committed_bytes view computes it in SQL: what the host holds, plus what is in
-// flight to it and not there yet. Nothing is stored, so there is no delta to apply
-// and nothing to apply twice — a resumed pass computes the same answer as the pass
-// that crashed.
+// host_committed_bytes view computes it in SQL: what the host holds. Nothing is
+// stored, so there is no delta to apply and nothing to apply twice — a resumed pass
+// computes the same answer as the pass that crashed.
+//
+// The second term — what an in-flight operation plan had reserved here and not yet
+// placed — went with the operations table (internal/schema/schema.sql carries the
+// reasoning). The sim summed it in Go and the view summed it in SQL; both are gone
+// together, which is the point of the shared contract: a term one implementation
+// keeps and the other does not is a proof about the wrong program.
 func (s *Store) committedLocked(hostID string) int64 {
 	var total int64
-	primary := map[string]bool{}
 	for _, v := range s.vols {
 		if v.PrimaryHostID == hostID {
 			total += v.SizeBytes
-			primary[v.VolumeID] = true
-		}
-	}
-	for _, op := range s.ops {
-		if op.Phase.Terminal() {
-			continue // a finished plan reserves nothing
-		}
-		for _, r := range metadata.PlanReservations(op.CurrentState) {
-			// A volume already primary here is counted by the first term; counting
-			// the plan too would charge the destination twice for one volume.
-			if r.ToHost != hostID || !r.Reserves() || primary[r.VolumeID] {
-				continue
-			}
-			if v, ok := s.vols[r.VolumeID]; ok {
-				total += v.SizeBytes
-			}
 		}
 	}
 	return total
@@ -717,97 +703,4 @@ func (s *Store) SetVolumeState(_ context.Context, term int64, volumeID string, s
 	}
 	s.vols[volumeID] = v
 	return nil
-}
-
-func (s *Store) RecordOperation(_ context.Context, term int64, op metadata.Operation) (bool, error) {
-	if err := requireID("operation", op.OperationID); err != nil {
-		return false, err
-	}
-	if !op.Kind.Valid() {
-		return false, fmt.Errorf("%w: operation kind %q", lifecycle.ErrUnknownState, op.Kind)
-	}
-	if !op.Phase.Valid() {
-		return false, fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return false, err
-	}
-	if _, exists := s.ops[op.OperationID]; exists {
-		return false, nil // duplicate request (§18)
-	}
-	// One live drain per host (§28.1). In Postgres this is a unique partial index;
-	// here it is the same rule stated in Go, because a property proven against this
-	// store is only a proof about production if both refuse the same writes.
-	if op.Kind == lifecycle.OpDrain && op.HostID != "" && !op.Phase.Terminal() {
-		for _, cur := range s.ops {
-			if cur.Kind == lifecycle.OpDrain && cur.HostID == op.HostID && !cur.Phase.Terminal() {
-				return false, fmt.Errorf("%w: host %s is already being drained by operation %s",
-					metadata.ErrDrainInProgress, op.HostID, cur.OperationID)
-			}
-		}
-	}
-	s.ops[op.OperationID] = op
-	return true, nil
-}
-
-func (s *Store) UpdateOperation(_ context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
-	if err := requireID("operation", op.OperationID); err != nil {
-		return err
-	}
-	if !op.Phase.Valid() {
-		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return err
-	}
-	cur, ok := s.ops[op.OperationID]
-	if !ok {
-		return metadata.ErrNotFound
-	}
-	if err := cur.Phase.Transition(op.Phase); err != nil {
-		return err
-	}
-	// The progress about to be written is this operation's reservation, so the
-	// §28.2 bound is a predicate of the write (ADR-0017), not a check before it.
-	if err := s.boundLocked(bound); err != nil {
-		return err
-	}
-	cur.Phase, cur.CurrentState, cur.Error = op.Phase, op.CurrentState, op.Error
-	s.ops[op.OperationID] = cur
-	return nil
-}
-
-func (s *Store) ListLiveOperationsByHost(_ context.Context, hostID string) ([]metadata.Operation, error) {
-	// An empty id would match every operation recorded with no host at all, which is
-	// the opposite of what any caller of this means (in Postgres host_id is NULL for
-	// those, and NULL matches nothing).
-	if err := requireID("host", hostID); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var ops []metadata.Operation
-	for _, op := range s.ops {
-		// Live only, as in Postgres: a finished operation is history, and the
-		// question this answers is what is happening now (§28.1).
-		if op.HostID == hostID && !op.Phase.Terminal() {
-			ops = append(ops, op)
-		}
-	}
-	sort.Slice(ops, func(i, j int) bool { return ops[i].OperationID < ops[j].OperationID })
-	return ops, nil
-}
-
-func (s *Store) GetOperation(_ context.Context, operationID string) (metadata.Operation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	op, ok := s.ops[operationID]
-	if !ok {
-		return metadata.Operation{}, metadata.ErrNotFound
-	}
-	return op, nil
 }

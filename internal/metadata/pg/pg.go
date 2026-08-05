@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/spin-stack/storage/internal/db"
@@ -231,33 +230,6 @@ func (s *Store) boundRefused(ctx context.Context, b *metadata.CapacityBound) err
 			metadata.ErrCapacityExceeded, b.HostID, h.NVMeUsedBytes, b.UsedLimit)
 	}
 	return nil
-}
-
-// oneLiveDrainPerHostIndex is the unique partial index that makes "one live drain
-// per host" a property of the database rather than of whoever remembered to check
-// (§28.1, schema.sql). Its name is matched rather than the SQLSTATE alone: 23505 on
-// this table also means a duplicate operation_id, which is idempotency and not an
-// error at all.
-const oneLiveDrainPerHostIndex = "operations_one_live_drain_per_host_idx"
-
-// uniqueViolation is SQLSTATE 23505, spelled out rather than pulled in as a
-// dependency for one constant.
-const uniqueViolation = "23505"
-
-// drainInProgress turns that index's violation into a sentinel the caller can act
-// on. Without it the loser of the race is handed a driver error carrying an index
-// name, which no caller can branch on and every caller would log as "unknown".
-//
-// Only the insert path needs it: a row joins the live set when it is created or by
-// leaving the terminal set, and no phase transition leaves it (SUCCEEDED and
-// CANCELED have no successors), so an update cannot create a second live drain.
-func drainInProgress(err error, hostID string) error {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != uniqueViolation ||
-		pgErr.ConstraintName != oneLiveDrainPerHostIndex {
-		return nil
-	}
-	return fmt.Errorf("%w: host %s", metadata.ErrDrainInProgress, hostID)
 }
 
 func notFound(err error) error {
@@ -952,133 +924,4 @@ func (s *Store) SetSnapshotState(ctx context.Context, term int64, snapshotID str
 		return terr
 	}
 	return fmt.Errorf("%w: snapshot %s changed state concurrently", lifecycle.ErrInvalidTransition, snapshotID)
-}
-
-func (s *Store) RecordOperation(ctx context.Context, term int64, op metadata.Operation) (bool, error) {
-	id, err := requireUUID("operation", op.OperationID)
-	if err != nil {
-		return false, err
-	}
-	volID, err := nullUUID("volume", op.VolumeID)
-	if err != nil {
-		return false, err
-	}
-	hostID, err := nullUUID("host", op.HostID)
-	if err != nil {
-		return false, err
-	}
-	if !op.Kind.Valid() {
-		return false, fmt.Errorf("%w: operation kind %q", lifecycle.ErrUnknownState, op.Kind)
-	}
-	if !op.Phase.Valid() {
-		return false, fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
-	}
-	rows, err := s.q.RecordOperation(ctx, db.RecordOperationParams{
-		OperationID: id, Kind: op.Kind.String(), VolumeID: volID, HostID: hostID,
-		DesiredState: op.DesiredState, CurrentState: op.CurrentState, Phase: op.Phase.String(),
-		Term: term,
-	})
-	if derr := drainInProgress(err, op.HostID); derr != nil {
-		return false, derr
-	}
-	// This query affects 0 rows for two very different reasons: the request is a
-	// duplicate (§18 idempotency — recorded=false, no error) or the caller is not
-	// the leader (§7 — ErrStaleTerm). Reporting the second as the first is what lets
-	// a zombie CP's Cancel return success while the real drain keeps promoting.
-	return s.wrote(ctx, term, rows, err)
-}
-
-func (s *Store) UpdateOperation(ctx context.Context, term int64, op metadata.Operation, bound *metadata.CapacityBound) error {
-	id, err := requireUUID("operation", op.OperationID)
-	if err != nil {
-		return err
-	}
-	if !op.Phase.Valid() {
-		return fmt.Errorf("%w: operation phase %q", lifecycle.ErrUnknownState, op.Phase)
-	}
-	boundHost, addBytes, limit, usedLimit, err := boundParams(bound)
-	if err != nil {
-		return err
-	}
-	rows, err := s.placing(ctx, bound, func(q *db.Queries) (int64, error) {
-		return q.UpdateOperationPhase(ctx, db.UpdateOperationPhaseParams{
-			OperationID: id, CurrentState: op.CurrentState, Phase: op.Phase.String(), Error: text(op.Error),
-			AllowedPhases:  op.Phase.PredecessorNames(), // the §7 lifecycle, as a predicate
-			Term:           term,                        // and the §7 term guard
-			BoundHost:      boundHost,                   // and the capacity bound (ADR-0017, ADR-0013)
-			BoundAddBytes:  addBytes,
-			BoundLimit:     limit,
-			BoundUsedLimit: usedLimit,
-		})
-	})
-	ok, err := s.wrote(ctx, term, rows, err)
-	if err != nil || ok {
-		return err
-	}
-	// Still the leader, so 0 rows means the operation is missing, the phase move is
-	// illegal — a terminal operation is never resurrected — or the reservation this
-	// progress records does not fit.
-	cur, gerr := s.GetOperation(ctx, op.OperationID)
-	if gerr != nil {
-		return gerr
-	}
-	if terr := cur.Phase.Transition(op.Phase); terr != nil {
-		return terr
-	}
-	if berr := s.boundRefused(ctx, bound); berr != nil {
-		return berr
-	}
-	return fmt.Errorf("%w: operation %s changed phase concurrently", lifecycle.ErrInvalidTransition, op.OperationID)
-}
-
-func (s *Store) GetOperation(ctx context.Context, operationID string) (metadata.Operation, error) {
-	id, err := requireUUID("operation", operationID)
-	if err != nil {
-		return metadata.Operation{}, err
-	}
-	op, err := s.q.GetOperation(ctx, id)
-	if err != nil {
-		return metadata.Operation{}, notFound(err)
-	}
-	return operationFromRow(op)
-}
-
-func (s *Store) ListLiveOperationsByHost(ctx context.Context, hostID string) ([]metadata.Operation, error) {
-	id, err := requireUUID("host", hostID)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.q.ListLiveOperationsByHost(ctx, pgtype.UUID{Bytes: id, Valid: true})
-	if err != nil {
-		return nil, err
-	}
-	ops := make([]metadata.Operation, 0, len(rows))
-	for _, row := range rows {
-		op, err := operationFromRow(row)
-		if err != nil {
-			return nil, err
-		}
-		ops = append(ops, op)
-	}
-	return ops, nil
-}
-
-// operationFromRow converts a generated row to the interface type, parsing the kind
-// and the phase rather than trusting the columns (the CHECKs make this unreachable
-// in practice — this is the second line of defence).
-func operationFromRow(op *db.Operation) (metadata.Operation, error) {
-	kind, err := lifecycle.ParseOperationKind(op.Kind)
-	if err != nil {
-		return metadata.Operation{}, fmt.Errorf("operation %s: %w", op.OperationID, err)
-	}
-	phase, err := lifecycle.ParseOperationPhase(op.Phase)
-	if err != nil {
-		return metadata.Operation{}, fmt.Errorf("operation %s: %w", op.OperationID, err)
-	}
-	return metadata.Operation{
-		OperationID: op.OperationID.String(), Kind: kind,
-		VolumeID: fromNullUUID(op.VolumeID), HostID: fromNullUUID(op.HostID),
-		DesiredState: op.DesiredState, CurrentState: op.CurrentState,
-		Phase: phase, Error: fromText(op.Error),
-	}, nil
 }

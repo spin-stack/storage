@@ -463,94 +463,15 @@ func (s SnapshotState) Predecessors() []SnapshotState { return snapshotMachine.p
 // PredecessorNames is Predecessors as stored strings — the store's SQL guard.
 func (s SnapshotState) PredecessorNames() []string { return names(s.Predecessors()) }
 
-// --- Reconciliation operations (§7, §8) ---
-
-// OperationKind is what a reconciled operation does (§8 `operations.kind`).
-type OperationKind string
-
-// Operation kinds (§8).
-const (
-	OpAttach   OperationKind = "attach"
-	OpDetach   OperationKind = "detach"
-	OpClone    OperationKind = "clone"
-	OpResize   OperationKind = "resize"
-	OpDrain    OperationKind = "drain"
-	OpRecovery OperationKind = "recovery"
-	OpFlatten  OperationKind = "flatten"
-	OpGC       OperationKind = "gc"
-)
-
-var kindMachine = newMachine("operation kind",
-	[]OperationKind{OpAttach, OpDetach, OpClone, OpResize, OpDrain, OpRecovery, OpFlatten, OpGC},
-	nil) // a kind never changes: an operation is what it was created as.
-
-// OperationKinds returns every operation kind.
-func OperationKinds() []OperationKind { return kindMachine.all }
-
-// ParseOperationKind converts a stored value, rejecting anything else.
-func ParseOperationKind(raw string) (OperationKind, error) { return kindMachine.parse(raw) }
-
-func (k OperationKind) String() string { return string(k) }
-
-// Valid reports whether k is a declared operation kind.
-func (k OperationKind) Valid() bool { return kindMachine.valid(k) }
-
-// OperationPhase is where a long-running reconciled operation stands (§7). It is
-// deliberately generic: what a drain is *doing* belongs in current_state, not in a
-// bespoke phase word per operation kind.
-type OperationPhase string
-
-// Operation phases (§7 reconciliation).
-const (
-	OpPending   OperationPhase = "PENDING"
-	OpRunning   OperationPhase = "RUNNING"
-	OpCanceling OperationPhase = "CANCELING"
-	OpCanceled  OperationPhase = "CANCELED"
-	OpSucceeded OperationPhase = "SUCCEEDED"
-	OpFailed    OperationPhase = "FAILED"
-)
-
-var phaseMachine = newMachine("operation phase",
-	[]OperationPhase{OpPending, OpRunning, OpCanceling, OpCanceled, OpSucceeded, OpFailed},
-	map[OperationPhase][]OperationPhase{
-		OpPending: {OpRunning, OpCanceling, OpFailed},
-		OpRunning: {OpSucceeded, OpFailed, OpCanceling},
-		// A failed pass is a retryable state, not an outcome: the reconciler runs the
-		// operation again (§7).
-		OpFailed: {OpRunning, OpCanceling},
-		// A cancellation is honored at the next safe boundary, so the pass in flight
-		// may still complete successfully.
-		OpCanceling: {OpCanceled, OpSucceeded, OpFailed},
-		OpCanceled:  {},
-		OpSucceeded: {},
-	})
-
-// OperationPhases returns every operation phase.
-func OperationPhases() []OperationPhase { return phaseMachine.all }
-
-// ParseOperationPhase converts a stored value, rejecting anything else.
-func ParseOperationPhase(raw string) (OperationPhase, error) { return phaseMachine.parse(raw) }
-
-func (p OperationPhase) String() string { return string(p) }
-
-// Valid reports whether p is a declared operation phase.
-func (p OperationPhase) Valid() bool { return phaseMachine.valid(p) }
-
-// Terminal reports whether the operation is finished for good.
-func (p OperationPhase) Terminal() bool { return p == OpSucceeded || p == OpCanceled }
-
-// CanTransitionTo reports whether the reconciliation lifecycle allows this move.
-func (p OperationPhase) CanTransitionTo(to OperationPhase) bool { return phaseMachine.allows(p, to) }
-
-// Transition returns ErrInvalidTransition unless the move is allowed.
-func (p OperationPhase) Transition(to OperationPhase) error { return phaseMachine.transition(p, to) }
-
-// Predecessors returns the phases that may become p (including p).
-func (p OperationPhase) Predecessors() []OperationPhase { return phaseMachine.predecessors(p) }
-
-// PredecessorNames is Predecessors as stored strings — the store's SQL guard.
-func (p OperationPhase) PredecessorNames() []string { return names(p.Predecessors()) }
-
+// There are no reconciliation operations here any more. §7's OperationKind
+// (attach|detach|clone|resize|drain|recovery|flatten|gc) and OperationPhase
+// (PENDING…SUCCEEDED) were the vocabulary of the `operations` table, and both went
+// with it: ADR-0026 withdrew the drain, the promotion and the recovery those rows
+// converged, and nothing outside a test ever wrote one. The kinds that describe work
+// V1 still does — a snapshot, a clone — were never phases of an operation row; they
+// are one Control-Plane call each, and what they are waiting on is the snapshot's own
+// §19 state.
+//
 // There is no durability mode here any more. §14.8 once let a volume choose between
 // ACKing a FLUSH on the local fdatasync and ACKing it only once a verified object
 // existed; ADR-0026 withdrew the remote half, so the local ACK is the *only* contract

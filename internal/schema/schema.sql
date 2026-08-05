@@ -1,7 +1,15 @@
 -- Control Plane metadata schema (§8). Authority for leases, epochs, ownership,
--- attachments, snapshot/clone catalog, hosts/capacity, reconciliation operations,
--- and Control Plane terms. NOT the authority for the durable point of data (that is
--- S3, §5.8). Reconstructible from S3 via rebuild-metadata (§22.5).
+-- attachments, snapshot/clone catalog, hosts/capacity, and Control Plane terms.
+-- NOT the authority for the durable point of data (that is S3, §5.8).
+-- Reconstructible from S3 via rebuild-metadata (§22.5).
+--
+-- There is no `operations` table. §7's reconciliation operations — the
+-- desired_state/current_state rows a drain, a promotion or a recovery converged
+-- through — described the machinery ADR-0026 withdrew, and after it nothing wrote a
+-- row: every write path (RecordOperation, UpdateOperationPhase) had a test for its
+-- only caller. It is dropped rather than left empty because an empty table with
+-- three indexes, a kind vocabulary and a term-guarded writer reads as a mechanism
+-- somebody is about to use, and the next reader has no way to tell.
 --
 -- Identity columns are `uuidv7` (a domain over uuid, not text): volume_id in
 -- particular is the same 16-byte
@@ -209,23 +217,6 @@ CREATE TABLE snapshots (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Reconciliation operations (§7): desired/current state converge idempotently. The
--- operation_id is the client request_id (a UUIDv7).
-CREATE TABLE operations (
-    operation_id  UUIDV7 PRIMARY KEY,
-    kind          TEXT NOT NULL CHECK (kind IN ('attach', 'detach', 'clone', 'resize',
-                                                'drain', 'recovery', 'flatten', 'gc')),
-    volume_id     UUID REFERENCES volumes(volume_id),
-    host_id       UUID REFERENCES hosts(host_id),
-    desired_state JSONB NOT NULL,
-    current_state JSONB NOT NULL,
-    phase         TEXT NOT NULL CHECK (phase IN ('PENDING', 'RUNNING', 'CANCELING',
-                                                 'CANCELED', 'SUCCEEDED', 'FAILED')),
-    error         TEXT,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
 -- Indexes.
 --
 -- Two rules, both checked by tests:
@@ -237,17 +228,11 @@ CREATE TABLE operations (
 --    and each child lookup does too. `TestPGEveryForeignKeyHasAnIndex` fails if a
 --    future FK arrives without one.
 -- 2. A query with a filter + ORDER BY gets a composite index in that order, so the
---    planner can skip the sort. Today that is ListVolumesByHost, the loop a drain
---    iterates, and ListLiveOperationsByHost, the lookup that stops a second drain of
---    a host that already has one (§28.1). Where the query also has a fixed
---    predicate, the index carries it: see the live-operation indexes below.
+--    planner can skip the sort. Today that is ListVolumesByHost, the listing a
+--    volume's placement is read back from (§28.1).
 --
 -- Deliberately NOT added yet (no query uses them; each has a named trigger so the
 -- index lands with its query rather than on speculation):
---   * operations (phase) WHERE phase NOT IN ('SUCCEEDED','CANCELED') — a partial
---     index for "find work to reconcile", fleet-wide rather than per host. Needed
---     when the reconciler loop lands (§7); the per-host one below does not serve it,
---     since a scan for work everywhere has no host to lead with.
 --   * hosts (last_heartbeat) / host_leases (last_renewal) — expiry sweeps (§12.3).
 --     The fleet is hundreds of rows; a sequential scan is cheaper than the index
 --     until it is not.
@@ -259,54 +244,6 @@ CREATE TABLE operations (
 -- Composite so the index satisfies both the filter and the ordering; it also serves
 -- as the FK index for primary_host_id.
 CREATE INDEX volumes_primary_host_id_volume_id_idx ON volumes (primary_host_id, volume_id);
-
--- The FK index for operations.host_id (rule 1). It is not the index the drain reads
--- by: a parent DELETE has to find every child row, including the finished ones, so
--- this one cannot be partial — and precisely because it cannot, it is the wrong
--- index for a query that only ever wants the live ones.
-CREATE INDEX operations_host_id_operation_id_idx ON operations (host_id, operation_id);
-
--- The live-operation predicate, twice.
---
--- `phase NOT IN ('SUCCEEDED', 'CANCELED')` is lifecycle.OperationPhase.Terminal()
--- written in SQL, and that duplication is the real cost of these two indexes: the
--- authority for the vocabulary is internal/lifecycle, and this is a second copy of
--- one of its rules. It is stated as the *complement* of the terminal set rather than
--- as a list of live phases because that set is the one the lifecycle defines and the
--- one that does not grow when a phase is added — a new live phase is covered by
--- these indexes on the day it is declared, without a schema change.
---
--- The duplication is only acceptable because a test refuses to let it drift:
--- TestPGLivePhaseSetsAgreeWithTheLifecycle evaluates these predicates in PostgreSQL
--- once per value of the vocabulary and compares each answer with lifecycle's own. If
--- that test is ever deleted, delete these indexes with it.
-
--- ListLiveOperationsByHost: WHERE host_id = $1 AND phase NOT IN (…) ORDER BY
--- operation_id (§28.1, the drain's exclusion check). Partial because `operations` is
--- append-only history — nothing deletes a finished operation — so an index over all
--- of them makes the check that runs before every drain pass slower for the rest of
--- the cluster's life. Composite so the index satisfies the filter and the sort.
-CREATE INDEX operations_live_by_host_idx ON operations (host_id, operation_id)
-    WHERE phase NOT IN ('SUCCEEDED', 'CANCELED');
-
--- One live drain per host (§28.1). Two evacuations of one host each capture their
--- own plan and promote the same volumes; whichever loses a race is left holding a
--- destination reservation nobody will release, because releasing it is the losing
--- operation's own next step and that step now fails for ever (§28.2). Wave 3 closed
--- the harm in Go with a read followed by a write, which is not exclusion: two
--- goroutines inside one leader can both pass the read. This closes it.
---
--- A unique partial index rather than EXCLUDE USING gist (host_id WITH =): the
--- constraint form needs the btree_gist extension and buys nothing here, since
--- equality is all this excludes on. host_id is nullable and NULLs are distinct, so
--- an operation attached to no host is unaffected — which is right, since nothing can
--- be draining a host nobody named.
---
--- Only an INSERT can violate it. A row enters the live set at creation or by leaving
--- the terminal set, and no phase transition leaves it (SUCCEEDED and CANCELED have
--- no successors), so the phase update path cannot create a second live drain.
-CREATE UNIQUE INDEX operations_one_live_drain_per_host_idx ON operations (host_id)
-    WHERE kind = 'drain' AND phase NOT IN ('SUCCEEDED', 'CANCELED');
 
 -- FK indexes (rule 1).
 CREATE INDEX volumes_standby_host_id_idx ON volumes (standby_host_id);
@@ -323,19 +260,17 @@ ALTER TABLE volumes
 -- a snapshot would take a full scan of volumes to check the constraint.
 CREATE INDEX volumes_parent_snapshot_id_idx ON volumes (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
-CREATE INDEX operations_volume_id_idx ON operations (volume_id);
 
 -- Committed NVMe capacity (§28.2) is DERIVED, not stored (ADR-0017):
 --
 --   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
---                   + Σ size_bytes reserved by in-flight operation plans targeting it
 --
--- Both terms are queries over rows that already exist and are already term-guarded,
--- so there is no delta to apply and nothing to apply twice: a resumed pass computes
--- the same answer as the pass that crashed. The column this replaces was an
--- incremental ledger, and every safeguard the last two waves added to it — the
--- non-negative guard, the expected-value predicate, the per-volume release stage —
--- existed only because a delta is not an idempotency key.
+-- It is a query over rows that already exist and are already term-guarded, so there
+-- is no delta to apply and nothing to apply twice: a resumed pass computes the same
+-- answer as the pass that crashed. The column this replaces was an incremental
+-- ledger, and every safeguard the last two waves added to it — the non-negative
+-- guard, the expected-value predicate, the per-volume release stage — existed only
+-- because a delta is not an idempotency key.
 --
 -- It is a view because it is a rule, and a rule lives once. It was inlined in four
 -- queries until now for a tooling reason that no longer exists (Atlas Community
@@ -343,45 +278,39 @@ CREATE INDEX operations_volume_id_idx ON operations (volume_id);
 -- of an accounting rule is four places for a placement decision to be taken against
 -- a different definition of "full".
 --
--- The second term is what makes it correct rather than merely simple: a volume being
--- moved must be charged to its destination *before* it becomes the primary there, or
--- two placements would both see room. It is read out of the operation's own recorded
--- progress, which carries a per-volume stage, so "reserved but not yet primary" is
--- readable rather than inferred. An entry stops reserving the moment the volume it
--- names is actually primary on the host — otherwise the volume is charged twice,
--- once as a plan and once as a placement — and a settled entry (DONE, FOREIGN)
--- reserves nothing at all.
+-- **ADR-0017's second term is gone with the operations table.** It summed the
+-- size_bytes an in-flight operation plan had reserved on a destination — "charged to
+-- its destination *before* it becomes the primary there", which is what stops two
+-- placements from both seeing room for one volume in flight. Removing it does not
+-- change a single number this view has ever produced: nothing outside a test ever
+-- wrote an operations row, so the lateral join ran over an empty relation for every
+-- host in every state a V1 catalog can reach. What it removes is the *headroom* for
+-- a move that spans two hosts — and V1 performs none, because ADR-0026 withdrew the
+-- drain and the promotion that made one. ADR-0017's own "the tests that enforce it"
+-- section already says so: the behavioural cases for that term went with the drain,
+-- "V1 performs no moves, so the interleaving they quantified over is empty".
 --
--- The join is on volume_id::text rather than a cast of the JSON value to uuid: a
--- malformed plan must make the row disappear from the sum, not make every capacity
--- read raise. The consequence, stated in ADR-0017, is that an operation whose plan
--- is lost makes its destination look emptier than it is — which is why the plan is
--- written term-guarded, before the work it describes.
+-- What this means for the one move a V1 catalog *can* make: detach-then-attach
+-- (SetVolumePrimaryHost) makes the volume primary on the destination in the same
+-- statement that places it, so there is no interval between "reserved" and "primary"
+-- for a second term to cover. The gap that write does have is a different one and it
+-- is still open — it carries no CapacityBound at all, so nothing evaluates a ceiling
+-- inside it (recorded against D6 in docs/plan/tracks/TRACK-D.md). The reservation
+-- term would not have closed it: a reservation is written by the operation that
+-- plans a move, and an attach plans nothing.
 --
--- Both sums are correlated subqueries in the select list rather than an aggregate
--- over a join, so a reader asking about one host is charged for one host: the
--- host_id filter is applied to the scan of `hosts` and the subqueries run only for
--- the rows that survive it. That is the property a view puts at risk and the one
--- TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet measures — the drain reads this
--- on every pass, per host it considers.
+-- The sum is a correlated subquery in the select list rather than an aggregate over
+-- a join, so a reader asking about one host is charged for one host: the host_id
+-- filter is applied to the scan of `hosts` and the subquery runs only for the rows
+-- that survive it. That is the property a view puts at risk and the one
+-- TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet measures.
 --
 -- It is a plain view and not a materialized one on purpose: staleness in an
 -- accounting path is the exact failure ADR-0017 removed when it deleted the ledger,
 -- and a materialized view is a ledger with a refresh job.
 CREATE VIEW host_committed_bytes AS
 SELECT h.host_id,
-       (COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
-                   WHERE v.primary_host_id = h.host_id), 0)
-        + COALESCE((SELECT SUM(rv.size_bytes)
-                      FROM operations o
-                      CROSS JOIN LATERAL jsonb_array_elements(
-                          CASE WHEN jsonb_typeof(o.current_state -> 'volumes') = 'array'
-                               THEN o.current_state -> 'volumes'
-                               ELSE '[]'::jsonb END) AS e
-                      JOIN volumes rv ON rv.volume_id::text = e ->> 'volume_id'
-                     WHERE o.phase NOT IN ('SUCCEEDED', 'CANCELED')
-                       AND e ->> 'to_host' = (h.host_id)::text
-                       AND COALESCE(e ->> 'stage', '') NOT IN ('DONE', 'FOREIGN')
-                       AND rv.primary_host_id IS DISTINCT FROM h.host_id), 0))::BIGINT
+       COALESCE((SELECT SUM(v.size_bytes) FROM volumes v
+                  WHERE v.primary_host_id = h.host_id), 0)::BIGINT
            AS committed_bytes
   FROM hosts h;

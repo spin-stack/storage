@@ -15,9 +15,9 @@ var querySources embed.FS
 
 // TestEveryMutatingQueryIsTermGuarded is DEV-0005. §7 says every Control-Plane write
 // validates the leader term, so a zombie CP affects 0 rows — but that was a
-// convention, enforced only by whoever wrote the query remembering it, and
-// operations.sql had been written without it. This reads the query files and fails on
-// any INSERT/UPDATE/DELETE that does not consult control_plane_leader.
+// convention, enforced only by whoever wrote the query remembering it, and the
+// operations queries had been written without it. This reads the query files and
+// fails on any INSERT/UPDATE/DELETE that does not consult control_plane_leader.
 //
 // Exemptions must be listed explicitly, with the reason, so adding one is a visible
 // decision rather than an omission.
@@ -75,14 +75,19 @@ func TestEveryMutatingQueryIsTermGuarded(t *testing.T) {
 // copies of an accounting rule is four places for a placement decision to be taken
 // against a different definition of "full".
 //
-// The marker is jsonb_array_elements: the in-flight half of the sum is the only
-// thing in this project that unnests an operation's plan, so a query file that
-// mentions it is a query file carrying its own copy of the derivation.
+// The marker is `SUM(` over `size_bytes`: summing volume sizes *is* the derivation
+// now that the operations table is gone with the reservation term ADR-0017's second
+// line described (schema.sql says what that removed and what it did not). It used to
+// be jsonb_array_elements — the plan-unnesting half was the only thing in the project
+// that did that — and a marker naming a construct nothing can write any more is a
+// check that passes because its subject was deleted, which is the shape of every
+// assertion this repository has had to prove could still fail.
 func TestCommittedBytesIsDerivedInOnePlace(t *testing.T) {
 	entries, err := querySources.ReadDir("queries")
 	if err != nil {
 		t.Fatal(err)
 	}
+	sumRe := regexp.MustCompile(`(?is)\bSUM\s*\([^)]*size_bytes`)
 	var inlined []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
@@ -92,7 +97,7 @@ func TestCommittedBytesIsDerivedInOnePlace(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(body), "jsonb_array_elements") {
+		if sumRe.MatchString(string(body)) {
 			inlined = append(inlined, e.Name())
 		}
 	}
@@ -103,7 +108,7 @@ func TestCommittedBytesIsDerivedInOnePlace(t *testing.T) {
 
 	// And the readers do read it: a derivation that lives in a view nobody selects
 	// from is not a rule that lives once, it is a rule that has been deleted.
-	readers := map[string]int{"hosts.sql": 2, "volumes.sql": 1, "operations.sql": 1}
+	readers := map[string]int{"hosts.sql": 2, "volumes.sql": 1}
 	for file, want := range readers {
 		body, err := querySources.ReadFile("queries/" + file)
 		if err != nil {

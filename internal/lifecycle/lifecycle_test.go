@@ -145,45 +145,6 @@ func TestPublishedSnapshotNeverGoesBack(t *testing.T) {
 	}
 }
 
-// TestOperationPhaseLifecycle is the reconciliation lifecycle every long-running
-// operation shares (§7): a pass may fail and be retried, cancellation is a request
-// that resolves, and a finished operation never resurrects.
-func TestOperationPhaseLifecycle(t *testing.T) {
-	tests := []struct {
-		name    string
-		from    lifecycle.OperationPhase
-		to      lifecycle.OperationPhase
-		allowed bool
-	}{
-		{"start", lifecycle.OpPending, lifecycle.OpRunning, true},
-		{"a failed pass is retried by the reconciler", lifecycle.OpFailed, lifecycle.OpRunning, true},
-		{"running can fail", lifecycle.OpRunning, lifecycle.OpFailed, true},
-		{"running completes", lifecycle.OpRunning, lifecycle.OpSucceeded, true},
-		{"cancellation is requested while running", lifecycle.OpRunning, lifecycle.OpCanceling, true},
-		{"cancellation is requested before it starts", lifecycle.OpPending, lifecycle.OpCanceling, true},
-		{"cancellation resolves", lifecycle.OpCanceling, lifecycle.OpCanceled, true},
-		{"a canceling pass may still finish the volume it was on", lifecycle.OpCanceling, lifecycle.OpSucceeded, true},
-
-		{"succeeded is terminal", lifecycle.OpSucceeded, lifecycle.OpRunning, false},
-		{"canceled is terminal", lifecycle.OpCanceled, lifecycle.OpRunning, false},
-		{"no jumping from pending to done", lifecycle.OpPending, lifecycle.OpSucceeded, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.from.CanTransitionTo(tc.to); got != tc.allowed {
-				t.Fatalf("%s -> %s: allowed=%v, want %v", tc.from, tc.to, got, tc.allowed)
-			}
-		})
-	}
-	// Terminal phases report themselves as such, so a reconciler can stop cheaply.
-	for _, p := range lifecycle.OperationPhases() {
-		want := p == lifecycle.OpSucceeded || p == lifecycle.OpCanceled
-		if got := p.Terminal(); got != want {
-			t.Fatalf("%s.Terminal() = %v, want %v", p, got, want)
-		}
-	}
-}
-
 // TestPredecessorsDriveTheStoreGuard: the transition table is also what the SQL
 // predicate is built from, so it must list the legal previous states (including the
 // target itself, for an idempotent re-write).
@@ -218,7 +179,6 @@ func TestTransitionReportsTheVocabularyItRefused(t *testing.T) {
 		{"volume", lifecycle.VolumeFencingWait.Transition(lifecycle.VolumeActive), `volume state "FENCING_WAIT" -> "ACTIVE"`},
 		{"agent volume", lifecycle.AgentSelfFenced.Transition(lifecycle.AgentActive), `agent volume state "SELF_FENCED" -> "ACTIVE"`},
 		{"snapshot", lifecycle.SnapshotPublished.Transition(lifecycle.SnapshotCreating), `snapshot state "PUBLISHED" -> "CREATING"`},
-		{"operation phase", lifecycle.OpCanceled.Transition(lifecycle.OpRunning), `operation phase "CANCELED" -> "RUNNING"`},
 		{"host", lifecycle.HostActive.Transition(lifecycle.HostState("GONE")), `host state "ACTIVE" -> "GONE"`},
 	}
 	for _, tc := range tests {
@@ -236,7 +196,6 @@ func TestTransitionReportsTheVocabularyItRefused(t *testing.T) {
 		lifecycle.VolumeRecovering.Transition(lifecycle.VolumeActive),
 		lifecycle.AgentAttaching.Transition(lifecycle.AgentActive),
 		lifecycle.SnapshotCreating.Transition(lifecycle.SnapshotPublished),
-		lifecycle.OpRunning.Transition(lifecycle.OpSucceeded),
 	} {
 		if err != nil {
 			t.Fatalf("a legal transition returned %v", err)
@@ -264,12 +223,9 @@ func TestPredecessorsOfAnUnknownStateIsEmpty(t *testing.T) {
 	if got := lifecycle.HostState("NOPE").PredecessorNames(); len(got) != 0 {
 		t.Fatalf("predecessors of an unknown state = %v, want none", got)
 	}
-	if got := lifecycle.OperationPhase("STARTED").PredecessorNames(); len(got) != 0 {
-		t.Fatalf("predecessors of an unknown phase = %v, want none", got)
-	}
 	// A legal target lists itself plus its predecessors, as strings for the guard.
-	if got := lifecycle.OpRunning.PredecessorNames(); len(got) != 3 {
-		t.Fatalf("predecessors of RUNNING = %v, want PENDING/RUNNING/FAILED", got)
+	if got := lifecycle.SnapshotPublished.PredecessorNames(); len(got) != 2 {
+		t.Fatalf("predecessors of PUBLISHED = %v, want CREATING/PUBLISHED", got)
 	}
 	if got := lifecycle.VolumeActive.PredecessorNames(); len(got) == 0 {
 		t.Fatal("ACTIVE must list its predecessors")
@@ -391,8 +347,6 @@ func TestParseRejectsAnythingElse(t *testing.T) {
 		{"VolumeState", func(s string) error { _, err := lifecycle.ParseVolumeState(s); return err }},
 		{"AgentVolumeState", func(s string) error { _, err := lifecycle.ParseAgentVolumeState(s); return err }},
 		{"SnapshotState", func(s string) error { _, err := lifecycle.ParseSnapshotState(s); return err }},
-		{"OperationPhase", func(s string) error { _, err := lifecycle.ParseOperationPhase(s); return err }},
-		{"OperationKind", func(s string) error { _, err := lifecycle.ParseOperationKind(s); return err }},
 	}
 	bad := []string{"", " ", "active", "ACTIVE ", "nonsense", "0"}
 	for _, tc := range tests {
@@ -429,16 +383,6 @@ func TestParseRoundTripsEveryValue(t *testing.T) {
 			t.Fatalf("SnapshotState %q: got %q err=%v", s, got, err)
 		}
 	}
-	for _, p := range lifecycle.OperationPhases() {
-		if got, err := lifecycle.ParseOperationPhase(p.String()); err != nil || got != p {
-			t.Fatalf("OperationPhase %q: got %q err=%v", p, got, err)
-		}
-	}
-	for _, k := range lifecycle.OperationKinds() {
-		if got, err := lifecycle.ParseOperationKind(k.String()); err != nil || got != k {
-			t.Fatalf("OperationKind %q: got %q err=%v", k, got, err)
-		}
-	}
 }
 
 // TestValidRejectsTheZeroValue: a struct field nobody set must not look like a state.
@@ -448,9 +392,7 @@ func TestValidRejectsTheZeroValue(t *testing.T) {
 		v  lifecycle.VolumeState
 		a  lifecycle.AgentVolumeState
 		s  lifecycle.SnapshotState
-		p  lifecycle.OperationPhase
-		k  lifecycle.OperationKind
-		ok = []bool{h.Valid(), v.Valid(), a.Valid(), s.Valid(), p.Valid(), k.Valid()}
+		ok = []bool{h.Valid(), v.Valid(), a.Valid(), s.Valid()}
 	)
 	for i, valid := range ok {
 		if valid {

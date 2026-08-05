@@ -74,7 +74,6 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"WatermarksAreOrderedAndNeverGoBackwards", watermarks},
 		{"UpsertHostDoesNotClobberStateOrCapacity", upsertHost},
 		{"ACordonRecordsWhoPlacedItAndOutranksThePressureLoop", cordonAuthority},
-		{"RecordOperationSeparatesDuplicateFromStaleTerm", recordOperation},
 		{"VolumeLifecycleIsExpressible", volumeLifecycle},
 		{"SnapshotLifecycleIsExpressible", snapshotLifecycle},
 		{"PendingSnapshotsFollowTheVolumeAndPublishOnce", pendingSnapshots},
@@ -84,8 +83,6 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesAreRevocableAndNotRenewableForADeadHost", hostLeases},
 		{"CapacityIsDerivedAndTheBoundIsAPredicateOfTheWrite", capacity},
-		{"LiveOperationsAreListableByHost", liveOperationsByHost},
-		{"AHostHoldsOnlyOneLiveDrain", oneLiveDrainPerHost},
 		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
 	for _, tc := range cases {
@@ -174,14 +171,13 @@ func bumpVolumeEpoch(ctx context.Context, s metadata.Store, term int64, volumeID
 
 func id() string { return ids.New().String() }
 
-// world is a small fixture: a leader, one host, one volume, one snapshot and one
-// operation — so that "the row is missing" is never the reason a mutation fails.
+// world is a small fixture: a leader, one host, one volume and one snapshot — so
+// that "the row is missing" is never the reason a mutation fails.
 type world struct {
 	term int64
 	host string
 	vol  string
 	snap string
-	op   string
 }
 
 func newWorld(t *testing.T, s metadata.Store) world {
@@ -191,7 +187,7 @@ func newWorld(t *testing.T, s metadata.Store) world {
 	if err != nil {
 		t.Fatalf("AcquireLeadership: %v", err)
 	}
-	w := world{term: term, host: id(), vol: id(), snap: id(), op: id()}
+	w := world{term: term, host: id(), vol: id(), snap: id()}
 	if err := s.UpsertHost(ctx, term, metadata.Host{
 		HostID: w.host, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
 	}); err != nil {
@@ -208,12 +204,6 @@ func newWorld(t *testing.T, s metadata.Store) world {
 		RootDigest: "digest", State: lifecycle.SnapshotCreating, RequestID: id(),
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
-	}
-	if _, err := s.RecordOperation(ctx, term, metadata.Operation{
-		OperationID: w.op, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-		VolumeID: w.vol, HostID: w.host, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-	}); err != nil {
-		t.Fatalf("RecordOperation: %v", err)
 	}
 	return w
 }
@@ -280,18 +270,6 @@ func everyMutation() []mutation {
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.PublishSnapshot(ctx, term, w.snap, 7, w.host, "image/k/snapshots/s.json")
 		}},
-		{"RecordOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			_, err := s.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-				DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-			})
-			return err
-		}},
-		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.UpdateOperation(ctx, term, metadata.Operation{
-				OperationID: w.op, Phase: lifecycle.OpRunning, CurrentState: []byte(`{}`),
-			}, nil)
-		}},
 	}
 }
 
@@ -303,7 +281,7 @@ func everyMutation() []mutation {
 func termZero(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	// No AcquireLeadership: there is no leader at all.
-	w := world{host: id(), vol: id(), snap: id(), op: id()}
+	w := world{host: id(), vol: id(), snap: id()}
 	for _, m := range everyMutation() {
 		t.Run(m.name, func(t *testing.T) {
 			if err := m.call(ctx, s, 0, w); !errors.Is(err, metadata.ErrStaleTerm) {
@@ -337,7 +315,7 @@ func staleTerm(t *testing.T, s metadata.Store) {
 func missingRows(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
-	ghostHost, ghostVol, ghostSnap, ghostOp := id(), id(), id(), id()
+	ghostHost, ghostVol, ghostSnap := id(), id(), id()
 
 	tests := []mutation{
 		{"SetHostState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
@@ -377,11 +355,6 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.PublishSnapshot(ctx, term, ghostSnap, 7, "", "k")
 		}},
-		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.UpdateOperation(ctx, term, metadata.Operation{
-				OperationID: ghostOp, Phase: lifecycle.OpRunning, CurrentState: []byte(`{}`),
-			}, nil)
-		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -399,7 +372,6 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"GetHostLease", func() error { _, err := s.GetHostLease(ctx, ghostHost); return err }},
 		{"GetVolume", func() error { _, err := s.GetVolume(ctx, ghostVol); return err }},
 		{"GetSnapshot", func() error { _, err := s.GetSnapshot(ctx, ghostSnap); return err }},
-		{"GetOperation", func() error { _, err := s.GetOperation(ctx, ghostOp); return err }},
 	}
 	for _, tc := range reads {
 		t.Run(tc.name, func(t *testing.T) {
@@ -786,44 +758,6 @@ func cordonAuthority(t *testing.T, s metadata.Store) {
 			t.Fatalf("an authorless cordon landed: state = %q", h.State)
 		}
 	})
-}
-
-// recordOperation: the one mutation whose whole purpose is admin idempotency
-// (INV-21) must let the caller tell "already done" from "you are not the leader".
-// An operator cancelling a drain through a CP that lost the election otherwise gets
-// success while the real drain keeps promoting volumes.
-func recordOperation(t *testing.T, s metadata.Store) {
-	ctx := t.Context()
-	w := newWorld(t, s)
-	op := metadata.Operation{
-		OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-		DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-	}
-	recorded, err := s.RecordOperation(ctx, w.term, op)
-	if err != nil || !recorded {
-		t.Fatalf("first record: recorded=%v err=%v", recorded, err)
-	}
-	recorded, err = s.RecordOperation(ctx, w.term, op)
-	if err != nil || recorded {
-		t.Fatalf("duplicate: want (false, nil), got (%v, %v)", recorded, err)
-	}
-
-	stale := w.term
-	if _, err := s.AcquireLeadership(ctx, "cp-b"); err != nil {
-		t.Fatal(err)
-	}
-	fresh := op
-	fresh.OperationID = id()
-	recorded, err = s.RecordOperation(ctx, stale, fresh)
-	if !errors.Is(err, metadata.ErrStaleTerm) {
-		t.Fatalf("zombie CP: want ErrStaleTerm, got (%v, %v)", recorded, err)
-	}
-	if recorded {
-		t.Fatal("zombie CP reported the operation as recorded")
-	}
-	if _, err := s.GetOperation(ctx, fresh.OperationID); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("zombie CP wrote a row: %v", err)
-	}
 }
 
 // volumeLifecycle: the §7 states the schema declares must be reachable through the
@@ -1446,57 +1380,6 @@ func capacity(t *testing.T, s metadata.Store) {
 		}
 	})
 
-	t.Run("an in-flight plan charges the destination before the volume is primary there", func(t *testing.T) {
-		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: w.op, Phase: lifecycle.OpRunning,
-			CurrentState: plan(w.vol, other, "MOVING"),
-		}, nil); err != nil {
-			t.Fatal(err)
-		}
-		if got := committed(t, other); got != gib {
-			t.Fatalf("destination committed = %d, want %d — a volume in flight to it is not charged", got, gib)
-		}
-		// And it is still charged to the source, which is still serving it. Both
-		// sides is the conservative direction: the alternative is two placements
-		// that each believe they have the room.
-		if got := committed(t, w.host); got != gib {
-			t.Fatalf("source committed = %d, want %d while it still holds the volume", got, gib)
-		}
-	})
-
-	t.Run("a settled entry reserves nothing", func(t *testing.T) {
-		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: w.op, Phase: lifecycle.OpRunning,
-			CurrentState: plan(w.vol, other, "DONE"),
-		}, nil); err != nil {
-			t.Fatal(err)
-		}
-		if got := committed(t, other); got != 0 {
-			t.Fatalf("a DONE entry still reserves %d bytes", got)
-		}
-	})
-
-	t.Run("a finished operation reserves nothing", func(t *testing.T) {
-		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: w.op, Phase: lifecycle.OpRunning,
-			CurrentState: plan(w.vol, other, "MOVING"),
-		}, nil); err != nil {
-			t.Fatal(err)
-		}
-		if got := committed(t, other); got != gib {
-			t.Fatalf("setup: destination committed = %d, want %d", got, gib)
-		}
-		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: w.op, Phase: lifecycle.OpSucceeded,
-			CurrentState: plan(w.vol, other, "MOVING"),
-		}, nil); err != nil {
-			t.Fatal(err)
-		}
-		if got := committed(t, other); got != 0 {
-			t.Fatalf("a terminal operation still reserves %d bytes", got)
-		}
-	})
-
 	t.Run("the bound is a predicate of the write that places a volume", func(t *testing.T) {
 		tight := &metadata.CapacityBound{HostID: other, AddBytes: 2 * gib, Limit: gib}
 		fresh := id()
@@ -1589,65 +1472,6 @@ func capacity(t *testing.T, s metadata.Store) {
 		}); !errors.Is(err, metadata.ErrCapacityExceeded) {
 			t.Fatalf("CreateVolume after a heartbeat past the ceiling = %v, want ErrCapacityExceeded", err)
 		}
-		// The other write that reserves bytes is a drain's plan entry, and it carries
-		// the same two-armed bound: a destination that is out of device is no
-		// destination, whatever the fleet promised it. Without this the ceiling would
-		// hold for a clone and not for an evacuation — and an evacuation is the one
-		// that moves whole hosts' worth of data at once.
-		drain := id()
-		if _, err := s.RecordOperation(ctx, w.term, metadata.Operation{
-			OperationID: drain, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-			HostID: full, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: drain, Phase: lifecycle.OpRunning,
-			CurrentState: plan(w.vol, full, "MOVING"),
-		}, &metadata.CapacityBound{
-			HostID: full, AddBytes: gib, Limit: total, UsedLimit: 950 * gib,
-		}); !errors.Is(err, metadata.ErrCapacityExceeded) {
-			t.Fatalf("a plan reserving space on a device past its fill ceiling = %v, want ErrCapacityExceeded", err)
-		}
-		if got := committed(t, full); got != gib {
-			t.Fatalf("a refused reservation charged the destination: committed = %d, want %d", got, gib)
-		}
-	})
-
-	t.Run("the bound is a predicate of the write that records a plan", func(t *testing.T) {
-		// `other` now holds 2 GiB. A plan that would add the world's 1 GiB volume
-		// under a 2 GiB ceiling has to be refused, progress and all: the entry *is*
-		// the reservation.
-		// A fresh operation: the one above was taken to SUCCEEDED, and a terminal
-		// operation is refused by the lifecycle guard before the bound is reached.
-		live := id()
-		if _, rerr := s.RecordOperation(ctx, w.term, metadata.Operation{
-			OperationID: live, Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-			HostID: w.host, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-		}); rerr != nil {
-			t.Fatal(rerr)
-		}
-		before, err := s.GetOperation(ctx, live)
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: live, Phase: lifecycle.OpRunning,
-			CurrentState: plan(w.vol, other, "MOVING"),
-		}, &metadata.CapacityBound{HostID: other, AddBytes: gib, Limit: 2 * gib})
-		if !errors.Is(err, metadata.ErrCapacityExceeded) {
-			t.Fatalf("UpdateOperation past the bound = %v, want ErrCapacityExceeded", err)
-		}
-		after, err := s.GetOperation(ctx, live)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(after.CurrentState) != string(before.CurrentState) || after.Phase != before.Phase {
-			t.Fatalf("a refused reservation still wrote the progress: %+v", after)
-		}
-		if got := committed(t, other); got != 2*gib {
-			t.Fatalf("destination committed = %d, want %d", got, 2*gib)
-		}
 	})
 
 	t.Run("placements racing for the last slot leave the host inside its ceiling", func(t *testing.T) {
@@ -1720,170 +1544,6 @@ func capacity(t *testing.T, s metadata.Store) {
 				t.Fatalf("round %d: the destination holds %d committed bytes against a ceiling of %d",
 					round, got, gib)
 			}
-		}
-	})
-}
-
-// plan builds the current_state a drain records for one volume in flight.
-func plan(volumeID, toHost, stage string) []byte {
-	return fmt.Appendf(nil, `{"total":1,"volumes":[{"volume_id":%q,"stage":%q,"to_host":%q}]}`,
-		volumeID, stage, toHost)
-}
-
-// liveOperationsByHost: an operation id is the only handle GetOperation offers, and
-// the question a reconciler has to answer before it starts work on a host — "is
-// anything already happening here?" — arrives with a *different* id every time. The
-// listing is what answers it, so its filter has to be exact in both directions: an
-// operation belonging to another host, or to no host at all, must never be counted
-// as work in progress here, and neither must one that has finished.
-//
-// Terminal operations are excluded by the listing itself rather than by the caller.
-// The set of operations a host has ever had only grows — nothing deletes them — so a
-// listing that returned all of them would make the check that runs before every
-// drain pass get slower for the rest of the cluster's life.
-func liveOperationsByHost(t *testing.T, s metadata.Store) {
-	ctx := t.Context()
-	w := newWorld(t, s) // records one live drain operation for w.host
-
-	other := id()
-	if err := s.UpsertHost(ctx, w.term, metadata.Host{
-		HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// A second live operation on the same host, one on another host, one recorded
-	// with no host at all (a cancellation that arrived before the drain started),
-	// and one that has finished. Only the first is work in progress here.
-	//
-	// The second one is an attach rather than a drain because a host may hold only
-	// one live drain (that is the rule the drain exclusion used to enforce in Go);
-	// what this case is about is the host filter, not the kind.
-	mine, done := id(), id()
-	for _, op := range []metadata.Operation{
-		{OperationID: mine, Kind: lifecycle.OpAttach, HostID: w.host, Phase: lifecycle.OpRunning},
-		{OperationID: id(), Kind: lifecycle.OpDrain, HostID: other, Phase: lifecycle.OpPending},
-		{OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpCanceling},
-		{OperationID: done, Kind: lifecycle.OpAttach, HostID: w.host, Phase: lifecycle.OpPending},
-	} {
-		op.DesiredState, op.CurrentState = []byte(`{}`), []byte(`{}`)
-		if _, err := s.RecordOperation(ctx, w.term, op); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, phase := range []lifecycle.OperationPhase{lifecycle.OpRunning, lifecycle.OpSucceeded} {
-		if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-			OperationID: done, Kind: lifecycle.OpAttach, HostID: w.host, Phase: phase,
-			DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-		}, nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	ops, err := s.ListLiveOperationsByHost(ctx, w.host)
-	if err != nil {
-		t.Fatalf("ListLiveOperationsByHost: %v", err)
-	}
-	got := make([]string, 0, len(ops))
-	for _, op := range ops {
-		if op.HostID != w.host {
-			t.Fatalf("operation %s belongs to host %q", op.OperationID, op.HostID)
-		}
-		if op.Phase.Terminal() {
-			t.Fatalf("operation %s is %s and is not live work", op.OperationID, op.Phase)
-		}
-		got = append(got, op.OperationID)
-	}
-	want := []string{w.op, mine}
-	sort.Strings(want) // the listing is ordered by operation id (INV-02)
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("live operations for the host = %v, want %v", got, want)
-	}
-	if ops[0].Kind == "" || ops[0].Phase == "" {
-		t.Fatalf("the listing must round-trip kind and phase: %+v", ops[0])
-	}
-
-	t.Run("a host with no operations lists none", func(t *testing.T) {
-		ops, err := s.ListLiveOperationsByHost(ctx, id())
-		if err != nil || len(ops) != 0 {
-			t.Fatalf("unknown host: %d operations, err=%v", len(ops), err)
-		}
-	})
-
-	t.Run("an empty host id is rejected", func(t *testing.T) {
-		// Not "every operation nobody attached to a host": that set is exactly the
-		// one a caller of this must never be handed.
-		if _, err := s.ListLiveOperationsByHost(ctx, ""); !errors.Is(err, metadata.ErrInvalidID) {
-			t.Fatalf("empty host id: want ErrInvalidID, got %v", err)
-		}
-	})
-}
-
-// oneLiveDrainPerHost: two evacuations of one host are not two halves of the same
-// work. Each captures its own plan and promotes the same volumes, and whichever
-// loses a race is left holding a destination reservation nobody will release —
-// releasing it is the losing operation's own next step, and that step now fails for
-// ever (§28.2, ADR-0017). The volumes are safe either way, since the promotion
-// protocol serializes them; the accounting is not, and a host placement believes is
-// full is a host that stays empty.
-//
-// The Control Plane checks this before it writes, but a check followed by a write is
-// not exclusion: two goroutines inside one leader can both pass it. So the store
-// itself refuses the second one, with a sentinel the caller can act on rather than
-// an integrity error it can only log.
-func oneLiveDrainPerHost(t *testing.T, s metadata.Store) {
-	ctx := t.Context()
-	w := newWorld(t, s) // records one live drain for w.host
-
-	second := metadata.Operation{
-		OperationID: id(), Kind: lifecycle.OpDrain, HostID: w.host, Phase: lifecycle.OpPending,
-		DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-	}
-	if _, err := s.RecordOperation(ctx, w.term, second); !errors.Is(err, metadata.ErrDrainInProgress) {
-		t.Fatalf("a second live drain: want ErrDrainInProgress, got %v", err)
-	}
-	if _, err := s.GetOperation(ctx, second.OperationID); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("the refused drain was recorded anyway: %v", err)
-	}
-
-	// The rule is about live *drains* of *this* host, and nothing wider.
-	other := id()
-	if err := s.UpsertHost(ctx, w.term, metadata.Host{
-		HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	allowed := []struct {
-		name string
-		op   metadata.Operation
-	}{
-		{"another kind on the same host", metadata.Operation{
-			OperationID: id(), Kind: lifecycle.OpAttach, HostID: w.host, Phase: lifecycle.OpPending}},
-		{"a drain of another host", metadata.Operation{
-			OperationID: id(), Kind: lifecycle.OpDrain, HostID: other, Phase: lifecycle.OpPending}},
-		{"a drain attached to no host", metadata.Operation{
-			OperationID: id(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending}},
-	}
-	for _, tc := range allowed {
-		t.Run(tc.name, func(t *testing.T) {
-			op := tc.op
-			op.DesiredState, op.CurrentState = []byte(`{}`), []byte(`{}`)
-			if _, err := s.RecordOperation(ctx, w.term, op); err != nil {
-				t.Fatalf("must be allowed: %v", err)
-			}
-		})
-	}
-
-	t.Run("the host is drainable again once the owning operation finishes", func(t *testing.T) {
-		for _, phase := range []lifecycle.OperationPhase{lifecycle.OpRunning, lifecycle.OpSucceeded} {
-			if err := s.UpdateOperation(ctx, w.term, metadata.Operation{
-				OperationID: w.op, Kind: lifecycle.OpDrain, HostID: w.host, Phase: phase,
-				DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-			}, nil); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if _, err := s.RecordOperation(ctx, w.term, second); err != nil {
-			t.Fatalf("a finished drain must not block the next one: %v", err)
 		}
 	})
 }
@@ -1980,18 +1640,6 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.PublishSnapshot(ctx, term, "", 7, "", "k")
-		}},
-		{"RecordOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			_, err := s.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: "", Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-				DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-			})
-			return err
-		}},
-		{"UpdateOperation", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.UpdateOperation(ctx, term, metadata.Operation{
-				OperationID: "", Phase: lifecycle.OpRunning, CurrentState: []byte(`{}`),
-			}, nil)
 		}},
 	}
 	for _, tc := range tests {

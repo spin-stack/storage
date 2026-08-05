@@ -48,12 +48,8 @@ internal/lease.Manager.Valid  # reached in production only through Loop.LeaseVal
 internal/lifecycle.HostStates       # walked by lifecycle_test and by pg_integration_test against the column's CHECK
 internal/lifecycle.CordonReasons    # same
 internal/lifecycle.VolumeStates     # same
-internal/lifecycle.OperationKinds   # same
-internal/lifecycle.OperationPhases  # same
 
-# --- metadata / placement test affordances ----------------------------------------------
-internal/metadata.PlanReservations        # the reservation set a placement plan implies; read by metadata/sim and by the contract tests, never by a binary
-internal/metadata.PlanReservation.Reserves # same
+# --- placement test affordances ----------------------------------------------------------
 internal/placement.CommittedRatio          # the ratio placement_test asserts on; the chooser compares capacities directly
 
 # --- the observability test provider ----------------------------------------------------

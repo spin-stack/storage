@@ -98,23 +98,6 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 	}
 }
 
-// TestOperationIdempotency is §18: a duplicated admin request records once.
-func TestOperationIdempotency(t *testing.T) {
-	ctx := t.Context()
-	s := newStore()
-	term, _ := s.AcquireLeadership(ctx, "cp")
-	op := metadata.Operation{OperationID: "req-1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
-
-	recorded, err := s.RecordOperation(ctx, term, op)
-	if err != nil || !recorded {
-		t.Fatalf("first record: recorded=%v err=%v", recorded, err)
-	}
-	recorded, err = s.RecordOperation(ctx, term, op)
-	if err != nil || recorded {
-		t.Fatalf("duplicate record should report recorded=false, got %v err=%v", recorded, err)
-	}
-}
-
 // TestGettersRoundTripAndNotFound exercises every read path: a value is returned
 // after it is written, and a missing key yields ErrNotFound.
 func TestGettersRoundTripAndNotFound(t *testing.T) {
@@ -134,9 +117,6 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 	}
 	if _, err := s.GetVolume(ctx, "nope"); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("GetVolume missing: %v", err)
-	}
-	if _, err := s.GetOperation(ctx, "nope"); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("GetOperation missing: %v", err)
 	}
 
 	term, _ := s.AcquireLeadership(ctx, "cp")
@@ -168,14 +148,6 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 		t.Fatalf("BumpVolumeEpoch missing: %v", err)
 	}
 
-	op := metadata.Operation{OperationID: "op1", Kind: lifecycle.OpAttach, DesiredState: []byte("{}"), CurrentState: []byte("{}"), Phase: lifecycle.OpPending}
-	if _, err := s.RecordOperation(ctx, term, op); err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.GetOperation(ctx, "op1")
-	if err != nil || got.Kind != lifecycle.OpAttach {
-		t.Fatalf("GetOperation: %+v err=%v", got, err)
-	}
 }
 
 // TestStoreRejectsValuesOutsideTheVocabulary: the store is the authority for what a
@@ -212,18 +184,6 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 		{"CreateSnapshot with an unknown state", func(s *sim.Store, term int64) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: "s", State: lifecycle.SnapshotState("DONE")})
 		}},
-		{"RecordOperation with an unknown kind", func(s *sim.Store, term int64) error {
-			_, err := s.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: "op", Kind: lifecycle.OperationKind("teleport"), Phase: lifecycle.OpPending,
-			})
-			return err
-		}},
-		{"RecordOperation with an unknown phase", func(s *sim.Store, term int64) error {
-			_, err := s.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: "op", Kind: lifecycle.OpDrain, Phase: lifecycle.OperationPhase("STARTED"),
-			})
-			return err
-		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -233,43 +193,6 @@ func TestStoreRejectsValuesOutsideTheVocabulary(t *testing.T) {
 				t.Fatalf("want ErrUnknownState, got %v", err)
 			}
 		})
-	}
-}
-
-// TestUpdateOperationEnforcesThePhaseLifecycle: a finished operation cannot be
-// resurrected, and cancellation cannot rewrite a terminal outcome (§7).
-func TestUpdateOperationEnforcesThePhaseLifecycle(t *testing.T) {
-	ctx := t.Context()
-	s := newStore()
-	term, _ := s.AcquireLeadership(ctx, "cp")
-	op := metadata.Operation{
-		OperationID: "op-1", Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-		DesiredState: []byte("{}"), CurrentState: []byte("{}"),
-	}
-	if _, err := s.RecordOperation(ctx, term, op); err != nil {
-		t.Fatal(err)
-	}
-
-	op.Phase = lifecycle.OpRunning
-	if err := s.UpdateOperation(ctx, term, op, nil); err != nil {
-		t.Fatalf("PENDING -> RUNNING: %v", err)
-	}
-	op.Phase = lifecycle.OpSucceeded
-	if err := s.UpdateOperation(ctx, term, op, nil); err != nil {
-		t.Fatalf("RUNNING -> SUCCEEDED: %v", err)
-	}
-
-	op.Phase = lifecycle.OpRunning
-	if err := s.UpdateOperation(ctx, term, op, nil); !errors.Is(err, lifecycle.ErrInvalidTransition) {
-		t.Fatalf("SUCCEEDED -> RUNNING: want ErrInvalidTransition, got %v", err)
-	}
-	op.Phase = lifecycle.OpCanceling
-	if err := s.UpdateOperation(ctx, term, op, nil); !errors.Is(err, lifecycle.ErrInvalidTransition) {
-		t.Fatalf("SUCCEEDED -> CANCELING: want ErrInvalidTransition, got %v", err)
-	}
-	got, _ := s.GetOperation(ctx, "op-1")
-	if got.Phase != lifecycle.OpSucceeded {
-		t.Fatalf("a refused transition changed the phase to %q", got.Phase)
 	}
 }
 
@@ -327,11 +250,11 @@ func TestSetHostState(t *testing.T) {
 }
 
 // TestDerivedCapacity is the §28.2 accounting after ADR-0017: the sim's committed
-// bytes are a function of the volumes and in-flight plans that name the host, so
-// there is nothing to reserve, nothing to release, and nothing that can be applied
-// twice. What is left to check here is that the sim sums the same two terms the
-// host_committed_bytes view sums in SQL (the shared contract pins the semantics for
-// both stores; this is the sim's own arithmetic).
+// bytes are a function of the volumes that name the host, so there is nothing to
+// reserve, nothing to release, and nothing that can be applied twice. What is left to
+// check here is that the sim sums what the host_committed_bytes view sums in SQL (the
+// shared contract pins the semantics for both stores; this is the sim's own
+// arithmetic).
 func TestDerivedCapacity(t *testing.T) {
 	ctx := t.Context()
 	s := newStore()
@@ -353,19 +276,8 @@ func TestDerivedCapacity(t *testing.T) {
 		t.Fatalf("an empty host committed %d", h.NVMeCommittedBytes)
 	}
 
-	// A plan in flight charges its destination before the volume is primary there.
-	if _, err := s.RecordOperation(ctx, term, metadata.Operation{
-		OperationID: "op1", Kind: lifecycle.OpDrain, HostID: "h1", Phase: lifecycle.OpRunning,
-		DesiredState: []byte(`{}`),
-		CurrentState: []byte(`{"volumes":[{"volume_id":"v1","stage":"MOVING","to_host":"h2"}]}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if h, _ := s.GetHost(ctx, "h2"); h.NVMeCommittedBytes != 400 {
-		t.Fatalf("destination committed = %d, want 400 (in flight to it)", h.NVMeCommittedBytes)
-	}
-
-	// Once it is primary there the plan stops charging: exactly one, never two.
+	// The charge follows the primary, and only the primary: a volume moved to h2 is
+	// h2's the moment the row says so, and h1 stops paying for it in the same write.
 	if _, err := s.BumpVolumeEpoch(ctx, term, "v1", "h2", 0); err != nil {
 		t.Fatal(err)
 	}

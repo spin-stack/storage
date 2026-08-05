@@ -26,7 +26,7 @@ func TestPGStoreContract(t *testing.T) {
 	pool := startPostgres(t)
 	metadatatest.RunContract(t, func(t *testing.T) metadata.Store {
 		if _, err := pool.Exec(ctx,
-			`TRUNCATE operations, snapshots, volumes, host_leases, hosts, control_plane_leader`); err != nil {
+			`TRUNCATE snapshots, volumes, host_leases, hosts, control_plane_leader`); err != nil {
 			t.Fatalf("reset: %v", err)
 		}
 		return pg.New(pool)
@@ -96,19 +96,8 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 				RequestID: ids.New().String(),
 			})
 		}},
-		{"RecordOperation volume", func() error {
-			_, err := store.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: ids.New().String(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-				VolumeID: truncated, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-			})
-			return err
-		}},
-		{"RecordOperation host", func() error {
-			_, err := store.RecordOperation(ctx, term, metadata.Operation{
-				OperationID: ids.New().String(), Kind: lifecycle.OpDrain, Phase: lifecycle.OpPending,
-				HostID: truncated, DesiredState: []byte(`{}`), CurrentState: []byte(`{}`),
-			})
-			return err
+		{"SetVolumePrimaryHost", func() error {
+			return store.SetVolumePrimaryHost(ctx, term, volID, truncated)
 		}},
 	}
 	for _, tc := range tests {
@@ -123,8 +112,7 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 	var nulls int
 	if err := pool.QueryRow(ctx, `
         SELECT (SELECT count(*) FROM volumes WHERE primary_host_id IS NULL AND standby_host_id IS NULL)
-             + (SELECT count(*) FROM snapshots)
-             + (SELECT count(*) FROM operations)`).Scan(&nulls); err != nil {
+             + (SELECT count(*) FROM snapshots)`).Scan(&nulls); err != nil {
 		t.Fatal(err)
 	}
 	if nulls != 0 {
@@ -132,10 +120,9 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 	}
 }
 
-// TestPGVolumeStateGuardIsAtomic is the volume-lifecycle counterpart of
-// TestPGOperationPhaseGuardIsAtomic: the §7 transition table must live in the
-// UPDATE predicate, not in a read-modify-write in Go, or two Control Planes racing
-// to react to the same suspicion can both win.
+// TestPGVolumeStateGuardIsAtomic: the §7 transition table must live in the UPDATE
+// predicate, not in a read-modify-write in Go, or two Control Planes racing to react
+// to the same suspicion can both win.
 func TestPGVolumeStateGuardIsAtomic(t *testing.T) {
 	ctx := t.Context()
 	pool := startPostgres(t)
@@ -183,11 +170,11 @@ func TestPGVolumeStateGuardIsAtomic(t *testing.T) {
 	}
 }
 
-// TestPGSnapshotStateGuardIsAtomic is the §19 twin of TestPGVolumeStateGuardIsAtomic
-// and TestPGOperationPhaseGuardIsAtomic: INV-16 says a PUBLISHED snapshot never
-// changes, and that rule has to live in the UPDATE predicate. A read-modify-write in
-// Go lets a publication that lands between the read and the write be overwritten by
-// a concurrent cleanup pass marking the snapshot FAILED.
+// TestPGSnapshotStateGuardIsAtomic is the §19 twin of TestPGVolumeStateGuardIsAtomic:
+// INV-16 says a PUBLISHED snapshot never changes, and that rule has to live in the
+// UPDATE predicate. A read-modify-write in Go lets a publication that lands between
+// the read and the write be overwritten by a concurrent cleanup pass marking the
+// snapshot FAILED.
 func TestPGSnapshotStateGuardIsAtomic(t *testing.T) {
 	ctx := t.Context()
 	pool := startPostgres(t)

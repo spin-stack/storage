@@ -313,3 +313,58 @@ No schema change (two new queries, no new object), so no migration and no `db:pl
 DST scenario and no new checker: this is neither data path nor fencing. `task ci`,
 `task cover` (production 90.0%) and `go test -tags integration ./internal/metadata/pg` are
 green.
+
+**D8a: the operations subsystem is retired, and ADR-0017's second capacity term with
+it (2026-08-05).** An audit found twelve `metadata.Store` methods with no non-test
+caller; four of them — `RecordOperation`, `UpdateOperation`, `GetOperation`,
+`ListLiveOperationsByHost` — were the whole interface of the `operations` table, and
+**nothing outside a test has ever written a row**. They arrived with the drain and the
+reconciliation loop ADR-0026 withdrew. Deleted: the table and its four indexes, the
+`operations.sql` queries and their generated half, the four store methods in both
+implementations, `metadata.Operation`, `ErrDrainInProgress`, `PlanReservation` /
+`PlanReservations`, and `lifecycle.OperationKind` / `OperationPhase` — a vocabulary
+whose only remaining reader was the CHECK constraint on a column that no longer
+exists.
+
+**The capacity view was the part to think about, and the answer is that removing the
+second term changes no number this catalog has ever produced.** ADR-0017 derives
+`committed(host)` as the volumes whose primary is the host *plus* what an in-flight
+operation plan reserved there and had not yet placed. The lateral join that computed
+the second half ran over an empty relation for every host in every state a V1 catalog
+can reach, because the only writer of `operations.current_state` was
+`UpdateOperationPhase` and it had no caller. What is removed is headroom for a move
+that spans two hosts, and V1 performs none — ADR-0017's own "the tests that enforce
+it" section already says so, in the past tense, of the behavioural cases that went
+with the drain. The one move a V1 catalog can make, detach-then-attach, makes the
+volume primary in the same statement that places it, so there is no interval between
+"reserved" and "primary" for the term to cover. **It does not touch wave 2's admission
+work**: `CreateVolume` still carries the bound, the advisory lock in front of it
+(D4b) still serializes racing placements, and the arithmetic both stores agree on is
+now one term in Go and one in SQL instead of two and two. The gap that remains is the
+one D6 already recorded and this does not widen: `SetVolumePrimaryHost` carries no
+`CapacityBound` at all.
+
+`TestCommittedBytesIsDerivedInOnePlace` needed a new marker and that is the
+interesting test change. It detected an inlined copy of the derivation by looking for
+`jsonb_array_elements` — the plan-unnesting half was the only thing in the project
+that unnested anything — and after this nothing can write that construct, so the check
+would have passed for ever by having had its subject deleted. It now looks for `SUM(…
+size_bytes`, which is what the derivation *is* now.
+
+**Three planted bugs, each watched go red.** Inlining the sum back into
+`volumes.sql`'s bound predicate (`SELECT COALESCE(SUM(bv.size_bytes),0) FROM volumes
+bv WHERE bv.primary_host_id = …` in place of the view read): `queries carrying their
+own copy of the committed-bytes derivation instead of reading host_committed_bytes:
+[volumes.sql]`. Replacing the view's correlation with `WHERE v.primary_host_id IS NOT
+NULL` so every host is charged for the fleet: `committed = 2147483648000, want
+10737418240 (the volumes it holds)` in `TestPGCommittedBytesViewDoesNotDeriveTheWhole
+Fleet`, plus four contract subtests including `an empty host reports 1073741824
+committed bytes`. The same plant in the sim (`v.PrimaryHostID != ""`) reddens the
+contract in the unit lane with the identical line — which is the point of the shared
+contract: a term one implementation keeps and the other drops is a proof about the
+wrong program.
+
+Schema change: `DROP TABLE operations CASCADE` plus the view
+(`migrations/20260805113004_drop_operations.{sql,json}`, planned against the dev
+database and applied to it). `task ci`, `task db:verify` and
+`go test -tags integration ./internal/metadata/pg` are green.

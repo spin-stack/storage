@@ -41,19 +41,6 @@ type HostLease struct {
 	TtlSeconds  int32              `json:"ttl_seconds"`
 }
 
-type Operation struct {
-	OperationID  uuid.UUID          `json:"operation_id"`
-	Kind         string             `json:"kind"`
-	VolumeID     pgtype.UUID        `json:"volume_id"`
-	HostID       pgtype.UUID        `json:"host_id"`
-	DesiredState []byte             `json:"desired_state"`
-	CurrentState []byte             `json:"current_state"`
-	Phase        string             `json:"phase"`
-	Error        pgtype.Text        `json:"error"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
-}
-
 type Snapshot struct {
 	SnapshotID       uuid.UUID          `json:"snapshot_id"`
 	VolumeID         uuid.UUID          `json:"volume_id"`
