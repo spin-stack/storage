@@ -146,10 +146,6 @@ type Log struct {
 	published uint64
 	replayed  bool // this log rebuilt itself from the WAL file's contents
 
-	// resumeTail holds the replayed records no verified object covers yet; they go
-	// to the batcher as soon as EnableRemote provides one.
-	resumeTail []resumedRecord
-
 	view   *cow.IntervalMap
 	limits Limits
 	enc    *Encryption // nil = plaintext WAL

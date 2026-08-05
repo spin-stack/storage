@@ -29,14 +29,6 @@ var ErrBaseUnavailable = errors.New("wal: the read view's base could not be reco
 // and a plaintext volume carries no tag, so nothing else would notice.
 var ErrForeignVolume = errors.New("wal: the WAL holds records from another volume")
 
-// resumedRecord is a record that was in the local WAL but is not yet covered by a
-// verified object: it must be handed back to the batcher when the remote path is
-// wired, or the writes since the last successful upload exist on this host only.
-type resumedRecord struct {
-	seq     uint64
-	encoded []byte
-}
-
 // Resume rebuilds a Log from an existing WAL file: the ATTACHING→ACTIVE path of §16,
 // where an agent restart re-attaches to a volume at the *same* epoch (§16 validates
 // the epoch and takes the lease; it does not bump it).
@@ -48,10 +40,10 @@ type resumedRecord struct {
 // one span (INV-21) — while reporting zeros for data the guest wrote. NewLog's first
 // append refuses that; this is what to do instead.
 //
-// durableInS3 is the sequence the object store is known to reproduce (from
-// recovery.DurablePoint). Records above it are queued for re-upload and counted in
-// the remote gap; records at or below it are replayed into the view only, so no span
-// the bucket already holds is re-issued.
+// durableInS3 is the sequence the object store is known to reproduce. It is the floor
+// the sequence space continues from, so a log whose local segments were all reclaimed
+// does not re-issue sequences an object already carries; every record found on disk is
+// replayed into the view regardless of where it sits relative to it.
 //
 // A torn tail in the newest segment is the normal crash case and is not an error:
 // replay returns the intact prefix (INV-05), the torn bytes are cut off so the next
@@ -119,14 +111,6 @@ func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch,
 		if rec.Sequence > l.local {
 			l.local = rec.Sequence
 		}
-		if rec.Sequence <= durableInS3 {
-			continue // already in a verified object; replaying it into the view is enough
-		}
-		encoded, err := reencode(rec)
-		if err != nil {
-			return nil, fmt.Errorf("wal: resume sequence %d: %w", rec.Sequence, err)
-		}
-		l.resumeTail = append(l.resumeTail, resumedRecord{seq: rec.Sequence, encoded: encoded})
 	}
 	return l, nil
 }
@@ -150,24 +134,4 @@ func (l *Log) replayRecord(rec Record) error {
 		l.view.Clear(rec.Offset, uint64(rec.Length))
 	}
 	return nil
-}
-
-// reencode rebuilds the exact on-disk bytes of a replayed record. The header fields
-// are carried through untouched — including the plaintext CRC and the GCM tag of an
-// encrypted record, which cannot be recomputed without the DEK — so a record that is
-// re-uploaded is byte-identical to the one already in the WAL.
-func reencode(rec Record) ([]byte, error) {
-	h := format.RecordHeader{
-		RecordType:    rec.Type,
-		VolumeID:      rec.VolumeID,
-		Epoch:         rec.Epoch,
-		Sequence:      rec.Sequence,
-		Offset:        rec.Offset,
-		Length:        rec.Length,
-		Flags:         rec.Flags,
-		KeyID:         rec.KeyID,
-		PayloadCRC32C: rec.PayloadCRC,
-		AuthTag:       rec.AuthTag,
-	}
-	return format.EncodeRecordRaw(h, rec.Payload)
 }
