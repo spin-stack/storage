@@ -29,13 +29,16 @@ import (
 // it printed, and kills it. The "restart the Agent" arm of the e2e lane is a literal
 // SIGKILL, because that is the failure ADR-0024 reasons about.
 
-// Binary resolves one of this project's binaries in _output/bin and skips the test —
-// loudly, naming the command that produces it — when it is not there.
+// Binary resolves one of this project's binaries in _output/bin and reports it missing —
+// naming the command that produces it — when it is not there.
 //
-// Skipping rather than failing is the same call `test:integration:qemu` makes: a lane
-// whose *input* is missing has not found a defect, and a red build that means "you did
-// not run task build:cmd" trains people to ignore red builds. CI builds them, so CI
-// never skips.
+// Whether that report is a skip or a failure is missingInput's decision, and it is the
+// same one the guest artefacts get: outside the gate a developer who has not run
+// `task build:cmd` has not broken anything; inside the gate, an e2e lane that quietly
+// declined to start the two binaries is the gate reporting success for work it did not do.
+// A renamed binary is the case that makes this more than theory — `task test:e2e` depends
+// on `build:cmd`, so the artefacts are always built, and the one way this site can still
+// fire under the gate is the lane and the build disagreeing about a name.
 func Binary(t *testing.T, name string) string {
 	t.Helper()
 	root, err := repoRoot()
@@ -44,7 +47,7 @@ func Binary(t *testing.T, name string) string {
 	}
 	path := filepath.Join(root, "_output", "bin", name)
 	if _, err := os.Stat(path); err != nil {
-		t.Skipf("%s is not built (run `task build:cmd`): %v", path, err)
+		missingInput(t, fmt.Sprintf("%s is not built: %v", path, err), "task build:cmd")
 	}
 	return path
 }

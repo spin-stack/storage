@@ -4,6 +4,7 @@ package testinfra
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,12 +35,8 @@ func outputRoot() string {
 	return filepath.Join("..", "..", "_output")
 }
 
-// GuestImages returns the kernel and initramfs, or skips.
-//
-// Skipping rather than failing is the same call the rest of the lane makes about QEMU: a
-// lane whose *input* has not been built has not found a defect, and a red build meaning
-// "you did not run task build:guest" trains people to ignore red builds. CI builds them
-// (ADR-0025), so CI never skips.
+// GuestImages returns the kernel and initramfs, or skips — unless the caller is the merge
+// gate, which may not skip. missingInput carries that decision and the reason for it.
 func GuestImages(t *testing.T) (kernel, initramfs string) {
 	t.Helper()
 	root := outputRoot()
@@ -47,25 +44,25 @@ func GuestImages(t *testing.T) (kernel, initramfs string) {
 	initramfs = filepath.Join(root, "guest", "initramfs.cpio.gz")
 	for _, p := range []string{kernel, initramfs} {
 		if _, err := os.Stat(p); err != nil {
-			t.Skipf("%s is not built (run `task build:guest` and `task fetch:kernel`): %v", p, err)
+			missingInput(t, fmt.Sprintf("the guest lane's %s is not there: %v", p, err),
+				"task fetch:kernel && task build:guest")
 		}
 	}
 	return kernel, initramfs
 }
 
-// QEMUPaths locates the pinned QEMU and its firmware. The binary and the BIOS blobs are
-// what `task build:qemu` extracts into _output; the lane skips rather than fails when they
-// are absent, because a developer who has not built QEMU has not broken anything.
+// QEMUPaths locates the pinned QEMU and its firmware — what `task build:qemu` extracts
+// into _output — or reports them missing.
 func QEMUPaths(t *testing.T) (bin, bios string) {
 	t.Helper()
 	root := outputRoot()
 	bin = filepath.Join(root, "bin", "qemu-system-x86_64")
 	bios = filepath.Join(root, "share", "spin-stack", "qemu")
 	if _, err := os.Stat(bin); err != nil {
-		t.Skipf("no QEMU at %s — run: task build:qemu", bin)
+		missingInput(t, "no QEMU at "+bin, "task build:qemu")
 	}
 	if _, err := os.Stat(filepath.Join(bios, "bios-256k.bin")); err != nil {
-		t.Skipf("no firmware at %s — run: task build:qemu", bios)
+		missingInput(t, "no QEMU firmware at "+bios, "task build:qemu")
 	}
 	return bin, bios
 }
