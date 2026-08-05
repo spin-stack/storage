@@ -109,6 +109,23 @@ Without these, the merge cost exceeds the implementation cost for C and D.
 
 ## The merge protocol
 
+- **Commit by pathspec, not by index: `git commit -m "…" -- path1 path2`.** Wave 3 proved
+  that "stage by explicit pathspec" is not enough — `git add <path>` stages into an index
+  **every agent shares**, so a commit sweeps whatever another lane staged seconds earlier.
+  One commit in wave 3 carries another lane's entry, and another lane's own entry landed
+  inside somebody else's commit. Nothing was lost, and attribution was scrambled. The
+  pathspec form of `git commit` bypasses the index entirely and is the mechanical fix.
+- **Each track's running log is its own file** (`docs/plan/tracks/TRACK-*.md`, carved out
+  of `STATUS.md` on 2026-08-04). Five lanes appending to one region collided in every
+  wave; in wave 3 a lane committed a stale copy and deleted 121 lines of another's, ten
+  seconds after they landed, and the only thing that restored them was the other lane
+  happening to look again. Ownership by *file* is a control; ownership by *section* is a
+  convention.
+- **A number written into a document is stale by the next commit.** Wave 3's document lane
+  recounted the mandatory set at 18 and the ADR-0013 citations at 54; twenty minutes later
+  another lane made them 19 and 68, and several cited line numbers moved by 47. Cite the
+  *symbol* and the mechanism that computes the count — `pinnedMandatorySet`, `task
+  deadcode` — not the number and the line.
 - **Generated output is regenerated at integration, never merged.** `internal/db/models.go`
   is one file for every table and `api/gen/` is committed; `task generate:check` is in
   `ci:full`, so a text merge that succeeds still has to be regenerated.
