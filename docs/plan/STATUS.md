@@ -1503,6 +1503,48 @@ have been enough), and a guest deaf to the console keeps printing heartbeats unt
 gives up. What this unblocks is track C's snapshot-mid-write, an Agent restart under an
 attached guest, and RISK-10's reconnect path; none of them are written here.
 
+**B8a: "components with no production caller" is computed (2026-08-04).** The list under
+that heading above was hand-written, and in two consecutive waves it was wrong — it went
+stale inside one increment, and wave 2 added an OTLP exporter and a provider nobody listed.
+`task deadcode` (`hack/deadcode.sh` + `hack/deadcode-allow.txt`, on the pinned
+`golang.org/x/tools/cmd/deadcode` — the module already required x/tools, so the pin is
+go.mod's and `tools:deadcode` refuses to install when the two disagree) answers it from the
+call graph instead. Roots are the binaries and only the binaries — `./cmd/...` plus
+`integration/guestinit`, which is PID 1 in the guest; `-test` was rejected because it makes
+every test's own subject reachable and answers a question nobody asked.
+
+**Its output today: 78 reported, 61 explained by the allowlist, 17 unexplained, exit 1.**
+The 17 are `internal/simio/real`'s entire network implementation (9 — a real `Listen`/
+`Dial` whose only caller is the simio contract test; the transport is Connect over HTTP),
+`internal/lifecycle`'s Agent volume-state machine (7 — §16's `AgentVolumeState`, tested and
+referenced by nothing outside its own file), and `lease.Manager.Revoke`, a verb nothing
+performs since ADR-0026 removed the lease-gated ACK. They belong to tracks E and D, so this
+track reports them rather than deleting them. **What would make it blocking in `ci:full`:
+that number reaching zero** — each finding deleted, or in the allowlist with its reason.
+Until then it stays out of the gate deliberately: a step that is red the day it lands is a
+step someone removes.
+
+**The allowlist is the part that had to be built carefully**, because an allowlist is where
+findings go to be forgotten. Every entry carries its reason on the same line and the task
+**fails** on an entry with no reason and on an entry that no longer matches a finding —
+which caught its own author twice within minutes: `lifecycle.SnapshotStates` is called by
+`SnapshotState.Valid` and was never dead, and `package integration/guestinit` cannot be
+reported because it is a root. Neither would have been noticed by a human writing a list.
+
+**Two blind spots, both stated in the script, both real.** RTA marks every method of a type
+that reaches `reflect` as live, so `wal.TruncateLocal` — the flagship entry of the
+hand-written list — is *not* reported (`-whylive` answers "reachable only through
+reflection"); and a package no binary imports is not in the program at all, which is where
+`metadata.BumpVolumeEpoch`, the other entry, lives. A second pass names those packages
+(10, all explained) at package granularity. So the tool is a floor: absence from its report
+is not evidence of a caller, and the hand-written list and the tool disagree in *both*
+directions — which is the argument for having the mechanical one, not against it.
+
+**Planted:** an exported `PlantedUnusedVerb()` in `integration/guestinit/main.go` (a root,
+so the plant tests the analysis and not just the parser). Reported went 78 → 79 and
+unexplained 17 → 18, with `integration/guestinit.PlantedUnusedVerb` at the top of the
+unexplained list. Reverted.
+
 ## Track C — the agent data path (open work, appended per increment)
 
 *Only track C appends here* — it owns `internal/agent`, `internal/wal`,

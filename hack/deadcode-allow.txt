@@ -1,0 +1,119 @@
+# Unreachable-from-a-binary symbols that are not liabilities, each with the reason.
+#
+# Read hack/deadcode.sh first: it explains what "unreachable" means here (no path from
+# ./cmd/... or integration/guestinit), and the two things the analysis cannot see.
+#
+# Format: `<symbol>  # why`, or `package <import path>  # why`. The reason is not
+# decoration — `task deadcode` fails on an entry that has none, and fails on an entry that
+# no longer matches a finding. Both rules exist because the list this replaced was a set of
+# names with the decisions missing, and it went stale twice without anyone noticing.
+#
+# What belongs here: an affordance whose only legitimate caller is a test, a DST scenario
+# or an integration lane, because those are not binaries and never will be. What does NOT
+# belong here: a component that was written for production and never wired up. That is the
+# CloneCrossHost shape, and CLAUDE.md's answer to it is deletion, not an entry in a file.
+
+# --- the Agent's read-only accessors and its no-data-path VolumeSource ----------------
+# A binary never asks the Loop what it thinks; it asks the Control Plane. These four
+# accessors exist so a test — and integration/e2e/guest_test.go, driving real processes —
+# can observe the lease/desired-state/fencing decisions the loop already made, instead of
+# asserting on a field it set itself, which CLAUDE.md forbids.
+internal/agent.Loop.LeaseValid   # observed by loop_test/spine_test and the e2e guest lane; production reads the lease through the loop's own paths
+internal/agent.Loop.Desired      # same: the desired state a test compares against what the loop then did
+internal/agent.Loop.HostState    # same
+internal/agent.Loop.Fenced       # same
+internal/agent.NewVolumeSet      # the in-memory VolumeSource the Agent runs against when there is no data path (agent.go:104); every real Agent uses the WAL-backed one
+internal/agent.VolumeSet.Set     # part of that stand-in
+internal/agent.VolumeSet.Remove  # part of that stand-in
+internal/agent.VolumeSet.Volumes # part of that stand-in
+
+# --- Control-Plane election affordances ------------------------------------------------
+internal/controlplane.ParseTermClaim            # the inverse of the claim encoder, so election_test can assert on what was written rather than on the writer's argument
+internal/controlplane.Elector.HighestClaimedTerm # read by election_test and by the pg integration lane to prove a zombie CP's term never wins
+
+# --- deterministic ids (INV-22) ---------------------------------------------------------
+internal/ids.NewAt  # CLAUDE.md names it: ids.New() in production, ids.NewAt(ms, r) for DST's reproducible ids. A binary using it would be a bug.
+
+# --- the lease manager ------------------------------------------------------------------
+# The Agent's loop drives the clock-explicit variants (GrantAt/RenewAt); these two are the
+# now-relative spellings the tests and the vhost lane use.
+internal/lease.Manager.Grant  # used by internal/lease, internal/wal and internal/blockdev tests and by the integration/vhost lane; loop.go calls GrantAt
+internal/lease.Manager.Valid  # reached in production only through Loop.LeaseValid, itself a test/e2e accessor (above)
+
+# --- lifecycle enum listings ------------------------------------------------------------
+# Each returns every value of one enum. Their reason for existing is that a test can walk
+# the whole set: lifecycle_test round-trips every value through Parse/String, and
+# pg_integration_test asserts the database's CHECK constraint accepts exactly these — which
+# is how a state added in Go but not in schema.sql gets caught.
+internal/lifecycle.HostStates       # walked by lifecycle_test and by pg_integration_test against the column's CHECK
+internal/lifecycle.CordonReasons    # same
+internal/lifecycle.VolumeStates     # same
+internal/lifecycle.OperationKinds   # same
+internal/lifecycle.OperationPhases  # same
+
+# --- metadata / placement test affordances ----------------------------------------------
+internal/metadata.PlanReservations        # the reservation set a placement plan implies; read by metadata/sim and by the contract tests, never by a binary
+internal/metadata.PlanReservation.Reserves # same
+internal/placement.CommittedRatio          # the ratio placement_test asserts on; the chooser compares capacities directly
+
+# --- the observability test provider ----------------------------------------------------
+# obs.NewTestProvider is why every metric in this repository is proven by reading the
+# collected value rather than by checking that a recorder was called. It cannot live in a
+# _test.go file: internal/agent, internal/wal and internal/obs's own tests all import it.
+internal/obs.NewTestProvider          # the in-memory meter provider tests collect from; production wires the OTLP one
+internal/obs.Provider.CollectedMetrics # reading it is how agent/wal tests assert on what left the process
+internal/obs.Provider.GaugeValues      # same, for gauges (wal/degraded_test)
+
+# --- vhost front-end encoders -------------------------------------------------------------
+# The Agent is the vhost-user *backend*; it decodes these messages and never encodes one.
+# The encoders exist so a test can play the front-end — the role QEMU plays in production —
+# which is the only way to drive the backend without a VM.
+internal/vhost.encodeMemTable     # a fake front-end's SET_MEM_TABLE; the backend only ever parses one
+internal/vhost.encodeVringAddr    # likewise SET_VRING_ADDR
+internal/vhost.writeDesc          # a test writing descriptors into a virtqueue, which in production is the guest kernel's job
+internal/vhost.Device.Features    # read back by device_test to prove the negotiated set
+internal/vhost.Server.Device      # the bound device, reached by server_test and by the QEMU lane
+
+# --- the vhost host-I/O file backend ------------------------------------------------------
+# RawFile is the lane's disk: integration/vhost/qemu_test.go backs a guest with a plain file
+# so the test can read the bytes QEMU wrote. The Agent's own backend is the WAL, so no
+# binary opens one.
+internal/vhost/hostio.CreateRawFile   # used by integration/vhost/qemu_test.go and rawfile_test
+internal/vhost/hostio.OpenRawFile     # same
+internal/vhost/hostio.checkCapacity   # only those two reach it
+internal/vhost/hostio.RawFile.Size    # part of the same backend
+internal/vhost/hostio.RawFile.ReadAt  # part of the same backend
+internal/vhost/hostio.RawFile.WriteAt # part of the same backend
+internal/vhost/hostio.RawFile.Flush   # part of the same backend
+internal/vhost/hostio.RawFile.Close   # part of the same backend
+internal/vhost/hostio.RawFile.inRange # part of the same backend
+internal/vhost/hostio.NewCallEventFD  # the call-direction eventfd a fake front-end supplies; QEMU supplies the real one over the socket
+
+# --- the WAL's reference model and its non-production entry points -------------------------
+# State/Apply/ApplyAll/At/Equal are the model §25.2's property tests replay against: encode
+# a record sequence, truncate or corrupt it at every byte, and assert the recovered state is
+# exactly the model's or an error. A model with a production caller would be the bug.
+internal/wal.NewState     # the reference model the serialize/replay property tests compare against
+internal/wal.State.Apply  # same
+internal/wal.ApplyAll     # same
+internal/wal.State.At     # same
+internal/wal.State.Equal  # same
+internal/wal.Serialize    # encodes a record sequence for those tests; the Log encodes as it appends
+internal/wal.Replay       # decodes one; production recovers through Resume/ReplaySegments inside the Log
+internal/wal.Resume       # the plain resume; production takes wal.ResumeAwaitingBase (agent/volume.go:624), this one is DST's and the wal tests'
+internal/wal.SegmentFiles    # lists a volume's segments so DST and segment_test can assert on the files themselves
+internal/wal.ReplaySegments  # replays them the same way, outside a Log
+internal/wal/format.ObjectHeader.MarshalBinary # the object header's writer; nothing publishes a WAL object under ADR-0026 — kept as the inverse the format property test round-trips
+internal/wal/format.UnmarshalObjectHeader      # same, the reading half
+internal/wal/format.WALObjectKey               # the key such an object would take; asserted by record_test so the naming survives the mechanism's return
+
+# --- packages no binary imports (the coarse pass) -------------------------------------------
+package internal/dst        # the deterministic simulation harness. It is the test lane, so a binary importing it would be the defect.
+package internal/metadata/sim   # the in-memory metadata.Store DST runs against; binaries take metadata/pg
+package internal/metadata/metadatatest # the shared metadata.Store contract both implementations run
+package internal/simio/sim  # the simulated clock/disk/network/objectstore; the counterpart of simio/real, which binaries do take
+package internal/simio      # the interface package's own directory (docs and shared declarations); binaries import its children
+package internal/simio/objectstore/storetest # the shared objectstore contract every store implementation runs
+package internal/schema     # schema.sql plus its embed; read by the pg lane and by task db:verify, never linked
+package hack/analyzers/simulable          # the INV-01 analyzer, run by task lint:simulable as its own program
+package hack/analyzers/simulable/cmd/simulable # its main; `go run` builds it, no shipped binary imports it

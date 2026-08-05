@@ -82,6 +82,12 @@ vars:
   # golangci-lint v2 also owns formatting (gofmt + goimports are configured as
   # `formatters` in .golangci.yml), so there is exactly one formatter binary.
   GOLANGCI_VERSION: v2.12.2
+  # `deadcode` ships in golang.org/x/tools, which this module already requires (the
+  # simulable analyzer is built on go/analysis). It is pinned to the *same* version as
+  # go.mod's, and `tools:deadcode` refuses to install when the two disagree: an analyzer
+  # built against a different x/tools than the tree compiles with answers about a
+  # different program than the one this repository ships.
+  XTOOLS_VERSION: v0.43.0
 
 tasks:
   default:
@@ -98,6 +104,7 @@ tasks:
       - task: tools:golangci
       - task: tools:buf
       - task: tools:protoc-plugins
+      - task: tools:deadcode
 
   tools:sqlc:
     desc: Install the pinned sqlc.
@@ -138,6 +145,20 @@ tasks:
     cmds:
       - GOBIN={{.TOOLS_BIN}} go install google.golang.org/protobuf/cmd/protoc-gen-go@{{.PROTOC_GEN_GO_VERSION}}
       - GOBIN={{.TOOLS_BIN}} go install connectrpc.com/connect/cmd/protoc-gen-connect-go@{{.PROTOC_GEN_CONNECT_GO_VERSION}}
+
+  tools:deadcode:
+    desc: Install the pinned golang.org/x/tools/cmd/deadcode (the `deadcode` task's analyzer).
+    # The status reads the version out of the built binary rather than trusting the file
+    # exists: `go version -m` prints the module the binary was built from, so a stale
+    # .tools/bin from an older pin reinstalls instead of silently reporting on the wrong
+    # analysis.
+    status:
+      - test -x {{.TOOLS_BIN}}/deadcode && go version -m {{.TOOLS_BIN}}/deadcode | grep -qE 'mod[[:space:]]+golang.org/x/tools[[:space:]]+{{.XTOOLS_VERSION}}'
+    preconditions:
+      - sh: grep -q 'golang.org/x/tools {{.XTOOLS_VERSION}}$' go.mod
+        msg: "XTOOLS_VERSION ({{.XTOOLS_VERSION}}) is not the golang.org/x/tools in go.mod — bump both together."
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install golang.org/x/tools/cmd/deadcode@{{.XTOOLS_VERSION}}
 
   # --- code generation and migrations ----------------------------------------
 
@@ -483,6 +504,23 @@ tasks:
     desc: Cross-package coverage report; enforces a 90% floor on production code.
     cmds:
       - bash hack/coverage.sh
+
+  deadcode:
+    desc: >-
+      Report functions no binary reaches, minus hack/deadcode-allow.txt's explained ones
+      (CLAUDE.md: "a component with no caller is a liability, not progress").
+    # NOT in `ci` or `ci:full` yet, and the reason is not squeamishness: it exits 1 today
+    # on 17 findings in three packages (internal/simio/real's whole network implementation,
+    # internal/lifecycle's Agent volume-state machine, and lease.Manager.Revoke — a verb
+    # nothing performs since ADR-0026 took the lease-gated ACK), and a gate that is red the day it
+    # lands is a gate someone deletes the step for. It becomes blocking the moment that
+    # count is zero — every finding either deleted or in the allowlist with its reason —
+    # and the check that keeps it honest until then is that the allowlist itself fails on
+    # a stale or unexplained entry. The hand-written list in STATUS.md this replaces had
+    # neither property and was wrong twice.
+    deps: [tools:deadcode]
+    cmds:
+      - DEADCODE={{.TOOLS_BIN}}/deadcode bash hack/deadcode.sh
 
   lint:
     desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).
