@@ -198,3 +198,90 @@ lane starts the real Agent binary with `-otlp-endpoint` pointed at a receiver an
 series arrives. That belongs in `integration/e2e`, which is track C's file set this wave.
 Until it exists, "a metric leaves the process" is proven for the exporter and the provider,
 not for the binary.
+
+### E5 — a number on what the resident read view costs, and what the number found (2026-08-05)
+
+`cow.IntervalMap` is the one per-volume structure on an Agent whose size the guest decides
+rather than the operator: a base from the published image, a layer per resumed session, and
+one more layer for every snapshot ever taken. Nothing measured it. `IntervalMap.Bytes`
+existed and its own comment called it "metric `active_map_bytes` proxy" — a proxy for a
+metric that was never wired, called by nothing but its own test.
+
+**What is measured, and what was rejected.** `cow.Cost` reports `Bytes` (payload of every
+live extent in the chain), `Extents` (records, which are both the other half of memory —
+about forty bytes of Go each — and the shape of every read, since `Read` scans a layer's
+extents linearly) and `Layers` (chain depth). Three and not one, because a snapshotted
+volume moves them apart: `Freeze` adds a layer and not one byte, so a single `bytes` gauge
+would report "fine" for a volume whose reads had become a sixty-five-layer walk. The
+tombstone count is in `Cost` for tests and gets no series: `cover` merges adjacent spans, so
+it is bounded by construction (`TestClearsAreMerged`), and a fourth per-volume series that
+can only ever be small is cardinality bought for nothing. A "reachable bytes" number — what
+`Ranges` still covers, which is what would separate live data from stale copies — was
+rejected for the metric because it is O(extents); the measurement tests below compute it,
+where the cost does not matter.
+
+**When it is computed.** Each layer maintains its own byte count as it is mutated (one add
+in `insert`, one subtract per overlap in `removeRange`), so `Cost` is O(layers) rather than
+O(extents). The number is read at the WAL's flush cadence — every guest `fsync` — and a fold
+over the extents at that cadence would make the measurement scale with the thing it
+measures: the fuller the volume, the more the metric costs.
+`TestTheMaintainedByteCountEqualsAFoldOverTheExtents` is what keeps the incremental counter
+honest — arbitrary `rapid`-drawn write/clear sequences, compared against the fold it
+replaced after every single operation.
+
+**The finding, and it is a defect rather than a reassurance.** Nothing ever collapses the
+chain: `Freeze` seals a layer and installs a new one over it, no layer is dropped when every
+extent in it has been superseded, and no base is released once its image is published. So a
+volume that rewrites one hot block between snapshots holds one copy of that block per
+snapshot, for ever — `TestASnapshottedVolumeHoldsOneCopyPerSnapshot` prints the
+amplification for the number of snapshots it models, and the multiplier is exactly the
+number of snapshots plus one. Depth is also paid on every guest read, because `Read` paints
+the base and lets each layer overwrite it: `BenchmarkReadAtDepth` (the repository's first
+benchmark, and the only executable form of the claim) shows a 4 KiB read of a block every
+layer has rewritten going from tens of nanoseconds at depth 1 to tens of microseconds at
+depth 256 — the same order as the NVMe the read view exists to avoid. The slope is the
+code's; the constants are the machine's.
+
+The other half is genuinely cheap, and it matters: a volume that never rewrites pays for its
+data and nothing else (`TestALayeredVolumeThatDoesNotRewriteCostsItsDataAndNoMore`), and a
+sparse image costs its written set and not its address space
+(`TestASparseImageCostsItsWrittenSetAndNotItsSize`). The gauge is therefore not watching a
+structure that is doomed either way; it separates the volume whose view is its working set
+from the volume whose view is its history.
+
+**For track A — `internal/obs.Catalog()` is §26.2**, so the architecture document's §26.2
+needs the same three lines: `read_view_bytes`, `read_view_extents`, `read_view_layers`, all
+gauges labelled by volume.
+
+**The handoff — track C owns `internal/wal`, so this lane did not wire the call site.** The
+only place a read view can be read without racing its writer is under the lock `wal.Log`
+holds over `l.view`; `ViewAtRest` hands the pointer out and its one caller uses it on a
+stopped volume, so no package outside `wal` can sample a live one. Three lines, in
+`recordWatermarks`, which already runs under `l.mu` at the flush cadence:
+
+```go
+cost := l.view.Cost()
+l.rec.Gauge(ctx, "read_view_bytes", float64(cost.Bytes), vol)
+l.rec.Gauge(ctx, "read_view_extents", float64(cost.Extents), vol)
+l.rec.Gauge(ctx, "read_view_layers", float64(cost.Layers), vol)
+```
+
+Until that lands, **`cow.Cost` has no production caller** — said here because `task deadcode`
+cannot say it: no `cow` symbol appears in its output at all (the reflection blind spot
+`hack/deadcode.sh` documents, the same one that hides `wal.TruncateLocal`). What this lane
+could prove is everything except the call site:
+`TestTheReadViewCostReachesTheCatalogSeries` builds a real layered view, records exactly the
+three lines above through the `Recorder` production code holds, and asserts the *collected*
+series carry the chain's numbers rather than the top layer's. **Three planted bugs, each
+watched go red:** deleting `read_view_layers` from the catalog (`nothing collected for
+read_view_layers; the catalog carries map[read_view_bytes:8192 read_view_extents:2]` — an
+unregistered name is dropped silently, which is why the catalog entry *is* the wiring at
+this layer), dropping the subtraction in `removeRange` (`maintained 1 live bytes, a fold
+over the extents says 0`), and stopping `Cost` from following the base chain (`Cost() =
+{Bytes:0 Extents:0 Layers:1 Cleared:1}, want {Bytes:6 Extents:2 Layers:3 Cleared:1}`, and
+the snapshot measurement collapsing to `Bytes=4096 Extents=1 Layers=1 (amplification 1x)`).
+
+`task test` and `task dst` green; `task cover` 90.0% against the 90% floor. `task ci` fails
+before reaching them on two other lanes' uncommitted files (`fmt:check` on
+`integration/e2e/desired_test.go`, `lint` on `internal/metadata/pg`), neither touched here;
+`golangci-lint run` and `fmt --diff` over `internal/cow` and `internal/obs` are clean.
