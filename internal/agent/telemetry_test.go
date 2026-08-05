@@ -63,7 +63,14 @@ func TestAServedVolumeRecordsItsWALMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"wal_local_sequence", "wal_durable_sequence", "wal_unflushed_bytes"} {
+	// The read view's cost travels with the watermarks, on the durable step: cow.Cost
+	// had no production caller and these three series had no producer when they landed,
+	// which is the shape CLAUDE.md calls a liability — and the shape the chunk-addressing
+	// spec spends a section condemning, in the same wave.
+	for _, want := range []string{
+		"wal_local_sequence", "wal_durable_sequence", "wal_unflushed_bytes",
+		"read_view_bytes", "read_view_extents", "read_view_layers",
+	} {
 		if !collected[want] {
 			t.Errorf("a served volume recorded no %s; collected: %v", want, collected)
 		}

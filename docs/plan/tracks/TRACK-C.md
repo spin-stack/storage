@@ -486,3 +486,29 @@ Production coverage after the increment: **90.0%** (`task cover`, floor 90%). Th
 reclaim's error path is what `TestALogThatCannotReclaimItsRedundantWALRefusesToServe`
 exists for — without it the figure was 89.9%, since the increment also deletes covered
 production code.
+
+### Integration owner, 2026-08-05 — an encrypted clone, and a comment that promised a protection it did not provide
+
+Every clone test in the tree ran **unencrypted** — the two DST scenarios and the e2e lane
+all pass `nil` for the encryption — so a clone had never once opened a chunk its parent
+sealed. `TestAnEncryptedCloneReadsItsParentsChunks` closes that: a parent writes, is
+snapshotted, and a clone with its own id, its own data directory and its own empty WAL
+reads the parent's bytes back through its device, with an INV-15 check in the middle so a
+clone that succeeded *because nothing was sealed* cannot pass.
+
+**Writing it corrected a false claim in production code.** `parentEncryption`'s comment
+said the chunk AAD binds the volume id, so the DEK must be re-bound to the parent's, and
+that handing the clone its own `Encryption` "would fail to open every chunk the parent
+wrote". Planting exactly that changes **nothing**: `image.chunkAAD` takes the volume id as
+a *parameter*, and `LoadSnapshot` is already handed the parent's, so what opens a chunk is
+`enc.DEK` plus that argument — and the DEK is identical either way. The re-binding is
+inert for image chunks.
+
+The call is kept and the claim corrected, rather than the reverse: an `Encryption` bound
+to the wrong volume is the wrong object to hold on a path whose subject is another
+volume's data, and `wal.Encryption` *does* bind the id for WAL records. What is not kept
+is a comment asserting a protection that is not there — that is the shape this repository
+has spent four waves removing from its documents, found this time inside a function.
+
+The plant that does work is passing the clone's own id to `LoadSnapshot`: the snapshot key
+is derived from the volume id too, so it fails at once with "which was never published".

@@ -233,3 +233,19 @@ Both are private packages by default, so a pull request from a fork gets a token
 cannot read them and its gate will be red. There are no forks and no runner yet; the
 choice when there are is to make the two packages public, and the comment at
 `guest-inputs` is where having made it should be recorded.
+
+### Integration owner, 2026-08-05 — the coverage floor was decorative at the boundary
+
+`hack/coverage.sh` compared the **rounded string** `go tool cover -func` prints. On
+2026-08-05 it reported `90.0%` and `OK` for a tree whose real figure was 3929/4366 =
+**89.9908%** — under the floor, passing on 0.0092pp of rounding. It now computes the ratio
+from the profile and compares exactly; the printed percentages stay rounded, because that
+is what a human reads. It also fails when the production profile has no statements at all,
+which would otherwise pass having measured nothing.
+
+This is the same defect as the one wave 4's gate work was about — a check reporting
+success for something it did not establish — one level down, inside the check that guards
+the others. Turning it on immediately made the tree red, which is the correct outcome and
+the reason it was worth finding: the previous wave had deleted tested production code and
+recorded that coverage "did not fall below", which was true of the printed number and
+false of the number.

@@ -942,8 +942,21 @@ func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.
 	}
 	// The parent's chunks are sealed under the parent's id, and a clone inherits the
 	// parent's DEK and its version (controlplane.Clone) precisely so the chain stays
-	// readable — but the AAD binds the volume id, so the key has to be re-bound. Handing
-	// this volume's own Encryption would fail to open every chunk the parent wrote.
+	// readable.
+	//
+	// **The re-binding below is inert for image chunks, and the comment that used to be
+	// here said the opposite.** It claimed that handing this volume's own Encryption
+	// would fail to open every chunk the parent wrote; it would not. `image.chunkAAD`
+	// takes the volume id as a *parameter* and LoadSnapshot is already given the
+	// parent's, so what opens a chunk is `enc.DEK` plus that argument — and the DEK is
+	// the same one either way. Proven by planting it: binding to this volume's id
+	// changes nothing, while passing this volume's id to LoadSnapshot fails immediately.
+	//
+	// Kept, with the claim corrected rather than the call deleted, because an Encryption
+	// bound to the wrong volume is the wrong object to be holding on a path whose whole
+	// subject is another volume's data — and because `wal.Encryption` does bind the id
+	// for WAL records, so a future reader of the parent's *records* would need exactly
+	// this. What is not kept is a comment asserting a protection that is not there.
 	penc, err := m.parentEncryption(v, parentVol)
 	if err != nil {
 		return nil, err

@@ -271,6 +271,24 @@ func (l *Log) recordWatermarks(ctx context.Context) {
 	// Republished here so the series exists for a healthy volume too: an alert on
 	// "the device is full" cannot fire on a metric that only appears once it is.
 	l.recordDegraded(ctx)
+	l.recordReadView(ctx, vol)
+}
+
+// recordReadView publishes what this volume's read view costs (§26.2). It is here, on
+// the durable step, for two reasons: this is a moment the log's state has just changed
+// and the caller already holds the lock Cost requires, and it is the *lowest*-frequency
+// hook that still moves with the guest — a gauge sampled only at attach would report a
+// volume's cost at its emptiest and never again.
+//
+// Rejected: a background sampler. It would need the lock at a moment nothing else does,
+// and a poller that walks every volume's layer chain on a timer is the shape of the
+// io-class problem ADR-0026 deleted. Also rejected: recording it on every WRITE — the
+// numbers move by one extent at a time and a FLUSH is the granularity an operator reads.
+func (l *Log) recordReadView(ctx context.Context, vol obs.Attr) {
+	c := l.view.Cost()
+	l.rec.Gauge(ctx, "read_view_bytes", float64(c.Bytes), vol)
+	l.rec.Gauge(ctx, "read_view_extents", float64(c.Extents), vol)
+	l.rec.Gauge(ctx, "read_view_layers", float64(c.Layers), vol)
 }
 
 // Broken reports whether a failed rollback left this log's tail unknown.

@@ -55,10 +55,26 @@ echo "overall (all packages):        ${overall}"
 echo "production (unit-covered code): ${prod}"
 
 # Enforce a floor on production code.
+#
+# Measured from the profile, not from `go tool cover`'s printed string. That string is
+# rounded to one decimal, and on 2026-08-05 the gate reported "90.0%" and OK for a tree
+# whose real figure was 3929/4366 = 89.9908% — under the floor, passing on 0.0092pp of
+# rounding. A gate that reports success for something it did not establish is the exact
+# defect this repository keeps finding in its own checks; it should not have been in the
+# check that guards against it.
+#
+# The printed percentages above stay rounded, because that is what a human reads. Only
+# the comparison changed.
 floor=90
-prod_num=${prod%\%}
-if awk "BEGIN{exit !(${prod_num} < ${floor})}"; then
-	echo "FAIL: production coverage ${prod} is below ${floor}%"
+read -r covered total < <(awk 'NR>1 {n=$2; c=$3; tot+=n; if (c+0 > 0) cov+=n} END {print cov, tot}' cover.prod.out)
+if [ "${total}" -eq 0 ]; then
+	echo "FAIL: the production profile has no statements — the floor would pass having measured nothing"
 	exit 1
 fi
-echo "OK: production coverage >= ${floor}%"
+if awk "BEGIN{exit !(${covered} * 100 < ${floor} * ${total})}"; then
+	printf 'FAIL: production coverage is %d/%d = %.4f%%, below %d%%\n' "${covered}" "${total}" \
+		"$(awk "BEGIN{printf \"%.4f\", ${covered}*100/${total}}")" "${floor}"
+	exit 1
+fi
+printf 'OK: production coverage %d/%d = %.4f%% >= %d%%\n' "${covered}" "${total}" \
+	"$(awk "BEGIN{printf \"%.4f\", ${covered}*100/${total}}")" "${floor}"
