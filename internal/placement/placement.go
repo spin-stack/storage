@@ -57,15 +57,6 @@ type Request struct {
 	CachedHostIDs []string
 }
 
-// CommittedRatio is committed/total, the value behind the host_nvme_committed_ratio
-// alert (§28.2). A host that reports no NVMe has ratio 0 (and is never chosen).
-func CommittedRatio(h metadata.Host) float64 {
-	if h.NVMeTotalBytes <= 0 {
-		return 0
-	}
-	return float64(h.NVMeCommittedBytes) / float64(h.NVMeTotalBytes)
-}
-
 func (p Policy) maxRatio() float64 {
 	if p.MaxOversubscription <= 0 {
 		return 1

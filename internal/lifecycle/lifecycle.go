@@ -1,7 +1,17 @@
 // Package lifecycle holds the typed vocabularies for everything in the system that
-// has a lifecycle: host fleet states (§28.1), volume ownership states (§7), the
-// Agent's per-volume machine (§16), snapshot states (§19), reconciliation operation
-// kinds and phases (§7, §8), and the per-volume durability mode (§14.8).
+// has a lifecycle: host fleet states (§28.1), volume ownership states (§7) and
+// snapshot states (§19).
+//
+// §16's Agent-side per-volume machine is deliberately not here. It was written
+// first, so that "Phases 02/03 implement the doc's machine rather than reinventing
+// one", and then the Agent was built and reinvented nothing: it imports exactly one
+// symbol from this package (lifecycle.VolumeActive) and tracks a volume's serving
+// state in internal/agent, per volume, next to the WAL and the lease it actually
+// depends on. Nine constants, a transition table and two tests spent three phases
+// describing a machine no process ran. It is deleted rather than kept as
+// documentation because a vocabulary in this package is a claim that some store or
+// boundary parses values into it, and this one made that claim falsely — which is
+// exactly how a reader concludes the Agent has states it does not have.
 //
 // Each vocabulary is a distinct named type with an explicit transition table taken
 // from the architecture document. That buys three things a bare string cannot:
@@ -326,67 +336,6 @@ func (s VolumeState) Predecessors() []VolumeState { return volumeMachine.predece
 
 // PredecessorNames is Predecessors as stored strings — the store's SQL guard.
 func (s VolumeState) PredecessorNames() []string { return names(s.Predecessors()) }
-
-// --- Volume state, Agent side (§16) ---
-
-// AgentVolumeState is the Volume Agent's per-volume machine (§16). It is a different
-// vocabulary from VolumeState on purpose: the Agent knows states the Control Plane
-// never sees (ATTACHING, SNAPSHOTTING, SELF_FENCED) and vice versa.
-type AgentVolumeState string
-
-// Agent per-volume states (§16).
-const (
-	AgentDetached         AgentVolumeState = "DETACHED"
-	AgentAttaching        AgentVolumeState = "ATTACHING"
-	AgentActive           AgentVolumeState = "ACTIVE"
-	AgentSnapshotting     AgentVolumeState = "SNAPSHOTTING"
-	AgentSelfFenced       AgentVolumeState = "SELF_FENCED"
-	AgentFenced           AgentVolumeState = "FENCED"
-	AgentRecoveryRequired AgentVolumeState = "RECOVERY_REQUIRED"
-	AgentRecovering       AgentVolumeState = "RECOVERING"
-	AgentFailed           AgentVolumeState = "FAILED"
-)
-
-var agentMachine = newMachine("agent volume state",
-	[]AgentVolumeState{AgentDetached, AgentAttaching, AgentActive, AgentSnapshotting,
-		AgentSelfFenced, AgentFenced, AgentRecoveryRequired, AgentRecovering, AgentFailed},
-	map[AgentVolumeState][]AgentVolumeState{
-		AgentDetached:     {AgentAttaching},
-		AgentAttaching:    {AgentActive, AgentFailed, AgentDetached},
-		AgentActive:       {AgentSnapshotting, AgentSelfFenced, AgentFenced, AgentDetached},
-		AgentSnapshotting: {AgentActive, AgentFailed},
-		// A fenced volume waits for instructions; it never resumes serving on its own
-		// (§16, §12.2) — the way back is a full recovery into a new epoch.
-		AgentSelfFenced:       {AgentRecoveryRequired, AgentDetached},
-		AgentFenced:           {AgentRecoveryRequired, AgentDetached},
-		AgentRecoveryRequired: {AgentRecovering, AgentDetached},
-		AgentRecovering:       {AgentActive, AgentRecoveryRequired, AgentFailed},
-		AgentFailed:           {AgentRecoveryRequired, AgentDetached},
-	})
-
-// AgentVolumeStates returns every Agent-side volume state.
-func AgentVolumeStates() []AgentVolumeState { return agentMachine.all }
-
-// ParseAgentVolumeState converts a stored value, rejecting anything else.
-func ParseAgentVolumeState(raw string) (AgentVolumeState, error) { return agentMachine.parse(raw) }
-
-func (s AgentVolumeState) String() string { return string(s) }
-
-// Valid reports whether s is a declared Agent volume state.
-func (s AgentVolumeState) Valid() bool { return agentMachine.valid(s) }
-
-// Serving reports whether the guest data path may be ACKed in this state (§12.2).
-func (s AgentVolumeState) Serving() bool { return s == AgentActive || s == AgentSnapshotting }
-
-// CanTransitionTo reports whether the §16 machine allows this move.
-func (s AgentVolumeState) CanTransitionTo(to AgentVolumeState) bool {
-	return agentMachine.allows(s, to)
-}
-
-// Transition returns ErrInvalidTransition unless the move is allowed.
-func (s AgentVolumeState) Transition(to AgentVolumeState) error {
-	return agentMachine.transition(s, to)
-}
 
 // --- Snapshot state (§19) ---
 

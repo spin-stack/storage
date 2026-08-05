@@ -434,3 +434,46 @@ green.
 **Owed to track A:** ADR-0016 is still `Accepted` and its stage 1 now has no
 implementation, and `STATUS.md` still names `RenewalsBlockedUntil` as a live
 mechanism. Neither file is track D's to edit this wave.
+
+**D8c: two orphan types are deleted and the third is not one (2026-08-05).**
+`lifecycle.AgentVolumeState` is §16's Agent-side per-volume machine — nine
+constants, a transition table, `Serving()`, `CanTransitionTo`, `Transition`,
+`AgentVolumeStates`, `ParseAgentVolumeState`. It was written first, explicitly so
+that "Phases 02/03 implement the doc's machine rather than reinventing one", and
+then the Agent was built and reinvented nothing: `internal/agent` imports exactly
+one symbol from `internal/lifecycle` (`VolumeActive`) and tracks a volume's serving
+state next to the WAL and the lease it actually depends on. The audit's claim of
+"zero references anywhere" was wrong in the way that matters — there were two whole
+test functions, `TestAgentVolumeStateMachine` and `TestServingStates`, and their
+only subject was the machine itself. `placement.CommittedRatio` is the same shape
+four lines long: the §26.2 catalog declares `host_nvme_committed_ratio`, nothing
+records a value for it, and the division is two lines at whatever recording site
+eventually exists.
+
+**`controlplane.Elector.HighestClaimedTerm` is kept, and the audit is wrong about
+it.** It is not read only by its own test: `internal/metadata/pg`'s
+`TestATermIsNeverIssuedTwiceAcrossADatabaseRestore` uses it as the *observation*
+that every term ever issued is in the bucket whatever the database says — the
+property ADR-0011 rests on, proven against a real PostgreSQL that has just been
+rewound. Deleting it would either delete that assertion or put a hand-written copy
+of the bucket walk inside the test. What it genuinely lacks is the operator surface
+its own doc comment promises ("what an operator, or a startup check, reads"), and
+`-fleet-status` is the obvious home — `fleetReport` takes only a `metadata.Store`
+today, so wiring it means handing the report the object store as well. That is an
+increment, not a line, and it is not this one.
+
+The allowlist entries for `OperationKinds`, `OperationPhases`, `PlanReservations`,
+`PlanReservation.Reserves` (D8a) and `CommittedRatio` (here) went with the symbols;
+`hack/deadcode.sh` fails on a stale entry, which is how they were found rather than
+remembered. `task deadcode` reported 74 findings with 17 unexplained before D8 and
+66 with 10 after it; every one of the remaining ten is another lane's
+(`internal/simio/real`'s network, `lease.Manager.Revoke`).
+
+**One planted bug for the one assertion that changed.** `TestValidRejectsTheZeroValue`
+walked four vocabularies and now walks three, so its index-based message moved:
+making `SnapshotState.Valid()` return true unconditionally prints `zero value 2
+reported itself valid`, which is the third entry and therefore the right one.
+
+No schema change. `task ci` is green and `task cover` reports production 90.0%
+against the 90% floor — deleting production code that was fully covered is what
+keeps that number from rising, and it did not fall below.

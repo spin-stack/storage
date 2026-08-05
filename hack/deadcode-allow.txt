@@ -49,9 +49,6 @@ internal/lifecycle.HostStates       # walked by lifecycle_test and by pg_integra
 internal/lifecycle.CordonReasons    # same
 internal/lifecycle.VolumeStates     # same
 
-# --- placement test affordances ----------------------------------------------------------
-internal/placement.CommittedRatio          # the ratio placement_test asserts on; the chooser compares capacities directly
-
 # --- the observability test provider ----------------------------------------------------
 # obs.NewTestProvider is why every metric in this repository is proven by reading the
 # collected value rather than by checking that a recorder was called. It cannot live in a

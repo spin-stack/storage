@@ -177,26 +177,6 @@ func TestChooseIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestCommittedRatio is the value behind the host_nvme_committed_ratio alert (§28.2).
-func TestCommittedRatio(t *testing.T) {
-	tests := []struct {
-		name string
-		h    metadata.Host
-		want float64
-	}{
-		{"half committed", host("h", lifecycle.HostActive, 100*gib, 50*gib), 0.5},
-		{"oversubscribed", host("h", lifecycle.HostActive, 100*gib, 250*gib), 2.5},
-		{"no capacity reported", host("h", lifecycle.HostActive, 0, 10), 0},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := placement.CommittedRatio(tc.h); got != tc.want {
-				t.Fatalf("ratio = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestZeroPolicyRefusesOversubscription documents the safe default: an unset policy
 // means "no oversubscription" (committed <= total), never "unbounded".
 func TestZeroPolicyRefusesOversubscription(t *testing.T) {

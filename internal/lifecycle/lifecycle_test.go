@@ -86,38 +86,6 @@ func TestVolumePromotionAlwaysPassesFencingWait(t *testing.T) {
 	}
 }
 
-// TestAgentVolumeStateMachine is §16, the Agent's per-volume machine. It is defined
-// here so Phases 02/03 implement the doc's machine rather than reinventing one.
-func TestAgentVolumeStateMachine(t *testing.T) {
-	tests := []struct {
-		name    string
-		from    lifecycle.AgentVolumeState
-		to      lifecycle.AgentVolumeState
-		allowed bool
-	}{
-		{"attach", lifecycle.AgentDetached, lifecycle.AgentAttaching, true},
-		{"attached", lifecycle.AgentAttaching, lifecycle.AgentActive, true},
-		{"snapshot in background", lifecycle.AgentActive, lifecycle.AgentSnapshotting, true},
-		{"snapshot done", lifecycle.AgentSnapshotting, lifecycle.AgentActive, true},
-		{"lease expired on the monotonic clock", lifecycle.AgentActive, lifecycle.AgentSelfFenced, true},
-		{"fenced by an epoch notification", lifecycle.AgentActive, lifecycle.AgentFenced, true},
-		{"fenced waits for instructions", lifecycle.AgentFenced, lifecycle.AgentRecoveryRequired, true},
-		{"recovery completes into the new epoch", lifecycle.AgentRecovering, lifecycle.AgentActive, true},
-		{"recovery can fail", lifecycle.AgentRecovering, lifecycle.AgentFailed, true},
-
-		{"a fenced volume never resumes serving", lifecycle.AgentSelfFenced, lifecycle.AgentActive, false},
-		{"attaching does not snapshot", lifecycle.AgentAttaching, lifecycle.AgentSnapshotting, false},
-		{"a failed volume needs recovery, not a jump to active", lifecycle.AgentFailed, lifecycle.AgentActive, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.from.CanTransitionTo(tc.to); got != tc.allowed {
-				t.Fatalf("%s -> %s: allowed=%v, want %v", tc.from, tc.to, got, tc.allowed)
-			}
-		})
-	}
-}
-
 // TestPublishedSnapshotNeverGoesBack is INV-16 expressed in the vocabulary: once
 // PUBLISHED, the only way out is deletion (§19).
 func TestPublishedSnapshotNeverGoesBack(t *testing.T) {
@@ -177,7 +145,6 @@ func TestTransitionReportsTheVocabularyItRefused(t *testing.T) {
 		wantSub string
 	}{
 		{"volume", lifecycle.VolumeFencingWait.Transition(lifecycle.VolumeActive), `volume state "FENCING_WAIT" -> "ACTIVE"`},
-		{"agent volume", lifecycle.AgentSelfFenced.Transition(lifecycle.AgentActive), `agent volume state "SELF_FENCED" -> "ACTIVE"`},
 		{"snapshot", lifecycle.SnapshotPublished.Transition(lifecycle.SnapshotCreating), `snapshot state "PUBLISHED" -> "CREATING"`},
 		{"host", lifecycle.HostActive.Transition(lifecycle.HostState("GONE")), `host state "ACTIVE" -> "GONE"`},
 	}
@@ -194,25 +161,10 @@ func TestTransitionReportsTheVocabularyItRefused(t *testing.T) {
 	// The legal moves return nil.
 	for _, err := range []error{
 		lifecycle.VolumeRecovering.Transition(lifecycle.VolumeActive),
-		lifecycle.AgentAttaching.Transition(lifecycle.AgentActive),
 		lifecycle.SnapshotCreating.Transition(lifecycle.SnapshotPublished),
 	} {
 		if err != nil {
 			t.Fatalf("a legal transition returned %v", err)
-		}
-	}
-}
-
-// TestServingStates is §12.2: only a volume the Agent is actually serving may ACK
-// guest I/O — a fenced or attaching one may not.
-func TestServingStates(t *testing.T) {
-	serving := map[lifecycle.AgentVolumeState]bool{
-		lifecycle.AgentActive:       true,
-		lifecycle.AgentSnapshotting: true, // §19: the snapshot does not quiesce the guest
-	}
-	for _, s := range lifecycle.AgentVolumeStates() {
-		if got := s.Serving(); got != serving[s] {
-			t.Fatalf("%s.Serving() = %v, want %v", s, got, serving[s])
 		}
 	}
 }
@@ -345,7 +297,6 @@ func TestParseRejectsAnythingElse(t *testing.T) {
 	}{
 		{"HostState", func(s string) error { _, err := lifecycle.ParseHostState(s); return err }},
 		{"VolumeState", func(s string) error { _, err := lifecycle.ParseVolumeState(s); return err }},
-		{"AgentVolumeState", func(s string) error { _, err := lifecycle.ParseAgentVolumeState(s); return err }},
 		{"SnapshotState", func(s string) error { _, err := lifecycle.ParseSnapshotState(s); return err }},
 	}
 	bad := []string{"", " ", "active", "ACTIVE ", "nonsense", "0"}
@@ -373,11 +324,6 @@ func TestParseRoundTripsEveryValue(t *testing.T) {
 			t.Fatalf("VolumeState %q: got %q err=%v", s, got, err)
 		}
 	}
-	for _, s := range lifecycle.AgentVolumeStates() {
-		if got, err := lifecycle.ParseAgentVolumeState(s.String()); err != nil || got != s {
-			t.Fatalf("AgentVolumeState %q: got %q err=%v", s, got, err)
-		}
-	}
 	for _, s := range lifecycle.SnapshotStates() {
 		if got, err := lifecycle.ParseSnapshotState(s.String()); err != nil || got != s {
 			t.Fatalf("SnapshotState %q: got %q err=%v", s, got, err)
@@ -390,9 +336,8 @@ func TestValidRejectsTheZeroValue(t *testing.T) {
 	var (
 		h  lifecycle.HostState
 		v  lifecycle.VolumeState
-		a  lifecycle.AgentVolumeState
 		s  lifecycle.SnapshotState
-		ok = []bool{h.Valid(), v.Valid(), a.Valid(), s.Valid()}
+		ok = []bool{h.Valid(), v.Valid(), s.Valid()}
 	)
 	for i, valid := range ok {
 		if valid {
