@@ -346,23 +346,41 @@ jobs:
   # `if: always()` is required, not decorative: without it this job is itself skipped the
   # moment anything it needs fails, and a skipped gate is a gate that never says no.
   gate:
-    needs: [ci, guest-lane, guest-e2e-lane]
+    # guest-inputs is listed even though nothing downstream of it can succeed without it:
+    # when the two artefacts are unpublished it is the job that *says so*, and a table
+    # naming it is a reader's first stop. Its absence here would show up only as two
+    # skipped guest lanes with no stated cause.
+    needs: [ci, guest-inputs, guest-lane, guest-e2e-lane]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Every lane ran, and every lane passed
         env:
-          # One assignment per needed job. There is no way to enumerate `needs` from
-          # inside a run step, so this list is written twice — here and in `needs:` —
-          # and the loop below fails on an empty result, which is what a job missing
-          # from this map produces.
-          RESULTS: |
-            ci=${{ needs.ci.result }}
-            guest-lane=${{ needs.guest-lane.result }}
-            guest-e2e-lane=${{ needs.guest-e2e-lane.result }}
+          # The whole `needs` context, serialized. This was one hand-written
+          # `job=${{ needs.<job>.result }}` line per needed job — a second list of lanes
+          # beside `needs:`, with nothing holding the two equal. That is the same defect
+          # this workflow exists to remove, one level in: a job added to `needs` and
+          # forgotten here is a lane the gate does not check and reports green for, and
+          # nothing about the run looks wrong. `toJSON(needs)` is the same object
+          # `needs.<job>.result` reads from, so there is exactly one list now — the
+          # `needs:` above.
+          #
+          # jq is preinstalled on hosted Ubuntu runners and this job is not a container
+          # job, so it is there; if it ever is not, `set -e` makes that a red gate rather
+          # than a green one, which is the direction every failure in this file leans.
+          NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
+          results=$(jq -r 'to_entries[] | "\(.key)=\(.value.result)"' <<< "$NEEDS")
+          # An enumeration that came back empty is the no-op that reports success — the
+          # shape of every defect this gate was built to remove (a `-run` regex matching
+          # no tests, a lane skipping itself, a target exiting 0 after printing SKIP).
+          # A gate with no lanes has not passed; it has failed to run.
+          if [ -z "$results" ]; then
+            echo "::error::the gate enumerated no lanes — it would be green having checked nothing"
+            exit 1
+          fi
           failed=0
           {
             echo "## Gate"
@@ -379,7 +397,7 @@ jobs:
               # here, it is a proof this repository claims to make and did not.
               echo "::error::$job did not pass (${result:-no result}) — the gate is not green"
             fi
-          done <<< "$RESULTS"
+          done <<< "$results"
           if [ "$failed" -ne 0 ]; then
             echo >> "$GITHUB_STEP_SUMMARY"
             echo "A lane that was **skipped** counts as a failure: the guest-backed proofs are" >> "$GITHUB_STEP_SUMMARY"
