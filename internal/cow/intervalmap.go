@@ -48,6 +48,12 @@ type IntervalMap struct {
 	// base later would uncover exactly the range the guest discarded.
 	layered bool
 	cleared []span // sorted, non-overlapping, merged; recorded only when layered
+
+	// liveBytes is the sum of len(e.data) over extents, maintained by insert and
+	// removeRange rather than recomputed. See Cost for why it is maintained at all: the
+	// number is read at the WAL's flush cadence, and a fold over every extent at that
+	// cadence is a scan of the whole working set per guest fsync.
+	liveBytes int64
 }
 
 // NewIntervalMap returns an empty map.
@@ -77,18 +83,65 @@ func (m *IntervalMap) SetBase(base *IntervalMap) error {
 	return nil
 }
 
-// ClearedSpans reports how many tombstones this layer holds. It exists so a test can
-// assert that adjacent clears merge rather than accumulate — a guest discarding a volume
-// in 4 KiB steps must not grow a list proportional to the volume.
-func (m *IntervalMap) ClearedSpans() int { return len(m.cleared) }
+// Cost is what one volume's read view costs, in the numbers that move independently of
+// each other. A single number cannot answer both questions an operator has, and this
+// package is where they are cheap to answer honestly.
+//
+//   - Bytes is memory: the payload of every live extent in the chain. It is what grows
+//     with the working set.
+//   - Extents is both the other half of memory and the whole of read latency. Half of
+//     memory, because an extent record is ~40 bytes of Go (a uint64 and a slice header)
+//     plus its allocation — so a million single-sector extents cost about 32 MiB of
+//     structure over 4 GiB of payload, and reporting Bytes alone would call that free.
+//     All of read latency, because Read is a linear scan of `extents` per layer: there
+//     is no index, and every read walks every extent of every layer it crosses.
+//   - Layers is the depth of the chain, and it is the number that moves on its own.
+//     Freeze (§19) adds a layer and not one byte — a volume snapshotted a hundred times
+//     has the same Bytes and a hundred times the read path.
+//   - Cleared is the tombstone count. It gets no series of its own: a span is 16 bytes
+//     and `cover` merges adjacent ones, so this is bounded by construction rather than
+//     by the working set (TestClearsAreMerged is the proof), and a fourth per-volume
+//     series that can only ever be small is cardinality bought for nothing.
+//
+// Rejected: reporting a single `bytes` gauge, which is the shape the deleted `Bytes()`
+// had. It answers "how much memory" and silently answers "the read path is fine" for a
+// volume whose reads have become a hundred-layer walk.
+type Cost struct {
+	Bytes   int64
+	Extents int
+	Layers  int
+	Cleared int
+}
 
-// Bytes reports the total live extent bytes held (metric active_map_bytes proxy).
-func (m *IntervalMap) Bytes() int {
-	n := 0
-	for _, e := range m.extents {
-		n += len(e.data)
+// Cost reports what this view costs, following the whole base chain.
+//
+// **It is O(layers), not O(extents), and that is the point.** The number an Agent
+// records is read at the WAL's flush cadence — every guest fsync — and the structure it
+// describes holds one entry per distinct written region of a live volume. Folding over
+// those entries to answer "how big are you" would make the measurement scale with the
+// thing it measures, which is a performance defect wearing observability's clothes: the
+// fuller the volume, the more the metric costs. So each layer maintains its own byte
+// count as it is mutated (one add in insert, one subtract per overlap in removeRange),
+// and this walks the chain to sum them.
+//
+// Walking the chain is not free either — but its length *is* the depth being reported,
+// it changes only at Freeze, and a chain long enough for the walk to matter is already
+// the condition the Layers gauge exists to make visible.
+//
+// Two limits, deliberately not papered over. Two maps may share one base ("layering two
+// maps over one base is legal"), and each will count that base's bytes as its own, so
+// summing Cost across volumes double-counts a shared parent image. And the caller must
+// hold whatever serializes mutation of this map — it is exactly as concurrency-unsafe as
+// Read, and for the same reason.
+func (m *IntervalMap) Cost() Cost {
+	c := Cost{Bytes: m.liveBytes, Extents: len(m.extents), Layers: 1, Cleared: len(m.cleared)}
+	for b := m.base; b != nil; b = b.base {
+		c.Bytes += b.liveBytes
+		c.Extents += len(b.extents)
+		c.Cleared += len(b.cleared)
+		c.Layers++
 	}
-	return n
+	return c
 }
 
 // Overwrite records a WRITE of data at offset, superseding any overlap (newest wins).
@@ -158,6 +211,10 @@ func (m *IntervalMap) removeRange(s, e uint64) {
 			kept = append(kept, x) // no overlap
 			continue
 		}
+		// What leaves is exactly the overlap: the two remainders below re-add the rest.
+		// Counted here, on the extent being dropped, rather than by re-folding `kept` at
+		// the end — the fold is what Cost exists not to do.
+		m.liveBytes -= int64(min64(x.end(), e) - max64(x.start, s))
 		// Left remainder [x.start, s).
 		if x.start < s {
 			kept = append(kept, extent{start: x.start, data: x.data[:s-x.start]})
@@ -172,6 +229,7 @@ func (m *IntervalMap) removeRange(s, e uint64) {
 }
 
 func (m *IntervalMap) insert(x extent) {
+	m.liveBytes += int64(len(x.data))
 	m.extents = append(m.extents, x)
 	sort.Slice(m.extents, func(i, j int) bool { return m.extents[i].start < m.extents[j].start })
 }

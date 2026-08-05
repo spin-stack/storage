@@ -44,8 +44,8 @@ func TestClearReadsAsZero(t *testing.T) {
 		t.Fatalf("clear should zero the range: %v", got)
 	}
 	// Memory holds only the two surviving 1-byte extents.
-	if m.Bytes() != 2 {
-		t.Fatalf("expected 2 live bytes after clear, got %d", m.Bytes())
+	if got := m.Cost().Bytes; got != 2 {
+		t.Fatalf("expected 2 live bytes after clear, got %d", got)
 	}
 }
 
@@ -150,7 +150,7 @@ func TestClearsAreMerged(t *testing.T) {
 	for off := range uint64(8) {
 		m.Clear(off*512, 512)
 	}
-	if got := m.ClearedSpans(); got != 1 {
+	if got := m.Cost().Cleared; got != 1 {
 		t.Fatalf("%d tombstones for eight adjacent clears, want 1", got)
 	}
 }
@@ -161,7 +161,7 @@ func TestAnUnlayeredMapRecordsNoTombstones(t *testing.T) {
 	m := cow.NewIntervalMap()
 	m.Overwrite(0, []byte("AAAA"))
 	m.Clear(0, 4)
-	if got := m.ClearedSpans(); got != 0 {
+	if got := m.Cost().Cleared; got != 0 {
 		t.Fatalf("%d tombstones without a base, want 0", got)
 	}
 	buf := make([]byte, 4)
