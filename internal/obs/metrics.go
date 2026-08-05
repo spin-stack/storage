@@ -63,6 +63,23 @@ func Catalog() []MetricDesc {
 		{"snapshot_publish_duration_seconds", KindHistogram, "Snapshot publish duration", []string{"volume"}},
 		{"snapshot_pause_duration_seconds", KindHistogram, "Guest I/O pause during snapshot (~0 expected; measured around the freeze, not the upload)", []string{"volume"}},
 
+		// --- The read view (§13.2, §19) ---
+		//
+		// `cow.IntervalMap` is the only per-volume structure on an Agent whose size is
+		// decided by the guest rather than by configuration, and until these three
+		// existed nothing measured it: the first evidence of a host holding too many
+		// read views would have been the OOM killer. Three series and not one, because
+		// they answer different questions and a snapshotted volume moves them apart —
+		// `cow.Cost`'s doc comment carries the reasoning and the alternative rejected.
+		//
+		// Recorded by the owner of the map, under the lock that serializes it, at the
+		// cadence the watermarks already use (a flush). Not sampled by a poller: the
+		// structure is not safe to read concurrently, and a poller would be a second
+		// thing needing the volume's lock on the data path.
+		{"read_view_bytes", KindGauge, "Live extent bytes held by a volume's read view, across its whole layer chain", []string{"volume"}},
+		{"read_view_extents", KindGauge, "Live extent records in a volume's read view; Read scans them all, per layer", []string{"volume"}},
+		{"read_view_layers", KindGauge, "Layers a read traverses (1 = no snapshot; §19's Freeze adds one and no bytes)", []string{"volume"}},
+
 		// --- Leases (liveness, no longer durability — §26.2) ---
 		{"lease_remaining_seconds", KindGauge, "Remaining lease time per host", []string{"host"}},
 		{"lease_renewal_failures_total", KindCounter, "Lease renewal failures", []string{"host"}},
