@@ -633,6 +633,14 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		}
 	}
 
+	// The four §26.2 metrics this log owns — the watermarks, the unflushed bytes, and
+	// wal_out_of_space — reach an instrument only through here. It is wired at the one
+	// place a Log is built for a real volume: SetRecorder had no production caller at
+	// all until now, so those series could not be recorded even once a collector
+	// existed. The label is the volume id rather than a counter, because that is what
+	// an operator has when they arrive with a volume that is misbehaving.
+	log.SetRecorder(m.deps.Recorder, id)
+
 	// Nothing enables a remote path any more (ADR-0026 increment 4.5). A FLUSH is
 	// fdatasync and an ACK; the volume reaches the object store when it stops, as one
 	// image, and that is the whole of what leaves the host.

@@ -1356,6 +1356,35 @@ the rule in `PARALLEL-PLAN.md`, along with the four files no track owned.
 deletions of tested production code. The next deletion-heavy increment trips it, and the
 answer is to write the tests the surviving code lacks — not to move the floor.
 
+**Wave 2 (2026-08-04): `task ci:full` exit 0, production coverage 90.0% — the floor
+exactly, with no slack left.** Twelve commits across four lanes. The lane that mattered
+delivered: an Agent that cannot publish now holds its data directory and retries, and the
+verifier confirmed it against a real TCP proxy in front of RustFS rather than an injected
+error — SIGTERM with the store unreachable, the Agent does not exit, prints the holding
+line twice, a second real `volume-agent` process is refused **by the kernel**, and only
+after the proxy comes back does the image appear and the process exit 0.
+
+**E2 was written up as done and was not.** The exporter and provider were proven against
+a real OTLP collector, but nothing called either: both binaries still passed
+`Recorder: nil`, and no `-otlp-endpoint` flag existed. By CLAUDE.md's own rule that is not
+done, however well tested — it is the `CloneCrossHost` shape. **Closed by the integration
+owner** (`internal/agent`, `cmd/volume-agent`): the Agent constructs the provider before
+anything that records, hands the Recorder to the manager, and the manager hands it to each
+`wal.Log` at the one place a Log is built.
+
+That last hop was a second defect hiding behind the first: **`wal.Log.SetRecorder` had no
+production caller at all**, so the four metrics a Log owns — the watermarks, the unflushed
+bytes, `wal_out_of_space` — could not be recorded even once a collector existed. An
+exporter would have shipped an empty series set and looked like working observability.
+`TestAServedVolumeRecordsItsWALMetrics` drives the real manager and asserts on the
+collected series; planting the missing `SetRecorder` call turns it red with `collected:
+map[]`.
+
+**Three ownership gaps again, and the wave got lucky in all three rather than protected.**
+`internal/simio/real` and `go.mod` (E), `internal/placement` (D), and
+`internal/dst/mandatory_set_test.go` — a hand-maintained registry that *must* be edited in
+the same commit as any new mandatory scenario, and which no lane owns.
+
 ## Track A — the documents (open work, appended per increment)
 
 *Only track A appends here* — it owns the architecture document, the head of this file,

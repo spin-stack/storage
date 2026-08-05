@@ -68,6 +68,15 @@ one wave), and `internal/descriptor`. Assignment: `scenarios_agent.go` and
 `internal/descriptor` to **D**. A file with no owner is a file every lane feels entitled
 to.
 
+**Wave 2 found three more, and got lucky in all three rather than protected:**
+`internal/simio/real` and `go.mod`/`go.sum` → **E** (the exporter's socket code belongs
+there, so INV-01 needs no new exemption; route any other dependency through E).
+`internal/placement` → **D**. And `internal/dst/mandatory_set_test.go`, which is a
+hand-maintained registry that **must** be edited in the same commit as any new mandatory
+scenario — `TestMandatorySetIsPinnedByName` fails otherwise, which is its whole purpose.
+It goes to whichever lane adds a scenario, and **at most one lane may add one per merge
+window**, the same rule the DST checkers already have.
+
 **Wave 1's real lesson: ownership by file is necessary and not sufficient.** Track E
 committed two files it did not own (`internal/agent/publish_test.go`,
 `snapshot_test.go`) from a *stale pre-edit copy*, wholesale reverting the fix track C had

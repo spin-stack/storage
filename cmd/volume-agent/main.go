@@ -28,6 +28,7 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/image"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
@@ -84,7 +85,9 @@ func run() (err error) {
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
-		grace        = flag.Duration("shutdown-grace", 60*time.Second,
+		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
+		grace = flag.Duration("shutdown-grace", 60*time.Second,
 			"bound on ONE publish attempt at shutdown, not on the shutdown: an Agent that cannot publish keeps its data directory and retries until it can, or until a second signal")
 		kekFile = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
 	)
@@ -121,6 +124,30 @@ func run() (err error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Telemetry, before anything that records: an exporter that arrives after the
+	// components hold their Recorder would leave those components holding a no-op for
+	// the life of the process. NewOTLPMetricExporter returns (nil, nil) for an empty
+	// endpoint and NewProvider takes that nil, so an Agent with no collector needs no
+	// conditional here and behaves exactly as it did before this existed.
+	exporter, err := real.NewOTLPMetricExporter(ctx, *otlpEndpoint)
+	if err != nil {
+		return err
+	}
+	telemetry, err := obs.NewProvider("volume-agent", exporter)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// WithoutCancel: the final flush must outlive the SIGTERM that started the
+		// shutdown, and this Agent's most interesting samples — the publish duration,
+		// the holding line's attempts — are produced during it. Logged and never
+		// fatal: a collector that is down must not change what the Agent's exit code
+		// says about the guest's data.
+		if err := telemetry.Shutdown(context.WithoutCancel(ctx)); err != nil {
+			slog.Error("flushing metrics", "error", err)
+		}
+	}()
 
 	disk, err := real.NewDisk(*dataDir)
 	if err != nil {
@@ -198,6 +225,9 @@ func run() (err error) {
 		// §15: the image chunk nonces. Real randomness in the binary; the DST
 		// harness injects a seeded reader so the same seed gives the same ciphertext.
 		Rand: rand.Reader,
+		// Every volume's Log gets this too — VolumeManager hands it down at the one
+		// place a Log is built (see start).
+		Recorder: telemetry.Recorder(),
 		// Read through the loop for the same reason the lease is: the loop is assigned
 		// below, and it owns the cache whose entries are evicted when a volume leaves
 		// this host's desired state.
@@ -235,13 +265,9 @@ func run() (err error) {
 		// filesystem holding --data-dir, so the capacity ADR-0013's thresholds
 		// divide by is the disk's own answer and includes what other tenants of
 		// that filesystem occupy.
-		Device:  agent.NewDiskUsage(disk),
-		Volumes: volumes,
-		// No Recorder: obs has no production exporter yet (the OTLP wiring is a
-		// deploy concern nobody has landed), and a nil Recorder is a working no-op.
-		// Passing obs.NewTestProvider here would export the metrics to memory and
-		// look like observability from the outside.
-		Recorder: nil,
+		Device:   agent.NewDiskUsage(disk),
+		Volumes:  volumes,
+		Recorder: telemetry.Recorder(),
 	})
 	if err != nil {
 		return err
