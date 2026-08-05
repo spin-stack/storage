@@ -402,3 +402,87 @@ place. The repeat run after `TestAFencedVolumeIsForgottenOnceItLeavesTheDesiredS
 added could not build the tree at all — `internal/metadata/metadatatest` was mid-edit in
 another lane — and a test that only adds exercised lines cannot lower the figure. Track A
 recounts it at integration, which is the only place it means anything.
+
+### C10 — what a second session does with the first session's WAL (2026-08-05)
+
+A restarted Agent re-attaches at the **same epoch** (ADR-0024), so it opens
+`<data-dir>/wal/<volume-id>/<epoch>` with the previous session's segments still in it.
+Nothing in this tree had ever asked what happens to them, and the answer had a cost
+nobody had noticed.
+
+**What happens.** `wal.ResumeAwaitingBase` replays every record it finds into the read
+view's top layer, `image.Load` installs the published image underneath as the base, and
+`Log.Read` parks until one of the two arrives. So the second session's view is the
+previous session's records *over* an image that already holds every one of them — the
+same bytes twice, in sequence order, which is why it is not wrong: replay is ordered, so
+a WRITE followed by a DISCARD lands as the tombstone either way. The records **above**
+the image's sequence — a session that wrote after its last publish — are the only ones
+the replay contributes, and they are what the retry story wave 2 built rests on.
+
+**What was wrong is that nothing ever gave the redundant ones back.** `release()` deletes
+nothing on purpose (SHUTDOWN-PUBLISH-SPEC §6), the next session adopts what it finds and
+counts those bytes against its share (`segments.adopt`), and `TruncateLocal` has had no
+production caller since ADR-0026 deleted the checkpoint. A volume started and stopped ten
+times on one host held ten sessions of WAL, all of it inside its own image, against a
+`Limits.MaxLocalBytes` **no session clears** — the field's own comment says so. The end
+of that road is a guest whose WRITEs are refused with `ErrBackpressure` for good, on a
+volume whose every byte is safe in the bucket.
+
+**The reclaim lives in `wal.Log.InstallBase`**, because that is the only moment anything
+in the process knows the segments are redundant: the caller knows an image covers this
+sequence, the log knows which segments that sequence spans, and neither knows both
+anywhere else. It is also what the published watermark set three lines above was always
+for — that comment already said published must move so `AllowTruncate` would permit
+exactly this, for a caller that never arrived. Rejected: doing it in the Agent once
+`InstallBase` has returned, which puts one rule in two components, makes the Agent reach
+through the log into a segment set it does not own, and leaves a window in which a guest
+WRITE is weighed against a footprint the call has already superseded.
+
+**Not a durability review-zone change, and the reason is stronger than "the base has
+them".** A log resumed awaiting a base cannot answer a read from its segments at all —
+`Read` parks on `baseWait` and fails with `ErrBaseUnavailable` if the base never arrives
+— so an unreachable store already refuses to serve, with or without them. Segments below
+the installed point are a fallback for nothing. Nothing about a FLUSH ACK, a publish or
+a format changed.
+
+Proven able to fail, in **opposite directions**, because either half alone is satisfied
+by a wrong answer:
+
+- the reclaim removed — the guest-backed arm
+  (`TestASecondSessionGivesBackTheWALItsImageAlreadyHolds`,
+  `integration/vhost/lifecycle_test.go`: a real kernel writes and fsyncs, the Agent
+  stops and publishes, a second Agent starts on the untouched directory and a second
+  boot reads the range back) went red on the filesystem — *"the second session kept 3
+  segment file(s) holding 33792 bytes, out of the 3 files and 33792 bytes its own image
+  already covers"*. Green it prints *"3 segments (33792 bytes) reduced to 1 (8464
+  bytes), and the guest still reads its own pattern"*. It is deliberately the older
+  `TestAGuestSurvivesAStopAndComesBackFromItsImage` **with its third step removed**: that
+  one deletes the WAL by hand so only the image can answer, this one leaves it where a
+  restart actually finds it.
+- reclaim's published-point guard removed, so it unlinks everything but the newest file —
+  the counterweight (`TestASessionThatNeverPublishedKeepsItsWAL`,
+  `internal/agent/resume_test.go`) went red on the bytes: *"offset 524288 reads
+  0x0000000000000000 where 0xb2b2b2b2b2b2b2b2 was written and ACKed"*.
+- the reclaim's error swallowed and `baseWait` closed anyway —
+  `TestALogThatCannotReclaimItsRedundantWALRefusesToServe` (`internal/wal`): *"installing
+  a base over a WAL it could not reclaim reported success: the volume would serve from a
+  device that has begun refusing operations"*.
+
+**The counterweight needs four sessions and the reason is worth knowing: a wrong reclaim
+is invisible to the session that performs it.** Resume has already replayed those records
+into memory, so a session that unlinked segments it should have kept still answers every
+read correctly; only the incarnation after it finds them gone. Two failed publishes in a
+row is not a contrivance — re-attaching happens at the same epoch, so a host whose store
+is down across two restarts is exactly this.
+
+**A second thing the second session was keeping.** `Resume` re-encoded every record it
+replayed into `Log.resumeTail` — a full second copy of the session's WAL, in memory, for
+the life of the process — and `grep -rn resumeTail` found the declaration, one append and
+no reader at all. It was the hand-back to the batcher, and the batcher went with the
+remote durability chain in ADR-0026. Deleted, with `reencode`, its only caller;
+`format.EncodeRecordRaw` stays because the encrypted write path uses it.
+
+Production coverage after the increment: **90.0%** (`task cover`, floor 90%). The
+reclaim's error path is what `TestALogThatCannotReclaimItsRedundantWALRefusesToServe`
+exists for — without it the figure was 89.9%, since the increment also deletes covered
+production code.
