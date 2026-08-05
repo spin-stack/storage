@@ -1,0 +1,20 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-08-05T08:43:43-03:00",
+  "source_fingerprint": {
+    "hash": "c31ccd51c5d4b401db2dbf0a74fd9223dcba4d642fbabb972efdd966676011bd"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE hosts DROP COLUMN renewals_blocked_until;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.hosts.renewals_blocked_until"
+        }
+      ]
+    }
+  ]
+}

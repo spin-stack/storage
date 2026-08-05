@@ -84,23 +84,23 @@ CREATE TABLE hosts (
     -- capacity is derived from the rows that already say who holds what; see the
     -- note at the bottom of this file.
     last_heartbeat       TIMESTAMPTZ NOT NULL,
-    -- The end of the bounded revocation window (§12.6, ADR-0016 stage 1): until this
-    -- instant, by this database's clock, the host's lease renewals are refused.
+    -- There is deliberately no renewals_blocked_until column either, and it is a
+    -- different deletion from the one above: this one held a mechanism that worked.
+    -- ADR-0016 stage 1 refused a host's lease renewals for the length of one
+    -- promotion, so that the lease the Control Plane revoked to fence a source could
+    -- not be re-armed by the source's next heartbeat. ADR-0026 then withdrew the
+    -- promotion, and the ADR's own amendment states the consequence: the window "is
+    -- currently empty, because a revocation stops nothing on the data path". Its
+    -- three writers (BlockHostRenewals, UnblockHostRenewals, RevokeHostLease) had no
+    -- caller, so the column could only ever be NULL and the renewal predicate that
+    -- read it could only ever be true.
     --
-    -- The drain revokes the source's lease to fence it, and the source's next
-    -- heartbeat would otherwise re-arm it — moving the instant the fencing wait is
-    -- measured from, so a healthy host could never be evacuated. Refusing renewals
-    -- for any DRAINING host fixes that and costs too much: the lease is per host and
-    -- the evacuation is per volume, so it stops the durable ACKs of every volume the
-    -- host still holds, including the ones nobody is moving. This column is the same
-    -- mechanism with the blast radius cut to one promotion.
-    --
-    -- It is a deadline rather than a flag on purpose. The Control Plane closes the
-    -- window on every exit path of the promotion, but a Control Plane that dies
-    -- mid-promotion runs no closing write at all, and a host that can never renew
-    -- again is worse than the bug this fixes. The deadline is the backstop: at most
-    -- one lease_ttl + max_clock_skew per volume moved, whatever happens to the CP.
-    renewals_blocked_until TIMESTAMPTZ,
+    -- Kept for stage 2 was the alternative, and it is worse than it looks: stage 2 is
+    -- a fence that follows the *volume*, so what it needs is not this column with a
+    -- caller added — it is a different granularity. A column no write ever sets is
+    -- indistinguishable, to the next reader, from one whose writer is broken.
+    -- A durability tier that gates an ACK on the lease brings back the requirement,
+    -- and it will bring back the schema with the code that exercises it.
     -- A reason belongs to a cordon and dies with it. Stated as a table constraint
     -- because it spans two columns: a column-level CHECK reading another column is
     -- accepted by PostgreSQL and silently promoted to one anyway, which hides from

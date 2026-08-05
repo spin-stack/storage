@@ -26,7 +26,6 @@ type Host struct {
 	NvmeUsedBytes          int64              `json:"nvme_used_bytes"`
 	NvmeRemoteBacklogBytes int64              `json:"nvme_remote_backlog_bytes"`
 	LastHeartbeat          pgtype.Timestamptz `json:"last_heartbeat"`
-	RenewalsBlockedUntil   pgtype.Timestamptz `json:"renewals_blocked_until"`
 }
 
 type HostCommittedByte struct {

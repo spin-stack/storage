@@ -368,3 +368,69 @@ Schema change: `DROP TABLE operations CASCADE` plus the view
 (`migrations/20260805113004_drop_operations.{sql,json}`, planned against the dev
 database and applied to it). `task ci`, `task db:verify` and
 `go test -tags integration ./internal/metadata/pg` are green.
+
+**D8b: the revocation window is deleted, the lease keeps its one rule, and
+`ResizeVolume` is a decision left to a human (2026-08-05).** Five more
+`metadata.Store` methods had no non-test caller. Three of them —
+`BlockHostRenewals`, `UnblockHostRenewals`, `RevokeHostLease` — are ADR-0016 stage
+1: the Control Plane revoked a source's lease to fence it and refused that host's
+renewals for the length of one promotion, so the source's next heartbeat could not
+re-arm what the fence took away. ADR-0026 withdrew the promotion. The ADR's own
+amendment already states the consequence — the window "is currently empty, because
+a revocation stops nothing on the data path" — so what was left was three writers
+with no caller, a `hosts.renewals_blocked_until` column that could only ever be
+NULL, and a predicate in `RenewHostLease` that could only ever be true. All of it
+is gone, along with `metadata.ErrRenewalsBlocked`, `Host.RenewalsBlockedUntil` and
+the `HostExists` query, whose only reader was `RevokeHostLease`'s ErrNotFound
+disambiguation.
+
+**Kept for stage 2 was the alternative and it is worse than it looks.** Stage 2 is
+a fence that follows the *volume*; what it needs is not this column with a caller
+added, it is a different granularity. A column no write ever sets is
+indistinguishable, to the next reader, from one whose writer is broken. The
+schema carries that reasoning where the column was.
+
+**`GetHostLease` stays, against the audit, and the reason is what it is for.** It
+has no binary caller either, but it is the only way to observe what
+`RenewHostLease` did from outside the store, and `cpserver`'s heartbeat test uses
+it exactly that way — the heartbeat renewed the lease is asserted by reading the
+lease back, not by trusting the handler's return. Deleting it would delete an
+observation and leave the assertion resting on an error value, which is the shape
+CLAUDE.md names.
+
+**`ResizeVolume` is not deleted, and that is a decision, not an omission.** §3 makes
+volumes grow-only and resize a product verb; the store method is the bottom half of
+it and refuses a shrink with `ErrShrinkNotAllowed`. What does not exist is
+everything above it: no RPC in `api/`, no `controlplane` function, no operator
+surface — and no Agent-side path either, since a guest learns its device size at
+attach. Deleting thirty lines that already state the §3 rule correctly, so that a
+future resize can restate it, is the trade this note refuses to make on its own.
+**Waiting on a human: does V1 offer resize, or is §3's grow-only rule a promise with
+no verb behind it?** Either answer is cheap; assuming one is not.
+
+The contract's `hostLeases` case is rewritten rather than trimmed. It had proved
+"a host holds no lease" by revoking one, and with nothing to revoke that branch
+would have had no case at all — a store inventing a zero-valued lease would have
+passed. It now proves it on a registered host that has never renewed, and both
+renewal claims read the lease back and compare the stored TTL, because a store that
+returns nil and writes nothing satisfies any assertion on `err`.
+
+**Three planted bugs, each watched go red.** Making the sim's `GetHostLease` return
+the zero lease instead of `ErrNotFound`: `a host that has never renewed: want
+ErrNotFound, got <nil>`. Dropping `l.TTLSeconds = int32(ttlSeconds)` from the sim's
+renewal: `lease = {…TTLSeconds:0}, want host … with a 10s TTL`, and the
+cordoned/draining case with `lease TTL 0 -> 0, want the renewal to have landed as
+20`. The same defect in SQL — `ON CONFLICT … DO UPDATE SET last_renewal = now()`
+without `ttl_seconds`, regenerated — reddens the pg lane alone with `CORDONED host:
+lease TTL 10 -> 10, want the renewal to have landed as 20`, which is the case the
+sim could not have caught for it.
+
+Schema change: `ALTER TABLE hosts DROP COLUMN renewals_blocked_until`
+(`migrations/20260805114343_drop_renewal_window.{sql,json}`, planned against the dev
+database and applied to it before this was written). `task ci`, `task db:verify`,
+`task test:integration` and `go test -tags integration ./internal/metadata/pg` are
+green.
+
+**Owed to track A:** ADR-0016 is still `Accepted` and its stage 1 now has no
+implementation, and `STATUS.md` still names `RenewalsBlockedUntil` as a live
+mechanism. Neither file is track D's to edit this wave.

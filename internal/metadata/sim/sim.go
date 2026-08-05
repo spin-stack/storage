@@ -112,9 +112,6 @@ func (s *Store) UpsertHost(_ context.Context, term int64, h metadata.Host) error
 		// a CORDONED host with an empty cordon_reason and an operator with no way to
 		// tell why it is out of service (ADR-0013 §3).
 		h.CordonReason = cur.CordonReason
-		// Nor may it close a revocation window that is fencing one of its volumes
-		// (ADR-0016): that is the Control Plane's write, not the Agent's.
-		h.RenewalsBlockedUntil = cur.RenewalsBlockedUntil
 	} else {
 		// A host introducing itself is ACTIVE, and ACTIVE carries no reason. The
 		// caller's field is dropped for the same reason its State is only read here.
@@ -257,12 +254,6 @@ func (s *Store) RenewHostLease(_ context.Context, term int64, hostID string, ttl
 		return fmt.Errorf("%w: host %s is %s", metadata.ErrHostNotServing, hostID, h.State)
 	}
 	now := s.now()
-	// A revocation window is the same refusal bounded to one promotion (ADR-0016):
-	// the Control Plane took this lease away to fence a volume, and a heartbeat
-	// landing now would hand it straight back.
-	if !h.RenewalsBlockedUntil.IsZero() && now.Before(h.RenewalsBlockedUntil) {
-		return fmt.Errorf("%w: host %s until %s", metadata.ErrRenewalsBlocked, hostID, h.RenewalsBlockedUntil)
-	}
 	l, ok := s.leases[hostID]
 	if !ok {
 		l = metadata.HostLease{HostID: hostID, GrantedAt: now}
@@ -270,55 +261,6 @@ func (s *Store) RenewHostLease(_ context.Context, term int64, hostID string, ttl
 	l.LastRenewal = now
 	l.TTLSeconds = int32(ttlSeconds)
 	s.leases[hostID] = l
-	return nil
-}
-
-// BlockHostRenewals opens (or re-arms) the ADR-0016 revocation window on a host.
-func (s *Store) BlockHostRenewals(_ context.Context, term int64, hostID string, d time.Duration) error {
-	return s.setRenewalWindow(term, hostID, d)
-}
-
-// UnblockHostRenewals closes it. Idempotent: no window is the state asked for.
-func (s *Store) UnblockHostRenewals(_ context.Context, term int64, hostID string) error {
-	return s.setRenewalWindow(term, hostID, 0)
-}
-
-func (s *Store) setRenewalWindow(term int64, hostID string, d time.Duration) error {
-	if err := requireID("host", hostID); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return err
-	}
-	h, ok := s.hosts[hostID]
-	if !ok {
-		return metadata.ErrNotFound
-	}
-	if d <= 0 {
-		h.RenewalsBlockedUntil = time.Time{}
-	} else {
-		h.RenewalsBlockedUntil = s.now().Add(d)
-	}
-	s.hosts[hostID] = h
-	return nil
-}
-
-// RevokeHostLease drops a host's lease. Idempotent: no lease is the state asked for.
-func (s *Store) RevokeHostLease(_ context.Context, term int64, hostID string) error {
-	if err := requireID("host", hostID); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return err
-	}
-	if _, exists := s.hosts[hostID]; !exists {
-		return metadata.ErrNotFound
-	}
-	delete(s.leases, hostID)
 	return nil
 }
 
