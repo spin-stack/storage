@@ -2183,6 +2183,77 @@ No DST scenario: this is neither data path nor fencing nor GC, and it adds no ch
 merge protocol allows one per window). `task ci`, `task cover` (90.0%) and
 `go test -tags integration ./internal/metadata/pg` are green.
 
+**D6: an operator can read the fleet, and a rebuilt volume can be placed (2026-08-04).**
+Two findings, one increment. `cmd/control-plane` had a one-shot for every *write* an
+operator needs — seed, snapshot, clone, rebuild, detach, attach — and none for looking, so
+"which hosts are cordoned and why", "which volumes has nobody got" and "which snapshots
+are stuck" were a psql session and four hand-written joins that lived nowhere. And the
+reason the catalog could not answer them is structural: every read the Control Plane
+serves is scoped to a host, because every one of them answers an Agent. A volume with no
+primary matches no host id — not even `""`, which is `ErrInvalidID` at the boundary — and
+`ListPendingSnapshots` reaches a snapshot *through* `volumes.primary_host_id`. After
+`-rebuild-metadata`, which restores no placement, every volume in the catalog is in that
+blind spot.
+
+`metadata.Store` gains `ListVolumes` and `ListUnfinishedSnapshots` in both
+implementations, with the contract case `FleetWideReadsSeeTheRowsNoHostOwns` stating the
+contrast rather than assuming it (it detaches the fixture volume, then asserts the
+per-host read has gone blind and the fleet-wide one has not). Unfinished is CREATING and
+DELETING, defined once as `lifecycle.SnapshotState.Unfinished` and handed to the SQL as an
+array — the `allowed_states` move — so the §19 vocabulary keeps one authority. It is
+deliberately not "the states with no successor": PUBLISHED has one and is finished, while
+DELETING has none and is not, because ADR-0026 deleted the reclaim that was supposed to
+consume it. No index on `snapshots.state`: this is a fleet-wide scan an operator runs by
+hand, and an index would be maintained by every snapshot write for its benefit (written in
+the query).
+
+`-fleet-status` prints hosts with state/reason/fill, volumes with host/state/epoch, and
+the unfinished snapshots with the host that is supposed to take each — `-` when nobody is,
+which is the column that says whether anything will ever happen. Text, not JSON, and a
+flag rather than a subcommand tree: ADR-0021 says these binaries are test harnesses and
+the operator interface belongs to `spin`, so the bar is "someone running this repository's
+lanes can see the fleet". It takes no term and no `-holder-id`, and runs before the object
+store is opened — a read guards nothing, and refusing to show the catalog because nothing
+is leading (or because no bucket was named) removes the view exactly when it is the only
+thing left. Ages are differences against `metadata.Store.Now`, the catalog's own clock.
+
+The placing half: `-attach-host` is now optional, and `controlplane.Place` chooses with
+`placement.Choose` when it is absent — §20's third rule, under the same two ceiling flags
+`-clone-snapshot` uses. **Both, and neither direction is an accident**: an operator naming
+a host is overriding the admission rule on information the catalog does not have (a volume
+restored to the machine whose device still holds its bytes goes to a host cordoned for
+exactly that fill), so a named host is honoured without an admission check — and not
+silently, since the placement line carries `host_state` and `chosen_by`.
+
+**Owed, and it is a real gap: the bound is checked by `Choose` and is not carried into the
+write.** `SetVolumePrimaryHost` takes no `CapacityBound`, so two attaches racing onto one
+host both evaluate the ceiling against a fleet the other is not in yet and both commit —
+the same defect D4b closed for `CreateVolume` by making the bound a predicate of the
+statement (and, in Postgres, by the advisory lock in front of it). Closing it is a
+signature change to a store method in both implementations plus its contract; until then
+this path is one human running one command from a shell.
+
+**Also owed: nothing drives `-fleet-status` as a process.** The report is asserted on the
+bytes it writes, against the sim store, in `cmd/control-plane/fleet_test.go`; the three
+lines in `main` that reach it from the flag are covered by nothing, and `integration/e2e`
+is track C's file set this wave. That is the seam this repository keeps losing defects at.
+
+**Six planted bugs, each watched go red.** Dropping the state filter from the sim's
+`ListUnfinishedSnapshots`: the printed report says `SNAPSHOTS NOT FINISHED (2)` and lists
+a PUBLISHED snapshot; the contract case fails with `a PUBLISHED snapshot is still
+outstanding`. The same tautology in SQL (`WHERE TRUE OR state = ANY(...)`, regenerated)
+fails the pg lane identically. Making the sim's `ListVolumes` skip the unplaced:
+`ListVolumes = [b1], want [b1 b2]`. Narrowing `Unfinished` to CREATING:
+`"DELETING".Unfinished() = false, want true`. Replacing `Choose` with `hosts[0]` — the
+fixture's admitted host sorts *last* so that this plant cannot pass — `placed on ...072,
+want the one host that admits it (...074)`. Ignoring the named host: `Place returned
+...074/ACTIVE, want the named host and the state that says it is out of service`.
+
+No schema change (two new queries, no new object), so no migration and no `db:plan`. No
+DST scenario and no new checker: this is neither data path nor fencing. `task ci`,
+`task cover` (production 90.0%) and `go test -tags integration ./internal/metadata/pg` are
+green.
+
 ## Track E — observability (open work, appended per increment)
 
 *Only track E appends here* — it owns `internal/obs`, `internal/vhost`,
