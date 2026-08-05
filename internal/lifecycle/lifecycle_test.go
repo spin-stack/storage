@@ -345,6 +345,41 @@ func TestCordonNoneIsNotAnAuthority(t *testing.T) {
 	}
 }
 
+// TestUnfinishedSnapshotsAreTheOnesSomethingIsOwedOn pins the partition an operator's
+// fleet-wide read is built on, and it is deliberately not "the states with no
+// successor": PUBLISHED still has one (DELETING) and is finished, while DELETING has
+// none and is not — under ADR-0026 nothing reclaims a snapshot, so a row that reaches
+// it stays there and stays somebody's problem. Reading the machine's shape instead of
+// this table would get both of those backwards.
+func TestUnfinishedSnapshotsAreTheOnesSomethingIsOwedOn(t *testing.T) {
+	want := map[lifecycle.SnapshotState]bool{
+		lifecycle.SnapshotCreating:  true, // owed by the Agent serving the volume
+		lifecycle.SnapshotDeleting:  true, // owed by a reclaim that no longer exists
+		lifecycle.SnapshotPublished: false,
+		lifecycle.SnapshotFailed:    false,
+	}
+	for _, s := range lifecycle.SnapshotStates() {
+		if got := s.Unfinished(); got != want[s] {
+			t.Fatalf("%q.Unfinished() = %v, want %v", s, got, want[s])
+		}
+	}
+	// The store's SQL filter is generated from the same predicate, so it has to agree
+	// with it for every value — that is the point of deriving it rather than writing
+	// the state list into the query by hand.
+	names := lifecycle.UnfinishedSnapshotStateNames()
+	for _, s := range lifecycle.SnapshotStates() {
+		var listed bool
+		for _, n := range names {
+			if n == s.String() {
+				listed = true
+			}
+		}
+		if listed != s.Unfinished() {
+			t.Fatalf("UnfinishedSnapshotStateNames() = %v, disagrees with %q.Unfinished()", names, s)
+		}
+	}
+}
+
 // TestParseRejectsAnythingElse: values arriving from outside Go (a DB row, a JSON
 // descriptor, a CLI flag) are parsed, so a bad value fails at the boundary.
 func TestParseRejectsAnythingElse(t *testing.T) {

@@ -207,6 +207,59 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 	return &i, err
 }
 
+const listVolumes = `-- name: ListVolumes :many
+SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
+`
+
+// Every volume, placed or not, for a human reading the catalog. The volumes with a
+// NULL primary are why it is not ListVolumesByHost run once per host: NULL matches
+// no host id, so the per-host listings union to "everything already being served" —
+// and after rebuild-metadata, which restores no placement, that union is empty while
+// this returns the whole catalog.
+//
+// Ordered by the primary key, so it is an index scan and no sort node; it is a
+// one-shot admin read over a table nothing on the data path scans.
+func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
+	rows, err := q.db.Query(ctx, listVolumes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*Volume{}
+	for rows.Next() {
+		var i Volume
+		if err := rows.Scan(
+			&i.VolumeID,
+			&i.SizeBytes,
+			&i.BlockSize,
+			&i.CurrentEpoch,
+			&i.State,
+			&i.PrimaryHostID,
+			&i.StandbyHostID,
+			&i.ActiveRootID,
+			&i.PublishedRootID,
+			&i.ChainDepth,
+			&i.ParentSnapshotID,
+			&i.DekWrapped,
+			&i.KekID,
+			&i.DekKeyID,
+			&i.LocalSequence,
+			&i.DurableSequence,
+			&i.PublishedSequence,
+			&i.FencingStartedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listVolumesByHost = `-- name: ListVolumesByHost :many
 SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `

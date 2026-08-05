@@ -431,6 +431,18 @@ func (s *Store) ListVolumesByHost(_ context.Context, hostID string) ([]metadata.
 	return vols, nil
 }
 
+// ListVolumes returns every volume, placed or not, in volume-id order.
+func (s *Store) ListVolumes(_ context.Context) ([]metadata.Volume, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	vols := make([]metadata.Volume, 0, len(s.vols))
+	for _, v := range s.vols {
+		vols = append(vols, v)
+	}
+	sort.Slice(vols, func(i, j int) bool { return vols[i].VolumeID < vols[j].VolumeID })
+	return vols, nil
+}
+
 func (s *Store) BumpVolumeEpoch(_ context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error) {
 	if err := requireID("volume", volumeID); err != nil {
 		return 0, err
@@ -601,6 +613,23 @@ func (s *Store) ListPendingSnapshots(_ context.Context, hostID string) ([]metada
 		// Through the volume, not through snap.SourceHostID: the request names a
 		// volume, and the host that can freeze it is whichever one serves it now.
 		if v, ok := s.vols[snap.VolumeID]; !ok || v.PrimaryHostID != hostID {
+			continue
+		}
+		out = append(out, snap)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SnapshotID < out[j].SnapshotID })
+	return out, nil
+}
+
+// ListUnfinishedSnapshots returns the snapshots nothing has closed out — CREATING
+// (owed by an Agent) and DELETING (owed by a reclaim ADR-0026 deleted) — fleet-wide,
+// regardless of which host, if any, serves the volume they belong to.
+func (s *Store) ListUnfinishedSnapshots(_ context.Context) ([]metadata.Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]metadata.Snapshot, 0, len(s.snaps))
+	for _, snap := range s.snaps {
+		if !snap.State.Unfinished() {
 			continue
 		}
 		out = append(out, snap)

@@ -143,6 +143,58 @@ func (q *Queries) ListPendingSnapshots(ctx context.Context, primaryHostID pgtype
 	return items, nil
 }
 
+const listUnfinishedSnapshots = `-- name: ListUnfinishedSnapshots :many
+SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, target_sequence, root_digest, source_host_id, state, portable, manifest_key, request_id, created_at FROM snapshots
+ WHERE state = ANY($1::text[])
+ ORDER BY snapshot_id
+`
+
+// The snapshots nothing has closed out, fleet-wide, for a human reading the catalog.
+//
+// The states come in as an array rather than being written here, the same move
+// SetSnapshotState makes with allowed_states: the §19 vocabulary's authority is
+// internal/lifecycle (SnapshotState.Unfinished), and a literal IN-list in SQL is a
+// second copy of a rule that would silently stop matching the day a state is added.
+//
+// No index, deliberately. This is unfiltered by host on purpose — the stuck snapshot
+// is exactly the one whose volume has no primary, so ListPendingSnapshots's join
+// through volumes cannot return it — and an index on `state` would be maintained by
+// every snapshot write for the benefit of a query an operator runs by hand during an
+// incident. Add one when something on the data path asks this question, which is a
+// change to what this query is for, not a tuning.
+func (q *Queries) ListUnfinishedSnapshots(ctx context.Context, states []string) ([]*Snapshot, error) {
+	rows, err := q.db.Query(ctx, listUnfinishedSnapshots, states)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.SnapshotID,
+			&i.VolumeID,
+			&i.ParentSnapshotID,
+			&i.Epoch,
+			&i.TargetSequence,
+			&i.RootDigest,
+			&i.SourceHostID,
+			&i.State,
+			&i.Portable,
+			&i.ManifestKey,
+			&i.RequestID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const publishSnapshot = `-- name: PublishSnapshot :execrows
 UPDATE snapshots
    SET state = 'PUBLISHED',

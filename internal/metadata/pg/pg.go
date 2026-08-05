@@ -627,6 +627,23 @@ func (s *Store) ListVolumesByHost(ctx context.Context, hostID string) ([]metadat
 	return vols, nil
 }
 
+// ListVolumes returns every volume, placed or not, in volume-id order.
+func (s *Store) ListVolumes(ctx context.Context) ([]metadata.Volume, error) {
+	rows, err := s.q.ListVolumes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	vols := make([]metadata.Volume, 0, len(rows))
+	for _, row := range rows {
+		v, err := volumeFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		vols = append(vols, v)
+	}
+	return vols, nil
+}
+
 func (s *Store) BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error) {
 	id, err := requireUUID("volume", volumeID)
 	if err != nil {
@@ -838,6 +855,25 @@ func (s *Store) ListPendingSnapshots(ctx context.Context, hostID string) ([]meta
 	snaps := make([]metadata.Snapshot, 0, len(rows))
 	for _, row := range rows {
 		snap, err := snapshotFromRow(&row.Snapshot)
+		if err != nil {
+			return nil, err
+		}
+		snaps = append(snaps, snap)
+	}
+	return snaps, nil
+}
+
+// ListUnfinishedSnapshots returns the snapshots nothing has closed out, fleet-wide.
+// The state set is lifecycle's, handed to the query, so the §19 vocabulary is not
+// copied into SQL.
+func (s *Store) ListUnfinishedSnapshots(ctx context.Context) ([]metadata.Snapshot, error) {
+	rows, err := s.q.ListUnfinishedSnapshots(ctx, lifecycle.UnfinishedSnapshotStateNames())
+	if err != nil {
+		return nil, err
+	}
+	snaps := make([]metadata.Snapshot, 0, len(rows))
+	for _, row := range rows {
+		snap, err := snapshotFromRow(row)
 		if err != nil {
 			return nil, err
 		}

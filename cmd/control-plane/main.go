@@ -114,6 +114,10 @@ func run() error {
 		// serving it). Detaching is what makes the release safe — the Agent's teardown
 		// publishes the session's image before it drops the socket — and an operator
 		// re-placing the volume has to wait for that to have happened.
+		// fleet-status: the only read-only one-shot here, and the only fleet-wide read
+		// this repository has that is not psql. fleet.go carries the reasoning.
+		fleetStatus = flag.Bool("fleet-status", false, "print the fleet's hosts, volumes and unfinished snapshots, and exit")
+
 		detachVolume = flag.String("detach-volume", "", "clear this volume's placement and exit, instead of serving")
 		attachVolume = flag.String("attach-volume", "", "place this volume on -attach-host and exit, instead of serving")
 		attachHost   = flag.String("attach-host", "", "with -attach-volume: the host that will serve it (a UUIDv7)")
@@ -123,7 +127,11 @@ func run() error {
 	flag.Parse()
 
 	switch {
-	case *holderID == "":
+	// -fleet-status is exempt from both. It identifies nobody, because it takes no
+	// term and writes nothing, and demanding an identity for a read is friction in
+	// front of the one command an operator runs when they do not yet know what is
+	// wrong. The DSN it still needs: the catalog is what it reports.
+	case *holderID == "" && !*fleetStatus:
 		return errors.New("-holder-id is required")
 	case *databaseDSN == "":
 		return errors.New("-database-url (or $DATABASE_URL) is required")
@@ -138,14 +146,22 @@ func run() error {
 	}
 	defer pool.Close()
 
+	md := pg.New(pool)
+
+	// Before the object store is opened, deliberately: a report of the catalog reads
+	// no object, and storeFlags.Open refuses the empty case, so leaving it below would
+	// make an operator name a bucket this command never touches — during an incident,
+	// possibly the very bucket that is unreachable.
+	if *fleetStatus {
+		return fleetReport(ctx, md, os.Stdout)
+	}
+
 	// storeFlags.Open refuses the empty case: the object store is the recovery
-	// authority (§5.8) and both paths below need it.
+	// authority (§5.8) and every path below needs it.
 	store, err := storeFlags.Open(ctx)
 	if err != nil {
 		return err
 	}
-
-	md := pg.New(pool)
 
 	// Seeding is an admin command, not a leader taking over, and the difference is not
 	// cosmetic: AcquireLeadership increments the term unconditionally — for the same

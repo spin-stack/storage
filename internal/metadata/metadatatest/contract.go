@@ -43,6 +43,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -77,6 +78,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"VolumeLifecycleIsExpressible", volumeLifecycle},
 		{"SnapshotLifecycleIsExpressible", snapshotLifecycle},
 		{"PendingSnapshotsFollowTheVolumeAndPublishOnce", pendingSnapshots},
+		{"FleetWideReadsSeeTheRowsNoHostOwns", fleetWideReads},
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
 		{"VolumePlacementIsChangeableAndClearingIsIdempotent", volumePlacement},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
@@ -941,6 +943,104 @@ func pendingSnapshots(t *testing.T, s metadata.Store) {
 	}
 	if got, _ := s.GetSnapshot(ctx, w.snap); got.TargetSequence != seq {
 		t.Fatalf("a refused report moved the sequence to %d", got.TargetSequence)
+	}
+}
+
+// fleetWideReads: the two listings a human reads the catalog with, and the whole
+// reason they are not the per-host ones with the argument dropped.
+//
+// Every read the Control Plane serves is scoped to a host, because every read it
+// serves answers an Agent. That makes a volume with no primary, and a snapshot of a
+// volume with no primary, invisible to the entire store: NULL matches no host id, and
+// ListPendingSnapshots reaches the snapshot *through* volumes.primary_host_id. Those
+// are exactly the rows an operator is looking for — rebuild-metadata restores every
+// volume unplaced, and a snapshot stops making progress precisely when the volume it
+// belongs to stops being served — so the case detaches the fixture volume first and
+// then asks both questions.
+func fleetWideReads(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s) // w.snap is CREATING on w.vol, whose primary is w.host
+
+	// A volume placed nowhere, the shape rebuild-metadata restores.
+	unplaced := id()
+	if err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
+		VolumeID: unplaced, SizeBytes: 1 << 30, BlockSize: 65536,
+		State: lifecycle.VolumeDetached, DEKWrapped: []byte{1}, KEKID: "kek",
+	}, nil); err != nil {
+		t.Fatalf("CreateVolume with no primary: %v", err)
+	}
+
+	volumeIDs := func(t *testing.T, vols []metadata.Volume) []string {
+		t.Helper()
+		out := make([]string, 0, len(vols))
+		for _, v := range vols {
+			out = append(out, v.VolumeID)
+		}
+		return out
+	}
+	want := []string{w.vol, unplaced}
+	sort.Strings(want) // both listings are ordered by volume id (INV-02)
+
+	all, err := s.ListVolumes(ctx)
+	if err != nil {
+		t.Fatalf("ListVolumes: %v", err)
+	}
+	if got := volumeIDs(t, all); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListVolumes = %v, want %v", got, want)
+	}
+	// The contrast, stated rather than assumed: the read the fleet actually runs on
+	// cannot produce the unplaced volume, from any host.
+	placed, err := s.ListVolumesByHost(ctx, w.host)
+	if err != nil {
+		t.Fatalf("ListVolumesByHost: %v", err)
+	}
+	if got := volumeIDs(t, placed); !reflect.DeepEqual(got, []string{w.vol}) {
+		t.Fatalf("ListVolumesByHost = %v, want just the placed volume %s", got, w.vol)
+	}
+	for _, v := range all {
+		if v.VolumeID == unplaced && v.PrimaryHostID != "" {
+			t.Fatalf("the unplaced volume came back placed on %q", v.PrimaryHostID)
+		}
+	}
+
+	// Detach the fixture volume: its CREATING snapshot now belongs to no host, which
+	// is the state in which nothing will ever finish it.
+	if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, ""); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if pending, err := s.ListPendingSnapshots(ctx, w.host); err != nil || len(pending) != 0 {
+		t.Fatalf("the per-host read still sees the snapshot of a detached volume: %+v (err %v)", pending, err)
+	}
+	snapshotIDs := func(t *testing.T, snaps []metadata.Snapshot) []string {
+		t.Helper()
+		out := make([]string, 0, len(snaps))
+		for _, snap := range snaps {
+			out = append(out, snap.SnapshotID)
+		}
+		return out
+	}
+	unfinished, err := s.ListUnfinishedSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListUnfinishedSnapshots: %v", err)
+	}
+	if got := snapshotIDs(t, unfinished); !reflect.DeepEqual(got, []string{w.snap}) {
+		t.Fatalf("unfinished = %v, want the stranded CREATING snapshot %s", got, w.snap)
+	}
+
+	// A published snapshot is finished and drops out; a DELETING one does not, because
+	// under ADR-0026 nothing reclaims it and it stays there for ever.
+	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotPublished); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if got, err := s.ListUnfinishedSnapshots(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("a PUBLISHED snapshot is still outstanding: %v (err %v)", snapshotIDs(t, got), err)
+	}
+	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotDeleting); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got, err := s.ListUnfinishedSnapshots(ctx); err != nil ||
+		!reflect.DeepEqual(snapshotIDs(t, got), []string{w.snap}) {
+		t.Fatalf("a DELETING snapshot nothing reclaims = %v (err %v), want %s", snapshotIDs(t, got), err, w.snap)
 	}
 }
 

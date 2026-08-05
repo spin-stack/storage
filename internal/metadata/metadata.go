@@ -491,6 +491,22 @@ type Store interface {
 	// ListVolumesByHost returns the volumes whose primary is hostID, ordered by
 	// volume id — what a drain iterates over (§28.1).
 	ListVolumesByHost(ctx context.Context, hostID string) ([]Volume, error)
+	// ListVolumes returns every volume ordered by volume id, including the ones
+	// placed nowhere.
+	//
+	// Those are the whole reason it exists, and they are unreachable through
+	// ListVolumesByHost: an unplaced volume's primary is NULL, which no host id
+	// matches — not even the empty one, which is ErrInvalidID at the boundary. So a
+	// caller iterating the fleet's hosts and unioning their listings sees exactly the
+	// volumes that are already being served and none of the ones that are not, which
+	// inverts what the question is usually asked for. rebuild-metadata restores every
+	// volume with no placement (no object records one), so after the one event that
+	// most needs an answer, *every* volume is in the set the per-host read cannot
+	// return.
+	//
+	// It is a fleet-wide scan and it is not on any data path: cpserver answers Agents
+	// from the per-host listings, and this exists for a human reading the catalog.
+	ListVolumes(ctx context.Context) ([]Volume, error)
 	// BumpVolumeEpoch advances the epoch to expectedEpoch+1 and sets the primary
 	// host, term-guarded, returning the new epoch (§12.3). It is a compare-and-set,
 	// not an increment: a promotion chooses which epoch to grant by reading the
@@ -568,6 +584,25 @@ type Store interface {
 	// on completion by the host that actually took it, which is what §20's placement
 	// rule 1 reads later.
 	ListPendingSnapshots(ctx context.Context, hostID string) ([]Snapshot, error)
+	// ListUnfinishedSnapshots returns every snapshot that is waiting on something,
+	// fleet-wide and ordered by snapshot id: the CREATING ones, which are waiting on
+	// an Agent, and the DELETING ones, which are waiting on a reclaim that ADR-0026
+	// deleted and will therefore wait for ever. PUBLISHED and FAILED are finished —
+	// one of them succeeded, the other is a request that is over — so neither is
+	// anybody's outstanding work.
+	//
+	// It is not ListPendingSnapshots without the host argument, and the difference is
+	// the point of it. That one joins through volumes.primary_host_id, so a CREATING
+	// snapshot of a volume that has since been detached — or of every volume, after a
+	// rebuild — belongs to no host and appears in no per-host listing at all. It is
+	// precisely the snapshot that is stuck, and it is precisely the one the read that
+	// drives the Agents cannot see.
+	//
+	// The two states are hard-coded rather than taken as a parameter: there is one
+	// caller and one question, and a state filter callers pass would let a future one
+	// ask for PUBLISHED — a fleet-wide unbounded scan of the largest table here, which
+	// is a listing API, not an incident read.
+	ListUnfinishedSnapshots(ctx context.Context) ([]Snapshot, error)
 	// PublishSnapshot moves CREATING → PUBLISHED, recording the three facts only the
 	// host that took it knows: the §19 sequence the copy was frozen at, the manifest
 	// it wrote, and which host did it (term-guarded).

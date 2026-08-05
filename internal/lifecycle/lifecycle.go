@@ -415,6 +415,34 @@ var snapshotMachine = newMachine("snapshot state",
 // SnapshotStates returns every snapshot state.
 func SnapshotStates() []SnapshotState { return snapshotMachine.all }
 
+// Unfinished reports whether something is still owed on a snapshot in this state.
+// CREATING is owed by the Agent serving the volume; DELETING is owed by a reclaim
+// ADR-0026 deleted, so nothing will ever move it and a snapshot that reaches it
+// stays there — which is why it belongs in the same answer rather than being read as
+// "on its way out".
+//
+// PUBLISHED and FAILED are finished: one is the result, the other is a request that
+// is over. Neither is a terminal state of the machine (both may still become
+// DELETING), so this is deliberately not `len(successors) == 0` — that predicate
+// would call a permanently stuck DELETING snapshot finished and a published one
+// outstanding, exactly backwards.
+func (s SnapshotState) Unfinished() bool {
+	return s == SnapshotCreating || s == SnapshotDeleting
+}
+
+// UnfinishedSnapshotStateNames is the Unfinished set as stored strings — a store's
+// SQL filter. Derived from the vocabulary rather than written out, so the SQL and
+// the Go predicate above cannot disagree.
+func UnfinishedSnapshotStateNames() []string {
+	var out []SnapshotState
+	for _, s := range SnapshotStates() {
+		if s.Unfinished() {
+			out = append(out, s)
+		}
+	}
+	return names(out)
+}
+
 // ParseSnapshotState converts a stored value, rejecting anything else.
 func ParseSnapshotState(raw string) (SnapshotState, error) { return snapshotMachine.parse(raw) }
 

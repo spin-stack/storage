@@ -46,6 +46,24 @@ SELECT sqlc.embed(s) FROM snapshots s
    AND s.state = 'CREATING'
  ORDER BY s.snapshot_id;
 
+-- name: ListUnfinishedSnapshots :many
+-- The snapshots nothing has closed out, fleet-wide, for a human reading the catalog.
+--
+-- The states come in as an array rather than being written here, the same move
+-- SetSnapshotState makes with allowed_states: the §19 vocabulary's authority is
+-- internal/lifecycle (SnapshotState.Unfinished), and a literal IN-list in SQL is a
+-- second copy of a rule that would silently stop matching the day a state is added.
+--
+-- No index, deliberately. This is unfiltered by host on purpose — the stuck snapshot
+-- is exactly the one whose volume has no primary, so ListPendingSnapshots's join
+-- through volumes cannot return it — and an index on `state` would be maintained by
+-- every snapshot write for the benefit of a query an operator runs by hand during an
+-- incident. Add one when something on the data path asks this question, which is a
+-- change to what this query is for, not a tuning.
+SELECT * FROM snapshots
+ WHERE state = ANY(sqlc.arg(states)::text[])
+ ORDER BY snapshot_id;
+
 -- name: PublishSnapshot :execrows
 -- CREATING → PUBLISHED, stamping the three facts only the host that took it knows:
 -- the sequence the copy was frozen at, the manifest it wrote, and which host did it.

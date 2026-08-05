@@ -75,6 +75,17 @@ SELECT * FROM volumes WHERE volume_id = $1;
 -- The volumes a drain must evacuate (§28.1), in a deterministic order.
 SELECT * FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id;
 
+-- name: ListVolumes :many
+-- Every volume, placed or not, for a human reading the catalog. The volumes with a
+-- NULL primary are why it is not ListVolumesByHost run once per host: NULL matches
+-- no host id, so the per-host listings union to "everything already being served" —
+-- and after rebuild-metadata, which restores no placement, that union is empty while
+-- this returns the whole catalog.
+--
+-- Ordered by the primary key, so it is an index scan and no sort node; it is a
+-- one-shot admin read over a table nothing on the data path scans.
+SELECT * FROM volumes ORDER BY volume_id;
+
 -- name: BumpVolumeEpoch :one
 -- Grant the next epoch to a host, term-guarded — and guarded by the epoch the
 -- promoter read (§12.3). The expected-epoch predicate is what makes this a
