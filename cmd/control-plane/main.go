@@ -91,7 +91,8 @@ func run() error {
 		// INV-20). It is why descriptors are written at all — without it a lost
 		// PostgreSQL is unrecoverable even though every byte of every volume is intact.
 		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
-		oversubscribe   = flag.Float64("max-oversubscription", 1.0, "with -clone-snapshot: committed/total ceiling a host may reach (§28.2)")
+		oversubscribe   = flag.Float64("max-oversubscription", 1.0,
+			"with -clone-snapshot / -attach-volume: committed/total ceiling a host may reach (§28.2)")
 		// The second ceiling is the measured one (ADR-0013 §3): what the host's last
 		// heartbeat said its device holds, which is what actually runs out. It is a
 		// separate flag rather than a share of the one above because the two are not
@@ -100,7 +101,11 @@ func run() error {
 		// NVMe per host tolerates a higher fill than a filesystem shared with logs
 		// and images, whose other tenants no truncation of ours can reclaim.
 		maxUsedRatio = flag.Float64("max-used-ratio", placement.DefaultMaxUsedRatio,
-			"with -clone-snapshot: used/total a host may already measure and still receive a volume (ADR-0013)")
+			"with -clone-snapshot / -attach-volume: used/total a host may already measure and still receive a volume (ADR-0013)")
+
+		// fleet-status: the only read-only one-shot here, and the only fleet-wide read
+		// this repository has that is not psql. fleet.go carries the reasoning.
+		fleetStatus = flag.Bool("fleet-status", false, "print the fleet's hosts, volumes and unfinished snapshots, and exit")
 
 		// detach-volume / attach-volume: the two halves of a volume's placement, the
 		// same one-shot shape as the flags above. They exist because primary_host_id
@@ -114,13 +119,16 @@ func run() error {
 		// serving it). Detaching is what makes the release safe — the Agent's teardown
 		// publishes the session's image before it drops the socket — and an operator
 		// re-placing the volume has to wait for that to have happened.
-		// fleet-status: the only read-only one-shot here, and the only fleet-wide read
-		// this repository has that is not psql. fleet.go carries the reasoning.
-		fleetStatus = flag.Bool("fleet-status", false, "print the fleet's hosts, volumes and unfinished snapshots, and exit")
-
+		//
+		// -attach-host is optional, and its absence is the case the rebuild leaves
+		// behind: a catalog restored from the bucket records no placement at all, so an
+		// operator with forty volumes has forty hosts to invent. Without it the
+		// placement order decides, exactly as -clone-snapshot's does, under the same two
+		// ceiling flags above. controlplane.Place carries the reasoning for both halves.
 		detachVolume = flag.String("detach-volume", "", "clear this volume's placement and exit, instead of serving")
-		attachVolume = flag.String("attach-volume", "", "place this volume on -attach-host and exit, instead of serving")
-		attachHost   = flag.String("attach-host", "", "with -attach-volume: the host that will serve it (a UUIDv7)")
+		attachVolume = flag.String("attach-volume", "", "place this volume and exit, instead of serving")
+		attachHost   = flag.String("attach-host", "",
+			"with -attach-volume: the host that will serve it (a UUIDv7); empty asks placement to choose")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -235,32 +243,34 @@ func run() error {
 		if lerr != nil {
 			return fmt.Errorf("changing a volume's placement needs a Control Plane to be leading (start one first): %w", lerr)
 		}
-		volumeID, host := *detachVolume, ""
 		if *attachVolume != "" {
-			if *attachHost == "" {
-				return errors.New("-attach-volume needs -attach-host: there is no default host, and a volume placed nowhere is a volume nobody serves")
+			// The policy the operator declared, the same one -clone-snapshot places
+			// against: whichever host it picks has to be one the fleet would have picked
+			// itself, or the two paths that add bytes to a device disagree about what a
+			// full device is.
+			host, aerr := controlplane.Place(ctx, md,
+				placement.Policy{MaxOversubscription: *oversubscribe, MaxUsedRatio: *maxUsedRatio},
+				leader.Term, *attachVolume, *attachHost)
+			if aerr != nil {
+				return aerr
 			}
-			volumeID, host = *attachVolume, *attachHost
-			// Read the host before writing it. primary_host_id has a foreign key, so a
-			// typo is caught either way — but as a driver-level 23503 naming a
-			// constraint, which tells an operator nothing about what they mistyped.
-			if _, herr := md.GetHost(ctx, host); herr != nil {
-				return fmt.Errorf("-attach-host %s: %w", host, herr)
-			}
-		}
-		if err := md.SetVolumePrimaryHost(ctx, leader.Term, volumeID, host); err != nil {
-			return err
-		}
-		if host == "" {
-			// The Agent finds out on its next GetDesiredState poll, and its teardown is
-			// what puts this session's bytes in the object store. Said out loud because
-			// an operator who reads "detached" and immediately re-places the volume has
-			// re-created the window this command exists to avoid.
-			slog.Info("volume detached; its host stops serving it on its next poll, and publishes the session's image as it does",
-				"volume_id", volumeID)
+			// host_state is logged because a named host is honoured without an admission
+			// check (controlplane.Place says why): an operator who has just placed a
+			// volume onto a CORDONED or DRAINING host must be able to see that in the
+			// line that says it worked.
+			slog.Info("volume placed", "volume_id", *attachVolume,
+				"host_id", host.HostID, "host_state", host.State, "chosen_by", chooser(*attachHost))
 			return nil
 		}
-		slog.Info("volume placed", "volume_id", volumeID, "host_id", host)
+		if err := md.SetVolumePrimaryHost(ctx, leader.Term, *detachVolume, ""); err != nil {
+			return err
+		}
+		// The Agent finds out on its next GetDesiredState poll, and its teardown is
+		// what puts this session's bytes in the object store. Said out loud because
+		// an operator who reads "detached" and immediately re-places the volume has
+		// re-created the window this command exists to avoid.
+		slog.Info("volume detached; its host stops serving it on its next poll, and publishes the session's image as it does",
+			"volume_id", *detachVolume)
 		return nil
 	}
 
@@ -318,6 +328,17 @@ func run() error {
 		slog.Info("control-plane stopped")
 		return nil
 	}
+}
+
+// chooser names who decided the host, for the line that reports a placement. It is one
+// word in a log rather than nothing because the two are answerable to different people:
+// a volume the policy placed can be re-placed by re-running the command, and a volume an
+// operator placed by hand is where it is because somebody meant it.
+func chooser(attachHost string) string {
+	if attachHost == "" {
+		return "placement"
+	}
+	return "operator"
 }
 
 // seed provisions one volume and reports what it made. It runs after the election, so
