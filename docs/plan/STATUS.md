@@ -1418,16 +1418,10 @@ calls it.
   proof of a transition, which is the same deliberate exception `Log.Fenced()` was before
   the rename. Listed so a later sweep does not read it as the `CloneCrossHost` pattern.
 
-**This list is not exhaustive, it is not the authority any more, and saying both is the
-point.** `PARALLEL-PLAN.md`'s audit counted about fifteen surfaces with no caller; the four
-above are the ones verified by grep while recounting this file on 2026-08-04. On the same
-day track B made the question computable — `task deadcode` walks the call graph from the
-binaries and fails on a finding nobody has explained (`hack/deadcode.sh`, `833541d`) — for
-exactly the reason this section keeps needing a recount: a list a human maintains about
-code a human is changing reports success by not being updated. **Run the task; read this
-list for the two entries the task cannot see**, which its own header names: symbols reached
-through reflection (`TruncateLocal`) and packages no binary imports (`metadata`'s two store
-implementations, where `BumpVolumeEpoch` and `ResizeVolume` live).
+**This list is not exhaustive, and saying so is the point.** `PARALLEL-PLAN.md`'s audit
+counted about fifteen surfaces with no caller across the tree; the four above are the ones
+verified by grep while recounting this file on 2026-08-04. Tracks D and E are removing or
+wiring others as they go, in their own sections below.
 
 ## ~~STOPPED~~ — the data-path cleanup, superseded by ADR-0026 *(and the ADR is now executed)*
 
@@ -1643,60 +1637,6 @@ changed three Markdown files. What it is accountable to are the four self-checks
 `REFERENCE.md`'s header (dangling `§`, and every `ADR-`/`INV-`/`DEV-` the code cites
 resolving), which were run and are all empty; adding the missing `DEV-0022` row is what
 made the last one so.
-
-### A2 — the head is recounted, the body stops using the present tense (2026-08-04)
-
-`30ea4b2` (STATUS.md), `ad77035` (README + two spec deletions), `<this commit>` (this
-entry).
-
-**Every claim in both head tables was re-derived from the code and cites the file and line
-it was checked against.** That is the whole method, and the audit that produced this item is
-the argument for it: the phase table listed checkpoints, GC, the drain, promotion and the
-remote WAL as integrated, and none of those packages exists. A table edited from another
-table is what produced that. The invariant line is now **14 active, 6 withdrawn, 2
-pending** — counted from `INVARIANTS.md`'s explicit states, against "21 of 22 active".
-
-**Three rows needed a state the table did not have**, so `withdrawn` was added to the
-maturity legend, matching `INVARIANTS.md`. "Model" reads as *written, waiting for a
-caller*; a reader who goes looking for `internal/recovery` finds nothing at all, and those
-are not the same claim.
-
-**The old BUILD-INVENTORY table (increments 0-8) was deleted rather than banner-ed** — the
-only deletion in this increment. It recorded a queue, not a defect or a decision, and
-`git log` has it. Everything else got a banner and kept its account: the durability
-scheduler's two traps, the e2e lane's "an object in the bucket is not proof of a claim",
-§14.8's two halves, DEV-0007's clone-chain findings, DEV-0019's three-level fix, DEV-0012's
-two fencing triggers, Gap 1's LIST precondition.
-
-**DEV-0020 was rewritten, not banner-ed, because it is open and it described the wrong
-defect.** `materialize.FromSnapshot` is gone; nothing walks a clone chain, and
-`image.Publish`/`PublishSnapshot` upload `view.Ranges()`, which flattens the base into the
-layer (`internal/cow/ranges.go:24`) — so a depth-2 clone reads a *copy* of its
-grandparent's data, not zeros, and pays a full duplicate per link. Nothing in the tree
-exercises `chain_depth > 1`, and the entry now says so rather than asserting the inference.
-C11 and this are one decision, which is what `PARALLEL-PLAN.md` concluded independently.
-
-**Four counters were recounted with the command beside them**, all four wrong: ADR-0013's
-citations (54 non-test lines, not 32 — it has overtaken ADR-0026 as the most-cited),
-`internal/obs.Catalog()` (25 declared, 9 with a producer, under a paragraph that said
-"six" above a list of nine, one of which had been cut), the architecture document's
-citations (846, not 2.106), and §12.3's (22 across 15 files, none in the deleted
-`promotion.go`). Two of them moved between two runs an hour apart while other lanes
-committed.
-
-**`README.md`'s reachability claim was wrong and is now a loop that answers itself.** Six
-`.go` files cite `SHUTDOWN-PUBLISH-SPEC.md`; one cites `VIEW-ADOPTION-SPEC.md`; every other
-spec is cited by no code at all. `DURABILITY-SCHEDULER-SPEC.md` and
-`RUNTIME-FENCING-SPEC.md` are deleted under that file's own rule — ADR-0026 removed the
-scheduler and the lease-gated ACK they reviewed, and the decisions that outlived them are
-in `internal/agent/volume.go` where CLAUDE.md says they belong.
-
-**`task ci` exit 0** (fmt, build, lint, race tests, dst) immediately before the first
-commit; an earlier run the same afternoon was red at `fmt:check` on
-`internal/metadata/metadatatest/contract.go`, another lane's file, and that lane fixed it.
-The four self-checks in `REFERENCE.md`'s header were run and are all empty. **Left for
-whoever holds the counters:** `CLAUDE.md` says "25 ADRs and 10 spec documents" and the
-tree has 22 and 7 — that file is outside this track's ownership.
 
 ## Track B — the gate runs (open work, appended per increment)
 
@@ -2045,63 +1985,6 @@ the property under test ("the process is still there and the lock is still refus
 about a process and a kernel, which is `integration/e2e`'s job. The retry's *effects* on
 the data path — what publishes, what refuses, what stays in the WAL — are covered by the
 unit arms above and by the existing publish scenarios.
-
-### C9 — a snapshot taken while a guest writes is one point, not a smear (2026-08-04)
-
-§19's whole claim is that a snapshot is a **sequence number, not an event**, and until now
-nothing tested it: every snapshot, restart and clone in these lanes happened over a device
-whose guest had already powered off, and the e2e lane's "snapshot of a live volume" asks
-for its snapshot thirteen lines after the guest has gone. `TestASnapshotOfAWritingGuestIsOnePointAndNotASmear`
-(`integration/vhost/lifecycle_test.go`) is the first test in this repository where a real
-Linux guest is writing to a device *while* something else happens to it.
-
-**The assertion is on bytes, and the weaker ones prove nothing.** "The snapshot object
-exists" is satisfied by a smeared snapshot — it exists too, with the wrong bytes in it, and
-a clone of it boots a state its parent never had. "The sequence is non-zero", or below the
-volume's, tests a number the same function writes into the manifest next to the bytes;
-nothing ties the two together, so `Freeze` could return the live map with a perfectly
-correct sequence and every sequence assertion in the tree stays green. And "the guest's
-data is in the snapshot" is the opposite half — completeness — which a copy of everything,
-including writes made after the freeze, passes perfectly.
-
-**The shape of the test is forced by two facts, and they are worth writing down because
-the obvious design does not work.** (1) `integration/guestinit`'s hold mode writes one
-constant pattern to eight fixed blocks, so a volume it is writing to stops changing about
-400 ms into the run — every later moment looks identical, and a snapshot taken at any of
-them is indistinguishable from a smear. The changing byte therefore has to be *filler the
-guest then overwrites*, which means the region must already be in the frozen view:
-`image.uploadChunks` evaluates `view.Ranges()` once, up front, so a range that did not
-exist at the freeze is never uploaded and could never carry a late write. The volume boots
-from an image the test publishes with `image.Publish`, with the guest's whole write region
-pre-filled. (2) Whether a write lands inside the freeze→upload window cannot be left to
-timing, so the Agent's object store is a double that **suspends the upload at its first
-chunk `Head`** and holds it there while the kernel boots and writes. That turns "the guest
-wrote while the copy was being made" from a race into an ordering the test enforces. A
-second, unwritten region below the guest's exists only so the frozen view is two chunks:
-`uploadChunks` reads a chunk's bytes and only then calls the store, so with one chunk the
-whole copy is already in memory before the first call and there is no moment to suspend
-the upload *at*.
-
-Planted bug — the natural error in `wal.Log.Freeze`, taking `l.view` without swapping a
-fresh layer over it, so the "frozen" map is the live one — red on the bytes:
-
-    the snapshot carries a byte the guest wrote after it was frozen: at volume offset
-    2097152 it holds 0x41, and the point it was frozen at (sequence 0) held 0xf5
-
-0x41 is `'A'`, the first byte of the guest's pattern, in a snapshot whose every byte should
-be filler. The other half of the test is what keeps that from being vacuous: a guest that
-wrote nothing — a moved offset in `guestinit`, a device swallowing requests — also leaves a
-snapshot full of filler, so the volume's **own** image, published when it stops, is read
-back and required to differ from the filler in the same region.
-
-Two things the first run of it established. The gate is on chunk keys and not on any
-`Head`, because loading a volume's base image Heads `manifest.json` once for the ETag its
-publish will CAS against — a gate on the first Head of any kind held the read view instead
-of the snapshot, and the assertion on *which* key it stopped at is what said so. And the
-lane, not `integration/e2e`, is where this can live: suspending an upload deterministically
-needs a store the test owns, and over RustFS the equivalent is a paused TCP proxy, which
-trades the deterministic window for an S3 client timeout — with the snapshot then failing
-and never being retried (`ensureSnapshot` starts one at most once per id).
 
 ## Track D — the catalog (open work, appended per increment)
 

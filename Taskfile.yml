@@ -336,7 +336,37 @@ tasks:
     deps: [build:guest, fetch:kernel]
     env: *guest_kernel_env
     cmds:
-      - test -f {{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
+      # This half was one `test -f`, and `test -f` says OK for a zero-byte file, for a
+      # half-written one, and for an archive with no /init — three states whose whole
+      # symptom is a kernel panic minutes later inside QEMU, attributed to the lane. Worse,
+      # `build:guest` does not rebuild any of them: its `sources:`/`generates:` fingerprint
+      # compares the *sources*, so a truncated artefact is "up to date". Verified 2026-08-04
+      # by emptying the file: the old target printed OK and exited 0.
+      #
+      # So the artefact is opened, not stat'ed, and every failure names the task that makes
+      # a good one. cpio is required rather than optional for the same reason the kernel's
+      # readelf check is: a machine that cannot look must not report OK.
+      - |
+        set -euo pipefail
+        img={{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
+        test -f "$img" || { echo "no initramfs at $img — run: task build:guest" >&2; exit 1; }
+        command -v cpio >/dev/null || {
+          echo "cpio is missing, so $img cannot be inspected (apt-get install cpio)" >&2; exit 1; }
+        gzip -t "$img" 2>/dev/null || {
+          echo "$img is not a valid gzip stream — a truncated or interrupted build; rebuild: task build:guest" >&2
+          exit 1; }
+        # ./init is the whole contract with the kernel: it mounts the archive as rootfs and
+        # execs /init, and an archive without one panics with "no working init found",
+        # which reads like a kernel problem rather than a missing build step.
+        # `find . | cpio` stores paths as ./init, and cpio --list prints them back without
+        # the ./ — matching only the stored spelling made this fail on a perfectly good
+        # archive the first time it ran, which is the crying-wolf failure a preflight can
+        # least afford.
+        listing=$(gzip -dc "$img" | cpio --list --quiet 2>/dev/null || true)
+        grep -qE '^(\./)?init$' <<<"$listing" || {
+          echo "$img contains no ./init — the kernel would mount it and panic with no PID 1; rebuild: task build:guest" >&2
+          exit 1; }
+        echo "OK: $img — gzip cpio carrying ./init"
       - bash hack/guest-kernel.sh verify
 
   guest:kernel:pin:

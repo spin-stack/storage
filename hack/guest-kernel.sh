@@ -16,7 +16,9 @@
 set -euo pipefail
 
 KERNEL=${KERNEL:-_output/guest/vmlinux}
-# The pin. Empty disables the check — for bisecting a kernel change, never for CI.
+# The pin. Empty lets `fetch` accept whatever it finds — for bisecting a kernel change,
+# never for CI — and is refused outright by `verify`, which has nothing to verify without
+# it.
 KERNEL_SHA256=${KERNEL_SHA256:-}
 KERNEL_VERSION=${KERNEL_VERSION:-}
 # Source 1: a sibling spinbox checkout that has already built one.
@@ -144,56 +146,77 @@ readonly REQUIRED_CONFIG=(
   CONFIG_SERIAL_8250_CONSOLE
 )
 
+# cmd_verify refuses every state that is not "checked and correct" — including the two
+# states that used to print OK: a check it was not asked to perform (an empty pin) and a
+# check it could not perform (no embedded config, no readelf). A preflight that reports
+# success for a kernel it did not read is worth less than no preflight, because the lane
+# it guards then fails later and somewhere else. Each refusal names the input and the task
+# that produces it: the reader is usually on a machine that has never run this lane.
 cmd_verify() {
   local fail=0
 
   test -f "$KERNEL" || { echo "no kernel at $KERNEL — run: task fetch:kernel" >&2; return 1; }
 
-  if [ -n "$KERNEL_SHA256" ]; then
-    local got
-    got=$(sha256 "$KERNEL")
-    if [ "$got" != "$KERNEL_SHA256" ]; then
-      echo "$KERNEL is not the pinned kernel:" >&2
-      echo "  pinned $KERNEL_SHA256" >&2
-      echo "  found  $got" >&2
-      echo "re-fetch it (task fetch:kernel) or re-pin deliberately (task guest:kernel:pin)" >&2
-      return 1
-    fi
+  # An empty pin used to mean "skip the hash comparison", which made `verify` pass for any
+  # file that happened to be at $KERNEL. `fetch` still honours an empty pin — acquiring an
+  # unpinned kernel is what bisecting a kernel change needs — but *verifying* against no
+  # pin is a contradiction, and it is how a lane certifies one kernel and reports on
+  # another.
+  test -n "$KERNEL_SHA256" || {
+    echo "GUEST_KERNEL_SHA256 is empty: there is no pin to verify $KERNEL against" >&2
+    echo "print its hash with 'task guest:kernel:pin -- $KERNEL' and set GUEST_KERNEL_SHA256 in Taskfile.yml" >&2
+    return 1; }
+  local got
+  got=$(sha256 "$KERNEL")
+  if [ "$got" != "$KERNEL_SHA256" ]; then
+    echo "$KERNEL is not the pinned kernel:" >&2
+    echo "  pinned $KERNEL_SHA256" >&2
+    echo "  found  $got" >&2
+    echo "re-fetch it (task fetch:kernel) or re-pin deliberately (task guest:kernel:pin)" >&2
+    return 1
   fi
 
   # The lane boots a PVH ELF, not a bzImage. QEMU's failure for the wrong one is a
   # rom-open error that reads like a backend bug, which is why it is checked here.
   head -c4 "$KERNEL" | grep -q 'ELF' || {
     echo "$KERNEL is not an ELF: the lane boots a PVH kernel, not a bzImage" >&2; return 1; }
-  if command -v readelf >/dev/null; then
-    readelf -n "$KERNEL" 2>/dev/null | grep -q 'Xen' || {
-      echo "$KERNEL has no Xen PVH note: QEMU has no entry point for it (needs CONFIG_PVH=y)" >&2
-      return 1; }
-  fi
+  # readelf absent used to skip the PVH-note check silently, on the theory that the tool is
+  # optional. It is not: without the note QEMU has no entry point, and a machine that
+  # cannot look is a machine that must not say OK.
+  command -v readelf >/dev/null || {
+    echo "readelf is missing, so $KERNEL's Xen PVH note cannot be checked" >&2
+    echo "install binutils (apt-get install binutils) — QEMU has no entry point for a kernel without that note" >&2
+    return 1; }
+  readelf -n "$KERNEL" 2>/dev/null | grep -q 'Xen' || {
+    echo "$KERNEL has no Xen PVH note: QEMU has no entry point for it (needs CONFIG_PVH=y)" >&2
+    return 1; }
 
-  local config checked
+  local config
   config=$(ikconfig || true)
-  if [ -n "$config" ]; then
-    local opt
-    for opt in "${REQUIRED_CONFIG[@]}"; do
-      if ! grep -q "^${opt}=y$" <<<"$config"; then
-        echo "$KERNEL was built without ${opt}=y" >&2
-        fail=1
-      fi
-    done
-    [ "$fail" -eq 0 ] || return 1
-    checked="${REQUIRED_CONFIG[*]} present"
-  else
-    # Legal, just unverifiable: nothing says a kernel must carry its config.
-    echo "warning: $KERNEL has no embedded config (CONFIG_IKCONFIG=n) — ${REQUIRED_CONFIG[*]} unchecked" >&2
-    checked="config unchecked"
-  fi
+  # A kernel carrying no config is legal in general and impossible here: the hash above
+  # already established this is the artefact we pinned, and that one embeds its config.
+  # So "unverifiable" means the pinned artefact changed shape, which is precisely when the
+  # four options below stop being checked — the warning this replaces let that pass with a
+  # line nobody reads in CI.
+  [ -n "$config" ] || {
+    echo "$KERNEL has no embedded config (CONFIG_IKCONFIG=n), so ${REQUIRED_CONFIG[*]} cannot be checked" >&2
+    echo "it matches GUEST_KERNEL_SHA256, so the pinned artefact itself changed: re-pin a kernel built with" >&2
+    echo "CONFIG_IKCONFIG=y (cd ../spinbox && task build:kernel; task guest:kernel:pin -- <file>)" >&2
+    return 1; }
+  local opt
+  for opt in "${REQUIRED_CONFIG[@]}"; do
+    if ! grep -q "^${opt}=y$" <<<"$config"; then
+      echo "$KERNEL was built without ${opt}=y" >&2
+      fail=1
+    fi
+  done
+  [ "$fail" -eq 0 ] || return 1
 
   # Just the version, not the full banner: the banner runs to the build host and
   # timestamp, and the first copy of it in the image is a truncated format string.
   local version
   version=$(strings -a "$KERNEL" 2>/dev/null | grep -m1 -o 'Linux version [^ ]*' || true)
-  echo "OK: ${version:-$KERNEL} — PVH ELF, $checked"
+  echo "OK: ${version:-$KERNEL} — pinned, PVH ELF, ${REQUIRED_CONFIG[*]} present"
 }
 
 # --- pin --------------------------------------------------------------------------
