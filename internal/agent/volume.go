@@ -906,8 +906,14 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		v.log.FailBase(err)
 		return
 	}
+	// reclaimed_local_bytes is what installing that base gave back to the device: the
+	// previous session's segments, whose records this image already holds (wal.InstallBase).
+	// It belongs on this line because it is the only place the number can be attributed —
+	// an operator watching a host's data directory shrink at start-up otherwise has
+	// nothing saying which volume it was, or that it was deliberate.
 	slog.Info("read view recovered from the object store",
 		"volume_id", v.id, "epoch", v.epoch, "durable_sequence", durable,
+		"reclaimed_local_bytes", v.log.ReclaimedBytes(),
 		"cloned_from", d.GetParentSnapshotId())
 }
 

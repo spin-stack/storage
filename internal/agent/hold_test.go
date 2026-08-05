@@ -312,3 +312,19 @@ func (s *failingStore) failed() int {
 	defer s.mu.Unlock()
 	return s.failures
 }
+
+// refuseEverything and takeEverything turn the outage on and off between sessions, for
+// the tests that need one incarnation to publish and the next not to (resume_test.go).
+// Methods rather than a field the test writes, because failPuts is read under the lock
+// from whatever goroutine is publishing.
+func (s *failingStore) refuseEverything() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failPuts = -1
+}
+
+func (s *failingStore) takeEverything() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failPuts = 0
+}

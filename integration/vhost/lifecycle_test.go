@@ -124,16 +124,142 @@ func TestAGuestSurvivesAStopAndComesBackFromItsImage(t *testing.T) {
 	}
 }
 
+// TestASecondSessionGivesBackTheWALItsImageAlreadyHolds is the test above with its third
+// step **removed**, and that is the whole point of having both.
+//
+// That one deletes the local WAL by hand so only the image can answer. This one leaves it
+// exactly where the first session left it, which is what a restarted Agent actually finds:
+// re-attaching happens at the *same* epoch (ADR-0024), so the second session opens
+// <data-dir>/wal/<volume-id>/<epoch> with the previous session's segments still in it.
+// Nothing in this repository had ever asked what happens to them.
+//
+// What happened was nothing: they were replayed on top of an image that already held
+// every one of their records, and kept. Kept for the life of the host, because a session
+// only ever appends and the next one adopts what it finds — so a volume started and
+// stopped ten times held ten sessions of WAL, all of it redundant, against a
+// Limits.MaxLocalBytes that no session clears. The visible end of that is a guest whose
+// WRITEs are refused with backpressure for good, on a volume whose every byte is safe in
+// the bucket.
+//
+// The assertions are bytes on a real filesystem before and after, and a real kernel
+// reading its own pattern back afterwards. Neither is enough alone: an Agent that deleted
+// the whole directory passes the first, and one that reclaimed nothing passes the second.
+func TestASecondSessionGivesBackTheWALItsImageAlreadyHolds(t *testing.T) {
+	kernel, initramfs := testinfra.GuestImages(t)
+	_, _ = testinfra.QEMUPaths(t) // skip early if QEMU is missing, before anything is built
+
+	ctx := t.Context()
+	dir := laneDir(t)
+	volumeID := ids.New().String()
+
+	// A 128 KiB share, so Budget makes the segments 16 KiB. guestinit's write mode puts
+	// eight 4 KiB blocks on the device — about 33 KiB of records — which fills two
+	// segments and opens a third. That matters because reclaim never unlinks the newest
+	// segment: on the lane's ordinary 1 MiB share this guest's whole session fits in one
+	// file, and a test over one file cannot tell a working reclaim from none.
+	budget := agent.Budget{DeviceBytes: 1 << 20, ReserveBytes: 64 << 10, GuestBytes: 128 << 10, MaxVolumes: 1}
+
+	m, sock := startAgentBudgeted(t, ctx, dir, volumeID, budget)
+
+	// (1) A real guest writes and fsyncs. Nothing has left the host yet: the ACK is a
+	// local fdatasync (§14.8, INV-18).
+	if _, out := testinfra.RunLinuxGuest(t, sock, kernel, initramfs); !strings.Contains(out, "GUESTINIT-PASS") {
+		t.Fatalf("the first boot did not report a pass:\n%s", testinfra.VerdictLines(out))
+	}
+
+	before := segmentFiles(t, dir, volumeID)
+	beforeBytes := totalBytes(t, before)
+	if len(before) < 2 {
+		t.Fatalf("the guest's session left %d segment file(s) in %s: reclaim never unlinks the newest, "+
+			"so this fixture could not tell a working reclaim from none", len(before), filepath.Join(dir, "wal"))
+	}
+
+	// (2) Stopping publishes the image, and releasing the volume deliberately deletes
+	// nothing — the records stay so a publish that had failed could be retried by the next
+	// incarnation (SHUTDOWN-PUBLISH-SPEC §6). Both halves are asserted, because the
+	// assertion after the restart would also be satisfied by a release that reclaimed.
+	if err := m.Close(t.Context()); err != nil {
+		t.Fatalf("stopping the Agent: %v", err)
+	}
+	if len(imageObjects(t, dir)) == 0 {
+		t.Fatal("stopping the Agent published no image: there is nothing that could make the local WAL redundant")
+	}
+	if held := segmentFiles(t, dir, volumeID); len(held) != len(before) {
+		t.Fatalf("releasing the volume left %d of %d segments: an abandoned publish would have nothing to retry from",
+			len(held), len(before))
+	}
+
+	// (3) A second Agent on the same directory, and a real kernel reading the range back.
+	// The read is what proves the reclaim cost the guest nothing, and it is also what
+	// makes the measurement below well defined: a read cannot be answered until the base
+	// is installed, and installing the base is what reclaims.
+	m2, sock2 := startAgentBudgeted(t, ctx, dir, volumeID, budget)
+	defer func() { _ = m2.Close(t.Context()) }()
+
+	_, out := testinfra.RunLinuxGuest(t, sock2, kernel, initramfs, "spin.mode=verify")
+	switch {
+	case strings.Contains(out, "GUESTINIT-FAIL"):
+		t.Fatalf("after the second session reclaimed the WAL its image covers, the guest could not read its own data:\n%s",
+			testinfra.VerdictLines(out))
+	case !strings.Contains(out, "GUESTINIT-PASS"):
+		t.Fatalf("the second boot reported no verdict:\n%s", out)
+	}
+
+	after := segmentFiles(t, dir, volumeID)
+	afterBytes := totalBytes(t, after)
+	if len(after) != 1 || afterBytes >= beforeBytes {
+		t.Fatalf("the second session kept %d segment file(s) holding %d bytes, out of the %d files and %d bytes "+
+			"its own image already covers: this host's data directory grows by a session on every restart, "+
+			"and nothing ever clears MaxLocalBytes",
+			len(after), afterBytes, len(before), beforeBytes)
+	}
+	t.Logf("%d segments (%d bytes) reduced to %d (%d bytes), and the guest still reads its own pattern",
+		len(before), beforeBytes, len(after), afterBytes)
+}
+
+// totalBytes is what those files occupy on the device. Stat and not a number the Agent
+// reports: "the data directory is growing" is a statement about a filesystem, and no
+// counter the code maintains can make it true or false.
+func totalBytes(t *testing.T, names []string) int64 {
+	t.Helper()
+	var total int64
+	for _, name := range names {
+		fi, err := os.Stat(name)
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		total += fi.Size()
+	}
+	return total
+}
+
 // startAgent runs the real per-volume runtime against dir and returns the manager and
 // the socket it bound. The wiring is production's: hostio for the socket and the kernel
 // objects, real.Disk and a filesystem object store.
 func startAgent(t *testing.T, ctx context.Context, dir, volumeID string) (*agent.VolumeManager, string) {
 	t.Helper()
+	return startAgentBudgeted(t, ctx, dir, volumeID, laneBudget())
+}
+
+// startAgentBudgeted is startAgent with the device budget chosen by the caller. Only the
+// reclaim test needs one: the segment size is an eighth of the share, so a test that
+// wants several *sealed* segments out of the 32 KiB this guest writes has to say so.
+func startAgentBudgeted(t *testing.T, ctx context.Context, dir, volumeID string, budget agent.Budget) (*agent.VolumeManager, string) {
+	t.Helper()
 	store, err := real.NewObjectStore(filepath.Join(dir, "bucket"))
 	if err != nil {
 		t.Fatalf("real.NewObjectStore: %v", err)
 	}
-	return startAgentOn(t, ctx, dir, volumeID, store)
+	return startAgentOn(t, ctx, dir, volumeID, store, budget)
+}
+
+// laneBudget is what most of this lane runs on. A budget rather than a raw wal.Limits:
+// production has no other way to bound a log any more, so a lane that set the limits
+// itself would be testing a wiring no Agent uses (ADR-0013 §1). The share is 1 MiB, which
+// Budget turns into 128 KiB segments — large enough that the guest is never the one
+// refused, and small enough to seal at all.
+func laneBudget() agent.Budget {
+	return agent.Budget{DeviceBytes: 8 << 20, ReserveBytes: 1 << 20, GuestBytes: 1 << 20, MaxVolumes: 1}
 }
 
 // startAgentOn is startAgent with the object store handed in, for the one test that has
@@ -141,7 +267,7 @@ func startAgent(t *testing.T, ctx context.Context, dir, volumeID string) (*agent
 // its first call and needs a store it can hold, not one this function builds and keeps.
 // Everything else about the wiring is identical, deliberately — two copies of the Agent's
 // production wiring would drift, and the one that drifted would be the one nobody ran.
-func startAgentOn(t *testing.T, ctx context.Context, dir, volumeID string, store objectstore.Store) (*agent.VolumeManager, string) {
+func startAgentOn(t *testing.T, ctx context.Context, dir, volumeID string, store objectstore.Store, budget agent.Budget) (*agent.VolumeManager, string) {
 	t.Helper()
 	d, err := real.NewDisk(dir)
 	if err != nil {
@@ -155,14 +281,7 @@ func startAgentOn(t *testing.T, ctx context.Context, dir, volumeID string, store
 		// namespace, and passing dir here is DEV-0017.
 		DataDir:   ".",
 		SocketDir: dir,
-		// A budget rather than a raw wal.Limits: production has no other way to bound a
-		// log any more, so a lane that set the limits itself would be testing a wiring
-		// no Agent uses (ADR-0013 §1). The share is 1 MiB, which Budget turns into
-		// 128 KiB segments — small enough to seal several times under the 512 KiB this
-		// guest writes, because reclaim only unlinks sealed segments and a truncation
-		// that unlinks nothing would make step 3 vacuous, and large enough that the
-		// guest is never the one refused.
-		Budget: agent.Budget{DeviceBytes: 8 << 20, ReserveBytes: 1 << 20, GuestBytes: 1 << 20, MaxVolumes: 1},
+		Budget:    budget,
 	}, agent.VolumeManagerDeps{
 		Clock:   real.NewClock(),
 		Disk:    d,
@@ -354,7 +473,7 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 		t.Fatalf("publishing the image this volume boots from: %v", err)
 	}
 
-	m, sock := startAgentOn(t, ctx, dir, volumeID, gate)
+	m, sock := startAgentOn(t, ctx, dir, volumeID, gate, laneBudget())
 
 	// Arm the gate before asking, not after: the reconcile path starts the upload inside
 	// Apply, and a gate armed afterwards would be armed behind it.

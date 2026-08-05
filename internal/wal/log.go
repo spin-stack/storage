@@ -231,6 +231,10 @@ func (l *Log) SegmentNames() []string {
 func (l *Log) TruncateLocal(upTo uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.truncateLocalLocked(upTo)
+}
+
+func (l *Log) truncateLocalLocked(upTo uint64) error {
 	if err := l.orderPolicy().AllowTruncate(upTo, l.watermarksLocked()); err != nil {
 		return err
 	}
@@ -500,22 +504,49 @@ func (l *Log) Read(offset uint64, buf []byte) error {
 }
 
 // InstallBase adopts the read view recovered from the object store, under everything the
-// local segments replayed. It is the seam BUILD-INVENTORY increment 5 exists to add:
-// recovery.Recover and materialize.From* have always produced exactly this object and
-// nothing could consume it.
-// InstallBase adopts the read view recovered from the object store, under everything the
-// local segments replayed, and with it the durable sequence that view covers.
+// local segments replayed, and with it the durable sequence that view covers. It is the
+// seam BUILD-INVENTORY increment 5 exists to add: image.Load produces exactly this object
+// and nothing could consume it.
 //
 // The watermarks it sets are the point of taking `durable` here rather than at resume:
 //
 //   - durable and published both become the recovered point. Those objects are verified
-//     — that is what made truncating the local WAL legal — so published must say so, or
+//     — that is what makes truncating the local WAL legal — so published must say so, or
 //     StrictOrder.AllowTruncate (INV-13) refuses to reclaim ranges the store already
-//     holds and the first checkpoint after a restart republishes finished work.
+//     holds.
 //   - local is raised to at least that point. Not bookkeeping: the next append must not
 //     reuse a sequence an object already carries, which is exactly what would happen on
 //     a volume whose local segments were all reclaimed and whose replay therefore found
 //     nothing.
+//
+// # It reclaims the segments the base makes redundant
+//
+// This is the only moment anything in the process knows they are redundant: the caller
+// knows an image covers `durable`, this type knows which segments that sequence spans,
+// and neither knows both anywhere else. Nothing was doing it — TruncateLocal has had no
+// production caller since ADR-0026 deleted the checkpoint that used to call it — and the
+// cost was not theoretical. A restarted Agent re-attaches at the *same* epoch (ADR-0024),
+// so it resumes the same directory: without this, one volume started and stopped ten
+// times on one host holds ten sessions of WAL, every record of them inside its image, and
+// Limits.MaxLocalBytes is cleared by nothing at all. The end state is a guest whose WRITEs
+// are refused with ErrBackpressure for good, on a volume whose every byte is in the
+// bucket.
+//
+// It is safe for a stronger reason than "the base holds them". A read on a log resumed
+// awaiting a base cannot be answered from the segments at all — Read parks on baseWait and
+// returns ErrBaseUnavailable if the base never arrives — so segments the base covers are
+// not a fallback for anything: they can answer no read the base could not. What they
+// *would* be a fallback for is the records above `durable`, a session that wrote after its
+// last publish, and reclaim keeps every one of those: it unlinks only segments whose last
+// possible record is at or below the point, and never the newest.
+//
+// Under the lock and before the parked reads are released, deliberately. A WRITE arriving
+// between the release and a later reclaim would be weighed against a footprint this call
+// has already superseded — a guest refused over bytes that were about to be given back.
+//
+// Rejected: doing it in the Agent, once InstallBase has returned. It puts one rule in two
+// components, leaves that window open, and makes the Agent reach through the log into a
+// segment set it does not own.
 func (l *Log) InstallBase(base *cow.IntervalMap, durable uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -539,6 +570,14 @@ func (l *Log) InstallBase(base *cow.IntervalMap, durable uint64) error {
 	}
 	if durable > l.published {
 		l.published = durable
+	}
+	if err := l.truncateLocalLocked(durable); err != nil {
+		// baseWait stays open, so the caller's FailBase is what resolves it and the
+		// volume refuses to serve. A disk that cannot unlink a file this process listed a
+		// moment ago is the disk the next guest WRITE is about to be appended to, and
+		// carrying on — the view is correct either way — would mean serving from it while
+		// pretending the failure was cosmetic.
+		return fmt.Errorf("wal: reclaiming the local WAL the installed base already holds: %w", err)
 	}
 	close(l.baseWait)
 	return nil
