@@ -17,12 +17,34 @@ Each row answers one question, and no two answer the same one.
 **The `*-SPEC.md` files are review artefacts, not a category.** `CLAUDE.md` asks for a
 spec before implementing *only* inside a human-review zone; everywhere else the increment
 is the plan. So each one exists to be read by a person before a risky change, and once
-that change has landed its decisions belong in comments at the code. One of them is cited
-by a `.go` file (`VIEW-ADOPTION-SPEC.md`); the rest are reachable only from `STATUS.md`.
+that change has landed its decisions belong in comments at the code.
+
+**Which of them the code still cites is a command, not a sentence:**
+
+```
+for f in docs/plan/*-SPEC.md; do
+  printf '%2d %s\n' "$(grep -rl "$(basename "$f" .md)" --include='*.go' . | wc -l)" "$(basename "$f")"
+done
+```
+
+Run on 2026-08-04 it answered **6** for `SHUTDOWN-PUBLISH-SPEC.md` (`internal/agent/volume.go`
+and `loop.go`, `cmd/volume-agent/main.go`, `internal/dst/scenarios_agent.go` and two lane
+tests), **1** for `VIEW-ADOPTION-SPEC.md`, and **0** for every other. The sentence this
+replaced said one spec was cited by a `.go` file and named the wrong one — it was written
+before the shutdown-publish increment landed and was never rechecked, which is precisely
+the drift this directory exists to prevent. A count in prose is a second thing to
+maintain; the command is the answer.
+
 Treat a spec whose increment is done as history, which this directory keeps in git rather
-than in the tree — `SNAPSHOT-LIFECYCLE-SPEC.md` and `OBJECTIZATION-SPEC.md` were removed on
-that rule (2026-08-03), the first superseded by ADR-0026 increment 3 and the second
-describing a V2 object kind whose readers no longer exist.
+than in the tree. Removed on that rule: `SNAPSHOT-LIFECYCLE-SPEC.md` and
+`OBJECTIZATION-SPEC.md` (2026-08-03) — the first superseded by ADR-0026 increment 3, the
+second describing a V2 object kind whose readers no longer exist — and
+`DURABILITY-SCHEDULER-SPEC.md` and `RUNTIME-FENCING-SPEC.md` (2026-08-04), whose subjects
+ADR-0026 deleted: there is no checkpoint scheduler and no lease-gated ACK for a spec to
+govern. Nothing cited either from code. The decisions that outlived them are in the tree,
+not in git: the fencing teardown is at `VolumeManager.Fence` and `fencedEpoch`
+(`internal/agent/volume.go`), and the one guarantee `wal.Log` still owns about concurrency
+is proven by its own tests.
 
 The count that used to open this file ("Eight entries") had been wrong for a while, in the
 direction that matters: the directory kept growing and the map did not. A number here is a
