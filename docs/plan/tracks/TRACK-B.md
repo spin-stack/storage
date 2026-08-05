@@ -158,3 +158,78 @@ Each exits non-zero; with good inputs the target is green.
 because it is the failure mode that gets a preflight disabled: the first `./init` matcher
 was `grep -qx './init'`, and `cpio --list` prints the stored `./init` back as `init`, so a
 perfectly good initramfs failed. Caught by running the good path, not by reading it.
+
+**B10: a skip stops looking like a pass, and CI runs the guest-backed proofs
+(2026-08-05, `8c9d296`, `927f79d`, `d27c988`, and the commit this entry lands in).** The
+item is one sentence — `task ci:full` reported success on a machine that had booted no
+guest — and it took four commits because the lie had three layers.
+
+*The exit code.* `test:integration:qemu` printed `SKIP: no QEMU in _output` and exited 0,
+and every test under both guest-backed lanes skipped itself for the same reason, so the
+merge gate was green on every machine but one laptop while running none of the proofs a
+real Linux kernel carries: that a guest's `fsync` puts zero objects in the bucket, that a
+snapshot taken while a guest writes is one point and not a smear, that an Agent that
+cannot publish keeps its data directory. The decision now belongs to whoever makes the
+claim: a caller passes `REQUIRE_PROOFS`, the lanes export it as `SPIN_REQUIRE_PROOFS`, and
+`testinfra.missingInput` — one helper behind all three "input is not built" sites, so a
+lane cannot acquire a new way to skip without going through it — turns a skip into a
+failure under it. `ci:full` sets it; `ci:noguest` is the *same* `ci:lanes` list with it
+unset and ends by printing what it did not prove. A second target name rather than an
+opt-out variable, because the sentence people exchange is "ci:full was green" and an
+environment variable is invisible inside it. The alternatives, including the
+machine-readable skip summary, are written at the gate targets in `Taskfile.yml`.
+
+*The workflow.* CI had never executed one of these proofs and could not have: the `ci`
+job ran `ci:full` on a runner with no QEMU, and `guest-lane` would have died at
+`fetch:kernel`, which had no source to fetch from. `guest-inputs` now resolves both
+artefacts this repository does not build — the pinned QEMU runtime image and the mirrored
+kernel, both named from the Taskfile via `qemu:version` and `guest:kernel:tag` so no
+version is spelled twice — and hands the kernel on as an artefact; `guest-lane` and
+`guest-e2e-lane` run the two lanes with `REQUIRE_PROOFS=1` in container jobs on that
+image; `ci` runs `ci:noguest`, which is what a runner with Docker and no QEMU can honestly
+claim. `gate` is the job to require on the branch: `needs` alone enforces nothing, because
+a *skipped* needed job leaves its dependents free to run and a workflow of green-and-grey
+boxes reports as a passing run — the same defect as a target exiting 0 after printing
+SKIP, one level up. It now enumerates its lanes with `toJSON(needs)` instead of keeping a
+hand-written result map beside `needs:`, since two lists with nothing holding them equal
+is that defect one level in again, and it fails on an empty enumeration.
+
+*The reading.* Both of those were verified by reading, because no workflow can execute
+here — and reading is what goes stale. `task workflows:verify` (`hack/workflow-tasks.sh`,
+in `task ci`) resolves every `task <name>` in `.github/workflows` with `task --summary`,
+which also refuses an `internal:` target a workflow may not call. Its first finding was
+immediate: `guest:proofs` described itself as "what CI's guest jobs run" and no workflow
+named it — nor could one, since a hosted runner has the pinned QEMU or a Docker daemon and
+not both (ADR-0025). Deleted rather than re-described.
+
+**Verified both ways, on the machine that has the pinned QEMU.** With it present,
+`task test:integration:qemu REQUIRE_PROOFS=1` is `ok ... 8.260s`, exit 0. Pointed at an
+empty tree (`OUTPUT_DIR=/tmp/spin-empty-out`) the same command exits **201** at
+`guest:ready` — `missing .../bin/qemu-system-x86_64 — run: task build:qemu` — and without
+`REQUIRE_PROOFS` it prints SKIP and exits **0**, which is the developer path the design
+keeps. Below the preflight, where CI's jobs actually live, the tests themselves go red:
+`SPIN_REQUIRE_PROOFS=1 QEMU_OUTPUT_DIR=<empty>` over `integration/vhost` exits **1** with
+every guest test FAIL naming its missing input and the remedy. The `gate` job's body was
+run against the shapes GitHub produces for `needs`: all-success 0, a failed `guest-inputs`
+with two skipped lanes 1, `{}` 1.
+
+**What is still blocked, and it is not a failure — it is two artefacts nobody has
+published.** The workflow is red until both exist, deliberately, and its preflight prints
+the command for each:
+
+- **The QEMU runtime image**, `ghcr.io/<owner>/<repo>/qemu:$(task qemu:version)`. Nothing
+  is missing but a run: `.github/workflows/qemu.yml` publishes it, it has
+  `workflow_dispatch`, and anyone with write access can trigger it. It is not on the
+  per-push path because the build is tens of minutes.
+- **The mirrored guest kernel**, `guest-kernel:$(task guest:kernel:tag)`. This one needs a
+  human: storage never builds a kernel (ADR-0021), so it has to come from a machine with a
+  sibling spinbox checkout that has already built the pinned artefact —
+  `task fetch:kernel && task guest:kernel:push GUEST_KERNEL_IMAGE=...`, with
+  `packages: write`. Until then `vars.GUEST_KERNEL_IMAGE` can point at any registry path
+  carrying it; `hack/guest-kernel.sh` re-hashes whatever it pulls against
+  `GUEST_KERNEL_SHA256` regardless of where it came from.
+
+Both are private packages by default, so a pull request from a fork gets a token that
+cannot read them and its gate will be red. There are no forks and no runner yet; the
+choice when there are is to make the two packages public, and the comment at
+`guest-inputs` is where having made it should be recorded.
