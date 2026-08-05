@@ -375,6 +375,17 @@ tasks:
     cmds:
       - bash hack/guest-kernel.sh pin {{.CLI_ARGS}}
 
+  guest:kernel:tag:
+    desc: >-
+      Print the content tag of the pinned guest kernel (sha256-<pin>) — the tag
+      `guest:kernel:push` publishes alongside the version. CI resolves the mirror from
+      this so no workflow spells the pin out a second time, and the tag is
+      content-addressed for the same reason ADR-0022 pins by hash: a tag that can be
+      moved is a kernel that can be swapped under a lane that already certified it.
+    silent: true
+    cmds:
+      - echo "sha256-{{.GUEST_KERNEL_SHA256}}"
+
   guest:kernel:push:
     desc: >-
       Mirror the pinned kernel into a registry so machines with no spinbox checkout can
