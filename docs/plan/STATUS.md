@@ -529,6 +529,31 @@ mid-session replay to bound. §22.4's lazy loading is the same. Under ADR-0026 t
 is one manifest and its chunks, and what shortens it is placement (increment 5), not a new
 object kind.
 
+## DEV-0023 — the design document still has resize, and V1 does not
+
+Wave 5 deleted `metadata.ResizeVolume` and everything under it: V1 does not grow a volume,
+because a row that grows is not a volume that grows and nothing on the Agent side ever
+acted on a size change. The reasoning and the guard test are in `tracks/TRACK-D.md`, and
+`metadata.go` carries the note where the verb used to be.
+
+`arquitectura_mvp_volumenes_remotos_v5.md` still promises it, in five places and in the
+present tense: §1's objective bullet (*resize online (grow)*), §7's client-facing operation
+list, the `size_bytes` column comment (*mutable: resize grow*), the operation-kind enum, and
+§9's propagation sentence (config space + notification + `resize2fs` in the guest). None
+carries a marker.
+
+**It is a DEV entry and not a struck-through decision, which is what the deleting lane
+recorded.** CLAUDE.md is explicit: an observed doc↔code divergence is a DEV entry in this
+file, and an open one blocks the gate. The lane's judgement — that the document describes
+the product rather than V1's scope — is reasonable and is exactly the judgement the DEV
+mechanism exists to make visible rather than resolve silently.
+
+**Two ways to close it**, and it is track A's to do either way: mark those five places the
+way §17, §21, §23 and §31 were marked when ADR-0026 withdrew them — a banner naming what is
+V2 — or, if resize is meant to be V1, reopen it as an increment with the Agent half that
+was always missing. What is not an option is leaving a document promising a verb whose
+implementation was deleted this week.
+
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 
 `WAL-SEGMENTS-SPEC.md` asks that creating a segment be charged against the device budget
