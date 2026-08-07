@@ -285,3 +285,102 @@ the snapshot measurement collapsing to `Bytes=4096 Extents=1 Layers=1 (amplifica
 before reaching them on two other lanes' uncommitted files (`fmt:check` on
 `integration/e2e/desired_test.go`, `lint` on `internal/metadata/pg`), neither touched here;
 `golangci-lint run` and `fmt --diff` over `internal/cow` and `internal/obs` are clean.
+
+### E6 — a collector that has actually received something (2026-08-07)
+
+E2 closed with the sentence this item exists to delete: *"no lane starts the real Agent
+binary with `-otlp-endpoint` pointed at a receiver and asserts a series arrives… 'a metric
+leaves the process' is proven for the exporter and the provider, not for the binary."*
+Since then track C wired `cmd/volume-agent` exactly as E2's handoff described. Every link
+was then covered and **the chain had still never been run**: a binary that built its
+Provider and dropped it, or handed `agent.Deps` a `Recorder` nothing reached, or exited
+before the flush, satisfies every existing test in this tree. That is the shape of every
+row in CLAUDE.md's "build it thin" table.
+
+`internal/simio/real/agent_export_test.go` builds `cmd/volume-agent` with `go build`,
+starts it as a process against an OTLP/HTTP receiver on a real socket, signals it, waits
+for it, and asserts on **what the collector decoded** — a name, a value, and a label.
+
+**Two things established first, because they decided the shape.**
+
+*What an Agent with no volume exports.* Two series, and only two: `lease_remaining_seconds`
+(gauge, one record per successful heartbeat) and `lease_renewal_failures_total` (counter,
+one per failed one), both in `agent.Loop.heartbeat`. Everything else in `obs.Catalog()`
+needs a volume — the WAL's watermarks and `wal_out_of_space`, the read-view gauges,
+`image_publish_duration_seconds`, the two snapshot histograms. So a volume-less Agent is
+the smallest process that can prove the telemetry path at all, and those two names are the
+only ones it can prove it with. **That is a finding about the metric set, not an
+obstacle** — and while establishing it, a second one fell out: a good part of the catalog
+has no producer anywhere in the tree. The set is computed, never written down:
+
+```
+comm -23 \
+  <(grep -oE '\{"[a-z0-9_]+", Kind' internal/obs/metrics.go | cut -d'"' -f2 | sort -u) \
+  <(grep -rhoE '(Gauge|Count|Observe)\(ctx, "[a-z0-9_]+"' --include='*.go' internal/ | cut -d'"' -f2 | sort -u)
+```
+
+It currently prints the S3 subsystem's four, the fleet's `chain_depth`,
+`clone_cross_host_total`, `discarded_bytes_total` and `host_nvme_committed_ratio`, the
+Agent's `agent_memory_bytes`, `vhost_reconnects_total` and `inflight_recovered_total`,
+`clock_offset_seconds`, and three WAL series (`wal_append_latency_seconds`,
+`wal_fdatasync_latency_seconds`, `wal_oldest_unflushed_age_seconds`). Declared and never
+recorded is the DEV-0010 shape the catalog was already trimmed for once — a series
+permanently absent reads as a plan. Not touched here: it is a deletion item of its own,
+and this one is about proving the path that does work.
+
+*What delivers the sample.* The flush, and nothing else. `obs.NewProvider` attaches a
+`PeriodicReader` whose interval is the SDK's default minute, so in a test measured in
+seconds **`Shutdown` is the only thing that can put a byte on the wire** — which is why
+the test signals and then waits for the process rather than killing it, and why the first
+planted bug below is the one that matters most. Retries stay off (E2's decision), so a
+collector that is down costs the shutdown nothing.
+
+**What is asserted, and why it is not circular.** The fake Control Plane grants a lease of
+300s while the Agent is started with `-lease-ttl 2h`. §12.2 says the Agent's window is the
+Control Plane's answer and never its own configuration, so the number the collector decodes
+has to be ~300 and not 7200 — an assertion that a value merely *arrived* would pass on the
+wrong one. The `host` label is checked against the UUIDv7 this test put on the command
+line, which is what rules out a sample from anywhere else, and `service.name` against
+`volume-agent`. The second test points the Agent at a Control Plane that is not there and
+asserts `lease_renewal_failures_total = 1` exactly: with `-heartbeat-interval` and
+`-retry-backoff` both an hour, one cycle runs, one heartbeat fails, and `Sustain` sleeps
+through the shutdown — so the value is a fact and not a race. That case is also the harder
+flush: the process spends its whole shutdown talking to something that is not answering.
+
+**Three planted bugs, each watched go red** (planted in a scratch `git worktree` at HEAD,
+because all three are in files this lane does not own — `git checkout --` would have
+discarded this lane's own uncommitted work, which is how wave 5 lost a fix):
+
+- dropping the deferred `telemetry.Shutdown` in `cmd/volume-agent/main.go` →
+  `the collector received no lease_remaining_seconds from the running Agent; it decoded []`
+  (and the same for the counter);
+- `Recorder: nil` in the binary's `agent.Deps` → the same two lines. This is the *exact*
+  state `cmd/volume-agent` shipped in until E2, and no test in the tree could see it;
+- recording `l.cfg.LeaseTTL` instead of `l.leaseRemaining()` in `agent.Loop.heartbeat` →
+  `the collector decoded lease_remaining_seconds = 7200, want the Control Plane's 300s
+  lease less one round trip`.
+
+**Where it lives, and the alternative rejected.** Its honest home is `integration/e2e`,
+which already runs both binaries — and that file set is track C's this wave, so landing it
+there means editing files this lane does not own. `internal/simio/real` was chosen over
+waiting, and the consequence is an argument for it: the e2e lane is Docker-gated, and this
+test needs no Docker at all (a fake Control Plane over `httptest` and a filesystem object
+store are everything an idle Agent wants), so it runs in `task test` on every push. It is
+also the package whose code opens the socket, which is where INV-01 put the exporter.
+`internal/testinfra` has the process-driving machinery and was rejected mechanically: it is
+behind `//go:build integration || e2e`, so importing it would tag this proof out of `task
+test` and into a lane that needs Docker — trading the proof's reach for about forty lines
+of process handling. Moving it to `integration/e2e` later is a package rename and a swap of
+`startAgent` for `testinfra.Start`.
+
+`task ci` green, including `deadcode`. No production code changed, so the coverage floor is
+untouched.
+
+**Seen and not acted on, for track D.** E2's handoff offered `cmd/control-plane` the same
+five lines. They were never taken, and the reason to leave it that way is stronger than the
+reason to take them: `grep -rn "Recorder\|obs\." --include='*.go' internal/controlplane
+internal/cpserver cmd/control-plane` finds nothing outside tests, so the Control Plane
+records no series at all. Wiring an exporter into it would produce a process that exports
+its `service.name` and nothing else — observability from the outside, which is the trap
+`obs.NewProvider`'s comment names. The order is the other way round: a metric with a
+producer first, then the wiring, then a test shaped like this one.
