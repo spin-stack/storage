@@ -512,3 +512,58 @@ has spent four waves removing from its documents, found this time inside a funct
 
 The plant that does work is passing the clone's own id to `LoadSnapshot`: the snapshot key
 is derived from the volume id too, so it fails at once with "which was never published".
+
+### C-a-clone-works-exactly-once — a clone that stopped once could never start again (2026-08-06)
+
+`CHUNK-ADDRESSING-SPEC` §2 found it and this lane reproduced it before changing anything.
+`image.Load` returns an **unlayered** view, `fetchBase` then slid the parent's snapshot
+underneath it with `SetBase`, and `cow` refuses that — *"cow: this map was not built to
+take a base (use NewIntervalMapOver)"*, the exact string the spec quotes. The error path
+sets `baseFailed` and calls `FailBase`, so every read of the restarted clone came back
+`ErrBaseUnavailable`, and the Agent then could not publish that session either
+(`ErrNoReadView`), so it exited 1 with the session in a local WAL nobody would read. A
+clone booted fine the first time — no image of its own, so the parent's snapshot *is* the
+base — and never again.
+
+**The fix is to stop layering, not to make the layering possible, and the refusal is the
+reason.** A publish serialises `log.ViewAtRest()` and `image.uploadChunks` walks
+`view.Ranges()`, which is the base's ranges minus this layer's tombstones plus its own
+extents, read *through* the layering — so a clone's own image already holds its parent's
+bytes, flattened, from its first stop. The parent is redundant once the manifest exists.
+It is worse than redundant: tombstones do not survive publication as tombstones, a range
+the clone discarded is expressed in the manifest as *absence*, and putting the parent back
+underneath uncovers every DISCARD the guest issued — §14.6's failure. Weakening `SetBase`
+to accept an unlayered map would have converted a total outage into silently resurrected
+data. `SetBase` is untouched. `parentView` is now reached only in the `ErrNotPublished`
+arm, which also stops a restarted clone from GETting its parent's whole snapshot on every
+attach for a view it then threw away.
+
+**Two arms, because the seam that missed it and the bytes are different questions.**
+`TestACloneThatStoppedOnceStartsAgainAndReadsBothHalves` (`internal/agent`) drives a real
+`VolumeManager`, a real WAL and a real device across two sessions on one disk and one
+bucket, and asserts three offsets: one only the parent wrote, one only the clone wrote,
+and one the parent wrote and the clone overwrote — a single offset cannot tell dropped
+inheritance, a lost own-image and an inverted layer order apart.
+`TestACloneThatStoppedOnceIsServedAgain` (`integration/e2e`) is the deployment: real
+binaries, real Postgres, real object store, the clone stopped and its host restarted, with
+the second Agent's recovery line *for the clone's volume id* and its exit status as the
+observables.
+
+**Both plants were run.** The unit arm was red against the tree as it stood, before any
+production line changed, with `blockdev: READ of 512 bytes at 0 failed: wal: wal: the read
+view's base could not be recovered: cow: this map was not built to take a base` — the
+defect quoted by the spec, reproduced rather than inferred. Restoring the layering on top
+of the fix reproduces it in the e2e lane too: agent-2 prints *"the clone's parent could not
+be layered under its image; its reads will fail"* and the recovery line never arrives. A
+second plant — never making the parent the base at all, the wrong fix that also gets past
+`SetBase` — turns the first session's inherited range to zeros: *"offset 0 reads
+0x0000000000000000, want 0xa1 repeated"*.
+
+**No DST scenario was added, deliberately.** `DurableRangeChecker` watches for zeros and
+foreign bytes and explicitly does *not* treat a refused read as a violation — which is the
+right rule and means it could not have caught this. A third arm would have bought no
+catching power for the cost the plan warns about: a new mandatory scenario edits
+`pinnedMandatorySet`, and at most one lane may add one per merge window.
+
+Nothing here touches the addressing decision `CHUNK-ADDRESSING-SPEC` §3 puts to a human.
+This is §4's "the §2 fix now, on its own".
