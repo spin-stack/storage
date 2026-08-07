@@ -112,15 +112,17 @@ jobs:
               echo "These artefacts are not published, so no lane in this run can boot a guest:"
               for m in $missing; do echo "- \`$m\`"; done
               echo
-              echo "Both are produced by one command each, by anyone with write access to this"
-              echo "repository's packages:"
+              echo "Both are published by one command, which checks and names everything it"
+              echo "needs first and verifies both refs afterwards the way this job resolves"
+              echo "them. It publishes nothing twice, so re-running it is how you wait for the"
+              echo "QEMU build (tens of minutes) to finish:"
               echo '```'
-              echo "  # the QEMU runtime image — or just run the QEMU workflow, which publishes it"
-              echo "  task build:qemu:push QEMU_IMAGE=ghcr.io/${{ github.repository }}/qemu"
-              echo "  # the guest kernel: build it in a spinbox checkout, then mirror it (ADR-0022)"
-              echo "  task fetch:kernel && task guest:kernel:push \\"
-              echo "      GUEST_KERNEL_IMAGE=ghcr.io/${{ github.repository }}/guest-kernel"
+              echo "  task guest:inputs:check      # what is missing, and the fix for each"
+              echo "  task guest:inputs:publish REPO=${{ github.repository }}"
               echo '```'
+              echo "The kernel is the part that needs a particular machine: storage never"
+              echo "builds one (ADR-0021), so run it where a sibling spinbox checkout has"
+              echo "already built the pinned artefact. Everything else it does for itself."
               echo
               echo "Until they exist this gate is red, deliberately: the proofs that a real Linux"
               echo "kernel drives this system are the ones it is least safe to assume."

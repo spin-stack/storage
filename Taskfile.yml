@@ -402,10 +402,24 @@ tasks:
         # scratch, so its digest is a hash of the kernel and of nothing else.
         ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
         cp {{.GUEST_KERNEL}} "$ctx/vmlinux"
+        # org.opencontainers.image.source is what links a ghcr.io package to a repository,
+        # and the link is what lets that repository's Actions token read it. Without it a
+        # kernel published from a laptop is a package owned by the pusher: `guest-inputs`
+        # then fails with "not published", which is also its message when nothing was
+        # published at all — the two states are indistinguishable from CI's side, and this
+        # label is the difference. Derived from the target path rather than configured,
+        # because the only namespace CI resolves is ghcr.io/<owner>/<repo>/...; anything
+        # else gets no label rather than a wrong one. Same derivation in build:qemu:push.
+        src=""
+        case "{{.GUEST_KERNEL_IMAGE}}" in
+          ghcr.io/*/*/*) slug={{.GUEST_KERNEL_IMAGE}}; slug=${slug#ghcr.io/}; slug=${slug%/*}
+                         src="--label org.opencontainers.image.source=https://github.com/$slug" ;;
+        esac
         docker buildx build \
           --file Dockerfile.guest-kernel \
           --target package \
           --platform linux/amd64 \
+          $src \
           --tag {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}} \
           --tag {{.GUEST_KERNEL_IMAGE}}:sha256-{{.GUEST_KERNEL_SHA256}} \
           --push \
@@ -413,6 +427,37 @@ tasks:
         echo
         echo "pull it back with the digest, not the tag:"
         echo "  task fetch:kernel GUEST_KERNEL_IMAGE={{.GUEST_KERNEL_IMAGE}}@\$(docker buildx imagetools inspect --format '{{`{{.Manifest.Digest}}`}}' {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}})"
+
+  # The two artefacts CI's guest jobs need and this repository does not build. Publishing
+  # them was a procedure spread over four files — this workflow's failure summary, two push
+  # targets above, and a track log — and a procedure is what a human gets one step wrong
+  # in. `guest:inputs:check` names every input; `guest:inputs:publish` does the whole thing
+  # and proves it by resolving both refs the way `.github/workflows/ci.yml` resolves them.
+  # The name matches that workflow's `guest-inputs` job on purpose: the job that fails is
+  # the job this task exists to unblock.
+  guest:inputs:check:
+    desc: >-
+      Name every input publishing the guest lanes' artefacts needs (gh, a token with
+      write:packages, docker, the pinned kernel), and say which are missing. No side effects.
+    env: &publish_guest_env
+      REPO: '{{.REPO | default ""}}'
+      KERNEL: '{{.GUEST_KERNEL}}'
+      KERNEL_SHA256: '{{.GUEST_KERNEL_SHA256}}'
+      KERNEL_VERSION: '{{.GUEST_KERNEL_VERSION}}'
+      SPINBOX_KERNEL: '{{.SPINBOX_KERNEL}}'
+      QEMU_VERSION: '{{.QEMU_VERSION}}'
+      TASK_EXE: '{{.TASK_EXE}}'
+    cmds:
+      - bash hack/publish-guest-inputs.sh check
+
+  guest:inputs:publish:
+    desc: >-
+      Publish both artefacts CI's guest jobs need — the pinned QEMU image (by dispatching
+      the QEMU workflow) and the pinned guest kernel — then verify both resolve. Idempotent.
+      Usage: task guest:inputs:publish REPO=<owner>/<repo>
+    env: *publish_guest_env
+    cmds:
+      - bash hack/publish-guest-inputs.sh publish
 
   build:qemu:image:
     desc: Build the QEMU runtime image (used by the integration lane, not extracted).
@@ -444,6 +489,14 @@ tasks:
       QEMU_IMAGE_EXTRA_TAG: '{{.QEMU_IMAGE_EXTRA_TAG | default ""}}'
     cmds:
       - |
+        set -euo pipefail
+        # The package→repository link, exactly as at guest:kernel:push and for the same
+        # reason: an unlinked private package reads to CI as an unpublished one.
+        src=""
+        case "{{.QEMU_IMAGE}}" in
+          ghcr.io/*/*/*) slug={{.QEMU_IMAGE}}; slug=${slug#ghcr.io/}; slug=${slug%/*}
+                         src="--label org.opencontainers.image.source=https://github.com/$slug" ;;
+        esac
         docker buildx build \
           --file Dockerfile.qemu \
           --target runtime \
@@ -452,6 +505,7 @@ tasks:
           --cache-to {{.QEMU_CACHE_TO}} \
           --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
           --build-arg JOBS={{.QEMU_JOBS}} \
+          $src \
           --tag {{.QEMU_IMAGE}}:{{.QEMU_VERSION}} \
           {{if .QEMU_IMAGE_EXTRA_TAG}}--tag {{.QEMU_IMAGE}}:{{.QEMU_IMAGE_EXTRA_TAG}} \{{end}}
           --push \

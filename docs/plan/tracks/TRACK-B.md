@@ -299,3 +299,64 @@ deletion happened. Remove the lines, in the commit that removed the code"*; a sy
 both lists → *"which claims they are permanently fine and must be deleted at the same
 time"*; an entry with no `#` → *"entries with no reason"*. `task --summary ci` shows the
 step between `lint` and `test`.
+
+**B12: publishing the guest lanes' inputs is one command (2026-08-06).** CI's guest jobs
+have never run and cannot: `guest-inputs` resolves the pinned QEMU runtime image and the
+pinned guest kernel out of ghcr.io, and neither is published. That is not a defect in the
+gate — it is the gate correctly refusing to claim proofs it did not make — but what a human
+had to do about it was a *procedure*, reconstructed from four places: the workflow's
+failure summary, `build:qemu:push`, `guest:kernel:push`, and the entry above. Every wrong
+step in that procedure is silent. Push the kernel to a path CI does not resolve, tag it
+with the version instead of the content hash, publish a package the repository's own
+Actions token cannot read — each of them ends as `guest-inputs` printing "not published",
+which is also what it prints when nobody has published anything at all.
+
+`task guest:inputs:check` names every input with the remedy for each; `task
+guest:inputs:publish REPO=<owner>/<repo>` does the whole thing (`hack/publish-guest-inputs.sh`).
+It logs Docker in with gh's own token, so "did you `docker login`" stops being a
+precondition nobody can check; it *dispatches* `qemu.yml` rather than building QEMU
+locally, because the workflow produces the same image from the same Taskfile target with a
+shared BuildKit cache; it pushes the kernel through `guest:kernel:push` so the image's
+shape stays defined in one place; and it computes both refs from `QEMU_VERSION` and `task
+guest:kernel:tag` — the same sources `ci.yml` computes them from, so a path this publishes
+that the workflow does not resolve is impossible rather than merely unlikely. It ends by
+pulling the kernel back out of the registry and re-hashing it against the pin, which is the
+only check that would catch an image carrying something other than the pinned artefact.
+It is idempotent and it exits **non-zero while either input is still missing**, including
+the several minutes when the QEMU build it just dispatched is still running: "I ran the
+publish task" must not be able to mean "the guest jobs still cannot run".
+
+**One real trap was found while writing it, and fixed in the push targets.** A ghcr.io
+package is private by default *and* is not linked to any repository when it is pushed from
+a laptop — and an unlinked private package is unreadable by that repository's Actions
+token. Both `guest:kernel:push` and `build:qemu:push` now attach
+`org.opencontainers.image.source`, derived from the target path rather than configured, so
+the package links itself to the repository it belongs to. Without it the first publish
+would have looked like a successful one and CI would have gone on saying "not published".
+
+**What is left for a human, and it is now one machine and one command.** Run
+`task guest:inputs:publish REPO=<owner>/<repo>` **on a machine with a sibling spinbox
+checkout that has built the pinned kernel** — storage never builds one (ADR-0021), which is
+the single reason this cannot be a workflow. Everything else it does for itself, provided
+the gh token carries `write:packages` (it says so, with the `gh auth refresh` line, when it
+does not). Afterwards, one thing stays in the GitHub UI and the task prints both URLs:
+confirm each package is linked to the repository and inherits its Read access. Until all of
+that happens, **every CI run is red at `guest-inputs`**, the two guest lanes are skipped,
+and the `gate` job fails because a skipped lane is not a passed one — which is the design,
+not a regression.
+
+**Verified in both states, since nothing here may publish anything.** With the inputs
+present the check is `OK: everything publishing needs is present` and exit 0 — repository,
+both target refs, gh, `write:packages`, write access, `qemu.yml is dispatchable`, docker,
+`the pinned kernel 7.1.0`. With them absent each one names itself and the fix: no
+repository (`'gh repo view' could not resolve one from this checkout's git remote` — this
+tree's origin is a local bare repo), `scopes are: gist, read:org, repo, workflow` against
+`remedy: gh auth refresh -h github.com -s write:packages`, `the repository did not answer —
+it may not exist on GitHub yet`, `docker is installed but 'docker info' failed`, and
+`storage does not build a kernel (ADR-0021)` with the `cd ../spinbox && task build:kernel`
+line. A kernel that is present and *wrong* prints its hash beside the pin rather than
+saying nothing. Checks that cannot run print `SKIPPED` and the reason instead of being
+silent — the `guest:verify` trap, one file over. `task guest:inputs:publish` with a
+precondition missing stops before it logs in to anything: `2 precondition(s) missing —
+nothing was published.` The publish path itself is reviewed code, not proven code, and the
+script says so at the top: no registry has ever been touched from here.
