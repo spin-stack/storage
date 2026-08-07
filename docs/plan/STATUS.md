@@ -529,7 +529,37 @@ mid-session replay to bound. §22.4's lazy loading is the same. Under ADR-0026 t
 is one manifest and its chunks, and what shortens it is placement (increment 5), not a new
 object kind.
 
-## DEV-0023 — the design document still has resize, and V1 does not
+## ~~DEV-0023~~ — the design document still has resize, and V1 does not *(resolved 2026-08-07)*
+
+> **Closed by bannering, in `d315840`.** Resize is **V2**, and §3's objective 14 carries
+> the reasoning where the promise was made; every other mention in the design document is
+> struck through and points there. The banner names the whole missing path rather than the
+> deleted verb, because that is the part a reader cannot reconstruct: the desired state
+> already carries `size_bytes` to every Agent and `agent.Loop.Apply` returns at its epoch
+> check before reading it, a `blockdev.Device`'s capacity is fixed by `blockdev.New`, and a
+> new capacity would reach the guest as `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` over the
+> backend request channel — which `vhost.ProtocolFeatures` does not advertise (it offers
+> `REPLY_ACK` and `CONFIG`, and its comment says of each bit why). So §9's `resize2fs`
+> sentence was not half-built; it was the half that could not be built without a protocol
+> feature nobody has asked for.
+>
+> **The other option was to declare resize in scope, and it was rejected on that
+> sentence.** From the catalog side resize looks like a column write, which is why the row
+> existed; from the device side it is a vhost-user feature plus a device that changes its
+> own capacity mid-session while a guest is reading it. Nothing in the use case of §2 —
+> CI runners and ephemeral dev VMs, cloned from snapshots — asks for a volume to grow
+> without stopping. It comes back as an increment with that half, or not at all.
+>
+> What stands in the verb's place is a property both `metadata.Store` implementations are
+> held to, `VolumeGeometryIsImmutable` in `internal/metadata/metadatatest`, which reads a
+> volume's geometry back after every mutation. A resize brought back as a store method
+> **and nothing else** fails there rather than shipping.
+>
+> **The mechanism worked, and that is worth one line.** This entry exists because a
+> previous lane recorded the divergence as a struck-through decision under "Decisions
+> waiting on a human" — the right call, filed where nothing blocks on it. As a DEV entry it
+> blocked the gate until somebody decided, which is what took two waves' distance to see:
+> the deletion was correct *and* the document was left promising the verb.
 
 Wave 5 deleted `metadata.ResizeVolume` and everything under it: V1 does not grow a volume,
 because a row that grows is not a volume that grows and nothing on the Agent side ever
