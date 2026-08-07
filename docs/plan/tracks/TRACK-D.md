@@ -597,3 +597,57 @@ the 65% the loop un-cordons at — was cordoned by hand and left for four heartb
 stayed `CORDONED OPERATOR`. `docs/plan/RUNBOOK.md` §3 carries that transcript.
 
 No schema change, no new query. `task ci` is green.
+
+**D11: the incident path is written down, and every step was run (2026-08-07).**
+`docs/plan/RUNBOOK.md`. CLAUDE.md's maturity table names "runbook times measured" as one
+of three criteria for production-verified and there was no runbook to time: the pieces an
+incident uses all existed — `-fleet-status`, the hold-and-retry teardown, the self-cordon,
+`-rebuild-metadata`, detach and attach — and nothing said how they fit together when
+something is actually wrong.
+
+**The constraint was that every step is a command that exists and an output somebody has
+seen**, so it was built by running a deployment rather than by reading the tree: the pinned
+Postgres with `schema.sql` applied, a `control-plane` serving, one Agent on the host
+filesystem and a second in a container with a 64 MiB device so the ADR-0013 band could be
+crossed in both directions for real. Four failures were then walked end to end — a host
+holding unpublished data, a host that cordoned itself, a lost catalog, and a volume that
+will not attach — and what the processes printed is pasted in. The deployment's one
+honest gap is stated in the file's header: no guest booted, so every session in it is
+empty and every published manifest says `"sequence":0`.
+
+**Four things the run established that no document said, and two of them are hazards.**
+
+- **Nothing answers "which hosts are holding unpublished data".** An Agent in its retry
+  loop is `ACTIVE` with a one-second heartbeat in `-fleet-status`, indistinguishable from a
+  healthy one; the only witness is that host's own log. That is the cost of the owner's
+  hold-and-retry decision being *legible per host* rather than fleet-wide, and closing it
+  means a field on the heartbeat — `api/`, `internal/agent`, a column — so it is an
+  increment, not a line.
+- **`LEADER … renewed Xm ago` is not liveness.** `renewed_at` is written by
+  `AcquireLeadership` and nothing else, so a healthy Control Plane's age grows at exactly
+  the same rate as a dead one's. The run read "renewed 12m22s ago" off a process that had
+  been serving for twelve minutes. The cheap honest fix is for the word to be "elected".
+- **Placement never looks at a heartbeat.** `Policy.Admits` reads `AcceptsPlacement` and the
+  two device numbers; `LastHeartbeat` is not in it. So `-attach-volume` places a volume onto
+  a host whose Agent has been down for minutes and reports `host_state=ACTIVE`, and the
+  socket never appears. Measured. It matters most immediately after `-rebuild-metadata`,
+  when an operator is placing every volume in the fleet by hand.
+- **Electing a Control Plane against an emptied catalog is what stops the fleet serving**,
+  not the loss of the catalog itself. Agents keep serving through the outage; the moment
+  heartbeats succeed again the Control Plane refuses their reports for volumes it has never
+  heard of and every Agent fences, publishes and drops its socket. So the rebuild is not a
+  background repair — between the election and the last `-attach-volume` the fleet serves
+  nothing, and the runbook orders the three steps for that reason.
+
+The term continuity ADR-0011 exists for was observed rather than argued: a Control Plane
+elected against a truncated catalog took term 2, because the bucket held
+`control-plane/terms/00000000000000000001` and the Elector reads the bucket.
+
+Two paths were run end to end from a clean state and are quoted in full — the catalog-loss
+recovery (elect, rebuild, place, serving again) and the holding host (SIGTERM, hold for
+five attempts, second signal and `SIGKILL` as the two escapes, store restored, publish,
+exit 0). Exit codes are measured: 1 on abandon, 137 on `SIGKILL`, 0 on a publish that
+landed. Exit 2 — superseded — was not reached in this run and the file says so rather than
+claiming it.
+
+`docs/plan/README.md` is track A's to update; the runbook is not linked from the map yet.
