@@ -515,12 +515,17 @@ create-only so a retry converges on its own manifest and refuses a different one
 same id (`image.ErrSnapshotExists`), and the pause is measured where the capture is, not
 around the whole operation.
 
-**§19's two mandatory metrics are still unrecorded.** `internal/obs` registers
-`snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds`; the code that
-observed them was deleted with `internal/snapshot`, and neither `ensureSnapshot` nor
-`snapshot` observes them. It is the one piece of §19 that increments 3 and 3b did not
-close, and a metric nobody records is a metric that is missing during the first incident
-that needs it.
+**~~§19's two mandatory metrics are still unrecorded.~~ — closed, and the paragraph is kept
+because of how it was found.** It said `internal/obs` registers
+`snapshot_pause_duration_seconds` and `snapshot_publish_duration_seconds` and that neither
+`ensureSnapshot` nor `snapshot` observes them. Both are observed now, in the Agent's
+snapshot path (`internal/agent/volume.go`, and `internal/agent/snapshot_test.go` asserts a
+snapshot records both), and `image_publish_duration_seconds` with them at the stop. What is
+worth keeping is that this was about to be filed as a DEV entry on the strength of *this
+paragraph*, and the grep that was supposed to justify the entry is what showed it was
+already fixed. A claim about the code is only as fresh as the last time somebody ran the
+command beside it — which is the rule this file states about counts and had not extended to
+prose.
 
 **Objectization, lazy loading and the cold-RTO work are withdrawn, not deferred to a spec.**
 `OBJECTIZATION-SPEC.md` described segments feeding `recovery` and `materialize`, both of
@@ -583,6 +588,39 @@ way §17, §21, §23 and §31 were marked when ADR-0026 withdrew them — a bann
 V2 — or, if resize is meant to be V1, reopen it as an increment with the Agent half that
 was always missing. What is not an option is leaving a document promising a verb whose
 implementation was deleted this week.
+
+## DEV-0024 — `block_size` is the guest's logical block size, and two files call it the 64 KiB CoW granularity
+
+**The declared schema is the one that is wrong**, which is what makes this a DEV entry
+rather than a document fix: `internal/schema/schema.sql`'s `block_size` column carries the
+comment `-- CoW segment granularity (64 KiB)`, and ADR-0019 makes that file the single
+source of truth — sqlc generates from it, the integration lane builds its database from it,
+and anyone asking "what is this column" is meant to read it there. The design document said
+the same thing in §8 and is corrected (`2e80c11`'s successor); the schema is track D's file.
+
+**What the column actually is.** `controlplane.VolumeSpec.BlockSize` is "the logical block
+size reported to the guest", `VolumeSpec.validate` refuses one that is not a multiple of the
+512-byte sector, `control-plane -seed-block-size` (whose own help text says "logical block
+size") defaults it to 4096, and the Agent hands
+it to `blockdev` as the device's block size. Nothing anywhere treats it as a CoW
+granularity. The contract fixtures in `internal/metadata/metadatatest` pass 65536, which is
+legal and is presumably where the confusion kept its footing.
+
+**And the 64 KiB CoW segment it names does not exist at all.** `cow.IntervalMap` works on
+the guest's real extents with no grid — its own package comment records that the second
+structure increment 4.4 promised never arrived — and what leaves the host is a chunk of up
+to `image.MaxChunkBytes` (64 MiB) keyed by the digest of its plaintext. So this is not one
+comment that drifted: it is the last surviving sentence of a design (§13.1's second bullet,
+§4's granularity row) whose replacement has different properties — dedup by content instead
+of read-modify-write at objectization.
+
+**Why it is not settled here.** Two things need an owner and neither is track A's. The
+comment is a one-line fix in track D's schema, but a schema edit is a `task db:plan`
+increment, not a comment change. And whether 64 KiB CoW segments are *V2* or *dead* is
+downstream of the chunk-addressing question that `CHUNK-ADDRESSING-SPEC.md` puts to a human
+and DEV-0020 waits on: if a chain is walked rather than flattened, the granularity of what
+is addressed is exactly the decision being made. Marking the doc "V2" would have been the
+guess this entry exists to avoid.
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 

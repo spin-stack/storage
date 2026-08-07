@@ -202,7 +202,7 @@ leerlas contra esta fila.
 | WAL local | Append-only en NVMe |
 | WAL remoto | Objetos inmutables en S3 |
 | Registro de WAL | **Extent real del guest (offset + length, alineado a 512 B)** |
-| Granularidad CoW (segmentos) | 64 KiB |
+| Granularidad CoW (segmentos) | 64 KiB — **no existe; lo que sale del host son chunks de hasta 64 MiB direccionados por contenido (§13.1)** |
 | Tamaño objetivo de WAL object | 8 MiB |
 | Tamaño máximo de WAL object | 16 MiB |
 | Cierre/PUT de batch | **Bajo demanda**: FLUSH/FUA pendiente, ≥ 8 MiB, o antigüedad ≥ 20 s |
@@ -543,7 +543,7 @@ CREATE TABLE volumes (
     -- 'remote' afirma una durabilidad que el data path ya no da, y el que la lee no
     -- tiene cómo saber que es decoración. El esquema declarado real es
     -- `internal/schema/schema.sql` (líneas 96-102), que escribe esta misma razón.
-    block_size         INTEGER NOT NULL,          -- granularidad de segmentos (64 KiB)
+    block_size         INTEGER NOT NULL,          -- bloque lógico del guest, NO 64 KiB (DEV-0024)
     current_epoch      BIGINT NOT NULL DEFAULT 0,
     state              TEXT NOT NULL,
     primary_host_id    TEXT,
@@ -810,6 +810,23 @@ produzcan los mismos bytes no pueden corromperse entre sí — la clave *es* el 
 - **Segmentos CoW**: granularidad de 64 KiB. El RMW se paga una sola vez, en objectization (clase background), donde no afecta latencia del guest.
 
 Esto reduce simultáneamente: bytes de WAL local, bytes subidos a S3, tiempo de replay y costo — precisamente para el peor workload (bases de datos con páginas de 8–16 KiB y fsync frecuente).
+
+> **El primer bullet es exacto y es lo mejor de v5; el segundo describe una estructura que
+> no existe.** No hay segmentos CoW de 64 KiB en ninguna parte: `cow.IntervalMap` trabaja
+> sobre los extents reales y nada los alinea a una grilla — el propio comentario de esa
+> estructura dice que la segunda que prometía el incremento 4.4 no llegó. Lo que la
+> reemplazó tiene otras propiedades y vale conocerlas: lo que sale del host son **chunks de
+> hasta 64 MiB** (`image.MaxChunkBytes`) direccionados por el digest de su texto plano, así
+> que una región que no cambió se saltea entre paradas y **no hay RMW en ningún lado**,
+> ni en el data path ni en background. El tamaño se eligió por los dos extremos: un objeto
+> por volumen choca contra el límite de PUT del backend y re-sube todo en cada parada; un
+> objeto chico multiplica requests.
+>
+> **`block_size` no es esta granularidad**, aunque §8 y el esquema declarado digan lo
+> contrario: es el tamaño de bloque lógico que se le reporta al guest, validado como
+> múltiplo del sector de 512 B, y `control-plane -seed-block-size` lo default-ea en 4096.
+> Es DEV-0024 en `docs/plan/STATUS.md`, porque el comentario equivocado está en un archivo
+> que este track no posee.
 
 ### 13.2 Read path
 
