@@ -43,3 +43,6 @@ testdata/rapid/
 # tree, and the value is a function of the machine that produced it, not of the
 # sources — it was committed once by accident and was already stale by the next run.
 /.task/
+
+# The agent harness's local settings and scratch workflows.
+/.claude/

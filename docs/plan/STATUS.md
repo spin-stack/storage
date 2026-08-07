@@ -7,9 +7,10 @@ tracks state.
 - **Date:** 2026-08-06 · **Branch:** everything is on `main`, and `main` has not been pushed
   since wave 1. Run the two commands rather than reading a number here: `git ls-remote
   origin` (`/home/aledbf/spin-storage.git`, bare) for what the remote has, and
-  `git rev-list --count origin/main..HEAD` for how far ahead this tree is. On 2026-08-06 the
-  answers were `9f5e5e4` and **35**; they move under you while a parallel wave is running,
-  because five lanes commit into this one working tree.
+  `git rev-list --count origin/main..HEAD` for how far ahead this tree is. Both answers move
+  under you while a parallel wave is running, because five lanes commit into this one
+  working tree — which is why neither is written here. The wave that wrote them down had
+  them stale before the wave ended.
 
   This line has been wrong twice, in opposite directions, and both times because it was
   written from memory. The rule this file needs is not "check before writing", which was
@@ -19,10 +20,10 @@ tracks state.
   in mind. It no longer skips the guest-backed proofs — it refuses to run without the pinned
   QEMU and the pinned kernel, and `ci:noguest` is the same lane list for a machine that has
   neither, ending by printing what it did **not** prove (ADR-0025, amended). So a green
-  `ci:full` now means a guest booted. The last recorded coverage figure is **3940/4371 =
-  90.1396%** (`f65b579`), against a floor that since the same commit compares the ratio
-  rather than the one-decimal string `go tool cover` prints — which had been passing a tree
-  at 89.9908%. Recompute it with `task cover`; do not read the number above as current.
+  `ci:full` now means a guest booted. Run `task cover` for the coverage figure — it is not
+  written here for the same reason the commit count is not. What is worth knowing about it
+  is structural: since `f65b579` the floor compares the ratio rather than the one-decimal
+  string `go tool cover` prints, which had been reporting OK for a tree at 89.9908%.
   While a wave is open the tree is not continuously green, and the usual reason is another
   lane's uncommitted `fmt:check`.
   Green *on a developer machine, and nowhere else*. **CI has never run**: `origin` is a
@@ -194,7 +195,7 @@ integrated machinery that is not in the tree at all.
 | 08 recovery (S3 authority) + rebuild-metadata | **rebuild integrated; recovery withdrawn** | `internal/recovery` does not exist. The object store is the **boot** authority, not the recovery authority (INV-08): one manifest and its chunks. `controlplane.RebuildMetadata` + `control-plane -rebuild-metadata` (`cmd/control-plane/main.go:93`) bring volumes and snapshots back from two objects per volume — and deliberately not placement. |
 | 09 snapshots + clone + resize | **snapshot and clone integrated; resize is out of V1** | A snapshot of a live volume is requested through desired state and published while the Agent serves (`integration/e2e/snapshot_test.go`); a clone of it is placed and boots (`integration/e2e/clone_test.go`). **Resize is gone, not pending** (2026-08-06, `446b61e`): `metadata.Store.ResizeVolume` grew a row and nothing else — a `Device`'s capacity is fixed by `blockdev.New`, `Apply` returns before reading the size, and the guest cannot be told at all, since a new capacity travels on a vhost-user backend request channel `internal/vhost` does not offer. What guards the decision is `metadatatest`'s `VolumeGeometryIsImmutable`, which reads a volume's size back after every mutation. |
 | 10 objectization + checkpoints + GC + I/O classes | **withdrawn** — ADR-0026 | All four subjects are deleted: `internal/gc`, `internal/checkpoint`, `internal/ioclass`, and the segment-object plan (`OBJECTIZATION-SPEC.md`, removed 2026-08-03). What survives of GC is enforced at construction — `real.NewS3Store` refuses an unversioned bucket (`TestRequireVersioning`, `internal/simio/real/s3_versioning_test.go:36`) — and it is all that INV-14 has left. |
-| 11 cross-host + cordon/drain + capacity | **cordon and capacity integrated; drain withdrawn** | `controlplane/drain.go` is deleted and nothing calls a drain; `HostDraining` survives as a lifecycle state (`internal/lifecycle/lifecycle.go:132`) with no producer. What is real: a host cordons itself out of the fleet when its device fills, through the heartbeat (`cpserver.CordonUsedRatio`/`UncordonUsedRatio`, a Schmitt band rather than ADR-0013's single threshold, in `internal/cpserver/pressure.go`), and admission counts what a host is *using* rather than only what it was promised (`internal/placement`). Wave 4 retired the `operations` table and with it ADR-0017's second capacity term, which summed rows nothing ever wrote — `internal/schema/schema.sql` opens by saying there is no such table and why. Cross-host movement of a volume does not exist. |
+| 11 cross-host + cordon/drain + capacity | **cordon and capacity integrated; drain withdrawn** | `controlplane/drain.go` is deleted and nothing calls a drain; `HostDraining` survives as a lifecycle state (`lifecycle.HostDraining`, in `internal/lifecycle`) with no producer. What is real: a host cordons itself out of the fleet when its device fills, through the heartbeat (`cpserver.CordonUsedRatio`/`UncordonUsedRatio`, a Schmitt band rather than ADR-0013's single threshold, in `internal/cpserver/pressure.go`), and admission counts what a host is *using* rather than only what it was promised (`internal/placement`). Wave 4 retired the `operations` table and with it ADR-0017's second capacity term, which summed rows nothing ever wrote — `internal/schema/schema.sql` opens by saying there is no such table and why. Cross-host movement of a volume does not exist. |
 | 12 warm standby + compaction + flatten | **not started, and V2 under ADR-0026** | Nothing in the tree; ADR-0014 (its quota/squash half) is itself withdrawn. Listed because §2 still names it as a target for a later version. |
 | 13 hardening | **13.1 integrated (typed lifecycles); the rest needs infra** | `internal/lifecycle` is the typed state machine (ADR-0009) and the Control Plane uses it. 13.2 (real-hardware fault injection + measured runbooks) and 13.3 (backend conformance per version) need hardware nobody has; 13.4 is **INV-19**, which stays pending on purpose until two Agents can run different formats. |
 
@@ -302,8 +303,12 @@ The replacement is the other half of the same §12.2 sentence — *"deja de ACKe
 durabilidad, **deja de publicar checkpoints/manifests**"*. Two obligations, one lease; the
 first has had a checker since 7.2 and **the second never did**, though the gate is one
 `if` at the top of `checkpointOnce`. `CheckpointLeaseChecker` +
-`scenarioLapsedLeaseStopsPublishing` now watch it, and `plantedProofs` counts 16
-behavioural proofs.
+`scenarioLapsedLeaseStopsPublishing` now watch it, and `plantedProofs` grew a behavioural
+entry. *(That checker and its scenario went with the durability scheduler in ADR-0026
+increment 4.1; `wantBehavioural` in `internal/dst/planted_bug_test.go` is what counts them
+now, and its comment carries every decrease with the reason. This paragraph is the record
+of an increment, not a description of the tree — which is why the number it used to state
+here was wrong within days and is gone.)*
 
 Three things make it a proof rather than a formality:
 
