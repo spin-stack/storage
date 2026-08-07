@@ -14,7 +14,7 @@
 - **Snapshots crash-consistent sin pausa** (captura atómica de sequence, sellado en background). Freeze del guest opcional, no default.
 - **Reconexión vhost-user con inflight tracking** promovida al roadmap temprano (deploys del Agent sin reiniciar VMs).
 - **Requisito mínimo de durabilidad del backend de objetos** en on-prem; single-node prohibido en producción.
-- **Soporte de DISCARD/WRITE_ZEROES, resize online (grow) y aplanado de cadenas de snapshots**.
+- **Soporte de DISCARD/WRITE_ZEROES, ~~resize online (grow)~~ (V2, §3) y aplanado de cadenas de snapshots**.
 - **Clases de I/O internas** (foreground / flush / background) con presupuestos; background siempre cede.
 - **Cliente S3 como subsistema**: hedged GETs, retry budget global, límites de ancho de banda por clase.
 - **Deterministic Simulation Testing (DST)** como estrategia de verificación principal; interfaces simulables (reloj, red, disco, S3) obligatorias desde el primer commit.
@@ -119,8 +119,30 @@ Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un
 11. **DST + fault injection** automatizados en CI.
 12. **Cifrado en reposo** de todo dato de VM fuera del host.
 13. **Reconexión vhost-user**: crash o deploy del Agent no reinicia VMs.
-14. Resize online (grow) del volumen persistente.
+14. ~~Resize online (grow) del volumen persistente.~~ — **V2** (banner abajo).
 15. Operación local, on-premises o cloud sin Kubernetes.
+
+> **El objetivo 14 es V2 desde 2026-08-06 (DEV-0023).** V1 no redimensiona un volumen, y
+> no es un pendiente a medio terminar: lo único que existía era una fila que crecía. El
+> verbo del catálogo se borró — `metadata.Store` lleva la nota donde estaba
+> `ResizeVolume`, que era grow-only, term-guarded y correcto, y no tenía camino detrás.
+> El desired state ya lleva `size_bytes` a cada Agent y `agent.Loop.Apply` retorna en su
+> chequeo de epoch antes de leerlo; la capacidad de un `blockdev.Device` la fija
+> `blockdev.New` y nada la mueve después; y una capacidad nueva viajaría al guest como
+> `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` por un canal de peticiones del backend que
+> `internal/vhost` no ofrece (§9 lo prometía; ver ahí).
+>
+> Peor que incompleto: `descriptor.json` guarda el mismo tamaño y solo se escribe al
+> crear y al clonar, así que un resize que llegara al catálogo y no al bucket era la única
+> forma de que los dos discreparan sobre el tamaño de un volumen sin que nada lo notara.
+> Lo que queda en su lugar es una propiedad que las dos implementaciones de
+> `metadata.Store` tienen que cumplir — `VolumeGeometryIsImmutable`, en
+> `internal/metadata/metadatatest`, que relee la geometría después de cada mutación — de
+> modo que un resize que vuelva **como método de store y nada más** falla ahí.
+>
+> Las demás menciones de resize en este documento llevan «(V2, §3)». Vuelve como
+> incremento cuando alguien lo pida con la mitad del Agent que nunca existió, no como
+> columna.
 
 ### No objetivos iniciales
 
@@ -157,7 +179,7 @@ Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un
 | Interfaz guest | virtio-blk (FLUSH + DISCARD anunciados; write-back explícito) |
 | Backend QEMU | vhost-user-blk **con reconexión + inflight shmfd** |
 | Imagen base | EROFS |
-| Volumen durable | Un ext4 persistente (grow online soportado) |
+| Volumen durable | Un ext4 persistente (~~grow online soportado~~ — V2, §3) |
 | Datos reconstruibles | Un ext4 efímero |
 | Writer | Single writer |
 | **Modo de durabilidad** | **Uno solo, para todos los volúmenes: FLUSH → `fdatasync` local → ACK (§14.8). El par `remote`/`local` y la columna que lo guardaba se retiraron con ADR-0026** |
@@ -274,7 +296,7 @@ El GC marca; nunca ejecuta borrado permanente. El borrado real lo ejecuta el lif
 
 | Origen | Destino | Protocolo | Uso |
 |---|---|---|---|
-| Cliente | Control Plane | gRPC/HTTP | Attach, snapshot, clone, resize |
+| Cliente | Control Plane | gRPC/HTTP | Attach, detach, snapshot, clone (~~resize~~ — V2, §3) |
 | Control Plane | PostgreSQL | PostgreSQL/TLS | Metadata, leases, epochs, reconciliación |
 | Control Plane | Volume Agent | gRPC/mTLS | Operaciones administrativas |
 | Volume Agent | Control Plane | gRPC/mTLS | **Heartbeat + renovación de lease + reporte de capacidad** |
@@ -353,7 +375,7 @@ Cada componente puede ejecutarse como binario con systemd o como contenedor Dock
 
 Responsabilidades:
 
-- Crear, eliminar y **redimensionar** volúmenes.
+- Crear, eliminar y ~~**redimensionar**~~ (V2, §3) volúmenes.
 - Attach y detach.
 - Asignar host (con contabilidad de capacidad).
 - **Administrar leases y promociones** (incluida la espera de fencing).
@@ -368,9 +390,33 @@ Responsabilidades:
 
 No participa en el data path.
 
+> **Qué de esta lista tiene verbo hoy, y con qué se invoca.** El Control Plane de V1 no
+> expone un cliente administrativo: cada verbo es un flag de `cmd/control-plane` que hace
+> una cosa y termina, y es lo que `integration/e2e` maneja. Existen `-seed-volume`
+> (crear), `-attach-volume` / `-detach-volume` (colocar y liberar; `-attach-volume` sin
+> `-attach-host` pregunta a `placement.Choose`), `-snapshot-volume`, `-clone-snapshot`,
+> `-rebuild-metadata` y `-fleet-status`. **No existe borrar**: nada en este repositorio
+> elimina un objeto todavía, y con ello el crypto-shredding de §15.3 no tiene ejecutor —
+> es el primer incremento que lo haría y su spec (`docs/plan/DELETION-AND-RECLAIM-SPEC.md`)
+> está escrito y sin revisar, con la pregunta abierta anotada en `STATUS.md`.
+>
+> De los demás puntos: las promociones y la espera de fencing son V2 (§12), el GC no
+> existe (§21), el standby tibio no existe (§22.3), el drain se borró (§28.1 lleva lo que
+> queda) y el aplanado de cadenas nunca se construyó (§20.1). El `request_id` sigue en
+> cada mutación, pero no se materializa en ninguna tabla `operations` — ver §8.
+
 ### Modelo de reconciliación (nuevo)
 
 Toda operación de larga duración (attach, detach, clone, drain, recovery, aplanado, resize) se representa como una fila con `desired_state` / `current_state`. Loops de reconciliación idempotentes y nivel-triggered convergen el estado. El CP puede crashear en cualquier punto: nada queda a medias, solo re-converge. La respuesta operativa ante incidentes es "arreglar la causa y dejar reconciliar", no cirugía manual en la base.
+
+> **La forma sobrevive; la fila no.** V1 reconcilia de verdad — el Agent pregunta su
+> desired state en cada heartbeat y converge (`agent.Loop.Apply`), que es lo que hace que
+> un snapshot pedido y un volumen despachado ocurran sin que nadie mande una orden — pero
+> el estado deseado viaja en la respuesta del heartbeat (`DesiredVolume` en
+> `api/spin/storage/v1/control_plane.proto`), no en filas de una tabla de operaciones. Esa
+> tabla se retiró (§8), y con ella las operaciones que solo ella representaba: drain,
+> recovery, aplanado y resize. Lo que queda reconciliado es lo que el desired state
+> nombra: qué volúmenes sirve este host, y qué snapshot le falta tomar.
 
 ### Single-active con término verificado (reemplaza al advisory lock puro)
 
@@ -415,10 +461,18 @@ Operación: PITR obligatorio (WAL-G o pgBackRest hacia el mismo object store), r
 
 ## 8. Modelo PostgreSQL mínimo
 
+> **Este es el boceto de v5; el esquema declarado es `internal/schema/schema.sql`** y es la
+> única fuente de verdad (ADR-0019: pgschema planifica contra él, sqlc genera desde él y el
+> lane de integración construye su base desde él). Las diferencias que un lector notaría
+> primero: los identificadores son `uuidv7` — un dominio sobre `uuid`, no `TEXT` (INV-22) —
+> `volumes` lleva además `parent_snapshot_id`, `dek_key_id` y un CHECK que enforcea el orden
+> de watermarks de §5.6, y `hosts` lleva la razón del cordon (§28.1). Lo que **no** existe es
+> la tabla `operations` de abajo.
+
 ```sql
 CREATE TABLE volumes (
     volume_id          TEXT PRIMARY KEY,
-    size_bytes         BIGINT NOT NULL,          -- mutable: resize grow
+    size_bytes         BIGINT NOT NULL,          -- INMUTABLE en V1: no hay resize (§3)
     -- Sin columna `durability`: ADR-0026 retiró el par 'remote'/'local' y con él la
     -- columna, en vez de dejarla por defecto en 'remote' — un catálogo que dice
     -- 'remote' afirma una durabilidad que el data path ya no da, y el que la lee no
@@ -485,8 +539,19 @@ CREATE TABLE snapshots (
 );
 ```
 
+> **Esta tabla no existe (retirada en 2026-08-05).** Se deja aquí porque §7, §18 y §28.1 la
+> nombran y un lector tiene que poder resolver la referencia, no porque describa el esquema.
+> Su vocabulario de `kind` es el inventario de lo que se fue: `resize` es V2 (§3),
+> `drain`, `recovery` y `flatten` describen mecanismos que ADR-0026 retiró, y `gc` no
+> existe. Después de eso nada escribía una fila — los dos escritores (`RecordOperation`,
+> `UpdateOperationPhase`) tenían por único llamador su propia prueba — y se borró en lugar
+> de dejarla vacía: una tabla vacía con tres índices, un vocabulario y un escritor
+> term-guarded se lee como un mecanismo que alguien está por usar, y el lector siguiente no
+> tiene cómo saber que no. La razón está escrita en la cabecera de
+> `internal/schema/schema.sql`, que es donde vive el esquema real.
+
 ```sql
-CREATE TABLE operations (          -- reconciliación general
+CREATE TABLE operations (          -- reconciliación general — NO EXISTE, ver arriba
     operation_id   UUID PRIMARY KEY,      -- = request_id del cliente
     kind           TEXT NOT NULL,         -- attach|detach|clone|resize|drain|recovery|flatten|gc
     volume_id      TEXT,
@@ -547,7 +612,15 @@ Features anunciadas al guest en `/dev/vdb`:
 
 - `VIRTIO_BLK_F_FLUSH`: write-back explícito; el guest sabe qué garantías tiene.
 - `VIRTIO_BLK_F_DISCARD` y `VIRTIO_BLK_F_WRITE_ZEROES`: el espacio liberado por el guest se recupera (ver §14.6). Montar ext4 con `discard` o correr `fstrim` periódico.
-- Resize: el grow se propaga vía actualización del config space + notificación; el guest expande con `resize2fs`.
+- ~~Resize: el grow se propaga vía actualización del config space + notificación; el guest
+  expande con `resize2fs`.~~ — **V2 (§3).** Esta frase es la mitad que nunca se construyó:
+  la notificación es `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG`, que viaja por el canal de
+  peticiones del backend hacia el front-end, y `vhost.ProtocolFeatures` no anuncia ese canal
+  (`VHOST_USER_PROTOCOL_F_BACKEND_REQ`): ofrece `REPLY_ACK` y `CONFIG`, y nada más — el
+  comentario sobre esa constante dice de cada bit por qué está o no está. Sin el canal no hay
+  forma de decirle al guest que
+  su disco creció, y un `resize2fs` sobre una capacidad que el dispositivo no movió no tiene
+  nada que expandir.
 
 ---
 
@@ -956,7 +1029,7 @@ Guest DISCARD
 ## 18. Idempotencia
 
 - PUTs de datos: clave determinística + `If-None-Match: *` + retry/HEAD/checksum (§14.5).
-- Operaciones administrativas: `request_id` UUID único en **todas** las mutaciones (attach, detach, snapshot, clone, resize, drain, recovery), materializado en la tabla `operations`.
+- Operaciones administrativas: `request_id` UUID único en **todas** las mutaciones (attach, detach, snapshot, clone, ~~resize~~ (V2, §3), ~~drain, recovery~~), ~~materializado en la tabla `operations`~~ — esa tabla no existe (§8). En V1 la idempotencia administrativa que queda es la del snapshot: su manifiesto se escribe create-only, así que un reintento converge en el suyo y rechaza uno distinto con el mismo id (`image.ErrSnapshotExists`, INV-16).
 - Publicaciones de baja frecuencia (checkpoint, manifest): CAS contra el objeto de epoch (§12.4).
 - Mismo rango con hash distinto → corrupción o divergencia → fallo duro.
 
@@ -1314,7 +1387,7 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 6. WAL remoto: batching bajo demanda + idempotencia de PUT + summary objects.
 7. PostgreSQL + Control Plane con **término verificado** + modelo de reconciliación + **leases y protocolo de fencing completo** (§12) bajo DST con particiones y deriva de reloj.
 8. Recovery con **S3 como autoridad** + recovery-point + `rebuild-metadata` básico.
-9. Snapshots sin pausa + clones same-host + resize (grow).
+9. Snapshots sin pausa + clones same-host + ~~resize (grow)~~ (V2, §3).
 10. Objectization + checkpoints + GC mark-and-sweep (buckets con versioning + Object Lock desde el primer entorno de staging).
 11. Cross-host por materialización completa + cordon/drain + contabilidad de capacidad.
 12. Standby tibio + compactación de WAL objects + aplanado de cadenas.
@@ -1333,6 +1406,14 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 > standby tibio; el **15** nombra `wal_objects`, que ya no existen, y habrá que decir
 > sobre qué se mide antes de poder cumplirlo. El resto sigue siendo el criterio de V1, y
 > el **3** —que decía en presente el contrato retirado— está reescrito.
+>
+> **Dos más, agregados 2026-08-06 y 2026-08-07.** El **16** (resize grow end-to-end) es V2
+> con el objetivo 14 de §3 — DEV-0023, resuelto ahí. Y el **17** (`rebuild-metadata`
+> reconstruye PG desde S3) **es el único criterio de esta lista que ya se cumple en un
+> entorno de prueba**: `controlplane.RebuildMetadata` lo hace desde dos objetos por volumen
+> y su arma DST es `a-rebuilt-catalog-can-serve-its-volumes`, que no comprueba que
+> volvieron las filas sino que un Agent nuevo sirve los bytes que el guest original
+> escribió (INV-20). Lo que no vuelve es el placement, porque ningún objeto lo registra.
 
 1. Boot con los tres dispositivos.
 2. Docker/containerd solo en efímero.
@@ -1349,7 +1430,7 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 13. Backpressure estricto antes de llenar NVMe.
 14. WAL nunca eliminado antes de durabilidad remota verificada; GC incapaz de borrado permanente directo.
 15. DISCARD reduce `wal_objects`/segmentos: el storage converge al working set en el test de churn.
-16. Resize (grow) online end-to-end.
+16. ~~Resize (grow) online end-to-end.~~ — V2 (§3).
 17. `rebuild-metadata` reconstruye PG desde S3 en un entorno de prueba.
 18. Fleet mixto vN/vN+1 opera sin volúmenes ilegibles (test de upgrade en CI).
 19. Métricas y trazas mínimas visibles desde el día 1; runbooks con tiempos medidos.
@@ -1366,6 +1447,11 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 > compare-and-set sobre el manifiesto en ese momento (§12), no una ventana cerrada por
 > leases. Sigue exacto todo lo demás: los tres dispositivos, el CoW, el cifrado de todo lo
 > que sale del host, el WAL local, y que **no existe replicación host-to-host**.
+>
+> **En el diagrama de abajo**, la línea del Control Plane nombra además tres verbos que no
+> existen: `resize` es V2 (§3, DEV-0023), `drain` se borró (§28.1) y el GC tampoco marca
+> (§21). Lo que sí falta en el diagrama y sí existe es lo de §28.1: el CP **cordona hosts
+> por sí solo** según la presión del dispositivo que reporta el heartbeat.
 
 ```text
 PostgreSQL
