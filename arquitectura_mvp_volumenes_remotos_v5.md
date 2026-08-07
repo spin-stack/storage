@@ -1091,7 +1091,8 @@ Equivalente al `flatten` de RBD / compactación de niveles de un LSM. Sin esto, 
 > **Retirados en 2026-08-02 por ADR-0026.** Describían la cadena de durabilidad remota:
 > objectization y truncado a mitad de sesión (§21.1), compactación (§21.2), GC
 > mark-and-sweep (§21.3), determinación del punto durable desde S3 (§22.1), standby tibio
-> (§22.3), lazy loading (§22.4) y `rebuild-metadata` (§22.5).
+> (§22.3) y lazy loading (§22.4). **`rebuild-metadata` (§22.5) no**: se fue con ellos y
+> volvió el 2026-08-03, en una forma mucho más chica — ver §22.5.
 >
 > V1 no tiene nada de eso: un volumen es una imagen que se publica al parar (§14.8), su
 > WAL local vive una sesión, y arrancar es leer un manifiesto. El texto completo está en
@@ -1100,21 +1101,34 @@ Equivalente al `flatten` de RBD / compactación de niveles de un LSM. Sin esto, 
 > Lo que **no** se fue con ellos: §19 (un snapshot es un número, no un evento) y §20
 > (clonado, localidad y cadenas), que son los dos que más peso cargan en V1.
 
-## 22. Recovery, standby y reconstrucción — V2
+## 22. Recovery y standby — V2 (la reconstrucción, §22.5, no)
 
-Retirada con §21 por ADR-0026, y con la misma razón. Las subsecciones que el código
-todavía cita se resuelven aquí:
+Retirada con §21 por ADR-0026, y con la misma razón — **salvo §22.5**, que volvió. Las
+subsecciones que el código todavía cita se resuelven aquí:
 
 - **§22.1** — determinación del punto durable con autoridad S3. V1 no la necesita: no hay
   prefijo contiguo que establecer, hay un manifiesto que resuelve o no.
 - **§22.3** — standby tibio. Requiere durabilidad remota continua.
 - **§22.4** — lazy loading. Diseñado, no implementado, y ahora tampoco necesario: un clon
   en el host de origen no descarga nada (§20).
-- **§22.5** — `rebuild-metadata`, reconstrucción de PostgreSQL desde S3. **Su implementación
-  se fue con esta sección.** El `descriptor.json` que un volumen escribe al aprovisionarse
-  sigue existiendo y sigue siendo la única ancla auto-descriptiva de un volumen en el
-  object store — pero su lector se fue con el rebuild, así que hoy tiene escritores y
-  ningún lector. Registrado en `STATUS.md`, no resuelto aquí.
+- **§22.5** — `rebuild-metadata`, reconstrucción de PostgreSQL desde S3. **Es la única
+  subsección de §22 que sigue viva, y este párrafo decía lo contrario hasta 2026-08-07.**
+  La implementación que ADR-0026 borró volvió el 2026-08-03, mucho más chica:
+  `controlplane.RebuildMetadata` lee **dos objetos por volumen** — el `descriptor.json` que
+  el volumen escribe al aprovisionarse y los manifiestos de snapshot bajo su prefijo — sin
+  cadena de epochs, sin recovery-point y sin prefijo contiguo que reensamblar. Su llamador
+  de producción es `control-plane -rebuild-metadata`, y es el lector que `descriptor.Write`
+  venía alimentando sin tener ninguno. **No usa material de claves**: un operador con el
+  bucket y sin la KEK puede reconstruir el catálogo, aunque no leer un byte de guest.
+  Es INV-20, y su arma DST (`a-rebuilt-catalog-can-serve-its-volumes`) no comprueba que
+  volvieron las filas sino que un Agent nuevo, sobre un data-dir que nunca vio el volumen,
+  sirve los bytes que el guest original escribió. **Lo que no vuelve** está dicho donde se
+  decide, en `volumeFromDescriptor`: el placement, porque ningún objeto lo registra — un
+  catálogo reconstruido describe volúmenes que nadie está sirviendo, y ésa es la respuesta
+  honesta. Dos hechos cambiaron de sentido con ADR-0026 y valen aquí: el `current_epoch`
+  del descriptor es **autoritativo** (el objeto de epoch al que antes cedía se borró con la
+  cadena de fencing), y la existencia del manifiesto de un snapshot **es** su estado
+  PUBLISHED, porque se escribe create-only y no cambia (INV-16).
 
 ## 23. Edge cases
 
@@ -1249,8 +1263,22 @@ Ver §6.1; bloqueante para cada versión de MinIO/RustFS/S3 que se habilite.
 > retirado se lee como un plan, y `internal/obs.Catalog()` es esta lista. Lo que se fue
 > vuelve con su mecanismo, desde git.
 
+> **Que esta lista siga siendo `Catalog()` es un comando, no una afirmación** — se
+> desincronizó dos veces, y la segunda le faltaban las tres series de la vista de lectura:
+> ```
+> for n in $(sed -n 's/^\t\t{"\([a-z0-9_]*\)".*/\1/p' internal/obs/metrics.go); do
+>   grep -q "$n" arquitectura_mvp_volumenes_remotos_v5.md || echo "sin documentar: $n"
+> done
+> ```
+> Vacío significa que el catálogo declarado está entero acá. Por eso los nombres se
+> escriben completos abajo y no abreviados con llaves: una abreviatura hace que el chequeo
+> ladre por algo que sí está, y un chequeo que ladra de más se ignora. Lo que el comando
+> **no** dice es cuál tiene productor; eso está en `STATUS.md`, con su propia trampa
+> anotada.
+
 **WAL local**: `wal_append_latency_seconds`, `wal_fdatasync_latency_seconds`,
-`wal_unflushed_bytes`, `wal_oldest_unflushed_age_seconds`, `wal_{local,durable}_sequence`,
+`wal_unflushed_bytes`, `wal_oldest_unflushed_age_seconds`, `wal_local_sequence`,
+`wal_durable_sequence`,
 `wal_out_of_space` (1 mientras el dispositivo rechaza appends por espacio, §5.7).
 
 `wal_published_sequence` se retira con el checkpoint: en V1 nada publica, así que sería
@@ -1264,8 +1292,15 @@ mide alrededor del *congelado*, no de la subida).
 **Leases** (liveness, ya no durabilidad): `lease_remaining_seconds`,
 `lease_renewal_failures_total`, `clock_offset_seconds` (chrony).
 
-**Fleet**: `host_nvme_committed_ratio`, `clone_{same,cross}_host_total`, `chain_depth`,
-`discarded_bytes_total`.
+**Fleet**: `host_nvme_committed_ratio`, `clone_same_host_total`, `clone_cross_host_total`,
+`chain_depth`, `discarded_bytes_total`.
+
+**Vista de lectura** (agregadas en 2026-08-06; §10.1 pide que nada crezca sin cota y
+`cow.IntervalMap` es la única estructura por volumen cuyo tamaño lo decide el guest y no la
+configuración): `read_view_bytes`, `read_view_extents`, `read_view_layers`. Las tres las
+graba el dueño del mapa bajo el lock que lo serializa, en el paso durable — no las muestrea
+un poller, porque la estructura no es segura de leer en concurrencia y un poller sería una
+segunda cosa pidiendo el lock del volumen en el data path.
 
 **Agent**: `agent_memory_bytes{component}`, `vhost_reconnects_total`,
 `inflight_recovered_total`.
