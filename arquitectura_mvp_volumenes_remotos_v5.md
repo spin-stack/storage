@@ -268,6 +268,33 @@ oldest_unflushed_age <= max_unflushed_age           (default 30 s)
 
 Si se superan, se aplica backpressure: se rechazan nuevos WRITEs con error explícito al guest.
 
+> **Estos dos no son la cota que ata en V1, y hasta 2026-08-07 este documento no nombraba
+> la que sí (ADR-0013).** `Sync` limpia el contador de no-flusheados en cada `fsync` del
+> guest, así que bajo cualquier workload que haga fsync — o sea, cualquiera al que le
+> importen sus datos — `unflushed_bytes` está en cero mientras los segmentos siguen
+> creciendo. Acota una ráfaga; no puede acotar una sesión, y con ADR-0026 el WAL entero de
+> una sesión se queda local hasta que el volumen para.
+>
+> La cota que ata es **`MaxLocalBytes`: lo que este log puede ocupar del dispositivo**, y
+> es una tercera regla en el mismo lugar (`wal.Limits`, comprobada en el mismo camino que
+> las dos de arriba; cruzarla devuelve `wal.ErrBackpressure`, el mismo error que el guest
+> entiende). No la limpia nada durante la sesión, y ésa es la forma honesta de V1: un
+> volumen que gastó su parte queda en backpressure hasta que para y publica.
+>
+> **De dónde sale la parte**, porque un límite por volumen no es una cota sobre un
+> dispositivo — N volúmenes, cada uno dentro del suyo, lo agotan entre todos y nada los
+> suma. `agent.Budget` divide el dispositivo medido: `GuestRatio` (0,85) es lo que los
+> guests de este host pueden llenar entre todos, `ReserveRatio` (0,05) es la resta que
+> deja libre lo que la publicación al parar necesita — el `fdatasync` de segmentos ya
+> escritos, que en un filesystem con delayed allocation es donde aparece el ENOSPC — y el
+> resto se divide por `-max-volumes` (default `agent.DefaultMaxVolumes` = 16). La parte es
+> **estática**, calculada una vez: una parte que se encogiera al atachar un volumen
+> pondría en backpressure retroactivo a logs que ya estaban por encima de su parte nueva,
+> que es un guest fallando WRITEs porque llegó *otro* volumen al host. Un Agent que no
+> puede derivar una parte **no arranca** (`NewVolumeManager` rechaza `Budget.Share() <= 0`),
+> y ésa es la diferencia entre esta cota y las dos de arriba: son configuración, y ésta es
+> una precondición.
+
 ### 5.8 S3 es la autoridad de recovery (nuevo)
 
 > El punto durable de un volumen = el final del **prefijo contiguo más largo** de sequences bajo `wal/<vol>/<epoch>/` para el **epoch fenced más alto**. Los watermarks en PostgreSQL son informativos (actualización lazy), nunca autoridad.
@@ -661,6 +688,16 @@ background_net_budget: 30% de NIC (configurable)
 background_nvme_budget: 30% de IOPS/BW (configurable)
 ```
 
+> **Lo que `cmd/volume-agent` acepta de verdad es otra lista**, y el bloque de arriba
+> describe sobre todo V2 (batches, checkpoints, clases de I/O). Los flags que existen:
+> `-host-id`, `-control-plane`, `-data-dir`, `-vhost-socket-dir`, `-heartbeat-interval`,
+> `-retry-backoff`, `-lease-ttl`, `-rpc-timeout`, `-otlp-endpoint`, `-shutdown-grace`,
+> `-kek-file` y **`-max-volumes`** — el divisor del presupuesto del dispositivo (§5.7).
+> Tres cosas que ese bloque no dice y que un operador necesita: sin `-kek-file` el Agent
+> escribe datos de guest **sin cifrar** y lo advierte por log (es modo dev, §15); el
+> `lease_ttl` de acá es liveness, no durabilidad (§14.8); y `-shutdown-grace` acota **un
+> intento** de publicación, no la espera entera (§14.8).
+
 ### 10.1 Presupuesto de memoria (nuevo)
 
 El Agent declara y respeta un presupuesto explícito; nada crece sin cota:
@@ -896,6 +933,28 @@ Reglas:
    secuencia. Es el mecanismo para obtener un punto portable bajo demanda.
 5. Los límites de unflushed (§5.7) y el backpressure aplican igual.
 6. **El guest no puede detectar nada de esto.** El contrato es con el operador.
+7. **Un Agent que no puede publicar no para.** La regla 2 dice que S3 recibe el volumen al
+   parar; ésta dice qué pasa cuando no puede, que es la mitad que este documento no tenía
+   (revisada y decidida el 2026-08-04, `docs/plan/SHUTDOWN-PUBLISH-SPEC.md`). El Agent
+   sigue vivo, se queda con el lock de su data-dir, conserva el WAL local y reintenta con
+   backoff **indefinidamente**; `-shutdown-grace` acota **un intento**, no la espera, y no
+   es un presupuesto tras el cual se abandonan datos. Se eligió contra salir con código
+   distinto de cero, que era lo que la spec proponía: un Agent que sale es
+   indistinguible de uno que crasheó, y la flota ve un host muerto sin poder saber si
+   guarda una sesión que nadie tiene. Uno que sigue arriba diciendo *estoy reteniendo
+   datos sin publicar del volumen X, intento 14* es algo sobre lo que se puede actuar, y
+   además sigue heartbeateando. **El costo, dicho sin adornos:** una caída del object
+   store deja a cada Agent afectado vivo y negándose a parar, así que un rolling restart
+   se cuelga a nivel flota hasta que el store vuelva. Es el lado correcto del trade: una
+   flota que no reinicia durante una caída es un problema operativo con causa obvia; una
+   que reinició y perdió una sesión por host es un problema de datos sin ninguna.
+   Las salidas son tres: una **segunda señal** abandona y sale distinto de cero diciendo
+   qué sesiones deja sin publicar (`agent.ErrPublishAbandoned`, que `exitCode` traduce);
+   un `SIGKILL` libera el flock y **no pierde nada**, porque los records están en disco y
+   el Agent siguiente sobre ese host re-atacha en el mismo epoch y los publica (ADR-0024);
+   y que el store vuelva, que es el caso para el que existe. La única excepción que sí
+   sale es `image.ErrSuperseded` — otro escritor publicó encima, reintentar sería pisar
+   una imagen más nueva con una más vieja, que es exactamente lo que INV-10 impide.
 
 ---
 
@@ -1246,6 +1305,30 @@ La lista de v4 se mantiene íntegra (kills alrededor de append/fdatasync/PUT/ACK
 
 Ver §6.1; bloqueante para cada versión de MinIO/RustFS/S3 que se habilite.
 
+### 25.5 Alcanzabilidad desde un binario (agregada 2026-08-07)
+
+Nada de §25 detecta el defecto que este repositorio más veces se comió: una pieza
+completa, con tests unitarios, property tests y escenario DST, **que ningún binario
+llama**. Un checker verifica lo que el escenario ejerce, y un escenario no ejerce lo que
+nadie invoca; la maquinaria sofisticada alrededor de un camino desconectado no hace que el
+camino funcione, hace que el hueco sea más difícil de notar. Por eso el gate incluye
+`task deadcode`: análisis estático sobre el programa construido, que responde qué símbolos
+no alcanza ningún `main`.
+
+Su forma importa más que la herramienta, y es un **trinquete de dos listas**, no un
+contador. `hack/deadcode-allow.txt` es "nadie lo alcanza y está bien — para siempre" (una
+afordancia de test, un modelo de referencia); `hack/deadcode-pending.txt` es "nadie lo
+alcanza y es un defecto que nadie terminó de borrar". El trinquete gira en un solo sentido
+y los dos lados fallan: un hallazgo que no está en ninguna lista pone el gate en rojo, así
+que el conjunto no puede crecer — que es la propiedad que un *número* pineado no tiene,
+porque con un número borrar un hallazgo compra el derecho a agregar otro y nadie nota el
+canje — y una entrada que la herramienta deja de reportar **también** lo pone en rojo, así
+que cuando el código se va, la línea se va en el mismo commit.
+
+La consecuencia sobre qué significa "hecho" es directa y es la razón de que esto viva en
+§25 y no en un README: **un componente sin llamador no es progreso, es pasivo**, y ahora
+hay algo que lo dice sin depender de que alguien se acuerde.
+
 ---
 
 ## 26. Observabilidad y trazabilidad
@@ -1338,6 +1421,34 @@ Sin esta política, el primer cambio de formato con el fleet a medias actualizad
 
 - `cordon <host>`: no colocar nada nuevo (estado en tabla `hosts`).
 - `drain <host>`: operación reconciliada de larga duración; mueve volúmenes fuera (snapshot + restore cross-host en el MVP, priorizando destinos con caché/standby), con progreso visible (`operations`) y cancelable. Prerequisito de todo mantenimiento de kernel/NVMe/decomiso.
+
+> **El drain se borró y el cordon dejó de ser un verbo humano; este párrafo describía las
+> dos cosas al revés hasta 2026-08-07.** `controlplane/drain.go` no existe y nada mueve un
+> volumen de host: `HostDraining` sobrevive como estado del ciclo de vida sin productor, y
+> el movimiento entre hosts es dos pasos manuales — `-detach-volume`, observar que el host
+> paró y publicó, `-attach-volume` (§7).
+>
+> El cordon, en cambio, **lo aplica el Control Plane solo**, sobre la medición de
+> dispositivo que el heartbeat del Agent reporta (ADR-0013 §3, `internal/cpserver/pressure.go`).
+> Y no es un umbral sino una **banda de Schmitt**: cordona al 70% usado
+> (`cpserver.CordonUsedRatio`) y vuelve a ACTIVE solo por debajo del 65%
+> (`UncordonUsedRatio`). Un umbral solo es un cordon que oscila — un host parado sobre la
+> línea la cruza en los dos sentidos en heartbeats consecutivos, y cada cruce es una
+> escritura, un cambio de estado que lee toda decisión de placement de la flota, y una
+> línea en lo que sea que un operador esté mirando. Volver exige liberar un 5% del
+> dispositivo, que no es jitter. Se rechazó además un *dwell* ("seguir cordonado hasta N
+> heartbeats sin presión"): necesita estado que esto no tiene — cuándo se despejó la
+> presión, por host — o sea una columna escrita en el RPC más frecuente que hay, o memoria
+> del CP que un cambio de líder descarta, con lo que una flota en failover dejaría hosts
+> cordonados indefinidamente.
+>
+> Como ahora `state = 'CORDONED'` puede haberlo puesto un humano o el bucle, la tabla
+> `hosts` guarda **por qué** (`lifecycle.CordonReason`: `OPERATOR` o `DEVICE_PRESSURE`), y
+> el escritor automático solo puede pisar `''` o `DEVICE_PRESSURE` — un cordon puesto por
+> una persona, por una causa que la flota no puede ver, no lo levanta la presión al bajar.
+>
+> Lo que §28.2 dice sigue en pie y es lo que hace el `placement` de V1: la admisión mira
+> lo que un host **está usando**, no solo lo que le prometieron.
 
 ### 28.2 Capacidad y placement
 
