@@ -249,3 +249,53 @@ the others. Turning it on immediately made the tree red, which is the correct ou
 the reason it was worth finding: the previous wave had deleted tested production code and
 recorded that coverage "did not fall below", which was true of the printed number and
 false of the number.
+
+**B11: `task deadcode` binds, over a set (2026-08-06).** The check existed and gated
+nothing: it was landed outside `ci`/`ci:full` on the argument that a step which is red the
+day it lands is a step someone deletes, and the plan was to wire it in "the moment the
+unexplained count is zero". That plan cannot arrive on purpose. The count drifts as other
+lanes delete code — it has fallen once already since the entry above was written, and no
+one decided anything to make it — so the gate would have switched itself on by accident,
+and until then every newly unreachable symbol was landing unnoticed. The entry above is
+also the demonstration of `PARALLEL-PLAN.md`'s rule about numbers in documents: every
+figure in it is now wrong, and the mechanism that computes the right ones is `task
+deadcode`.
+
+**The shape is a second list, `hack/deadcode-pending.txt`, and the split is the decision.**
+`deadcode-allow.txt` claims "unreachable, and that is correct forever"; the pending list
+claims "unreachable, and nobody has finished deleting it yet". Both are parsed by one
+reader in `hack/deadcode.sh`, so no rule can apply to one and quietly not the other, and
+the gate now fails on four things: a finding in neither list (the set cannot grow), an
+entry in either list that is no longer reported (it cannot outlive its code), a symbol
+claimed by both, and an entry with no reason. The rejected alternative was one list: move
+the outstanding findings into the allowlist with a reason each. That is green immediately
+and costs the allowlist its meaning — the file that says which unreachable symbols are
+*correct* would have been carrying, at that moment, mostly ones that are not. Pinning a
+bare integer was rejected for the reason this repository already paid for: `wantBehavioural`
+is the ratchet that causes merge conflicts, and a number is satisfied by deleting one
+finding and adding another.
+
+**What is pinned, and whose it is.** Everything in the pending list belongs to another
+lane, so this track recorded them rather than deleting them: `internal/simio/real`'s whole
+TCP transport (track E — a complete listen/dial/framed-send implementation reachable from
+no binary, because the wire is Connect over HTTP; its only callers are the simio contract
+test and DST's simulated counterpart), and `lease.Manager.Revoke` (a production verb whose
+two callers — the fence and the lease-gated ACK — ADR-0026 deleted; `internal/lease`
+belongs to no track in `PARALLEL-PLAN.md`'s table, and the decision travels with track D's
+detach). The consequence to know about: **a lane that deletes one of these must delete its
+line in the same commit**, or the gate goes red on a stale entry. That is deliberate and it
+is the same rule `internal/dst/mandatory_set_test.go` already imposes; the file says so in
+its header.
+
+**Planted, and it went red.** An exported `PlantedUnreachableVerb()` in
+`integration/guestinit/main.go` — a root, so the plant exercises the call-graph analysis
+and not just the parser. `task deadcode` printed `unexplained: 1` with
+`integration/guestinit.PlantedUnreachableVerb` named, and exited 1; reverted, and the
+target prints `OK: every unreachable symbol has a recorded reason` followed by the
+still-owed list, which is printed on *green* runs precisely because after this change a
+green run is the only kind anyone sees. The other three failures were exercised too, with
+`PENDING=` pointed at a doctored copy: a pending entry deadcode does not report → *"the
+deletion happened. Remove the lines, in the commit that removed the code"*; a symbol in
+both lists → *"which claims they are permanently fine and must be deleted at the same
+time"*; an entry with no `#` → *"entries with no reason"*. `task --summary ci` shows the
+step between `lint` and `test`.

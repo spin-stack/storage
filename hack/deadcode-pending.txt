@@ -1,0 +1,62 @@
+# Unreachable-from-a-binary symbols this repository still owes a decision. The ratchet.
+#
+# Read hack/deadcode.sh first, then hack/deadcode-allow.txt. The difference between that
+# file and this one is the reason there are two, and it is not bookkeeping:
+#
+#   deadcode-allow.txt  "no binary reaches this, and that is correct — forever."
+#                       A test-only affordance, a reference model, a fake front-end's
+#                       encoder. The reason is stable; the entry never leaves.
+#   deadcode-pending.txt (here)
+#                       "no binary reaches this, and that is a defect nobody has
+#                       finished yet." CLAUDE.md's answer to a component with no caller
+#                       is deletion; an entry here is a deletion that has not happened.
+#
+# Moving these lines into the allowlist would have made `task deadcode` green on the day
+# it became a gate, at the cost of the allowlist's meaning — the file whose whole purpose
+# is to say which unreachable symbols are *fine* would have started carrying the ones that
+# are not, and the distinction would have been gone for good. Two lists keep the claim
+# honest and still let the check bind today.
+#
+# THE RATCHET TURNS ONE WAY, and both directions are enforced by hack/deadcode.sh:
+#
+#   - a finding in neither list fails the gate, so the set cannot grow. That is the
+#     property a pinned *count* does not have: with a number, deleting one finding buys
+#     the right to add another, and nobody ever notices the swap.
+#   - an entry here that deadcode no longer reports also fails the gate, so when the code
+#     goes, the line goes with it — in the same commit. That is the rule
+#     `internal/dst/mandatory_set_test.go` already has, for the same reason: a registry
+#     that outlives what it registers is a registry nobody trusts.
+#
+# So a lane deleting one of these edits this file, even though hack/ is track B's. It is
+# not a lane's private property while it is shrinking; it is the list of things the tree
+# owes, and the last commit to touch it should be the one that empties it.
+#
+# Format is the allowlist's: `<symbol>  # who owns the decision, and what the decision is`.
+# The reason is mandatory here too — an entry with none fails the check that reads it.
+
+# --- internal/simio/real's network: a transport nothing transports over (track E) --------
+# A complete TCP implementation of the simio network interface — listen, dial, framed
+# send/recv — reachable from no binary, because the wire between the Agent and the Control
+# Plane is Connect over HTTP (ADR-0018) and neither binary opens a socket through simio.
+# Its only callers are internal/simio/network's contract test and the DST harness's
+# simulated counterpart. This is the CloneCrossHost shape — well-tested code doing real
+# work that nothing asks for — and the decision (delete it, or give the contract test a
+# home that does not ship a transport) is track E's, which owns internal/simio/real.
+internal/simio/real.NewNetwork          # track E: the constructor no binary calls
+internal/simio/real.Network.Listen      # track E: same
+internal/simio/real.Network.Dial        # track E: same
+internal/simio/real.realListener.Accept # track E: reachable only through Listen
+internal/simio/real.realListener.Addr   # track E: same
+internal/simio/real.realListener.Close  # track E: same
+internal/simio/real.realConn.Send       # track E: reachable only through Dial/Accept
+internal/simio/real.realConn.Recv       # track E: same
+internal/simio/real.realConn.Close      # track E: same
+
+# --- the lease verb nothing performs -----------------------------------------------------
+# Revoke drops the lease and bumps the generation so an in-flight grant response cannot
+# revive it (§12.2). Nothing performs it: ADR-0026 removed the fence and the lease-gated
+# ACK, so the two events that revoked a lease no longer exist. It is not in the allowlist
+# because it is not a test affordance — it is a production verb waiting for the one caller
+# V1 still lacks. `internal/lease` belongs to no track in PARALLEL-PLAN.md's table; the
+# decision travels with detach.
+internal/lease.Manager.Revoke  # detach (track D's -detach-volume) is the caller this is waiting for; if detach lands without calling it, delete it

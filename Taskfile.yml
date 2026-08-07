@@ -595,17 +595,34 @@ tasks:
 
   deadcode:
     desc: >-
-      Report functions no binary reaches, minus hack/deadcode-allow.txt's explained ones
-      (CLAUDE.md: "a component with no caller is a liability, not progress").
-    # NOT in `ci` or `ci:full` yet, and the reason is not squeamishness: it exits 1 today
-    # on 17 findings in three packages (internal/simio/real's whole network implementation,
-    # internal/lifecycle's Agent volume-state machine, and lease.Manager.Revoke — a verb
-    # nothing performs since ADR-0026 took the lease-gated ACK), and a gate that is red the day it
-    # lands is a gate someone deletes the step for. It becomes blocking the moment that
-    # count is zero — every finding either deleted or in the allowlist with its reason —
-    # and the check that keeps it honest until then is that the allowlist itself fails on
-    # a stale or unexplained entry. The hand-written list in STATUS.md this replaces had
-    # neither property and was wrong twice.
+      Fail on a function no binary reaches that neither hack/deadcode-allow.txt nor
+      hack/deadcode-pending.txt accounts for (CLAUDE.md: "a component with no caller is a
+      liability, not progress"). In `ci`.
+    # It is in `ci` since 2026-08-06, and what it took to get there was a second list.
+    #
+    # It was deliberately out of every gate before that, with the reason written down: it
+    # exited 1 on findings nobody had decided about, and a step that is red the day it
+    # lands is a step someone deletes. Waiting for that count to reach zero was the plan,
+    # and it was the wrong plan — the count drifts on its own as other lanes delete code
+    # (it has already fallen once, with nobody deciding anything), so "wait until it is
+    # zero" is a gate that arrives by accident if it arrives at all, and until it does,
+    # every newly unreachable symbol lands unnoticed.
+    #
+    # The mechanism is a ratchet over a *set*, not a count: hack/deadcode-pending.txt pins
+    # the findings that are still owed a decision, each with its owner, and the script
+    # fails on a finding in neither list (the set cannot grow), on an entry that is no
+    # longer reported (it cannot outlive its code), and on a symbol claimed by both lists.
+    # A pinned integer was rejected for the reason this repository already knows: the one
+    # ratchet here that pins a bare number, `wantBehavioural`, is the one that causes merge
+    # conflicts, and a number can be satisfied by deleting one finding and adding another.
+    #
+    # Rejected alternative: move the ten into hack/deadcode-allow.txt with a reason each
+    # and have one list. That is green today and costs the allowlist its meaning — it is
+    # the file that says which unreachable symbols are *correct*, and half its entries
+    # would then be ones that are not.
+    #
+    # In `ci` rather than only `ci:full`, next to lint: it needs no Docker, it costs ~2s,
+    # and the person who creates an unreachable symbol is running `task ci`.
     deps: [tools:deadcode]
     cmds:
       - DEADCODE={{.TOOLS_BIN}}/deadcode bash hack/deadcode.sh
@@ -691,11 +708,15 @@ tasks:
       - TASK_EXE={{.TASK_EXE}} bash hack/workflow-tasks.sh
 
   ci:
-    desc: Fast local gate — format, build, lint, test, dst. No Docker required.
+    desc: Fast local gate — format, build, lint, deadcode, test, dst. No Docker required.
     cmds:
       - task: fmt:check
       - task: build
       - task: lint
+      # Beside lint, and before the race suite: it is static analysis over the built
+      # program, it costs about two seconds, and an unreachable symbol reported after
+      # twenty seconds of tests is a report that arrives once nobody is watching.
+      - task: deadcode
       - task: test
       - task: dst
       # Half a second, and it is in the *fast* gate rather than only in `ci:full`
