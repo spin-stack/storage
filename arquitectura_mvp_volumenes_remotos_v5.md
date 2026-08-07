@@ -515,8 +515,12 @@ Operación: PITR obligatorio (WAL-G o pgBackRest hacia el mismo object store), r
 > lane de integración construye su base desde él). Las diferencias que un lector notaría
 > primero: los identificadores son `uuidv7` — un dominio sobre `uuid`, no `TEXT` (INV-22) —
 > `volumes` lleva además `parent_snapshot_id`, `dek_key_id` y un CHECK que enforcea el orden
-> de watermarks de §5.6, y `hosts` lleva la razón del cordon (§28.1). Lo que **no** existe es
-> la tabla `operations` de abajo.
+> de watermarks de §5.6, y `hosts` lleva la razón del cordon (§28.1). En `hosts`,
+> `nvme_committed_bytes` **no es una columna**: lo comprometido se *deriva* sumando los
+> volúmenes que el catálogo ya coloca en ese host (ADR-0017), porque un número que SQL puede
+> recalcular es una caché y la caché más barata de mantener honesta es la que no existe. La
+> columna que sí hay en su lugar es `nvme_remote_backlog_bytes`, que es lo contrario: se
+> almacena porque nada la puede derivar. Y lo que **no** existe es la tabla `operations`.
 
 ```sql
 CREATE TABLE volumes (
@@ -1248,6 +1252,20 @@ si chain_depth > max_chain_depth (5)  o  replay_estimado > umbral:
 
 Equivalente al `flatten` de RBD / compactación de niveles de un LSM. Sin esto, el sistema funciona en la demo y degrada en silencio durante meses. Métricas: `chain_depth{volume}`, `flatten_operations_total`.
 
+> **No hay FLATTEN, no hay techo de profundidad, y el aplanado que sí ocurre es otro y no lo
+> decidió nadie — es DEV-0020, abierto.** `controlplane.Clone` hace
+> `ChainDepth: parent.ChainDepth + 1` y ningún camino se niega por profundidad; el
+> `max_chain_depth = 5` de §4 y §10 no lo lee nadie. Lo que sí pasa es que la publicación de
+> un clon aplana **en cada parada**: `image.uploadChunks` recorre `view.Ranges()`, que
+> mezcla la base con la capa (§13.2), así que la primera parada de un clon vuelve a subir el
+> dataset entero de su padre bajo su propio prefijo — un duplicado por eslabón, y **la única
+> razón por la que un clon de profundidad 2 lee algo que no sean ceros**, porque nada
+> recorre una cadena al leer. Quitar el costo sin construir la lectura encadenada convierte
+> un defecto de costo en uno de corrección silenciosa, así que son una sola decisión, y es
+> una decisión de formato en S3 (`docs/plan/CHUNK-ADDRESSING-SPEC.md`, sin revisar). Hasta
+> que se responda, `chain_depth` describe un linaje, no un camino de lectura, y
+> `flatten_operations_total` no existe.
+
 ---
 
 ## 21. Objectization, compactación y GC — V2
@@ -1572,6 +1590,16 @@ Sin esta política, el primer cambio de formato con el fleet a medias actualizad
 ### 28.2 Capacidad y placement
 
 Heartbeat del Agent reporta NVMe total/usado/comprometido. El CP aplica la política de sobresuscripción declarada al decidir placement, y la alerta `host_nvme_committed_ratio` avisa antes del incidente.
+
+> **Esto es lo que hace `internal/placement`, con una corrección: el heartbeat no reporta lo
+> comprometido.** Reporta total y usado; lo comprometido se deriva sumando los volúmenes que
+> el catálogo ya coloca en el host (§8). Y son **dos** techos, no uno: `Policy.Admits` exige
+> que lo comprometido más el volumen nuevo entre en `MaxOversubscription` **y** que lo
+> *medido como usado* esté bajo `MaxUsedRatio` (`DefaultMaxUsedRatio` = 0,85, el mismo
+> número que el `GuestRatio` del Agent en §5.7, deliberadamente escrito igual). Colapsarlos
+> en un solo techo sobre `max(comprometido, usado)` hace que el más bajo esconda al otro:
+> son dos preguntas distintas —cuánto se prometió y cuánto hay— y una sola respuesta oculta
+> la que no disparó.
 
 ### 28.3 Deploys
 
