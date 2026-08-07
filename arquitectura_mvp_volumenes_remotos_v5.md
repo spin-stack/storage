@@ -92,7 +92,7 @@ Las decisiones "aceptadas en el MVP" solo son evaluables contra un caso de uso d
 | **RPO** | **una sesión.** Un FLUSH/FUA ACKeado es durable frente a la caída del proceso, del Agent y de QEMU — no frente a la pérdida del host. |
 | Latencia de FLUSH | la de `fdatasync` local. S3 no está en el camino del ACK. |
 | Pausa de I/O por snapshot | ~0 (crash-consistent, sin quiesce; el punto congelado es un número de secuencia, §19) |
-| Pausa de I/O por deploy/crash del Agent | segundos (reconexión vhost-user), sin reinicio de VM |
+| Pausa de I/O por deploy/crash del Agent | **no medible todavía: el mecanismo no existe** (ver abajo) |
 | Boot de un clon en el host de origen | sin descarga (§20) |
 | Boot de un clon en otro host | descarga completa; medido por GiB, no prometido |
 
@@ -101,6 +101,18 @@ Las decisiones "aceptadas en el MVP" solo son evaluables contra un caso de uso d
 Es coherente con el caso de uso de arriba: nadie pide que un runner de CI sobreviva a la muerte de su host. La versión anterior de esta tabla pedía **RPO 0 bajo el modelo de fallas probado por DST**, y esa fila —no el caso de uso— es la que generaba la cadena de durabilidad remota completa: subida por cada FLUSH, ACK gobernado por lease, checkpoints, promoción y recuperación a mitad de sesión. Nadie la había pedido.
 
 Un volumen que deba sobrevivir a la pérdida del host es **V2**, y vuelve con un requisito real detrás.
+
+**La fila de la pausa por deploy/crash del Agent no está retirada: está sin construir, y
+decía un número igual.** El inflight tracking es el incremento 3.3 y no se empezó;
+`vhost.ProtocolFeatures` **no anuncia** `VHOST_USER_PROTOCOL_F_INFLIGHT_SHMFD`
+deliberadamente, con la razón escrita al lado de la constante: anunciarlo antes de
+implementar la región haría que QEMU entregue un buffer que este backend ni lee ni escribe,
+y la garantía que el front-end creería entonces —las requests sobreviven un reinicio del
+backend— sería falsa. Anunciar de menos degrada; anunciar de más miente. Así que hoy, un
+crash o un deploy del Agent **sí** afecta a las VMs, y esta fila no tiene con qué medirse.
+Es RISK-10, abierto (`docs/plan/RISKS.md`). Las otras cinco menciones de la reconexión en
+este documento —§1, §4, §10, §16, §23 y el criterio 11 de §31— describen lo mismo y hay que
+leerlas contra esta fila.
 
 ---
 
@@ -1323,8 +1335,14 @@ subsecciones que el código todavía cita se resuelven aquí:
 > y *Old writer vuelve* (no hay lease que vencer ni checkpoints que rechazar; queda el CAS
 > del manifiesto al parar, §12).
 >
-> Siguen vigentes tal cual: *PUT exitoso con respuesta perdida*, *Manifest publicado /
-> PostgreSQL no actualizado* y *Crash del Agent con requests en vuelo*. *NVMe lleno*
+> Siguen vigentes tal cual: *PUT exitoso con respuesta perdida* y *Manifest publicado /
+> PostgreSQL no actualizado*. **Corrección de 2026-08-07: *Crash del Agent con requests en
+> vuelo* estaba en esta lista y no corresponde** — dice que el Agent recupera las requests
+> por inflight shmfd "verificado por DST", y no hay nada que recuperar ni nada que lo
+> verifique: el incremento 3.3 no se empezó, `vhost.ProtocolFeatures` no anuncia
+> `INFLIGHT_SHMFD` a propósito, y `inflight_recovered_total` es una serie sin productor. Es
+> el caso de esta sección con más distancia entre lo que promete y lo que hay, y estaba
+> bendecido como vigente. Ver §2 y RISK-10. *NVMe lleno*
 > conserva del 3 en adelante — sus dos primeros pasos nombran la objectización y los
 > batches pendientes. *Reloj con deriva excesiva* conserva la alerta y pierde la
 > inelegibilidad para promoción, porque nada promociona.
@@ -1376,7 +1394,7 @@ El reconciler completa la operación usando `request_id` (o `rebuild-metadata` e
 
 ### Crash del Agent con requests en vuelo
 
-Inflight shmfd: al reiniciar, el Agent recupera y completa/reintenta las requests sin duplicar ni perder (verificado por DST).
+Inflight shmfd: al reiniciar, el Agent recupera y completa/reintenta las requests sin duplicar ni perder (verificado por DST). — **Nada de esto existe; ver el banner de esta sección y §2.**
 
 ---
 
@@ -1728,7 +1746,7 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 8. Stale writer incapaz de confirmar durabilidad tras `lease_ttl` (verificado con partición + acceso a S3 intacto).
 9. PUT idempotente (incluyendo respuesta perdida).
 10. Recovery cuyo punto durable se determina desde S3 y coincide con todo lo ACKeado.
-11. Crash/deploy del Agent sin reinicio de VMs (inflight recuperado, cero I/O perdido o duplicado).
+11. Crash/deploy del Agent sin reinicio de VMs (inflight recuperado, cero I/O perdido o duplicado). — **sin mecanismo: incremento 3.3 no empezado, RISK-10** (§2).
 12. Todo dato de VM fuera del host cifrado; borrado de volumen = crypto-shred.
 13. Backpressure estricto antes de llenar NVMe.
 14. WAL nunca eliminado antes de durabilidad remota verificada; GC incapaz de borrado permanente directo.
