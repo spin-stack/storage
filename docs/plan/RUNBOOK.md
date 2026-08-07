@@ -178,7 +178,7 @@ exit=1
 
 The `wal=` field is the path, relative to `data_dir`, that must survive. Exit **1** is the
 supervisor's instruction to restart — `exitCode` in `cmd/volume-agent/main.go` documents
-all three codes, and **2** ("another writer published over us; do not restart") was not
+every code it can return, and **2** ("another writer published over us; do not restart") was not
 reached in this verification run.
 
 **(c) `SIGKILL`. Same cost as (b), and it is safe.** Measured: the process ends with 137,

@@ -599,8 +599,8 @@ stayed `CORDONED OPERATOR`. `docs/plan/RUNBOOK.md` §3 carries that transcript.
 No schema change, no new query. `task ci` is green.
 
 **D11: the incident path is written down, and every step was run (2026-08-07).**
-`docs/plan/RUNBOOK.md`. CLAUDE.md's maturity table names "runbook times measured" as one
-of three criteria for production-verified and there was no runbook to time: the pieces an
+`docs/plan/RUNBOOK.md`. CLAUDE.md's maturity table names "runbook times measured" among its
+criteria for production-verified and there was no runbook to time: the pieces an
 incident uses all existed — `-fleet-status`, the hold-and-retry teardown, the self-cordon,
 `-rebuild-metadata`, detach and attach — and nothing said how they fit together when
 something is actually wrong.
