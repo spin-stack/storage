@@ -631,9 +631,9 @@ Answering §8 "structure" changes what a *clone* reads and touches none of that,
 owner's motive is bucket cost, `chain_depth` is the wrong variable to decide it on.
 
 **And a cost nobody has priced is larger, in the limit, than the one being priced.** No
-production caller deletes an object (`grep -rn '\.Delete(' --include=*.go internal/ cmd/`
-reaches only the store implementations and their conformance suite), so a superseded chunk
-stays for ever: after three stops a clone's prefix holds 8388636 bytes named by no manifest.
+production caller deletes an object — `grep -rln '\.Delete(' --include=*.go internal/ cmd/`
+reaches only test files: the object store's own conformance suite and one forwarding
+decorator in a WAL test. So a superseded chunk stays for ever: after three stops a clone's prefix holds 8388636 bytes named by no manifest.
 Chunk identity is fragile in a way that makes this worse than it sounds — `uploadChunks`
 chunks a range relative to its own offset and `cow.Ranges` merges runs that touch, so a
 512-byte write into the gap between two 1 MiB regions transfers 2097692 bytes as a single new
