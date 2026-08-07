@@ -70,7 +70,7 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §5.4 | Locality is not durability — a local write is not a durable one. |
 | §5.5 | The ephemeral device may be lost; nothing durable may depend on it. |
 | §5.6 | Watermarks are ordered: `published ≤ durable ≤ local` (→ INV-03). |
-| §5.7 | Bounds on unflushed local WAL — backpressure, never a silent NVMe fill (→ INV-04). |
+| §5.7 | Bounds on unflushed local WAL — backpressure, never a silent NVMe fill (→ INV-04). The bound an Agent enforces is not this section's: it is `MaxLocalBytes`, ADR-0013's device share, because `Sync` clears the unflushed counter on every guest `fsync`. |
 | §5.8 | **S3 is the recovery authority**; PostgreSQL watermarks are informative only (→ INV-08). |
 | §5.9 | Background I/O always yields to foreground/flush (→ INV-17). |
 | §5.10 | Nothing leaves the host in cleartext (→ INV-15). |
@@ -78,7 +78,7 @@ Section numbers are stable; the doc is in Spanish, these glosses are not a trans
 | §6 | Deployment architecture. |
 | §6.1 | **Object-store backend requirements** — the conformance suite (`task backend:conformance`). |
 | §6.2 | Execution modes. |
-| §7 | **Control Plane + PostgreSQL**: the verified term, and the volume failover states. The most-cited section in the code (96 references). |
+| §7 | **Control Plane + PostgreSQL**: the verified term, and the volume failover states. The most-cited exact `§` token in the code — the ranking is `grep -rhoE '§[0-9]+(\.[0-9]+)*' --include='*.go' . \| sort \| uniq -c \| sort -rn \| head`, not a number written here (roll the subsections up and the §12 and §14 families lead instead). |
 | §8 | The minimal PostgreSQL model (tables). Illustrative, not the schema: the declared state is `internal/schema/schema.sql`. Its `durability` column went with ADR-0026, in both places. |
 | §9 | Guest layout: the three devices and OverlayFS. |
 | §10 | The Volume Agent. |
@@ -153,8 +153,8 @@ file that owns it.
 |---|---|---|
 | INV-01 | Simulable interfaces only — no `time.Now()`/sockets/syscalls outside `simio`. Three exemptions, all narrow and all with a fixture proving they did not widen: `internal/vhost/hostio` (host code, ADR-0020), `integration/guestinit` (not host code — PID 1 inside the guest, DEV-0013), and build-tagged test harnesses (`integration/**/*_test.go`, `internal/testinfra` — they drive real processes and containers, so there is no clock to inject; DEV-0016). | active |
 | INV-02 | Deterministic replay: same seed ⇒ identical trace. | active |
-| INV-03 | Ordered watermarks: `published ≤ durable ≤ local`. | active (two terms; `published` is permanently 0) |
-| INV-04 | Unflushed bounds: backpressure rather than a silent NVMe fill. | active |
+| INV-03 | Ordered watermarks: `published ≤ durable ≤ local`. `published` stopped being permanently 0 when `wal.Log.InstallBase` landed. | active |
+| INV-04 | Local WAL bounds: backpressure rather than a silent NVMe fill. What an Agent actually sets is `MaxLocalBytes`, a share of the measured device (`agent.Budget`); it sets neither of §5.7's unflushed bounds, and says why. | active |
 | INV-05 | WAL serialize/replay is total and safe — corruption is detected, never applied. | active |
 | INV-06 | No durable ACK without a valid lease at the instant of ACK. | **withdrawn** — ADR-0026 |
 | INV-07 | FLUSH/FUA ordering — ACK only after the records are durable. Two steps now, not §14.4's six. | active |
@@ -163,14 +163,14 @@ file that owns it.
 | INV-10 | Effective single writer: a stale-epoch writer publishes nothing. | active |
 | INV-11 | Promotion waits `lease_ttl + max_clock_skew` before granting epoch N+1. | **withdrawn** — ADR-0026 (nothing promotes) |
 | INV-12 | The recovery point is the epoch boundary; late PUTs fall outside it. | **withdrawn** — DEV-0021 (the floor it defended was fictional) |
-| INV-13 | **Never truncate local WAL above a verified `published_sequence`.** | **withdrawn** — ADR-0026; the rule survives in `wal.Log` with no production caller |
+| INV-13 | **Never truncate local WAL above a verified `published_sequence`.** | **active again** — `wal.Log.InstallBase` reclaims the segments a restored image already holds, through `StrictOrder.AllowTruncate`; nothing truncates mid-session |
 | INV-14 | The GC cannot permanently delete — it marks; the bucket lifecycle removes. | **pending** — its subject went with `internal/gc` |
 | INV-15 | Nothing leaves the host in cleartext. | active |
 | INV-16 | Published snapshots are immutable (compaction may replace objects with logically-equal ones). | active |
 | INV-17 | Background I/O always yields to foreground/flush. | **withdrawn** — ADR-0026 (no background data path left) |
 | INV-18 | S3 is not in the WRITE path — only FLUSH/FUA touch it. | active |
 | INV-19 | Fleet-mixed format gating: no writer at format v+1 until every host can read it. | **pending** |
-| INV-20 | `rebuild-metadata` reconstructs the volume and snapshot catalog from S3 — not placement, which no object records. | active |
+| INV-20 | `rebuild-metadata` reconstructs the volume and snapshot catalog from S3 — including a volume's chain depth and parent link, and *not* placement or a snapshot's source host, which no object records. | active |
 | INV-21 | PUT idempotency: a duplicate data PUT has no double effect — now structural, since a chunk's key is its content digest. | active |
 | INV-22 | **Every UUID is v7** — `internal/ids` only, enforced by lint and a DB domain. | active |
 
@@ -192,14 +192,14 @@ that way. Full text: `DECISIONS/ADR-NNNN-*.md`.
 | ADR-0013 | Local device pressure: a device budget, thresholds, and who may react. | Accepted 2026-08-03, *as amended* — segments shipped, the reclaim-chain half is moot under ADR-0026, the device budget + thresholds + authority split stand |
 | ADR-0014 | Volume quota: soft, per-lineage, content-addressed snapshots, and squash. | **Withdrawn** — ADR-0026 (no squash, no lineage ledger; the soft/hard distinction survives) |
 | ADR-0015 | The fencing wait is a **monotonic dwell**, not a comparison of wall clocks. | Amended — nothing promotes; the durable half (`fencing_started_at`) survives |
-| ADR-0016 | Fencing granularity: a revocation window bounded to one promotion. | Amended — the lease is liveness only; the per-host granularity stands |
+| ADR-0016 | Fencing granularity: a revocation window bounded to one promotion. | Amended twice — the lease is liveness only, and the window itself (three writers, `hosts.renewals_blocked_until`, `ErrRenewalsBlocked`) was **deleted** in wave 4; the per-host granularity stands |
 | ADR-0017 | **Capacity is derived from state, not an incremental ledger.** | Accepted |
 | ADR-0018 | The spine: Agent first, Connect RPC in `api/`, the Agent pulls and the CP never pushes. | Accepted |
 | ADR-0019 | Schema tooling is **pgschema**, not Atlas; `schema.sql` is the declared state. | Accepted |
 | ADR-0020 | `internal/vhost/hostio` is the one documented INV-01 exception (SCM_RIGHTS + mmap). | Accepted |
 | ADR-0021 | storage integrates into **spin**; spin imports storage and never the reverse. The two binaries are test harnesses that must stay runnable end to end. spin migrates to pgschema. | Accepted |
 | ADR-0026 | V1 accepts an RPO of one session: §14.8 local becomes the only ACK contract, a volume is uploaded once at stop, and a snapshot is an fsync plus a copy at a §19 sequence number. Withdraws the remote durability chain. The product question behind it — has anyone asked for a VM to survive host loss mid-session? — was answered no. | Accepted |
-| ADR-0025 | The QEMU guest lane runs **inside the published runtime image** (`ghcr.io/<repo>/qemu:<version>`) as a CI container job, rather than installing QEMU's dynamic dependencies on a bare runner, so the dependency set has one definition in `Dockerfile.qemu`. The job is gated on the image existing and skips with a notice rather than failing the gate. | Accepted |
+| ADR-0025 | The QEMU guest lane runs **inside the published runtime image** (`ghcr.io/<repo>/qemu:<version>`) as a CI container job, rather than installing QEMU's dynamic dependencies on a bare runner, so the dependency set has one definition in `Dockerfile.qemu`. **Amended 2026-08-05:** the preflight (`guest-inputs`) now *fails* the run when either artefact is unpublished instead of skipping the lane — a green gate that booted no guest was the larger cost. The developer path keeps the skip; `REQUIRE_PROOFS` is what removes it. | Accepted (amended) |
 | ADR-0024 | A restarted Agent re-attaches at the **same epoch** — no bump, no CP round trip, no FENCING_WAIT. **Its justification was rewritten with ADR-0026**: not a prefix in S3 and a record-by-record agreement check, but the simpler fact that nothing leaves the host mid-session, so a second incarnation has nothing to overwrite until it stops — where the manifest CAS catches it. Two *live* Agents on one data dir are the flock's job (DEV-0014), not an epoch policy. | Accepted (amended) |
 | ADR-0023 | The object store is a fencing witness the data path may act on. **The witness moved with ADR-0026**: not a checkpoint mid-session but the manifest's compare-and-set at stop, which tells a host its predecessor published while it was running (`image.ErrSuperseded`) instead of letting it overwrite. | Accepted (amended) |
 | ADR-0022 | The guest kernel is pinned by sha256 and obtained by `task fetch:kernel` into `_output/guest/vmlinux` — never resolved from a sibling checkout's path. storage may *mirror* spinbox's artefact into a registry; mirroring is not building (ADR-0021 stands). | Accepted |

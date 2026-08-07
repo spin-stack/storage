@@ -1,6 +1,38 @@
 # ADR-0025 — the guest lane runs inside the published QEMU runtime image
 
-- **Status:** Accepted — 2026-08-02
+> **Amended 2026-08-05 (track B, `8c9d296`/`927f79d`): the decision stands, the skip is
+> reversed.** Running the lane *inside* `ghcr.io/<repo>/qemu:<version>` is unchanged and is
+> still right for the reason below — one definition of the dependency set, in
+> `Dockerfile.qemu`. What this ADR also decided, twice, was that a missing artefact
+> **skips** the lane rather than failing the gate: "the lane is skipped — visibly, with the
+> reason", because "a red build that means *you did not build QEMU* trains people to ignore
+> red builds". That is now the opposite of what the gate does.
+>
+> **What overturned it is that the skip was invisible where it mattered.** `task ci:full`
+> exited 0 on every machine without QEMU while running none of the proofs a real Linux
+> kernel carries, and the sentence people exchange is "ci:full was green" — a skip notice
+> inside a run nobody reads does not survive that sentence, and a job that is skipped leaves
+> its dependents free to run, so a workflow of green-and-grey boxes reports as a pass.
+> Trained-to-ignore-red is a real cost; **believed-to-be-proven is a larger one**, and it is
+> the one this repository has actually paid (three documents claimed a Linux-guest lane no
+> test performed — DEV-0018).
+>
+> **Concretely, and each is checkable:** the preflight job is `guest-inputs`, not
+> `guest-lane-image`, and it **exits 1** when either artefact is unpublished, writing the two
+> commands that publish them into `$GITHUB_STEP_SUMMARY`. `guest-lane` and `guest-e2e-lane`
+> run with `REQUIRE_PROOFS=1`, which the lanes export as `SPIN_REQUIRE_PROOFS` and
+> `testinfra.missingInput` turns into a failure. The `ci` job no longer runs `ci:full` — it
+> runs `ci:noguest`, the same lane list with the flag unset, which ends by printing what it
+> did **not** prove. A `gate` job enumerates the lanes with `toJSON(needs)` and is the job to
+> require on the branch.
+>
+> **What survives of the reasoning below is the developer path, deliberately.** Without
+> `REQUIRE_PROOFS` the lanes still print SKIP and exit 0, so a laptop with no `_output` is
+> not red; the difference is that no target which *claims* to be the merge gate can reach
+> that state any more. The "Consequences" section's "`task test:integration:qemu` keeps
+> skipping there" is therefore true of `task ci` and false of `task ci:full`.
+
+- **Status:** Accepted — 2026-08-02, amended 2026-08-05
 - **Date:** 2026-08-02
 - **Deciders:** human owner (approved the increment plan), implementer agent (proposed)
 - **Relates to:** ADR-0022 (the guest kernel, pinned and mirrored), BUILD-INVENTORY

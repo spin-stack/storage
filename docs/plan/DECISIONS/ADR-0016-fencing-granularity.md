@@ -8,10 +8,21 @@
 >
 > **The granularity decision stands and is why that was safe.** A lease per *host* rather
 > than per volume is what makes revocation an operation on one row, and it is still the
-> unit `Loop` renews. What this ADR bounded — the window in which a revocation affects
-> volumes it was not aimed at — is currently empty, because a revocation stops nothing on
-> the data path. It becomes load-bearing again the moment a durability tier gates an ACK
-> on the lease.
+> unit `Loop` renews.
+>
+> **Further amended 2026-08-05 (`98b27cc`): stage 1 is not empty any more, it is deleted.**
+> This banner used to say the window "is currently empty, because a revocation stops nothing
+> on the data path", and an empty window with three writers is indistinguishable, to the next
+> reader, from a window whose writers are broken. So `BlockHostRenewals`,
+> `UnblockHostRenewals`, `RevokeHostLease`, `metadata.ErrRenewalsBlocked`,
+> `Host.RenewalsBlockedUntil` and the `hosts.renewals_blocked_until` column are gone, along
+> with the `RenewHostLease` predicate that could only ever be true. `internal/schema/schema.sql`
+> carries the reasoning where the column stood, which is where CLAUDE.md says it belongs.
+>
+> **Keeping the column for stage 2 was the alternative, and it is worse than it looks.**
+> Stage 2 is a fence that follows the *volume*; what it needs is not this column with a
+> caller added, it is a different granularity. Reviving stage 1 from git is a smaller job
+> than reading a column no write ever set and trusting it.
 
 - **Status:** Accepted 2026-07-26 (two-stage: the window now, per-volume fencing with
   the Agent)
