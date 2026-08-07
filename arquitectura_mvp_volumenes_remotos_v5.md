@@ -301,9 +301,23 @@ Si se superan, se aplica backpressure: se rechazan nuevos WRITEs con error expl�
 
 Corolario: PostgreSQL completo debe poder reconstruirse desde S3 (`rebuild-metadata`, §22.5). El layout en S3 es autodescriptivo.
 
+> **La regla de arriba es V2; el corolario no.** En V1 el object store es la autoridad de
+> **arranque**, no de recovery — es INV-08, y el cambio de palabra es el invariante entero:
+> no hay prefijo contiguo que establecer ni epochs que ordenar, hay **un manifiesto y sus
+> chunks** que resuelven o no resuelven (`image.Load`). No existe replay a media sesión que
+> pudiera necesitar un punto durable. Los watermarks de PostgreSQL siguen siendo
+> informativos por la misma razón de siempre. El corolario **sí** se cumple hoy, y es lo
+> único de §5.8 que tiene mecanismo: §22.5.
+
 ### 5.9 Background siempre cede (nuevo)
 
 Todo I/O del Agent pertenece a una clase (foreground / flush / background). El tráfico background (objectization, compactación, hidratación, prefetch, GC) opera con presupuesto fijo de NVMe y red, y cede ante foreground y flush. Ninguna mejora de background puede degradar la latencia del data path.
+
+> **V2 con §11: no hay clases y no hay background que ceder.** Los cinco productores que
+> esta regla nombra — objectización, compactación, hidratación de standby, prefetch y GC —
+> los retiró ADR-0026, y con ellos el único I/O del Agent que no era del data path. Lo que
+> queda fuera del camino del guest es la publicación al parar (§14.8), que ocurre cuando
+> el volumen ya no sirve a nadie. El invariante vuelve con su primer productor.
 
 ### 5.10 Nada sale del host en claro (nuevo)
 
@@ -312,6 +326,14 @@ Todo payload de datos de VM (WAL records, segmentos, checkpoints) se cifra con l
 ### 5.11 El GC no puede causar el peor incidente (nuevo)
 
 El GC marca; nunca ejecuta borrado permanente. El borrado real lo ejecuta el lifecycle del bucket sobre versiones no-actuales tras el grace period. Las credenciales del GC no incluyen `DeleteObject` permanente ni bypass de Object Lock.
+
+> **No hay GC (ADR-0026 incremento 1), así que este invariante no puede dispararse: es
+> INV-14, `pending`.** Lo que sobrevive está enforceado en la construcción y no en un
+> proceso: `real.NewS3Store` **se niega a usar un bucket sin versioning**
+> (`TestRequireVersioning`), de modo que cualquier borrado futuro deja un delete marker
+> reversible, y la interfaz `objectstore.Store` no tiene borrado permanente que ofrecer.
+> Nada en este repositorio elimina un objeto todavía — cuando algo lo haga, será el
+> incremento que devuelva este invariante (`docs/plan/DELETION-AND-RECLAIM-SPEC.md`).
 
 ---
 
@@ -717,7 +739,15 @@ Métricas: `agent_memory_bytes{component}`, `active_map_bytes{volume}`.
 
 ---
 
-## 11. Clases de I/O internas (nuevo)
+## 11. Clases de I/O internas (nuevo) — V2
+
+> **Retirada con ADR-0026 (2026-08-02), y no reescrita.** `internal/ioclass` no existe, no
+> hay token buckets y no hay nada que priorizar: la clase *background* enumeraba
+> objectización, compactación, hidratación, prefetch, GC y materialización, y ninguna
+> existe; la clase *flush* eran los PUTs que bloqueaban un ACK, y un ACK ya no espera
+> ningún PUT (§14.8). Queda el data path del guest, que es todo el I/O del Agent mientras
+> un volumen sirve. Las dos métricas de abajo se fueron con el mecanismo (§26.2, DEV-0022).
+> El texto está en git y vuelve con la durabilidad remota.
 
 Todo I/O del Agent pertenece a exactamente una clase:
 
@@ -778,9 +808,29 @@ dirty local (extents recientes en WAL/caché)
 
 Los extents del WAL aún no objectizados se indexan en memoria (interval map por volumen) para resolver reads con overlap parcial. En el MVP, un attach cross-host materializa el snapshot completo antes del boot (mitigado por standby tibio, §22.3; lazy loading diseñado para después, §22.4).
 
+> **La cadena de arriba tiene tres eslabones que no existen.** El read path de V1 es de dos
+> capas y una constante: los extents de esta sesión en el interval map del volumen
+> (`cow.IntervalMap`), debajo la base que se cargó al atachar desde el manifiesto
+> (`image.Load`, instalada con `SetBase`), y ceros para todo lo que ninguna de las dos
+> cubre — `IntervalMap.Read` los escribe, no hay "zero block" que buscar. No hay checkpoint,
+> no hay segmento local objectizado y **no hay read-miss contra S3**: el object store se lee
+> una vez, al atachar, y no vuelve a aparecer en el camino de una lectura. La frase del
+> cross-host sigue siendo cierta en su forma (un clon en otro host descarga completo), pero
+> ni el standby tibio ni el lazy loading existen para mitigarla; lo que la mitiga es colocar
+> el clon donde ya están sus datos (§20, `placement.Choose`).
+
 ### 13.3 Active map con cota de memoria
 
 Con segmentos de 64 KiB, 1 TiB = 16M entradas posibles. Implementación: roaring bitmaps (presencia) + tabla de ubicaciones por rangos, no hashmaps naive. Métrica `active_map_bytes` por volumen; entra en el presupuesto de memoria del Agent (§10.1).
+
+> **El active map se construyó y se borró el 2026-08-02 sin haber tenido nunca un usuario**
+> (§17 lo dice donde se escribe un WRITE). No hay roaring bitmaps y no existe
+> `active_map_bytes`. La estructura que sí tiene la cota que esta sección pide es
+> `cow.IntervalMap`, y desde 2026-08-06 se mide: `read_view_bytes`, `read_view_extents` y
+> `read_view_layers` (§26.2). El problema que §13.3 planteaba sigue siendo real —es la única
+> estructura por volumen cuyo tamaño lo decide el guest y no la configuración— y hasta que
+> esas tres series existieron, la primera evidencia de un host con demasiadas vistas de
+> lectura habría sido el OOM killer.
 
 ---
 
@@ -819,7 +869,18 @@ type BlockWriteRecordHeader struct {
 - DISCARD/WRITE_ZEROES son records sin payload: baratos, y esenciales para que el storage converja al working set (§14.6).
 - El CRC en claro + el tag GCM dan verificación en dos capas: integridad criptográfica del objeto y validación del pipeline de descifrado.
 
-### 14.2 WAL Object (batch remoto)
+> **§14.2 a §14.5 son V2 en bloque (ADR-0026, 2026-08-02), y no están reescritas.**
+> Describen el WAL remoto: el objeto batch y su header, las reglas de cierre y PUT, los seis
+> pasos del FLUSH y la idempotencia de esos PUTs. No hay nada de eso en el árbol — no existe
+> batcher ni uploader, `wal.Log` no tiene object store, y el paso durable es `fdatasync` y
+> avanzar el watermark (`Log.durableStep`). El contrato vigente es **§14.8**, y §17 apunta
+> ahí desde el camino del guest. **Lo que sí sobrevive de este bloque**, en otra forma: la
+> idempotencia de §14.5 es estructural (INV-21 — la clave de un chunk *es* el digest de su
+> texto plano, así que una clave que ya existe se saltea), y la clave determinística sigue
+> siendo la idea que hace que reintentar sea seguro. §14.1 (el record) y §14.6, §14.7 y
+> §14.8 no son V2: son el formato y el camino que V1 usa.
+
+### 14.2 WAL Object (batch remoto) — V2
 
 ```go
 // Header de tamaño fijo: 104 bytes (mismo erratum que §14.1 — ADR-0005 / DEV-0001).
@@ -846,7 +907,7 @@ type WALObjectHeader struct {
 wal/<volume_id>/<epoch>/<first_seq>-<last_seq>-<sha256_prefix8>.wal
 ```
 
-### 14.3 Reglas de cierre y PUT de batch (reemplaza la regla de 50 ms)
+### 14.3 Reglas de cierre y PUT de batch (reemplaza la regla de 50 ms) — V2
 
 La durabilidad solo se promete en FLUSH/FUA; no hay razón para subir batches por timer corto. Un batch se cierra y se programa para PUT cuando se cumple **cualquiera** de:
 
@@ -860,7 +921,7 @@ La durabilidad solo se promete en FLUSH/FUA; no hay razón para subir batches po
 
 Efecto: un volumen sin fsyncs frecuentes pasa de ~20 PUTs/s (v4) a ~3 PUTs/min. La cardinalidad de objetos y el costo de requests bajan 2-3 órdenes de magnitud. Métricas `wal_batch_size_bytes` y `wal_small_batch_ratio` vigilan el caso fsync-pesado, que se corrige con compactación (§21.2).
 
-### 14.4 Orden de operaciones en FLUSH / FUA (crítico)
+### 14.4 Orden de operaciones en FLUSH / FUA (crítico) — V2
 
 ```text
 1. Capturar target_sequence = local_sequence actual
@@ -879,7 +940,7 @@ Efecto: un volumen sin fsyncs frecuentes pasa de ~20 PUTs/s (v4) a ~3 PUTs/min. 
 
 Nota de semántica FUA: virtio solo exige durabilidad del write marcado, no de todos los anteriores; implementarlo como flush-hasta-target es correcto pero pesimista. Se acepta en el MVP por simplicidad; queda documentado como optimización futura (flush selectivo del extent FUA).
 
-### 14.5 Idempotencia de PUT
+### 14.5 Idempotencia de PUT — V2
 
 Idéntica a v4: clave determinística por `(volume_id, epoch, first_seq, last_seq, content_hash)`, `If-None-Match: *`, y retry + HEAD + checksum ante respuesta perdida. Mismo rango con hash distinto → fallo duro.
 
@@ -892,6 +953,15 @@ Sin TRIM, los bloques borrados por el guest viven para siempre: el costo de S3 s
 - Los reads de rangos descartados devuelven ceros.
 
 El storage converge al working set en lugar de crecer monotónicamente. Métrica: `discarded_bytes_total`.
+
+> **Los tres pasos de arriba nombran maquinaria retirada; el efecto que importa se
+> conserva.** No hay objectizer, ni checkpoints, ni compactación. Lo que un DISCARD hace en
+> V1 es `cow.IntervalMap.Clear`: el rango sale de la vista de lectura, se lee como ceros, y
+> —esto es lo que hace que el storage converja— **no se sube**, porque lo que se publica al
+> parar son los rangos vivos de la vista (`view.Ranges()`). O sea que el espacio se recupera
+> en el object store en el momento en que este documento decía que se recuperaba en el
+> objectizer. Lo que **no** se recupera es el byte local: el record de DISCARD se anexa como
+> cualquier otro y no hay reclamo a media sesión (§5.7).
 
 ### 14.7 Layout local del WAL
 
@@ -907,6 +977,24 @@ El storage converge al working set en lugar de crecer monotónicamente. Métrica
 ```
 
 Rotación a ~256 MiB o en checkpoint. Nunca truncar por encima de `published_sequence` verificado.
+
+> **El layout real es más chico, y el epoch está en el path.** Lo que existe es
+> `<data-dir>/wal/<volume-id>/<epoch>/<first-seq>.seg` — `wal.SegmentDir` lo construye y
+> `segmentName` nombra el archivo, con la primera sequence zero-padded a ancho fijo para que
+> el orden lexicográfico sea el orden de las sequences. El epoch va en el path espejando el
+> layout de claves en S3, así que un directorio de otro epoch es **imposible** en vez de
+> meramente detectable; el header del segmento repite las dos cosas, porque el path dice
+> dónde se archivó el directorio y el header dice qué es. No hay `state.json` (el estado
+> vive en el catálogo y en el manifiesto), ni `active.wal` (el segmento abierto es el último
+> por sequence), ni `cache/`, ni `segments/`, ni `checkpoints/`. El directorio entero está
+> bajo el `flock` que garantiza un Agent por host (DEV-0014).
+>
+> El corte de segmento no es 256 MiB fijos: `wal.Limits.SegmentBytes` sale de la parte del
+> presupuesto del volumen (§5.7). Y la regla de no truncar por encima del punto publicado es
+> INV-13, que **volvió a tener productor** en 2026-08-06: `wal.Log.InstallBase` desenlaza,
+> al atachar, los segmentos que la imagen restaurada ya cubre. Sin eso un volumen arrancado
+> y parado diez veces sobre un host se quedaba con diez sesiones de WAL bajo una cota que
+> nada limpiaba.
 
 ### 14.8 El contrato de ACK (V1)
 
@@ -991,6 +1079,23 @@ Por qué día 1: re-cifrar petabytes de objetos inmutables después es un proyec
 ---
 
 ## 16. Máquina de estados del Volume Agent
+
+> **Mitad retirada por ADR-0026 y no reescrita.** De los estados de abajo, V1 recorre
+> `DETACHED → ATTACHING → ACTIVE` y `ACTIVE ⇄ SNAPSHOTTING`. Los otros cuatro
+> —`SELF_FENCED`, `FENCED`, `RECOVERY_REQUIRED`, `RECOVERING`— no tienen transición que los
+> alcance: `SELF_FENCED` era el lease gobernando el ACK y un ACK no consulta el lease
+> (§14.8); `RECOVERING` era la recuperación a media sesión, que no existe. El vocabulario
+> sigue en `internal/lifecycle` y en el CHECK del esquema, que es donde un lector debería
+> mirar antes que acá.
+>
+> **De la secuencia ATTACHING → ACTIVE**, los pasos 3 y 4 (cargar checkpoint, reproducir
+> WAL local + remoto hasta el punto durable) son **un** paso: leer el manifiesto del volumen
+> y sus chunks (`image.Load`) e instalarlo como base del interval map. El paso 1 obtiene un
+> lease que es liveness, no permiso de escritura. El resto —unwrap de la DEK, abrir el
+> socket vhost-user, publicar ACTIVE— es exacto.
+>
+> Lo que esta sección **no** tiene y el árbol sí es el otro extremo: qué pasa al parar
+> cuando la publicación falla. Está en §14.8, regla 7.
 
 Estados por volumen (cambios v5 en negrita):
 
@@ -1257,7 +1362,21 @@ Inflight shmfd: al reiniciar, el Agent recupera y completa/reintenta las request
 
 ---
 
-## 24. Cliente S3 como subsistema (nuevo)
+## 24. Cliente S3 como subsistema (nuevo) — V2
+
+> **No existe el subsistema, y la razón por la que no duele es §14.8.** Esta sección
+> presupone que el object store está en el camino de cada FLUSH: por eso pide hedged GETs,
+> presupuesto global de retries, circuit breaker y límites de ancho de banda por clase. En
+> V1 el store se toca dos veces por sesión —al atachar, para leer el manifiesto, y al parar,
+> para publicarlo— así que no hay latencia de cola del data path que recortar. El cliente
+> real es un archivo detrás de `objectstore.Store` (`internal/simio/real/s3.go`, ADR-0010),
+> sin hedging, sin circuit breaker y sin clases; el único mecanismo de reintento que existe
+> es el del párrafo 7 de §14.8, y es al parar. Las métricas `s3_*` de §26.2 siguen
+> declaradas porque el cliente sí puede reportar errores y latencia.
+>
+> Lo que **sí** es requisito hoy y vive en §6.1 es la semántica, no el rendimiento: CAS
+> (`If-Match`/`If-None-Match`) y versioning, verificados por `task backend:conformance`
+> antes de habilitar un backend.
 
 Aquí vive la latencia de cola del sistema. Requisitos:
 
@@ -1524,6 +1643,16 @@ Sin cambios: orden estricto + DST/fault injection en cada paso + nunca truncar p
 ## 30. Roadmap
 
 Reordenado: DST e interfaces simulables van primero (estructurales); la reconexión vhost-user sube (era el punto 10 en v4 y es lo que hace operables los deploys); el fencing completo llega junto con los epochs.
+
+> **Esta lista es el plan de v5, no la cola de trabajo, y no se puede leer como un
+> progreso.** Cinco de sus catorce puntos describen mecanismos que ADR-0026 retiró: el **6**
+> (WAL remoto, batching, summary objects), el **10** (objectización, checkpoints, GC), el
+> **12** (standby tibio, compactación, aplanado), la mitad de fencing del **7** y la mitad
+> de "recovery con S3 como autoridad" del **8** — cuyo `rebuild-metadata` sí existe (§22.5).
+> El **9** pierde el resize (V2, §3) y el **11** pierde el drain y el cross-host (§28.1).
+> **Dónde está el estado de verdad:** `docs/plan/STATUS.md`, que es el único archivo que
+> lleva estado en este repositorio y que recorre estas fases una por una diciendo qué
+> símbolo la sostiene.
 
 1. **Esqueleto con interfaces simulables** (reloj/red/disco/S3) + harness DST mínimo + tracing/logging estructurado. *Nada de `time.Now()` directo desde el primer commit.*
 2. Layout local + tres dispositivos + OverlayFS.
