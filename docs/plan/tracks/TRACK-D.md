@@ -559,3 +559,41 @@ can neither meet nor fail, the same shape ADR-0026 left on four others.
 No schema change (the column's comment moved; `task db:verify` re-plans to empty).
 `task ci` is green, `task cover` reports production 90.2091% against the 90% floor, and
 `go test -tags integration ./internal/metadata/pg` is green.
+
+**D10: the operator half of the cordon has a command (2026-08-07).** ADR-0013 §5 splits
+cordon between two actors, and only one of them could act. The pressure loop has cordoned
+and un-cordoned hosts since D5; the human half — `lifecycle.CordonOperator`, the
+`cordonOverwrite` authority table, `ErrCordonHeld`, and the `overwritable_reasons`
+predicate the `SetHostState` statement carries so the loop cannot clear what a person set
+— was reachable from no binary. `grep -rn CordonOperator --include='*.go' . | grep -v
+_test.go` named the constant's declaration, the table, and the store contract, and stopped
+there. So the mechanism that exists to protect an operator's decision from the automatic
+loop could only ever be exercised *by* the automatic loop, and an operator about to reboot
+a host had two options: leave it taking new volumes, or hand-write an UPDATE that skips
+the term guard and the transition table.
+
+`-cordon-host` and `-uncordon-host` are that command, in `cmd/control-plane/cordon.go`,
+one-shots under the current term like every other admin verb in that binary. **The reason
+is not a flag**, and that follows from the type rather than from brevity: `CordonReason`
+answers "who is asking", there is exactly one human actor, and its own comment rejects a
+second column that would have to agree with the first. What an incident needs from here is
+the state, and `-fleet-status` already prints it as `OPERATOR` beside `DEVICE_PRESSURE`.
+
+**The line names what the host is still serving**, because "cordoned" answers a question
+an operator usually does not mean: a cordoned host keeps serving everything it holds
+(`HostState.Serving`), so somebody who reads "cordoned" and reboots the machine has
+stopped those volumes rather than protected them. Detaching them stays a separate command
+and a separate decision.
+
+**One planted bug.** `TestAnOperatorsCordonOutranksThePressureLoop` asserts on the row
+`fleetReport` prints, never on the store's error, because a write with the wrong authority
+returns nil exactly as happily as the right one and the difference is only visible to the
+next reader. Writing `lifecycle.CordonPressure` instead of `CordonOperator` in `setCordon`
+turns it red at the first step: `after -cordon-host the report says state=CORDONED
+reason=DEVICE_PRESSURE; want CORDONED/OPERATOR`. Reverted by textual replacement.
+
+Verified against a live deployment as well as in the test: a host at 47% used — well under
+the 65% the loop un-cordons at — was cordoned by hand and left for four heartbeats, and
+stayed `CORDONED OPERATOR`. `docs/plan/RUNBOOK.md` §3 carries that transcript.
+
+No schema change, no new query. `task ci` is green.

@@ -32,6 +32,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/cpserver"
+	"github.com/spin-stack/storage/internal/lifecycle"
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
@@ -129,6 +130,14 @@ func run() error {
 		attachVolume = flag.String("attach-volume", "", "place this volume and exit, instead of serving")
 		attachHost   = flag.String("attach-host", "",
 			"with -attach-volume: the host that will serve it (a UUIDv7); empty asks placement to choose")
+
+		// cordon-host / uncordon-host: the human half of ADR-0013 §5. The automatic half
+		// has run since wave 3 — a host past 70% used cordons itself on its next heartbeat
+		// — and the half a human drives had no command at all, so the authority split the
+		// cordon_reason column exists to enforce could only ever be exercised by the loop.
+		// cordon.go carries the reasoning.
+		cordonHost   = flag.String("cordon-host", "", "stop placing new volumes on this host and exit, instead of serving")
+		uncordonHost = flag.String("uncordon-host", "", "let this host take new volumes again and exit, instead of serving")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -272,6 +281,24 @@ func run() error {
 		slog.Info("volume detached; its host stops serving it on its next poll, and publishes the session's image as it does",
 			"volume_id", *detachVolume)
 		return nil
+	}
+
+	if *cordonHost != "" || *uncordonHost != "" {
+		if *cordonHost != "" && *uncordonHost != "" {
+			return errors.New("-cordon-host and -uncordon-host are two separate runs: pass the one you mean")
+		}
+		// Under the current term, like every other admin command here: taking a host out
+		// of the rotation is not a leader taking over, and AcquireLeadership would leave
+		// the serving Control Plane's writes refused as stale.
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("changing a host's fleet state needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		host, state := *cordonHost, lifecycle.HostCordoned
+		if host == "" {
+			host, state = *uncordonHost, lifecycle.HostActive
+		}
+		return setCordon(ctx, md, leader.Term, host, state)
 	}
 
 	if *cloneSnapshot != "" {
