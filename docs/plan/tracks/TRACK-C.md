@@ -567,3 +567,137 @@ catching power for the cost the plan warns about: a new mandatory scenario edits
 
 Nothing here touches the addressing decision `CHUNK-ADDRESSING-SPEC` §3 puts to a human.
 This is §4's "the §2 fix now, on its own".
+
+### C11-measured — what the duplicate actually costs, and three things the spec assumed that are not so (2026-08-07)
+
+`CHUNK-ADDRESSING-SPEC` §8 asks a human whether `chain_depth` is a structure or a label and
+recommends *label* — keep flattening, pay a duplicate per link. Nothing in the tree had ever
+weighed that duplicate, so this increment weighed it. **The addressing is untouched: that is
+the owner's decision and it is not made here.** What changed is that the price is now a set
+of assertions rather than an impression, and that a stop paying it says so.
+
+The scales are `internal/image/clone_cost_test.go`, and every number below is asserted by a
+test rather than written down, so it cannot go stale in silence:
+
+```
+go test ./internal/image/ -run 'TestACloneFirstStop|TestASecondStop|TestTheBucketHolds|TestAWriteThatJoins' -v
+go test ./internal/agent/ -run TestAnOperatorIsToldWhenAStopIsCopyingItsParentsDataset -v
+```
+
+Three numbers are reported for each shape, because one answers none of the questions
+honestly: **transferred** (what the store was handed, from a decorator over `Put`),
+**resident** (what the bucket then holds, from `List`) and **distinct** (what one
+content-addressed namespace would have held, folded by the digest each key ends in — which
+is computable from outside the process only because a chunk's key *is* the digest of its
+plaintext). `resident - distinct` is exactly what the spec's option 2 would save.
+
+**The headline is confirmed and it is exact.** A parent holds 8 MiB; a clone writes one
+512-byte sector and stops. Its first stop transfers one object of 8388636 bytes — 8 MiB plus
+the nonce and tag of one sealed chunk — for 512 bytes of new information, and the bucket then
+holds 16777272. The cost is linear in the parent's dataset, so multiply by whatever a golden
+image weighs.
+
+**But the spec overstates when it recurs.** §3 prices option 1 as a duplicate "paid at the
+clone's first stop **and at every snapshot of the clone**". The second half is not true: a
+snapshot taken straight after the first stop transfers no chunk bytes at all, and neither
+does an unchanged second stop, because `uploadChunks` skips a chunk whose key already exists
+and by then the chunks are under the clone's own prefix. The duplicate is paid **once per
+clone**. Planting a `Head` on a key that cannot exist takes that snapshot from 0 to 8388636,
+which is what the spec describes and what the code does not do.
+
+**And it overstates what option 2 would buy, which is the finding that changes the
+decision.** §3 says a per-lineage chunk store makes "the storage cost of a clone
+proportional to what the clone wrote". It does not. The saving is bounded by *chunk
+granularity*, and with `MaxChunkBytes` at 64 MiB the golden image the whole workflow is built
+around is **one chunk**:
+
+| the parent's 8 MiB, laid out as | the clone writes | resident | distinct | option 2 would save |
+|---|---|---|---|---|
+| one contiguous run (one chunk) | nothing | 16777272 | 8388636 | all of it |
+| one contiguous run (one chunk) | one 512-byte sector | 16777272 | 16777272 | **nothing at all** |
+| eight regions (eight chunks) | one 512-byte sector | 16777664 | 9437436 | seven eighths |
+| one contiguous run (one chunk) | every byte it inherited | 16777272 | 16777272 | nothing, and nothing is owed |
+
+A single sector changes its chunk's content, so its digest, so no key space can make it
+shared. The lever with the larger effect on the golden-image workflow is therefore the
+**chunk size**, not the key space — and that is a much smaller change than moving the key
+space and the AAD.
+
+**The duplication is not a property of cloning.** Two volumes that were never related and
+hold the same bytes hold 16777272 resident bytes and 8388636 distinct ones — the same
+duplication as a clone, because `chunkKey` names the volume. A fleet booting N machines off
+one image pays N copies whether they are clones or were created and written independently.
+Answering §8 "structure" changes what a *clone* reads and touches none of that, so if the
+owner's motive is bucket cost, `chain_depth` is the wrong variable to decide it on.
+
+**And a cost nobody has priced is larger, in the limit, than the one being priced.** No
+production caller deletes an object (`grep -rn '\.Delete(' --include=*.go internal/ cmd/`
+reaches only the store implementations and their conformance suite), so a superseded chunk
+stays for ever: after three stops a clone's prefix holds 8388636 bytes named by no manifest.
+Chunk identity is fragile in a way that makes this worse than it sounds — `uploadChunks`
+chunks a range relative to its own offset and `cow.Ranges` merges runs that touch, so a
+512-byte write into the gap between two 1 MiB regions transfers 2097692 bytes as a single new
+object and orphans the 2097208 it replaced. **The duplication is a cost per link, paid once;
+the orphaning is a cost per stop, unbounded in time.** Neither option in the spec fixes it —
+option 2 gives a re-chunked object a new digest too — and it belongs to
+`DELETION-AND-RECLAIM-SPEC`, whose reclaim rule ("this volume's manifests, set difference")
+would already collect it.
+
+**One property nobody had written down, found by a fixture that was wrong.** The fragmented
+parent originally wrote eight identical regions and produced *one* object, not eight: within
+a single volume, identical content already dedups, because the key is the digest. The fixture
+now uses different bytes per region, and the property is worth knowing when pricing a guest
+filesystem full of zeroed or repeated blocks.
+
+**Where this leaves the recommendation.** *Label* survives the measurement, but not for the
+reason §4 gives. §4 defends it as "the storage cost is real but bounded per link"; the
+measurement says it is bounded per link **and** that answering "structure" would not remove
+most of it — the one-chunk case and the unrelated-volumes case are both untouched by a chain
+walk. So the sentence §20 owes a reader is not "a clone costs a duplicate per link". It is:
+*a volume costs a full copy of everything it holds, and content addressing dedups only within
+its own prefix and only at chunk granularity.* That is a bigger and simpler claim, and it is
+true of every volume rather than only of clones. The owner's decision is unchanged in
+substance and much better priced.
+
+**Making it visible** is `Volume.sayWhatThisImageCosts`. `fetchBase` records what the read
+view took from a parent's snapshot rather than from an image of its own, and the publish
+prints it **before** the upload — the operator's question is asked while the stop is hanging,
+and a line printed when the publish finishes cannot answer a question about why it has not
+finished. The size is a fold over `Ranges()`, the O(extents) walk `cow.Cost` deliberately
+avoids; that is right here and wrong there, because `Cost` is recorded on every guest fsync
+and this runs once per stop, immediately before an upload of exactly these bytes. `Cost().Bytes`
+was the alternative and is wrong for a second reason: it sums the layers, so a clone that
+rewrote its parent would report 16 MiB of an 8 MiB upload.
+
+**Two series are owed to track E, and this lane did not write them**, because
+`internal/obs/metrics.go` is track E's and `Recorder.Gauge` silently no-ops on a name that is
+not in `obs.Catalog()` — recording them first would be a metric that looks recorded and emits
+nothing:
+
+- **`image_bytes`**, gauge, labels `[volume]` — bytes of guest data in the image a volume last
+  published. There is no series for what the bucket holds; `image_publish_duration_seconds`
+  says how long it took and never how much.
+- **`image_inherited_bytes`**, gauge, labels `[volume]` — of those, the bytes that came from a
+  parent's snapshot rather than from this volume's own image. Nonzero only in the one session
+  before a clone's first stop, which is the only session that pays. Both would be recorded at
+  the call sites of `sayWhatThisImageCosts`, which already holds both numbers.
+
+`chain_depth` still has no producer and the Agent is the wrong place for one (ADR-0021 keeps
+it from knowing what a Control Plane is); it is owed by whoever owns `controlplane.Clone`,
+and §8's answer decides whether it should exist at all.
+
+**No `integration/e2e` arm, deliberately.** No guest boots in that lane, so a clone's parent
+there has no data and the inherited number would be zero — an assertion that could not
+distinguish "the line is right" from "the line is empty". The deployment statement this
+increment can honestly make is the one in `internal/agent`, over a real `VolumeManager`, a
+real WAL and a real device, asserting the clone's prefix holds exactly what its parent's
+holds **and** the line that says so. The line's arm asserts the parent's stop too, and that
+is not padding: a message printed on every publish satisfies any assertion about the clone's.
+
+**Every measurement was planted.** Keying chunks bucket-wide takes the clone's first stop to
+0 objects and 0 bytes and the bucket to a single copy — and the chain-of-three arm then fails
+with `crypto: authentication failed`, which is the AAD blocker §3 predicts for that naive
+form, reproduced rather than argued. Disabling the `Head` skip makes the snapshot pay 8388636
+where the assertion wants 0. Inverting the condition in `sayWhatThisImageCosts` makes the
+clone print a line with no `inherited_bytes` and the parent claim it is copying an inherited
+dataset, and four assertions go red.
