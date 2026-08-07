@@ -843,26 +843,32 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		return
 	}
 
-	// A clone reads *through* its parent (§20): its own objects are only what it has
-	// written since, and everything else lives under the parent's volume id. The
-	// parent's view goes underneath as the base layer, which is exactly what
-	// increment 5 built cow.IntervalMap's base for — the clone's own extents shadow
-	// it, and a DISCARD in the clone reads as zeros rather than falling through.
-	parent, err := m.parentView(ctx, v, d)
-	if err != nil {
-		// Fail closed, the same rule as a base that cannot be recovered and for the
-		// same reason: an empty view where data belongs is a wrong answer a guest
-		// cannot detect.
-		slog.Error("the clone's parent snapshot could not be materialized; its reads will fail",
-			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
-		v.baseFailed = true
-		v.log.FailBase(err)
-		return
-	}
-
 	// The volume's own state is one image, published when it last stopped (ADR-0026).
 	// This replaced replaying a chain of WAL objects: there is no chain, and no
 	// contiguous prefix to establish — the manifest resolves or it does not.
+	//
+	// **An image supersedes the parent; it does not sit on top of one.** A publish
+	// serialises `log.ViewAtRest()`, which is the volume's layer over whatever base it
+	// was given, and `image.uploadChunks` walks `view.Ranges()` — the base's ranges
+	// minus this layer's tombstones plus its own extents — reading each one *through*
+	// the layering. So a clone's own image already holds its parent's bytes, flattened,
+	// from the first stop onwards, and the parent link stops describing the read path
+	// the moment the manifest exists (CHUNK-ADDRESSING-SPEC §1, §2).
+	//
+	// Rejected: loading the image and layering the parent underneath it anyway, which is
+	// what this did until the clone that stops and starts again was finally exercised.
+	// It was not merely redundant, it was refused — `image.Load` returns an unlayered map
+	// and `cow.SetBase` says no — and the refusal is right rather than an obstacle.
+	// Tombstones do not survive publication as tombstones: a range the clone discarded is
+	// expressed in the manifest as *absence*, so sliding the parent back underneath
+	// uncovers every DISCARD the guest issued and answers reads of freed blocks with the
+	// parent's older bytes, which is §14.6's failure exactly. Making `image.Load` return
+	// a layerable map to get past the refusal would have converted a total outage — every
+	// read failing with ErrBaseUnavailable — into silently resurrected data.
+	//
+	// It is also one download the restart no longer pays: the parent's whole snapshot
+	// manifest and every chunk it names were being GET on every attach of every clone,
+	// for a view that was then thrown away.
 	//
 	// v.enc, not nil: the chunks are sealed under this volume's DEK, and loading them
 	// without it would fold ciphertext into the read view (DEV-0019).
@@ -871,6 +877,22 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	case errors.Is(err, image.ErrNotPublished):
 		// A volume that has never stopped cleanly has no image, which is the first boot
 		// and must work. Its base is whatever its parent gives it, or nothing.
+		//
+		// This is the only session in which a clone reads *through* its parent (§20):
+		// its own objects do not exist yet, so everything lives under the parent's
+		// volume id. The parent's view becomes the base outright — not a layer under
+		// this one — and the clone's own extents shadow it as they arrive.
+		parent, perr := m.parentView(ctx, v, d)
+		if perr != nil {
+			// Fail closed, the same rule as a base that cannot be recovered and for the
+			// same reason: an empty view where data belongs is a wrong answer a guest
+			// cannot detect.
+			slog.Error("the clone's parent snapshot could not be materialized; its reads will fail",
+				"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", perr)
+			v.baseFailed = true
+			v.log.FailBase(perr)
+			return
+		}
 		base, man = parent, image.Manifest{}
 		if base == nil {
 			base = cow.NewIntervalMap()
@@ -883,16 +905,6 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		v.baseFailed = true
 		v.log.FailBase(err)
 		return
-	default:
-		if parent != nil { // a clone reads through its parent, underneath its own image (§20)
-			if err := base.SetBase(parent); err != nil {
-				slog.Error("the clone's parent could not be layered under its image; its reads will fail",
-					"volume_id", v.id, "error", err)
-				v.baseFailed = true
-				v.log.FailBase(err)
-				return
-			}
-		}
 	}
 	// The ETag this volume CASes against when it publishes in turn. Carrying it is what
 	// makes the fence work: a host that never loaded the manifest publishes with an empty
@@ -919,6 +931,10 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 
 // parentView loads the snapshot this volume was cloned from, or returns nil for a volume
 // that was created rather than cloned (§20).
+//
+// Its one caller reaches it only for a volume with no image of its own — see fetchBase
+// for why an image supersedes the parent instead of layering over it. So this runs once
+// in a clone's whole life, on the boot before its first stop.
 //
 // It used to materialize that snapshot from a checkpoint plus the WAL objects after it.
 // Under ADR-0026 a snapshot is one manifest naming chunks the parent already wrote, and
