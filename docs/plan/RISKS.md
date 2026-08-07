@@ -91,7 +91,7 @@ re-reviewed when its trigger fires; closing a risk requires a note here.
 - Mitigation: VMs keep serving non-durable I/O; reconciliation makes catch-up trivial;
   PITR + `rebuild-metadata` cover blip-to-total-loss; verified CP term removes
   split-brain (INV-10, §7).
-- Status: open. The cited reason is stale: DEV-0009 (`rebuild-metadata` rebuilt volumes only) is resolved at `2b09d1e`, and the rebuild now covers the snapshot catalog too. What remains uncovered is the rest of the row set a Control Plane needs to resume — hosts, leases and operations are not reconstructed from S3, so a total PG loss still leaves placement and fencing state to be re-established by hand. Closes when the rehearsal in the trigger has actually been run.
+- Status: open. The cited reason is stale: DEV-0009 (`rebuild-metadata` rebuilt volumes only) is resolved at `2b09d1e`, and the rebuild now covers the snapshot catalog too. What remains uncovered is the rest of the row set a Control Plane needs to resume — hosts and leases are not reconstructed from S3, and neither is placement, so a total PG loss leaves an operator with a list of volumes and no list of where they were. (There is no `operations` table any more; wave 4 dropped it and `internal/schema/schema.sql` opens by saying so.) The re-placement is at least a verb rather than a guess since wave 3: `control-plane -attach-volume` with no `-attach-host` asks `placement.Choose`. Closes when the rehearsal in the trigger has actually been run.
 
 ### RISK-07 — Added complexity (implementation surface) of v5
 - Source: §29.7 (honest self-assessment)

@@ -19,6 +19,12 @@ spec before implementing *only* inside a human-review zone; everywhere else the 
 is the plan. So each one exists to be read by a person before a risky change, and once
 that change has landed its decisions belong in comments at the code.
 
+**Two of them ask rather than decide, and are the only two that landed before their code:**
+`CHUNK-ADDRESSING-SPEC.md` and `DELETION-AND-RECLAIM-SPEC.md` each end in a section headed
+"The question for review", and until it is answered nothing implements them. Those questions
+are open items in `STATUS.md`'s "Decisions waiting on a human" — which is where a reader
+looks for what is *waiting*; this directory is where they look for what a thing is.
+
 **Which of them the code still cites is a command, not a sentence:**
 
 ```

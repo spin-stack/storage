@@ -4,22 +4,27 @@
 file disagrees with this one, this one is wrong and should be fixed — nothing else
 tracks state.
 
-- **Date:** 2026-08-04 · **Branch:** everything is on `main`. `git ls-remote origin`
-  (`/home/aledbf/spin-storage.git`, bare) reports `9f5e5e4` for `refs/heads/main`, and
-  `git rev-list --count origin/main..HEAD` reports **1** — the exporter's caller
-  (`fa0c834`) is unpushed. Both numbers move under you while a parallel wave is running:
-  four lanes commit into this one working tree, so read them as "run the command", not as
-  a fact this file keeps up to date.
+- **Date:** 2026-08-06 · **Branch:** everything is on `main`, and `main` has not been pushed
+  since wave 1. Run the two commands rather than reading a number here: `git ls-remote
+  origin` (`/home/aledbf/spin-storage.git`, bare) for what the remote has, and
+  `git rev-list --count origin/main..HEAD` for how far ahead this tree is. On 2026-08-06 the
+  answers were `9f5e5e4` and **35**; they move under you while a parallel wave is running,
+  because five lanes commit into this one working tree.
 
   This line has been wrong twice, in opposite directions, and both times because it was
   written from memory. The rule this file needs is not "check before writing", which was
   already the rule — it is that **a claim about another system belongs next to the command
   that produced it**. Here that command is `git ls-remote origin`.
-- **Gate:** the last recorded `task ci:full` green is **wave 2, 2026-08-04, production
-  coverage 90.0%** — the floor exactly, with no slack (the integration log at the end of
-  the open-work region has the run). While the wave is open the tree is not continuously
-  green: `task ci` on 2026-08-04 during this increment stopped at `fmt:check` on
-  `internal/metadata/metadatatest/contract.go`, another lane's file.
+- **Gate:** `task ci:full` changed meaning in wave 4 and the claim has to be read with that
+  in mind. It no longer skips the guest-backed proofs — it refuses to run without the pinned
+  QEMU and the pinned kernel, and `ci:noguest` is the same lane list for a machine that has
+  neither, ending by printing what it did **not** prove (ADR-0025, amended). So a green
+  `ci:full` now means a guest booted. The last recorded coverage figure is **3940/4371 =
+  90.1396%** (`f65b579`), against a floor that since the same commit compares the ratio
+  rather than the one-decimal string `go tool cover` prints — which had been passing a tree
+  at 89.9908%. Recompute it with `task cover`; do not read the number above as current.
+  While a wave is open the tree is not continuously green, and the usual reason is another
+  lane's uncommitted `fmt:check`.
   Green *on a developer machine, and nowhere else*. **CI has never run**: `origin` is a
   local bare repo (`git remote -v` → `/home/aledbf/spin-storage.git`), so the GitHub
   workflows have never executed on a runner. Treat every
@@ -53,30 +58,48 @@ record each increment next to what it removed.
    catalog row, the Agent finds it in its desired state, freezes at a sequence and
    publishes; the socket is still there when the manifest lands;
 5. be cloned from that snapshot with `control-plane -clone-snapshot`, which asks
-   `placement.Choose` and lands the clone on the host that took the snapshot.
+   `placement.Choose` and lands the clone on the host that took the snapshot;
+6. be told **no** rather than fill the device: since wave 3 every Agent divides the
+   filesystem behind `-data-dir` among `-max-volumes` and refuses to start without a share
+   (`agent.Budget`), so a WRITE past the share is `wal.ErrBackpressure` — an error a guest
+   understands — instead of an ENOSPC nothing planned for. `integration/e2e/budget_test.go`
+   reads the budget off the Agent's own start-up line;
+7. survive a stop that cannot reach the bucket: the Agent keeps its data directory locked,
+   keeps the local WAL, retries, and does not exit 0 having lost the session
+   (`SHUTDOWN-PUBLISH-SPEC.md`, reviewed; verified against a TCP proxy in front of RustFS).
 
 **What is not there, in the order it matters:**
 
 - **Nothing is deployed and CI has never run.** Every claim above is one machine's word.
-- **A metric can leave the Agent, and no lane has watched one arrive.** Since 2026-08-04
-  (`fa0c834`) `cmd/volume-agent` takes `-otlp-endpoint` (`main.go:88`), builds a real
-  exporter before anything records (`main.go:133`), and hands the Recorder to the manager
-  (`main.go:230`), which hands it to each `wal.Log` at the one place a Log is built
-  (`internal/agent/volume.go:642`). What is recorded through it: the WAL's watermarks and
-  `wal_out_of_space` (`internal/wal/log.go:239-244`, `degraded.go:151`), the lease pair
-  (`internal/agent/loop.go:286,292`), `image_publish_duration_seconds`
-  (`internal/agent/volume.go:229`) and §19's two snapshot histograms (`volume.go:1332,1338`).
-  **`cmd/control-plane` still records nothing** — no exporter, no Recorder, verified by
-  `grep -n 'otlp\|Recorder' cmd/control-plane/main.go` returning nothing — and **no test
-  starts the real binary and asserts a series arrives at a collector**, so "a metric leaves
-  the process" is proven of the exporter and of the wiring, not of a deployment. The §26.2
-  catalog was trimmed to what exists on 2026-08-03 (~~DEV-0022~~); it declares **25** entries
-  today (`internal/obs/metrics.go:47`) and **nine** have a producer — the nine named
-  above, counted by grepping each catalog name outside `_test.go` and `metrics.go`.
+- **A metric can leave the Agent, and no lane has watched one arrive.** Since `fa0c834`
+  `cmd/volume-agent` takes `-otlp-endpoint`, builds the provider through
+  `real.NewOTLPMetricExporter` *before* anything that records, and hands
+  `telemetry.Recorder()` to the manager, which hands it to each `wal.Log` at the one place a
+  Log is built (`Log.SetRecorder`, called from `internal/agent/volume.go`). Which catalog
+  entries have a producer is a command, not a list — and this bullet has carried a wrong
+  number twice:
+
+  ```
+  for n in $(sed -n 's/^\t\t{"\([a-z0-9_]*\)".*/\1/p' internal/obs/metrics.go); do
+    grep -rl "\"$n\"" --include='*.go' . | grep -v _test.go | grep -v internal/obs/metrics.go |
+      head -1 | sed "s|^|$n → |"
+  done
+  ```
+
+  Read its output with one caveat that bit this recount: a metric name that is also a JSON
+  tag matches its struct field, so `chain_depth` reports a "producer" in
+  `internal/descriptor` and has none. **`cmd/control-plane` still records nothing** — no
+  exporter, no Recorder, and `grep -n 'otlp\|Recorder' cmd/control-plane/main.go` returns
+  nothing — and **no test starts a real binary and asserts a series arrives at a
+  collector**, so "a metric leaves the process" is proven of the exporter and of the wiring,
+  not of a deployment. The §26.2 catalog was trimmed to what exists on 2026-08-03
+  (~~DEV-0022~~) and has grown since: wave 4 added the read-view trio, and `f65b579` gave
+  them their producer on the durable step after they shipped with none.
 - **A rebuilt catalog cannot tell you who was serving what.** `-rebuild-metadata` brings
   back volumes and snapshots from the bucket (INV-20, since 2026-08-03) but no placement,
   because no object records one. After losing the database you know what exists, not who
-  was running it.
+  was running it — and the answer to that is `-attach-volume` with no `-attach-host`, which
+  asks `placement.Choose` instead of making an operator invent a host id per volume.
 - **A host that dies mid-session loses everything written since the volume attached.**
   That is ADR-0026's accepted trade, not a defect, and it is what "what would reverse it"
   in that ADR is for.
@@ -161,27 +184,34 @@ integrated machinery that is not in the tree at all.
 
 | Phase | State | What is true, and what is not |
 |---|---|---|
-| 01 skeleton (simio + DST + obs) | **integrated** | Both binaries run on `simio/real` (clock, disk, network, object store); `internal/dst` holds a mandatory scenario set pinned **by name** in `pinnedMandatorySet` (`internal/dst/mandatory_set_test.go`), which is the only place its size is stated: it moved from 18 to 19 within twenty minutes of being written down here, so this row names the pin rather than a number. Telemetry got its caller on 2026-08-04: `-otlp-endpoint` → a real exporter → the Recorder the manager hands to each `wal.Log` (`cmd/volume-agent/main.go:88,133,230`; `internal/agent/volume.go:642`). Nine of the catalog's 25 entries have a producer, and **no lane has observed a series arrive at a collector**. |
+| 01 skeleton (simio + DST + obs) | **integrated** | Both binaries run on `simio/real` (clock, disk, network, object store); `internal/dst` holds a mandatory scenario set pinned **by name** in `pinnedMandatorySet` (`internal/dst/mandatory_set_test.go`), which is the only place its size is stated: it moved from 18 to 19 within twenty minutes of being written down here, so this row names the pin rather than a number. Telemetry got its caller on 2026-08-04: `-otlp-endpoint` → `real.NewOTLPMetricExporter` → the Recorder the manager hands to each `wal.Log` through `Log.SetRecorder`. Under half of `obs.Catalog()` has a producer — the command that says which is in "What is not there" above — and **no lane has observed a series arrive at a collector**. |
 | 02 guest layout (3 devices + OverlayFS) | **not started** | `grep -ril 'erofs\|overlayfs' --include=*.go .` is empty. Nothing V1 does depends on it. Spec below. |
 | 03 vhost-user | **3.1 integrated + served by the Agent** | A real QEMU 11.0.2 guest completes the handshake and does READ/WRITE through our virtqueue (`integration/vhost/qemu_test.go:355`), and a **Linux** guest boots the lane (`integration/vhost/guest_test.go:43`). The *Agent* binds a socket per volume and serves `blockdev.Device` behind it (`internal/agent/volume.go:648,883`). A FLUSH is `fdatasync` and nothing else — the "full §14.4 remote path" this row used to claim went with ADR-0026 (`internal/wal/log.go:607`). 3.2 reconnection and 3.3 inflight-shmfd untouched: `INFLIGHT_SHMFD` is deliberately not advertised (`internal/vhost/features.go:93`), RISK-10 open. |
-| 04 WAL/CoW format | **integrated** | A guest's WRITE lands as a replayable WAL record with **0 PUTs**, and so does its `fsync` — asserted with a real kernel and the real binary in the loop (`integration/e2e/guest_test.go:75`, INV-18). The WAL is a directory of segments (`internal/wal/segment.go`). What this row used to add — "the uploader and checkpoints are integrated too, and increment 3's scheduler is what finally reclaims a byte" — is withdrawn: nothing reclaims mid-session and `TruncateLocal`/`AdvancePublished` have no production caller (see the callerless list). Format review still pending (human-review zone). |
+| 04 WAL/CoW format | **integrated** | A guest's WRITE lands as a replayable WAL record with **0 PUTs**, and so does its `fsync` — asserted with a real kernel and the real binary in the loop (`integration/e2e/guest_test.go:75`, INV-18). The WAL is a directory of segments (`internal/wal/segment.go`). What this row used to add — "the uploader and checkpoints are integrated too, and increment 3's scheduler is what finally reclaims a byte" — is withdrawn: nothing reclaims *mid-session*. **Something does reclaim, since wave 4**, and the row said otherwise until 2026-08-06: `wal.Log.InstallBase` unlinks the segments a restored image already holds, at attach, through the INV-13 rule — without it a volume started and stopped ten times on one host kept ten sessions of WAL under a bound nothing cleared. The exported `TruncateLocal`/`AdvancePublished` still have no production caller. Format review still pending (human-review zone). |
 | 05 encryption (AES-256-GCM, DEK/KEK) | **integrated** | `-kek-file` on the Agent (`cmd/volume-agent/main.go:92`), the unwrap at attach, and every chunk a volume publishes is sealed (`internal/image/image.go`, INV-15). The *read* half was integrated and wrong until 2026-08-02 — see DEV-0019, and note that this row said "model / —" while a real defect lived in the path it declined to describe. |
 | 06 remote WAL (batching, idempotent PUT, summary) | **withdrawn** — ADR-0026 | There is no remote WAL: no batcher, no uploader, no summary object (`grep -rn 'WriteSummary\|SummaryKey' --include=*.go .` is empty; `Batcher`/`Uploader` survive only as words in `integration/backend/edgecases_test.go`). What the guest lane proves now is the replacement — write, `fsync`, stop, and the image answers on a second boot (`TestAGuestSurvivesAStopAndComesBackFromItsImage`, `integration/vhost/lifecycle_test.go`). Idempotence survives as INV-21, structurally: a chunk key is its plaintext digest and an existing key is skipped. |
 | 07 Control Plane + leases + fencing | **partial: provisioning, snapshots, clone and placement integrated; fencing is one CAS** | Term-guarded writes are in every mutating query (`grep -c control_plane_leader internal/db/queries/*.sql`). The lease is liveness only — granted and renewed by `Heartbeat` (`internal/cpserver/cpserver.go:62`), consulted by nothing on the data path. **Promotion and `FENCING_WAIT` are gone** (increment 4.6): the only fencing left is `image.Publish`'s compare-and-set plus the Agent tearing a refused runtime down (`internal/agent/volume.go:931`). |
 | 08 recovery (S3 authority) + rebuild-metadata | **rebuild integrated; recovery withdrawn** | `internal/recovery` does not exist. The object store is the **boot** authority, not the recovery authority (INV-08): one manifest and its chunks. `controlplane.RebuildMetadata` + `control-plane -rebuild-metadata` (`cmd/control-plane/main.go:93`) bring volumes and snapshots back from two objects per volume — and deliberately not placement. |
-| 09 snapshots + clone + resize | **snapshot and clone integrated; resize has no caller** | A snapshot of a live volume is requested through desired state and published while the Agent serves (`integration/e2e/snapshot_test.go:28`); a clone of it is placed and boots (`integration/e2e/clone_test.go:21`). **Resize is metadata only**: `metadata.Store.ResizeVolume` is implemented by both stores and called by nothing but `metadatatest/contract.go` — no flag, no RPC, and nothing tells a guest its device grew. |
+| 09 snapshots + clone + resize | **snapshot and clone integrated; resize is out of V1** | A snapshot of a live volume is requested through desired state and published while the Agent serves (`integration/e2e/snapshot_test.go`); a clone of it is placed and boots (`integration/e2e/clone_test.go`). **Resize is gone, not pending** (2026-08-06, `446b61e`): `metadata.Store.ResizeVolume` grew a row and nothing else — a `Device`'s capacity is fixed by `blockdev.New`, `Apply` returns before reading the size, and the guest cannot be told at all, since a new capacity travels on a vhost-user backend request channel `internal/vhost` does not offer. What guards the decision is `metadatatest`'s `VolumeGeometryIsImmutable`, which reads a volume's size back after every mutation. |
 | 10 objectization + checkpoints + GC + I/O classes | **withdrawn** — ADR-0026 | All four subjects are deleted: `internal/gc`, `internal/checkpoint`, `internal/ioclass`, and the segment-object plan (`OBJECTIZATION-SPEC.md`, removed 2026-08-03). What survives of GC is enforced at construction — `real.NewS3Store` refuses an unversioned bucket (`TestRequireVersioning`, `internal/simio/real/s3_versioning_test.go:36`) — and it is all that INV-14 has left. |
-| 11 cross-host + cordon/drain + capacity | **cordon and capacity integrated; drain withdrawn** | `controlplane/drain.go` is deleted and nothing calls a drain; `HostDraining` survives as a lifecycle state (`internal/lifecycle/lifecycle.go:132`) with no producer. What is real: a host cordons itself out of the fleet when its device fills, through the heartbeat (`internal/cpserver/cpserver.go:14,339`), and admission counts what a host is *using* rather than only what it was promised (`internal/placement`). Cross-host movement of a volume does not exist. |
+| 11 cross-host + cordon/drain + capacity | **cordon and capacity integrated; drain withdrawn** | `controlplane/drain.go` is deleted and nothing calls a drain; `HostDraining` survives as a lifecycle state (`internal/lifecycle/lifecycle.go:132`) with no producer. What is real: a host cordons itself out of the fleet when its device fills, through the heartbeat (`cpserver.CordonUsedRatio`/`UncordonUsedRatio`, a Schmitt band rather than ADR-0013's single threshold, in `internal/cpserver/pressure.go`), and admission counts what a host is *using* rather than only what it was promised (`internal/placement`). Wave 4 retired the `operations` table and with it ADR-0017's second capacity term, which summed rows nothing ever wrote — `internal/schema/schema.sql` opens by saying there is no such table and why. Cross-host movement of a volume does not exist. |
 | 12 warm standby + compaction + flatten | **not started, and V2 under ADR-0026** | Nothing in the tree; ADR-0014 (its quota/squash half) is itself withdrawn. Listed because §2 still names it as a target for a later version. |
 | 13 hardening | **13.1 integrated (typed lifecycles); the rest needs infra** | `internal/lifecycle` is the typed state machine (ADR-0009) and the Control Plane uses it. 13.2 (real-hardware fault injection + measured runbooks) and 13.3 (backend conformance per version) need hardware nobody has; 13.4 is **INV-19**, which stays pending on purpose until two Agents can run different formats. |
 
-**Invariants — recounted against `INVARIANTS.md` on 2026-08-04: 14 active, 6 withdrawn,
-2 pending, 22 total.** This line said "21 of 22 active" and had been wrong since ADR-0026
-retired six mechanisms and their checkers with them. The two pending are **INV-14** (GC —
-its subject is deleted, so it cannot fire) and **INV-19** (format read-old/write-new, not
-binding until two Agents can run different versions). Every *active* checker has been shown
-to catch a planted bug, and `internal/dst`'s `TestMain` now enforces that claim rather than
-recording it. See `INVARIANTS.md`.
+**Invariants — `INVARIANTS.md`'s State column owns this, and the tally is a command:**
+
+```
+grep -oE '^\| \*\*INV-[0-9]+\*\* \| \*\*[a-z]+' docs/plan/INVARIANTS.md | sed 's/.*\*\*//' | sort | uniq -c
+```
+
+This line has carried a written total twice and been wrong both times — "21 of 22 active"
+survived ADR-0026 retiring six mechanisms, and "14 active, 6 withdrawn, 2 pending" survived
+INV-13 coming back on 2026-08-06 when `wal.Log.InstallBase` put a production caller behind
+its rule. The two `pending` are **INV-14** (GC — its subject is deleted, so it cannot fire;
+`DELETION-AND-RECLAIM-SPEC.md` is the shape it would return in) and **INV-19** (format
+read-old/write-new, not binding until two Agents can run different versions). Every *active*
+checker has been shown to catch a planted bug, and `internal/dst`'s `TestMain` enforces that
+claim rather than recording it.
 
 **Test backlog:** the 2026-07-25 six-way audit found 78 gaps (7 critical); **all 78 are
 closed**, each naming the commit. The one item still open is below and did not come
@@ -299,16 +329,30 @@ answer loses both obligations.
 
 ## The guest lane in CI
 
-**Decided 2026-08-02 — ADR-0025.** The lane runs inside the published QEMU runtime image
-as a container job, rather than installing its dynamic dependencies on a bare runner,
-because that keeps one definition of the dependency set in `Dockerfile.qemu`. It is
-implemented: `.github/workflows/ci.yml` has a `guest-lane-image` job that probes for
-`ghcr.io/<repo>/qemu:<version>` and a `guest-lane` job gated on it, which skips with a
-notice rather than failing the gate when the image has not been published yet.
+**Decided 2026-08-02 — ADR-0025, amended 2026-08-05.** The lane runs inside the published
+QEMU runtime image as a container job, rather than installing its dynamic dependencies on a
+bare runner, because that keeps one definition of the dependency set in `Dockerfile.qemu`.
+That half is unchanged.
+
+**The skip is gone, and this section described it for a wave after it went.** The preflight
+is `guest-inputs` (not `guest-lane-image`), and when either artefact — the QEMU runtime
+image or the mirrored kernel — is unpublished it **exits 1**, writing the command that
+publishes each into the run summary. `guest-lane` and `guest-e2e-lane` run with
+`REQUIRE_PROOFS=1`; the `ci` job runs `ci:noguest`, which is what a runner with Docker and
+no QEMU can honestly claim; and `gate` is the job to require on the branch, because a
+*skipped* needed job leaves its dependents free to run and a workflow of green-and-grey
+boxes reports as a pass. The reasoning is in ADR-0025's banner: trained-to-ignore-red is a
+real cost, believed-to-be-proven is the larger one, and it is the one this repository has
+already paid (DEV-0018).
+
+**So the gate is red until two artefacts exist, deliberately** — the runtime image
+(`qemu.yml` publishes it; it has `workflow_dispatch`) and the mirrored guest kernel (a human
+with a spinbox checkout has to run `task fetch:kernel && task guest:kernel:push`). Track B's
+log has both commands.
 
 What is still true is narrower, and it is the same caveat as everywhere else on this
 page: **no CI workflow has ever executed**, because `origin` is a local bare repo. The
-job is written and reviewed, not observed.
+jobs are written and reviewed, not observed.
 
 ## ~~DEV-0007~~ — the spine's second half *(the chain closed 2026-08-02; its subject was withdrawn 2026-08-03)*
 
@@ -1371,8 +1415,11 @@ allocation control and ADR-0013's *hard* device budget is the part to keep).
   Plane restarting mid-fence has no memory of having observed anything, which is the
   failure a future promotion must be rebuilt on.
 - **ADR-0016** — the lease is liveness only; the per-host granularity stands and is still
-  what `Loop` renews. The window this ADR bounded is currently empty because a revocation
-  stops nothing on the data path.
+  what `Loop` renews. The window this ADR bounded was *empty*; since wave 4 it is
+  **deleted** — `BlockHostRenewals`, `UnblockHostRenewals`, `RevokeHostLease`,
+  `metadata.ErrRenewalsBlocked` and the `hosts.renewals_blocked_until` column are all gone,
+  and `internal/schema/schema.sql` carries the reasoning where the column stood. The ADR's
+  own banner says so.
 
 **And one more thing with no caller went with them.** `wal.Log.BasePending` existed so the
 durability scheduler could not act on a *false* ADR-0023 witness — a resumed log reports
@@ -1380,54 +1427,68 @@ durability scheduler could not act on a *false* ADR-0023 witness — a resumed l
 writer held the epoch and fence a healthy host on every restart. With no mid-session
 publication there is no such window, and the method had only its own test.
 
-**ADR-0013 is still `Proposed` and is now the most-cited ADR in the tree, ahead of
-ADR-0026** — 72 citations in all `.go` files, 54 of them outside `_test.go`, against
-ADR-0026's 73 and 49 (`grep -rhoE 'ADR-[0-9]{4}' --include=*.go . | sort | uniq -c | sort -rn`,
-2026-08-04; the figure here was "32" and had never been recounted). It carries DEV-0011 (a
-segment's space charged as used rather than reserved), and ADR-0014's amendment above leans
-on it for the hard limit. It is a decision waiting on a human, not a divergence.
+**ADR-0013 is still `Proposed` and is the most-cited ADR in the tree.** Which ADR leads and
+by how much is a command, not a sentence here — it has been rewritten twice with a number
+that was wrong within a wave:
+
+```
+grep -rhoE 'ADR-[0-9]{4}' --include='*.go' . | sort | uniq -c | sort -rn | head
+```
+
+It carries DEV-0011 (a segment's space charged as used rather than reserved), ADR-0014's
+amendment leans on it for the hard limit, and since wave 3 an Agent's whole write-path bound
+is derived from it (`agent.Budget`, `cmd/volume-agent`'s `-max-volumes`). It is a decision
+waiting on a human, not a divergence.
 
 ## Components with no production caller
 
 CLAUDE.md's rule is that a component with no caller is a liability rather than progress,
-and `CloneCrossHost` was deleted for exactly it. These are the remaining ones. They are
-listed here, in the file that tracks state, because until now each was recorded only
-inside the spec or ADR that built it — which is how a thing stays "done" while nothing
-calls it.
+and `CloneCrossHost` was deleted for exactly it. **This section no longer answers "which
+ones". `task deadcode` does, it runs inside `task ci`, and the reason for every symbol it
+reports is on the line beside it** in one of two files:
 
-- **`wal.TruncateLocal` and `wal.AdvancePublished` have no production caller.** The
-  durability scheduler that called them went in increment 4.1, so `published_sequence`
-  is permanently 0 and nothing reclaims a segment mid-session — which is correct under
-  ADR-0026, since the WAL lives one session. Both are kept deliberately: the rule
-  `TruncateLocal` enforces (`ErrTruncateAboveDurable`) is the part that is easy to get
-  wrong, and reclamation returns with any long-lived volume. Recorded so nobody reads
-  INV-03's first `≤` as a live property.
-- **`metadata.BumpVolumeEpoch` has no caller outside tests.** `controlplane.Promoter`
-  went with the fencing half in increment 4.6; the store's compare-and-set on the epoch
-  stayed, because it is what would grant one if promotion returns (ADR-0024). INV-11 is
-  withdrawn, not pending.
-- **`metadata.Store.ResizeVolume` has no caller outside tests** (added to this list
-  2026-08-04). Both stores implement it, the term guard and the shrink refusal are
-  contract-tested, and nothing asks for a resize: no flag on `cmd/control-plane`, no RPC,
-  and no path that does what §17 describes — propagate the grow through the device's config
-  space and notify the guest (`arquitectura_mvp_volumenes_remotos_v5.md:550`), which is an
-  objective in §3's list and is not built. Recorded here rather than deleted because the
-  refusal (`ErrShrinkNotAllowed`) is the part that is easy to get wrong later.
-- **`wal.Log.Broken()` has no production caller, and its own doc comment says so**
-  (`internal/wal/log.go:257`). It is read by the DST harness and a concurrency test as
-  proof of a transition, which is the same deliberate exception `Log.Fenced()` was before
-  the rename. Listed so a later sweep does not read it as the `CloneCrossHost` pattern.
+- `hack/deadcode-allow.txt` — "unreachable, and that is correct forever": a test-only
+  affordance, a reference model, a fake front-end's encoder.
+- `hack/deadcode-pending.txt` — "unreachable, and that is a deletion nobody has finished".
+  A ratchet over a **set**, not a count: a finding in neither file fails, and an entry the
+  tool stops reporting also fails, so the line leaves in the same commit as the code.
 
-**This list is not exhaustive, it is not the authority any more, and saying both is the
-point.** `PARALLEL-PLAN.md`'s audit counted about fifteen surfaces with no caller; the four
-above are the ones verified by grep while recounting this file on 2026-08-04. On the same
-day track B made the question computable — `task deadcode` walks the call graph from the
-binaries and fails on a finding nobody has explained (`hack/deadcode.sh`, `833541d`) — for
-exactly the reason this section keeps needing a recount: a list a human maintains about
-code a human is changing reports success by not being updated. **Run the task; read this
-list for the two entries the task cannot see**, which its own header names: symbols reached
-through reflection (`TruncateLocal`) and packages no binary imports (`metadata`'s two store
-implementations, where `BumpVolumeEpoch` and `ResizeVolume` live).
+**The hand-written list that stood here is deleted rather than corrected, and how it failed
+is the argument.** Recounted 2026-08-06 it was wrong in both directions at once: it said
+`published_sequence` "is permanently 0 and nothing reclaims a segment", which stopped being
+true when `wal.Log.InstallBase` landed; it still listed `metadata.Store.ResizeVolume`, which
+track D deleted; and it had never grown the ten entries the pending list now carries. A list
+a human maintains about code a human is changing reports success by not being updated — the
+same failure mode as a checker that cannot fire, one document over. **Do not add an entry
+here that `task deadcode` can see.** There the reason is checked against a finding; here it
+is checked by whoever happens to reread this paragraph.
+
+**What the task cannot see is the only thing this section is still for.**
+`hack/deadcode.sh`'s header names both blind spots, and an entry belongs here **only** if it
+falls in one of them:
+
+- **Reached through reflection**, so RTA marks it live and it is never reported:
+  `wal.TruncateLocal` and `wal.AdvancePublished`. Neither exported method has a production
+  caller, and that has not changed. **What changed in wave 4 is that the rules they carry
+  now run in production.** `wal.Log.InstallBase`, called by the Agent's `fetchBase`, raises
+  `published` to the sequence the recovered image covers and reclaims the segments below it
+  through the same `truncateLocalLocked` and the same `StrictOrder.AllowTruncate` (INV-13)
+  the exported method uses. So `published_sequence` is no longer permanently zero, and a
+  volume that has been started and stopped ten times on one host no longer keeps ten
+  sessions of WAL. The exported pair is kept because *mid-session* reclamation returns with
+  any long-lived volume.
+- **Not in the analysed program at all**: `metadata.BumpVolumeEpoch`. `metadata/sim` is a
+  package no binary imports (the allowlist's coarse pass names the package, not the symbol),
+  and `metadata/pg` is linked but its store methods are not built into the analysed program
+  — `deadcode -whylive '…/internal/metadata/pg.(*Store).BumpVolumeEpoch' ./cmd/...` answers
+  `not found in program`. It is the store's compare-and-set on the epoch, kept because
+  ADR-0024 says it is what would grant one if promotion returns.
+- **`wal.Log.Broken()`**, whose own doc comment says so. It is read by the DST harness and a
+  concurrency test as proof of a transition — the same deliberate exception `Log.Fenced()`
+  was before the rename — and the task does not report it either.
+
+The entry this section held for `metadata.Store.ResizeVolume` is gone because the method is:
+see "Decisions waiting on a human", where the question it was waiting on was answered.
 
 ## ~~STOPPED~~ — the data-path cleanup, superseded by ADR-0026 *(and the ADR is now executed)*
 
@@ -1497,19 +1558,22 @@ ADR-0026 either way.
 
 ## Decisions waiting on a human
 
-- **ADR-0013 (device pressure) is still `Proposed`.** It carries DEV-0011 and the
-  `SetLimits` the segment code has no way to receive today. Note the gap this leaves: **54
-  citing lines across 23 non-test files** treat it as decided (recounted 2026-08-04; it
-  said 32), it is now the most-cited ADR in the tree, its WAL segment format has landed,
-  and since 2026-08-04 a host **cordons itself** on the device measurement it defines
-  (`internal/cpserver/cpserver.go:14`). Either the review happened and the ADR should say
-  so, or it did not.
+- **ADR-0013 (device pressure) is still `Proposed`.** It carries DEV-0011. Note the gap
+  this leaves: it is the most-cited ADR in the tree (the command is in "The decisions stop
+  describing deleted machinery" above — do not trust a number written here), its WAL
+  segment format has landed, a host **cordons itself** on the device measurement it defines
+  (`cpserver.CordonUsedRatio`/`UncordonUsedRatio`, `internal/cpserver/pressure.go`), and
+  since wave 3 an Agent that cannot derive a budget from it **refuses to start**
+  (`agent.Budget`, `NewVolumeManager`'s `Budget.Share() <= 0` guard). Every one of those
+  treats it as decided. Either the review happened and the ADR should say so, or it did not.
 - **The review-zone specs have no commit that precedes their implementation.** Five
   increments in a human-review zone (fencing, keys/format, on-S3 format ×3) have their
   `*-SPEC.md` landing in the same commit as the code it was supposed to gate. That is not
   proof the review did not happen — a commit records when a file entered the tree, not
   when a person read it — but the evidence CLAUDE.md's review-zone rule asks for is not
-  in git, and only a human can say which it was.
+  in git, and only a human can say which it was. **Wave 4 stopped adding to the pile:**
+  `DELETION-AND-RECLAIM-SPEC.md` (`b132161`) and `CHUNK-ADDRESSING-SPEC.md` (`1586c32`) are
+  each a commit that changes one file and no code. Their questions are two bullets below.
 - ~~**ADR-0023 shipped without a DST scenario**~~ **— moot since 2026-08-03, and left
   standing for one line of it.** The checkpoint it governed is deleted, and
   `grep -rn 'ADR-0023' internal/dst/` now returns **nothing**; the unit test this entry
@@ -1519,21 +1583,54 @@ ADR-0026 either way.
   mandatory arm, `two-hosts-cannot-both-publish-an-image`. Nothing is waiting on a human
   here any more; it stays as a `~~closed~~` line because "an ADR whose DST arm was never
   written" is the shape worth being able to find again.
-- **ADR-0016's stage 2 has lost its blocker, and has now lost its subject too.** Stage 2
-  changed what `wal.Log` consults before ACKing a FLUSH; under ADR-0026 a FLUSH consults
-  nothing but `fdatasync`, so there is no window for it to bound. The marker this entry
-  pointed at (`internal/controlplane/drain.go`) is deleted. Stage 1 survives and is real —
-  the bounded revocation window, `RenewalsBlockedUntil`, term-guarded
-  (`internal/metadata/metadata.go:213,444`) — with **no production caller**, like the rest
-  of the promotion path. The decision a human still owns is the small one: record stage 1
-  as the final answer, or keep stage 2 alive for the durability tier ADR-0026 says would
-  reverse it.
+- **ADR-0016 has lost both its stages, and the entry that stood here named a mechanism that
+  no longer exists.** It said stage 1 "survives and is real — the bounded revocation window,
+  `RenewalsBlockedUntil`, term-guarded"; wave 4 deleted all of it, because three writers
+  with no caller, a column that could only ever be NULL and a predicate that could only ever
+  be true are indistinguishable from a broken writer to the next reader. Stage 2 changed
+  what `wal.Log` consults before ACKing a FLUSH, and a FLUSH consults nothing but
+  `fdatasync`. **What a human still owns is one sentence:** close ADR-0016 at "the lease is
+  per host and is liveness only", or keep stage 2 open against the durability tier ADR-0026
+  says would reverse it. The schema carries the reasoning where the column was
+  (`internal/schema/schema.sql`, the `hosts` table's comment).
 - **DEV-0020**, above: whether a clone chain is walked at read time or flattened at clone
   time. **Not subsumed by ADR-0026 — sharpened by it.** The code answers "flattened, at
   every publish, by copying the parent's whole dataset under the clone's prefix", nobody
   decided that, and `PARALLEL-PLAN.md`'s C11 wants the copy gone. Removing it without a
   chain read turns a storage cost back into silent zeros, so the two are one decision, and
-  it is an on-S3 format decision.
+  it is an on-S3 format decision. **It now has its spec**, and the question is put in that
+  spec's terms below.
+- **Is `chain_depth` a structure or a label?** — `CHUNK-ADDRESSING-SPEC.md` §8, written in
+  wave 4 and unreviewed. Today it is neither: `controlplane.Clone` increments it, nothing
+  reads it, no ceiling refuses on it, and the flattening at `image.uploadChunks`'s
+  `view.Ranges()` loop makes it describe a lineage rather than a read path. *Label* means
+  keep flattening and pay a duplicate per link forever; *structure* means a chunk-key format
+  change, a chain walk in the attach path, and a deletion design that counts references
+  across prefixes. Every option in that spec is downstream of the answer, and it is an
+  on-S3 format decision.
+- **Must a clone be independent of its parent before the parent can be deleted, or should
+  the delete make it independent?** — `DELETION-AND-RECLAIM-SPEC.md` §9, written in wave 4
+  and unreviewed. This is the first thing in the repository that would remove an object.
+  **The spec's own recommendation has a hole it asks the reviewer to close rather than
+  discover:** refusing a delete while `parent_snapshot_id` is set is only a *temporary*
+  refusal if something can clear that column, and nothing can — the upsert is
+  `parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED.parent_snapshot_id)`
+  and a rebuild reads the link back out of the descriptor. So the second decision is: clear
+  the link when a clone's first publish makes it self-contained, or make the precondition
+  "descends from this **and** has no image of its own". Free now, a migration later.
+- ~~**Does V1 offer resize, or is §3's grow-only rule a promise with no verb behind it?**~~
+  **Answered 2026-08-06 (`446b61e`): V1 does not resize a volume, and `ResizeVolume` is
+  deleted.** It is recorded here rather than dropped because the *shape* is worth finding
+  again: a store method that was term-guarded, grow-only and correct, and whose whole path
+  did not exist — the desired state already carries `size_bytes` to every Agent, `Apply`
+  returns at its epoch check before reading it, a `Device`'s capacity is fixed by
+  `blockdev.New`, and a new capacity would travel as `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG`
+  on a backend request channel `internal/vhost` does not offer. The thirty correct lines
+  were not neutral either: `descriptor.json` carries the same size and is written only at
+  create and clone, so a resize that landed in the catalog and not in the bucket was the one
+  way to make the two disagree about a volume's size with nothing to notice. What replaces
+  it is a property both stores are held to (`metadatatest`'s `VolumeGeometryIsImmutable`),
+  so a resize brought back as a store method *and nothing else* fails there.
 - ~~**ADR-0026 — does V1 accept an RPO of one session?**~~ **Answered 2026-08-02: yes.**
   Recorded in the ADR with the reasoning; what remains is execution, not a decision.
 - **The Phase 04 format review** (human-review zone) has never been signed off.
