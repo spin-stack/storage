@@ -177,3 +177,74 @@ the epoch object, recovery-points, and manifests", two of which ADR-0026 deleted
 `Descriptor.CurrentEpoch`'s field comment still says "last known; the epoch object is
 authoritative" while `controlplane.rebuild` states the opposite and is right. Both are track
 D's.
+
+### A4 — DEV-0023 closed, and the design document read end to end (2026-08-07)
+
+`d315840` (resize → V2), `36adab7` (`STATUS.md` + `REFERENCE.md`), `f0eab30`, `1270fdf`,
+`58e6eca`, `0cf95e6`, `2e80c11` (the sweep), `7405547` (DEV-0024), `<this commit>` (this
+entry).
+
+**DEV-0023 is closed by bannering, not by reopening resize.** §3's objective 14 carries the
+reasoning where the promise was made and every other mention points there. What the banner
+records is the *missing path*, not the deleted verb, because that is the part a reader
+cannot reconstruct: the desired state already carries `size_bytes` to every Agent and
+`agent.Loop.Apply` returns at its epoch check before reading it; a `blockdev.Device`'s
+capacity is fixed by `blockdev.New`; and a new capacity reaches a guest as
+`VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` over a channel `vhost.ProtocolFeatures` does not
+advertise. §9's `resize2fs` sentence was not half-built — it was the half that could not be.
+
+**Then the larger half: four waves of code had landed since anybody read the document end to
+end.** The findings sort into three kinds, and the middle one is the one this increment
+would repeat if it ran again.
+
+*Withdrawn mechanisms still in the present tense.* A1 left an inventory rather than a
+rediscovery and this increment spent it: §5.8, §5.9, §5.11, §11, §14.2–§14.5, §16, §24 and
+§30 now carry banners in the shape §12/§21/§23/§31 already used.
+
+*Claims that were simply false, which is worse than stale.* §22.5 said `rebuild-metadata`'s
+implementation went with its section and that `descriptor.json` has writers and no reader —
+`controlplane.RebuildMetadata` came back on 2026-08-03 and is INV-20, which makes §31's
+criterion 17 the one criterion in that list met today. §23's ADR-0026 banner **blessed** the
+inflight-shmfd edge case as standing unchanged when nothing implements it, and §2's SLO
+table promised seconds of I/O pause on an Agent crash on the same non-existent mechanism
+(RISK-10, open since phase 03, never referenced from the promise). A banner that blesses a
+case is stronger than a stale case: a reader who checks the banner stops there.
+`STATUS.md` had the same shape internally — a "new finding, not resolved" about the
+descriptor's missing reader, four days upstream of its own resolution in the same file.
+
+*Behaviour the tree has and the document never described.* §5.7's two unflushed bounds are
+not what binds V1 — `Sync` clears the counter on every guest `fsync`, so `MaxLocalBytes` is
+the bound that holds and its value is a share of the device from `agent.Budget`; §10's
+config block listed batch sizes and checkpoint intervals and not one flag
+`cmd/volume-agent` takes, `-max-volumes` included. §14.8 promised the volume reaches the
+store at stop and never said what happens when it cannot: rule 7 now records hold-and-retry,
+its cost (a store outage hangs a fleet-wide rolling restart) and the one failure that still
+exits. §28.1 had cordon and drain backwards — the drain is deleted and the cordon is applied
+by the Control Plane itself as a Schmitt band with a stored reason. And §25 gained §25.5,
+because none of its techniques catches the defect this repository shipped most often, a
+fully tested component no binary calls, and `task deadcode`'s two-list ratchet now does.
+
+**One thing was not settled and became DEV-0024** rather than a guess: the declared schema
+comments `block_size` as the 64 KiB CoW granularity when it is the guest's logical block
+size, and the 64 KiB CoW segment exists nowhere — `cow.IntervalMap` has no grid and what
+leaves the host is a content-addressed chunk of up to `image.MaxChunkBytes`. The comment is
+track D's file, and whether that granularity is *V2* or *dead* is downstream of
+`CHUNK-ADDRESSING-SPEC.md`'s unanswered question, which DEV-0020 also waits on.
+
+**One entry was nearly opened and was disproved by its own evidence.** `STATUS.md` said
+§19's two mandatory metrics are unrecorded; the grep meant to justify the DEV entry found
+them being observed in the Agent's snapshot path, with a test asserting it. The paragraph is
+struck rather than deleted, with that note: this file's rule about running the command beside
+a claim had only ever been applied to counts, and prose rots the same way.
+
+**§26.2 is checkable now instead of restated.** It claims to be `internal/obs.Catalog()` and
+had drifted a second time; a loop in the section answers the question, and two names written
+with brace abbreviations (`wal_{local,durable}_sequence`, `clone_{same,cross}_host_total`)
+are spelled out because an abbreviation a reader expands and a grep cannot is a check that
+cries wolf. **Proven to fire:** renaming `read_view_layers` to `read_view_layerz` in the
+document made it print the missing name, and the rename was reverted by textual replacement.
+
+**`task ci` exit 0** before the last commit. An earlier run the same afternoon was red at
+`lint` on `internal/simio/real/agent_export_test.go` — another lane's uncommitted file, fixed
+by that lane. The four self-checks in `REFERENCE.md`'s header were run and are empty, and so
+is §26.2's new one.

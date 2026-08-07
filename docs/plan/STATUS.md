@@ -1202,11 +1202,15 @@ would replace a volume's history with a partial view of it. `stop()` now waits f
 fetch, and a volume whose base never resolved does not publish at all: its view is not a
 subset of the truth, it is a different thing.
 
-**New finding, not resolved: `descriptor` has writers and no reader.** `provision` and
-`clone` write `descriptor.json`; its readers were `gc.Reachable` and
-`controlplane.RebuildMetadata`, and both are gone. It is the volume's only
-self-describing anchor in the object store, so deleting it is not obviously right — but a
-thing only ever written is the pattern this sweep exists to remove. §22.5 records it too.
+**~~New finding, not resolved: `descriptor` has writers and no reader.~~ — resolved the
+next day, further down this file.** It said `provision` and `clone` write
+`descriptor.json` and that both readers (`gc.Reachable`, `controlplane.RebuildMetadata`)
+were gone. The owner's call was to write the reader rather than stop writing the
+descriptors: `RebuildMetadata` came back on 2026-08-03 in a much smaller form, and the
+section "INV-20 is active again" below is the record. The struck line stays because this
+paragraph is what the decision was made against, and because it was still readable as a
+current finding for four days — an unresolved item and its resolution in one file, in that
+order, is how this file misleads when it misleads.
 
 ## ADR-0026 increment 4.5 — one ACK contract, and the WAL's remote half is gone
 
