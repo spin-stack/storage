@@ -90,6 +90,22 @@ type Volume struct {
 	// got its base must not publish at all: its view is not a subset of the truth, it is
 	// a different thing.
 	baseFailed bool
+	// inheritedBytes is how much of this volume's read view came from a *parent's*
+	// snapshot rather than from an image of its own, and inheritedFrom names that
+	// snapshot. Both are zero for every volume that is not a clone in the one session
+	// before its first stop, which is the only session that pays for them.
+	//
+	// They exist to be logged. A clone's first publish re-seals and re-uploads the whole
+	// inherited dataset under its own prefix — `image.uploadChunks` walks `view.Ranges()`
+	// and cow reports the base's ranges merged with this layer's — so a clone that wrote
+	// one sector still stops for as long as its parent's data takes to upload. Measured
+	// in internal/image's TestACloneFirstStopCopiesWhatItInherited; until this field
+	// existed there was nothing an operator could read that said why.
+	//
+	// Written by fetchBase before it closes baseDone, read only after a wait on it, so
+	// the two do not need a lock.
+	inheritedBytes int64
+	inheritedFrom  string
 
 	// snapMu guards the snapshot bookkeeping below. It is its own lock because a
 	// snapshot's upload outlives the reconcile cycle that started it, and the manager's
@@ -220,6 +236,7 @@ func (v *Volume) publish(ctx context.Context) error {
 		return fmt.Errorf("%w: volume %s", ErrNoReadView, v.id)
 	}
 	view, seq := v.log.ViewAtRest()
+	v.sayWhatThisImageCosts(view)
 	// Under ADR-0026 this is the *only* moment anything leaves the host, so its duration
 	// is the cost of a whole session rather than one step among many — and it is what an
 	// operator watching a slow shutdown needs (§26.2). Recorded for a failed publish too:
@@ -236,6 +253,43 @@ func (v *Volume) publish(ctx context.Context) error {
 	v.imageETag = etag
 	slog.Info("volume image published", "volume_id", v.id, "sequence", seq)
 	return nil
+}
+
+// sayWhatThisImageCosts prints the size of what is about to be uploaded, and how much of
+// it this volume never wrote.
+//
+// **Before the upload, not after, and that is the whole point.** The operator's question
+// is asked while a stop is hanging — a clone of a 40 GiB golden image that wrote one
+// sector still uploads 40 GiB at its first stop, because publishing flattens
+// (`image.uploadChunks` walks `view.Ranges()`, which merges the parent's ranges into this
+// layer's). A line printed when the publish finishes cannot answer a question about why it
+// has not finished. Nothing else in the process says this: the durability histogram is
+// recorded on the way out, and `chain_depth` has no producer.
+//
+// It is printed for a snapshot too, because the snapshot's manifest names the same copy
+// under this volume's prefix. The *transfer* is paid once — `uploadChunks` skips a chunk
+// whose key already exists, so the second upload of the same content moves no bytes
+// (internal/image's TestASecondStopPaysOnlyForWhatItTouched) — which is why the message
+// is about what the image contains rather than about what crosses the wire.
+//
+// Summing Ranges() is O(extents), the fold `cow.Cost` deliberately avoids. That is right
+// here and wrong there: Cost is recorded at the WAL's flush cadence, on every guest
+// fsync, and this runs once per stop, immediately before an upload of exactly these bytes.
+// The alternative — reporting Cost().Bytes instead — would double-count every byte the
+// layer overwrote in its base, which for a clone that rewrote its parent is the difference
+// between "8 MiB" and "16 MiB" of an 8 MiB upload.
+func (v *Volume) sayWhatThisImageCosts(view *cow.IntervalMap) {
+	var n int64
+	for _, r := range view.Ranges() {
+		n += int64(r.Length)
+	}
+	if v.inheritedBytes == 0 {
+		slog.Info("publishing the volume's image", "volume_id", v.id, "image_bytes", n)
+		return
+	}
+	slog.Info("publishing the volume's image, which copies the dataset it inherited from its parent under its own prefix",
+		"volume_id", v.id, "image_bytes", n,
+		"inherited_bytes", v.inheritedBytes, "parent_snapshot_id", v.inheritedFrom)
 }
 
 // ListenFunc opens the vhost-user socket for one volume. It is injected because a Unix
@@ -897,6 +951,10 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		if base == nil {
 			base = cow.NewIntervalMap()
 		}
+		// What this session will have to copy at its first stop. Cost() is O(layers) and
+		// the parent's view is one unlayered map, so Bytes is exactly its live extent
+		// bytes — the dataset this volume inherited and did not write.
+		v.inheritedBytes, v.inheritedFrom = base.Cost().Bytes, d.GetParentSnapshotId()
 	case err != nil:
 		// Refuse loudly rather than serve zeros. An empty view where data belongs is
 		// indistinguishable from a fresh volume, and a guest cannot tell them apart.
@@ -1482,6 +1540,7 @@ func (m *VolumeManager) snapshot(ctx context.Context, v *Volume, snapshotID stri
 	if err != nil {
 		return 0, fmt.Errorf("agent: volume %s: freezing at a sequence: %w", v.id, err)
 	}
+	v.sayWhatThisImageCosts(frozen)
 	publishStart := m.deps.Clock.Now()
 	defer func() {
 		m.deps.Recorder.Observe(ctx, "snapshot_publish_duration_seconds", m.deps.Clock.Now().Sub(publishStart).Seconds(), vol)
