@@ -14,17 +14,21 @@
 //
 //   - Term first. Every mutation validates the caller's Control-Plane term before
 //     anything else (§7). A stale term — including term 0, before any election has
-//     happened — is metadata.ErrStaleTerm even when the row is also missing, the
-//     transition is also illegal, and the resize is also a shrink. A zombie CP must
-//     learn that it is a zombie; every other diagnosis it could be handed is a lie
-//     that sends a reconciler down the wrong branch.
+//     happened — is metadata.ErrStaleTerm even when the row is also missing and the
+//     transition is also illegal. A zombie CP must learn that it is a zombie; every
+//     other diagnosis it could be handed is a lie that sends a reconciler down the
+//     wrong branch.
 //   - Then existence. A mutation naming a row that does not exist is
 //     metadata.ErrNotFound, never ErrStaleTerm.
-//   - Then the domain guard: lifecycle.ErrInvalidTransition, ErrShrinkNotAllowed,
-//     ErrCapacityUnderflow, ErrWatermarkOrder.
+//   - Then the domain guard: lifecycle.ErrInvalidTransition, ErrEpochConflict,
+//     ErrCapacityExceeded, ErrWatermarkOrder.
 //   - Creates are idempotent and never destructive: re-creating a volume never
 //     lowers its epoch, blanks its ownership, shrinks it, rewinds its watermarks or
 //     rewrites its lifecycle state, and re-creating a snapshot is a no-op (INV-16).
+//   - A volume's geometry is fixed at create: no mutation on the Store changes
+//     size_bytes or block_size. V1 has no resize (metadata.Store carries why), and
+//     the Agent, the WAL and descriptor.json all carry the number they were handed
+//     when the volume was made.
 //
 // # Deliberately not in the contract
 //
@@ -70,6 +74,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"StaleTermWinsOverEveryOtherDiagnosis", staleTermWins},
 		{"CreateVolumeRoundTripsEveryField", volumeRoundTrip},
 		{"RecreatingAVolumeNeverRegresses", volumeRecreate},
+		{"VolumeGeometryIsImmutable", volumeGeometry},
 		{"RecreatingASnapshotIsANoOp", snapshotRecreate},
 		{"WatermarksAreOrderedAndNeverGoBackwards", watermarks},
 		{"UpsertHostDoesNotClobberStateOrCapacity", upsertHost},
@@ -228,9 +233,6 @@ func everyMutation() []mutation {
 		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.UpdateWatermarks(ctx, term, w.vol, 3, 2, 1)
 		}},
-		{"ResizeVolume", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.ResizeVolume(ctx, term, w.vol, 1<<31)
-		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return setVolumeState(ctx, s, term, w.vol, lifecycle.VolumePrimarySuspected)
 		}},
@@ -310,9 +312,6 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.UpdateWatermarks(ctx, term, ghostVol, 3, 2, 1)
 		}},
-		{"ResizeVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.ResizeVolume(ctx, term, ghostVol, 1<<31)
-		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setVolumeState(ctx, s, term, ghostVol, lifecycle.VolumePrimarySuspected)
 		}},
@@ -353,14 +352,11 @@ func missingRows(t *testing.T, s metadata.Store) {
 }
 
 // staleTermWins: when a zombie CP issues a call that is also wrong for a second
-// reason, the term is the answer. Otherwise the zombie is told "shrink not allowed"
-// or "no such volume" and concludes it is still the leader.
+// reason, the term is the answer. Otherwise the zombie is told "no such volume" or
+// "that is not the epoch you compared against" and concludes it is still the leader.
 func staleTermWins(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
-	if err := s.ResizeVolume(ctx, w.term, w.vol, 1<<31); err != nil {
-		t.Fatal(err)
-	}
 	stale := w.term
 	if _, err := s.AcquireLeadership(ctx, "cp-b"); err != nil {
 		t.Fatal(err)
@@ -371,7 +367,6 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 		name string
 		call func() error
 	}{
-		{"shrink under a stale term", func() error { return s.ResizeVolume(ctx, stale, w.vol, 1) }},
 		{"missing volume under a stale term", func() error {
 			_, err := bumpVolumeEpoch(ctx, s, stale, ghost, w.host, 0)
 			return err
@@ -471,6 +466,47 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 		t.Fatalf("lifecycle state was rewritten to %q", got.State)
 	case got.LocalSequence != 500 || got.DurableSequence != 400 || got.PublishedSequence != 300:
 		t.Fatalf("watermarks were rewound: %+v", got)
+	}
+}
+
+// volumeGeometry: a volume's size and block size are what CreateVolume was given, for
+// as long as the row exists. This is the standing half of "V1 does not resize" —
+// metadata.Store says why the verb is gone, and this says the property that replaced
+// it, in the one place both implementations are held to it.
+//
+// It runs *everyMutation*, which is the point and is why it is not a list of the
+// methods that plausibly touch a volume. That list is the whole mutating surface and
+// carries the rule that a method added to the Store without a line in it is a method
+// whose term guard nobody checks; the same line now also asks whether the new method
+// moved a geometry it had no business moving. A resize brought back as a store method
+// and nothing else — the exact shape this deleted — fails here rather than passing a
+// suite that never looked.
+//
+// Each mutation gets its own world, so this proves something about each method rather
+// than about the order they happen to run in, and every one of them is required to
+// succeed: a case that silently errored would assert that a write which never happened
+// changed nothing.
+func volumeGeometry(t *testing.T, s metadata.Store) {
+	for _, m := range everyMutation() {
+		t.Run(m.name, func(t *testing.T) {
+			ctx := t.Context()
+			w := newWorld(t, s)
+			before, err := s.GetVolume(ctx, w.vol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.call(ctx, s, w.term, w); err != nil {
+				t.Fatalf("%s under the current term: %v", m.name, err)
+			}
+			after, err := s.GetVolume(ctx, w.vol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.SizeBytes != before.SizeBytes || after.BlockSize != before.BlockSize {
+				t.Fatalf("%s changed the volume's geometry: %d/%d -> %d/%d (V1 has no resize)",
+					m.name, before.SizeBytes, before.BlockSize, after.SizeBytes, after.BlockSize)
+			}
+		})
 	}
 }
 
@@ -1536,9 +1572,6 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		}},
 		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.UpdateWatermarks(ctx, term, "", 3, 2, 1)
-		}},
-		{"ResizeVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.ResizeVolume(ctx, term, "", 1<<31)
 		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setVolumeState(ctx, s, term, "", lifecycle.VolumePrimarySuspected)

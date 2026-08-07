@@ -461,27 +461,6 @@ func (s *Store) UpdateWatermarks(_ context.Context, term int64, volumeID string,
 	return nil
 }
 
-func (s *Store) ResizeVolume(_ context.Context, term int64, volumeID string, newSizeBytes int64) error {
-	if err := requireID("volume", volumeID); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return err
-	}
-	v, ok := s.vols[volumeID]
-	if !ok {
-		return metadata.ErrNotFound
-	}
-	if newSizeBytes < v.SizeBytes {
-		return metadata.ErrShrinkNotAllowed
-	}
-	v.SizeBytes = newSizeBytes
-	s.vols[volumeID] = v
-	return nil
-}
-
 func (s *Store) CreateSnapshot(_ context.Context, term int64, snap metadata.Snapshot) error {
 	if err := requireID("snapshot", snap.SnapshotID); err != nil {
 		return err

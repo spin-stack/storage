@@ -145,13 +145,11 @@ UPDATE volumes
         OR sqlc.narg(primary_host_id)::uuid IS NULL
         OR primary_host_id = sqlc.narg(primary_host_id)::uuid);
 
--- name: ResizeVolume :execrows
--- Grow-only (§3: shrink is a non-goal). The size guard rejects a shrink at the DB.
-UPDATE volumes
-   SET size_bytes = $2, updated_at = now()
- WHERE volume_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
-   AND $2 >= size_bytes;
+-- There is no ResizeVolume query. It was here, it was grow-only and term-guarded, and
+-- nothing but a contract test ever ran it: V1 has no resize, because the row is the only
+-- half of it that existed (see metadata.Store, where the method was). No statement in
+-- this file writes size_bytes after CreateVolume, and that is what makes the geometry the
+-- Agent and descriptor.json were handed at create still true when they are read back.
 
 -- name: UpdateVolumeWatermarks :execrows
 -- Lazy, informative watermark update (§5.8, §12.6), term-guarded and monotonic.

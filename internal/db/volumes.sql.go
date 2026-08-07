@@ -306,29 +306,6 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 	return items, nil
 }
 
-const resizeVolume = `-- name: ResizeVolume :execrows
-UPDATE volumes
-   SET size_bytes = $2, updated_at = now()
- WHERE volume_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
-   AND $2 >= size_bytes
-`
-
-type ResizeVolumeParams struct {
-	VolumeID  uuid.UUID `json:"volume_id"`
-	SizeBytes int64     `json:"size_bytes"`
-	Term      int64     `json:"term"`
-}
-
-// Grow-only (§3: shrink is a non-goal). The size guard rejects a shrink at the DB.
-func (q *Queries) ResizeVolume(ctx context.Context, arg ResizeVolumeParams) (int64, error) {
-	result, err := q.db.Exec(ctx, resizeVolume, arg.VolumeID, arg.SizeBytes, arg.Term)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const setVolumePrimaryHost = `-- name: SetVolumePrimaryHost :execrows
 UPDATE volumes
    SET primary_host_id = $1::uuid,
@@ -441,6 +418,7 @@ func (q *Queries) SetVolumeState(ctx context.Context, arg SetVolumeStateParams) 
 }
 
 const updateVolumeWatermarks = `-- name: UpdateVolumeWatermarks :execrows
+
 UPDATE volumes
    SET local_sequence = GREATEST(local_sequence, $2),
        durable_sequence = GREATEST(durable_sequence, $3),
@@ -458,6 +436,11 @@ type UpdateVolumeWatermarksParams struct {
 	Term              int64     `json:"term"`
 }
 
+// There is no ResizeVolume query. It was here, it was grow-only and term-guarded, and
+// nothing but a contract test ever ran it: V1 has no resize, because the row is the only
+// half of it that existed (see metadata.Store, where the method was). No statement in
+// this file writes size_bytes after CreateVolume, and that is what makes the geometry the
+// Agent and descriptor.json were handed at create still true when they are read back.
 // Lazy, informative watermark update (§5.8, §12.6), term-guarded and monotonic.
 // GREATEST is the fencing part: promotion does not change the CP term, so an
 // epoch-N primary's report that was queued behind a retry still passes the term

@@ -34,8 +34,6 @@ var (
 	ErrStaleTerm = errors.New("metadata: stale control-plane term")
 	// ErrNotFound means the row does not exist.
 	ErrNotFound = errors.New("metadata: not found")
-	// ErrShrinkNotAllowed means a resize tried to reduce a volume's size (§3 non-goal).
-	ErrShrinkNotAllowed = errors.New("metadata: volume shrink not allowed")
 	// ErrCapacityExceeded means a write would take a host past the §28.2
 	// oversubscription bound it was offered: the volume it places, plus what the
 	// host already holds and what is already in flight to it, is more than the
@@ -318,10 +316,14 @@ type Snapshot struct {
 //   - Then the term. Every mutation validates the caller's CP term (§7); a stale
 //     term — including term 0, before any election — is ErrStaleTerm, and it wins
 //     over every other diagnosis. A zombie CP must learn that it is a zombie rather
-//     than be told its resize was a shrink.
+//     than be told its epoch bump raced.
 //   - Then existence: a mutation naming a row that is not there is ErrNotFound.
-//   - Then the domain guard: lifecycle.ErrInvalidTransition, ErrShrinkNotAllowed,
-//     ErrCapacityUnderflow, ErrWatermarkOrder.
+//   - Then the domain guard: lifecycle.ErrInvalidTransition, ErrEpochConflict,
+//     ErrCapacityExceeded, ErrWatermarkOrder.
+//
+// A volume's geometry — size_bytes, block_size — is not on that list, because no
+// method here changes it. The note where ResizeVolume used to be, between
+// UpdateWatermarks and SetVolumeState, says why V1 has no resize at all.
 type Store interface {
 	// AcquireLeadership takes/renews leadership, incrementing and returning the term.
 	AcquireLeadership(ctx context.Context, holderID string) (int64, error)
@@ -477,8 +479,46 @@ type Store interface {
 	// monotonic, because promotion does not change the CP term and this number is
 	// what an operator reads during an incident.
 	UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error
-	// ResizeVolume grows size_bytes (term-guarded); shrink is rejected (§3 non-goal).
-	ResizeVolume(ctx context.Context, term int64, volumeID string, newSizeBytes int64) error
+	// There is no ResizeVolume here any more, and **V1 does not resize a volume**.
+	// §3's objective 14 ("resize online (grow)") has no verb behind it; §9's promise
+	// that "el grow se propaga vía actualización del config space + notificación" has
+	// no mechanism behind it either.
+	//
+	// The method that was here grew size_bytes under the term guard and refused a
+	// shrink with ErrShrinkNotAllowed, and it was correct. What it was not was a
+	// resize: **a row that grows is not a volume that grows.** The rest of the path
+	// does not exist, and every step of it is missing, not merely untested —
+	//
+	//   - cpserver.GetDesiredState already sends size_bytes to the Agent on every
+	//     poll, and agent.VolumeManager.Apply returns at its epoch check before it
+	//     reads the field, so a grown row reaches the Agent every few seconds and
+	//     changes nothing;
+	//   - blockdev.New fixes a Device's capacity at construction and blockdev.Device
+	//     has no way to change it, so even a restart-driven resize means tearing the
+	//     volume down — which publishes the session and takes the guest's device away;
+	//   - the guest cannot be told in any case. Announcing a new capacity needs
+	//     VHOST_USER_BACKEND_CONFIG_CHANGE_MSG over the backend request channel, and
+	//     internal/vhost deliberately does not offer VHOST_USER_PROTOCOL_F_BACKEND_REQ
+	//     (a test pins that it is not offered). Without it QEMU raises no virtio
+	//     configuration-change interrupt and the guest never re-reads its capacity.
+	//   - descriptor.json carries size_bytes and is written only at create and clone,
+	//     so a resized volume's descriptor kept the old size — and -rebuild-metadata
+	//     reads exactly that object to reconstruct the row (INV-20). Keeping the method
+	//     was therefore not neutral: it was the one way to make the catalog and the
+	//     bucket disagree about a volume's size, with nothing to notice.
+	//
+	// **The rejected alternative was to keep it and wait.** Thirty correct lines cost
+	// nothing to hold, and a future resize would have to restate the §3 rule. But an
+	// uncallable verb reads to the next person as a feature that exists, and this one
+	// had a defect behind it rather than a gap. Bringing it back is one commit —
+	// the query, the two store methods, the contract cases — and it belongs in the
+	// same increment as the Agent, blockdev, vhost and guest-lane work above, which is
+	// what makes resize a verb instead of a column write.
+	//
+	// The immutability this leaves is asserted, not assumed: metadatatest's
+	// VolumeGeometryIsImmutable runs every mutation on the Store against a fresh
+	// volume and reads its size and block size back.
+
 	// SetVolumeState moves a volume through the §7 ownership machine (term-guarded).
 	// The move is guarded by the lifecycle table inside the write itself, so two
 	// Control Planes reacting to the same suspicion cannot both win.

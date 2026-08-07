@@ -55,8 +55,17 @@ var ErrCorruptDescriptor = errors.New("descriptor: contents do not match the sto
 // Key is the deterministic descriptor key for a volume.
 func Key(volumeID string) string { return "volumes/" + volumeID + "/descriptor.json" }
 
-// Write persists (or overwrites) a volume descriptor. It is updated on resize, epoch
-// change, and snapshot-lineage changes.
+// Write persists (or overwrites) a volume descriptor.
+//
+// It is written at create (controlplane.Provision) and at clone (controlplane.Clone),
+// and nothing else writes one. It said "updated on resize, epoch change, and
+// snapshot-lineage changes" until 2026-08-06, which was true of none of the three: the
+// only resize verb was a catalog UPDATE nothing called (now deleted, see metadata.Store),
+// the epoch is bumped in the catalog by BumpVolumeEpoch without coming back here, and
+// CurrentEpoch below already says the epoch object is the authority. The staleness that
+// matters is therefore the epoch's, and it is stated where the field is; a sentence
+// promising updates nobody makes is worse than no sentence, because -rebuild-metadata
+// reads this object as the truth about a volume the database no longer describes.
 func Write(ctx context.Context, store objectstore.Store, d Descriptor) error {
 	body, err := json.Marshal(d)
 	if err != nil {

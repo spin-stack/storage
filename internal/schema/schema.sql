@@ -120,7 +120,15 @@ CREATE TABLE host_leases (
 
 CREATE TABLE volumes (
     volume_id          UUIDV7 PRIMARY KEY,              -- = on-disk VolumeID [16]byte
-    size_bytes         BIGINT NOT NULL,                 -- mutable: resize grow
+    -- size_bytes is written once, at create, and no statement in queries/ updates it.
+    -- It said "mutable: resize grow" until 2026-08-06; the grow-only UPDATE that made
+    -- that true had no caller, and the rest of a resize (an Agent that acts on a new
+    -- size, a device whose capacity can change, a guest that can be told) does not
+    -- exist. Leaving the column documented as mutable would have been the expensive
+    -- half: descriptor.json carries this same number and is written only at create, so
+    -- a size that moved here and not there is a catalog and a bucket that disagree —
+    -- and -rebuild-metadata restores from the bucket.
+    size_bytes         BIGINT NOT NULL,
     -- There is no durability column. §14.8 once stored a per-volume FLUSH ACK
     -- contract here ('remote' | 'local'); ADR-0026 withdrew the remote half, leaving
     -- the local ACK as the only contract and the column as a value every write set,

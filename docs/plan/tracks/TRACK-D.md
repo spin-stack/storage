@@ -477,3 +477,85 @@ reported itself valid`, which is the third entry and therefore the right one.
 No schema change. `task ci` is green and `task cover` reports production 90.0%
 against the 90% floor — deleting production code that was fully covered is what
 keeps that number from rising, and it did not fall below.
+
+**D9: resize is deleted, and V1 does not resize (2026-08-06).** `ResizeVolume` was
+the last term-guarded verb with no caller outside a contract test, and D8b left it
+open as a question for a human: does V1 offer resize, or is §3's grow-only rule a
+promise with no verb behind it? The answer is the second, and it is not a preference
+— **a row that grows is not a volume that grows**, and the rest of the path is
+missing rather than untested. Establishing that came first:
+
+- `cpserver.GetDesiredState` already sends `size_bytes` to the Agent on every poll,
+  and `agent.VolumeManager.Apply` returns at its `existing.epoch == d.GetEpoch()`
+  check before it reads the field. A grown row therefore reaches every Agent serving
+  it, every few seconds, and changes nothing.
+- `blockdev.New` fixes a Device's capacity at construction and `blockdev.Device`
+  offers no way to change it, so even a restart-driven resize means the teardown
+  path — which publishes the session and takes the guest's device away.
+- The guest cannot be told in any case. A new capacity has to arrive as
+  `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` on the backend request channel, and
+  `internal/vhost` does not offer `VHOST_USER_PROTOCOL_F_BACKEND_REQ` — there is a
+  test pinning that it is not offered. Without it QEMU raises no virtio
+  configuration-change interrupt and the guest never re-reads `capacity`.
+- The image does not care, and that is the one part that was already fine: an
+  `image.Manifest` is a volume id and a chunk list with no size in it, so a larger
+  volume genuinely is the same chunks plus unwritten space.
+
+**Keeping it was not neutral, which is what decided this.** `descriptor.json` carries
+`size_bytes` and is written only by `controlplane.Provision` and `controlplane.Clone`;
+`-rebuild-metadata` reads exactly that object to reconstruct a volume the database no
+longer describes (INV-20). A resize that landed in the catalog and not in the bucket
+was therefore the one way to make the two disagree about a volume's size, with nothing
+to notice — and the descriptor's own doc comment claimed it was "updated on resize,
+epoch change, and snapshot-lineage changes", which was true of none of the three. Thirty
+correct lines that a future resize would have to restate cost nothing to hold; a verb
+that reads as existing, with that behind it, does.
+
+**Wiring it instead was the alternative, and it is five lanes wide.** It needs the
+backend request channel and the configuration-change message (`internal/vhost`), a
+Device whose capacity can move under in-flight requests (`internal/blockdev`), an
+`Apply` that acts on a size change with no epoch bump (`internal/agent`), a guest-lane
+proof that reads `/sys/block/vda/size` before and after (`integration/vhost`), and only
+then this lane's half: an RPC, a `controlplane.Resize` that rewrites the descriptor in
+the same operation, and a flag on `cmd/control-plane`. That is a wave, not an item, and
+four of those files belong to other tracks. Bringing the catalog half back is one commit
+— the query, the two store methods, the contract cases — and it belongs in that wave.
+
+**What replaced it is a property, not a gap.** `metadatatest`'s
+`VolumeGeometryIsImmutable` runs *everyMutation* — the whole mutating surface, the same
+list that already carries "a method added to the Store without a line here is a method
+whose term guard nobody checks" — each against a fresh world, and reads the volume's
+size and block size back through `GetVolume`. A resize brought back as a store method
+and nothing else, the exact shape this deleted, fails there instead of passing a suite
+that never looked. `queries/volumes.sql` now has no statement that writes `size_bytes`
+after `CreateVolume`, and `schema.sql`'s column says so where the column is.
+
+**Three planted bugs, each watched go red.** `v.SizeBytes = v.SizeBytes * 2` inside the
+sim's `UpdateWatermarks`: `UpdateWatermarks changed the volume's geometry:
+1073741824/65536 -> 2147483648/65536 (V1 has no resize)`. The same defect in SQL —
+`SET size_bytes = size_bytes + 1` in `UpdateVolumeWatermarks`, regenerated — reddens
+the pg lane alone with `... -> 1073741825/65536`, which is the half the sim cannot
+prove for it. And the case this exists for: `ResizeVolume` put back on `sim.Store` with
+a line in `everyMutation` and nothing else, which fails as
+`ResizeVolume changed the volume's geometry`.
+
+**`task deadcode` did not move, and that is worth writing down.** It reported 66
+findings before this and 66 after: `metadata/sim` is explained at package granularity,
+and `deadcode -whylive` answers "reachable only through reflection" for
+`internal/metadata/pg.Store.ResizeVolume` — blind spot 1, which `hack/deadcode.sh`
+documents. Nothing in the catalog layer's pg or `internal/db` half is visible to that
+tool, so "the gate is green" was never evidence about this method, and the audit that
+found it read the code.
+
+**Handed to track A, because §3 is track A's file.** Four places in
+`arquitectura_mvp_volumenes_remotos_v5.md` promise a resize V1 does not have: the
+objective list ("Resize online (grow) del volumen persistente"), §9's guest feature list
+("el grow se propaga vía actualización del config space + notificación; el guest expande
+con `resize2fs`"), §30's roadmap item that pairs resize with snapshots and clones, and
+§31's success criterion "Resize (grow) online end-to-end" — which is now a criterion V1
+can neither meet nor fail, the same shape ADR-0026 left on four others.
+`STATUS.md`'s phase-09 row and its "no production caller" list name `ResizeVolume` too.
+
+No schema change (the column's comment moved; `task db:verify` re-plans to empty).
+`task ci` is green, `task cover` reports production 90.2091% against the 90% floor, and
+`go test -tags integration ./internal/metadata/pg` is green.

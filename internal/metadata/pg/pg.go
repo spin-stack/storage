@@ -653,27 +653,6 @@ func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID strin
 	return metadata.ErrNotFound
 }
 
-func (s *Store) ResizeVolume(ctx context.Context, term int64, volumeID string, newSizeBytes int64) error {
-	id, err := requireUUID("volume", volumeID)
-	if err != nil {
-		return err
-	}
-	rows, err := s.q.ResizeVolume(ctx, db.ResizeVolumeParams{VolumeID: id, SizeBytes: newSizeBytes, Term: term})
-	ok, err := s.wrote(ctx, term, rows, err)
-	if err != nil || ok {
-		return err
-	}
-	// Still the leader, so 0 rows means a missing volume or a rejected shrink.
-	v, gerr := s.GetVolume(ctx, volumeID)
-	if gerr != nil {
-		return gerr
-	}
-	if newSizeBytes < v.SizeBytes {
-		return metadata.ErrShrinkNotAllowed
-	}
-	return fmt.Errorf("%w: volume %s resized concurrently", metadata.ErrShrinkNotAllowed, volumeID)
-}
-
 // SetVolumeState moves a volume through the §7 ownership machine.
 func (s *Store) SetVolumeState(ctx context.Context, term int64, volumeID string, state lifecycle.VolumeState) error {
 	id, err := requireUUID("volume", volumeID)

@@ -107,23 +107,6 @@ func TestCloneFromMissingSnapshotFails(t *testing.T) {
 	}
 }
 
-func TestResizeGrowsOnly(t *testing.T) {
-	ctx := t.Context()
-	md, _, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 100, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k"}, nil)
-
-	if err := md.ResizeVolume(ctx, term, parentVol, 200); err != nil {
-		t.Fatalf("grow: %v", err)
-	}
-	if v, _ := md.GetVolume(ctx, parentVol); v.SizeBytes != 200 {
-		t.Fatalf("size = %d, want 200", v.SizeBytes)
-	}
-	// Shrink is rejected (§3 non-goal).
-	if err := md.ResizeVolume(ctx, term, parentVol, 50); !errors.Is(err, metadata.ErrShrinkNotAllowed) {
-		t.Fatalf("shrink: want ErrShrinkNotAllowed, got %v", err)
-	}
-}
-
 // TestAFailedCloneChargesNothing is ADR-0017's structural claim, kept as its regression
 // guard: the destination is charged when the volume row naming it exists, and a clone
 // that fails never writes one. There is no delta anybody has to remember to reverse.
