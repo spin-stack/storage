@@ -112,3 +112,68 @@ commit; an earlier run the same afternoon was red at `fmt:check` on
 The four self-checks in `REFERENCE.md`'s header were run and are all empty. **Left for
 whoever holds the counters:** `CLAUDE.md` says "25 ADRs and 10 spec documents" and the
 tree has 22 and 7 — that file is outside this track's ownership.
+
+### A3 — the record catches up, and stops needing to (2026-08-06)
+
+`00bbeee` (`INVARIANTS.md`), `cd0c0a6` (ADR-0025, ADR-0016, `REFERENCE.md`), `60ecc13`
+(`STATUS.md`, `RISKS.md`, `README.md`), `<this commit>` (this entry).
+
+**Four lanes changed the tree for a wave while this file did not run, and the item was to
+catch it up *and* remove the reason it needed catching up.** Two sections did most of the
+rotting and both are now handed to something that computes them.
+
+**"Components with no production caller" is deleted as a list.** It was wrong in three ways
+at once: it stated that `published_sequence` "is permanently 0 and nothing reclaims a
+segment", which stopped being true when `wal.Log.InstallBase` landed; it still listed
+`metadata.Store.ResizeVolume`, which track D deleted (`446b61e`) about an hour before this
+increment committed; and it had never grown the ten findings that now sit in
+`hack/deadcode-pending.txt`. `task deadcode` moved into `task ci` in the same window
+(`64b9087`), with a two-list ratchet — allowlist for "unreachable and correct forever",
+pending list for "unreachable and not yet deleted" — and both fail on an entry with no reason
+*and* on an entry the tool stops reporting. What is left in `STATUS.md` is only what the tool
+cannot see, and each of those is verified by a command rather than asserted:
+`deadcode -whylive '…/internal/metadata/pg.(*Store).BumpVolumeEpoch' ./cmd/...` answers
+`not found in program`, and `wal.Log.Broken`'s own doc comment says it has no production
+caller.
+
+**Four invariant rows had moved, and the one that matters is INV-13.** It was `withdrawn` on
+"there is no mid-session truncation, and the rule survives with no production caller".
+`Log.InstallBase` — called from `internal/agent/volume.go`'s `fetchBase` — reclaims the
+segments the restored image already covers, through `truncateLocalLocked` and
+`StrictOrder.AllowTruncate`, which *is* INV-13; it also raises `published`, which ends INV-03's
+"permanently 0". INV-04 described §5.7's unflushed bounds, and `agent.Budget.Limits` sets
+neither: `Sync` clears the unflushed counter on every guest `fsync`, so the bound that binds
+is `MaxLocalBytes`. INV-20 claimed a rebuilt catalog loses "snapshot lineage depth" — it does
+not, `volumeFromDescriptor` restores `ChainDepth` and `ParentSnapshotID`; what it loses is
+placement and a snapshot's `SourceHostID`.
+
+**ADR-0025 got a banner, not a rewrite**, matching the six amended before it. It decided
+twice that a missing artefact *skips* the guest lane, and wave 4 reversed that; the banner
+says what overturned it (a skip notice does not survive the sentence "ci:full was green", and
+a skipped needed job leaves its dependents free to run) and what survives (the developer path
+still skips; `REQUIRE_PROOFS` is what removes it). **ADR-0016 got a second banner** because
+its first one said stage 1 "survives and is real" and wave 4 deleted all of it.
+
+**Every count in the head is now the command that recomputes it**, and each one was wrong
+when checked: ADR-0013's citations (the file said 54 across 23 non-test files; the ranking
+command is what is written now), `obs.Catalog()`'s declared and produced entries, the
+invariant tally, and §7's "96 references" in `REFERENCE.md`. Line numbers went the same way —
+several cited lines had moved while other lanes committed. **One trap is recorded next to the
+metric command rather than left to be rediscovered:** a catalog name that is also a JSON tag
+matches its struct field, so `chain_depth` reports a producer it does not have, and the
+previous "nine of 25" was produced by that grep without the caveat.
+
+**The wave moved under this increment twice**, which is the argument for the whole approach:
+`ResizeVolume` was a "waiting on a human" bullet when it was written and an answered decision
+when it was committed, and `task deadcode` went from red-and-outside-the-gate to
+green-and-inside it between two runs. Both were caught by re-running the commands, not by
+rereading the prose.
+
+**`task ci` exit 0** immediately before the first commit (fmt, build, lint, deadcode, race
+tests, dst, workflows:verify). The four self-checks in `REFERENCE.md`'s header were run and
+are all empty. **Left for other lanes, all outside this track's files:**
+`internal/descriptor`'s package doc still says the layout is autodescriptive "together with
+the epoch object, recovery-points, and manifests", two of which ADR-0026 deleted, and
+`Descriptor.CurrentEpoch`'s field comment still says "last known; the epoch object is
+authoritative" while `controlplane.rebuild` states the opposite and is right. Both are track
+D's.
