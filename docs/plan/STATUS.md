@@ -72,7 +72,7 @@ record each increment next to what it removed.
 **What is not there, in the order it matters:**
 
 - **Nothing is deployed and CI has never run.** Every claim above is one machine's word.
-- **A metric can leave the Agent, and no lane has watched one arrive.** Since `fa0c834`
+- **A metric leaves the Agent and arrives, and this bullet was wrong about that for twelve minutes.** Since `fa0c834`
   `cmd/volume-agent` takes `-otlp-endpoint`, builds the provider through
   `real.NewOTLPMetricExporter` *before* anything that records, and hands
   `telemetry.Recorder()` to the manager, which hands it to each `wal.Log` at the one place a
@@ -91,9 +91,18 @@ record each increment next to what it removed.
   tag matches its struct field, so `chain_depth` reports a "producer" in
   `internal/descriptor` and has none. **`cmd/control-plane` still records nothing** — no
   exporter, no Recorder, and `grep -n 'otlp\|Recorder' cmd/control-plane/main.go` returns
-  nothing — and **no test starts a real binary and asserts a series arrives at a
-  collector**, so "a metric leaves the process" is proven of the exporter and of the wiring,
-  not of a deployment. The §26.2 catalog was trimmed to what exists on 2026-08-03
+  nothing. What *is* proven end to end, since wave 6:
+  `internal/simio/real/agent_export_test.go` builds `cmd/volume-agent`, runs it as a
+  process against an `httptest` OTLP collector, SIGTERMs it, and asserts on the value the
+  collector decoded — the gauge carries the *Control Plane's* lease TTL rather than the
+  one on the Agent's command line, so the assertion cannot pass on a number the test
+  supplied. It dies when `Recorder: nil` is put back in the binary's deps.
+
+  **This paragraph claimed the opposite for twelve minutes**, because the lane that landed
+  that test and the lane that owns this file ran in the same wave. It is the failure mode
+  this file exists to prevent, in this file, and the honest lesson is that a running wave
+  makes STATUS.md's head *less* reliable than the track logs, not more — the track log was
+  right and this was wrong. The §26.2 catalog was trimmed to what exists on 2026-08-03
   (~~DEV-0022~~) and has grown since: wave 4 added the read-view trio, and `f65b579` gave
   them their producer on the durable step after they shipped with none.
 - **A rebuilt catalog cannot tell you who was serving what.** `-rebuild-metadata` brings
@@ -540,7 +549,7 @@ object kind.
 > the reasoning where the promise was made; every other mention in the design document is
 > struck through and points there. The banner names the whole missing path rather than the
 > deleted verb, because that is the part a reader cannot reconstruct: the desired state
-> already carries `size_bytes` to every Agent and `agent.Loop.Apply` returns at its epoch
+> already carries `size_bytes` to every Agent and `agent.VolumeManager.Apply` returns at its epoch
 > check before reading it, a `blockdev.Device`'s capacity is fixed by `blockdev.New`, and a
 > new capacity would reach the guest as `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` over the
 > backend request channel — which `vhost.ProtocolFeatures` does not advertise (it offers
@@ -588,6 +597,29 @@ way §17, §21, §23 and §31 were marked when ADR-0026 withdrew them — a bann
 V2 — or, if resize is meant to be V1, reopen it as an increment with the Agent half that
 was always missing. What is not an option is leaving a document promising a verb whose
 implementation was deleted this week.
+
+## The gate says "no open DEV entry that this increment introduced", and nothing enforces it
+
+Recorded 2026-08-07, after wave 6 opened DEV-0024 and shipped green.
+
+The gate's fourth line is a rule about DEV entries, and **no Taskfile target, no hack
+script and no CI job reads a DEV entry.** `task ci:full` was always going to pass. That is
+not a defect in wave 6 — its reasoning for deferring DEV-0024 is sound, and it wrote the
+reasoning down — it is a defect in the gate, and it is the same shape as the two the last
+three waves found in `task dst` and `hack/coverage.sh`: a check that reports success for
+something it never established.
+
+**It is deliberately not being automated in the same breath as being found.** A parser
+over Markdown headings that fails a build is a gate that fires on prose, and this file's
+headings are edited by five lanes; the first false red would get it disabled, which is the
+argument `task deadcode` was landed with and is the reason that one pins a *set* with a
+reason per entry. The honest version is small and belongs to track B: a target that lists
+the open entries and the increments that opened them, so a human reads a list rather than
+greps, and a decision to ship with one open is a decision somebody makes rather than one
+nobody notices.
+
+Until then the rule is enforced by whoever reads this file, which is exactly the
+"human-shaped control" `PARALLEL-PLAN.md` says is not a control.
 
 ## DEV-0024 — `block_size` is the guest's logical block size, and two files call it the 64 KiB CoW granularity
 

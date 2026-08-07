@@ -188,7 +188,7 @@ entry).
 reasoning where the promise was made and every other mention points there. What the banner
 records is the *missing path*, not the deleted verb, because that is the part a reader
 cannot reconstruct: the desired state already carries `size_bytes` to every Agent and
-`agent.Loop.Apply` returns at its epoch check before reading it; a `blockdev.Device`'s
+`agent.VolumeManager.Apply` returns at its epoch check before reading it; a `blockdev.Device`'s
 capacity is fixed by `blockdev.New`; and a new capacity reaches a guest as
 `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` over a channel `vhost.ProtocolFeatures` does not
 advertise. §9's `resize2fs` sentence was not half-built — it was the half that could not be.
