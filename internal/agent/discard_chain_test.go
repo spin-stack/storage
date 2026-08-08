@@ -54,7 +54,7 @@ func TestARangeErasedInTheMiddleOfALineageStaysErased(t *testing.T) {
 	})
 
 	v := desiredVolume(t, 1)
-	v.ParentSnapshotId, v.ParentVolumeId = middle.snapshot, middle.volume
+	descendsFrom(t, store, v, middle)
 
 	first := lineageManager(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-erased-1")
 	dev := serveClone(t, first, v)

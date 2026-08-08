@@ -70,7 +70,7 @@ func TestACloneReadsThroughThreeAncestors(t *testing.T) {
 
 	m := lineageManager(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-lineage")
 	v := desiredVolume(t, 1)
-	v.ParentSnapshotId, v.ParentVolumeId = nearest.snapshot, nearest.volume
+	descendsFrom(t, store, v, nearest)
 	dev := serveClone(t, m, v)
 
 	readBlock(t, dev, oldestOnly, 0xA1, "the range only the great-grandparent wrote: three links up")
@@ -144,7 +144,7 @@ func TestALineageThatCannotBeWalkedIsRefused(t *testing.T) {
 
 			m := lineageManager(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-lineage")
 			v := desiredVolume(t, 1)
-			v.ParentSnapshotId, v.ParentVolumeId = link.snapshot, link.volume
+			descendsFrom(t, store, v, link)
 			if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
 				t.Fatalf("Apply: %v", err)
 			}
@@ -237,6 +237,23 @@ func publishAncestor(t *testing.T, store objectstore.Store, dek crypto.DEK, spec
 	}
 	writeDescriptor(t, store, volumeID, spec.parent)
 	return lineageLink{volume: volumeID, snapshot: snapshotID, root: root}
+}
+
+// descendsFrom points a desired volume at a link *and* writes the descriptor that says so,
+// which is what a Control Plane does in one call (controlplane.Clone writes the row and the
+// object together).
+//
+// Both halves are needed since agent.parentChain started taking the link from the volume's
+// own descriptor: the desired state is only the trigger — it says a lineage may exist — and
+// the bucket is what says what it is, because the catalog's copy of the link is write-once
+// and can never say a lineage has ended (lineage.Walk). A fixture that set the desired
+// state alone would be a clone no Control Plane could have created, which is the same
+// omission three clone tests and two DST scenarios were making about *parents* until the
+// walk started reading them.
+func descendsFrom(t *testing.T, store objectstore.Store, d *storagev1.DesiredVolume, link lineageLink) {
+	t.Helper()
+	d.ParentSnapshotId, d.ParentVolumeId = link.snapshot, link.volume
+	writeDescriptor(t, store, d.GetVolumeId(), link)
 }
 
 // writeDescriptor writes the object controlplane.Provision and controlplane.Clone write,

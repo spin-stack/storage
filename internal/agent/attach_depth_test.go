@@ -53,7 +53,7 @@ func TestWhatDepthCostsAtAttach(t *testing.T) {
 			}
 
 			v := desiredVolume(t, 1)
-			v.ParentSnapshotId, v.ParentVolumeId = link.snapshot, link.volume
+			descendsFrom(t, store, v, link)
 
 			// First session: no image of its own, so the ancestry *is* the read view.
 			first := lineageManager(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-depth-1")
@@ -95,17 +95,24 @@ func TestWhatDepthCostsAtAttach(t *testing.T) {
 			// constant is 3 + (chunks that ancestor's manifest names), and only the 3 is
 			// bounded by anything the ceiling controls.
 			const perLink = 4
+			// Plus one that is not per-link: the volume's *own* descriptor, which is where
+			// the walk now starts (lineage.Walk). It is a constant, not a slope — it is read
+			// once whatever the depth — and it is what FLATTEN cost this lane: the catalog's
+			// parent link is write-once, so only this object can ever say a volume has
+			// stopped descending from anything. A volume the desired state gives no parent
+			// does not pay it at all, which is nearly every volume.
+			const ownDescriptor = 1
 			// Plus one, in the first session: the Head of its own manifest, which is not
 			// there. That is how ErrNotPublished is reached and it costs a round trip.
-			if want := tc.links*perLink + 1; firstAttach != want {
-				t.Errorf("a first attach at depth %d cost %d object reads, want %d (%d per link, plus the Head that finds no image of its own)",
+			if want := tc.links*perLink + ownDescriptor + 1; firstAttach != want {
+				t.Errorf("a first attach at depth %d cost %d object reads, want %d (%d per link, plus its own descriptor and the Head that finds no image of its own)",
 					tc.links, firstAttach, want, perLink)
 			}
 			// Plus three, on the restart: a Head and a Get for its own manifest, and a Get
 			// for the one chunk that manifest names. That it pays for the ancestry *at all*
 			// is the change — it used to read its own flattened manifest and stop, at any
 			// depth.
-			if want := tc.links*perLink + 3; secondAttach != want {
+			if want := tc.links*perLink + ownDescriptor + 3; secondAttach != want {
 				t.Errorf("a restart at depth %d cost %d object reads, want %d — a clone reads through its ancestry in every session, not only its first",
 					tc.links, secondAttach, want)
 			}

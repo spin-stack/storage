@@ -118,7 +118,12 @@ func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
 	// Cloned (§20) from a snapshot that is not in this bucket: fetchBase cannot
 	// materialize the parent, so it fails the read view rather than layering an empty one
 	// underneath — which would read as zeros for the parent's whole extent.
-	v.ParentSnapshotId, v.ParentVolumeId = ids.New().String(), ids.New().String()
+	//
+	// The link is written into the volume's *own* descriptor as well, because that is where
+	// the Agent reads it from (lineage.Walk) and because a clone with no descriptor is a
+	// volume no Control Plane could have created — the fixture would then be refused for
+	// being unbuildable rather than for the reason this test is about.
+	descendsFrom(t, r.store, v, lineageLink{volume: ids.New().String(), snapshot: ids.New().String()})
 	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

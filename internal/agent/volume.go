@@ -15,9 +15,9 @@ import (
 	"github.com/spin-stack/storage/internal/blockdev"
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
-	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
+	"github.com/spin-stack/storage/internal/lineage"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
@@ -1016,12 +1016,11 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		return
 	}
 
-	if len(chain) > 0 {
-		// parentChain returns nearest ancestor first, so the last link is the volume
-		// that descends from nothing: the lineage root, and the owner of the DEK the
-		// whole chain shares (controlplane.Clone).
-		v.lineage = chain[len(chain)-1].id
-	}
+	// The lineage root: the volume at the top of the chain, or this one when the chain is
+	// empty. It is where this volume's chunks live and what their AAD binds, and it has to
+	// be settled before anything is loaded — a clone cannot find one byte of its own image
+	// without it.
+	v.lineage = lineage.Root(volumeID, chain)
 
 	// The ancestry: every snapshot this volume descends from, composed into one view, or
 	// nil for a volume that was created rather than cloned. It is loaded in every session
@@ -1118,173 +1117,62 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 // life, on the boot before its first stop, and that was right only while publishing
 // flattened.
 //
-// # It follows the chain, and now every link of it is load-bearing
-//
-// A depth-2 clone read its grandparent's bytes at all, before this walk existed, only
-// because publishing flattened: every snapshot manifest held everything its volume could
-// read. Now a manifest states only its own volume, so a walk that stopped after one link
-// answers zeros for everything an ancestor above the parent ever wrote — DEV-0007's shape,
-// a wrong answer a guest cannot detect — and it answers them for the *nearest* ancestor's
-// own gaps too, not merely at depth 2.
-//
-// Nothing in `cow` had to be extended for this. `NewIntervalMapOver` nests arbitrarily,
-// `Ranges` and `Read` both recurse through `m.base`, so this composes what was already
-// there.
-//
-// # The erasures are what this composition cannot do without
-//
-// A range an intermediate ancestor discarded is a range where the layers below it still
-// hold bytes, and absence in a layered chain means "ask the layer below". So the snapshot
-// manifests this walk loads carry their erasures explicitly (`image.Manifest.Discarded`,
-// replayed as a tombstone by the loader) and the composition here reproduces §14.6 rather
-// than uncovering the grandparent's older bytes. That was the thing step 3 could not omit,
-// and it is why the format changed in the same increment that stopped flattening.
-func (m *VolumeManager) parentView(ctx context.Context, v *Volume, chain []ancestor) (*cow.IntervalMap, error) {
+// The composition itself is `lineage.Compose`, and it is there rather than here because
+// the operator's FLATTEN composes the same chain in order to write it down
+// (`lineage.Flatten`). A second implementation of "layer the ancestry" would be two
+// answers to what a clone reads, and only one of them would be the one its guest sees.
+// A nil bottom is what a reader wants: the foot of a chain is a link like any other, laid
+// over nothing.
+func (m *VolumeManager) parentView(ctx context.Context, v *Volume, chain []lineage.Ancestor) (*cow.IntervalMap, error) {
 	if len(chain) == 0 {
 		return nil, nil //nolint:nilnil // no parent is a shape, not a failure
 	}
-	// Oldest first, so the nearest ancestor — the snapshot this volume was actually
-	// cloned from — ends on top, where its bytes win over everything it inherited.
-	var view *cow.IntervalMap
-	for i := len(chain) - 1; i >= 0; i-- {
-		a := chain[i]
-		penc, err := m.parentEncryption(v, a)
-		if err != nil {
-			return nil, err
-		}
-		// **The two ids are different things here, which is why image takes them as one
-		// named pair.** The ancestor's own id says which manifest to read — a snapshot
-		// is addressed under the volume it belongs to. The lineage root says where that
-		// manifest's chunks are and what their AAD binds, and it is *this volume's*
-		// root, which is the same root as every ancestor's precisely because they are
-		// one chain. Getting the first wrong reads the wrong manifest; getting the
-		// second wrong finds no chunk at all, or one that will not open.
-		//
-		// The snapshot, not the ancestor's live image: an ancestor that is still running
-		// has written past the point this lineage descends from, and its image carries
-		// those writes. §19 makes the distinction cheap — a snapshot is a frozen view at
-		// a sequence, naming chunks the lineage already holds.
-		next, _, err := image.LoadSnapshotOver(ctx, m.deps.Store, penc,
-			image.Ident{Volume: a.id, Lineage: v.lineage}, a.snapshot, view)
-		if errors.Is(err, image.ErrNotPublished) {
-			// Not this volume's failure to hide: a lineage whose snapshot was never
-			// published would read zeros for everything that ancestor wrote.
-			return nil, fmt.Errorf("agent: volume %s descends from snapshot %s of %s, which was never published",
-				v.id, a.snapshot, a.volume)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("agent: volume %s: loading snapshot %s of ancestor %s: %w", v.id, a.snapshot, a.volume, err)
-		}
-		view = next
+	view, err := lineage.Compose(ctx, m.deps.Store, v.enc, v.lineage, chain, nil)
+	if err != nil {
+		return nil, fmt.Errorf("agent: volume %s: %w", v.id, err)
 	}
 	return view, nil
 }
 
-// ancestor is one link of a lineage: a snapshot, and the volume it lives under. Both
-// halves are needed to name an object at all — `image.SnapshotKey` takes the volume —
-// which is why `descriptor.json` carries both.
-type ancestor struct {
-	volume   string
-	id       [16]byte
-	snapshot string
-}
-
-// maxChainWalk is what stops a malformed lineage from becoming an attach that never
-// returns. It is not the depth limit.
-//
-// The depth limit is a refusal at *create* time — step 4 of CHUNK-ADDRESSING-SPEC makes
-// `controlplane.Clone` refuse past the design document's ceiling of 5 (§20.1) — and that
-// is where it belongs, because refusing here would turn a volume the fleet created
-// successfully into one nothing can read. So this sits far above that ceiling
-// deliberately: it is a termination guard for a chain some future bucket edit or wrong
-// rebuild made absurd, not a policy anybody should hit. The cycle case is caught by name
-// in parentChain and does not depend on this number.
-const maxChainWalk = 64
-
-// parentChain walks the lineage upward and returns it nearest-ancestor-first.
-//
-// The first link comes from the desired state, as it always has: ADR-0021 keeps this type
-// from knowing what a Control Plane is, so the Control Plane is what tells it. **Every
-// link above it comes from the ancestor's own `descriptor.json`**, which is the decision
-// this walk rests on. The alternative — having `DesiredVolume` carry the whole lineage —
-// costs no GETs, and it makes the Control Plane responsible for bounding the length of a
-// list in a message, and it moves the authority for a volume's ancestry out of the object
-// store, which is the thing `-rebuild-metadata` trusts precisely when the Control Plane's
-// database is the component that was lost (§22.5, INV-20).
-//
-// Every failure is closed, because the alternative is not an error but a *partial* view:
-// a walk that stopped early on anything would install a base holding however much of the
-// lineage it managed to read, and a guest cannot tell a partial view from a complete one
-// (DEV-0007).
-func (m *VolumeManager) parentChain(ctx context.Context, v *Volume, d *storagev1.DesiredVolume) ([]ancestor, error) {
-	snapID, volID := d.GetParentSnapshotId(), d.GetParentVolumeId()
-	from := "the desired state"
-	// The volume being attached is in the set from the start: a lineage that links back
-	// to it is a cycle like any other.
-	seen := map[string]bool{v.id: true}
-
-	var chain []ancestor
-	for snapID != "" {
-		if volID == "" {
-			// Half a link is worse than none. `image.SnapshotKey` needs the volume, so a
-			// snapshot id on its own addresses nothing: the load would find no manifest
-			// and the base would read as zeros for that ancestor's whole extent.
-			return nil, fmt.Errorf("agent: volume %s: %s names parent snapshot %s with no parent volume", v.id, from, snapID)
-		}
-		if seen[volID] {
-			return nil, fmt.Errorf("agent: volume %s: its lineage revisits volume %s, which makes it a cycle rather than a chain", v.id, volID)
-		}
-		seen[volID] = true
-		u, err := ids.Parse(volID)
-		if err != nil {
-			return nil, fmt.Errorf("agent: volume %s: %s names parent volume %q, which is not a uuid: %w", v.id, from, volID, err)
-		}
-		chain = append(chain, ancestor{volume: volID, id: [16]byte(u), snapshot: snapID})
-		if len(chain) > maxChainWalk {
-			return nil, fmt.Errorf("agent: volume %s: its lineage is over %d links deep, which is not a chain this Agent will walk", v.id, maxChainWalk)
-		}
-
-		// A descriptor that is not there is *not* "the lineage ends here". This walk
-		// cannot tell the top of a chain from a hole in one, and answering "the top"
-		// would serve every range above the hole as zeros — so it says so instead.
-		anc, err := descriptor.Read(ctx, m.deps.Store, volID)
-		if err != nil {
-			return nil, fmt.Errorf("agent: volume %s: reading %s, the descriptor of ancestor %s, which is where its own parent link lives: %w",
-				v.id, descriptor.Key(volID), volID, err)
-		}
-		from, snapID, volID = "the descriptor of "+volID, anc.ParentSnapshotID, anc.ParentVolumeID
-	}
-	return chain, nil
-}
-
-// parentEncryption re-binds this volume's DEK to an ancestor's id. Returns nil for an
-// unencrypted volume.
-//
-// **The re-binding is inert for image chunks, and it is now inert twice over.** The
-// comment that used to be here claimed that handing this volume's own Encryption would
-// fail to open every chunk an ancestor wrote; it would not, because `image.open` takes
-// the id its AAD binds as a *parameter* rather than reading it off the Encryption, and
-// the DEK is the same one either way — each clone inherits its parent's
-// (controlplane.Clone), so the whole lineage shares the root's. Since the chunk AAD binds
-// the **lineage root** rather than a volume, the argument `LoadSnapshotOver` is given is
-// the same for every ancestor as for this volume, so even the parameter no longer
-// distinguishes them. Proven by planting it: binding to this volume's id changes
+// parentChain returns this volume's ancestry, nearest first, or nil when it descends from
 // nothing.
 //
-// Kept, with the claim corrected rather than the call deleted, because an Encryption
-// bound to the wrong volume is the wrong object to be holding on a path whose whole
-// subject is another volume's data — and because `wal.Encryption` does bind the id for
-// WAL records, so a future reader of an ancestor's *records* would need exactly this.
-// What is not kept is a comment asserting a protection that is not there.
-func (m *VolumeManager) parentEncryption(v *Volume, a ancestor) (*wal.Encryption, error) {
-	if v.enc == nil {
-		return nil, nil //nolint:nilnil // no encryption is a mode, not a failure — see encryptionFor
+// # The desired state says whether to look; the bucket says what is found
+//
+// The link used to come from `DesiredVolume` outright, with only the links *above* it read
+// from the ancestors' descriptors. That was two authorities for one fact, and FLATTEN is
+// what made the difference between them observable: a flattened volume's descriptor names
+// no parent while the catalog still does, because `volumes.parent_snapshot_id` is
+// write-once by construction (`CreateVolume`'s COALESCE) and no catalog write can clear it.
+// An Agent that believed the desired state would walk to an ancestry the volume no longer
+// reads through — and, worse, resolve a lineage root that is no longer its own, so it would
+// look for its *own* chunks under its ex-parent's prefix and find none.
+//
+// So the desired state's link is the trigger and `lineage.Walk` is the answer. ADR-0021 is
+// untouched: the Agent is still told which volumes to serve and still looks nothing up
+// against a Control Plane — it reads an object out of the store it already reads its data
+// from, which is the same authority `-rebuild-metadata` trusts when the database is the
+// thing that was lost (§22.5, INV-20).
+//
+// A volume the desired state gives no parent walks nothing at all and touches the store
+// once less, which is nearly every volume; the extra GET is a clone's, and a clone already
+// pays three per link.
+func (m *VolumeManager) parentChain(ctx context.Context, v *Volume, d *storagev1.DesiredVolume) ([]lineage.Ancestor, error) {
+	if d.GetParentSnapshotId() == "" {
+		return nil, nil
 	}
-	penc, err := wal.NewEncryption(v.enc.DEK, a.id)
+	chain, err := lineage.Walk(ctx, m.deps.Store, v.id)
 	if err != nil {
-		return nil, fmt.Errorf("agent: volume %s: binding the DEK to ancestor %s: %w", v.id, a.volume, err)
+		return nil, err
 	}
-	return penc, nil
+	if len(chain) == 0 {
+		// The flattened case, and it is worth a line rather than silence: an operator who
+		// ran FLATTEN and has not yet corrected the catalog needs to see that the two
+		// disagree, and that the bucket is what the Agent obeyed.
+		slog.Info("the catalog says this volume descends from a snapshot and its descriptor says it descends from nothing; it has been flattened, and its own image is what answers every read",
+			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId())
+	}
+	return chain, nil
 }
 
 // supervise runs the vhost server and restarts it when it returns.

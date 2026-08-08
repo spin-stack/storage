@@ -65,7 +65,7 @@ func TestACloneThatStoppedOnceStartsAgainAndReadsBothHalves(t *testing.T) {
 	}
 
 	c := desiredVolume(t, 1)
-	c.ParentSnapshotId, c.ParentVolumeId = snapID, p.GetVolumeId()
+	descendsFrom(t, store, c, lineageLink{volume: p.GetVolumeId(), snapshot: snapID})
 
 	// First session: the clone has no image of its own, so the parent's snapshot *is* its
 	// base. This is the only session anything covered, and it has always worked.

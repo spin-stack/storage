@@ -86,7 +86,7 @@ func TestACloneStoresOnlyWhatItTouchedInItsLineageAndSaysSo(t *testing.T) {
 
 	// The clone writes one block, into the first region only, and stops.
 	c := desiredVolume(t, 1)
-	c.ParentSnapshotId, c.ParentVolumeId = snapID, p.GetVolumeId()
+	descendsFrom(t, store, c, lineageLink{volume: p.GetVolumeId(), snapshot: snapID})
 	clone := cloneSession(t, "/var/lib/spin-clone", sim.NewDisk(), store)
 	writeBlock(t, serveClone(t, clone, c), 0, 0xC2)
 	if err := clone.Close(t.Context()); err != nil {

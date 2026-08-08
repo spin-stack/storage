@@ -112,7 +112,7 @@ func TestAnEncryptedCloneReadsItsParentsChunks(t *testing.T) {
 	clone := newManager("/var/lib/spin-clone")
 	defer func() { _ = clone.Close(t.Context()) }()
 	c := desiredVolume(t, 1)
-	c.ParentSnapshotId, c.ParentVolumeId = snapID, p.GetVolumeId()
+	descendsFrom(t, store, c, lineageLink{volume: p.GetVolumeId(), snapshot: snapID})
 	if err := clone.Apply(t.Context(), []*storagev1.DesiredVolume{c}); err != nil {
 		t.Fatalf("Apply(clone): %v", err)
 	}

@@ -403,6 +403,17 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	}
 	defer func() { _ = m.Close(context.Background()) }()
 
+	// The clone's own descriptor, which is where its Agent takes the link from
+	// (lineage.Walk): the desired state says a lineage may exist and the bucket says what
+	// it is, because the catalog's copy of the link can never say a lineage has ended.
+	// controlplane.Clone writes exactly this object.
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: cloneID, SizeBytes: 1 << 20, BlockSize: 512, CurrentEpoch: 1, ChainDepth: 1,
+		ParentSnapshotID: snapID, ParentVolumeID: parentID,
+	}); err != nil {
+		return fmt.Errorf("writing the clone's descriptor: %w", err)
+	}
+
 	desired := &storagev1.DesiredVolume{
 		VolumeId: cloneID, SizeBytes: 1 << 20, BlockSize: 512, Epoch: 1,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
@@ -532,6 +543,12 @@ func scenarioACloneOfACloneReadsItsGrandparentsBytes(s *Sim) error {
 	defer func() { _ = m.Close(context.Background()) }()
 
 	cloneID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, CurrentEpoch: 1, ChainDepth: 2,
+		ParentSnapshotID: parentSnap, ParentVolumeID: parentID,
+	}); err != nil {
+		return fmt.Errorf("writing the clone's descriptor: %w", err)
+	}
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
@@ -979,6 +996,12 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 		return err
 	}
 	defer func() { _ = clone.Close(context.Background()) }()
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, CurrentEpoch: 1, ChainDepth: 1,
+		ParentSnapshotID: snapID, ParentVolumeID: sourceID,
+	}); err != nil {
+		return fmt.Errorf("writing the clone's descriptor: %w", err)
+	}
 	if err := clone.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
 		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
