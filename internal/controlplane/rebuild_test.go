@@ -52,7 +52,7 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 		t.Fatal(err)
 	}
 
-	c, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snap, ids.New().String())
+	c, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snap, ids.New().String())
 	if err != nil {
 		t.Fatalf("Clone: %v", err)
 	}

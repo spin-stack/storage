@@ -2,13 +2,17 @@ package controlplane_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/controlplane"
+	"github.com/spin-stack/storage/internal/descriptor"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -52,7 +56,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	}
 
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
-	clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol)
+	clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +98,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 	if _, err := md.AcquireLeadership(ctx, "cp-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, stale, snapID, cloneVol); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, stale, snapID, cloneVol); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("want ErrStaleTerm, got %v", err)
 	}
 }
@@ -102,7 +106,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 func TestCloneFromMissingSnapshotFails(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, "no-such-snap", cloneVol); !errors.Is(err, metadata.ErrNotFound) {
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, "no-such-snap", cloneVol); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("clone from a missing snapshot: want ErrNotFound, got %v", err)
 	}
 }
@@ -128,7 +132,7 @@ func TestAFailedCloneChargesNothing(t *testing.T) {
 	}
 	createSnapshot(t, md, term, cloneHostA)
 
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol); !errors.Is(err, placement.ErrNoCapacity) {
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol); !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("want ErrNoCapacity, got %v", err)
 	}
 	if dst, _ := md.GetHost(ctx, cloneHostA); dst.NVMeCommittedBytes != 0 {
@@ -175,7 +179,7 @@ func TestACloneStartsWhereTheDataAlreadyIs(t *testing.T) {
 			}
 			createSnapshot(t, md, term, sourceHost)
 
-			clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol)
+			clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol)
 			if err != nil {
 				t.Fatalf("Clone: %v", err)
 			}
@@ -211,12 +215,133 @@ func TestCloneRefusesASnapshotThatWasNeverPublished(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, term, snapID, cloneVol); err == nil {
+	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol); err == nil {
 		t.Fatal("a snapshot that was never published was accepted as a clone source")
 	}
 	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("a refused clone must not create the volume: %v", err)
 	}
+}
+
+// TestALineageStopsGrowingAtTheCeiling drives the production path five times and then a
+// sixth, which is the only way to see the ceiling as an operator does: a lineage that
+// grows until it does not.
+//
+// Nothing here asserts on a field Clone set. The refusal is judged by what the fleet
+// holds afterwards — no row for the volume that was refused, no descriptor under its key,
+// not one byte charged to the host it would have landed on, and no volume anywhere in the
+// catalog past the ceiling — because a gate that returns the right error and writes the
+// row anyway satisfies every assertion on `err`.
+//
+// The per-step depth is read back from a collector rather than from the returned struct.
+// `chain_depth` is a series the §26.2 catalog has declared since before anything recorded
+// it, and "a name arrived" would pass on a producer wired to the wrong number, which is
+// the failure this repository has actually shipped.
+func TestALineageStopsGrowingAtTheCeiling(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
+
+	root := ids.New().String()
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: root, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
+		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := publishSnapshotOf(t, md, term, root)
+	deepest := root
+	for depth := 1; depth <= controlplane.MaxChainDepth; depth++ {
+		// A fresh collector per link: the samples differ only in their volume label, and
+		// a single reader would leave the assertion at the mercy of which data point the
+		// SDK returned last.
+		prov, err := obs.NewTestProvider("control-plane")
+		if err != nil {
+			t.Fatal(err)
+		}
+		clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, prov.Recorder(), term, snap, ids.New().String())
+		if err != nil {
+			t.Fatalf("a clone at depth %d was refused below the ceiling of %d: %v", depth, controlplane.MaxChainDepth, err)
+		}
+		gauges, err := prov.GaugeValues(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := gauges["chain_depth"]; got != float64(depth) {
+			t.Fatalf("the collector decoded chain_depth=%v for the clone the Control Plane created at depth %d", got, depth)
+		}
+		snap, deepest = publishSnapshotOf(t, md, term, clone.VolumeID), clone.VolumeID
+	}
+
+	before, err := md.GetHost(ctx, cloneHostA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := ids.New().String()
+	prov, err := obs.NewTestProvider("control-plane")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Errorf and not Fatalf, so that a build with no ceiling reports what it did rather
+	// than only that it did not refuse: the four assertions below are the ones that say
+	// a lineage grew past the limit, and they are the point of the test.
+	switch _, cerr := controlplane.Clone(ctx, md, store, placement.Policy{}, prov.Recorder(), term, snap, refused); {
+	case !errors.Is(cerr, controlplane.ErrChainTooDeep):
+		t.Errorf("a clone of a volume at the ceiling: want ErrChainTooDeep, got %v", cerr)
+	// The message is the operator's whole interface to this refusal: it has to name the
+	// verb that gets them back under the ceiling and the volume to run it on.
+	case !strings.Contains(cerr.Error(), "FLATTEN") || !strings.Contains(cerr.Error(), deepest):
+		t.Errorf("the refusal tells an operator nothing to do: %v", cerr)
+	}
+
+	if _, err := md.GetVolume(ctx, refused); !errors.Is(err, metadata.ErrNotFound) {
+		t.Errorf("the refused clone left a row behind: %v", err)
+	}
+	if _, err := store.Head(ctx, descriptor.Key(refused)); !errors.Is(err, objectstore.ErrNotFound) {
+		t.Errorf("the refused clone left a descriptor in the bucket: %v", err)
+	}
+	after, err := md.GetHost(ctx, cloneHostA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.NVMeCommittedBytes != before.NVMeCommittedBytes {
+		t.Errorf("the refused clone charged %d bytes to %s", after.NVMeCommittedBytes-before.NVMeCommittedBytes, cloneHostA)
+	}
+	if series, err := prov.CollectedMetrics(ctx); err != nil {
+		t.Fatal(err)
+	} else if series["chain_depth"] {
+		t.Error("the refused clone reported a chain depth for a volume that does not exist")
+	}
+
+	// And the lineage really did reach the ceiling, so the loop above was not five clones
+	// of the root: this is the assertion a missing refusal takes past MaxChainDepth.
+	vols, err := md.ListVolumes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deepestFound int32
+	for _, v := range vols {
+		deepestFound = max(deepestFound, v.ChainDepth)
+	}
+	if deepestFound != controlplane.MaxChainDepth {
+		t.Fatalf("the catalog's deepest volume is at depth %d, the ceiling is %d", deepestFound, controlplane.MaxChainDepth)
+	}
+}
+
+// publishSnapshotOf records a PUBLISHED snapshot of a volume — what an Agent's publish
+// leaves behind, and the only shape Clone accepts as a source — and returns its id.
+func publishSnapshotOf(t *testing.T, md metadata.Store, term int64, volumeID string) string {
+	t.Helper()
+	id := ids.New().String()
+	if err := md.CreateSnapshot(t.Context(), term, metadata.Snapshot{
+		SnapshotID: id, VolumeID: volumeID, Epoch: 1, TargetSequence: 10,
+		RootDigest: "abc", SourceHostID: cloneHostA,
+		State: lifecycle.SnapshotPublished, RequestID: ids.New().String(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func addHost(t *testing.T, md metadata.Store, term int64, id string, state lifecycle.HostState, total int64) {

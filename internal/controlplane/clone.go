@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/spin-stack/storage/internal/descriptor"
@@ -9,28 +10,91 @@ import (
 
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/placement"
 )
 
-// Clone creates a new, independent volume from a parent snapshot (§20): it is pure
-// metadata — a new active child at epoch 1 that reuses the parent snapshot's
-// already-durable objects, with no data copy. The clone inherits the parent's size,
-// block size, and DEK (so it can read the shared base), and increments the
-// chain depth (§20.1). Returns the new volume's descriptor-shaped record.
+// MaxChainDepth is the deepest lineage this Control Plane will create. A volume that was
+// created rather than cloned is at depth 0, so the ceiling admits five clone links above
+// a root and refuses the sixth.
+//
+// **What one link costs, taken from the measurement rather than from the document.**
+// `agent.TestWhatDepthCostsAtAttach` drives a real VolumeManager over lineages of one, two
+// and three links and counts the object reads an attach issues. Each ancestor costs three
+// fixed reads — its `descriptor.json`, then a Head and a Get for its snapshot manifest —
+// plus one Get per chunk that manifest names. Only the three are depth's own cost: the
+// chunk Gets are the dataset, which a volume downloads whatever shape its lineage has. So
+// at this ceiling an attach pays fifteen fixed round trips where a root pays none, and
+// that is nowhere near the wall — the wall is `agent.awaitBase`'s ShutdownGrace, which
+// bounds one wait for a read view, and at any plausible per-request latency it sits an
+// order of magnitude further out. That is what `agent.maxChainWalk`'s termination guard
+// being far above this number means in practice, and it is why attach does not choose it.
+//
+// **What does choose it is the steady state, and the steady state has no knee.**
+// `cow.IntervalMap.Read` recurses into its base unconditionally and scans every extent of
+// every layer it crosses, so at depth D *every* guest read scans D+1 extent lists, and the
+// host holds D+1 interval maps for each attached clone (`cow.Cost`, and the read_view_*
+// series that report it). Both are linear, and nothing distinguishes four from five from
+// six. There was therefore no cliff to derive a number from, and inventing one from a
+// benchmark would have dressed a policy up as a measurement.
+//
+// So the number is a policy about how much read amplification a lineage may accumulate
+// before an operator is made to FLATTEN — and it is the one §20.1, §10's `max_chain_depth`
+// and the design document already tell an operator, which is worth more than a fresh
+// number with the same justification. Two measurements would move it: a per-link constant
+// that stops being small (links whose manifests each name many chunks make the attach the
+// binding cost rather than the read), or an index in `cow` that stops a read from scanning
+// every layer.
+//
+// Rejected: a flag on cmd/control-plane. A ceiling an operator can raise per invocation is
+// one that gets raised during the incident it exists to prevent, and the number only means
+// anything if every clone in the fleet was admitted against the same one.
+const MaxChainDepth = 5
+
+// ErrChainTooDeep is what a clone past MaxChainDepth is refused with.
+//
+// A sentinel rather than a bare error because this is the one refusal in Clone that an
+// operator can act on: every other one says the fleet or the snapshot is wrong, and this
+// one says the lineage is long and names the verb that shortens it. The caller that will
+// branch on it is FLATTEN's one-shot, which has to tell "you are at the ceiling" apart
+// from "that snapshot does not exist".
+var ErrChainTooDeep = errors.New("controlplane: the lineage is at its depth ceiling")
+
+// Clone creates a new volume from a parent snapshot (§20): it is pure metadata — a new
+// active child at epoch 1 that reads *through* the parent snapshot's already-durable
+// objects rather than copying them. The clone inherits the parent's size, block size, and
+// DEK (so it can read the shared base), and takes the next chain depth — or is refused
+// with ErrChainTooDeep if that would be past MaxChainDepth (§20.1). Returns the new
+// volume's descriptor-shaped record.
+//
+// It is not "independent", and it stopped being so deliberately. Until publishing stopped
+// flattening, a clone's first stop re-uploaded everything it had inherited under its own
+// id, so every image was self-contained and `chain_depth` counted a lineage nobody walked;
+// now a manifest states what its volume itself wrote and a read walks the ancestry
+// (`image.uploadChunks`, `agent.parentView`). That is what makes the ceiling below a real
+// bound rather than a number, and what makes deleting a parent take its descendants' data
+// with it — see DELETION-AND-RECLAIM-SPEC's answer B.
 //
 // **Where it lands is decided here, not passed in.** policy.Choose implements §20's
 // three steps — source host, a host with the data cached, any host with capacity — and
-// step 1 is most of the boot-time story under ADR-0026: a cross-host clone pays a full
-// download from the object store, with no warm standby and no lazy loading to shorten
-// it, while a same-host clone reads local NVMe. The snapshot's source_host_id is what
-// makes that possible, and it is a fact rather than a guess because the host that took
-// the snapshot stamped it (§19, increment 3b).
-//
-// Two things it deliberately is not. Same-host is a *preference*: Choose falls through
+// the snapshot's source_host_id is what makes step 1 expressible at all: it is a fact
+// rather than a guess, because the host that took the snapshot stamped it (§19,
+// increment 3b). Same-host is a *preference*, not a requirement: Choose falls through
 // when that host is full, cordoned or gone, and making it mandatory would couple
-// scheduling to a host with no obligation to be up. And the locality is time-bounded —
-// the source host holds the data only while it still holds the volume, so once the
-// source stops, step 1 buys nothing and the clone pays the download.
+// scheduling to a host with no obligation to be up.
+//
+// **What step 1 buys today is nothing, and this comment claimed otherwise for two waves.**
+// It said a same-host clone "reads local NVMe" while a cross-host clone pays the download.
+// No code path provides that: `agent.parentView` calls `image.LoadSnapshot` on every
+// attach, which GETs every chunk the ancestry names, on the host that took the snapshot
+// exactly as on any other; the only cache in `internal/agent` holds VolumeKeys, and
+// nothing there reads another volume's local segments. The locality the sentence described
+// was EROFS plus a checkpoint plus a cached WAL, which ADR-0026 deleted — the preference
+// outlived the thing it was a preference for. It is left in place rather than removed
+// because the preference costs nothing, is still the right destination if that cache is
+// ever built, and deleting it would also delete the only reason source_host_id is carried
+// into placement; what is removed is the claim. CHUNK-ADDRESSING-SPEC's opening section
+// records the same finding, which is where it was found.
 //
 // The capacity ceilings travel with the write rather than being checked here
 // (ADR-0017): Choose is pure and advisory, so two callers reading the same fleet pick
@@ -38,7 +102,7 @@ import (
 // the bytes the same two numbers Choose admitted against — §28.2 on what the host has
 // been promised, and ADR-0013's fill ceiling on what it measured itself using.
 func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, policy placement.Policy,
-	term int64, parentSnapshotID, newVolumeID string,
+	rec *obs.Recorder, term int64, parentSnapshotID, newVolumeID string,
 ) (metadata.Volume, error) {
 	snap, err := md.GetSnapshot(ctx, parentSnapshotID)
 	if err != nil {
@@ -54,6 +118,33 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 	parent, err := md.GetVolume(ctx, snap.VolumeID)
 	if err != nil {
 		return metadata.Volume{}, err
+	}
+	// The ceiling refuses here — before a host is chosen, before a row exists, before a
+	// byte is charged and before a descriptor is written — because a refusal that has
+	// already written something is a refusal an operator has to clean up after.
+	//
+	// This is also the only place it *can* refuse. `agent.maxChainWalk` is a termination
+	// guard on a walk, and refusing there would turn a volume the fleet created
+	// successfully into one nothing can read: the guest is already booting, and the
+	// operator's only remedy would be a FLATTEN of a volume that cannot be attached.
+	// Refusing at create costs an operator one command they have not run yet.
+	//
+	// **The number it compares is the parent volume's, and that holds only while a
+	// snapshot is at its volume's depth.** It is today: a snapshot is a delta published by
+	// the volume it belongs to, so its ancestry is that volume's ancestry. FLATTEN is what
+	// can break it — a flattened volume goes back to depth 0 while the snapshots it
+	// published before are still deltas over the old lineage, and a clone of one of those
+	// would be admitted at depth 1 while reading through as many ancestors as ever. So
+	// whatever FLATTEN does about its volume's earlier snapshots, it must leave that
+	// sentence true, or this comparison stops describing the read path it exists to bound.
+	if parent.ChainDepth >= MaxChainDepth {
+		return metadata.Volume{}, fmt.Errorf(
+			"%w: volume %s is at depth %d, so a clone of snapshot %s would be depth %d and the ceiling is %d. "+
+				"Every guest read on a clone scans one extent list per link and every attach reads one more ancestor, "+
+				"which is what this refuses to grow further. FLATTEN volume %s — the operator one-shot that makes it "+
+				"self-contained and returns it to depth 0 — then snapshot the flattened volume and clone that",
+			ErrChainTooDeep, parent.VolumeID, parent.ChainDepth, parentSnapshotID,
+			parent.ChainDepth+1, MaxChainDepth, parent.VolumeID)
 	}
 	hosts, err := md.ListHosts(ctx)
 	if err != nil {
@@ -107,6 +198,28 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 	if err := md.CreateVolume(ctx, term, clone, bound); err != nil {
 		return metadata.Volume{}, err
 	}
+	// `chain_depth` acquires the producer §26.2 declared it with and it has never had.
+	//
+	// **Here rather than on the Agent, and the distinction is the whole reason it is a
+	// second series.** `read_view_layers` already reports what a read *walks* — every
+	// layer, including the ones a Freeze adds and no lineage explains — recorded by the
+	// process that walks it, at the cadence it changes. This one is the catalog's number:
+	// the one the ceiling above refuses on and the one FLATTEN reduces. An operator
+	// comparing them is comparing a claim with what the object store actually made of it,
+	// which is only possible while they are two series.
+	//
+	// Recorded at the change and not polled, because between a clone and a FLATTEN a
+	// volume's depth cannot move: a poller would re-report, at fleet cardinality and from
+	// a process that has no loop to hang it on, a number that is not allowed to have
+	// changed. What that costs is stated rather than hidden: a series written only on
+	// change goes quiet, so "which volumes are deep *now*" is answered by the catalog —
+	// `-fleet-status` prints the column — and this answers "what did the Control Plane
+	// create, and how deep was it when it did".
+	//
+	// After CreateVolume, deliberately. A depth nothing has committed may never exist: the
+	// term guard can refuse this write, and a gauge that leads the catalog is one an
+	// operator cannot reconcile with the row.
+	rec.Gauge(ctx, "chain_depth", float64(clone.ChainDepth), obs.String("volume", clone.VolumeID))
 
 	// The descriptor, for the same reason provisioning writes one: §22.5's
 	// rebuild-metadata reconstructs volumes from these objects, and a clone with no
