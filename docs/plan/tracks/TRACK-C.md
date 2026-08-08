@@ -933,3 +933,167 @@ neither is track C's: `STATUS.md`'s DEV-0020 note about chunks under
 `image/<vol>/chunks/`, and `DELETION-AND-RECLAIM-SPEC`'s object table and its §
 establishing that `chunkKey` embeds the volume id. The second matters most — its reclaim
 rule is bounded by a volume's own prefix, which is exactly what stopped being true.
+
+## C — publishing stops flattening (step 3 of the chunk-addressing chain)
+
+**What landed.** `image.uploadChunks` walks `view.DeltaOver(inherited)` where it walked
+`view.Ranges()`, so a manifest states the layers *this* volume holds and leaves its
+ancestry to the chain. `agent.fetchBase` composes the ancestry on every attach and hands
+`image.Load` a base where it used to pass none; `Volume.inherited` is what publish and
+snapshot must not write down. `cow.Delta`/`DeltaOver` is the new serialising half of the
+layering, and `Ranges` is now written in terms of it so the rules have one implementation.
+`task ci` and `task ci:full` green — including `db:verify`, the RustFS backend
+conformance, the real-kernel `integration/vhost` lane and `integration/e2e`. Production
+coverage 90.40%.
+
+**The cost fell where the spec said it would not, and that is the finding.** Every number
+below is an assertion in `internal/image/clone_cost_test.go`, the same scales the decision
+was weighed on, re-run through the three key spaces this repository has had:
+
+| a clone of an 8 MiB parent that… | per-volume keys | per-lineage keys | a delta |
+|---|---|---|---|
+| stops without writing anything | 8388636 | 0 | 0 |
+| writes one sector, one-chunk parent | 8388636 | 8388636 | **540** |
+| writes one sector, eight-chunk parent | 8388636 | 1048604 | **540** |
+| overwrites every byte it inherited | 8388636 | 8388636 | 8388636 |
+| writes past what it inherited | 528 | 528 | 528 |
+
+The second row is the golden-image case — `MaxChunkBytes` is 64 MiB, so a golden image is
+one chunk — and `C11-measured` and step 2's entry both concluded that no key space could
+recover it: a sector written into a chunk changes that chunk's content, so its digest, so
+there is nothing to share. Both were right, and both were about the wrong lever. Stopping
+the flattening recovers it completely, because the manifest then names the sector rather
+than the chunk the sector fell in. **"Proportional to what the clone wrote" is now true as
+`CHUNK-ADDRESSING-SPEC` §3 stated it, rather than true at chunk granularity**, and the
+weaker form was the honest one to insist on right up until this step. The seam agrees: in
+`internal/agent`, a clone that writes one block into one of a parent's two regions adds 512
+bytes to its lineage's chunk store where it added 2048, and its publish line carries
+`image_bytes=512` beside `inherited_bytes=4096`.
+
+The two rows that did not move should not have. A clone that overwrote everything it
+inherited wrote everything it uploaded, and a disjoint write costs the disjoint write.
+
+**The tombstone was the core of the step, not a footnote, and it is a second on-S3 format
+change.** In a flattened manifest, absence meant zeros. In a delta it means *ask the layer
+below* — that is what a delta is — so the same absence hands a guest its ancestor's older
+bytes at every offset it freed. That is §14.6 and it is worse than losing the erasure: a
+filesystem has already returned those blocks and may have handed them to something else.
+`Manifest.Discarded` carries them, `loadManifest` replays them as `cow` tombstones, and
+`cow.DeltaOver` reports none at all when nothing is inherited, because with no layer below
+absence and an erasure are the same statement and storing the second in every manifest for
+ever buys a distinction no reader can act on.
+
+**`image.Load` therefore returns a layerable map, which is the exact reversal of the fix in
+`C-a-clone-works-exactly-once`, and the reversal is safe for the reason that entry gave.**
+That entry refused to weaken `cow.SetBase`, on the grounds that tombstones did not survive
+publication and sliding a parent under a published image would uncover every DISCARD — "a
+total outage converted into silently resurrected data". The premise was true and it is the
+premise this step changed. The protection has not been dropped; it moved into the format,
+where it also survives a restart, which the refusal never did.
+
+**What a clone stopped being, and where that lands.** A clone is no longer self-contained
+and never becomes so, which touches four things, checked rather than assumed:
+
+- **A restart.** Covered, and it was the thing most likely to break: `image.Load` now needs
+  the ancestry to answer anything the clone did not itself write.
+  `TestACloneThatStoppedOnceStartsAgainAndReadsBothHalves` and the e2e
+  `TestACloneThatStoppedOnceIsServedAgain` pass unchanged, which is what one wants of a test
+  written before the change it survives.
+- **`-rebuild-metadata`.** Unaffected, and worth saying why rather than leaving it: it reads
+  descriptors and `image.ReadSnapshotManifest` for a sequence number, never a view, so a
+  manifest that names less says nothing different to it. The parent link it restores comes
+  from the descriptor (step 1 added `parent_volume_id`), and `cpserver` still resolves the
+  parent *volume* from the snapshot row, so a rebuilt catalog produces a walkable desired
+  state.
+- **A snapshot of a clone** is a delta too — `snapshot` passes the same `v.inherited` — so a
+  clone of that snapshot walks through it to the same root. Measured: a chain of three holds
+  one copy of its dataset, and the middle link's snapshot manifest names nothing of the
+  root's.
+- **A delete of a parent** now takes its descendants' data with it, permanently, and there is
+  no window in which it does not. That is `DELETION-AND-RECLAIM-SPEC`'s answer B — flatten
+  the descendants first — and its FLATTEN does not exist yet. **Between here and step 4 a
+  parent with clones cannot safely be deleted at all**, which the decision block predicted
+  and which nothing in the code refuses, because nothing in the code deletes.
+
+**What depth costs at attach, which is step 4's number.** `TestWhatDepthCostsAtAttach`
+drives a real `VolumeManager` over lineages of one, two and three links and counts the reads
+an attach issues:
+
+| links | first attach (no image of its own) | restart (with one) |
+|---|---|---|
+| 1 | 5 | 7 |
+| 2 | 9 | 11 |
+| 3 | 13 | 15 |
+
+Four object reads per link — the ancestor's descriptor, a Head and a Get for its snapshot
+manifest, and one Get per chunk that manifest names (one, in this fixture) — plus one for
+the Head that finds no image of its own, or three for a manifest, its Get and its chunk. **A
+real golden image is many chunks, and that is where the depth cost actually lives**: the
+per-link constant is `3 + chunks named`, and only the 3 is bounded by anything a ceiling
+controls. At the design document's ceiling of five, a restart is 23 round trips plus the
+chunk Gets; at `agent.maxChainWalk`'s termination guard of 64 it is 259, which is what that
+guard being far above the ceiling means in practice.
+
+The restart row is the one that changed. It used to be a constant — a flattened image
+answered every read at any depth — and it is now the same slope as the first attach, which
+is what makes a ceiling a bound on a volume's whole life rather than on its first boot.
+
+**No guest can issue a DISCARD, and the tests say so rather than pretending otherwise.**
+`VIRTIO_BLK_F_DISCARD` is not offered (`internal/vhost/features.go`) and `wal.Log.Discard`
+has no production caller, so the erasure cannot be driven through a device. What a DISCARD
+*is*, when the bit is eventually negotiated, is `cow.IntervalMap.Clear` on the log's read
+view — `Log.appendClear` calls exactly that — so that is what `internal/image`'s arm drives,
+on a view composed the way `fetchBase` composes one. The Agent lane reaches the other side
+of the same format question and asserts it through a real manager: an ancestor whose
+published snapshot carries an erasure, read through the chain, across a stop and a restart
+(`TestARangeErasedInTheMiddleOfALineageStaysErased`). The format has to be right before the
+feature bit is offered, not after.
+
+**Four plants, all run.** Dropping the tombstone at the *publisher* takes the §25.2 round
+trip red at the first draw and leaves the erasure absent from the bucket. Dropping it at the
+*loader* makes a restarted clone read `0xa1a1a1a1a1a1a1a1` where it must read zeros — in
+`internal/image`, and again through a real `VolumeManager`, which is data resurrection
+observed from outside the process and the outcome this whole step is arranged around.
+Removing the tombstone handling from `cow.delta` fails the delta-plus-ancestry property with
+`byte 0: the view holds 0, the delta over its ancestry holds 1`. Restoring the flattening in
+the Agent's publish takes the seam measurement from 512 bytes back to 2048 and the depth-3
+restart from 15 object reads to 18 — the second of which is the one worth having, because a
+cost regression that only shows up in bytes is invisible to every correctness test here.
+
+**What §25.2 covers and what this format still cannot detect, stated because the second half
+is a real hole and it is one this step widened.** Truncation is total: a manifest is JSON, so
+every prefix fails the load. **A bit flip inside a manifest is not detected.** The digest
+protects a chunk's *contents*; nothing protects the manifest naming them, and flipping one
+bit of a decimal digit yields another decimal digit — `"offset":1024` becomes
+`"offset":1025` and the load succeeds with data in the wrong place. That exposure is not new
+(`chunks[].offset` has had it since the format existed) and `discarded` inherits exactly it,
+but it is **worse in consequence** now: a moved tombstone uncovers an ancestor's bytes rather
+than misplacing this volume's. Closing it is `descriptor.frame`/`unframe` applied to this
+object — a digest line over the bytes *as stored*, which `DESCRIPTOR-DIGEST-SPEC` already
+proved cannot be over a re-encoding — and it was deliberately not folded in here: it is an
+independent on-S3 format change in a review zone, and `PARALLEL-PLAN.md` says not to land a
+sixth spec in the same commit as its code. It is owed by whoever takes the next format
+increment.
+
+**No DST scenario was added, deliberately, and this is the second lane in a row to say so.**
+The mandatory set may grow by one per merge window and step 1 already spent it on
+`a-clone-of-a-clone-reads-its-grandparents-bytes` — which is now exercising the real
+publisher's output rather than a fixture anticipating it, so it got stronger for free. The
+erasure has no arm there either way: `DurableRangeChecker` watches for zeros and foreign
+bytes, and resurrection *is* foreign bytes, so a scenario is worth having — it is the
+cheapest thing left on this subject and it belongs to the next window.
+
+**DEV-0020 is implemented and this lane cannot close it.** Its subject — "removing the
+flattening before the chain read exists converts a storage-cost defect into silent zeros at
+chain depth 2" — is exactly what steps 1 to 3 answered, in that order and for that reason.
+Striking the heading is an edit to `STATUS.md`, which is track A's file, and
+`hack/dev-entries-open.txt` must lose its line in the *same* commit or `task dev:entries`
+fails both ways. So it stays open here, and closing it is one commit for whoever owns
+`STATUS.md`. DEV-0024 waits on the same answer.
+
+**What step 4 must know.** The table above is the ceiling's arithmetic. Two things beyond it:
+`agent.maxChainWalk` is 64 and is a termination guard, not a policy — refusing at attach
+would make a volume the fleet created successfully unreadable, which is why the refusal
+belongs at create. And FLATTEN is now load-bearing for two separate reasons rather than one:
+it is the only way back under the ceiling, *and* it is the only way to delete a parent that
+has clones without destroying them.
