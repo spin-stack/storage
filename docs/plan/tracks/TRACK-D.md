@@ -707,3 +707,114 @@ Agents pointed at the same wrong bucket so they agreed". Closing it is one arm i
 this track does not own (a desired volume with a non-default block size, and the guest's
 `blockdev --getss` or the config's `blk_size` read back), so it is reported rather than
 written here.
+
+**D13: the ceiling refuses, and `chain_depth` gets the producer it was declared with
+(2026-08-08).** `controlplane.Clone` refuses past `MaxChainDepth` with `ErrChainTooDeep`
+instead of incrementing a number nobody read; the refusal names FLATTEN, the volume to run
+it on, and the fact that the snapshot to clone is one taken afterwards. `cmd/control-plane`
+gained the telemetry wiring it has never had — exporter, Provider, deferred flush — and
+`-fleet-status` gained a `DEPTH` column and a header count. `task ci` green, production
+coverage 90.4%.
+
+**What the number is chosen against, since the task said not to take 5 because a document
+says 5.** Step 3's measurement is the input: at attach each ancestor costs three fixed
+object reads — its descriptor, then a Head and a Get for its snapshot manifest — plus one
+Get per chunk that manifest names. Only the three are depth's own cost; the chunk Gets are
+the dataset, which a volume downloads whatever its lineage looks like. At the ceiling that
+is fifteen fixed round trips where a root pays none, and the only wall in that direction is
+`agent.awaitBase`'s ShutdownGrace bounding one wait for a read view, which at any plausible
+per-request latency sits an order of magnitude further out — which is what
+`agent.maxChainWalk` being far above the ceiling means in practice. **So the attach does not
+choose the number.** What does is the steady state: `cow.IntervalMap.Read` recurses into its
+base unconditionally, so at depth D *every* guest read scans D+1 extent lists for the life
+of the volume, and the host holds D+1 interval maps per attached clone. Both are linear and
+nothing distinguishes four from five from six.
+
+**There was therefore no cliff to derive a number from, and that is the finding rather than
+an evasion.** A number invented from a benchmark would have dressed a policy up as a
+measurement. What is left to choose on is what an operator has already been told — §20.1,
+§10's `max_chain_depth` and the design document all say five — and the comment at
+`MaxChainDepth` states the two measurements that would move it: a per-link constant that
+stops being small (links whose manifests each name many chunks make the attach the binding
+cost rather than the read), or an index in `cow` that stops a read from scanning every
+layer. A flag was rejected: a ceiling an operator can raise per invocation is one that gets
+raised during the incident it exists to prevent.
+
+**It refuses at create because that is the only place it can.** Refusing during the walk
+would turn a volume the fleet created successfully into one nothing can read, with a guest
+already booting and the only remedy a FLATTEN of something that cannot be attached;
+`agent.maxChainWalk`'s comment says the same thing from the other side. Refusing here costs
+an operator a command they have not run yet, and it happens before a host is chosen, so a
+refusal leaves no row, no descriptor and no charged byte to clean up.
+
+**A thing FLATTEN must not break, which nothing enforces.** The comparison is against the
+parent *volume*'s depth, and that describes the read path only while a snapshot is at its
+volume's depth. It is today, because a snapshot is a delta published by the volume it
+belongs to. FLATTEN is exactly what can break it: a flattened volume returns to depth 0
+while the snapshots it published beforehand are still deltas over the old lineage, so a
+clone of one of *those* would be admitted at depth 1 while reading through as many ancestors
+as ever. Whatever FLATTEN does about its volume's earlier snapshots — rewrite them, refuse
+to clone them, or something else — it has to leave that sentence true, or this comparison
+stops bounding the thing it was chosen to bound. It is written at the comparison as well as
+here.
+
+**Where the producer went, and why not the Agent.** `read_view_layers` already reports what
+a read walks — every layer, including the ones a Freeze adds and no lineage explains — from
+the process that walks it, at the cadence it changes. A second series recorded there would
+be a subset of the first. `chain_depth` is the catalog's number: the one the ceiling refuses
+on and the one FLATTEN reduces, changed by nothing but the Control Plane. So it is recorded
+at the change and not polled — between a clone and a FLATTEN a volume's depth cannot move,
+and a poller would need a loop this process does not have, at fleet cardinality, to
+re-report a number that is not allowed to have changed. An operator comparing the two series
+is comparing a claim with what the object store made of it, which is only possible while
+they are two.
+
+**What a change-recorded series does not answer, and what was built because of it.** It goes
+quiet, so "which volumes are deep *now*" is not a question it can take — and after a
+`-rebuild-metadata` it has never been recorded at all for rows that came back from the
+bucket. That is the whole reason `-fleet-status` grew the `DEPTH` column and the header
+count: the operator who meets the refusal, or who wants to not meet it, needs the list of
+volumes waiting on a FLATTEN, and the catalog is the only thing that holds it. Saying this
+out loud is cheaper than discovering it during an incident with a dashboard that shows five
+volumes cloned last Tuesday.
+
+**`cmd/control-plane` recorded nothing at all before this**, which STATUS.md had already
+noticed: no exporter, no Recorder. A producer added to `Clone` with that still true would
+have written into a no-op for ever — the shape of every row in CLAUDE.md's "build it thin"
+table — so the binary got the same wiring `cmd/volume-agent` has, built before anything
+takes a Recorder.
+
+**Three plants, each watched go red, each reverted textually.** Deleting the refusal (which
+is exactly the code as it stood before this increment): *"the catalog's deepest volume is at
+depth 6, the ceiling is 5"*, alongside a row, a descriptor and 1073741824 charged bytes for
+a volume that should not exist — the test uses `Errorf` and not `Fatalf` at the sentinel
+check precisely so a build with no ceiling reports what it did rather than only that it did
+not refuse. Recording the parent's depth instead of the clone's: *"the collector decoded
+chain_depth=0 for the clone the Control Plane created at depth 1"* — the assertion reads
+each of the five links back from a collector, with a fresh reader per link, because the
+samples differ only in their volume label and one reader would leave the value at the mercy
+of which data point the SDK returned last. Counting the ceiling with `>` instead of `>=` in
+the report: *"report does not say VOLUMES (3, 1 with no primary host, 1 at the depth ceiling
+of 5"*.
+
+**A comment this spec said was owed here, and it was.** `Clone`'s doc claimed a same-host
+clone reads local NVMe while a cross-host clone pays the download. Nothing provides it:
+`agent.parentView` GETs the ancestry on every attach, on the host that took the snapshot
+exactly as on any other, and the only cache in `internal/agent` holds `VolumeKeys`. The
+locality was EROFS plus a checkpoint plus a cached WAL, which ADR-0026 deleted; the
+placement preference outlived it. The preference stays — it costs nothing, it is still the
+right destination if that cache is ever built, and removing it would remove the only reason
+`source_host_id` reaches placement — and the claim goes.
+
+**What this increment did not do.** No lane asserts that the *binary* refuses: the e2e
+fixture's `cloneSnapshot` would need five publish cycles to build a lineage at the ceiling,
+which is a slow arm in a lane this track does not own, so the refusal is proven at the
+Control Plane seam and the flag is proven only to compile. **The Control Plane's telemetry
+path is wired and has never been run against a collector** — `internal/simio/real`'s
+process-level export test covers `cmd/volume-agent`, and the equivalent for this binary
+needs a database, so what is proven here is that `Clone` records the right number into a
+real SDK reader, not that a byte leaves the process. That is the honest boundary and it is
+the next thing anyone should distrust. No DST scenario: the ceiling is an admission
+decision with no fencing or data-path property to violate, and the mandatory set's one slot
+per window is better spent on the erasure arm step 3 asked for. No DEV entry opened;
+DEV-0020 and DEV-0024 remain track A's to close.
