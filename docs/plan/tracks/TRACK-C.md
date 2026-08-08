@@ -830,3 +830,106 @@ worked around.
 rewrote counted once per layer; a three-link lineage would report three times the dataset
 an operator is watching upload. It is now the fold over `Ranges()` that
 `sayWhatThisImageCosts` already used, which is the bytes the publish actually moves.
+
+## C — the chunk store moves to the lineage (step 2 of the chunk-addressing chain)
+
+**What landed.** Chunks are keyed `chunks/<lineage-root>/<digest>` and the AAD binds the
+lineage root; `image.Ident{Volume, Lineage}` is how the two ids travel, `image.Prefix`
+still owns the manifests and snapshots, and `image.ChunksPrefix` is new. `agent.fetchBase`
+resolves the root from the walk step 1 built — `parentChain` returns the ancestry
+nearest-first, so its last link is the root — and does it *before* it loads anything,
+because a clone cannot find one byte of its own image without it. `task ci` green, the
+integration and e2e lanes green including the real-kernel one, production coverage 90.35%.
+
+**The nonce argument still holds, and it holds better than it read.** This was the part
+the decision block flagged as not mechanical, and the answer is not "it survives" but "it
+was true at the wrong scope and the key space is what fixed it". The doc rested on two
+facts together — the nonce is drawn, and a chunk is sealed exactly once ever because an
+existing key is skipped — and the second held per *volume* while the DEK has always been
+per *lineage*. A clone re-sealed everything it inherited under its parent's DEK with a
+fresh nonce, once per link: same plaintext, N nonces, one key. Never a reuse, never
+unsafe, but the sentence claiming safety was not the sentence providing it. What provides
+it is that a chunk's key is the digest of its plaintext, so two seals landing on one key
+are two seals of the same bytes; the skip keeps the *number* of nonces drawn under one DEK
+proportional to distinct content rather than to activity, which is what a drawn nonce's
+birthday bound needs. Both rejected derivations keep their reasons, and the
+generation-counter one gets worse: a lineage now has several volumes publishing into one
+key space, each with its own generation.
+
+**The one thing that would break it, written at the code and repeated here because it is
+somebody's future decision:** two DEKs inside one chunk prefix — a DEK rotation applied to
+a volume rather than to a lineage. Nothing rotates a DEK anywhere in this repository
+today. If one is added it must be per lineage; if it is not, the failure is closed rather
+than silent, because the create-only PUT means the first ciphertext owns the key and the
+other volume's load fails its authentication.
+
+**Where the root comes from, and the descriptor walk was enough.** The task asked to say
+if it was not. It is: every case the Agent has is answered by the walk it already does —
+a volume with no parent link never touches the store, a clone with no image walks anyway
+for `parentView`, and a clone *with* an image now walks too, which is the one behaviour
+this step adds and the one cost it adds (one small GET per link at attach, bounded by the
+ceiling step 4 will enforce). Recording the root in the volume's own descriptor was
+rejected: one GET whatever the depth, but it duplicates a fact the chain already states,
+and a duplicate that can disagree with the chain is a way for a volume's chunks to be
+written under a prefix its own ancestry says is the wrong one. No Control Plane lookup was
+added and `DesiredVolume` did not grow a field, so ADR-0021 is untouched.
+
+**Not under `image/<root>/chunks/`, and the difference is a delete.** The spec's literal
+`chunks/<lineage-root>/<digest>` is what landed, top-level. These bytes outlive the volume
+that first wrote them — a clone reads them after its parent's manifest is gone — so a
+delete that clears `image/<root>/` must not be able to take a descendant's data with it.
+
+**The measurements were re-weighed, not deleted, because they are what the decision was
+made on.** A clone that stops without writing now transfers **zero** where it transferred
+its parent's whole dataset; one sector into an eight-chunk parent costs one region, not
+eight; one sector into a one-chunk parent still costs the whole chunk, and no key space
+can give that back — with `MaxChunkBytes` at 64 MiB that is the golden-image case, so
+"proportional to what the clone wrote" is true at *chunk granularity* and should be quoted
+that way. A chain of three holds one copy of its dataset; two unrelated volumes holding
+identical bytes still hold two objects, which is not a defect to fix later: they share no
+key, so they cannot share an object.
+
+**Four plants, because the format's whole claim is a pair of directions.** Binding the
+seal to the writing volume: *"a clone could not open the chunks its parent sealed: crypto:
+authentication failed"*. Dropping the lineage from the AAD: *"an unrelated volume opened a
+chunk sealed for another lineage: the blast radius of a chunk is the bucket, not the
+lineage"*. Keying chunks by the volume again: the round trip still passes — which is the
+point of asserting on the bucket — while the location assertion and every cost number go
+red. Never resolving the root in the Agent: four clone tests and two DST scenarios fail
+with `chunk … not found`, which is the seam that no assertion inside `internal/image`
+could have caught, since they all supply the pair by hand.
+
+**Assertions that had quietly stopped covering anything, found by moving the objects.**
+Every "the bucket holds nothing for this volume yet" check in the e2e lanes and the
+plaintext-leak checks in `internal/agent` and the DST leak scenario listed `image/<vol>/`,
+which held the chunks until this change and now holds a manifest. They would all have gone
+on passing over nothing — including INV-18's "a guest WRITE is zero PUTs", whose whole
+subject is a chunk appearing where none should. The DST `hidingStore` had the same hole:
+it hid `image/` and would have left the chunks readable. Fixed in the same wave, in their
+own commit.
+
+**One test-only affordance is on the deadcode allow-list**, `image.OwnLineage`: production
+never builds one, because the Agent derives the pair from the walk and for a root the walk
+leaves the volume's own id in place. Tests, DST and the lanes build root volumes
+constantly.
+
+**What step 3 must know.** A manifest still means *everything this volume can read* — the
+publish still flattens, so every manifest is self-contained and the walk is still only
+load-bearing for ranges an intermediate ancestor discarded (step 1's entry says why). When
+step 3 stops flattening, a manifest becomes *what this volume itself wrote*, and three
+things stop being true. First, a manifest can no longer be read alone: `image.Load`'s
+result becomes a layer, and the caller must layer it over the ancestry — which is why
+`Load` returns an unlayered map today and why that is a protection, not an obstacle
+(`agent.fetchBase`). Second, absence in a manifest stops meaning "this range is empty" and
+starts meaning "ask the layer below", so **a discard needs a tombstone in the manifest** —
+step 1's entry calls this the thing step 3 cannot omit, and it is a second on-S3 format
+change with its own §25.2 work. Third, the `TestASecondStopPaysOnlyForWhatItTouched` fold
+is the shape reclaim now needs: a chunk is unreferenced only when *no manifest in the
+lineage* names it, across both volumes' images and both volumes' snapshots, and that fold
+exists nowhere in production code.
+
+**Two documents still describe the old key space and this lane did not edit them**, since
+neither is track C's: `STATUS.md`'s DEV-0020 note about chunks under
+`image/<vol>/chunks/`, and `DELETION-AND-RECLAIM-SPEC`'s object table and its §
+establishing that `chunkKey` embeds the volume id. The second matters most — its reclaim
+rule is bounded by a volume's own prefix, which is exactly what stopped being true.
