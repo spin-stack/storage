@@ -469,7 +469,7 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 	base := cow.NewIntervalMap()
 	base.Overwrite(decoyOffset, bytes.Repeat([]byte{decoyByte}, decoyLength))
 	base.Overwrite(guestRegionOffset, bytes.Repeat([]byte{fillerByte}, guestRegionLength))
-	if _, err := image.Publish(ctx, bucket, rand.Reader, nil, vol, base, 0, ""); err != nil {
+	if _, err := image.Publish(ctx, bucket, rand.Reader, nil, image.OwnLineage(vol), base, 0, ""); err != nil {
 		t.Fatalf("publishing the image this volume boots from: %v", err)
 	}
 
@@ -515,7 +515,7 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 	// Read it the way a clone reads its nearest ancestor: the same load agent.parentView
 	// performs at the top of its walk. (The symbol named here was `agent.cloneView`,
 	// which has not existed for some time; parentView now layers one of these per link.)
-	view, man, err := image.LoadSnapshot(ctx, bucket, nil, vol, snapshotID)
+	view, man, err := image.LoadSnapshot(ctx, bucket, nil, image.OwnLineage(vol), snapshotID)
 	if err != nil {
 		t.Fatalf("reading snapshot %s back: %v", snapshotID, err)
 	}
@@ -547,7 +547,7 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 	if err := m.Close(ctx); err != nil {
 		t.Fatalf("stopping the Agent: %v", err)
 	}
-	live, _, _, err := image.Load(ctx, bucket, nil, vol)
+	live, _, _, err := image.Load(ctx, bucket, nil, image.OwnLineage(vol))
 	if err != nil {
 		t.Fatalf("reading the volume's own image back: %v", err)
 	}
@@ -578,7 +578,7 @@ func firstByteNot(b []byte, want byte) (uint64, bool) {
 // name a chunk without asking the code under test where it went.
 func chunkKey(vol [16]byte, plain []byte) string {
 	sum := sha256.Sum256(plain)
-	return image.Prefix(vol) + "chunks/" + hex.EncodeToString(sum[:])
+	return image.ChunksPrefix(vol) + hex.EncodeToString(sum[:])
 }
 
 // gatedStore is an object store that can be told to stop the next chunk Head it is asked
@@ -618,7 +618,7 @@ func (g *gatedStore) holdNextChunkHead() *heldCall {
 func (g *gatedStore) Head(ctx context.Context, key string) (objectstore.ObjectInfo, error) {
 	g.mu.Lock()
 	hold := g.hold
-	if hold != nil && !strings.Contains(key, "/chunks/") {
+	if hold != nil && !strings.HasPrefix(key, "chunks/") {
 		hold = nil
 	}
 	if hold != nil {

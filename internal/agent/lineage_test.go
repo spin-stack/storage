@@ -166,11 +166,18 @@ func TestALineageThatCannotBeWalkedIsRefused(t *testing.T) {
 	}
 }
 
-// lineageLink is one published ancestor: the volume, and the snapshot below it descends
-// from. It is what the next clone in a test's chain is pointed at.
+// lineageLink is one published ancestor: the volume, the snapshot below it descends
+// from, and the root of the lineage they both belong to. It is what the next clone in a
+// test's chain is pointed at.
+//
+// The root is carried because the chunks of every volume in a chain live under it
+// (image.Ident), so a test that builds a lineage by hand has to thread it down the chain
+// exactly as controlplane.Clone threads the DEK. A link whose root is its own volume is a
+// root volume — what publishAncestor produces for an ancestorSpec with no parent.
 type lineageLink struct {
 	volume   string
 	snapshot string
+	root     [16]byte
 }
 
 type ancestorSpec struct {
@@ -202,11 +209,18 @@ func publishAncestor(t *testing.T, store objectstore.Store, dek crypto.DEK, spec
 		t.Fatalf("binding the DEK to %s: %v", volumeID, err)
 	}
 	snapshotID := ids.New().String()
-	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, enc, u, view, 1, snapshotID); err != nil {
+	// The chunks go under the lineage's root, not this volume's id: that is where the
+	// Agent's walk will look for them, and a root threaded wrongly here would leave the
+	// bytes in a prefix nothing reads — which the assertions would report as zeros.
+	root := u
+	if spec.parent.volume != "" {
+		root = spec.parent.root
+	}
+	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, enc, image.Ident{Volume: u, Lineage: root}, view, 1, snapshotID); err != nil {
 		t.Fatalf("publishing the snapshot of %s: %v", volumeID, err)
 	}
 	writeDescriptor(t, store, volumeID, spec.parent)
-	return lineageLink{volume: volumeID, snapshot: snapshotID}
+	return lineageLink{volume: volumeID, snapshot: snapshotID, root: root}
 }
 
 // writeDescriptor writes the object controlplane.Provision and controlplane.Clone write,

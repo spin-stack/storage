@@ -8,8 +8,9 @@
 //
 // # Shape
 //
-//	<prefix>/manifest.json      the chunk list, CASed on ETag
-//	<prefix>/chunks/<sha256>    the bytes, create-only and content-addressed
+//	image/<volume>/manifest.json         the chunk list, CASed on ETag
+//	image/<volume>/snapshots/<id>.json   a frozen point, create-only
+//	chunks/<lineage-root>/<sha256>       the bytes, create-only and content-addressed
 //
 // Chunks are content-addressed on purpose, and it buys the two things the format needs:
 // a stop that re-uploads an unchanged region is a no-op the store answers with
@@ -21,29 +22,100 @@
 // problem into one compare-and-set (§12, ADR-0026): two incarnations of a volume must
 // not both publish, and one CAS on one key is the entirety of that.
 //
+// # The chunk store belongs to a lineage, not to a volume
+//
+// This is the one thing about the layout above that cannot be read off it, and it is the
+// format change CHUNK-ADDRESSING-SPEC's decision of 2026-08-07 asked for. A clone
+// inherits its parent's DEK, KEK id and DEK version (controlplane.Clone), so a lineage —
+// the volume that was created, plus every clone that descends from it, however deep —
+// encrypts under **one key**. The chunk store is scoped to exactly that set: the lineage
+// root's id names it, every volume in the chain writes into it and reads from it, and a
+// chunk a parent already stored is one its clone Heads, finds, and skips. That is what
+// makes a clone's storage cost proportional to what the clone wrote rather than to what
+// it inherited.
+//
+// Rejected: **one bucket-wide chunks/<digest>**, which is the shape everyone reaches for.
+// It cannot work here and the reason is not the key space, it is the key: two lineages
+// seal the same plaintext under different DEKs, so they produce different ciphertext for
+// one content-addressed key. Whoever created the key owns it and nobody else can open
+// what is under it. Making it work needs a bucket-wide DEK, which spends the design
+// document's *"borrado de volumen = crypto-shred"* (§15) to buy dedup between volumes
+// that have nothing to do with each other.
+//
+// Rejected: **keeping chunks under image/<volume>/**, which is where they were until
+// 2026-08-08. It is why a clone's first stop re-uploaded its parent's entire dataset
+// under its own prefix — measured at 8 MiB for a 512-byte write in this package's
+// clone-cost tests — and it made "volume delete" and "the lineage's data" the same
+// prefix, so deleting a parent took its clones' bytes with it.
+//
+// What that costs, stated where a reader will look for it: the blast radius of a chunk is
+// now the lineage rather than the volume. Someone who can read the bucket can see that
+// two volumes of one lineage hold equal plaintexts — as they could within a volume
+// before — and a delete that reclaims bytes has to reason about the lineage's manifests
+// rather than one volume's (DELETION-AND-RECLAIM-SPEC §3).
+//
 // # Encryption (§15, INV-15)
 //
-// Chunks are sealed with the volume's DEK before they leave the host, and each one
+// Chunks are sealed with the lineage's DEK before they leave the host, and each one
 // carries the nonce it was sealed under:
 //
 //	<nonce:12><ciphertext><tag:16>
 //
-// The nonce is drawn rather than derived, and a chunk is **encrypted exactly once, ever**
-// — a chunk whose key already exists is not re-sealed, it is skipped. Together those two
-// facts are what make nonce reuse impossible: a nonce is used for exactly one plaintext,
-// because the plaintext that produced the key is the only one that will ever be sealed
-// under it.
+// The AAD is "image-chunk" || lineage-root || digest. It binds the ciphertext to the
+// lineage whose key it was sealed under and to the content it claims to be, so a chunk
+// cannot be moved between lineages, and cannot be relabelled inside one. It deliberately
+// no longer binds the *volume*: a chunk a parent wrote is one its clone must open, and
+// binding the writer would forbid exactly the sharing this key space exists for. What
+// replaces that protection is not the AAD — loadManifest verifies every chunk against
+// the digest it is keyed by, so a chunk substituted for another inside a lineage is
+// caught by its content and not by its label.
 //
-// Deriving the nonce instead was considered and rejected in both available shapes. From a
+// ## Why no nonce is ever used twice, now that the key space spans volumes
+//
+// AES-GCM demands one thing: no (key, nonce) pair may ever seal two *different*
+// plaintexts. Three facts give it here, and it is worth being exact about which one does
+// the work, because the previous wording of this paragraph credited the wrong one.
+//
+//  1. The nonce is **drawn** from the caller's random source, never derived.
+//  2. The key of a chunk is the SHA-256 of its plaintext, so a key names its content:
+//     two seals that land on one key are two seals of the *same bytes*. There is no way
+//     to reach one key with two plaintexts short of a SHA-256 collision.
+//  3. A chunk whose key already exists is skipped rather than re-sealed, so the number of
+//     nonces ever drawn under one DEK is the number of distinct chunk contents the
+//     lineage has ever held — not the number of sessions, stops or volumes that held
+//     them.
+//
+// (2) is what makes reuse-with-different-plaintexts impossible; (1) makes an actual nonce
+// collision a 2^-96 event per pair rather than a scheme; (3) is what keeps the number of
+// draws — and therefore the birthday bound (1) rests on — proportional to content instead
+// of to activity. At 64 MiB a chunk, approaching NIST's 2^32-invocation guidance for
+// random nonces means a lineage having held 2^32 distinct chunks, which is not a volume
+// anything here can store.
+//
+// **The old argument was true at the wrong scope, and moving the key space is what fixed
+// it.** It said a chunk is "encrypted exactly once, ever", and that held per *volume* —
+// which was never the scope of the key. The DEK has always been per lineage, so before
+// this change a clone re-sealed every byte it inherited under its parent's DEK with a
+// fresh nonce, once per link: the same plaintext, N nonces, one key. That was not a reuse
+// and it was never unsafe, but the sentence that claimed safety was not the sentence that
+// provided it. Now the key space and the key have the same scope, the skip in
+// uploadChunks spans exactly the volumes that share a DEK, and "sealed exactly once,
+// ever" is true as written.
+//
+// The one thing that would break it is **two DEKs inside one chunk prefix** — a DEK
+// rotation applied to one volume of a lineage rather than to the lineage. Nothing rotates
+// a DEK today (there is no rotation verb anywhere in this repository), and if one is
+// added it must be per lineage. It fails closed rather than silently if it is not: the
+// create-only PUT means the first ciphertext owns the key, and the other volume's load
+// fails its authentication rather than returning anything.
+//
+// Deriving the nonce instead was considered and rejected in both available shapes, and
+// both reasons survive this change — the first with more force than before. From a
 // generation counter: chunks are uploaded *before* the compare-and-set that decides which
-// writer wins, so two hosts at the same generation with different content would seal two
-// plaintexts under one nonce — the catastrophic case. From the plaintext digest: unique
-// per content, but it makes the nonce a function of the secret.
-//
-// The key is the plaintext digest, so dedup survives — an unchanged region is skipped
-// rather than transferred, and re-sealing it (which is what would reuse a nonce) never
-// happens. The cost is the one every deduplicating encrypted store pays: equality of
-// plaintexts is observable within a volume, to someone who can already read the bucket.
+// writer wins, so two writers at the same generation with different content would seal
+// two plaintexts under one nonce, which is the catastrophic case — and a lineage now has
+// several volumes publishing into one key space, each with its own generation. From the
+// plaintext digest: unique per content, but it makes the nonce a function of the secret.
 package image
 
 import (
@@ -97,20 +169,55 @@ type Manifest struct {
 	Sequence uint64 `json:"sequence"`
 }
 
-// Prefix is where a volume's image lives.
+// Ident is the pair of ids every operation in this package needs, and which are the same
+// id for every volume that was never cloned.
+//
+// It is a struct rather than two parameters because they are both [16]byte and adjacent,
+// and swapping them is silent: the chunks land under a prefix nothing else will look in,
+// the manifest describes the wrong volume, and — for a root volume, which is most of
+// them — the two are equal, so no test that does not involve a clone can tell. A field
+// name at every call site is what makes that mistake impossible to write.
+type Ident struct {
+	// Volume owns the manifest and the snapshots. It is the id in the manifest body and
+	// the one readManifest checks the object against.
+	Volume [16]byte
+	// Lineage is the root of the clone chain this volume belongs to — itself, for a
+	// volume that descends from nothing. It names the chunk store and it is what the
+	// chunk AAD binds, because it is the scope of the DEK: see the package doc.
+	Lineage [16]byte
+}
+
+// OwnLineage is the Ident of a volume that descends from nothing, so its chunks are its
+// own. Every non-clone is this, which is why it has a name.
+func OwnLineage(volumeID [16]byte) Ident { return Ident{Volume: volumeID, Lineage: volumeID} }
+
+// Prefix is where a volume's image lives: its manifest and its snapshots. Not its
+// chunks — those belong to the lineage (ChunksPrefix), which is what makes a clone's
+// bytes shareable with its parent's.
 func Prefix(volumeID [16]byte) string { return "image/" + format.UUIDString(volumeID) + "/" }
 
 // ManifestKey is the volume's manifest — the one mutable object, and the one the CAS is on.
 func ManifestKey(volumeID [16]byte) string { return Prefix(volumeID) + "manifest.json" }
 
-func chunkKey(volumeID [16]byte, digest string) string {
-	return Prefix(volumeID) + "chunks/" + digest
+// ChunksPrefix is where a lineage's chunk objects live. It is a top-level prefix rather
+// than something under the root volume's image/ prefix on purpose: these bytes outlive
+// the volume that first wrote them — a clone still reads them after its parent's own
+// manifest is gone — so a delete that clears image/<root>/ must not be able to take a
+// descendant's data with it (DELETION-AND-RECLAIM-SPEC).
+func ChunksPrefix(lineageRoot [16]byte) string {
+	return "chunks/" + format.UUIDString(lineageRoot) + "/"
+}
+
+func chunkKey(lineageRoot [16]byte, digest string) string {
+	return ChunksPrefix(lineageRoot) + digest
 }
 
 // SnapshotKey is where a named, frozen point of a volume lives. It sits under the
-// volume's own prefix so it shares the chunk store: a snapshot of a volume that has
-// barely changed costs almost nothing, which is what makes §2's primary use case —
-// frequent cloning from snapshots — affordable.
+// volume's own prefix because it is a statement about that volume: which ranges it held
+// at which sequence. What makes a snapshot cheap is not where the manifest is but that
+// the chunks it names are already in the lineage's store — a snapshot of a volume that
+// has barely changed transfers a manifest and no bytes, which is what makes §2's primary
+// use case, frequent cloning from snapshots, affordable.
 func SnapshotKey(volumeID [16]byte, snapshotID string) string {
 	return Prefix(volumeID) + "snapshots/" + snapshotID + ".json"
 }
@@ -139,8 +246,8 @@ var ErrSnapshotExists = errors.New("image: this snapshot is already published an
 // Create-only, because §5.2 says a PUBLISHED snapshot is immutable and because two
 // writers racing to publish the same id must not both think they won. The chunks are the
 // volume's own, so nothing is copied that already exists.
-func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, view *cow.IntervalMap, seq uint64, snapshotID string) (string, error) {
-	man, err := uploadChunks(ctx, store, rnd, enc, volumeID, view, seq)
+func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view *cow.IntervalMap, seq uint64, snapshotID string) (string, error) {
+	man, err := uploadChunks(ctx, store, rnd, enc, id, view, seq)
 	if err != nil {
 		return "", err
 	}
@@ -148,7 +255,7 @@ func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader
 	if err != nil {
 		return "", err
 	}
-	res, err := store.Put(ctx, SnapshotKey(volumeID, snapshotID), body, objectstore.PutOptions{IfNoneMatch: true})
+	res, err := store.Put(ctx, SnapshotKey(id.Volume, snapshotID), body, objectstore.PutOptions{IfNoneMatch: true})
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
 		return "", fmt.Errorf("%w: %s", ErrSnapshotExists, snapshotID)
 	}
@@ -161,8 +268,8 @@ func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader
 // LoadSnapshot reads a named frozen point. It is what a clone reads: the parent's *live*
 // image would carry writes the parent made after the snapshot, which is not what a clone
 // descending from that snapshot is entitled to see.
-func LoadSnapshot(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, snapshotID string) (*cow.IntervalMap, Manifest, error) {
-	return LoadSnapshotOver(ctx, store, enc, volumeID, snapshotID, nil)
+func LoadSnapshot(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident, snapshotID string) (*cow.IntervalMap, Manifest, error) {
+	return LoadSnapshotOver(ctx, store, enc, id, snapshotID, nil)
 }
 
 // LoadSnapshotOver reads a named frozen point as a layer *over* base: this snapshot's
@@ -178,8 +285,8 @@ func LoadSnapshot(ctx context.Context, store objectstore.Store, enc *wal.Encrypt
 // SetBase later (cow.IntervalMap.SetBase), and that refusal is what stops a published
 // image from having a parent slid underneath it — see agent.fetchBase for why that
 // refusal is a protection and not an obstacle.
-func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, snapshotID string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, error) {
-	view, man, _, err := loadManifest(ctx, store, enc, volumeID, SnapshotKey(volumeID, snapshotID), base)
+func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident, snapshotID string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, error) {
+	view, man, _, err := loadManifest(ctx, store, enc, id, SnapshotKey(id.Volume, snapshotID), base)
 	return view, man, err
 }
 
@@ -194,8 +301,8 @@ func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Enc
 // be none". A mismatch is ErrSuperseded and the publish fails: another incarnation
 // published while this one was uploading, and overwriting it is the silent lost update
 // that ADR-0026 keeps fencing for.
-func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, view *cow.IntervalMap, seq uint64, prevETag string) (string, error) {
-	man, err := uploadChunks(ctx, store, rnd, enc, volumeID, view, seq)
+func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view *cow.IntervalMap, seq uint64, prevETag string) (string, error) {
+	man, err := uploadChunks(ctx, store, rnd, enc, id, view, seq)
 	if err != nil {
 		return "", err
 	}
@@ -207,9 +314,9 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 	if prevETag != "" {
 		opts = objectstore.PutOptions{IfMatch: prevETag}
 	}
-	res, err := store.Put(ctx, ManifestKey(volumeID), body, opts)
+	res, err := store.Put(ctx, ManifestKey(id.Volume), body, opts)
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
-		return "", fmt.Errorf("%w: volume %s", ErrSuperseded, format.UUIDString(volumeID))
+		return "", fmt.Errorf("%w: volume %s", ErrSuperseded, format.UUIDString(id.Volume))
 	}
 	if err != nil {
 		return "", fmt.Errorf("image: publishing the manifest: %w", err)
@@ -222,8 +329,8 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 // which object the manifest is written to and under what precondition, and a second
 // implementation of "put the bytes there" is a second place for the sealing rule to be
 // forgotten.
-func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, view *cow.IntervalMap, seq uint64) (Manifest, error) {
-	man := Manifest{VolumeID: format.UUIDString(volumeID), Sequence: seq}
+func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view *cow.IntervalMap, seq uint64) (Manifest, error) {
+	man := Manifest{VolumeID: format.UUIDString(id.Volume), Sequence: seq}
 
 	for _, r := range view.Ranges() {
 		for off := r.Offset; off < r.Offset+r.Length; {
@@ -239,7 +346,13 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 			// second stop (or a second snapshot) cheap when little changed, and it is
 			// also what makes the encryption safe: skipping means a chunk is sealed
 			// exactly once, ever, so its nonce covers exactly one plaintext.
-			if _, err := store.Head(ctx, chunkKey(volumeID, digest)); err == nil {
+			//
+			// **The skip now spans the lineage**, which is the whole of what the key
+			// space change buys: a clone Heads the key its parent already created and
+			// transfers nothing for every chunk it did not touch. It is also what makes
+			// the sentence above true at the scope of the DEK rather than of the volume
+			// — see the package doc, which used to claim it at the wrong scope.
+			if _, err := store.Head(ctx, chunkKey(id.Lineage, digest)); err == nil {
 				man.Chunks = append(man.Chunks, Chunk{Offset: off, Length: n, Digest: digest})
 				off += n
 				continue
@@ -247,13 +360,14 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 				return Manifest{}, fmt.Errorf("image: checking chunk at %d: %w", off, err)
 			}
 
-			body, err := seal(rnd, enc, volumeID, digest, buf)
+			body, err := seal(rnd, enc, id.Lineage, digest, buf)
 			if err != nil {
 				return Manifest{}, fmt.Errorf("image: sealing chunk at %d: %w", off, err)
 			}
 			// Create-only: a race that puts the same bytes under the same key is
-			// harmless — whichever ciphertext wins decrypts to the same plaintext.
-			_, err = store.Put(ctx, chunkKey(volumeID, digest), body, objectstore.PutOptions{IfNoneMatch: true})
+			// harmless — whichever ciphertext wins decrypts to the same plaintext, since
+			// every volume of a lineage seals with the lineage's one DEK.
+			_, err = store.Put(ctx, chunkKey(id.Lineage, digest), body, objectstore.PutOptions{IfNoneMatch: true})
 			if err != nil && !errors.Is(err, objectstore.ErrPreconditionFailed) {
 				return Manifest{}, fmt.Errorf("image: uploading chunk at %d: %w", off, err)
 			}
@@ -272,16 +386,16 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 // make the first boot the one case that cannot work.
 // The view it returns is unlayered on purpose: a volume's own image supersedes whatever
 // it descends from and must not be given a base afterwards (agent.fetchBase).
-func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte) (*cow.IntervalMap, Manifest, string, error) {
-	return loadManifest(ctx, store, enc, volumeID, ManifestKey(volumeID), nil)
+//
+// It takes the lineage as well as the volume, and a clone genuinely cannot be loaded
+// without it: its own manifest names chunks that live under its lineage's prefix, so a
+// caller that does not know the root cannot find one byte of its data. That is the price
+// of the shared chunk store, and it is paid at the one place that can afford it —
+// agent.fetchBase already resolves the lineage before it loads anything.
+func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident) (*cow.IntervalMap, Manifest, string, error) {
+	return loadManifest(ctx, store, enc, id, ManifestKey(id.Volume), nil)
 }
 
-// loadManifest reads one manifest and the chunks it names. Shared by Load and
-// LoadSnapshot, which differ only in which key they read.
-//
-// Every failure is closed. A manifest that names a chunk which is not there is a *broken*
-// image, not an empty one, and the difference matters: an empty view reads as zeros, and
-// a guest cannot tell those from a range it never wrote.
 // ReadSnapshotManifest returns a snapshot's manifest without materialising its data —
 // what it covers and at which sequence, not the bytes. It needs no key: the manifest is
 // structural metadata and carries no guest data (§15.3), so a catalog rebuilt from a
@@ -316,8 +430,14 @@ func readManifest(ctx context.Context, store objectstore.Store, volumeID [16]byt
 	return man, head.ETag, nil
 }
 
-func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, key string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, string, error) {
-	man, etag, err := readManifest(ctx, store, volumeID, key)
+// loadManifest reads one manifest and the chunks it names. Shared by Load and
+// LoadSnapshot, which differ only in which key they read.
+//
+// Every failure is closed. A manifest that names a chunk which is not there is a *broken*
+// image, not an empty one, and the difference matters: an empty view reads as zeros, and
+// a guest cannot tell those from a range it never wrote.
+func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident, key string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, string, error) {
+	man, etag, err := readManifest(ctx, store, id.Volume, key)
 	if err != nil {
 		return nil, Manifest{}, "", err
 	}
@@ -327,11 +447,11 @@ func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encrypt
 		view = cow.NewIntervalMapOver(base)
 	}
 	for _, c := range man.Chunks {
-		data, err := store.Get(ctx, chunkKey(volumeID, c.Digest))
+		data, err := store.Get(ctx, chunkKey(id.Lineage, c.Digest))
 		if err != nil {
 			return nil, Manifest{}, "", fmt.Errorf("image: chunk %s at offset %d: %w", c.Digest, c.Offset, err)
 		}
-		plain, err := open(enc, volumeID, c.Digest, data)
+		plain, err := open(enc, id.Lineage, c.Digest, data)
 		if err != nil {
 			return nil, Manifest{}, "", fmt.Errorf("image: chunk %s at offset %d: %w", c.Digest, c.Offset, err)
 		}
@@ -361,13 +481,17 @@ func min64(a, b uint64) uint64 {
 // seal wraps one chunk. A nil enc is the unencrypted mode — no KMS on this Agent, which
 // §15 allows only for dev — and the bytes go as they are.
 //
-// The AAD binds the ciphertext to the volume and to the chunk's identity, so a chunk
-// cannot be moved between volumes or relabelled inside one and still open.
-func seal(rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, digest string, plain []byte) ([]byte, error) {
+// The AAD binds the ciphertext to the *lineage* and to the chunk's identity, so a chunk
+// cannot be moved between lineages or relabelled inside one and still open. It does not
+// bind the volume that wrote it, and that is the point of the whole key space: a chunk a
+// parent sealed is one its clone opens, under the DEK they share. See the package doc for
+// what protects a chunk from being substituted for another *inside* a lineage — the
+// digest check in loadManifest, not this.
+func seal(rnd io.Reader, enc *wal.Encryption, lineageRoot [16]byte, digest string, plain []byte) ([]byte, error) {
 	if enc == nil {
 		return plain, nil
 	}
-	nonce, sealed, err := enc.DEK.SealRandom(rnd, chunkAAD(volumeID, digest), plain)
+	nonce, sealed, err := enc.DEK.SealRandom(rnd, chunkAAD(lineageRoot, digest), plain)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +500,7 @@ func seal(rnd io.Reader, enc *wal.Encryption, volumeID [16]byte, digest string, 
 
 // open is seal's inverse. It refuses a body too short to hold a nonce rather than
 // slicing past the end of it.
-func open(enc *wal.Encryption, volumeID [16]byte, digest string, body []byte) ([]byte, error) {
+func open(enc *wal.Encryption, lineageRoot [16]byte, digest string, body []byte) ([]byte, error) {
 	if enc == nil {
 		return body, nil
 	}
@@ -385,9 +509,9 @@ func open(enc *wal.Encryption, volumeID [16]byte, digest string, body []byte) ([
 	}
 	var nonce [crypto.NonceSize]byte
 	copy(nonce[:], body[:crypto.NonceSize])
-	return enc.DEK.OpenRandom(nonce, chunkAAD(volumeID, digest), body[crypto.NonceSize:])
+	return enc.DEK.OpenRandom(nonce, chunkAAD(lineageRoot, digest), body[crypto.NonceSize:])
 }
 
-func chunkAAD(volumeID [16]byte, digest string) []byte {
-	return append(append([]byte("image-chunk"), volumeID[:]...), digest...)
+func chunkAAD(lineageRoot [16]byte, digest string) []byte {
+	return append(append([]byte("image-chunk"), lineageRoot[:]...), digest...)
 }

@@ -28,7 +28,7 @@ func TestASecondPublisherIsRefusedRatherThanOverwriting(t *testing.T) {
 
 	first := cow.NewIntervalMap()
 	first.Overwrite(0, bytes.Repeat([]byte{0x11}, 512))
-	etag, err := image.Publish(ctx, store, rand.Reader, nil, vol, first, 1, "")
+	etag, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), first, 1, "")
 	if err != nil {
 		t.Fatalf("the first publish: %v", err)
 	}
@@ -37,13 +37,13 @@ func TestASecondPublisherIsRefusedRatherThanOverwriting(t *testing.T) {
 	// booted the volume believing it had none — the exact split-brain the CAS is for.
 	second := cow.NewIntervalMap()
 	second.Overwrite(0, bytes.Repeat([]byte{0x22}, 512))
-	if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, second, 1, ""); !errors.Is(err, image.ErrSuperseded) {
+	if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), second, 1, ""); !errors.Is(err, image.ErrSuperseded) {
 		t.Fatalf("a second publisher overwrote the first: want ErrSuperseded, got %v", err)
 	}
 
 	// And the first host's data is still what the volume holds. Asserting the error is
 	// not enough: a refusal that had already replaced the manifest would satisfy it.
-	loaded, _, _, err := image.Load(ctx, store, nil, vol)
+	loaded, _, _, err := image.Load(ctx, store, nil, image.OwnLineage(vol))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestASecondPublisherIsRefusedRatherThanOverwriting(t *testing.T) {
 	// it holds. A fence that also blocks the writer it protects is not a fence.
 	third := cow.NewIntervalMap()
 	third.Overwrite(0, bytes.Repeat([]byte{0x33}, 512))
-	if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, third, 2, etag); err != nil {
+	if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), third, 2, etag); err != nil {
 		t.Fatalf("the rightful writer was refused its own volume: %v", err)
 	}
 }
@@ -71,14 +71,14 @@ func TestAStaleETagIsRefused(t *testing.T) {
 
 	v := cow.NewIntervalMap()
 	v.Overwrite(0, bytes.Repeat([]byte{0xAA}, 256))
-	stale, err := image.Publish(ctx, store, rand.Reader, nil, vol, v, 1, "")
+	stale, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), v, 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, v, 2, stale); err != nil {
+	if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), v, 2, stale); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := image.Publish(ctx, store, rand.Reader, nil, vol, v, 3, stale); !errors.Is(err, image.ErrSuperseded) {
+	if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), v, 3, stale); !errors.Is(err, image.ErrSuperseded) {
 		t.Fatalf("a stale ETag published anyway: want ErrSuperseded, got %v", err)
 	}
 }
@@ -86,7 +86,7 @@ func TestAStaleETagIsRefused(t *testing.T) {
 // A volume nobody has published is not an error: it is the first boot, and the only
 // case that would otherwise be impossible.
 func TestAVolumeWithNoImageIsNotAFailure(t *testing.T) {
-	if _, _, _, err := image.Load(t.Context(), sim.NewObjectStore(), nil, vol7()); !errors.Is(err, image.ErrNotPublished) {
+	if _, _, _, err := image.Load(t.Context(), sim.NewObjectStore(), nil, image.OwnLineage(vol7())); !errors.Is(err, image.ErrNotPublished) {
 		t.Fatalf("want ErrNotPublished for a volume that never stopped, got %v", err)
 	}
 }

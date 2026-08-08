@@ -269,17 +269,25 @@ func (hidingStore) List(context.Context, string) ([]objectstore.ObjectInfo, erro
 }
 
 func (h hidingStore) Head(ctx context.Context, key string) (objectstore.ObjectInfo, error) {
-	if strings.HasPrefix(key, "image/") {
+	if hidden(key) {
 		return objectstore.ObjectInfo{}, objectstore.ErrNotFound
 	}
 	return h.Store.Head(ctx, key)
 }
 
 func (h hidingStore) Get(ctx context.Context, key string) ([]byte, error) {
-	if strings.HasPrefix(key, "image/") {
+	if hidden(key) {
 		return nil, objectstore.ErrNotFound
 	}
 	return h.Store.Get(ctx, key)
+}
+
+// hidden is every prefix a volume's durable state lives under: its manifests, and — since
+// the chunk store moved to the lineage — the chunks, which are no longer inside image/.
+// A fault that hid the manifests and left the chunks readable would still be a volume that
+// cannot be found, but it would not be the fault this claims to inject.
+func hidden(key string) bool {
+	return strings.HasPrefix(key, "image/") || strings.HasPrefix(key, "chunks/")
 }
 
 // DurableRangeChecker enforces, from the guest's side, the promise INV-08 and INV-13
@@ -361,7 +369,10 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
 	parentDone := cow.NewIntervalMap()
 	parentDone.Overwrite(0, payload)
-	if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, parentVol, parentDone, 1, snapID); err != nil {
+	// The parent descends from nothing, so it is its own lineage root and its chunks are
+	// under its own id (image.ChunksPrefix). The clone will resolve the same root by
+	// walking, which is the only reason it can find these bytes at all.
+	if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, image.OwnLineage(parentVol), parentDone, 1, snapID); err != nil {
 		return fmt.Errorf("publishing the parent's snapshot: %w", err)
 	}
 	// The descriptor a provisioner writes. The clone's Agent reads it to learn whether the
@@ -459,32 +470,42 @@ func scenarioACloneOfACloneReadsItsGrandparentsBytes(s *Sim) error {
 	// publish writes one ancestor as it will exist once publishing stops flattening: a
 	// snapshot naming only this volume's own range, and a descriptor carrying its link
 	// upward — the only place the bucket states a lineage.
-	publish := func(payload []byte, offset uint64, parent descriptor.Descriptor) (string, string, error) {
+	//
+	// The root is passed in rather than derived because it is what the whole chain's
+	// chunks are keyed by: a zero root means "this volume is the top", and every volume
+	// below it seals into the same prefix under the same DEK (image.Ident). Publishing
+	// each ancestor under its *own* id would scatter the lineage's bytes across three
+	// prefixes, and the Agent's walk — which resolves one root — would find none of them.
+	publish := func(payload []byte, offset uint64, root [16]byte, parent descriptor.Descriptor) (string, string, [16]byte, error) {
 		volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
 		u, err := ids.Parse(volumeID)
 		if err != nil {
-			return "", "", err
+			return "", "", root, err
+		}
+		id := image.Ident{Volume: [16]byte(u), Lineage: root}
+		if root == ([16]byte{}) {
+			id = image.OwnLineage([16]byte(u))
 		}
 		own := cow.NewIntervalMap()
 		own.Overwrite(offset, payload)
 		snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
-		if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, [16]byte(u), own, 1, snapID); err != nil {
-			return "", "", fmt.Errorf("publishing the snapshot of %s: %w", volumeID, err)
+		if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, id, own, 1, snapID); err != nil {
+			return "", "", id.Lineage, fmt.Errorf("publishing the snapshot of %s: %w", volumeID, err)
 		}
 		if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
 			VolumeID: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, CurrentEpoch: 1,
 			ParentSnapshotID: parent.ParentSnapshotID, ParentVolumeID: parent.ParentVolumeID,
 		}); err != nil {
-			return "", "", fmt.Errorf("writing the descriptor of %s: %w", volumeID, err)
+			return "", "", id.Lineage, fmt.Errorf("writing the descriptor of %s: %w", volumeID, err)
 		}
-		return volumeID, snapID, nil
+		return volumeID, snapID, id.Lineage, nil
 	}
 
-	grandID, grandSnap, err := publish(grandBytes, grandparentOffset, descriptor.Descriptor{})
+	grandID, grandSnap, root, err := publish(grandBytes, grandparentOffset, [16]byte{}, descriptor.Descriptor{})
 	if err != nil {
 		return err
 	}
-	parentID, parentSnap, err := publish(parentBytes, parentOffset, descriptor.Descriptor{
+	parentID, parentSnap, _, err := publish(parentBytes, parentOffset, root, descriptor.Descriptor{
 		ParentSnapshotID: grandSnap, ParentVolumeID: grandID,
 	})
 	if err != nil {
@@ -1094,9 +1115,17 @@ func aStoppedVolumeComesBack(s *Sim, hideImage bool) error {
 	if err != nil {
 		return err
 	}
-	if len(objs) == 0 {
+	// The chunks are under chunks/<lineage>/, not under the volume's image prefix, and
+	// they are the objects that carry guest bytes at all: listing image/ alone would
+	// check manifests for a leak and never look at a sealed chunk.
+	chunks, err := s.Store.List(ctx, "chunks/")
+	if err != nil {
+		return err
+	}
+	if len(objs) == 0 || len(chunks) == 0 {
 		return errors.New("stopping the volume published nothing: the session's writes exist only on a host that has released them")
 	}
+	objs = append(objs, chunks...)
 	// §5.10/INV-15: what left the host is sealed.
 	for _, o := range objs {
 		body, err := s.Store.Get(ctx, o.Key)

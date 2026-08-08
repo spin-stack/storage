@@ -191,7 +191,7 @@ func TestThePublishedImageHoldsWhatTheGuestWrote(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := [16]byte(uu)
-	view, _, _, err := image.Load(t.Context(), store, nil, u)
+	view, _, _, err := image.Load(t.Context(), store, nil, image.OwnLineage(u))
 	if err != nil {
 		t.Fatalf("the published image does not load: %v", err)
 	}

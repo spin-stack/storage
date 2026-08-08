@@ -42,7 +42,7 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 	view := cow.NewIntervalMap()
 	view.Overwrite(0, []byte("the guest's bytes"))
 	snap = ids.New().String()
-	if _, err := image.PublishSnapshot(ctx, store, &ramp{}, nil, [16]byte(u), view, 9, snap); err != nil {
+	if _, err := image.PublishSnapshot(ctx, store, &ramp{}, nil, image.OwnLineage([16]byte(u)), view, 9, snap); err != nil {
 		t.Fatalf("PublishSnapshot: %v", err)
 	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{

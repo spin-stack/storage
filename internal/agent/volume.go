@@ -24,6 +24,7 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
+	"github.com/spin-stack/storage/internal/wal/format"
 )
 
 // Volume is one volume's data path on this host: the WAL it appends to, the block
@@ -59,6 +60,15 @@ type Volume struct {
 	enc *wal.Encryption
 	// vol is the volume id as the object store keys use it.
 	vol [16]byte
+	// lineage is the root of the clone chain this volume belongs to — itself, unless it
+	// descends from something. It is where its *chunks* live and what their AAD binds
+	// (image.Ident), because the whole chain shares one DEK.
+	//
+	// Resolved by fetchBase, from the walk it already does, before it reads a byte:
+	// a clone cannot find one chunk of its own image without it. Written there before
+	// baseDone closes and read only after a wait on it — like inheritedBytes below, and
+	// for the same reason the two need no lock.
+	lineage [16]byte
 	// imageETag is the manifest this volume booted from, and what its own publish CASes
 	// against (ADR-0026). Empty means there was none — a first boot — and publishing
 	// with an empty ETag is create-only, so a first boot racing another still produces
@@ -96,12 +106,14 @@ type Volume struct {
 	// snapshot. Both are zero for every volume that is not a clone in the one session
 	// before its first stop, which is the only session that pays for them.
 	//
-	// They exist to be logged. A clone's first publish re-seals and re-uploads the whole
-	// inherited dataset under its own prefix — `image.uploadChunks` walks `view.Ranges()`
-	// and cow reports the base's ranges merged with this layer's — so a clone that wrote
-	// one sector still stops for as long as its parent's data takes to upload. Measured
-	// in internal/image's TestACloneFirstStopCopiesWhatItInherited; until this field
-	// existed there was nothing an operator could read that said why.
+	// They exist to be logged. A clone's first publish still *names* the whole inherited
+	// dataset — `image.uploadChunks` walks `view.Ranges()` and cow reports the base's
+	// ranges merged with this layer's, which is what step 3 of CHUNK-ADDRESSING-SPEC
+	// changes — but since the chunk store moved to the lineage it no longer re-uploads
+	// it: every chunk the clone did not touch is already under the lineage's prefix and
+	// the Head skip finds it. What is left of the cost is the chunks it *did* touch,
+	// whole, and the manifest that names them all. Measured in internal/image's
+	// TestACloneFirstStopCopiesWhatItInherited.
 	//
 	// Written by fetchBase before it closes baseDone, read only after a wait on it, so
 	// the two do not need a lock.
@@ -209,6 +221,17 @@ func (v *Volume) release() error {
 // that can end it; a restart is what re-fetches the base and republishes.
 var ErrNoReadView = errors.New("agent: the volume's read view never resolved, so its image would be missing everything it held before this session")
 
+// ident is the pair image keys everything by: this volume, and the lineage whose chunk
+// store holds its bytes.
+//
+// Every caller of it is downstream of a wait on baseDone — publish, snapshot — because
+// fetchBase is what resolves the lineage of a clone. A caller that skipped that wait
+// would publish a clone's chunks under the clone's own id, where the next reader of that
+// manifest will not look for them, and nothing would report a failure.
+func (v *Volume) ident() image.Ident {
+	return image.Ident{Volume: v.vol, Lineage: v.lineage}
+}
+
 // publish writes the volume's state to the object store. It is the whole durability
 // contract of V1 (ADR-0026): nothing else leaves the host, and what this writes is what
 // the next boot — or a clone — reads.
@@ -247,7 +270,7 @@ func (v *Volume) publish(ctx context.Context) error {
 		v.rec.Observe(ctx, "image_publish_duration_seconds", v.clk.Now().Sub(start).Seconds(),
 			obs.String("volume", v.id))
 	}()
-	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.vol, view, seq, v.imageETag)
+	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.ident(), view, seq, v.imageETag)
 	if err != nil {
 		return fmt.Errorf("agent: volume %s: publishing its image at sequence %d: %w", v.id, seq, err)
 	}
@@ -256,22 +279,25 @@ func (v *Volume) publish(ctx context.Context) error {
 	return nil
 }
 
-// sayWhatThisImageCosts prints the size of what is about to be uploaded, and how much of
+// sayWhatThisImageCosts prints the size of the image about to be written, and how much of
 // it this volume never wrote.
 //
 // **Before the upload, not after, and that is the whole point.** The operator's question
-// is asked while a stop is hanging — a clone of a 40 GiB golden image that wrote one
-// sector still uploads 40 GiB at its first stop, because publishing flattens
-// (`image.uploadChunks` walks `view.Ranges()`, which merges the parent's ranges into this
-// layer's). A line printed when the publish finishes cannot answer a question about why it
-// has not finished. Nothing else in the process says this: the durability histogram is
-// recorded on the way out, and `chain_depth` has no producer.
+// is asked while a stop is hanging, and a line printed when the publish finishes cannot
+// answer a question about why it has not finished. Nothing else in the process says this:
+// the durability histogram is recorded on the way out, and `chain_depth` has no producer.
 //
-// It is printed for a snapshot too, because the snapshot's manifest names the same copy
-// under this volume's prefix. The *transfer* is paid once — `uploadChunks` skips a chunk
-// whose key already exists, so the second upload of the same content moves no bytes
-// (internal/image's TestASecondStopPaysOnlyForWhatItTouched) — which is why the message
-// is about what the image contains rather than about what crosses the wire.
+// What the second line claims changed with the key space, and the change is the subject of
+// the increment that moved it. It used to say a clone "copies the dataset it inherited
+// under its own prefix", which was the truth while chunks were keyed by volume: a clone of
+// a 40 GiB golden image that wrote one sector re-sealed and re-uploaded 40 GiB. Now the
+// chunks are keyed by the lineage, the clone Heads keys its parent already created, and
+// what it transfers is the chunks it actually touched. The image still *names* the
+// inherited ranges — publishing flattens until step 3 of CHUNK-ADDRESSING-SPEC — so the
+// number is still worth printing, but as what this manifest covers rather than as what is
+// crossing the wire.
+//
+// It is printed for a snapshot too, for the same reason and with the same meaning.
 //
 // Summing Ranges() is O(extents), the fold `cow.Cost` deliberately avoids. That is right
 // here and wrong there: Cost is recorded at the WAL's flush cadence, on every guest
@@ -285,9 +311,10 @@ func (v *Volume) sayWhatThisImageCosts(view *cow.IntervalMap) {
 		slog.Info("publishing the volume's image", "volume_id", v.id, "image_bytes", n)
 		return
 	}
-	slog.Info("publishing the volume's image, which copies the dataset it inherited from its parent under its own prefix",
+	slog.Info("publishing the volume's image, which names the dataset it inherited from its parent; the chunks it did not touch are already in its lineage's store and are not re-uploaded",
 		"volume_id", v.id, "image_bytes", n,
-		"inherited_bytes", v.inheritedBytes, "parent_snapshot_id", v.inheritedFrom)
+		"inherited_bytes", v.inheritedBytes, "parent_snapshot_id", v.inheritedFrom,
+		"lineage_root", format.UUIDString(v.lineage))
 }
 
 // liveBytes is how many bytes a view answers with — the sum of the ranges it reports,
@@ -833,7 +860,11 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		id: id, epoch: d.GetEpoch(), root: root, socket: socket,
 		log: log, dev: dev, enc: enc,
 		vol: [16]byte(u), store: m.deps.Store, rnd: m.deps.Rand,
-		clk: m.deps.Clock, rec: m.deps.Recorder,
+		// Its own lineage until the walk in fetchBase says otherwise. The zero value
+		// would be a chunk prefix no reader ever looks under, so the field is never
+		// allowed to hold it, not even for the moment before the walk runs.
+		lineage: [16]byte(u),
+		clk:     m.deps.Clock, rec: m.deps.Recorder,
 		done:  make(chan struct{}),
 		snaps: map[string]*snapState{},
 	}
@@ -933,19 +964,56 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	// manifest and every chunk it names were being GET on every attach of every clone,
 	// for a view that was then thrown away.
 	//
+	// **The lineage is resolved before anything is read**, and for a clone that is not
+	// bookkeeping: its chunks live under the root of its chain, so without the root this
+	// volume cannot find one byte of *its own* image (image.ChunksPrefix). The walk that
+	// produces it is the same one parentView needs, done once here and passed down.
+	//
+	// This is what the key-space change costs at attach, and it is worth stating plainly:
+	// a clone that already has an image now pays one GET per link — descriptors, small
+	// and cleartext — where before it read nothing but its own manifest. A volume that
+	// descends from nothing pays nothing at all, because parentChain returns on the empty
+	// parent link before it touches the store, and that is nearly every volume.
+	//
+	// Rejected: recording the root in the volume's own descriptor and reading that
+	// instead, one GET whatever the depth. It duplicates a fact the chain already states
+	// — and a duplicate that can disagree with the chain is a way for a volume's chunks
+	// to be written under a prefix its own ancestry says is the wrong one. Rejected too:
+	// carrying it in DesiredVolume, for the reason in parentChain — the bucket is the
+	// authority a rebuild trusts, and ADR-0021 is not the obstacle here, the second copy
+	// is.
+	chain, err := m.parentChain(ctx, v, d)
+	if err != nil {
+		// Fail closed. A volume whose lineage cannot be resolved is one whose chunk
+		// store cannot be named, so there is no view to serve and no prefix to publish
+		// into — proceeding would write this session under the wrong root.
+		slog.Error("the volume's lineage could not be resolved; its reads will fail",
+			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
+		v.baseFailed = true
+		v.log.FailBase(err)
+		return
+	}
+
+	if len(chain) > 0 {
+		// parentChain returns nearest ancestor first, so the last link is the volume
+		// that descends from nothing: the lineage root, and the owner of the DEK the
+		// whole chain shares (controlplane.Clone).
+		v.lineage = chain[len(chain)-1].id
+	}
+
 	// v.enc, not nil: the chunks are sealed under this volume's DEK, and loading them
 	// without it would fold ciphertext into the read view (DEV-0019).
-	base, man, etag, err := image.Load(ctx, m.deps.Store, v.enc, volumeID)
+	base, man, etag, err := image.Load(ctx, m.deps.Store, v.enc, v.ident())
 	switch {
 	case errors.Is(err, image.ErrNotPublished):
 		// A volume that has never stopped cleanly has no image, which is the first boot
 		// and must work. Its base is whatever its parent gives it, or nothing.
 		//
 		// This is the only session in which a clone reads *through* its parent (§20):
-		// its own objects do not exist yet, so everything lives under the parent's
-		// volume id. The parent's view becomes the base outright — not a layer under
-		// this one — and the clone's own extents shadow it as they arrive.
-		parent, perr := m.parentView(ctx, v, d)
+		// it has no manifest of its own yet, so what it can read is what its ancestors'
+		// snapshots name. The parent's view becomes the base outright — not a layer
+		// under this one — and the clone's own extents shadow it as they arrive.
+		parent, perr := m.parentView(ctx, v, chain)
 		if perr != nil {
 			// Fail closed, the same rule as a base that cannot be recovered and for the
 			// same reason: an empty view where data belongs is a wrong answer a guest
@@ -1045,11 +1113,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 // Rejected: keeping the single link until then. It leaves the walk with no caller — what
 // CLAUDE.md calls a liability rather than progress — and moves the discovery above into
 // the step that can least afford to make it.
-func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.DesiredVolume) (*cow.IntervalMap, error) {
-	chain, err := m.parentChain(ctx, v, d)
-	if err != nil {
-		return nil, err
-	}
+func (m *VolumeManager) parentView(ctx context.Context, v *Volume, chain []ancestor) (*cow.IntervalMap, error) {
 	if len(chain) == 0 {
 		return nil, nil //nolint:nilnil // no parent is a shape, not a failure
 	}
@@ -1062,18 +1126,20 @@ func (m *VolumeManager) parentView(ctx context.Context, v *Volume, d *storagev1.
 		if err != nil {
 			return nil, err
 		}
-		// **Which volume id opens an ancestor's chunk is this argument, not the key the
-		// Encryption is bound to.** `image.open` builds its AAD from
-		// `chunkAAD(volumeID, digest)`, and volumeID is the parameter passed here — so a
-		// chunk opens under this volume's DEK, which the whole lineage shares because
-		// each clone inherits its parent's (controlplane.Clone), plus *that ancestor's*
-		// id. Pass the wrong one and the snapshot key is wrong before the AAD ever is.
+		// **The two ids are different things here, which is why image takes them as one
+		// named pair.** The ancestor's own id says which manifest to read — a snapshot
+		// is addressed under the volume it belongs to. The lineage root says where that
+		// manifest's chunks are and what their AAD binds, and it is *this volume's*
+		// root, which is the same root as every ancestor's precisely because they are
+		// one chain. Getting the first wrong reads the wrong manifest; getting the
+		// second wrong finds no chunk at all, or one that will not open.
 		//
 		// The snapshot, not the ancestor's live image: an ancestor that is still running
 		// has written past the point this lineage descends from, and its image carries
 		// those writes. §19 makes the distinction cheap — a snapshot is a frozen view at
-		// a sequence, sharing the volume's chunks.
-		next, _, err := image.LoadSnapshotOver(ctx, m.deps.Store, penc, a.id, a.snapshot, view)
+		// a sequence, naming chunks the lineage already holds.
+		next, _, err := image.LoadSnapshotOver(ctx, m.deps.Store, penc,
+			image.Ident{Volume: a.id, Lineage: v.lineage}, a.snapshot, view)
 		if errors.Is(err, image.ErrNotPublished) {
 			// Not this volume's failure to hide: a lineage whose snapshot was never
 			// published would read zeros for everything that ancestor wrote.
@@ -1668,7 +1734,7 @@ func (m *VolumeManager) snapshot(ctx context.Context, v *Volume, snapshotID stri
 	defer func() {
 		m.deps.Recorder.Observe(ctx, "snapshot_publish_duration_seconds", m.deps.Clock.Now().Sub(publishStart).Seconds(), vol)
 	}()
-	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.vol, frozen, seq, snapshotID); err != nil {
+	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.ident(), frozen, seq, snapshotID); err != nil {
 		if !errors.Is(err, image.ErrSnapshotExists) {
 			return 0, fmt.Errorf("agent: volume %s: publishing snapshot %s: %w", v.id, snapshotID, err)
 		}
@@ -1676,7 +1742,7 @@ func (m *VolumeManager) snapshot(ctx context.Context, v *Volume, snapshotID stri
 		// The manifest is immutable (INV-16), so the sequence to report is *its* one,
 		// not the one just frozen: reporting the later number would put a point in the
 		// catalog that no copy corresponds to.
-		_, man, lerr := image.LoadSnapshot(ctx, m.deps.Store, v.enc, v.vol, snapshotID)
+		_, man, lerr := image.LoadSnapshot(ctx, m.deps.Store, v.enc, v.ident(), snapshotID)
 		if lerr != nil {
 			return 0, fmt.Errorf("agent: volume %s: snapshot %s exists but could not be read: %w", v.id, snapshotID, lerr)
 		}
