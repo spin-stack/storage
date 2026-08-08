@@ -63,8 +63,11 @@
 //
 // Rejected: **one bucket-wide chunks/<digest>**, which is the shape everyone reaches for.
 // It cannot work here and the reason is not the key space, it is the key: two lineages
-// seal the same plaintext under different DEKs, so they produce different ciphertext for
-// one content-addressed key. Whoever created the key owns it and nobody else can open
+// generally seal the same plaintext under different DEKs, so they produce different
+// ciphertext for one content-addressed key. (Generally, not always — a flattened volume
+// and the lineage it left share a DEK. That makes the rejection narrower than it reads,
+// and not weaker: one pair of prefixes that happen to agree does not give a bucket-wide
+// key space a key.) Whoever created the key owns it and nobody else can open
 // what is under it. Making it work needs a bucket-wide DEK, which spends the design
 // document's *"borrado de volumen = crypto-shred"* (§15) to buy dedup between volumes
 // that have nothing to do with each other.
@@ -125,16 +128,29 @@
 // this change a clone re-sealed every byte it inherited under its parent's DEK with a
 // fresh nonce, once per link: the same plaintext, N nonces, one key. That was not a reuse
 // and it was never unsafe, but the sentence that claimed safety was not the sentence that
-// provided it. Now the key space and the key have the same scope, the skip in
-// uploadChunks spans exactly the volumes that share a DEK, and "sealed exactly once,
-// ever" is true as written.
+// provided it. Moving the key space is what put the two in the same scope.
 //
-// The one thing that would break it is **two DEKs inside one chunk prefix** — a DEK
-// rotation applied to one volume of a lineage rather than to the lineage. Nothing rotates
-// a DEK today (there is no rotation verb anywhere in this repository), and if one is
-// added it must be per lineage. It fails closed rather than silently if it is not: the
-// create-only PUT means the first ciphertext owns the key, and the other volume's load
-// fails its authentication rather than returning anything.
+// **"Sealed exactly once, ever" is still not literally true, and it does not need to be.**
+// `lineage.Flatten` re-seals a volume's whole reachable content under its own new lineage
+// root, with fresh nonces, while the DEK does not change — a flatten does not rotate
+// anything. So one DEK spans two chunk prefixes and the same plaintext is sealed twice.
+// That is the *converse* of the hazard this paragraph used to name, it arrived two
+// increments after this text was written, and pretending otherwise would put the
+// repository's oldest documentation defect inside its encryption argument.
+//
+// What matters is that the fact carrying the safety is (2), not (3). A key names its
+// content, so two seals landing on one key are two seals of the *same bytes*: (key, nonce)
+// reuse over *different* plaintexts is impossible whatever the prefix count. (3) bounds
+// how many nonces are drawn for one plaintext, and a flatten costs one more per distinct
+// content — a bounded factor against the 2^32 birthday bound that a 64 MiB chunk puts far
+// out of reach.
+//
+// **The hazard is therefore two DEKs inside one chunk prefix, not one DEK across two.**
+// That would be a rotation applied to one volume of a lineage rather than to the lineage.
+// Nothing rotates a DEK today, and if a verb is added it must be per lineage. It fails
+// closed rather than silently: the create-only PUT means the first ciphertext owns the
+// key, and the other volume's load fails its authentication rather than returning
+// anything.
 //
 // Deriving the nonce instead was considered and rejected in both available shapes, and
 // both reasons survive this change — the first with more force than before. From a

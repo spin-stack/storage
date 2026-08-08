@@ -682,6 +682,32 @@ state named. That is a guest-lane change (track B owns `guestinit`, and it needs
 rebuild), which is why it is recorded here rather than done in the increment that found it.
 **The plant above is the ready-made proof that it would catch something.**
 
+## DEV-0025 — a manifest cannot meet §25.2's bit-corruption half, because it is JSON
+
+Found by the chain's own verifier, 2026-08-08, and disclosed at length by the increment that
+introduced the format — in the property test's doc comment and in track C's entry — but
+recorded nowhere that blocks a gate, which is what this entry fixes.
+
+**Truncation is covered and total**: a manifest cut anywhere fails to parse, and
+`TestADeltaOverAnAncestryRoundTripsAndATruncatedManifestIsRefused` draws the cut. **A flipped
+bit is not.** `"offset":1024` becomes `"offset":1025` and loads clean, so a corrupted manifest
+can describe a volume that never existed rather than being refused. CLAUDE.md's §25.2 asks for
+"arbitrary truncations **and** bit corruptions"; this format can only answer half.
+
+**It got worse with the lineage delta, and the chain said so.** While a manifest was a
+complete image, a moved offset misplaced *this* volume's own bytes. Now that a manifest is a
+delta over an ancestry, a moved or dropped tombstone uncovers an **ancestor's** bytes — data
+resurrection, which is the worst outcome in this area and the one step 3's tests are pointed
+at.
+
+**The fix is named and it already exists in this tree**: frame the manifest the way
+`internal/descriptor` frames its object — a digest line over the bytes *as stored*, not over a
+re-encoding. That package's own comment explains why the obvious alternative fails, and it is
+the same trap here: a digest over a re-marshalled struct cannot see what the decoder
+normalised away, and Go's decoder matches field names case-insensitively.
+
+It is a format change, so it is a human-review zone and it is track C's. It is small.
+
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 
 `WAL-SEGMENTS-SPEC.md` asks that creating a segment be charged against the device budget
@@ -759,7 +785,20 @@ cheapest route to the silent defect and now costs the volume its reads instead
 (`TestRestartWithoutTheKEKRefusesRatherThanAnswering`). One missing flag must not cost a
 guest its data.
 
-## DEV-0020 — a clone chain is flattened by copying, and nothing decided that
+## ~~DEV-0020~~ — a clone chain is flattened by copying, and nothing decided that *(resolved 2026-08-08)*
+
+**Decided and built.** The owner answered `CHUNK-ADDRESSING-SPEC`'s question — `chain_depth`
+is a **structure** — and the five-step chain that follows from it landed: `parentView` walks
+the lineage through each ancestor's descriptor, chunks live under `chunks/<lineage-root>/`
+with the root bound in the AAD, a publish writes only what its own volume holds, the depth
+limit refuses at `controlplane.Clone`, and `lineage.Flatten` is the way back under it. The
+flattening this entry was about is gone; what replaced it is a delta over an ancestry, with
+tombstones carried explicitly because absence now means "ask the layer below".
+
+The account below is left because it is the record of the defect and of what nobody had
+decided. What is *not* left is the claim in its title, which described this tree until
+2026-08-08 and stopped.
+
 
 **Still open, and its mechanism is not the one this entry was opened with (rewritten
 2026-08-04).** As recorded on 2026-08-02 it said `materialize.FromSnapshot` resolves only
