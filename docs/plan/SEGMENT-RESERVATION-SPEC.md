@@ -1,5 +1,24 @@
 # SEGMENT-RESERVATION-SPEC — DEV-0011, now that its blocker has cleared
 
+## DECIDED — 2026-08-08, human owner: **no**. DEV-0011 is closed as accepted, not fixed.
+
+The recommendation below is taken, and one argument was added in review that the spec did
+not make and that points the same way harder than the spec did.
+
+**The spec's case for "yes" rested on making `Log.broken`'s precondition unreachable** — a
+failed rollback, which under ADR-0026 costs a whole session. But the rollback is a
+`Truncate` *downward*, and truncating downward frees blocks: on ext4 and XFS it does not
+fail for want of space, and what would make it fail is an I/O error, which a reservation
+does nothing about. The filesystems where a truncate *can* fail for space are the CoW ones
+whose metadata must allocate — and those are exactly where `fallocate` answers
+`EOPNOTSUPP`. **The reservation buys its headline benefit where it is not needed and does
+not buy it where it might be.**
+
+So the answer to "The question for review" is no, and the entry closes. Everything below
+stands as the record of what was examined, including the two observables that would have
+been mandatory had it gone the other way.
+
+
 **★ Nominally a HUMAN-REVIEW ZONE: on-disk format.** DEV-0011 asks for "a durable write
 offset in the segment", and that is a format change, so this file exists before any code
 does, per CLAUDE.md. **It ends by recommending that no format change be made** — which is

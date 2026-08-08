@@ -740,7 +740,47 @@ normalised away, and Go's decoder matches field names case-insensitively.
 
 It is a format change, so it is a human-review zone and it is track C's. It is small.
 
-## DEV-0011 — a segment's space is charged as used, not reserved at creation
+## ~~DEV-0011~~ — a segment's space is charged as used, not reserved at creation *(closed 2026-08-08: accepted, not fixed)*
+
+**Closed by deciding not to do it**, which is what a spec-before-implementation is for.
+`SEGMENT-RESERVATION-SPEC.md` was written when the blocker cleared and it recommends no
+change; the owner agreed on 2026-08-08. Both premises of the entry below are false, and
+the argument that survived them points the other way too.
+
+**The budget is already charged before the record.** Wave 3's `wal.Limits.MaxLocalBytes`
+is checked against `retainedBytes` before a WRITE is accepted, so no write is ever
+half-accepted for want of *budget*. What is not pre-charged is the filesystem's blocks,
+which is a different claim from the one this entry makes.
+
+**And reserving needs no format change.** `fallocate(FALLOC_FL_KEEP_SIZE)` reserves blocks
+without growing the file, so the file's length remains the durable write offset and no
+zero-filled tail exists to be misread. The "durable write offset in the segment" this entry
+asks for is machinery for a problem that does not arise.
+
+**What is left is one defence, and it is bought in the wrong place.** The failure today is
+lossless: `segments.appendRecord` truncates back to the last intact record, the guest's
+WRITE fails with an error it understands, `Degraded()` latches OUT_OF_SPACE, the sequence
+is not consumed and replay is clean. The only expensive outcome is a *failed rollback*,
+which sets `Log.broken` and — under ADR-0026 — costs the whole session, since a volume that
+cannot serve to its stop never reaches the bucket.
+
+The spec argued a reservation makes that unreachable. It does not, and this is the
+reasoning that closed the entry rather than the spec's own: **the rollback is a `Truncate`
+downward, and truncating downward frees blocks.** On ext4 and XFS it does not fail for want
+of space — it would take an I/O error, which a reservation does not prevent. Where a
+truncate *can* fail for space is a CoW filesystem whose metadata must allocate (btrfs,
+some ZFS), and those are exactly where `fallocate` answers `EOPNOTSUPP`. The reservation
+buys its headline benefit where it is not needed and does not buy it where it might be.
+
+**What would have been required if the answer had been yes**, recorded because it is the
+shape of every guarantee like this: a startup line saying which world the host is in, and a
+simulated filesystem that refuses. Without both, a property that holds on ext4 and is
+silently absent on NFS is machinery that looks like a guarantee — which is what CLAUDE.md's
+opening table is made of.
+
+The original entry follows.
+
+### The original entry
 
 `WAL-SEGMENTS-SPEC.md` asks that creating a segment be charged against the device budget
 *before* the first append, so out-of-space is reached at a segment boundary rather than
