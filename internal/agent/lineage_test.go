@@ -312,12 +312,21 @@ func lineageKeys(t *testing.T) (crypto.KMS, crypto.DEK, []byte) {
 // makes an attach read everything from the bucket instead of replaying local segments.
 func lineageManager(t *testing.T, store objectstore.Store, kms crypto.KMS, wrapped []byte, keyID uint32, dataDir string) *agent.VolumeManager {
 	t.Helper()
+	return lineageManagerOn(t, store, kms, wrapped, keyID, dataDir, sim.NewDisk())
+}
+
+// lineageManagerOn is lineageManager over a caller-owned disk, so two incarnations can
+// share one device and a restart is a new manager against an unchanged device and an
+// unchanged bucket — which is what a restart is. A manager that built its own disk would
+// hide the seam.
+func lineageManagerOn(t *testing.T, store objectstore.Store, kms crypto.KMS, wrapped []byte, keyID uint32, dataDir string, disk *sim.Disk) *agent.VolumeManager {
+	t.Helper()
 	f := newListenerFactory()
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
 		DataDir: dataDir, SocketDir: "/run/spin", Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
-		Disk:    sim.NewDisk(),
+		Disk:    disk,
 		Listen:  f.listen,
 		Mapper:  unusedMapper{},
 		EventFD: unusedEventFD,
@@ -333,4 +342,66 @@ func lineageManager(t *testing.T, store objectstore.Store, kms crypto.KMS, wrapp
 	}
 	t.Cleanup(func() { _ = m.Close(context.Background()) }) //nolint:usetesting // a cancelled context abandons the publish
 	return m
+}
+
+// The depth-3 walk, across a stop and a restart. It is the one arm the chain shipped
+// without: the walk was covered at depth 3 in a *first* session, and the restart was
+// covered at depths 1 and 2, and the crossing of the two was proven by a throwaway probe
+// during verification and then deleted with it.
+//
+// The crossing is not a formality, because the two sessions reach the same bytes by
+// different routes. In the first, the clone has no image and the lineage IS its base. In
+// the second it has published one, so fetchBase loads that image and the walk runs only
+// where the image does not answer — and after the chain stopped flattening, an image
+// answers for less than it used to. A regression that split those two routes would leave
+// the first session green.
+//
+// The offsets discriminate which link failed rather than reporting that something did:
+// one range per ancestor, plus a range the oldest wrote and the nearest overwrote.
+func TestACloneReadsThroughThreeAncestorsAfterARestart(t *testing.T) {
+	const (
+		oldestOnly = int64(0)
+		middleOnly = int64(4 * testBlockSize)
+		nearestOly = int64(8 * testBlockSize)
+		shared     = int64(12 * testBlockSize)
+		ownWrite   = int64(16 * testBlockSize)
+	)
+	store := sim.NewObjectStore()
+	kms, dek, wrapped := lineageKeys(t)
+
+	oldest := publishAncestor(t, store, dek, ancestorSpec{
+		writes: map[int64]byte{oldestOnly: 0xA1, shared: 0xA1},
+	})
+	middle := publishAncestor(t, store, dek, ancestorSpec{
+		parent: oldest,
+		writes: map[int64]byte{middleOnly: 0xB2},
+	})
+	nearest := publishAncestor(t, store, dek, ancestorSpec{
+		parent: middle,
+		writes: map[int64]byte{nearestOly: 0xC3, shared: 0xC3},
+	})
+
+	v := desiredVolume(t, 1)
+	descendsFrom(t, store, v, nearest)
+
+	// One disk across both sessions: the restart must find its own WAL where it left it.
+	disk := sim.NewDisk()
+	first := lineageManagerOn(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-lineage-restart", disk)
+	dev := serveClone(t, first, v)
+	readBlock(t, dev, oldestOnly, 0xA1, "first session, three links up")
+	writeBlock(t, dev, ownWrite, 0xD4)
+	// Stopping publishes the clone's own image, which is what makes the second session a
+	// different problem from the first.
+	if err := first.Close(t.Context()); err != nil {
+		t.Fatalf("closing the first session: %v", err)
+	}
+
+	second := lineageManagerOn(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-lineage-restart", disk)
+	defer func() { _ = second.Close(t.Context()) }()
+	again := serveClone(t, second, v)
+	readBlock(t, again, oldestOnly, 0xA1, "after a restart: the range only the great-grandparent wrote, three links up")
+	readBlock(t, again, middleOnly, 0xB2, "after a restart: the range only the grandparent wrote, two links up")
+	readBlock(t, again, nearestOly, 0xC3, "after a restart: the range only the parent wrote, one link up")
+	readBlock(t, again, shared, 0xC3, "after a restart: the nearest ancestor's overwrite still wins over the oldest's")
+	readBlock(t, again, ownWrite, 0xD4, "after a restart: what the clone itself wrote in its first session")
 }
