@@ -22,6 +22,33 @@
 // problem into one compare-and-set (§12, ADR-0026): two incarnations of a volume must
 // not both publish, and one CAS on one key is the entirety of that.
 //
+// # A manifest states its own volume, not its ancestry
+//
+// This is the second half of CHUNK-ADDRESSING-SPEC's decision and it changes what reading
+// an image means. A manifest used to be **flattened**: a publish serialised the volume's
+// whole read view, so a clone's first stop wrote down every range its parent's snapshot
+// held, under the clone's own name, and any one manifest could be read alone. It is now a
+// **delta** — what this volume's own layers state — and reading a clone means composing
+// its ancestry first and laying the delta over it (agent.parentChain walks the lineage,
+// agent.fetchBase does the composing).
+//
+// Three things follow, and none of them is optional:
+//
+//   - **Absence changed meaning.** In a flattened manifest a range nobody named read as
+//     zeros. In a delta it means "ask the layer below", so an erasure needs a word of its
+//     own — Manifest.Discarded — or every DISCARD becomes data resurrection on the next
+//     boot (§14.6).
+//   - **A clone stopped being self-contained.** Its image cannot be read without its
+//     ancestors' snapshots, so deleting a parent takes its descendants with it unless
+//     they are flattened first (DELETION-AND-RECLAIM-SPEC's decision of 2026-08-07: a
+//     delete of a volume with descendants flattens them).
+//   - **The read path grows with depth.** Attaching a clone is one descriptor GET and one
+//     snapshot manifest per link, plus the chunks each names. That is what the ceiling of
+//     §20.1 bounds, and why step 4 makes it a refusal at create.
+//
+// What it buys is the cost this was all for: a clone's first stop writes down what the
+// clone wrote, not what it inherited. Measured in this package's clone-cost tests.
+//
 // # The chunk store belongs to a lineage, not to a volume
 //
 // This is the one thing about the layout above that cannot be read off it, and it is the
@@ -160,10 +187,42 @@ type Chunk struct {
 	Digest string `json:"digest"`
 }
 
-// Manifest is a volume's image: which regions hold data and where their bytes are.
+// Span is a half-open range with no bytes behind it: [Offset, Offset+Length).
+type Span struct {
+	Offset uint64 `json:"offset"`
+	Length uint64 `json:"length"`
+}
+
+// Manifest is a volume's image: which regions this volume holds, where their bytes are,
+// and which regions it erased.
+//
+// **It states this volume and not its ancestry**, which is the change of 2026-08-08 and
+// the thing to have in mind reading anything below. A manifest used to be flattened — a
+// clone's first stop wrote down every range its parent's snapshot held, under the clone's
+// own name — and now it is a delta: what this volume's own layers state, over whatever
+// the chain it descends from says (agent.parentView composes that chain; cow.DeltaOver
+// takes the delta). A reader that has one without the other has half a volume.
 type Manifest struct {
 	VolumeID string  `json:"volume_id"`
 	Chunks   []Chunk `json:"chunks"`
+	// Discarded is what makes the delta expressible, and it is the field a reader is most
+	// likely to think is optional.
+	//
+	// In a flattened manifest, absence meant "zeros". In a delta it means "ask the layer
+	// below", because that is what a delta is for — a clone that names nothing at an
+	// offset is deferring to its parent there. So an erasure needs a word of its own: a
+	// range the guest DISCARDed over something an ancestor holds is *here*, and a loader
+	// lays it back over the ancestry as a tombstone (cow.IntervalMap.Clear).
+	//
+	// Without it, publishing a delta would turn every DISCARD into data resurrection —
+	// the ancestor's older bytes reappearing at an offset the guest freed — which is
+	// §14.6's failure and strictly worse than losing the erasure, since those blocks may
+	// have been handed to something else.
+	//
+	// Empty for a volume that descends from nothing: with no layer below, absence and a
+	// tombstone say the same thing, and cow.DeltaOver reports none rather than
+	// accumulating them in every manifest for ever.
+	Discarded []Span `json:"discarded,omitempty"`
 	// Sequence is the point the image was frozen at (§19: a snapshot is a number, not
 	// an event). A boot resumes numbering above it.
 	Sequence uint64 `json:"sequence"`
@@ -246,8 +305,13 @@ var ErrSnapshotExists = errors.New("image: this snapshot is already published an
 // Create-only, because §5.2 says a PUBLISHED snapshot is immutable and because two
 // writers racing to publish the same id must not both think they won. The chunks are the
 // volume's own, so nothing is copied that already exists.
-func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view *cow.IntervalMap, seq uint64, snapshotID string) (string, error) {
-	man, err := uploadChunks(ctx, store, rnd, enc, id, view, seq)
+//
+// inherited is what Publish's is: the ancestry this volume's layers sit over, which a
+// snapshot states no more than an image does. A snapshot of a clone is therefore only
+// meaningful together with the chain it descends from — which is exactly what a clone of
+// that snapshot walks (agent.parentChain).
+func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view, inherited *cow.IntervalMap, seq uint64, snapshotID string) (string, error) {
+	man, err := uploadChunks(ctx, store, rnd, enc, id, view, inherited, seq)
 	if err != nil {
 		return "", err
 	}
@@ -280,11 +344,11 @@ func LoadSnapshot(ctx context.Context, store objectstore.Store, enc *wal.Encrypt
 // already nests arbitrarily (NewIntervalMapOver, and Ranges/Read recurse through
 // m.base), so this composes what is there rather than extending it.
 //
-// A nil base is exactly LoadSnapshot, and that is not a convenience: the bottom of a
-// chain must come back **unlayered**, because an unlayered map is the one that refuses
-// SetBase later (cow.IntervalMap.SetBase), and that refusal is what stops a published
-// image from having a parent slid underneath it — see agent.fetchBase for why that
-// refusal is a protection and not an obstacle.
+// A nil base is exactly LoadSnapshot: the bottom of a chain is a link like any other,
+// laid over nothing. It used to come back **unlayered**, so that cow.SetBase would refuse
+// to slide anything underneath a manifest that had been flattened; since a manifest
+// became a delta that refusal would forbid the composition this whole package now depends
+// on, and what replaced it is the tombstone the manifest carries (Manifest.Discarded).
 func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident, snapshotID string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, error) {
 	view, man, _, err := loadManifest(ctx, store, enc, id, SnapshotKey(id.Volume, snapshotID), base)
 	return view, man, err
@@ -301,8 +365,21 @@ func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Enc
 // be none". A mismatch is ErrSuperseded and the publish fails: another incarnation
 // published while this one was uploading, and overwriting it is the silent lost update
 // that ADR-0026 keeps fencing for.
-func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view *cow.IntervalMap, seq uint64, prevETag string) (string, error) {
-	man, err := uploadChunks(ctx, store, rnd, enc, id, view, seq)
+//
+// # inherited is what this volume does not write down
+//
+// It is the ancestry the view sits over — the composed snapshots of every volume this one
+// descends from — and everything below it is left out of the manifest, because the chain
+// already states it and a reader walks the chain (agent.parentView). nil for a volume
+// that descends from nothing, which writes down all of itself.
+//
+// Passing nil for a clone is not a corruption, it is the old behaviour: the manifest comes
+// out flattened, naming every range the ancestry holds under this volume's name. It reads
+// back correctly and costs a copy of the inherited dataset — which is what
+// CHUNK-ADDRESSING-SPEC measured at 8 MiB for a 512-byte write. Passing the *wrong* map is
+// refused rather than guessed at (cow.DeltaOver).
+func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view, inherited *cow.IntervalMap, seq uint64, prevETag string) (string, error) {
+	man, err := uploadChunks(ctx, store, rnd, enc, id, view, inherited, seq)
 	if err != nil {
 		return "", err
 	}
@@ -324,15 +401,39 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 	return res.ETag, nil
 }
 
-// uploadChunks puts every region the view holds in the store and returns the manifest
-// describing them. It is shared by Publish and PublishSnapshot: the two differ only in
-// which object the manifest is written to and under what precondition, and a second
-// implementation of "put the bytes there" is a second place for the sealing rule to be
-// forgotten.
-func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view *cow.IntervalMap, seq uint64) (Manifest, error) {
-	man := Manifest{VolumeID: format.UUIDString(id.Volume), Sequence: seq}
+// uploadChunks puts every region *this volume* holds in the store and returns the
+// manifest describing them. It is shared by Publish and PublishSnapshot: the two differ
+// only in which object the manifest is written to and under what precondition, and a
+// second implementation of "put the bytes there" is a second place for the sealing rule
+// to be forgotten.
+//
+// It walks `view.DeltaOver(inherited)` where it used to walk `view.Ranges()`, and that one
+// substitution is the whole of step 3 of CHUNK-ADDRESSING-SPEC. Ranges flattens: it
+// reports the base's ranges merged with this layer's, so a clone that wrote one sector
+// wrote down a manifest naming every byte of its parent's dataset — and, with the chunk
+// store now shared across a lineage, re-chunked and re-uploaded whichever of those chunks
+// its own boundaries no longer matched. The delta reports what these layers state and
+// leaves the ancestry to the chain.
+//
+// The bytes still come from `view.Read`, through the whole layering, and that is not an
+// oversight: every offset the delta reports as data is held by a layer at or above
+// `inherited`, so Read answers it out of exactly the layers the manifest is claiming.
+func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view, inherited *cow.IntervalMap, seq uint64) (Manifest, error) {
+	own, err := view.DeltaOver(inherited)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("image: volume %s: %w", format.UUIDString(id.Volume), err)
+	}
 
-	for _, r := range view.Ranges() {
+	man := Manifest{VolumeID: format.UUIDString(id.Volume), Sequence: seq}
+	// The erasures first, and they are recorded even when this volume uploads nothing at
+	// all: a stop whose only guest activity was a DISCARD still has something to say, and
+	// a manifest that omitted it would let the ancestor's bytes back through on the next
+	// boot.
+	for _, r := range own.Discarded {
+		man.Discarded = append(man.Discarded, Span{Offset: r.Offset, Length: r.Length})
+	}
+
+	for _, r := range own.Data {
 		for off := r.Offset; off < r.Offset+r.Length; {
 			n := min64(uint64(MaxChunkBytes), r.Offset+r.Length-off)
 			buf := make([]byte, n)
@@ -378,22 +479,34 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 	return man, nil
 }
 
-// Load reads a volume's image into a read view, and returns the manifest's ETag so the
-// caller can CAS against it when it publishes in turn.
+// Load reads a volume's image as a layer over base, and returns the manifest's ETag so
+// the caller can CAS against it when it publishes in turn.
 //
 // A volume with no manifest is ErrNotPublished, which callers treat as "boot empty":
 // a volume being served for the first time has written nothing, and refusing it would
 // make the first boot the one case that cannot work.
-// The view it returns is unlayered on purpose: a volume's own image supersedes whatever
-// it descends from and must not be given a base afterwards (agent.fetchBase).
+//
+// # base is the ancestry, and it is now required rather than forbidden
+//
+// This function used to return an **unlayered** map and take no base at all, and the
+// reason was a real protection: a manifest was flattened, so it already held everything
+// the volume could read, and sliding a parent underneath it would have uncovered every
+// range the guest discarded — the discard having been written down as absence
+// (agent.fetchBase, CHUNK-ADDRESSING-SPEC §2).
+//
+// Since a manifest became a delta, both halves of that reversed. The image no longer
+// holds what the volume inherited, so it *must* be laid over the ancestry or the clone
+// reads zeros for everything above it; and a discard is no longer absence, it is
+// Manifest.Discarded, replayed here as a tombstone. The protection is not gone, it moved
+// into the format — which is where it can also survive a restart.
 //
 // It takes the lineage as well as the volume, and a clone genuinely cannot be loaded
 // without it: its own manifest names chunks that live under its lineage's prefix, so a
 // caller that does not know the root cannot find one byte of its data. That is the price
 // of the shared chunk store, and it is paid at the one place that can afford it —
 // agent.fetchBase already resolves the lineage before it loads anything.
-func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident) (*cow.IntervalMap, Manifest, string, error) {
-	return loadManifest(ctx, store, enc, id, ManifestKey(id.Volume), nil)
+func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, id Ident, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, string, error) {
+	return loadManifest(ctx, store, enc, id, ManifestKey(id.Volume), base)
 }
 
 // ReadSnapshotManifest returns a snapshot's manifest without materialising its data —
@@ -442,9 +555,19 @@ func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encrypt
 		return nil, Manifest{}, "", err
 	}
 
-	view := cow.NewIntervalMap()
-	if base != nil {
-		view = cow.NewIntervalMapOver(base)
+	// Layered whether or not there is a base, and a nil base is not the same thing as no
+	// layering. A manifest is a delta: it may carry tombstones, and cow only records one
+	// on a layered map (IntervalMap.Clear) — an unlayered map would silently drop exactly
+	// the ranges the guest erased. The bottom of a chain therefore looks the same as any
+	// other link, and reads identically: over a nil base, Read clears the buffer first,
+	// so absence and a tombstone both answer zeros.
+	view := cow.NewIntervalMapOver(base)
+	// The erasures before the chunks. They are disjoint for a manifest this package
+	// wrote — a delta reports a range as data or as discarded, never both — so the order
+	// changes nothing here; it decides what a hand-edited or corrupted manifest does, and
+	// a write winning over an erasure is the less destructive of the two answers.
+	for _, s := range man.Discarded {
+		view.Clear(s.Offset, s.Length)
 	}
 	for _, c := range man.Chunks {
 		data, err := store.Get(ctx, chunkKey(id.Lineage, c.Digest))

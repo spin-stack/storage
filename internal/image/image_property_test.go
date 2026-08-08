@@ -101,10 +101,10 @@ func TestPublishLoadRoundTrip(t *testing.T) {
 		enc := drawEncryption(rt, id)
 		view := drawView(rt)
 
-		if _, err := image.Publish(ctx, store, rand.Reader, enc, id, view, 42, ""); err != nil {
+		if _, err := image.Publish(ctx, store, rand.Reader, enc, id, view, nil, 42, ""); err != nil {
 			rt.Fatalf("Publish: %v", err)
 		}
-		loaded, man, _, err := image.Load(ctx, store, enc, id)
+		loaded, man, _, err := image.Load(ctx, store, enc, id, nil)
 		if err != nil {
 			rt.Fatalf("Load: %v", err)
 		}
@@ -167,7 +167,7 @@ func TestLoadRefusesCorruptedChunks(t *testing.T) {
 
 		view := cow.NewIntervalMap()
 		view.Overwrite(0, bytes.Repeat([]byte{0xAB}, 2048))
-		if _, err := image.Publish(ctx, store, rand.Reader, enc, id, view, 1, ""); err != nil {
+		if _, err := image.Publish(ctx, store, rand.Reader, enc, id, view, nil, 1, ""); err != nil {
 			rt.Fatal(err)
 		}
 
@@ -195,7 +195,7 @@ func TestLoadRefusesCorruptedChunks(t *testing.T) {
 			rt.Fatal(err)
 		}
 
-		if _, _, _, err := image.Load(ctx, store, enc, id); err == nil {
+		if _, _, _, err := image.Load(ctx, store, enc, id, nil); err == nil {
 			rt.Fatal("a corrupted chunk loaded without complaint; the guest would be served zeros or wrong bytes")
 		}
 	})
@@ -238,7 +238,7 @@ func TestAChunkOpensForItsLineageAndForNothingElse(t *testing.T) {
 		}
 
 		view := drawView(rt)
-		if _, err := image.Publish(ctx, store, rand.Reader, enc, image.OwnLineage(parent), view, 1, ""); err != nil {
+		if _, err := image.Publish(ctx, store, rand.Reader, enc, image.OwnLineage(parent), view, nil, 1, ""); err != nil {
 			rt.Fatalf("the parent's publish: %v", err)
 		}
 		before, err := store.List(ctx, image.ChunksPrefix(parent))
@@ -249,7 +249,7 @@ func TestAChunkOpensForItsLineageAndForNothingElse(t *testing.T) {
 		// The clone publishes the same view: every chunk it names is one the parent
 		// sealed, so if it can read its own image back it is reading its parent's chunks.
 		cloneID := image.Ident{Volume: clone, Lineage: parent}
-		if _, err := image.Publish(ctx, store, rand.Reader, enc, cloneID, view, 2, ""); err != nil {
+		if _, err := image.Publish(ctx, store, rand.Reader, enc, cloneID, view, nil, 2, ""); err != nil {
 			rt.Fatalf("the clone's publish: %v", err)
 		}
 		after, err := store.List(ctx, image.ChunksPrefix(parent))
@@ -259,7 +259,7 @@ func TestAChunkOpensForItsLineageAndForNothingElse(t *testing.T) {
 		if len(after) != len(before) {
 			rt.Fatalf("the clone uploaded %d new chunk objects; it wrote nothing its parent had not already stored", len(after)-len(before))
 		}
-		loaded, man, _, err := image.Load(ctx, store, enc, cloneID)
+		loaded, man, _, err := image.Load(ctx, store, enc, cloneID, nil)
 		if err != nil {
 			rt.Fatalf("a clone could not open the chunks its parent sealed: %v", err)
 		}
@@ -298,7 +298,7 @@ func TestAChunkOpensForItsLineageAndForNothingElse(t *testing.T) {
 		if err != nil {
 			rt.Fatal(err)
 		}
-		_, _, _, err = image.Load(ctx, store, strangerEnc, image.OwnLineage(stranger))
+		_, _, _, err = image.Load(ctx, store, strangerEnc, image.OwnLineage(stranger), nil)
 		if len(man.Chunks) > 0 && err == nil {
 			rt.Fatal("an unrelated volume opened a chunk sealed for another lineage: the blast radius of a chunk is the bucket, not the lineage")
 		}

@@ -50,7 +50,7 @@ func TestPublishedChunksAreCiphertext(t *testing.T) {
 	view := cow.NewIntervalMap()
 	view.Overwrite(0, secret)
 
-	if _, err := image.Publish(ctx, store, &ramp{9}, enc, image.OwnLineage(vol), view, 1, ""); err != nil {
+	if _, err := image.Publish(ctx, store, &ramp{9}, enc, image.OwnLineage(vol), view, nil, 1, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -77,7 +77,7 @@ func TestPublishedChunksAreCiphertext(t *testing.T) {
 	}
 
 	// And it is not encrypted-to-noise: the same image loads back through the same key.
-	loaded, _, _, err := image.Load(ctx, store, enc, image.OwnLineage(vol))
+	loaded, _, _, err := image.Load(ctx, store, enc, image.OwnLineage(vol), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestAnUnchangedChunkIsNeverResealed(t *testing.T) {
 	view := cow.NewIntervalMap()
 	view.Overwrite(0, bytes.Repeat([]byte{0x5A}, 4096))
 
-	etag, err := image.Publish(ctx, store, &ramp{3}, enc, image.OwnLineage(vol), view, 1, "")
+	etag, err := image.Publish(ctx, store, &ramp{3}, enc, image.OwnLineage(vol), view, nil, 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestAnUnchangedChunkIsNeverResealed(t *testing.T) {
 
 	// Publish the identical view again, with a different random source. A re-seal would
 	// produce different bytes.
-	if _, err := image.Publish(ctx, store, &ramp{200}, enc, image.OwnLineage(vol), view, 2, etag); err != nil {
+	if _, err := image.Publish(ctx, store, &ramp{200}, enc, image.OwnLineage(vol), view, nil, 2, etag); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := store.Get(ctx, objs[0].Key)
@@ -132,7 +132,7 @@ func TestLoadWithTheWrongKeyFailsClosed(t *testing.T) {
 
 	view := cow.NewIntervalMap()
 	view.Overwrite(0, bytes.Repeat([]byte{0x7E}, 1024))
-	if _, err := image.Publish(ctx, store, &ramp{1}, encFor(t, vol), image.OwnLineage(vol), view, 1, ""); err != nil {
+	if _, err := image.Publish(ctx, store, &ramp{1}, encFor(t, vol), image.OwnLineage(vol), view, nil, 1, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,7 +144,7 @@ func TestLoadWithTheWrongKeyFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := image.Load(ctx, store, wrong, image.OwnLineage(vol)); err == nil {
+	if _, _, _, err := image.Load(ctx, store, wrong, image.OwnLineage(vol), nil); err == nil {
 		t.Fatal("an image loaded under the wrong key; the guest would be served ciphertext as its own data")
 	}
 }

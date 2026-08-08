@@ -372,7 +372,7 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	// The parent descends from nothing, so it is its own lineage root and its chunks are
 	// under its own id (image.ChunksPrefix). The clone will resolve the same root by
 	// walking, which is the only reason it can find these bytes at all.
-	if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, image.OwnLineage(parentVol), parentDone, 1, snapID); err != nil {
+	if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, image.OwnLineage(parentVol), parentDone, nil, 1, snapID); err != nil {
 		return fmt.Errorf("publishing the parent's snapshot: %w", err)
 	}
 	// The descriptor a provisioner writes. The clone's Agent reads it to learn whether the
@@ -450,11 +450,11 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 // the depth nothing in this repository had ever built: `chain_depth > 1`.
 //
 // `parentView` resolved exactly one link until 2026-08-08, and a depth-2 clone read its
-// grandparent's bytes only because publishing flattens — every snapshot manifest that
-// exists today already contains everything its volume could read. So the two ancestors
-// here publish **deltas**: each manifest names only the ranges that volume itself wrote,
-// which is what the publisher produces once step 3 of CHUNK-ADDRESSING-SPEC lands, and
-// what makes the walk the only thing that can answer the grandparent's offset.
+// grandparent's bytes only because publishing flattened — every snapshot manifest held
+// everything its volume could read. The two ancestors here publish **deltas**, each
+// manifest naming only the ranges that volume itself wrote, which is what the publisher
+// produces since step 3 of CHUNK-ADDRESSING-SPEC and what makes the walk the only thing
+// that can answer the grandparent's offset.
 //
 // The assertion is the bytes the guest reads back at two offsets, and the checker is the
 // one that already watches for this failure: DurableRangeChecker sees zeros. Reading zeros
@@ -467,9 +467,9 @@ func scenarioACloneOfACloneReadsItsGrandparentsBytes(s *Sim) error {
 	grandBytes := bytes.Repeat([]byte{0x77}, 4096)
 	parentBytes := bytes.Repeat([]byte{0x88}, 4096)
 
-	// publish writes one ancestor as it will exist once publishing stops flattening: a
-	// snapshot naming only this volume's own range, and a descriptor carrying its link
-	// upward — the only place the bucket states a lineage.
+	// publish writes one ancestor as a session of it leaves it: a snapshot naming only
+	// this volume's own range, and a descriptor carrying its link upward — the only place
+	// the bucket states a lineage.
 	//
 	// The root is passed in rather than derived because it is what the whole chain's
 	// chunks are keyed by: a zero root means "this volume is the top", and every volume
@@ -489,7 +489,7 @@ func scenarioACloneOfACloneReadsItsGrandparentsBytes(s *Sim) error {
 		own := cow.NewIntervalMap()
 		own.Overwrite(offset, payload)
 		snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
-		if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, id, own, 1, snapID); err != nil {
+		if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, id, own, nil, 1, snapID); err != nil {
 			return "", "", id.Lineage, fmt.Errorf("publishing the snapshot of %s: %w", volumeID, err)
 		}
 		if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{

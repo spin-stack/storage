@@ -158,23 +158,24 @@ func publishParent(t *testing.T, store objectstore.Store, vol [16]byte, write fu
 	write(view)
 	// A parent descends from nothing, so it is its own lineage root and its chunks name
 	// the prefix every clone below it will write into.
-	if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, 1, ""); err != nil {
+	if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, nil, 1, ""); err != nil {
 		t.Fatalf("publishing the parent's image: %v", err)
 	}
-	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, 1, snapID); err != nil {
+	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, nil, 1, snapID); err != nil {
 		t.Fatalf("publishing the parent's snapshot: %v", err)
 	}
 }
 
-// cloneView is what an Agent hands image.Publish at a clone's first stop.
+// cloneView is what an Agent hands image.Publish at a clone's first stop: the view, and
+// the ancestry underneath it that the publish must leave alone.
 //
-// agent.fetchBase makes the parent's snapshot the base *outright* in its ErrNotPublished
-// arm and wal.Log's own map is the layer over it, so this is that stack built directly.
-// Building it here rather than driving a VolumeManager keeps the subject of the
-// measurement `uploadChunks` walking `view.Ranges()`; internal/agent's
-// TestAnOperatorIsToldWhenAStopIsCopyingItsParentsDataset drives the real manager over the
-// same shape and its bucket numbers agree.
-func cloneView(t *testing.T, store objectstore.Store, parent [16]byte, snapID string) *cow.IntervalMap {
+// agent.fetchBase composes the ancestry and makes it the base — outright when the clone
+// has no image of its own, under the loaded image when it has — and wal.Log's own map is
+// the layer over that, so this is that stack built directly. Both halves are returned
+// because the second is now an argument to every publish: it is what tells the publisher
+// where this volume's own layers stop, and passing nil is how a manifest goes back to
+// being flattened.
+func cloneView(t *testing.T, store objectstore.Store, parent [16]byte, snapID string) (view, ancestry *cow.IntervalMap) {
 	t.Helper()
 	return cloneViewOver(t, store, image.OwnLineage(parent), snapID)
 }
@@ -182,7 +183,7 @@ func cloneView(t *testing.T, store objectstore.Store, parent [16]byte, snapID st
 // cloneViewOver is cloneView for an ancestor that is not the root of its own lineage —
 // the middle link of a chain, whose snapshot manifest lives under its own prefix and
 // whose chunks live under the root's.
-func cloneViewOver(t *testing.T, store objectstore.Store, parent image.Ident, snapID string) *cow.IntervalMap {
+func cloneViewOver(t *testing.T, store objectstore.Store, parent image.Ident, snapID string) (view, ancestry *cow.IntervalMap) {
 	t.Helper()
 	// The parent's DEK, which a clone inherits (controlplane.Clone). The Ident says both
 	// halves of where the snapshot is: the manifest under the parent's own prefix, the
@@ -192,39 +193,43 @@ func cloneViewOver(t *testing.T, store objectstore.Store, parent image.Ident, sn
 	if err != nil {
 		t.Fatalf("loading the parent's snapshot: %v", err)
 	}
-	return cow.NewIntervalMapOver(base)
+	return cow.NewIntervalMapOver(base), base
 }
 
 func fill(v *cow.IntervalMap, off uint64, n int, b byte) {
 	v.Overwrite(off, bytes.Repeat([]byte{b}, n))
 }
 
-// A clone's first stop pays for the chunks it **touched**, and for nothing else.
+// A clone's first stop pays for what it **wrote**, and for nothing else.
 //
-// This is the property the key-space change was bought for, and the four cases are the
-// same four the old key space was priced on, so the two sets of numbers can be read
-// against each other:
+// The same five cases have now been weighed three times, and reading the three sets of
+// numbers against each other is the point of keeping them:
 //
-//   - a clone that stops without writing anything transfers **zero bytes**. It used to
-//     transfer its parent's whole dataset.
-//   - a clone that writes one sector into a **one-chunk** parent still pays the whole
-//     8 MiB, and no key space can give that back: its chunk holds different bytes, so it
-//     is a different digest and a genuinely new object. With MaxChunkBytes at 64 MiB the
-//     golden image the workflow is built around is one chunk, so this is the case to
-//     price a fleet from.
-//   - the same 8 MiB in eight regions is eight chunks, and the same single-sector write
-//     leaves seven of them untouched: the clone transfers one region, not eight.
-//   - a clone that writes past the end of what it inherited transfers only its own new
-//     range.
+//	                                 per-volume keys   per-lineage keys   a delta
+//	stops without writing anything        8388636              0             0
+//	one sector, one-chunk parent          8388636         8388636           540
+//	one sector, eight-chunk parent        8388636         1048604           540
+//	overwrites every byte inherited       8388636         8388636       8388636
+//	writes past what it inherited             528             528           528
 //
-// So "the storage cost of a clone becomes proportional to what the clone wrote" is true
-// at **chunk granularity**, which is the honest form of CHUNK-ADDRESSING-SPEC §3's claim
-// and the form the measurement supports.
+// The middle row is the golden-image case — with MaxChunkBytes at 64 MiB a golden image is
+// **one chunk** — and it is the row this increment moved. Sharing a chunk store could not
+// touch it: a sector written into a chunk changes that chunk's content, so its digest, so
+// no key space can make it shared. Only stopping the flattening does, because then the
+// clone's manifest names the sector rather than the chunk the sector fell in.
 //
-// Every clone here publishes with `Lineage: parent` — that is what a clone's Ident is,
-// and the Agent derives it by walking (agent.fetchBase). Plant `Lineage: clone` in the
-// Publish below and every case goes back to the old numbers, which is the plant that
-// proves these assertions are about the key space and not about arithmetic.
+// The last two rows are what does not move and should not: a clone that overwrote
+// everything it inherited wrote everything it uploaded, and a disjoint write costs the
+// disjoint write.
+//
+// So "the storage cost of a clone becomes proportional to what the clone wrote" is finally
+// true as CHUNK-ADDRESSING-SPEC §3 stated it, rather than true at chunk granularity — and
+// the previous entry in this file was right to insist on the weaker form while the
+// publisher still flattened.
+//
+// Two plants, because two different things are being asserted. `Lineage: clone` in the
+// Publish takes every case back to the per-volume column. `nil` for the ancestry takes it
+// back to the per-lineage column, which is the flattening this increment removed.
 func TestACloneFirstStopPaysForWhatItTouched(t *testing.T) {
 	contiguous := func(v *cow.IntervalMap) { fill(v, 0, datasetBytes, 0xA1) }
 	fragmented := func(v *cow.IntervalMap) {
@@ -262,21 +267,25 @@ func TestACloneFirstStopPaysForWhatItTouched(t *testing.T) {
 		{
 			name:   "a clone that writes one sector into a one-chunk parent",
 			parent: contiguous, clone: func(v *cow.IntervalMap) { fill(v, 0, sectorBytes, 0xC2) },
-			wantObjects: 1, wantTransferred: sealed(datasetBytes),
+			// The sector, not the 8 MiB chunk it landed in. This is the row the whole
+			// increment is for: the parent's chunk stays whole and untouched under the
+			// lineage, and the clone's manifest names 512 bytes over the top of it.
+			wantObjects: 1, wantTransferred: sealed(sectorBytes),
 			// resident == distinct: the clone's chunk holds different bytes from the
 			// parent's, so it is new content and not a duplicate of anything.
-			wantResident: 2 * sealed(datasetBytes), wantDistinct: 2 * sealed(datasetBytes),
-			why: "512 bytes of new information still cost 8 MiB, because the chunk they fall in is 8 MiB",
+			wantResident: sealed(datasetBytes) + sealed(sectorBytes),
+			wantDistinct: sealed(datasetBytes) + sealed(sectorBytes),
+			why:          "512 bytes of new information cost 512 bytes, whatever size the chunk underneath them is",
 		},
 		{
 			name:   "a clone that writes one sector into an eight-chunk parent",
 			parent: fragmented, clone: func(v *cow.IntervalMap) { fill(v, 0, sectorBytes, 0xC2) },
-			// One region, not eight: the other seven are byte-identical to the parent's
-			// and the Head skip finds them under the lineage's prefix.
-			wantObjects: 1, wantTransferred: sealed(regionBytes),
-			wantResident: (datasetBytes/regionBytes + 1) * sealed(regionBytes),
-			wantDistinct: (datasetBytes/regionBytes + 1) * sealed(regionBytes),
-			why:          "the same data in eight chunks means the clone pays for one of them",
+			// The same 540 bytes as the row above, which is the point: how the parent
+			// happened to be chunked stopped mattering at all.
+			wantObjects: 1, wantTransferred: sealed(sectorBytes),
+			wantResident: datasetBytes/regionBytes*sealed(regionBytes) + sealed(sectorBytes),
+			wantDistinct: datasetBytes/regionBytes*sealed(regionBytes) + sealed(sectorBytes),
+			why:          "a delta costs the same whether its parent is one chunk or eight",
 		},
 		{
 			name:   "a clone that overwrites every byte it inherited",
@@ -304,12 +313,14 @@ func TestACloneFirstStopPaysForWhatItTouched(t *testing.T) {
 
 			publishParent(t, store, parent, tc.parent, snapID)
 
-			view := cloneView(t, store, parent, snapID)
+			view, ancestry := cloneView(t, store, parent, snapID)
 			tc.clone(view)
 			at := store.mark()
-			// A clone's Ident: its own manifest, its parent's chunk store.
+			// A clone's Ident: its own manifest, its parent's chunk store. And the
+			// ancestry it is a delta over, which is what its parent's snapshot already
+			// states and this manifest therefore does not.
 			cloneID := image.Ident{Volume: clone, Lineage: parent}
-			if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, 2, ""); err != nil {
+			if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, ancestry, 2, ""); err != nil {
 				t.Fatalf("the clone's first stop: %v", err)
 			}
 
@@ -334,10 +345,11 @@ func TestACloneFirstStopPaysForWhatItTouched(t *testing.T) {
 
 // A stop transfers what that stop touched, and a superseded chunk is never reclaimed.
 //
-// The first half is the key-space change seen from the other end: a clone's *first* stop
-// used to be the expensive one and is now free, so what is left to measure is the ordinary
-// cost of writing — a stop pays for the chunks its writes fell in, whole, and pays it
-// again every time it touches them.
+// The first half is what is left of a clone's cost once its first stop is free: the
+// ordinary cost of writing. A stop pays for the ranges *its own layer* holds, re-chunked
+// whole, and pays them again every time it touches them — so the sector written at the
+// third stop below costs a sector, and the fourth stop, writing the sector beside it,
+// merges the two into one range and pays for both.
 //
 // The second half is what nothing deletes. A later stop re-uploads a touched chunk under a
 // new digest, and **nothing in this repository deletes an object** (the objectstore.Store
@@ -361,19 +373,19 @@ func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 
 	publishParent(t, store, parent, func(v *cow.IntervalMap) { fill(v, 0, datasetBytes, 0xA1) }, parentSnap)
 
-	view := cloneView(t, store, parent, parentSnap)
+	view, ancestry := cloneView(t, store, parent, parentSnap)
 	at := store.mark()
-	etag, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, 2, "")
+	etag, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, ancestry, 2, "")
 	if err != nil {
 		t.Fatalf("the clone's first stop: %v", err)
 	}
 	if objs, first := store.chunksSince(at, chunks); first != 0 {
-		t.Errorf("the clone's first stop transferred %d chunk objects / %d bytes, want 0 — every chunk it inherited is already in its lineage's store", objs, first)
+		t.Errorf("the clone's first stop transferred %d chunk objects / %d bytes, want 0 — it wrote nothing, so its manifest states nothing", objs, first)
 	}
 
 	// A snapshot of the clone, immediately.
 	at = store.mark()
-	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, 2, cloneSnap); err != nil {
+	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, ancestry, 2, cloneSnap); err != nil {
 		t.Fatalf("snapshotting the clone: %v", err)
 	}
 	if objs, n := store.chunksSince(at, chunks); n != 0 {
@@ -382,7 +394,7 @@ func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 
 	// And a second stop that changed nothing.
 	at = store.mark()
-	etag, err = image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, 3, etag)
+	etag, err = image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, ancestry, 3, etag)
 	if err != nil {
 		t.Fatalf("the clone's second stop: %v", err)
 	}
@@ -390,22 +402,25 @@ func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 		t.Errorf("a second stop with no writes transferred %d chunk objects / %d bytes, want 0", objs, n)
 	}
 
-	// A stop that wrote one sector pays for the whole chunk that sector fell in.
+	// A stop that wrote one sector pays for the sector. It used to pay for the parent's
+	// whole 8 MiB chunk, because the flattened view merged the write into the run it fell
+	// in and re-chunked the join.
 	fill(view, 0, sectorBytes, 0xC2)
 	at = store.mark()
-	etag, err = image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, 4, etag)
+	etag, err = image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, ancestry, 4, etag)
 	if err != nil {
 		t.Fatalf("the clone's third stop: %v", err)
 	}
-	if _, again := store.chunksSince(at, chunks); again != sealed(datasetBytes) {
-		t.Errorf("a stop that wrote one sector transferred %d bytes, want %d", again, sealed(datasetBytes))
+	if _, again := store.chunksSince(at, chunks); again != sealed(sectorBytes) {
+		t.Errorf("a stop that wrote one sector transferred %d bytes, want %d", again, sealed(sectorBytes))
 	}
 
-	// And a fourth stop, touching the same chunk somewhere else, leaves the third stop's
-	// chunk named by nothing at all. It has to be the *clone's own* superseded chunk: the
-	// one the third stop replaced is its parent's, and its parent still names it.
+	// And a fourth stop, writing the sector beside it, merges the two into one range and
+	// leaves the third stop's object named by nothing at all. It has to be the *clone's
+	// own* superseded chunk: the parent's 8 MiB chunk was never replaced by any of this,
+	// and the parent still names it.
 	fill(view, sectorBytes, sectorBytes, 0xC3)
-	if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, 5, etag); err != nil {
+	if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), cloneID, view, ancestry, 5, etag); err != nil {
 		t.Fatalf("the clone's fourth stop: %v", err)
 	}
 
@@ -427,8 +442,8 @@ func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 		}
 	}
 	t.Logf("after four stops the lineage's chunk store holds %d objects; %d bytes are named by no manifest in the lineage and nothing deletes them", len(objs), orphaned)
-	if orphaned != sealed(datasetBytes) {
-		t.Errorf("%d bytes in the lineage's chunk store are unreferenced, want %d — a superseded chunk is never reclaimed", orphaned, sealed(datasetBytes))
+	if orphaned != sealed(sectorBytes) {
+		t.Errorf("%d bytes in the lineage's chunk store are unreferenced, want %d — a superseded chunk is never reclaimed", orphaned, sealed(sectorBytes))
 	}
 }
 
@@ -439,11 +454,11 @@ func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 func lineageManifests(t *testing.T, store objectstore.Store, parent [16]byte, parentSnap string, clone image.Ident, cloneSnap string) []image.Manifest {
 	t.Helper()
 	var out []image.Manifest
-	_, parentImage, _, err := image.Load(t.Context(), store, encFor(t, parent), image.OwnLineage(parent))
+	_, parentImage, _, err := image.Load(t.Context(), store, encFor(t, parent), image.OwnLineage(parent), nil)
 	if err != nil {
 		t.Fatalf("loading the parent's image: %v", err)
 	}
-	_, cloneImage, _, err := image.Load(t.Context(), store, encFor(t, clone.Volume), clone)
+	_, cloneImage, _, err := image.Load(t.Context(), store, encFor(t, clone.Volume), clone, nil)
 	if err != nil {
 		t.Fatalf("loading the clone's image: %v", err)
 	}
@@ -482,15 +497,15 @@ func TestTheBucketHoldsOneCopyPerLineage(t *testing.T) {
 	// for a clone of a clone is *not* its parent.
 	publishClone := func(t *testing.T, store objectstore.Store, root, parent [16]byte, snapID string, clone [16]byte, ownSnap string) {
 		t.Helper()
-		view := cloneViewOver(t, store, image.Ident{Volume: parent, Lineage: root}, snapID)
+		view, ancestry := cloneViewOver(t, store, image.Ident{Volume: parent, Lineage: root}, snapID)
 		id := image.Ident{Volume: clone, Lineage: root}
-		if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), id, view, 2, ""); err != nil {
+		if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, clone), id, view, ancestry, 2, ""); err != nil {
 			t.Fatalf("stopping clone %x: %v", clone[0], err)
 		}
 		if ownSnap == "" {
 			return
 		}
-		if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, encFor(t, clone), id, view, 2, ownSnap); err != nil {
+		if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, encFor(t, clone), id, view, ancestry, 2, ownSnap); err != nil {
 			t.Fatalf("snapshotting clone %x: %v", clone[0], err)
 		}
 	}
@@ -577,7 +592,7 @@ func TestAWriteThatJoinsTwoRegionsRewritesBothOfThem(t *testing.T) {
 	fill(view, regionBytes+sectorBytes, regionBytes, 0xA2)
 
 	at := store.mark()
-	etag, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, 1, "")
+	etag, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, nil, 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +603,7 @@ func TestAWriteThatJoinsTwoRegionsRewritesBothOfThem(t *testing.T) {
 	// One sector, into the gap.
 	fill(view, regionBytes, sectorBytes, 0xA3)
 	at = store.mark()
-	if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, 2, etag); err != nil {
+	if _, err := image.Publish(t.Context(), store, rand.Reader, encFor(t, vol), image.OwnLineage(vol), view, nil, 2, etag); err != nil {
 		t.Fatal(err)
 	}
 	objs, transferred := store.chunksSince(at, image.ChunksPrefix(vol))

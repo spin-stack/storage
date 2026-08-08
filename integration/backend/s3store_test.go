@@ -217,16 +217,16 @@ func TestTheImageIsIdempotentAgainstARealBackend(t *testing.T) {
 			view := cow.NewIntervalMap()
 			view.Overwrite(0, tc.payload)
 
-			etag, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, 1, "")
+			etag, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, nil, 1, "")
 			if err != nil {
 				t.Fatalf("first publish: %v", err)
 			}
 			// Republishing an unchanged view must reconcile rather than fail: the chunks
 			// are already there under their own digests.
-			if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, 2, etag); err != nil {
+			if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, nil, 2, etag); err != nil {
 				t.Fatalf("republishing an unchanged image must succeed, got %v", err)
 			}
-			loaded, _, _, err := image.Load(ctx, store, nil, image.OwnLineage(vol))
+			loaded, _, _, err := image.Load(ctx, store, nil, image.OwnLineage(vol), nil)
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
@@ -237,7 +237,7 @@ func TestTheImageIsIdempotentAgainstARealBackend(t *testing.T) {
 			}
 			// The fence: a stale ETag is refused rather than silently replacing the
 			// manifest. On a real backend this is the whole of V1's fencing.
-			if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, 3, etag); !errors.Is(err, image.ErrSuperseded) {
+			if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, nil, 3, etag); !errors.Is(err, image.ErrSuperseded) {
 				t.Fatalf("a stale ETag published against a real backend: %v, want ErrSuperseded", err)
 			}
 		})

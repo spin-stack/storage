@@ -417,7 +417,7 @@ const (
 //     contents stop changing about 400 ms into a hold run — every later moment looks
 //     identical, and a snapshot taken at any of them is indistinguishable from a smear.
 //     So the changing byte has to be "filler the guest then overwrites", which means the
-//     region must already be in the frozen view: uploadChunks evaluates view.Ranges()
+//     region must already be in the frozen view: uploadChunks evaluates the view's delta
 //     once, up front, so a range that did not exist at the freeze is never uploaded at
 //     all and could never carry a late write. Hence the volume boots from an image this
 //     test publishes, with the guest's whole write region pre-filled.
@@ -469,7 +469,7 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 	base := cow.NewIntervalMap()
 	base.Overwrite(decoyOffset, bytes.Repeat([]byte{decoyByte}, decoyLength))
 	base.Overwrite(guestRegionOffset, bytes.Repeat([]byte{fillerByte}, guestRegionLength))
-	if _, err := image.Publish(ctx, bucket, rand.Reader, nil, image.OwnLineage(vol), base, 0, ""); err != nil {
+	if _, err := image.Publish(ctx, bucket, rand.Reader, nil, image.OwnLineage(vol), base, nil, 0, ""); err != nil {
 		t.Fatalf("publishing the image this volume boots from: %v", err)
 	}
 
@@ -547,7 +547,7 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 	if err := m.Close(ctx); err != nil {
 		t.Fatalf("stopping the Agent: %v", err)
 	}
-	live, _, _, err := image.Load(ctx, bucket, nil, image.OwnLineage(vol))
+	live, _, _, err := image.Load(ctx, bucket, nil, image.OwnLineage(vol), nil)
 	if err != nil {
 		t.Fatalf("reading the volume's own image back: %v", err)
 	}

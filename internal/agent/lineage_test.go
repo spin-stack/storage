@@ -29,21 +29,15 @@ import (
 // overwritten by the nearest — says the layers went on in the right order, which the
 // other three cannot: a walk that composed the chain upside down passes them all.
 //
-// # Why the ancestors' snapshots are published from unlayered views
+// # The ancestors' snapshots are deltas, and since 2026-08-08 that is simply what they are
 //
-// They are published as **deltas** — each manifest naming only the ranges that volume
-// itself wrote — because that is the state this walk exists for and the state a real
-// lineage does not hold yet. Publishing still flattens (`image.uploadChunks` walks
-// `view.Ranges()`, which merges the base), so a lineage built by driving three Agents
-// would leave every manifest self-contained, the nearest ancestor alone would answer
-// every read, and a plant that stopped the walk after one link would not change a byte.
-// The test would run and prove nothing.
-//
-// So the ancestors' snapshots are written by the real publisher (`image.PublishSnapshot`,
-// the same call `VolumeManager.Snapshot` makes) from views holding only that volume's own
-// writes. That is exactly what step 3 of CHUNK-ADDRESSING-SPEC makes the publisher
-// produce, which is why it is worth asserting against now: this walk is what has to be
-// true *before* that step lands.
+// Each manifest states only the ranges that volume itself wrote. This fixture built that
+// state by hand while publishing still flattened — a lineage driven through three real
+// Agents would have left every manifest self-contained, the nearest ancestor alone would
+// have answered every read, and a plant stopping the walk after one link would not have
+// changed a byte. Now `image.uploadChunks` produces exactly this, so the fixture is no
+// longer anticipating a format: `publishAncestor` composes each ancestor over its parent's
+// snapshot and publishes the delta, which is what a session of that volume does.
 //
 // The lineage is encrypted for a second reason, and it is the question step 2 inherits:
 // a chunk opens under the DEK the whole lineage shares plus the volume id passed to the
@@ -74,7 +68,7 @@ func TestACloneReadsThroughThreeAncestors(t *testing.T) {
 		writes: map[int64]byte{nearestOly: 0xC3, shared: 0xC3},
 	})
 
-	m := lineageManager(t, store, kms, wrapped, dek.KeyID)
+	m := lineageManager(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-lineage")
 	v := desiredVolume(t, 1)
 	v.ParentSnapshotId, v.ParentVolumeId = nearest.snapshot, nearest.volume
 	dev := serveClone(t, m, v)
@@ -148,7 +142,7 @@ func TestALineageThatCannotBeWalkedIsRefused(t *testing.T) {
 			kms, dek, wrapped := lineageKeys(t)
 			link := tc.build(t, store, dek)
 
-			m := lineageManager(t, store, kms, wrapped, dek.KeyID)
+			m := lineageManager(t, store, kms, wrapped, dek.KeyID, "/var/lib/spin-lineage")
 			v := desiredVolume(t, 1)
 			v.ParentSnapshotId, v.ParentVolumeId = link.snapshot, link.volume
 			if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
@@ -185,38 +179,60 @@ type ancestorSpec struct {
 	parent lineageLink
 	// writes is offset -> the byte repeated across one block.
 	writes map[int64]byte
+	// discards are offsets this ancestor erased — one block each — over whatever the
+	// ancestors below it hold there. Only meaningful with a parent: a root has nothing
+	// underneath, so a tombstone in its manifest would state nothing (cow.DeltaOver).
+	discards []int64
 }
 
-// publishAncestor writes one ancestor into the bucket exactly as it will exist once
-// publishing stops flattening: a snapshot manifest naming only the ranges this volume
-// wrote, and a descriptor carrying its own link upward.
+// publishAncestor writes one ancestor into the bucket exactly as a session of it would:
+// a snapshot manifest stating only what that volume itself wrote and erased, and a
+// descriptor carrying its own link upward.
 //
 // The manifest goes through image.PublishSnapshot — the same call the Agent's Snapshot
 // makes — so the objects are sealed, keyed and framed by the production writer rather
-// than by the test. What the test supplies is the *view*, and it supplies an unlayered
-// one, which is the whole difference between a delta and today's flattened manifest.
+// than by the test. What the test supplies is the *view*, and it supplies the shape
+// agent.fetchBase composes: this volume's own layer over its parent's snapshot, published
+// as a delta over exactly that.
 func publishAncestor(t *testing.T, store objectstore.Store, dek crypto.DEK, spec ancestorSpec) lineageLink {
 	t.Helper()
 	volumeID := ids.New().String()
 	u := uuidOf(t, volumeID)
 
-	view := cow.NewIntervalMap()
-	for off, b := range spec.writes {
-		view.Overwrite(uint64(off), bytes.Repeat([]byte{b}, testBlockSize))
-	}
 	enc, err := wal.NewEncryption(dek, u)
 	if err != nil {
 		t.Fatalf("binding the DEK to %s: %v", volumeID, err)
 	}
-	snapshotID := ids.New().String()
 	// The chunks go under the lineage's root, not this volume's id: that is where the
 	// Agent's walk will look for them, and a root threaded wrongly here would leave the
 	// bytes in a prefix nothing reads — which the assertions would report as zeros.
 	root := u
+	view, ancestry := cow.NewIntervalMap(), (*cow.IntervalMap)(nil)
 	if spec.parent.volume != "" {
 		root = spec.parent.root
+		// Layered over the parent's snapshot, because that is the only way an erasure is
+		// a tombstone rather than nothing at all (cow.IntervalMap.Clear records one only
+		// on a layered map) — and because it is what the volume's own session held.
+		penc, err := wal.NewEncryption(dek, uuidOf(t, spec.parent.volume))
+		if err != nil {
+			t.Fatalf("binding the DEK to %s: %v", spec.parent.volume, err)
+		}
+		base, _, err := image.LoadSnapshot(t.Context(), store, penc,
+			image.Ident{Volume: uuidOf(t, spec.parent.volume), Lineage: root}, spec.parent.snapshot)
+		if err != nil {
+			t.Fatalf("loading the snapshot of %s: %v", spec.parent.volume, err)
+		}
+		view, ancestry = cow.NewIntervalMapOver(base), base
 	}
-	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, enc, image.Ident{Volume: u, Lineage: root}, view, 1, snapshotID); err != nil {
+	for off, b := range spec.writes {
+		view.Overwrite(uint64(off), bytes.Repeat([]byte{b}, testBlockSize))
+	}
+	for _, off := range spec.discards {
+		view.Clear(uint64(off), testBlockSize)
+	}
+
+	snapshotID := ids.New().String()
+	if _, err := image.PublishSnapshot(t.Context(), store, rand.Reader, enc, image.Ident{Volume: u, Lineage: root}, view, ancestry, 1, snapshotID); err != nil {
 		t.Fatalf("publishing the snapshot of %s: %v", volumeID, err)
 	}
 	writeDescriptor(t, store, volumeID, spec.parent)
@@ -274,11 +290,14 @@ func lineageKeys(t *testing.T) (crypto.KMS, crypto.DEK, []byte) {
 	return kms, dek, wrapped
 }
 
-func lineageManager(t *testing.T, store objectstore.Store, kms crypto.KMS, wrapped []byte, keyID uint32) *agent.VolumeManager {
+// dataDir is named by the caller so two sessions of one volume can be told apart: a
+// restart on a fresh directory is what a clone that moved hosts looks like, and it is what
+// makes an attach read everything from the bucket instead of replaying local segments.
+func lineageManager(t *testing.T, store objectstore.Store, kms crypto.KMS, wrapped []byte, keyID uint32, dataDir string) *agent.VolumeManager {
 	t.Helper()
 	f := newListenerFactory()
 	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		DataDir: "/var/lib/spin-lineage", SocketDir: "/run/spin", Budget: testBudget(),
+		DataDir: dataDir, SocketDir: "/run/spin", Budget: testBudget(),
 	}, agent.VolumeManagerDeps{
 		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
 		Disk:    sim.NewDisk(),

@@ -101,19 +101,25 @@ type Volume struct {
 	// got its base must not publish at all: its view is not a subset of the truth, it is
 	// a different thing.
 	baseFailed bool
-	// inheritedBytes is how much of this volume's read view came from a *parent's*
-	// snapshot rather than from an image of its own, and inheritedFrom names that
-	// snapshot. Both are zero for every volume that is not a clone in the one session
-	// before its first stop, which is the only session that pays for them.
+	// inherited is the ancestry this volume's own layers sit over: the composed snapshots
+	// of every volume it descends from, or nil for a volume that was created rather than
+	// cloned. It is what publish must *not* write down — `image.Publish` takes it and
+	// serialises only the layers above it (cow.DeltaOver) — and it is held here rather
+	// than passed along because a publish happens as the runtime tears down, long after
+	// the walk that produced it.
 	//
-	// They exist to be logged. A clone's first publish still *names* the whole inherited
-	// dataset — `image.uploadChunks` walks `view.Ranges()` and cow reports the base's
-	// ranges merged with this layer's, which is what step 3 of CHUNK-ADDRESSING-SPEC
-	// changes — but since the chunk store moved to the lineage it no longer re-uploads
-	// it: every chunk the clone did not touch is already under the lineage's prefix and
-	// the Head skip finds it. What is left of the cost is the chunks it *did* touch,
-	// whole, and the manifest that names them all. Measured in internal/image's
-	// TestACloneFirstStopCopiesWhatItInherited.
+	// Written by fetchBase before it closes baseDone, read only after a wait on it, like
+	// lineage above, so the two need no lock.
+	inherited *cow.IntervalMap
+	// inheritedBytes is how much of this volume's read view comes from its ancestors
+	// rather than from an image of its own, and inheritedFrom names the snapshot it was
+	// cloned from. Both are zero for a volume that descends from nothing.
+	//
+	// They exist to be logged, and what they mean changed when publishing stopped
+	// flattening: this is no longer a bill the clone settles at its first stop but a
+	// permanent property of it. The dataset stays in the ancestors' snapshots, this
+	// volume's manifest never names it, and every attach reads through it — which is
+	// exactly the cost the depth ceiling of §20.1 bounds.
 	//
 	// Written by fetchBase before it closes baseDone, read only after a wait on it, so
 	// the two do not need a lock.
@@ -270,7 +276,7 @@ func (v *Volume) publish(ctx context.Context) error {
 		v.rec.Observe(ctx, "image_publish_duration_seconds", v.clk.Now().Sub(start).Seconds(),
 			obs.String("volume", v.id))
 	}()
-	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.ident(), view, seq, v.imageETag)
+	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.ident(), view, v.inherited, seq, v.imageETag)
 	if err != nil {
 		return fmt.Errorf("agent: volume %s: publishing its image at sequence %d: %w", v.id, seq, err)
 	}
@@ -279,47 +285,63 @@ func (v *Volume) publish(ctx context.Context) error {
 	return nil
 }
 
-// sayWhatThisImageCosts prints the size of the image about to be written, and how much of
-// it this volume never wrote.
+// sayWhatThisImageCosts prints the size of the image about to be written, and how much
+// this volume reads out of its ancestors and is not writing down.
 //
 // **Before the upload, not after, and that is the whole point.** The operator's question
 // is asked while a stop is hanging, and a line printed when the publish finishes cannot
 // answer a question about why it has not finished. Nothing else in the process says this:
 // the durability histogram is recorded on the way out, and `chain_depth` has no producer.
 //
-// What the second line claims changed with the key space, and the change is the subject of
-// the increment that moved it. It used to say a clone "copies the dataset it inherited
-// under its own prefix", which was the truth while chunks were keyed by volume: a clone of
-// a 40 GiB golden image that wrote one sector re-sealed and re-uploaded 40 GiB. Now the
-// chunks are keyed by the lineage, the clone Heads keys its parent already created, and
-// what it transfers is the chunks it actually touched. The image still *names* the
-// inherited ranges — publishing flattens until step 3 of CHUNK-ADDRESSING-SPEC — so the
-// number is still worth printing, but as what this manifest covers rather than as what is
-// crossing the wire.
+// What the two numbers mean has now changed twice, and it is worth being exact because an
+// operator sizing a stop reads them. They were "the whole flattened view" and "how much of
+// it came from a parent", when a publish wrote down everything a clone could read. Moving
+// the chunk store to the lineage made the second stop being a *transfer* — the untouched
+// chunks were already there — while the manifest still named them. Now the manifest is a
+// delta, so `image_bytes` is what this volume itself states and `inherited_bytes` is what
+// it leaves to its ancestry: a clone of a 40 GiB golden image that wrote one sector prints
+// a few kilobytes against 40 GiB inherited, and the second number never falls, because it
+// is what every attach of this volume will keep reading through.
 //
 // It is printed for a snapshot too, for the same reason and with the same meaning.
 //
-// Summing Ranges() is O(extents), the fold `cow.Cost` deliberately avoids. That is right
-// here and wrong there: Cost is recorded at the WAL's flush cadence, on every guest
-// fsync, and this runs once per stop, immediately before an upload of exactly these bytes.
-// The alternative — reporting Cost().Bytes instead — would double-count every byte the
-// layer overwrote in its base, which for a clone that rewrote its parent is the difference
-// between "8 MiB" and "16 MiB" of an 8 MiB upload.
+// Summing the delta is O(extents), the fold `cow.Cost` deliberately avoids. That is right
+// here and wrong there: Cost is recorded at the WAL's flush cadence, on every guest fsync,
+// and this runs once per stop, immediately before an upload of exactly these ranges. The
+// alternative — reporting Cost().Bytes — would double-count every byte a layer overwrote
+// in the one below it.
 func (v *Volume) sayWhatThisImageCosts(view *cow.IntervalMap) {
-	n := liveBytes(view)
+	own, err := view.DeltaOver(v.inherited)
+	if err != nil {
+		// The publish that follows fails on this same error, so this is not the report of
+		// it — it is the line that would otherwise be missing from the one place an
+		// operator is looking while the stop hangs.
+		slog.Error("the volume's image cannot be sized: its view does not sit over the ancestry it was given",
+			"volume_id", v.id, "error", err)
+		return
+	}
+	var n int64
+	for _, r := range own.Data {
+		n += int64(r.Length)
+	}
 	if v.inheritedBytes == 0 {
 		slog.Info("publishing the volume's image", "volume_id", v.id, "image_bytes", n)
 		return
 	}
-	slog.Info("publishing the volume's image, which names the dataset it inherited from its parent; the chunks it did not touch are already in its lineage's store and are not re-uploaded",
-		"volume_id", v.id, "image_bytes", n,
+	slog.Info("publishing the volume's image, which states what this volume wrote; the dataset it inherited stays in its ancestors' snapshots and is read through them at every attach",
+		"volume_id", v.id, "image_bytes", n, "discarded_ranges", len(own.Discarded),
 		"inherited_bytes", v.inheritedBytes, "parent_snapshot_id", v.inheritedFrom,
 		"lineage_root", format.UUIDString(v.lineage))
 }
 
 // liveBytes is how many bytes a view answers with — the sum of the ranges it reports,
-// flattened over its whole base chain. It is the number of bytes an upload of this view
-// moves, which is the only sense in which either caller means "how big".
+// flattened over its whole base chain.
+//
+// Its one caller measures an **ancestry**, and flattened is the right sense there: what a
+// clone reads through its ancestors is the composed chain, not any one link of it, and
+// summing the links would count a range an ancestor wrote and a nearer one rewrote twice.
+// It is deliberately not what a publish moves any more — that is the delta, which
+// sayWhatThisImageCosts takes separately.
 func liveBytes(view *cow.IntervalMap) int64 {
 	var n int64
 	for _, r := range view.Ranges() {
@@ -941,47 +963,47 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	// This replaced replaying a chain of WAL objects: there is no chain, and no
 	// contiguous prefix to establish — the manifest resolves or it does not.
 	//
-	// **An image supersedes the parent; it does not sit on top of one.** A publish
-	// serialises `log.ViewAtRest()`, which is the volume's layer over whatever base it
-	// was given, and `image.uploadChunks` walks `view.Ranges()` — the base's ranges
-	// minus this layer's tombstones plus its own extents — reading each one *through*
-	// the layering. So a clone's own image already holds its parent's bytes, flattened,
-	// from the first stop onwards, and the parent link stops describing the read path
-	// the moment the manifest exists (CHUNK-ADDRESSING-SPEC §1, §2).
+	// **An image is a delta over the ancestry; it does not supersede it.** That is the
+	// sentence this function turned on 2026-08-08 (CHUNK-ADDRESSING-SPEC step 3), and the
+	// previous one read the other way round: a publish flattened, so a clone's own image
+	// held its parent's bytes from its first stop onwards and the parent link stopped
+	// describing the read path the moment the manifest existed. Now `image.uploadChunks`
+	// walks `view.DeltaOver(ancestry)` and writes down only what this volume's own layers
+	// state, so the read view is the ancestry with the image laid over it — in *every*
+	// session, not only the one before the first stop.
 	//
-	// Rejected: loading the image and layering the parent underneath it anyway, which is
-	// what this did until the clone that stops and starts again was finally exercised.
-	// It was not merely redundant, it was refused — `image.Load` returns an unlayered map
-	// and `cow.SetBase` says no — and the refusal is right rather than an obstacle.
-	// Tombstones do not survive publication as tombstones: a range the clone discarded is
-	// expressed in the manifest as *absence*, so sliding the parent back underneath
-	// uncovers every DISCARD the guest issued and answers reads of freed blocks with the
-	// parent's older bytes, which is §14.6's failure exactly. Making `image.Load` return
-	// a layerable map to get past the refusal would have converted a total outage — every
-	// read failing with ErrBaseUnavailable — into silently resurrected data.
+	// The order below is therefore forced: the chain, then the ancestry it names, then the
+	// image over it. A clone cannot find one byte of its *own* image without the first
+	// (its chunks live under the lineage root, image.ChunksPrefix), and cannot answer a
+	// read of anything it did not write without the second.
 	//
-	// It is also one download the restart no longer pays: the parent's whole snapshot
-	// manifest and every chunk it names were being GET on every attach of every clone,
-	// for a view that was then thrown away.
+	// **What made the old arrangement safe was flattening, and what makes this one safe is
+	// the tombstone.** A manifest used to state a DISCARD as *absence*, so sliding a parent
+	// underneath a loaded image uncovered every range the guest had erased — §14.6's
+	// failure, and the reason `image.Load` returned an unlayered map that `cow.SetBase`
+	// refused. Absence in a delta means "ask the layer below" by design, and the erasure is
+	// carried explicitly as `Manifest.Discarded`, replayed by the loader as a tombstone. The
+	// protection did not go away; it moved into the format, where it also survives a
+	// restart, which the refusal never did.
 	//
-	// **The lineage is resolved before anything is read**, and for a clone that is not
-	// bookkeeping: its chunks live under the root of its chain, so without the root this
-	// volume cannot find one byte of *its own* image (image.ChunksPrefix). The walk that
-	// produces it is the same one parentView needs, done once here and passed down.
+	// **What this costs at attach**, plainly, because step 4's ceiling is chosen against it:
+	// a clone now pays, per link of its lineage, one descriptor GET (small, cleartext) plus
+	// one snapshot manifest GET plus the chunks that manifest names — and it pays it on
+	// every attach, not only on its first. A volume that descends from nothing pays nothing
+	// at all: parentChain returns on the empty parent link before it touches the store, and
+	// that is nearly every volume.
 	//
-	// This is what the key-space change costs at attach, and it is worth stating plainly:
-	// a clone that already has an image now pays one GET per link — descriptors, small
-	// and cleartext — where before it read nothing but its own manifest. A volume that
-	// descends from nothing pays nothing at all, because parentChain returns on the empty
-	// parent link before it touches the store, and that is nearly every volume.
+	// Rejected: keeping the image self-contained by flattening at publish. That is the
+	// status quo this replaces, and it costs a copy of the whole inherited dataset at the
+	// clone's first stop — measured, in internal/image's clone-cost tests — for a volume
+	// that may have written one sector.
 	//
-	// Rejected: recording the root in the volume's own descriptor and reading that
-	// instead, one GET whatever the depth. It duplicates a fact the chain already states
-	// — and a duplicate that can disagree with the chain is a way for a volume's chunks
-	// to be written under a prefix its own ancestry says is the wrong one. Rejected too:
-	// carrying it in DesiredVolume, for the reason in parentChain — the bucket is the
-	// authority a rebuild trusts, and ADR-0021 is not the obstacle here, the second copy
-	// is.
+	// Rejected: recording the lineage root in the volume's own descriptor and reading that
+	// instead, one GET whatever the depth. It duplicates a fact the chain already states —
+	// and a duplicate that can disagree with the chain is a way for a volume's chunks to be
+	// written under a prefix its own ancestry says is the wrong one. Rejected too: carrying
+	// it in DesiredVolume, for the reason in parentChain — the bucket is the authority a
+	// rebuild trusts, and ADR-0021 is not the obstacle here, the second copy is.
 	chain, err := m.parentChain(ctx, v, d)
 	if err != nil {
 		// Fail closed. A volume whose lineage cannot be resolved is one whose chunk
@@ -1001,45 +1023,52 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		v.lineage = chain[len(chain)-1].id
 	}
 
+	// The ancestry: every snapshot this volume descends from, composed into one view, or
+	// nil for a volume that was created rather than cloned. It is loaded in every session
+	// now — it used to be loaded only in the one before a clone's first stop, because
+	// after that the flattened image already held it.
+	ancestry, err := m.parentView(ctx, v, chain)
+	if err != nil {
+		// Fail closed, the same rule as a base that cannot be recovered and for the same
+		// reason: an empty view where data belongs is a wrong answer a guest cannot
+		// detect. It is stricter than it was, and deliberately: a clone whose ancestry is
+		// unreadable used to serve happily from its own flattened image, and now that
+		// image states only what the clone itself wrote.
+		slog.Error("the volume's ancestry could not be materialized; its reads will fail",
+			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
+		v.baseFailed = true
+		v.log.FailBase(err)
+		return
+	}
+	// What this volume's own layers sit over, and what its publish must not write down.
+	// Held on the Volume because the publish happens after teardown, when the chain that
+	// produced it is long gone (see publish, which passes it to image.Publish).
+	v.inherited = ancestry
+	if ancestry != nil {
+		// What this volume reads out of its ancestors rather than out of an image of its
+		// own — the size of the dataset it is riding on, which is now a permanent property
+		// of a clone rather than a bill it settles at its first stop.
+		//
+		// It is a fold over Ranges(), not Cost().Bytes: Cost sums each layer, so a range an
+		// ancestor wrote and a nearer one rewrote would count once per layer and a
+		// depth-3 lineage would report three times the dataset. The fold is O(extents) —
+		// the walk Cost exists to avoid — and that is right here, because this runs once at
+		// attach rather than at every guest fsync.
+		v.inheritedBytes, v.inheritedFrom = liveBytes(ancestry), d.GetParentSnapshotId()
+	}
+
 	// v.enc, not nil: the chunks are sealed under this volume's DEK, and loading them
 	// without it would fold ciphertext into the read view (DEV-0019).
-	base, man, etag, err := image.Load(ctx, m.deps.Store, v.enc, v.ident())
+	base, man, etag, err := image.Load(ctx, m.deps.Store, v.enc, v.ident(), ancestry)
 	switch {
 	case errors.Is(err, image.ErrNotPublished):
 		// A volume that has never stopped cleanly has no image, which is the first boot
-		// and must work. Its base is whatever its parent gives it, or nothing.
-		//
-		// This is the only session in which a clone reads *through* its parent (§20):
-		// it has no manifest of its own yet, so what it can read is what its ancestors'
-		// snapshots name. The parent's view becomes the base outright — not a layer
-		// under this one — and the clone's own extents shadow it as they arrive.
-		parent, perr := m.parentView(ctx, v, chain)
-		if perr != nil {
-			// Fail closed, the same rule as a base that cannot be recovered and for the
-			// same reason: an empty view where data belongs is a wrong answer a guest
-			// cannot detect.
-			slog.Error("the clone's parent snapshot could not be materialized; its reads will fail",
-				"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", perr)
-			v.baseFailed = true
-			v.log.FailBase(perr)
-			return
-		}
-		base, man = parent, image.Manifest{}
+		// and must work. Its base is the ancestry outright — an empty delta over it is the
+		// same view — or an empty map for a volume that descends from nothing.
+		base, man = ancestry, image.Manifest{}
 		if base == nil {
 			base = cow.NewIntervalMap()
 		}
-		// What this session will have to copy at its first stop: the live extent bytes of
-		// the whole inherited view, counted the same way sayWhatThisImageCosts counts the
-		// image it is about to write, because it is about to write exactly these ranges.
-		//
-		// It used to be Cost().Bytes, which was right while the base was one unlayered
-		// map and became wrong the moment parentView started composing a chain: Cost sums
-		// each layer's bytes, so a range an ancestor wrote and a nearer one rewrote is
-		// counted once per layer, and a depth-3 lineage would report three times the
-		// dataset as "inherited". Folding over Ranges() is O(extents) — the fold Cost
-		// exists to avoid — and that is right here, because this runs once at attach
-		// rather than at every guest fsync.
-		v.inheritedBytes, v.inheritedFrom = liveBytes(base), d.GetParentSnapshotId()
 	case err != nil:
 		// Refuse loudly rather than serve zeros. An empty view where data belongs is
 		// indistinguishable from a fresh volume, and a guest cannot tell them apart.
@@ -1066,53 +1095,50 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	// It belongs on this line because it is the only place the number can be attributed —
 	// an operator watching a host's data directory shrink at start-up otherwise has
 	// nothing saying which volume it was, or that it was deliberate.
+	//
+	// ancestors is how many links this attach walked, and it is on this line because it is
+	// the number an operator needs when an attach is slow: every link is a descriptor, a
+	// snapshot manifest and the chunks it names, and a read then crosses all of them. It is
+	// not the catalog's `chain_depth` — nothing here knows what a Control Plane is
+	// (ADR-0021) — it is what this host actually walked, which is the number that can
+	// disagree with the catalog and the one worth printing.
 	slog.Info("read view recovered from the object store",
 		"volume_id", v.id, "epoch", v.epoch, "durable_sequence", durable,
 		"reclaimed_local_bytes", v.log.ReclaimedBytes(),
-		"cloned_from", d.GetParentSnapshotId())
+		"cloned_from", d.GetParentSnapshotId(), "ancestors", len(chain),
+		"inherited_bytes", v.inheritedBytes)
 }
 
 // parentView composes the read view a clone inherits: every snapshot in the lineage it
 // descends from, layered oldest first — or nil for a volume that was created rather than
 // cloned (§20).
 //
-// Its one caller reaches it only for a volume with no image of its own — see fetchBase
-// for why an image supersedes the parent instead of layering over it. So this runs once
-// in a clone's whole life, on the boot before its first stop.
+// Its one caller reaches it on **every** attach of a clone, because a clone's own image
+// is a delta over exactly this view (fetchBase). It used to run once in a clone's whole
+// life, on the boot before its first stop, and that was right only while publishing
+// flattened.
 //
-// # It follows the chain, where it used to resolve one link
+// # It follows the chain, and now every link of it is load-bearing
 //
-// A depth-2 clone read its grandparent's bytes at all only because publishing flattens:
-// `image.uploadChunks` walks `view.Ranges()`, which merges the base, so every snapshot
-// manifest that exists today is self-contained. Take the flattening away — which is what
-// CHUNK-ADDRESSING-SPEC's decision does, and this is the first of its four steps — and a
-// single link answers zeros for everything an ancestor above the parent ever wrote. That
-// is DEV-0007's shape: a wrong answer a guest cannot detect.
+// A depth-2 clone read its grandparent's bytes at all, before this walk existed, only
+// because publishing flattened: every snapshot manifest held everything its volume could
+// read. Now a manifest states only its own volume, so a walk that stopped after one link
+// answers zeros for everything an ancestor above the parent ever wrote — DEV-0007's shape,
+// a wrong answer a guest cannot detect — and it answers them for the *nearest* ancestor's
+// own gaps too, not merely at depth 2.
 //
 // Nothing in `cow` had to be extended for this. `NewIntervalMapOver` nests arbitrarily,
-// `Ranges` recurses through `m.base.Ranges()` and `Read` through `m.base.Read`, so this
-// composes what was already there.
+// `Ranges` and `Read` both recurse through `m.base`, so this composes what was already
+// there.
 //
-// # The one thing the walk changes today, and the step that must close it
+// # The erasures are what this composition cannot do without
 //
-// While publishing still flattens, every layer below the nearest is redundant — with one
-// exception, and it is exactly the failure fetchBase refuses one level down. A manifest
-// states a DISCARD as **absence** (`cow.Ranges` subtracts tombstones and says so), and
-// absence in a layered chain means "ask the layer below". So a range an intermediate
-// clone discarded and then snapshotted is answered here with its grandparent's older
-// bytes, where the snapshot it descends from would read zeros (§14.6). It needs depth ≥ 2
-// to reach, which nothing in this tree and no deployment creates — `chain_depth > 1` has
-// never been exercised outside the tests added with this walk.
-//
-// **Step 3 of that spec — stop flattening — therefore cannot land without a tombstone in
-// the manifest**, because at that point absence carries the whole meaning of the format:
-// it is how a delta says "the layer below has this", so a discard needs a way to say the
-// opposite. That is an on-S3 format change and it belongs with the step that makes the
-// manifest a delta.
-//
-// Rejected: keeping the single link until then. It leaves the walk with no caller — what
-// CLAUDE.md calls a liability rather than progress — and moves the discovery above into
-// the step that can least afford to make it.
+// A range an intermediate ancestor discarded is a range where the layers below it still
+// hold bytes, and absence in a layered chain means "ask the layer below". So the snapshot
+// manifests this walk loads carry their erasures explicitly (`image.Manifest.Discarded`,
+// replayed as a tombstone by the loader) and the composition here reproduces §14.6 rather
+// than uncovering the grandparent's older bytes. That was the thing step 3 could not omit,
+// and it is why the format changed in the same increment that stopped flattening.
 func (m *VolumeManager) parentView(ctx context.Context, v *Volume, chain []ancestor) (*cow.IntervalMap, error) {
 	if len(chain) == 0 {
 		return nil, nil //nolint:nilnil // no parent is a shape, not a failure
@@ -1736,7 +1762,7 @@ func (m *VolumeManager) snapshot(ctx context.Context, v *Volume, snapshotID stri
 	defer func() {
 		m.deps.Recorder.Observe(ctx, "snapshot_publish_duration_seconds", m.deps.Clock.Now().Sub(publishStart).Seconds(), vol)
 	}()
-	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.ident(), frozen, seq, snapshotID); err != nil {
+	if _, err := image.PublishSnapshot(ctx, m.deps.Store, v.rnd, v.enc, v.ident(), frozen, v.inherited, seq, snapshotID); err != nil {
 		if !errors.Is(err, image.ErrSnapshotExists) {
 			return 0, fmt.Errorf("agent: volume %s: publishing snapshot %s: %w", v.id, snapshotID, err)
 		}

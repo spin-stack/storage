@@ -24,6 +24,21 @@ import (
 // with a single chunk, "the clone re-uploaded everything it inherited" and "the clone
 // paid for the chunk it wrote in" produce the same bytes.
 //
+// # The number this increment moved
+//
+// The clone writes one block into one of two regions. It has cost, at this fixture's
+// sizes and in this order:
+//
+//	4096 bytes — chunks keyed per volume: a full copy of the parent's dataset
+//	2048 bytes — chunks keyed per lineage: the region it wrote into, re-chunked whole
+//	 512 bytes — a manifest that is a delta: the block it actually wrote
+//
+// The last step is the one asserted below, and its shape is what matters rather than its
+// size: the cost stopped being a function of the region the write landed in and became a
+// function of the write. A golden image is one 64 MiB chunk (image.MaxChunkBytes), so at
+// the sizes a fleet actually runs, the middle row is the whole image and the last row is
+// still one block.
+//
 // The parent's own stop is asserted too, and that is not padding. A message printed on
 // every publish would satisfy any assertion about the clone's, and this is precisely the
 // shape CLAUDE.md lists as a test that proves nothing — so the parent, which inherited
@@ -90,23 +105,28 @@ func TestACloneStoresOnlyWhatItTouchedInItsLineageAndSaysSo(t *testing.T) {
 	grew := chunkBytesUnder(t, store, "chunks/"+p.GetVolumeId()+"/") - lineage
 	t.Logf("the parent's two regions are %d chunk bytes; the clone's stop added %d after writing %d bytes into one of them",
 		lineage, grew, testBlockSize)
-	// One region, not two: the region the clone never touched is byte-identical to its
-	// parent's, so the publisher Heads its key, finds it, and transfers nothing.
-	if want := lineage / 2; grew != want {
-		t.Errorf("the clone's stop added %d bytes to its lineage's chunk store, want %d — it wrote into one of two regions, so it pays for one",
-			grew, want)
+	// The block it wrote, and not the region that block fell in. `uploadChunks` chunks a
+	// range relative to its own offset, so what a stop pays for is the *ranges its own
+	// layer holds* — one block here — where flattening made it the ranges of the merged
+	// view, which for this fixture was a whole region.
+	if grew != testBlockSize {
+		t.Errorf("the clone's stop added %d bytes to its lineage's chunk store, want %d — its manifest states the block it wrote, not the region it wrote into",
+			grew, testBlockSize)
 	}
 
 	// And the line that says so, on the clone's stop, carrying the numbers.
-	const inherited = "names the dataset it inherited from its parent"
+	const inherited = "the dataset it inherited stays in its ancestors' snapshots"
 	cloneLine := logLineFor(t, out.String(), c.GetVolumeId(), "publishing the volume's image")
 	if !strings.Contains(cloneLine, inherited) {
-		t.Errorf("the clone's publish printed %q; an operator waiting on it has no way to know it is writing an image over %d inherited bytes",
+		t.Errorf("the clone's publish printed %q; an operator waiting on it has no way to know it is riding on %d inherited bytes it will read through on every attach",
 			cloneLine, parentBytes)
 	}
 	for _, want := range []string{
 		"inherited_bytes=" + strconv.FormatInt(parentBytes, 10),
-		"image_bytes=" + strconv.FormatInt(parentBytes, 10),
+		// What the manifest states, which is now the block and not the dataset. The two
+		// numbers on one line are the whole point: an operator can see at a glance that a
+		// clone is writing kilobytes and reading through gigabytes.
+		"image_bytes=" + strconv.FormatInt(testBlockSize, 10),
 		"parent_snapshot_id=" + snapID,
 		// The root an operator needs to find the bytes at all: with the chunk store
 		// shared, "where is this volume's data" is no longer answered by its own id.
