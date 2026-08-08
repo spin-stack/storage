@@ -414,3 +414,30 @@ already carries.** `STATUS.md` is track A's and `hack/` is track B's, and the tw
 have to move together: the lane that closes an entry deletes its line in the same commit
 that strikes the heading. That coupling is deliberate — it is what makes closing an entry
 as visible as opening one — and it is written at the top of the pin file.
+
+### The first CI run found two things a developer machine could not (2026-08-08)
+
+Both are the same shape and neither is a defect in the product: a check that had only
+ever run where its environment happened to satisfy it.
+
+**`qemu:verify` executed the extracted binary on the host.** The build extracts QEMU from
+the Docker image into `_output/`, and the check then ran `qemu-system-x86_64 --version`.
+That binary is dynamically linked against the *build image's* libraries, so it runs only
+where those are installed — every developer machine that has ever run this, and not a bare
+runner: `liburing.so.2: cannot open shared object file`, exit 127, and a message saying the
+built QEMU "is not the pinned 11.0.2", which was true of nothing.
+
+ADR-0025 had already decided this for the lane — *the guest lane runs inside the published
+runtime image rather than installing QEMU's dynamic dependencies on a bare runner* — and
+the check that guards the lane was the last thing assuming otherwise. It is now two halves:
+the files are checked where they were extracted, and the **behaviour** is checked inside the
+runtime image, which is the artefact CI actually consumes.
+
+**And the runtime image could not be built at all.** Splitting the check surfaced it
+immediately: Ubuntu's 64-bit `time_t` transition renamed `libaio1` to `libaio1t64`, so
+`apt-get install` exited 100. The builder stage takes the `-dev` packages, whose names did
+not change — which is exactly why the build kept succeeding while the image the lane
+depends on could not be assembled. Nothing had built it since the rename, because nothing
+needed to: `build:qemu` extracts, and only `build:qemu:push` builds the runtime target.
+
+Proven by putting the old name back: `E: Unable to locate package libaio1`, exit 100.

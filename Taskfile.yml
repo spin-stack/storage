@@ -291,14 +291,23 @@ tasks:
   qemu:verify:
     desc: Verify the built QEMU is the pinned version and exposes the devices we depend on.
     cmds:
+      # Two halves, and they are separated because they need different things to be
+      # true. The files are checked where they were extracted; the *behaviour* is
+      # checked where the binary can actually run.
+      #
+      # It was one half until the first CI run this repository ever had, which failed
+      # here with `liburing.so.2: cannot open shared object file`. The extracted binary
+      # is dynamically linked against the build image's libraries, so executing it on
+      # the host works only where those happen to be installed — which is every
+      # developer machine that has ever run this, and not a bare GitHub runner.
+      # ADR-0025 already decided this for the lane ("the guest lane runs inside the
+      # published runtime image, rather than installing QEMU's dynamic dependencies on
+      # a bare runner"); the check that guards the lane was the one thing still
+      # assuming otherwise.
       - |
         set -euo pipefail
         bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
         test -x "$bin" || { echo "missing $bin — run: task build:qemu"; exit 1; }
-        "$bin" --version | grep -q '{{.QEMU_VERSION}}' || {
-          echo "built QEMU is not the pinned {{.QEMU_VERSION}}:"; "$bin" --version; exit 1; }
-        "$bin" -device help 2>&1 | grep -q 'vhost-user-blk-pci' || {
-          echo "this QEMU has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
         test -x {{.OUTPUT_DIR}}/bin/qemu-storage-daemon
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
         # pvh.bin is how -kernel enters a PVH ELF kernel, which is the guest lane's
@@ -306,7 +315,27 @@ tasks:
         # reads like a backend bug.
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin || {
           echo "missing pvh.bin — a direct kernel boot (-kernel) cannot work; rebuild with: task build:qemu"; exit 1; }
-        echo "OK: $("$bin" --version | head -1), vhost-user-blk-pci present, storage daemon + firmware (incl. pvh) in place"
+        echo "OK: the extracted tree carries qemu-system-x86_64, the storage daemon and the firmware (incl. pvh)"
+      - task: qemu:verify:behaviour
+
+  qemu:verify:behaviour:
+    desc: Run the pinned QEMU and assert its version and devices — inside the runtime image, where its libraries are.
+    deps: [build:qemu:image]
+    cmds:
+      # `docker run` and not the extracted binary: see qemu:verify. The image is the
+      # artefact the guest lane consumes on a runner (ADR-0025), so verifying it is
+      # verifying what CI will actually use, rather than a copy of it that happens to
+      # be executable here.
+      - |
+        set -euo pipefail
+        img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
+        out=$(docker run --rm --entrypoint /bin/sh "$img" -c \
+          '/usr/local/bin/qemu-system-x86_64 --version; echo ---; /usr/local/bin/qemu-system-x86_64 -device help 2>&1')
+        printf '%s' "$out" | grep -q '{{.QEMU_VERSION}}' || {
+          echo "the runtime image's QEMU is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
+        printf '%s' "$out" | grep -q 'vhost-user-blk-pci' || {
+          echo "this QEMU has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
+        echo "OK: $(printf '%s' "$out" | head -1), vhost-user-blk-pci present — verified inside $img"
 
   build:guest:
     desc: Build the initramfs the QEMU lane boots (a static Go /init). The kernel comes from `task fetch:kernel`.

@@ -152,12 +152,17 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
 RUN --mount=type=cache,sharing=locked,id=qemu-runtime-aptlib,target=/var/lib/apt \
     --mount=type=cache,sharing=locked,id=qemu-runtime-aptcache,target=/var/cache/apt \
     apt-get update && \
+    # libaio1t64 and not libaio1: Ubuntu's 64-bit time_t transition renamed the runtime
+    # package, so the old name resolves to nothing and `apt-get install` exits 100 —
+    # which is what this stage did until the first CI run went looking for it. The
+    # builder stage takes the -dev packages, whose names did not change, which is why
+    # the build kept succeeding while the runtime image could not be assembled at all.
     apt-get --no-install-recommends install -y \
         libglib2.0-0 \
         libpixman-1-0 \
         libcap-ng0 \
         libseccomp2 \
-        libaio1 \
+        libaio1t64 \
         liburing2 \
         zlib1g && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
