@@ -39,6 +39,7 @@ func agentScenarios() []MandatoryScenario {
 		{Name: "fenced-volume-stops-serving", Run: scenarioFencedVolumeStopsServing},
 		{Name: "a-stopped-volume-comes-back-from-its-image", Run: scenarioAStoppedVolumeComesBackFromItsImage},
 		{Name: "a-clone-reads-through-its-parent", Run: scenarioACloneReadsThroughItsParent},
+		{Name: "a-clone-of-a-clone-reads-its-grandparents-bytes", Run: scenarioACloneOfACloneReadsItsGrandparentsBytes},
 		{Name: "a-snapshot-of-a-live-volume-is-frozen", Run: scenarioASnapshotOfALiveVolumeIsFrozen},
 		{Name: "two-hosts-cannot-both-publish-an-image", Run: scenarioTwoHostsCannotBothPublishAnImage},
 		{Name: "a-rebuilt-catalog-can-serve-its-volumes", Run: scenarioARebuiltCatalogCanServeItsVolumes},
@@ -363,6 +364,14 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 	if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, parentVol, parentDone, 1, snapID); err != nil {
 		return fmt.Errorf("publishing the parent's snapshot: %w", err)
 	}
+	// The descriptor a provisioner writes. The clone's Agent reads it to learn whether the
+	// parent descends from anything itself, and refuses to attach when it is not there
+	// rather than assuming the lineage ends (agent.parentChain).
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: parentID, SizeBytes: 1 << 20, BlockSize: 512, CurrentEpoch: 1,
+	}); err != nil {
+		return fmt.Errorf("writing the parent's descriptor: %w", err)
+	}
 	s.Notef("parent %s published snapshot %s", parentID, snapID)
 
 	// The clone: its own volume id, its own empty WAL, and a desired state that names
@@ -423,6 +432,121 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 		return fmt.Errorf("clone read %x, the parent wrote %x", got[:8], payload[:8])
 	}
 	s.Notef("clone %s read its parent's bytes through the snapshot, with no data copy", cloneID)
+	return nil
+}
+
+// scenarioACloneOfACloneReadsItsGrandparentsBytes is the chain walk, in the harness, at
+// the depth nothing in this repository had ever built: `chain_depth > 1`.
+//
+// `parentView` resolved exactly one link until 2026-08-08, and a depth-2 clone read its
+// grandparent's bytes only because publishing flattens — every snapshot manifest that
+// exists today already contains everything its volume could read. So the two ancestors
+// here publish **deltas**: each manifest names only the ranges that volume itself wrote,
+// which is what the publisher produces once step 3 of CHUNK-ADDRESSING-SPEC lands, and
+// what makes the walk the only thing that can answer the grandparent's offset.
+//
+// The assertion is the bytes the guest reads back at two offsets, and the checker is the
+// one that already watches for this failure: DurableRangeChecker sees zeros. Reading zeros
+// is the violation and an error is not — a refusal is the designed answer when the lineage
+// cannot be followed, and zeros are the answer a guest cannot tell from a range nobody
+// wrote (DEV-0007).
+func scenarioACloneOfACloneReadsItsGrandparentsBytes(s *Sim) error {
+	ctx := context.Background()
+	const grandparentOffset, parentOffset = 0, 8192
+	grandBytes := bytes.Repeat([]byte{0x77}, 4096)
+	parentBytes := bytes.Repeat([]byte{0x88}, 4096)
+
+	// publish writes one ancestor as it will exist once publishing stops flattening: a
+	// snapshot naming only this volume's own range, and a descriptor carrying its link
+	// upward — the only place the bucket states a lineage.
+	publish := func(payload []byte, offset uint64, parent descriptor.Descriptor) (string, string, error) {
+		volumeID := ids.NewAt(simEpoch*1000, s.Rand).String()
+		u, err := ids.Parse(volumeID)
+		if err != nil {
+			return "", "", err
+		}
+		own := cow.NewIntervalMap()
+		own.Overwrite(offset, payload)
+		snapID := ids.NewAt(simEpoch*1000, s.Rand).String()
+		if _, err := image.PublishSnapshot(ctx, s.Store, s.Rand, nil, [16]byte(u), own, 1, snapID); err != nil {
+			return "", "", fmt.Errorf("publishing the snapshot of %s: %w", volumeID, err)
+		}
+		if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+			VolumeID: volumeID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, CurrentEpoch: 1,
+			ParentSnapshotID: parent.ParentSnapshotID, ParentVolumeID: parent.ParentVolumeID,
+		}); err != nil {
+			return "", "", fmt.Errorf("writing the descriptor of %s: %w", volumeID, err)
+		}
+		return volumeID, snapID, nil
+	}
+
+	grandID, grandSnap, err := publish(grandBytes, grandparentOffset, descriptor.Descriptor{})
+	if err != nil {
+		return err
+	}
+	parentID, parentSnap, err := publish(parentBytes, parentOffset, descriptor.Descriptor{
+		ParentSnapshotID: grandSnap, ParentVolumeID: grandID,
+	})
+	if err != nil {
+		return err
+	}
+	s.Notef("snapshot %s of %s descends from snapshot %s of %s, and neither manifest holds the other's ranges",
+		parentSnap, parentID, grandSnap, grandID)
+
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/clone-of-clone", SocketDir: "/run/spin",
+		Budget: scenarioBudget(1),
+	}, agent.VolumeManagerDeps{
+		Clock:   s.Clock,
+		Disk:    s.Disk,
+		Listen:  func(string) (vhost.Listener, error) { return newSimListener(), nil },
+		Mapper:  simMapper{},
+		EventFD: simEventFD,
+		Store:   s.Store,
+		Rand:    s.Rand,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = m.Close(context.Background()) }()
+
+	cloneID := ids.NewAt(simEpoch*1000, s.Rand).String()
+	if err := m.Apply(ctx, []*storagev1.DesiredVolume{{
+		VolumeId: cloneID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
+		State:            storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+		ParentSnapshotId: parentSnap,
+		ParentVolumeId:   parentID,
+	}}); err != nil {
+		return fmt.Errorf("starting the clone of a clone: %w", err)
+	}
+	dev, ok := m.Device(cloneID)
+	if !ok {
+		return errors.New("the clone of a clone is not being served")
+	}
+
+	for _, want := range []struct {
+		offset int64
+		bytes  []byte
+		whose  string
+	}{
+		{grandparentOffset, grandBytes, "its grandparent"},
+		{parentOffset, parentBytes, "its parent"},
+	} {
+		got := make([]byte, len(want.bytes))
+		_, readErr := dev.ReadAt(got, want.offset)
+		zeros := readErr == nil && bytes.Equal(got, make([]byte, len(got)))
+		s.Emit(Event{Kind: EventDurableRead, Key: cloneID, ZerosAfterRestart: zeros})
+		if zeros {
+			return fmt.Errorf("clone %s read zeros at %d for a range %s wrote (§20)", cloneID, want.offset, want.whose)
+		}
+		if readErr != nil {
+			return fmt.Errorf("the clone's read at %d: %w", want.offset, readErr)
+		}
+		if !bytes.Equal(got, want.bytes) {
+			return fmt.Errorf("clone read %x at %d, %s wrote %x", got[:8], want.offset, want.whose, want.bytes[:8])
+		}
+	}
+	s.Notef("clone %s read through two links, with neither ancestor's manifest holding the other's bytes", cloneID)
 	return nil
 }
 
@@ -788,6 +912,11 @@ func aSnapshotOfALiveVolumeIsFrozen(s *Sim, late bool) error {
 	// snapshot that only works once its parent has stopped is the stop-and-upload path
 	// with extra steps.
 	defer func() { _ = source.Close(context.Background()) }()
+	if err := descriptor.Write(ctx, s.Store, descriptor.Descriptor{
+		VolumeID: sourceID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, CurrentEpoch: 1,
+	}); err != nil {
+		return fmt.Errorf("writing the source volume's descriptor: %w", err)
+	}
 	if err := source.Apply(ctx, []*storagev1.DesiredVolume{{
 		VolumeId: sourceID, SizeBytes: stoppedVolumeSizeCap, BlockSize: 512, Epoch: 1,
 		State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,

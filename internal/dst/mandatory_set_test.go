@@ -51,6 +51,7 @@ var pinnedMandatorySet = []string{
 	"fenced-volume-stops-serving",
 	"a-stopped-volume-comes-back-from-its-image",
 	"a-clone-reads-through-its-parent",
+	"a-clone-of-a-clone-reads-its-grandparents-bytes",
 	"a-snapshot-of-a-live-volume-is-frozen",
 	"two-hosts-cannot-both-publish-an-image",
 	"a-rebuilt-catalog-can-serve-its-volumes",
