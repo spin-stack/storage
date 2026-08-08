@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
@@ -74,6 +75,33 @@ var ErrCorruptDescriptor = errors.New("descriptor: contents do not match the sto
 
 // Key is the deterministic descriptor key for a volume.
 func Key(volumeID string) string { return "volumes/" + volumeID + "/descriptor.json" }
+
+// Prefix is where every volume's descriptor lives. Two callers list it — the rebuild,
+// to find the volumes a lost database no longer describes, and the lineage walk's
+// inverse, to find what descends from a volume about to be deleted — and neither may
+// spell it itself: a listing of the wrong prefix answers "nothing" rather than failing,
+// and both callers read that answer as a fact about the fleet.
+const Prefix = "volumes/"
+
+// VolumeOfKey extracts the volume id from `volumes/<id>/descriptor.json`, reporting
+// false for any other key under the prefix.
+//
+// It is the inverse of Key and lives beside it for the reason this repository has
+// already paid for once with the KEK file: two components that parse the same string
+// two ways disagree silently, and here the disagreement would be a volume that a
+// deletion's descendant scan skips — which is the one question that scan exists to
+// answer.
+func VolumeOfKey(key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, Prefix)
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(rest, "/descriptor.json")
+	if !ok || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
 
 // Write persists (or overwrites) a volume descriptor.
 //

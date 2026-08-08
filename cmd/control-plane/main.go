@@ -150,6 +150,14 @@ func run() error {
 		flattenVolume = flag.String("flatten-volume", "",
 			"rewrite this volume's image so it owes nothing to its ancestors, and exit, instead of serving")
 
+		// delete-volume: the first verb in this repository that removes anything, and it
+		// removes nothing permanently — every object gets a delete marker and the bucket's
+		// lifecycle policy is what expires it (INV-14, docs/plan/RUNBOOK.md). It is a
+		// one-shot like the rest; delete.go carries the preconditions, the order and what a
+		// delete does *not* reclaim.
+		deleteVolumeID = flag.String("delete-volume", "",
+			"delete this volume — its objects and its catalog rows — and exit, instead of serving")
+
 		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
 	)
@@ -354,6 +362,17 @@ func run() error {
 			return fmt.Errorf("-flatten-volume needs a Control Plane to be leading (start one first): %w", lerr)
 		}
 		return flatten(ctx, md, store, *kekFile, *flattenVolume, leader.Term)
+	}
+
+	if *deleteVolumeID != "" {
+		// Under the current term, like every other admin command here: a delete is not a
+		// leader taking over, and AcquireLeadership would leave the serving Control Plane's
+		// writes refused as stale.
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("-delete-volume needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		return deleteVolume(ctx, md, store, *kekFile, *deleteVolumeID, leader.Term)
 	}
 
 	if *cloneSnapshot != "" {

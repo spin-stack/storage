@@ -124,13 +124,13 @@ func volumeFromDescriptor(d descriptor.Descriptor) metadata.Volume {
 // from some of the bucket, silently, is worse than no rebuild — the operator would have
 // no way to know which volumes are missing.
 func listDescriptors(ctx context.Context, store objectstore.Store) ([]descriptor.Descriptor, error) {
-	objs, err := store.List(ctx, "volumes/")
+	objs, err := store.List(ctx, descriptor.Prefix)
 	if err != nil {
 		return nil, fmt.Errorf("controlplane: listing volume descriptors: %w", err)
 	}
 	var out []descriptor.Descriptor
 	for _, o := range objs {
-		volumeID, ok := volumeOfDescriptorKey(o.Key)
+		volumeID, ok := descriptor.VolumeOfKey(o.Key)
 		if !ok {
 			continue
 		}
@@ -147,19 +147,6 @@ func listDescriptors(ctx context.Context, store objectstore.Store) ([]descriptor
 		out = append(out, d)
 	}
 	return out, nil
-}
-
-// volumeOfDescriptorKey extracts the volume id from `volumes/<id>/descriptor.json`.
-func volumeOfDescriptorKey(key string) (string, bool) {
-	rest, ok := strings.CutPrefix(key, "volumes/")
-	if !ok {
-		return "", false
-	}
-	id, ok := strings.CutSuffix(rest, "/descriptor.json")
-	if !ok || strings.Contains(id, "/") {
-		return "", false
-	}
-	return id, true
 }
 
 // rebuildSnapshots records every published snapshot under one volume's prefix.
