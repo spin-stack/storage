@@ -1,5 +1,69 @@
 # DELETION-AND-RECLAIM-SPEC — the first thing in this repository that removes an object
 
+## DECIDED — 2026-08-07, human owner
+
+**"Deleting a volume means you cannot create or start a VM from it: the data is not there any
+more. A soft delete for a couple of days to allow recovery, and after that it does not exist."**
+
+And, from the same sitting, the answer §9 said had to come first: **`chain_depth` is a
+structure** (CHUNK-ADDRESSING-SPEC, "DECIDED"). That answer changes this spec's §9, so read
+the two together.
+
+### 1. Soft delete is the bucket's job, not ours — and that is the whole design
+
+`real.NewS3Store` refuses a bucket without versioning. So a delete is already a **reversible
+marker**: the object stops being readable, its previous version is still there, and what
+removes it permanently is the bucket's own lifecycle policy after N days. "A couple of days of
+recovery, then gone" is therefore *a lifecycle rule on the bucket*, not code in this
+repository — and this is the one place where the right implementation is to write no code and
+say so loudly.
+
+That is exactly INV-14's shape — *"GC only marks; permanent removal is the bucket lifecycle,
+and GC credentials lack permanent delete"* — which is `pending` only because its subject went
+with `internal/gc`. This decision brings the invariant back with the sweeper, and the checker
+it needs is the one that already existed: **nothing this repository runs may issue a permanent
+delete.** Structural, not aspirational: the `objectstore.Store` interface has no permanent
+delete to call.
+
+**What the deployment therefore owes**, and it belongs in the runbook rather than in code: the
+lifecycle rule, its retention window, and the fact that shortening it shortens the only
+recovery path a deleted volume has.
+
+### 2. What "the data is not there" means for the catalog, precisely
+
+The volume's row does not linger in a DELETED state waiting for the lifecycle to fire. The
+delete marks the objects and removes the rows; a recovery within the window is a
+**`-rebuild-metadata` from the bucket's live versions**, which is a path that already exists
+and is already tested (INV-20). That is why this decision is cheap: the undo is not a new
+mechanism, it is the one built for losing the database.
+
+*Rejected: a DELETED lifecycle state with a timer.* It puts the retention window in two places
+— the bucket's policy and a column — and they drift; the bucket's is the one that actually
+controls the bytes.
+
+### 3. §9's question is answered by the chain-depth decision, and the answer is B
+
+§9 offered **A** (refuse to delete a parent that has descendants) and **B** (flatten the
+descendants first), and said A was nearly free *if* chunks stayed addressed per volume,
+because publishing already flattened. **They do not stay per volume.** Under the lineage
+prefix a clone never becomes independent by publishing, so A stops being a temporary refusal
+and becomes a permanent one — "you can never delete this volume" — which contradicts the
+decision above.
+
+**So: B. A delete of a volume with descendants flattens them first**, and FLATTEN is the
+operator-run one-shot the chunk decision already obliges. The hole §9 found in A —
+`parent_snapshot_id` is write-once by construction, so "stop the clone and retry" never clears
+the link — becomes FLATTEN's job to clear, deliberately, as the last step of making a clone
+self-contained. That is a write nothing performs today and it is part of the increment.
+
+### 4. What this does not decide
+
+Whether a *snapshot* can be deleted independently of its volume, and what that means for a
+clone that descends from it. §3's reachability facts are what settle it and they are already
+in this document; nobody has been asked. It is smaller than the above and it can wait for the
+increment that needs it.
+
+
 **★ HUMAN-REVIEW ZONE.** Nothing here has an implementation yet, and that is the point:
 five review-zone increments in this repository landed their spec in the same commit as
 their code, and `PARALLEL-PLAN.md`'s "Review zones needing a human before implementation"
@@ -447,7 +511,11 @@ Outside-observable, with the plant that proves each can fail.
 - **No cascade.** Deleting a volume never deletes its clones and never rewrites another
   volume's objects.
 
-## 9. The question for review
+## 9. ~~The question for review~~ — answered 2026-08-07: **B, flatten first**
+
+See "DECIDED" at the top, and CHUNK-ADDRESSING-SPEC's decision, which is what forces B. The
+original framing follows because it is what the answer was chosen against — in particular the
+hole it found in A, which is now FLATTEN's responsibility.
 
 **Must a clone be independent of its parent before the parent can be deleted, or should the
 delete make it independent?**

@@ -1,5 +1,78 @@
 # CHUNK-ADDRESSING-SPEC — where a chunk lives, and the chain-depth decision it cannot be separated from
 
+## DECIDED — 2026-08-07, human owner: `chain_depth` is a **structure**
+
+**Options 2 and 3 together**, which is the opposite of §4's recommendation. §4 argued
+*label* on the grounds that flattening is what the code already does and the storage cost is
+bounded per link. The owner chose structure. What follows is what that obliges, so nobody has
+to reconstruct it from a one-word answer.
+
+**The cost argument §4 rested on had already collapsed**, which makes the decision cheaper to
+defend than §4 does. The measurement lane established, with tests, that the duplicate is paid
+**once per clone and not once per snapshot** (§3's premise was wrong), and that under option 2
+the saving is bounded by *chunk granularity* rather than by what the clone wrote — a clone
+that writes one sector saves nothing. So structure is not being bought for bytes. It is being
+bought because a lineage that reads through its ancestors is a thing the system can then
+*talk* about: a ceiling that refuses, a FLATTEN that means something, a `chain_depth` that
+describes the read path rather than a lineage nobody walks.
+
+### What is now decided
+
+1. **Chunks move to `chunks/<lineage-root>/<digest>`**, and the AAD binds the lineage root
+   instead of the volume. Not bucket-wide: the DEK is per volume and the whole chain already
+   shares the root's (`clone.go`), so the lineage is exactly the scope where sharing is
+   already safe. Bucket-wide would need a bucket-wide key and would make the design
+   document's *volume delete = crypto-shred* meaningless.
+2. **`parentView` walks the chain**, reading each ancestor's `descriptor.json` for the next
+   link rather than receiving a list in `DesiredVolume`. §3's own reasoning stands: it keeps
+   ADR-0021 intact and the bucket is already the authority a rebuild trusts.
+3. **Publishing stops flattening.** That is what makes 1 and 2 worth anything, and it is what
+   makes a clone's cost proportional to what it wrote.
+4. **The ceiling becomes a refusal.** `controlplane.Clone` refuses past the depth limit
+   instead of incrementing a number nobody reads, and `chain_depth` acquires the producer it
+   has never had.
+5. **FLATTEN becomes real**, because it is now the only way back under the ceiling — and,
+   per the deletion decision, the only way to delete a parent that has clones.
+
+### Three consequences that are not optional
+
+**The nonce argument must be rewritten, not adjusted.** `internal/image`'s package doc rests
+the encryption safety case on two facts *together*: the nonce is drawn rather than derived,
+and a chunk is sealed exactly once ever because an existing key is skipped. The skip rule is
+unchanged but now spans volumes, so "who sealed this, under which nonce" stops being answered
+by the key space. That is three paragraphs of a package doc and it is the reason the format is
+safe. It is a review-zone edit in its own right.
+
+**The read path degrades linearly with depth**, which is what the design document predicts and
+why §20.1 asks for FLATTEN at all. The ceiling is what bounds it; the refusal is therefore not
+a nicety.
+
+**FLATTEN is an operator-run one-shot, not a background operation.** The `operations` table
+that would have carried it was retired in wave 4 with ADR-0017's second capacity term, and
+bringing it back for one verb is a schema change, a term guard and a reconciliation loop for
+something every other admin action in this repository does as a one-shot flag
+(`-seed-volume`, `-snapshot-volume`, `-clone-snapshot`, `-detach-volume`,
+`-rebuild-metadata`). ADR-0021 says these binaries are harnesses; a one-shot is the shape that
+fits. *(Rejected: reviving `lifecycle.OpFlatten`. If spin later needs it scheduled, it
+schedules the one-shot.)*
+
+### The order, which is not the order §4 assumed
+
+§4 sequenced this as "a later increment with its own spec". It is now the increment, and it
+has a forced order because each step breaks reading until the next lands:
+
+1. the chain walk (option 3) — harmless while publishing still flattens, and it is what makes
+   a depth-2 clone read from its ancestors rather than from a flattened copy;
+2. the key space and the AAD (option 2) — the format change, with the §25.2 property test and
+   the rewritten nonce argument;
+3. stop flattening — the moment the cost actually falls, and the moment a clone stops being
+   independent;
+4. the ceiling as a refusal, and FLATTEN.
+
+**Between 3 and 4 a parent with clones cannot be deleted at all.** That window is the reason
+this order is written down rather than left to whoever picks it up.
+
+
 **★ HUMAN-REVIEW ZONE: on-S3 format.** Anything here that moves the key space or the AAD is a
 format change, which means a human review of this spec before implementation *and* of the diff
 before merge, plus the §25.2 serialize/replay property test with arbitrary truncations and bit
@@ -384,7 +457,10 @@ Outside-observable, each with the plant that proves it can fail.
 - **No decision about deletion.** DELETION-AND-RECLAIM-SPEC owns that, and §3's option 2 is
   where the two touch.
 
-## 8. The question for review
+## 8. ~~The question for review~~ — answered 2026-08-07: **structure**
+
+See "DECIDED" at the top of this file, which supersedes §4's recommendation. The original
+framing follows, because the alternatives it lays out are what the decision was made against.
 
 **Is `chain_depth` a structure or a label?**
 
