@@ -441,3 +441,30 @@ depends on could not be assembled. Nothing had built it since the rename, becaus
 needed to: `build:qemu` extracts, and only `build:qemu:push` builds the runtime target.
 
 Proven by putting the old name back: `E: Unable to locate package libaio1`, exit 100.
+
+### The verify that could not run in the place it was meant to guard (2026-08-08)
+
+The split above — files on the host, behaviour in the runtime image — was half right and
+broke the job it exists for. CI's guest lanes run **inside** that image (ADR-0025), where
+QEMU is trivially runnable and there is no docker to ask about an image, so an
+unconditional `docker build` failed with `"docker": executable file not found in $PATH`
+from a container with QEMU sitting in `/usr/local/bin`.
+
+Three callers, one question — *is the QEMU this caller will execute the pinned one, with
+the device the data path needs* — and the answer has to come from whichever QEMU that is:
+a developer machine, where the extracted binary runs because its libraries happen to be
+installed; a guest job inside the image, where it also runs; and a bare runner building
+the artefact for others, where it cannot run at all. So the check runs it if it runs and
+asks the image if it does not, **and prints which one answered**, which is what separates
+this from the "detect and hope" the first version rejected.
+
+Proven both ways: on this machine it verifies the binary, and against a stand-in that
+exits 127 with the linker's own message it prints *"cannot run here (its libraries are
+the build image's) — asking the runtime image instead"* and then verifies the image.
+
+**And the runtime image has no CA bundle**, which the guest job found the moment it got
+past the check: `go mod download` failed every module with `x509: certificate signed by
+unknown authority`. `ca-certificates` joins cpio and binutils in the job rather than in
+`Dockerfile.qemu` — the image stays what QEMU needs to run, and putting it there would
+mean rebuilding and republishing QEMU, tens of minutes, to fix something only a job that
+compiles Go inside the image ever needs.

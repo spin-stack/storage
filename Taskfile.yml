@@ -319,23 +319,44 @@ tasks:
       - task: qemu:verify:behaviour
 
   qemu:verify:behaviour:
-    desc: Run the pinned QEMU and assert its version and devices — inside the runtime image, where its libraries are.
-    deps: [build:qemu:image]
+    desc: Run the pinned QEMU and assert its version and devices, wherever that QEMU is actually runnable.
     cmds:
-      # `docker run` and not the extracted binary: see qemu:verify. The image is the
-      # artefact the guest lane consumes on a runner (ADR-0025), so verifying it is
-      # verifying what CI will actually use, rather than a copy of it that happens to
-      # be executable here.
+      # The question is "is the QEMU this caller will execute the pinned one, with the
+      # device the data path needs" — and the answer has to come from whichever QEMU that
+      # is. There are three callers and they are not the same:
+      #
+      #   - a developer machine, where the extracted binary runs because the libraries it
+      #     was linked against happen to be installed;
+      #   - CI's guest jobs, which run *inside* the runtime image (ADR-0025) where the
+      #     binary is trivially runnable and there is no docker to ask about an image —
+      #     this is what broke when the check unconditionally built one: `"docker":
+      #     executable file not found in $PATH`, inside a container that had QEMU sitting
+      #     right there;
+      #   - a bare runner building the artefact for others, where the binary cannot run
+      #     at all: `liburing.so.2: cannot open shared object file`.
+      #
+      # So: run it if it runs, and fall back to the image if it does not. That is not the
+      # "detect and hope" this rejected in its first version — the branch taken is printed,
+      # so a reader always knows which QEMU answered.
       - |
         set -euo pipefail
-        img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
-        out=$(docker run --rm --entrypoint /bin/sh "$img" -c \
-          '/usr/local/bin/qemu-system-x86_64 --version; echo ---; /usr/local/bin/qemu-system-x86_64 -device help 2>&1')
+        bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
+        where=""
+        if out=$("$bin" --version 2>/dev/null && echo --- && "$bin" -device help 2>&1); then
+          where="the binary at $bin"
+        else
+          img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
+          echo "$bin cannot run here (its libraries are the build image's) — asking the runtime image instead"
+          task build:qemu:image
+          out=$(docker run --rm --entrypoint /bin/sh "$img" -c \
+            '/usr/local/bin/qemu-system-x86_64 --version; echo ---; /usr/local/bin/qemu-system-x86_64 -device help 2>&1')
+          where="$img"
+        fi
         printf '%s' "$out" | grep -q '{{.QEMU_VERSION}}' || {
-          echo "the runtime image's QEMU is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
+          echo "the QEMU in $where is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
         printf '%s' "$out" | grep -q 'vhost-user-blk-pci' || {
-          echo "this QEMU has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
-        echo "OK: $(printf '%s' "$out" | head -1), vhost-user-blk-pci present — verified inside $img"
+          echo "the QEMU in $where has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
+        echo "OK: $(printf '%s' "$out" | head -1), vhost-user-blk-pci present — verified in $where"
 
   build:guest:
     desc: Build the initramfs the QEMU lane boots (a static Go /init). The kernel comes from `task fetch:kernel`.

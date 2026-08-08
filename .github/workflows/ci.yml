@@ -189,11 +189,19 @@ jobs:
       # its embedded config, and since 2026-08-04 it *fails* when it cannot look rather
       # than printing OK. Installing them here rather than in Dockerfile.qemu keeps the
       # shipped image to what QEMU needs to run; this is the preflight's tooling, and it
-      # is two packages that announce themselves by name when they are absent.
+      # is three packages that announce themselves by name when they are absent.
+      #
+      # ca-certificates is the third and it is not the preflight's: the image carries
+      # QEMU's seven shared libraries and no CA bundle, so `go mod download` inside it
+      # fails every module with `x509: certificate signed by unknown authority`. It goes
+      # here rather than into Dockerfile.qemu for the reason above and one more — putting
+      # it in the image means rebuilding and republishing QEMU, which is tens of minutes
+      # and leaves the already-published image stale, to fix something only a job that
+      # compiles Go inside the image ever needs.
       - name: Install what the preflight reads artefacts with
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y cpio binutils
+          apt-get install --no-install-recommends -y cpio binutils ca-certificates
 
       - name: Take the kernel the preflight pinned
         uses: actions/download-artifact@v4
@@ -266,7 +274,7 @@ jobs:
       - name: Install what the preflight reads artefacts with
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y cpio binutils
+          apt-get install --no-install-recommends -y cpio binutils ca-certificates
 
       - name: Take the kernel the preflight pinned
         uses: actions/download-artifact@v4
