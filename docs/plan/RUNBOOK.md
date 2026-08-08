@@ -538,6 +538,147 @@ applied to a decision an operator made by hand — which is why the success line
 
 ---
 
+## 6. A volume has to be deleted — and the retention window is not ours
+
+**Verified 2026-08-08** on the same shape of deployment as the rest of this file, with the
+same gap: no guest booted, so the volume below had a descriptor and no published image
+(`descriptor=true manifest=false`). What that leaves untested here is the size of the
+numbers, not the steps.
+
+### What a delete means, in one sentence, because it is not reversible by anything here
+
+Deleting a volume means no VM can be created or started from it: the objects stop
+answering and the catalog rows go. **The couple of days of recovery come from the bucket,
+not from this repository.** Every object is marked, never removed — `objectstore.Store`
+has no permanent delete on it, and `real.NewS3Store` refuses a bucket without versioning —
+so what actually expires a deleted volume is the bucket's own lifecycle policy. If nobody
+configured one, nothing ever expires and a delete costs storage forever. If somebody set
+it to a day, a delete is irreversible after a day. **This code cannot see that setting and
+cannot enforce it**, which is why it is written down here and in the next subsection rather
+than validated at startup.
+
+### What the deployment owes the bucket, before the first delete
+
+Three things, on the bucket the Agents and the Control Plane are pointed at:
+
+- **Versioning enabled.** Not optional and not merely recommended: `real.NewS3Store` calls
+  `GetBucketVersioning` at construction and fails closed, so a bucket without it is a fleet
+  that will not start. That is the *only* part of this the code checks.
+- **A lifecycle rule expiring non-current versions**, whose retention is the deployment's
+  recovery window. The design document's §5.11 is where the shape comes from — *"El borrado
+  real lo ejecuta el lifecycle del bucket sobre versiones no-actuales tras el grace
+  period"* — and the number is a decision nobody in this repository is allowed to make for
+  a deployment. Write the number down next to the bucket, and write it here.
+- **A rule expiring the delete markers themselves**, or a deleted volume leaves a marker per
+  object for ever. It costs no storage and it does make a `LIST` of the bucket slower and a
+  bill line item confusing.
+
+**Shortening the retention shortens the only recovery path a deleted volume has.** There is
+no second copy, no snapshot of the catalog that helps, and no undo verb in any binary here:
+recovery is "the previous versions are still in the bucket, so put them back and rebuild".
+When they are gone, they are gone.
+
+### Deleting one
+
+Two preconditions, and the command refuses on each rather than working around it. The
+volume must be **detached** — a host learns it has lost a volume only on its next poll, so
+deleting a placed volume takes the objects out from under a guest that is still writing:
+
+```
+$ control-plane -delete-volume 019fe2b1-… -database-url "$DSN" -object-store-dir "$STORE" -holder-id cp-del
+ERROR control-plane exited error="volume 019fe2b1-… is placed on host 019fe200-…: detach it first (-detach-volume 019fe2b1-…) and let that host publish its session. Deleting it now would take the objects out from under a guest that is still writing, and the host would not find out until its next poll"
+```
+
+and **nothing may descend from it**. That question is asked of the bucket, not of the
+catalog, and the answer is each other volume's `descriptor.json`. A clone reads its
+ancestry on every attach — publishing stopped flattening — so a descendant is flattened
+first, by this command, calling the same one-shot as `-flatten-volume`. It needs
+`-kek-file` for exactly that reason and for no other: a flatten opens every chunk the clone
+reads and re-seals it under the clone's own lineage. A descendant that is still placed, or
+that has published snapshots of its own, stops the delete with the flatten's own refusal.
+
+Then it works, and says what it marked:
+
+```
+$ control-plane -detach-volume 019fe2b2-… …
+INFO volume detached; its host stops serving it on its next poll, and publishes the session's image as it does volume_id=019fe2b2-…
+
+$ control-plane -delete-volume 019fe2b2-… …
+INFO volume deleted from the object store; every key it owned now carries a delete marker, and the bucket's lifecycle policy is what expires them volume_id=019fe2b2-… descriptor=true manifest=false snapshots=0 chunk_objects=0 chunk_bytes=0 flattened_descendants=0
+INFO volume and its snapshots removed from the catalog; recovering it means restoring the objects and running -rebuild-metadata volume_id=019fe2b2-…
+```
+
+`chunk_bytes` is what the delete actually reclaims, and for a **clone** it is nearly always
+zero — a clone writes into its *ancestry's* chunk store, so its data is not under its own
+name and deleting it frees only its manifests. The command says so on the way out
+(`chunks_belong_to_lineage_of=…`). To reclaim a clone's data, flatten it first — which
+re-homes its dataset under its own id — and then delete it.
+
+Running it again is not an error. Every step treats "already gone" as done, so an operator
+who is not sure the first run finished re-runs it:
+
+```
+$ control-plane -delete-volume 019fe2b2-… …
+WARN no catalog row names this volume; deleting whatever the bucket still holds under its names volume_id=019fe2b2-…
+INFO volume deleted … descriptor=false manifest=false snapshots=0 chunk_objects=0 chunk_bytes=0
+```
+
+### What the fleet says afterwards, and what the bucket still holds
+
+`-fleet-status` no longer lists it, and `-rebuild-metadata` — the one path that brings a
+volume back from the object store — does not resurrect it, which is the point of deleting
+the descriptor first:
+
+```
+$ control-plane -fleet-status -database-url "$DSN"
+VOLUMES (0, 0 with no primary host, 0 at the depth ceiling of 5 …)
+VOLUME_ID  PRIMARY_HOST  STATE  EPOCH  SIZE  DEPTH  PARENT_SNAPSHOT
+  (none)
+
+$ control-plane -rebuild-metadata …
+INFO catalog rebuilt from the object store; no volume has a primary host — place them to resume serving volumes=0 snapshots=0
+```
+
+And the bytes are still there. In this verification run the object store is a directory,
+where a delete marker is a sibling file, so the window is visible directly:
+
+```
+$ find "$STORE/volumes" -type f
+volumes/019fe2b2-…/descriptor.json.deleted
+volumes/019fe2b2-…/descriptor.json
+```
+
+### Undeleting one, inside the window
+
+There is **no `-restore-volume`** (see [What nothing can answer](#what-nothing-can-answer)).
+The recovery is two steps, and the first is done with the bucket's own tooling:
+
+1. **Remove the delete markers**, oldest object first — chunks, then `manifest.json`, then
+   `snapshots/*.json`, then `descriptor.json`. The order is the inverse of the delete's, and
+   it is not decoration: the descriptor is what makes the volume exist to the rebuild, so it
+   goes back last, once the bytes it describes are already readable. On S3 that is
+   `aws s3api delete-object --version-id <the delete marker's version>` per key; against
+   `-object-store-dir` it is removing the `.deleted` file.
+2. **`-rebuild-metadata`**, which reconstructs the volume and its snapshots from those
+   objects. It restores no placement — no object records one — so finish with
+   `-attach-volume` per volume, exactly as in [section 4](#4-the-catalog-is-gone).
+
+```
+$ rm "$STORE"/volumes/019fe2b2-…/descriptor.json.deleted
+$ control-plane -rebuild-metadata …
+INFO catalog rebuilt from the object store; no volume has a primary host — place them to resume serving volumes=1 snapshots=0
+
+$ control-plane -fleet-status -database-url "$DSN"
+VOLUME_ID                             PRIMARY_HOST  STATE   EPOCH  SIZE    DEPTH  PARENT_SNAPSHOT
+019fe2b2-…                            -             ACTIVE  1      1.0GiB  0      -
+```
+
+**A restore that runs after the lifecycle expired the versions finds nothing and reports
+success on the rebuild with `volumes=0`.** That is the only signal there is, so check the
+number.
+
+---
+
 ## What nothing can answer
 
 Each of these is a question this verification run asked and could not answer with a command.
@@ -555,6 +696,26 @@ serving Control Plane writes nothing periodically, so the catalog holds no evide
 liveness at all. Making the line mean what it reads as means renewing on a schedule, which
 is a lease and a loop this system does not have; the cheaper honest fix is for the line to
 say "elected" rather than "renewed".
+
+**How to undelete a volume with a command.** *(not-yet-possible.)* `objectstore.Store` has
+`Restore`, both implementations honour it, and no binary calls it — so section 6's recovery
+is `aws s3api` per key, in an order a human has to get right, during the one incident where
+getting it wrong is expensive. It is a `-restore-volume` flag over the same deterministic
+key set the delete walks, plus one rule that is not obvious and is why this is not a
+one-line addition: `ErrRestoreSuperseded` on a chunk is *success* (a chunk is
+content-addressed, so a re-published one is a different ciphertext of the same plaintext)
+and on `manifest.json` it is fatal.
+
+**Whether the bucket's lifecycle policy is what the deployment thinks it is.**
+*(not-yet-possible, and structurally so.)* The retention window behind every "recoverable
+for a couple of days" sentence in section 6 is a bucket policy. Nothing here reads it,
+nothing validates it, and a delete run against a bucket with no such rule looks exactly
+like one run against a bucket with a thirty-day rule. The only thing this repository checks
+is that versioning is *on* (`real.NewS3Store` fails closed without it), which is the
+difference between "recoverable for some period" and "not recoverable at all" — not the
+period. Closing this means reading `GetBucketLifecycleConfiguration` at startup and
+refusing, or logging, a bucket whose rule does not exist; it is small, and it is a decision
+about whether a fleet should fail to start over an object-store policy.
 
 **Whether a volume is actually being served.** *(not-yet-possible.)* `-fleet-status` prints
 placement, which is intent. The socket is the fact, and it exists only on the host. Every
