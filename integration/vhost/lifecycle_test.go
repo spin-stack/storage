@@ -512,7 +512,9 @@ func TestASnapshotOfAWritingGuestIsOnePointAndNotASmear(t *testing.T) {
 		return err == nil
 	})
 
-	// Read it the way a clone reads it: LoadSnapshot is the call agent.cloneView makes.
+	// Read it the way a clone reads its nearest ancestor: the same load agent.parentView
+	// performs at the top of its walk. (The symbol named here was `agent.cloneView`,
+	// which has not existed for some time; parentView now layers one of these per link.)
 	view, man, err := image.LoadSnapshot(ctx, bucket, nil, vol, snapshotID)
 	if err != nil {
 		t.Fatalf("reading snapshot %s back: %v", snapshotID, err)
