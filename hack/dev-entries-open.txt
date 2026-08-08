@@ -1,0 +1,34 @@
+# The doc↔code divergences this tree currently ships with. The ratchet.
+#
+# Read hack/dev-entries.sh first. CLAUDE.md's gate ends with "No open DEV entry that this
+# increment introduced", and every entry here is a place that line was answered with "yes,
+# and here is who owns it" rather than with silence. Wave 6 opened DEV-0024 and shipped
+# green because nothing read these headings at all; this file is the second half of the
+# mechanism that noticed.
+#
+# THE RATCHET TURNS ONE WAY, and both directions are enforced by hack/dev-entries.sh:
+#
+#   - an entry open in STATUS.md and absent here fails the gate, so the set cannot grow
+#     by accident. Opening a DEV entry stays allowed — it is the honest thing to do with
+#     a divergence you cannot close — and it now costs one deliberate line, in the commit
+#     that opened it, naming the owner and the decision it waits on.
+#   - a line here whose entry is no longer open fails the gate too, so the pin cannot
+#     outlive its entry. That is the rule internal/dst/mandatory_set_test.go already has:
+#     a registry that survives what it registers is a registry nobody trusts.
+#
+# A pinned COUNT was rejected for the reason this repository has already paid for twice:
+# `wantBehavioural` is the one ratchet here that pins a bare integer and it is the one
+# that causes merge conflicts, and a number can be satisfied by closing one entry and
+# opening another with nobody seeing the swap.
+#
+# STATUS.md IS TRACK A'S FILE AND THIS ONE IS TRACK B'S, and they have to move together:
+# the lane that closes an entry deletes its line here, in the same commit that strikes the
+# heading. hack/deadcode-pending.txt carries the same cross-lane rule and says the same
+# thing — it is not a lane's private property while it is shrinking.
+#
+# Format: `DEV-NNNN  # who owns the decision, and what closing it takes`. The reason is
+# mandatory; an entry with none fails the check that reads it.
+
+DEV-0011  # track C (internal/wal): waits on ADR-0013, where the Agent knows a volume's share of the device budget. Reserving a segment needs fallocate in simio/disk plus a durable write offset in the segment — a format change, and a review zone. Not data loss: ENOSPC at a segment boundary is latched exactly like ENOSPC while appending.
+DEV-0020  # a human owns it: docs/plan/CHUNK-ADDRESSING-SPEC.md puts the on-S3 format question (walk the chain at read time, or flatten at clone time) to review. PARALLEL-PLAN.md's C11 is the same decision, and removing the flattening before the chain read exists converts a storage-cost defect into silent zeros at chain depth 2.
+DEV-0024  # two owners, which is why it is open: the `-- CoW segment granularity (64 KiB)` comment is in track D's internal/schema/schema.sql and a schema edit is a `task db:plan` increment, and whether 64 KiB CoW segments are V2 or dead is downstream of DEV-0020's chunk-addressing decision. Marking it V2 now would be the guess the entry exists to avoid.

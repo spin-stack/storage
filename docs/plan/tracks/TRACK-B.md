@@ -360,3 +360,57 @@ silent — the `guest:verify` trap, one file over. `task guest:inputs:publish` w
 precondition missing stops before it logs in to anything: `2 precondition(s) missing —
 nothing was published.` The publish path itself is reviewed code, not proven code, and the
 script says so at the top: no registry has ever been touched from here.
+
+**Wave 7: the gate's fourth line gets a mechanism (2026-08-08).** CLAUDE.md's definition of
+done ends with "No open DEV entry that this increment introduced", and **no Taskfile
+target, no hack script and no CI job read a DEV entry.** `task ci:full` was green over an
+open one by construction, which wave 6 demonstrated: it opened DEV-0024 and shipped. That
+is the third instance of one shape — `task dst` selecting no tests, `hack/coverage.sh`
+comparing a rounded string, and now a gate line with no reader — and `task dev:entries`
+(`hack/dev-entries.sh` + `hack/dev-entries-open.txt`) is its answer.
+
+**Two shapes were rejected and the reasons are the interesting part.** *Fail whenever an
+entry is open* is the literal reading of the gate and is red on the day it lands: two of
+the three open entries wait on decisions a human has not made (DEV-0020 on
+`CHUNK-ADDRESSING-SPEC.md`, DEV-0011 on ADR-0013), and a step that is red on the day it
+lands is a step someone deletes — the Taskfile already says this, as the reason `deadcode`
+stayed out of every gate for two waves. *List and never fail* cannot produce a false red
+and is also easy to never run; `backend:conformance` was broken on main for a whole
+increment for exactly that reason. What landed is `deadcode`'s ratchet over a **set**: the
+open entries are pinned with a reason each, an entry nothing pinned is red, and a pin whose
+entry stopped being open is red too. Opening a DEV entry stays allowed — it is the honest
+thing to do with a divergence you cannot close — and stops being free.
+
+**The "a Markdown parser fires on prose" objection is real, and is answered by narrowing
+what is parsed.** Only heading lines, and only ones naming a `DEV-NNNN` id. A lane
+rewriting a paragraph, adding a section or striking a sentence mid-entry cannot move this
+check; the one edit that can is the one it exists to notice. Resolved is read off the
+heading the way this file already writes it — the id struck, `## ~~DEV-0019~~ — …`. A
+heading carrying `~~` that leaves the id bare is reported as **ambiguous** rather than
+guessed at: guessing "open" invents work and guessing "resolved" hides it, and the fix is
+one edit. It also fails when it finds no `DEV-NNNN` heading of *any* kind, because zero
+headings is not zero open entries — it is the file having moved or the convention having
+changed, which is the empty-enumeration defect this repository has now found four times.
+
+**Verified by planting, in both directions, against a byte-identical copy of `STATUS.md`
+rather than the file itself** — track A owns it and may be editing it in this window, and
+the script takes `STATUS=` for exactly this. Appending `## DEV-0025 — a planted entry`:
+`OPEN AND UNPINNED — the gate's fourth line is about exactly these:` naming the file and
+line, exit 1. Striking a pinned entry's id (`## ~~DEV-0011~~ — a segment's space …`):
+`DEV-0011 — resolved; remove the line, in the commit that resolved it`, exit 1. Four more
+states were exercised the same way: a heading deleted outright (`no heading at all; it was
+renumbered or deleted, and the pin outlived it`), a strike landing off the id (the
+ambiguity report), one id carrying both an open and a struck heading (`the entry claims to
+be resolved and not resolved at once`), and a pin line with no reason.
+
+**It is in `task ci`, beside `deadcode`, and it prints the open list on a green run.** That
+placement is the whole claim: the person opening a DEV entry runs `task ci`, not
+`ci:full`, and CI reaches it through `ci:noguest` → `ci:lanes` → `ci` with no workflow edit.
+A list shown only when the build is red is a list that stops being read the moment the
+mechanism starts working, which is why `deadcode` prints its pending set on green too.
+
+**One cross-lane rule it creates, and it is the same one `hack/deadcode-pending.txt`
+already carries.** `STATUS.md` is track A's and `hack/` is track B's, and the two files
+have to move together: the lane that closes an entry deletes its line in the same commit
+that strikes the heading. That coupling is deliberate — it is what makes closing an entry
+as visible as opening one — and it is written at the top of the pin file.
