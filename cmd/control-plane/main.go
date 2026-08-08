@@ -140,6 +140,16 @@ func run() error {
 		cordonHost   = flag.String("cordon-host", "", "stop placing new volumes on this host and exit, instead of serving")
 		uncordonHost = flag.String("uncordon-host", "", "let this host take new volumes again and exit, instead of serving")
 
+		// flatten-volume: make a clone self-contained and exit — the one-shot
+		// controlplane.Clone's refusal names. CHUNK-ADDRESSING-SPEC's decision of
+		// 2026-08-07 made it load-bearing for two things at once when publishing stopped
+		// flattening: it is the only way back under §20.1's depth ceiling, and the only way
+		// to delete a parent that has clones without destroying them
+		// (DELETION-AND-RECLAIM-SPEC's answer B). flatten.go carries the reasoning for this
+		// binary's half; the mechanism and its ordering are lineage.Flatten's.
+		flattenVolume = flag.String("flatten-volume", "",
+			"rewrite this volume's image so it owes nothing to its ancestors, and exit, instead of serving")
+
 		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
 	)
@@ -332,6 +342,14 @@ func run() error {
 			host, state = *uncordonHost, lifecycle.HostActive
 		}
 		return setCordon(ctx, md, leader.Term, host, state)
+	}
+
+	// No leader is borrowed here, and it is the one admin one-shot that needs none: a
+	// flatten writes objects and not one catalog row, so there is no §7 term for a guard to
+	// compare. What stands in its place is a precondition the catalog answers (the volume is
+	// detached) and the manifest's own compare-and-set. flatten.go carries both.
+	if *flattenVolume != "" {
+		return flatten(ctx, md, store, *kekFile, *flattenVolume)
 	}
 
 	if *cloneSnapshot != "" {

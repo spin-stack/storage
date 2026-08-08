@@ -32,7 +32,6 @@ internal/controlplane.ParseTermClaim            # the inverse of the claim encod
 internal/controlplane.Elector.HighestClaimedTerm # read by election_test and by the pg integration lane to prove a zombie CP's term never wins
 
 # --- deterministic ids (INV-22) ---------------------------------------------------------
-internal/image.OwnLineage  # the Ident of a volume that descends from nothing. Production never builds one: agent.fetchBase derives the pair from the walk, and for a root the walk simply leaves the volume's own id in place. Tests, DST and the lanes build root volumes constantly, and spelling Ident{Volume: v, Lineage: v} at each of them loses the sentence "this volume is its own lineage".
 internal/ids.NewAt  # CLAUDE.md names it: ids.New() in production, ids.NewAt(ms, r) for DST's reproducible ids. A binary using it would be a bug.
 
 # --- the lease manager ------------------------------------------------------------------
