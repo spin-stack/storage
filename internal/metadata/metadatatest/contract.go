@@ -85,6 +85,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"FleetWideReadsSeeTheRowsNoHostOwns", fleetWideReads},
 		{"ConcurrentEpochBumpsAreSerialized", concurrentBumps},
 		{"VolumePlacementIsChangeableAndClearingIsIdempotent", volumePlacement},
+		{"AVolumeIsRemovedOnlyWhenNothingDescendsFromIt", volumeDelete},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesRenewAndADeadHostCannotRenew", hostLeases},
 		{"CapacityIsDerivedAndTheBoundIsAPredicateOfTheWrite", capacity},
@@ -251,6 +252,26 @@ func everyMutation() []mutation {
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.PublishSnapshot(ctx, term, w.snap, 7, w.host, "image/k/snapshots/s.json")
 		}},
+		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.ClearVolumeParent(ctx, term, w.vol)
+		}},
+		// DeleteVolume builds its own row and destroys that one. Every other entry
+		// here operates on the fixture, and this one cannot: volumeGeometry runs the
+		// whole surface and then reads w.vol back, so a delete of w.vol would make the
+		// only destructive method in this interface look like a broken one. The create
+		// is inside the closure rather than in the world for the same reason the term
+		// cases still work — a stale term fails it first, and its error is the
+		// ErrStaleTerm those cases are asserting on.
+		{"DeleteVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			doomed := id()
+			if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1,
+				VolumeID: doomed, SizeBytes: 1, BlockSize: 65536, State: lifecycle.VolumeActive,
+				DEKWrapped: []byte{1}, KEKID: "k",
+			}, nil); err != nil {
+				return err
+			}
+			return s.DeleteVolume(ctx, term, doomed)
+		}},
 	}
 }
 
@@ -317,6 +338,15 @@ func missingRows(t *testing.T, s metadata.Store) {
 		}},
 		{"SetVolumePrimaryHost", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.SetVolumePrimaryHost(ctx, term, ghostVol, w.host)
+		}},
+		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.ClearVolumeParent(ctx, term, ghostVol)
+		}},
+		// A re-run of a delete that already finished lands here, and it is the reason
+		// the sentinel matters rather than a detail of it: the command reads
+		// ErrNotFound as "the catalog half is done" and carries on.
+		{"DeleteVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.DeleteVolume(ctx, term, ghostVol)
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setSnapshotState(ctx, s, term, ghostSnap, lifecycle.SnapshotPublished)
@@ -1588,6 +1618,12 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.PublishSnapshot(ctx, term, "", 7, "", "k")
 		}},
+		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.ClearVolumeParent(ctx, term, "")
+		}},
+		{"DeleteVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.DeleteVolume(ctx, term, "")
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1596,4 +1632,146 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			}
 		})
 	}
+}
+
+// volumeDelete is the catalog half of DELETION-AND-RECLAIM-SPEC: a volume leaves the
+// catalog with its snapshots, and only when nothing still descends from them.
+//
+// It asserts the refusal by what it lets an operator *do* rather than by reading a
+// column back. `ClearVolumeParent` — the write a FLATTEN needs and could not make —
+// is proven here by a delete that was refused before it and succeeds after it, which
+// is the whole reason that verb exists; asserting `parent_snapshot_id IS NULL` would
+// have passed just as well against a verb that cleared the column and left the
+// snapshot unreferenceable.
+//
+// The two descendant directions are separated on purpose, and the second is the one
+// an implementation forgets: everything else in this tree talks about
+// `volumes.parent_snapshot_id`, and a snapshot that descends from a snapshot — a
+// clone that took one of its own — leaves a row only the other query sees.
+func volumeDelete(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s)
+
+	// Two clones of the fixture's snapshot. cloneB also took a snapshot of its own,
+	// which is what puts a row in the second direction.
+	cloneA, cloneB, snapB := id(), id(), id()
+	for _, c := range []string{cloneA, cloneB} {
+		if err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
+			VolumeID: c, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
+			DEKWrapped: []byte{1}, KEKID: "kek", ChainDepth: 1, ParentSnapshotID: w.snap,
+		}, nil); err != nil {
+			t.Fatalf("CreateVolume(%s): %v", c, err)
+		}
+	}
+	if err := s.CreateSnapshot(ctx, w.term, metadata.Snapshot{
+		SnapshotID: snapB, VolumeID: cloneB, ParentSnapshotID: w.snap, Epoch: 1,
+		TargetSequence: 20, RootDigest: "d", State: lifecycle.SnapshotCreating, RequestID: id(),
+	}); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	// intact is the assertion that a refusal cost nothing: both rows still readable.
+	intact := func(t *testing.T, why string) {
+		t.Helper()
+		if _, err := s.GetVolume(ctx, w.vol); err != nil {
+			t.Fatalf("%s: the refused volume is gone: %v", why, err)
+		}
+		if _, err := s.GetSnapshot(ctx, w.snap); err != nil {
+			t.Fatalf("%s: the refused volume's snapshot is gone: %v", why, err)
+		}
+	}
+
+	t.Run("a volume another volume descends from is refused", func(t *testing.T) {
+		if err := s.DeleteVolume(ctx, w.term, w.vol); !errors.Is(err, metadata.ErrHasDescendants) {
+			t.Fatalf("delete with two clones: want ErrHasDescendants, got %v", err)
+		}
+		intact(t, "two clones descend from it")
+	})
+
+	t.Run("clearing one clone's link is not enough while the other holds it", func(t *testing.T) {
+		if err := s.ClearVolumeParent(ctx, w.term, cloneA); err != nil {
+			t.Fatalf("ClearVolumeParent(%s): %v", cloneA, err)
+		}
+		if err := s.DeleteVolume(ctx, w.term, w.vol); !errors.Is(err, metadata.ErrHasDescendants) {
+			t.Fatalf("delete with one clone left: want ErrHasDescendants, got %v", err)
+		}
+		intact(t, "one clone still descends from it")
+	})
+
+	t.Run("a snapshot that descends from it refuses the delete too", func(t *testing.T) {
+		if err := s.ClearVolumeParent(ctx, w.term, cloneB); err != nil {
+			t.Fatalf("ClearVolumeParent(%s): %v", cloneB, err)
+		}
+		// No volume names the snapshot any more; snapB does.
+		if err := s.DeleteVolume(ctx, w.term, w.vol); !errors.Is(err, metadata.ErrHasDescendants) {
+			t.Fatalf("delete with only a descending snapshot left: want ErrHasDescendants, got %v", err)
+		}
+		intact(t, "a snapshot of a clone still descends from it")
+	})
+
+	t.Run("a flattened clone is still a volume, at depth zero", func(t *testing.T) {
+		v, err := s.GetVolume(ctx, cloneA)
+		if err != nil {
+			t.Fatalf("the flattened clone is gone: %v", err)
+		}
+		// The depth is not decoration: §20.1's ceiling refuses a clone on it, so a
+		// flatten that left it at 1 would have bought the copy and not the clonability.
+		if v.ChainDepth != 0 || v.ParentSnapshotID != "" {
+			t.Fatalf("after ClearVolumeParent the clone is still at depth %d under %q",
+				v.ChainDepth, v.ParentSnapshotID)
+		}
+		// Idempotent: a delete flattens several descendants in one pass and an
+		// operator re-runs the command it is not sure completed.
+		if err := s.ClearVolumeParent(ctx, w.term, cloneA); err != nil {
+			t.Fatalf("clearing twice: %v", err)
+		}
+	})
+
+	t.Run("deleting the last descendant takes its snapshots with it", func(t *testing.T) {
+		if err := s.DeleteVolume(ctx, w.term, cloneB); err != nil {
+			t.Fatalf("DeleteVolume(%s): %v", cloneB, err)
+		}
+		if _, err := s.GetSnapshot(ctx, snapB); !errors.Is(err, metadata.ErrNotFound) {
+			t.Fatalf("the deleted volume's snapshot is still in the catalog: %v", err)
+		}
+	})
+
+	t.Run("with nothing descending, the volume and its snapshot go", func(t *testing.T) {
+		if err := s.DeleteVolume(ctx, w.term, w.vol); err != nil {
+			t.Fatalf("DeleteVolume(%s): %v", w.vol, err)
+		}
+		if _, err := s.GetVolume(ctx, w.vol); !errors.Is(err, metadata.ErrNotFound) {
+			t.Fatalf("the deleted volume is still readable: %v", err)
+		}
+		if _, err := s.GetSnapshot(ctx, w.snap); !errors.Is(err, metadata.ErrNotFound) {
+			t.Fatalf("the deleted volume's snapshot is still readable: %v", err)
+		}
+		// The fleet-wide read a human uses, and the per-host read an Agent is driven
+		// by: a row that only GetVolume has stopped answering for is a row that is
+		// still being served.
+		vols, err := s.ListVolumes(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range vols {
+			if v.VolumeID == w.vol {
+				t.Fatal("ListVolumes still returns the deleted volume")
+			}
+		}
+		served, err := s.ListVolumesByHost(ctx, w.host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range served {
+			if v.VolumeID == w.vol {
+				t.Fatal("the deleted volume is still in its host's desired state")
+			}
+		}
+	})
+
+	t.Run("running the delete again says it is already done", func(t *testing.T) {
+		if err := s.DeleteVolume(ctx, w.term, w.vol); !errors.Is(err, metadata.ErrNotFound) {
+			t.Fatalf("second delete: want ErrNotFound, got %v", err)
+		}
+	})
 }

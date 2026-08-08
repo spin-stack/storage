@@ -344,12 +344,16 @@ func run() error {
 		return setCordon(ctx, md, leader.Term, host, state)
 	}
 
-	// No leader is borrowed here, and it is the one admin one-shot that needs none: a
-	// flatten writes objects and not one catalog row, so there is no §7 term for a guard to
-	// compare. What stands in its place is a precondition the catalog answers (the volume is
-	// detached) and the manifest's own compare-and-set. flatten.go carries both.
 	if *flattenVolume != "" {
-		return flatten(ctx, md, store, *kekFile, *flattenVolume)
+		// Under the current term, like every other admin command here. It did not need one
+		// until metadata.Store grew ClearVolumeParent: a flatten used to write objects and
+		// no row at all, and left a WARN where the catalog write belonged. flatten.go says
+		// what changed and what it costs.
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("-flatten-volume needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		return flatten(ctx, md, store, *kekFile, *flattenVolume, leader.Term)
 	}
 
 	if *cloneSnapshot != "" {

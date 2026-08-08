@@ -433,6 +433,87 @@ func (s *Store) SetVolumePrimaryHost(_ context.Context, term int64, volumeID, pr
 	return nil
 }
 
+// ClearVolumeParent says a volume descends from nothing any more. It is the write
+// CreateVolume's COALESCE deliberately forbids to a *converging* create and that a
+// flatten cannot do without; metadata.Store carries the whole reasoning.
+//
+// A volume that already descends from nothing is a no-op rather than an error, for
+// the same reason clearing a placement twice is: an operator re-running a command
+// after a timeout must not be told it failed.
+func (s *Store) ClearVolumeParent(_ context.Context, term int64, volumeID string) error {
+	if err := requireID("volume", volumeID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	v, ok := s.vols[volumeID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	v.ParentSnapshotID, v.ChainDepth = "", 0
+	s.vols[volumeID] = v
+	return nil
+}
+
+// DeleteVolume removes a volume and its snapshots. metadata.Store carries why there
+// is no DELETING state and why the snapshots go in the same write.
+//
+// The descendant refusal is the sim's copy of two foreign keys Postgres has and this
+// store does not. It is not a convenience: without it the two implementations differ
+// on the one write in this interface that destroys a row, and the DST harness would
+// be proving something about a catalog production does not have.
+func (s *Store) DeleteVolume(_ context.Context, term int64, volumeID string) error {
+	if err := requireID("volume", volumeID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	if _, ok := s.vols[volumeID]; !ok {
+		return metadata.ErrNotFound
+	}
+	doomed := map[string]bool{}
+	for id, snap := range s.snaps {
+		if snap.VolumeID == volumeID {
+			doomed[id] = true
+		}
+	}
+	// Both directions, because a snapshot can descend from a snapshot: a clone of this
+	// volume's snapshot that took a snapshot of its own leaves a row in the second set
+	// and not the first, and it is the one an implementation forgets — every other
+	// place in this tree talks about volumes.parent_snapshot_id.
+	//
+	// The lowest id wins rather than whichever the map yields, so the message a
+	// re-run prints is the message the first run printed (INV-02).
+	var volDesc, snapDesc string
+	for _, v := range s.vols {
+		if v.VolumeID != volumeID && doomed[v.ParentSnapshotID] && (volDesc == "" || v.VolumeID < volDesc) {
+			volDesc = v.VolumeID
+		}
+	}
+	for _, snap := range s.snaps {
+		if snap.VolumeID != volumeID && doomed[snap.ParentSnapshotID] && (snapDesc == "" || snap.SnapshotID < snapDesc) {
+			snapDesc = snap.SnapshotID
+		}
+	}
+	switch {
+	case volDesc != "":
+		return fmt.Errorf("%w: volume %s descends from a snapshot of %s", metadata.ErrHasDescendants, volDesc, volumeID)
+	case snapDesc != "":
+		return fmt.Errorf("%w: snapshot %s descends from a snapshot of %s", metadata.ErrHasDescendants, snapDesc, volumeID)
+	}
+	for id := range doomed {
+		delete(s.snaps, id)
+	}
+	delete(s.vols, volumeID)
+	return nil
+}
+
 func (s *Store) UpdateWatermarks(_ context.Context, term int64, volumeID string, local, durable, published int64) error {
 	if err := requireID("volume", volumeID); err != nil {
 		return err

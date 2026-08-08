@@ -26,23 +26,42 @@ import (
 // second capacity term, and bringing it back for one verb is a schema change, a term guard
 // and a reconciliation loop for something ADR-0021 §2 already says these binaries are for.
 //
-// # It takes no term, and that is a decision rather than an omission
+// # It takes a term now, and it did not before
 //
-// Every other one-shot here borrows the leader's term because it writes a row, and §7's
-// guard is what stops a zombie Control Plane from making that write. This one writes no
-// row at all — the catalog write it *would* make is owed and named on the way out — so
-// there is nothing for a term to guard. Adding one would be a lock over a mutation that
-// does not exist, and it would make an operator start a Control Plane before they could
-// repair a bucket, which is the opposite of what an admin command should demand.
+// The first version of this command wrote no catalog row, and said so as a decision:
+// there was nothing for §7's guard to guard, and demanding a leader would have made an
+// operator start a Control Plane before they could repair a bucket. What made that true
+// was a gap rather than a design — `volumes.parent_snapshot_id` is write-once by
+// construction (CreateVolume COALESCEs it so a converging rebuild cannot drop a clone's
+// link), so no verb on metadata.Store could say a lineage had ended, and this command
+// left a `WARN` where the write belonged. metadata.Store.ClearVolumeParent is that verb,
+// and with it a flatten is a mutation like every other admin one-shot here: it borrows
+// the current term rather than acquiring one, because a repair is not a leader taking
+// over and AcquireLeadership would leave the serving Control Plane's writes stale.
 //
-// What actually protects the objects is the precondition below plus the manifest CAS: the
-// flatten replaces the volume's manifest, so a host that is serving it — holding the ETag
-// it loaded and about to CAS against it at its stop — would have its publish fail with
+// The cost is real and worth naming: a flatten of a bucket whose Control Plane is down
+// now fails at the first read instead of half-succeeding. That is the better failure. A
+// flatten that rewrote the bucket and could not tell the catalog leaves §20.1's ceiling
+// refusing clones of a volume that is back at depth 0 and a delete of the old parent
+// still seeing a descendant — the two things the operation exists to unblock.
+//
+// # The order: the bucket, then the catalog
+//
+// lineage.Flatten first, ClearVolumeParent after, and never the reverse. The bucket is
+// the authority a rebuild trusts (INV-20), so a catalog cleared before the objects were
+// rewritten would state a self-containment nothing had produced. The failure in between
+// is the resumable one: the descriptor already names no parent, so a re-run gets
+// lineage.ErrSelfContained — which this command treats as "finish the catalog half"
+// rather than as nothing to do.
+//
+// What protects the objects is the precondition below plus the manifest CAS: the flatten
+// replaces the volume's manifest, so a host that is serving it — holding the ETag it
+// loaded and about to CAS against it at its stop — would have its publish fail with
 // image.ErrSuperseded, which its teardown deliberately does not retry, and that session
 // would be lost. So the volume must be detached, and detached is a fact only the catalog
 // holds (a host learns it has lost a volume on its next poll, which is
 // controlplane.Place's reasoning for ErrAlreadyPlaced).
-func flatten(ctx context.Context, md metadata.Store, store objectstore.Store, kekFile, volumeID string) error {
+func flatten(ctx context.Context, md metadata.Store, store objectstore.Store, kekFile, volumeID string, term int64) error {
 	vol, err := md.GetVolume(ctx, volumeID)
 	if err != nil {
 		return fmt.Errorf("reading volume %s: %w", volumeID, err)
@@ -62,29 +81,31 @@ func flatten(ctx context.Context, md metadata.Store, store objectstore.Store, ke
 	case errors.Is(err, lineage.ErrSelfContained):
 		// Idempotent on the happy path, which is what an operator re-running a command they
 		// are not sure completed needs. It is not "nothing happened": it is the state the
-		// command exists to reach.
+		// command exists to reach — and it is also the resume path, because a run that
+		// rewrote the descriptor and then failed to reach the database lands here. So the
+		// catalog write below still happens, and re-running the command is what repairs it.
 		slog.Info("volume already owes nothing to an ancestry; its image is what answers every read",
 			"volume_id", volumeID)
-		return nil
 	case err != nil:
 		return err
+	default:
+		slog.Info("volume flattened: its image now states the whole dataset and its descriptor names no parent",
+			"volume_id", volumeID, "ancestors_left", res.Ancestors,
+			"was_cloned_from", res.ParentSnapshotID, "of_volume", res.ParentVolumeID,
+			"image_bytes", res.Bytes, "runs", res.Runs, "erased_ranges", res.Erased)
 	}
 
-	slog.Info("volume flattened: its image now states the whole dataset and its descriptor names no parent",
-		"volume_id", volumeID, "ancestors_left", res.Ancestors,
-		"was_cloned_from", res.ParentSnapshotID, "of_volume", res.ParentVolumeID,
-		"image_bytes", res.Bytes, "runs", res.Runs, "erased_ranges", res.Erased)
-
-	// The half this command cannot do, said every time rather than documented once. The
-	// volume reads correctly without it — its Agent takes the link from the descriptor
-	// (lineage.Walk) precisely because this column cannot be cleared — but everything that
-	// *counts* lineage still counts this one: `chain_depth` still says what it said, so
-	// controlplane.Clone's ceiling still refuses clones of this volume, and a delete of the
-	// old parent still sees a descendant. `-rebuild-metadata` fixes both, because it
-	// reconstructs the row from the descriptor this command just rewrote.
-	slog.Warn("the catalog still records the lineage this volume no longer has: volumes.parent_snapshot_id is write-once by construction (CreateVolume COALESCEs it), so no verb here can clear it. Until metadata.Store grows one, -rebuild-metadata is what makes the catalog agree with the bucket",
-		"volume_id", volumeID, "catalog_parent_snapshot_id", vol.ParentSnapshotID,
-		"catalog_chain_depth", vol.ChainDepth)
+	// The catalog last, and it is what makes the operation mean anything to the rest of
+	// the Control Plane: until this row says depth 0 and no parent, §20.1's ceiling keeps
+	// refusing clones of a volume that has just paid for its independence, and
+	// -delete-volume on the old parent keeps refusing on a descendant that no longer
+	// reads through it (metadata.ErrHasDescendants).
+	if err := md.ClearVolumeParent(ctx, term, volumeID); err != nil {
+		return fmt.Errorf("volume %s is flattened in the object store but the catalog still records its lineage (re-run this command to finish it): %w", volumeID, err)
+	}
+	slog.Info("the catalog no longer records a lineage for this volume",
+		"volume_id", volumeID, "was_parent_snapshot_id", vol.ParentSnapshotID,
+		"was_chain_depth", vol.ChainDepth)
 	return nil
 }
 

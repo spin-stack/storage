@@ -80,6 +80,22 @@ var (
 
 	// ErrUnversionedDEK is a volume written with DEKKeyID 0 — see CheckDEKKeyID.
 	ErrUnversionedDEK = errors.New("metadata: a volume's DEK must carry a version")
+
+	// ErrHasDescendants means a volume cannot be removed while another volume — or
+	// another volume's snapshot — still descends from one of its snapshots. It is the
+	// catalog half of DELETION-AND-RECLAIM-SPEC's first precondition, and it is a
+	// safety net rather than the check an operator meets: since publishing stopped
+	// flattening, `parent_snapshot_id` is write-once by construction, so the catalog
+	// keeps naming a parent a FLATTEN has already dissolved in the bucket. The command
+	// therefore asks the *bucket* who descends from what and flattens them first; this
+	// refuses the write that would leave a snapshot row referenced by nothing it can
+	// still be read through.
+	//
+	// Postgres would refuse it anyway — snapshots.snapshot_id is referenced by both
+	// volumes.parent_snapshot_id and snapshots.parent_snapshot_id — and that is
+	// precisely why the sentinel exists: an integrity violation surfacing as a driver
+	// error is one no caller can branch on, and the sim has no foreign keys at all.
+	ErrHasDescendants = errors.New("metadata: a volume whose snapshots something still descends from")
 )
 
 // CheckWatermarkOrder returns ErrWatermarkOrder unless published ≤ durable ≤ local
@@ -472,6 +488,56 @@ type Store interface {
 	// has is a no-op, not an error — the operator who re-runs the command after a
 	// timeout must not be told it failed.
 	SetVolumePrimaryHost(ctx context.Context, term int64, volumeID, primaryHostID string) error
+	// ClearVolumeParent records that a volume descends from nothing any more:
+	// parent_snapshot_id back to NULL and chain_depth back to 0 (term-guarded).
+	//
+	// It is the one write `lineage.Flatten` cannot make and cannot do without.
+	// CreateVolume's conflict path is
+	// `parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED...)`, which
+	// makes the column write-once so that a converging rebuild can never drop a
+	// clone's link — correct, and it also means no write on this Store could say a
+	// lineage had ended. Nothing read wrong because of that: the Agent takes the link
+	// from `descriptor.json`, which the flatten rewrites. Everything that *counted*
+	// lineage did — `controlplane.Clone`'s ceiling kept refusing clones of a volume
+	// that is back at depth 0, and a delete of the old parent kept seeing a descendant
+	// whose snapshot rows it must not orphan (ErrHasDescendants). This is that write,
+	// and it is why a flatten now unblocks a delete instead of only appearing to.
+	//
+	// Clearing a volume that already descends from nothing is a no-op, not an error:
+	// an operator re-running a flatten, and a delete flattening several descendants in
+	// one pass, must both be able to run twice.
+	//
+	// It does not touch the descriptor. The bucket is the authority a rebuild trusts
+	// (INV-20), the flatten rewrites it before this is called, and a second writer of
+	// that object here would be a second place the fact lives.
+	ClearVolumeParent(ctx context.Context, term int64, volumeID string) error
+	// DeleteVolume removes a volume and its snapshots from the catalog
+	// (term-guarded). There is no DELETING state and no timer: the row goes, and the
+	// recovery window belongs entirely to the bucket's own versioning and lifecycle
+	// policy (DELETION-AND-RECLAIM-SPEC's decision of 2026-08-07). Putting a retention
+	// window in a column as well as in a bucket policy makes two of them, and they
+	// drift; only one of the two controls the bytes.
+	//
+	// **The undo is `-rebuild-metadata`**, which reconstructs both rows from the
+	// descriptor and the snapshot manifests while the bucket still holds their
+	// non-current versions. That is not a mechanism this method needs to provide — it
+	// is the one built for losing the whole database.
+	//
+	// The volume's snapshots go with it, in the same write. A snapshot row whose
+	// volume is gone is a row nothing can read (its manifest lives under the volume's
+	// prefix) and a foreign key nothing can satisfy, so leaving the two to separate
+	// calls would leave a window in which the catalog states a snapshot of a volume
+	// that does not exist.
+	//
+	// ErrHasDescendants if anything still descends from one of those snapshots.
+	// ErrNotFound if the volume is not there — which a re-run of a delete that already
+	// removed the row will get, and which its caller reads as "already done".
+	//
+	// It does not check placement. `primary_host_id` being NULL is the delete
+	// command's precondition and it belongs there: it is a statement about a host that
+	// is still serving a device, which this Store cannot see and could not enforce
+	// against an Agent that has not polled yet.
+	DeleteVolume(ctx context.Context, term int64, volumeID string) error
 	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
 	// A report violating published ≤ durable ≤ local is ErrWatermarkOrder (INV-03).
 	// A report that is merely *late* — an epoch-N primary's, delivered after epoch

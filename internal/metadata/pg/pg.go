@@ -632,6 +632,47 @@ func (s *Store) SetVolumePrimaryHost(ctx context.Context, term int64, volumeID, 
 	return fmt.Errorf("%w: volume %s was placed concurrently", metadata.ErrAlreadyPlaced, volumeID)
 }
 
+// ClearVolumeParent records that a volume descends from nothing any more.
+// metadata.Store carries why the column could not be written before this existed;
+// volumes.sql carries why chain_depth moves in the same statement.
+func (s *Store) ClearVolumeParent(ctx context.Context, term int64, volumeID string) error {
+	id, err := requireUUID("volume", volumeID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.ClearVolumeParent(ctx, db.ClearVolumeParentParams{VolumeID: id, Term: term})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// The statement's only predicates are the id and the term, and `wrote` has already
+	// ruled the term out, so nothing else can have matched no row.
+	return metadata.ErrNotFound
+}
+
+// DeleteVolume removes a volume and its snapshots. metadata.Store carries why the row
+// goes rather than entering a DELETING state, and volumes.sql carries why one
+// statement does both tables.
+func (s *Store) DeleteVolume(ctx context.Context, term int64, volumeID string) error {
+	id, err := requireUUID("volume", volumeID)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.DeleteVolume(ctx, db.DeleteVolumeParams{VolumeID: id, Term: term})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	// Three predicates could have matched nothing and `wrote` has ruled out the term,
+	// so the diagnosis is a read: the row is gone, or something still descends from
+	// its snapshots. Taken in that order because "not found" is what a re-run of a
+	// completed delete must be told.
+	if _, gerr := s.GetVolume(ctx, volumeID); gerr != nil {
+		return gerr
+	}
+	return fmt.Errorf("%w: %s", metadata.ErrHasDescendants, volumeID)
+}
+
 func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error {
 	id, err := requireUUID("volume", volumeID)
 	if err != nil {

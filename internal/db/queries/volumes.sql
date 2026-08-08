@@ -194,3 +194,74 @@ UPDATE volumes
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
    AND state = ANY(sqlc.arg(allowed_states)::text[]);
+
+-- name: ClearVolumeParent :execrows
+-- Record that a volume descends from nothing any more, term-guarded: the one write
+-- CreateVolume's COALESCE deliberately forbids to a converging create.
+--
+-- It exists because a FLATTEN dissolves a lineage in the *bucket* and nothing here
+-- could say so. The column is write-once by construction — a rebuild running twice
+-- must never drop a clone's link — so after a flatten the catalog kept naming a
+-- parent, `chain_depth` kept counting a chain the volume no longer reads through, and
+-- deleting the old parent kept hitting the foreign key that protects its snapshots.
+--
+-- chain_depth goes with it, in the same statement, because they are one fact: §20.1's
+-- ceiling refuses on the depth and a volume left at N would be as unclonable as it was
+-- before the copy it just paid for.
+--
+-- No state predicate and no descendant check. This does not destroy anything a reader
+-- needs: the link it clears is one the descriptor has already stopped carrying, and a
+-- volume that never had one is unchanged. Clearing twice affects one row both times,
+-- which is what lets an operator re-run a flatten.
+UPDATE volumes
+   SET parent_snapshot_id = NULL,
+       chain_depth = 0,
+       updated_at = now()
+ WHERE volume_id = $1
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $2;
+
+-- name: DeleteVolume :execrows
+-- Remove a volume and its snapshots, term-guarded. There is no DELETING state and no
+-- expiry column: the recovery window for a deleted volume is the bucket's own
+-- versioning plus its lifecycle policy, and a second window in a column here would
+-- drift from the one that actually controls the bytes
+-- (DELETION-AND-RECLAIM-SPEC, 2026-08-07).
+--
+-- One statement, three parts, and the order is forced by the two foreign keys that
+-- make volumes and snapshots mutually referencing:
+--
+--   * `doomed` is the guard — the term, and nothing descending from this volume's
+--     snapshots in *either* direction (volumes.parent_snapshot_id and
+--     snapshots.parent_snapshot_id, both of which are indexed for exactly this). It
+--     selects the row rather than deleting it, so an unmet guard affects 0 rows and
+--     writes nothing at all.
+--   * the snapshots go, because a snapshot row whose volume is gone is a row nothing
+--     can read: its manifest lives under the volume's prefix.
+--   * the volume goes last.
+--
+-- Data-modifying CTEs run to completion whether or not the primary query reads them,
+-- and referential integrity is checked at the end of the statement, so the two deletes
+-- are one atomic act — which is what stops a crash between them leaving a snapshot of
+-- a volume that does not exist.
+--
+-- Rejected: ON DELETE CASCADE on snapshots.volume_id. It would put the same behaviour
+-- in the schema where every other writer inherits it silently, and this is the only
+-- statement in the tree that may remove a volume: a cascade is a rule nobody reads
+-- until it has fired.
+WITH doomed AS (
+    SELECT v.volume_id
+      FROM volumes v
+     WHERE v.volume_id = sqlc.arg(volume_id)
+       AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
+       AND NOT EXISTS (SELECT 1 FROM volumes d
+                        WHERE d.volume_id <> sqlc.arg(volume_id)
+                          AND d.parent_snapshot_id IN (SELECT s.snapshot_id FROM snapshots s
+                                                        WHERE s.volume_id = sqlc.arg(volume_id)))
+       AND NOT EXISTS (SELECT 1 FROM snapshots d
+                        WHERE d.volume_id <> sqlc.arg(volume_id)
+                          AND d.parent_snapshot_id IN (SELECT s.snapshot_id FROM snapshots s
+                                                        WHERE s.volume_id = sqlc.arg(volume_id)))
+), gone AS (
+    DELETE FROM snapshots WHERE volume_id IN (SELECT volume_id FROM doomed)
+)
+DELETE FROM volumes WHERE volume_id IN (SELECT volume_id FROM doomed);
