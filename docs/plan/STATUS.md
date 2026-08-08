@@ -621,7 +621,12 @@ nobody notices.
 Until then the rule is enforced by whoever reads this file, which is exactly the
 "human-shaped control" `PARALLEL-PLAN.md` says is not a control.
 
-## DEV-0024 — `block_size` is the guest's logical block size, and two files call it the 64 KiB CoW granularity
+## DEV-0024 — is the 64 KiB CoW granularity V2, or is it dead?
+
+*(Narrowed 2026-08-07. The half about the declared schema's comment is closed: `schema.sql`
+now names the column for what it is, `cba356c`. A comment-only change produces no migration —
+pgschema diffs database objects and a `--` line is not one — which the `db:plan` target had
+already been written to say out loud.)*
 
 **The declared schema is the one that is wrong**, which is what makes this a DEV entry
 rather than a document fix: `internal/schema/schema.sql`'s `block_size` column carries the
@@ -634,7 +639,9 @@ the same thing in §8 and is corrected (`2e80c11`'s successor); the schema is tr
 size reported to the guest", `VolumeSpec.validate` refuses one that is not a multiple of the
 512-byte sector, `control-plane -seed-block-size` (whose own help text says "logical block
 size") defaults it to 4096, and the Agent hands
-it to `blockdev` as the device's block size. Nothing anywhere treats it as a CoW
+it on — **not to `blockdev`, which has no block size at all; the path is
+`VolumeManager.supervise` → `vhost.Config.BlockSize` → the virtio-blk config's `blk_size`.**
+Nothing anywhere treats it as a CoW
 granularity. The contract fixtures in `internal/metadata/metadatatest` pass 65536, which is
 legal and is presumably where the confusion kept its footing.
 
@@ -653,6 +660,27 @@ downstream of the chunk-addressing question that `CHUNK-ADDRESSING-SPEC.md` puts
 and DEV-0020 waits on: if a chain is walked rather than flattened, the granularity of what
 is addressed is exactly the decision being made. Marking the doc "V2" would have been the
 guess this entry exists to avoid.
+
+## Nothing observes that the catalog's `block_size` reaches the guest
+
+Found 2026-08-07 while closing DEV-0024's first half, by planting the defect rather than by
+reading: `VolumeManager.supervise` was made to hand `vhost.Config` a hardcoded 512 — an Agent
+that discards the catalog's block size entirely — and **`go test ./internal/...` stayed
+green everywhere.**
+
+The two places that look like they cover it are reading the default. `internal/vhost`'s
+`GET_CONFIG` assertion checks `blk_size` against `SectorSize` on a `Config` whose `BlockSize`
+is zero, and `integration/vhost`'s volume fixture names `BlockSize: 512` — which *is* the
+default `vhost.NewDevice` substitutes for zero. So the fixture agrees with the plant by
+coincidence, which is CLAUDE.md's "two Agents pointed at the same wrong bucket so they
+agreed", in a different costume.
+
+**What would close it** is one arm with a **non-default** block size — 4096 — carried from a
+desired volume to what the guest reports, which means `integration/guestinit` reading
+`BLKSSZGET` off its device and printing it, and the lane asserting on the number the desired
+state named. That is a guest-lane change (track B owns `guestinit`, and it needs an initramfs
+rebuild), which is why it is recorded here rather than done in the increment that found it.
+**The plant above is the ready-made proof that it would catch something.**
 
 ## DEV-0011 — a segment's space is charged as used, not reserved at creation
 
