@@ -28,5 +28,3 @@
 #
 # Format: `DEV-NNNN  # who owns the decision, and what closing it takes`. The reason is
 # mandatory; an entry with none fails the check that reads it.
-
-DEV-0025  # track C (internal/image): a manifest is JSON, so §25.2's bit-corruption half cannot be met — a flipped bit in `"offset":1024` yields `"offset":1025` and loads clean. Truncation IS covered. The fix is named and small: frame the manifest the way internal/descriptor frames its object, a digest line over the bytes as stored. It got worse with the lineage delta, and the chain said so: a moved tombstone now uncovers an *ancestor's* bytes rather than misplacing this volume's.

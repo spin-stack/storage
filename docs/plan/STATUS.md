@@ -714,7 +714,25 @@ state named. That is a guest-lane change (track B owns `guestinit`, and it needs
 rebuild), which is why it is recorded here rather than done in the increment that found it.
 **The plant above is the ready-made proof that it would catch something.**
 
-## DEV-0025 — a manifest cannot meet §25.2's bit-corruption half, because it is JSON
+## ~~DEV-0025~~ — a manifest cannot meet §25.2's bit-corruption half, because it is JSON *(closed 2026-08-08: framed)*
+
+**Closed by doing exactly what the entry named.** The digest line primitive moved out of
+`internal/descriptor` into `internal/framed` — one package, called by both, because the
+alternative was a second copy of an integrity rule and two copies of a rule drift. Both
+manifest write sites (`image.Publish`, `image.PublishSnapshot`) frame the marshalled bytes;
+`image.readManifest` unframes before it unmarshals, so a manifest that came back changed is
+refused rather than parsed. The owner's call was "a package of its own, no spec": the
+primitive is fifteen lines that already existed and had already been reviewed once.
+
+Two property tests in `internal/image/framing_test.go` mirror `internal/descriptor`'s and
+were proved able to fail — with the digest comparison disabled, a drawn bit flip at a drawn
+byte read back as a usable image, and a manifest stripped of its digest line was accepted.
+They assert on `image.Load` rather than on a parse, because what must be refused is the
+*use* of the manifest: a check that only proved the parser said no would pass for a format
+that parsed a wrong offset happily.
+
+The old shape — bare JSON, no digest line — is refused with the same error as a corrupt
+object. Nothing is deployed, so there is no such object anywhere to be lenient for.
 
 Found by the chain's own verifier, 2026-08-08, and disclosed at length by the increment that
 introduced the format — in the property test's doc comment and in track C's entry — but

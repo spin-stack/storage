@@ -1377,3 +1377,49 @@ progress state.
   DEV entry in `STATUS.md`, which is track A's file. Three causes, none of them closable here:
   a lineage shares one DEK, `crypto.KMS` has no destroy verb, and the wrapped DEK exists in
   the descriptor, the row and any backup of either.
+
+## DEV-0025 — the manifest is framed, and the primitive stopped being descriptor's private property
+
+**2026-08-08.** `image/<vol>/manifest.json` and the snapshot manifests beside it were bare
+JSON, so §25.2's two halves came out uneven: a manifest cut anywhere failed to parse, and a
+manifest with one flipped bit loaded clean. The fix is the one the entry named, and it was
+already in the tree — `internal/descriptor` closed DEV-0015 with a digest line over the bytes
+*as stored*.
+
+**What actually changed is where that primitive lives.** Copying fifteen lines into
+`internal/image` would have left two copies of an integrity rule, and two copies drift; so
+`Frame`/`Unframe`/`ErrCorrupt` moved into `internal/framed` and both packages call it.
+`descriptor.ErrCorruptDescriptor` is now `= framed.ErrCorrupt`, so every existing caller and
+every existing test kept working unchanged. The owner's instruction was "a package of its own,
+no spec" — right, because there is no design decision left to review: the format was chosen,
+argued and reviewed once already, and this increment moves it rather than deciding it.
+
+The rationale travelled with the code and got sharper in the move. Two paragraphs the
+`descriptor` version did not have:
+
+- **What this is not.** The digest is unkeyed, so it catches corruption and not an author.
+  What protects a chunk is its own key (the digest of its plaintext) and its AAD; what
+  protects a manifest from another writer is the CAS on its ETag (INV-10). This is the layer
+  below both.
+- **Which fields it is actually for.** A manifest names chunks that verify themselves and a
+  volume id `readManifest` checks. The fields with no second opinion are the ones that *place*
+  data — offsets and lengths — and, since a manifest became a delta over an ancestry, the
+  tombstones. That is the difference between misplacing this volume's bytes and uncovering an
+  ancestor's, which is why this entry got worse when the chain landed.
+
+**The tests assert on `image.Load`, not on a parse.** What must be refused is the *use* of a
+manifest; a check that only proved the parser said no would pass for a format that parsed a
+wrong offset happily. Both were proved able to fail, with the digest comparison disabled: a
+drawn bit flip at a drawn byte read back as a usable image, and a manifest stripped of its
+digest line was accepted.
+
+**One test was lying by accident and the compiler said so.** `delta_test.go`'s
+`readManifestObject` parsed the raw body, and after framing it failed with `invalid character
+'d' after top-level value` — a helper that reached past the format. It unframes now, because a
+test that parses the raw body stops noticing the day the framing breaks.
+
+The old shape is refused with the same error as a corrupt object rather than tolerated:
+nothing is deployed, so there is no bare-JSON manifest anywhere to be lenient for, and a
+lenient branch would leave the hole open permanently for an object that does not exist.
+
+With this, `hack/dev-entries.sh` reports **0 open, 10 resolved**, and the pin file is empty.

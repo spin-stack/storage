@@ -9,6 +9,7 @@ import (
 	"pgregory.net/rapid"
 
 	"github.com/spin-stack/storage/internal/cow"
+	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -49,8 +50,15 @@ func readManifestObject(t *testing.T, store objectstore.Store, key string) image
 	if err != nil {
 		t.Fatalf("reading %s: %v", key, err)
 	}
+	// Unframed the way production reads it: the object is a digest line over the bytes
+	// as stored, then the JSON (DEV-0025). A test that parsed the raw body would stop
+	// noticing the day the framing broke.
+	payload, err := framed.Unframe(body)
+	if err != nil {
+		t.Fatalf("unframing %s: %v", key, err)
+	}
 	var man image.Manifest
-	if err := json.Unmarshal(body, &man); err != nil {
+	if err := json.Unmarshal(payload, &man); err != nil {
 		t.Fatalf("parsing %s: %v", key, err)
 	}
 	return man

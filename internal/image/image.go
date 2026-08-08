@@ -172,6 +172,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/wal"
@@ -367,6 +368,10 @@ func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader
 	if err != nil {
 		return "", err
 	}
+	// Framed, so a flipped bit is refused rather than decoded (DEV-0025). A manifest's
+	// chunk digests check themselves, so what this protects is the rest: the offsets and
+	// lengths that place data, and the tombstones that keep an ancestor's bytes buried.
+	body = framed.Frame(body)
 	res, err := store.Put(ctx, SnapshotKey(id.Volume, snapshotID), body, objectstore.PutOptions{IfNoneMatch: true})
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
 		return "", fmt.Errorf("%w: %s", ErrSnapshotExists, snapshotID)
@@ -435,6 +440,10 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 	if err != nil {
 		return "", err
 	}
+	// Framed, so a flipped bit is refused rather than decoded (DEV-0025). A manifest's
+	// chunk digests check themselves, so what this protects is the rest: the offsets and
+	// lengths that place data, and the tombstones that keep an ancestor's bytes buried.
+	body = framed.Frame(body)
 	opts := objectstore.PutOptions{IfNoneMatch: prevETag == ""}
 	if prevETag != "" {
 		opts = objectstore.PutOptions{IfMatch: prevETag}
@@ -581,8 +590,12 @@ func readManifest(ctx context.Context, store objectstore.Store, volumeID [16]byt
 	if err != nil {
 		return Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
 	}
+	payload, err := framed.Unframe(body)
+	if err != nil {
+		return Manifest{}, "", fmt.Errorf("image: reading %s: %w", key, err)
+	}
 	var man Manifest
-	if err := json.Unmarshal(body, &man); err != nil {
+	if err := json.Unmarshal(payload, &man); err != nil {
 		return Manifest{}, "", fmt.Errorf("image: parsing %s: %w", key, err)
 	}
 	if man.VolumeID != format.UUIDString(volumeID) {
