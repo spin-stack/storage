@@ -432,11 +432,14 @@ tasks:
         ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
         cp {{.GUEST_KERNEL}} "$ctx/vmlinux"
         # org.opencontainers.image.source is what links a ghcr.io package to a repository,
-        # and the link is what lets that repository's Actions token read it. Without it a
-        # kernel published from a laptop is a package owned by the pusher: `guest-inputs`
-        # then fails with "not published", which is also its message when nothing was
-        # published at all — the two states are indistinguishable from CI's side, and this
-        # label is the difference. Derived from the target path rather than configured,
+        # and the link is what lets that repository's Actions token read it — **but only
+        # when Actions is the pusher.** Pushed from a laptop with a personal token, ghcr
+        # creates the package owned by the pusher and unlinked, and this label does not
+        # link it afterwards: storage/qemu, pushed by the QEMU workflow, came out linked,
+        # and storage/guest-kernel, pushed from a developer machine with the same label,
+        # did not. So the label is necessary and not sufficient, `guest-inputs` fails with
+        # "not published" for a package that exists, and hack/publish-guest-inputs.sh's
+        # readable_by_ci is what names the real state and prints where to fix it. Derived from the target path rather than configured,
         # because the only namespace CI resolves is ghcr.io/<owner>/<repo>/...; anything
         # else gets no label rather than a wrong one. Same derivation in build:qemu:push.
         src=""

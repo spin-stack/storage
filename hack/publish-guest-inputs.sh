@@ -273,6 +273,49 @@ cmd_check() {
 # so the postcondition here is the same question the workflow asks.
 published() { $DOCKER manifest inspect "$1" >/dev/null 2>&1; }
 
+# readable_by_ci <image-ref> — the question `published` cannot answer, and the reason a
+# whole afternoon went into a package that existed.
+#
+# `docker manifest inspect` here runs as the human, with a personal token, so it succeeds
+# for a package CI cannot read at all. From the workflow's side a private package linked
+# to no repository is indistinguishable from one that was never pushed — same message,
+# "not published". From this side they are perfectly distinguishable, so this is where the
+# distinction belongs.
+#
+# **The linking claim in this file and in the Taskfile was too strong.** Both pushes carry
+# org.opencontainers.image.source and that label is what links a package — *when Actions
+# is the pusher*. Pushed from a laptop with a personal token, ghcr creates the package
+# owned by the pusher, unlinked, and the label does not link it afterwards. Observed:
+# storage/qemu, pushed by the QEMU workflow, came out linked; storage/guest-kernel, pushed
+# from a developer machine minutes earlier with the same label, did not.
+readable_by_ci() {
+	local pkg="$1" owner="${REPO%%/*}" name repo vis
+	pkg="${pkg#"$REGISTRY"/"$owner"/}"; pkg="${pkg%%:*}"
+	name="${REPO#*/}/${pkg#*/}"
+	# The org endpoint answers for a package the workflow cannot see; that asymmetry is
+	# the whole point. A user-owned repository answers on /user/packages instead.
+	local path="/orgs/$owner/packages/container/${name//\//%2F}"
+	vis=$($GH api "$path" -q '.visibility // "unknown"' 2>/dev/null) || return 0
+	repo=$($GH api "$path" -q '.repository.full_name // ""' 2>/dev/null) || repo=""
+	if [ "$vis" = "public" ] || [ -n "$repo" ]; then
+		return 0
+	fi
+	cat <<EOF
+
+  the package exists and CI still cannot read it:
+    $name is $vis and is linked to no repository.
+  A workflow's GITHUB_TOKEN can read a private package only through the repository it
+  belongs to, so from CI this is indistinguishable from never having been pushed — which
+  is exactly the message you will get.
+  It was pushed from here rather than by Actions, and org.opencontainers.image.source
+  links a package only when Actions is the pusher.
+  Fix it in two clicks — make it public, which is what the rest of this org's packages
+  are and costs nothing for a kernel binary:
+    https://github.com/orgs/$owner/packages/container/${name//\//%2F}/settings
+EOF
+	return 1
+}
+
 cmd_publish() {
 	cmd_check
 
@@ -285,7 +328,7 @@ cmd_publish() {
 
 	local qemu_dispatched=0
 	echo
-	if published "$qemu_image"; then
+	if published "$qemu_image" && readable_by_ci "$qemu_image"; then
 		echo "QEMU runtime image: already published ($qemu_image)"
 	else
 		# Dispatch rather than build. A local `task build:qemu:push` is tens of minutes
@@ -327,12 +370,19 @@ cmd_publish() {
 		trap "rm -rf '$tmp'" RETURN
 		KERNEL="$tmp/vmlinux" KERNEL_SHA256="$KERNEL_SHA256" KERNEL_VERSION="$KERNEL_VERSION" \
 			SPINBOX_KERNEL="" KERNEL_IMAGE="$kernel_image" bash hack/guest-kernel.sh fetch
-		echo "  ok       $kernel_image — pulled back and re-hashed against the pin"
+		# And then the question the round trip cannot ask: this pull used a personal
+		# token, so it succeeds for a package CI cannot read at all.
+		if readable_by_ci "$kernel_image"; then
+			echo "  ok       $kernel_image — pulled back and re-hashed against the pin, and readable by CI"
+		else
+			echo "  UNREADABLE  $kernel_image — the bytes are right and the workflow still cannot see them"
+			unpublished=1
+		fi
 	else
 		echo "  MISSING  $kernel_image"
 		unpublished=1
 	fi
-	if published "$qemu_image"; then
+	if published "$qemu_image" && readable_by_ci "$qemu_image"; then
 		echo "  ok       $qemu_image"
 	else
 		echo "  MISSING  $qemu_image"
@@ -372,10 +422,16 @@ One thing is left, and it is in the GitHub UI:
 
 Confirm each package is linked to this repository and that the repository has Read
 access ("inherit access from source repository"). Both pushes carry
-org.opencontainers.image.source, which is what does the linking, but a package that is
-private and unlinked fails in CI as "not published" — the same message as never having
-published at all. A pull request from a fork gets a token that cannot read a private
-package either; if forks must pass the gate, make both packages public.
+org.opencontainers.image.source — **and that label links a package only when Actions is
+the pusher.** Pushed from here with a personal token, ghcr creates the package owned by
+the pusher and unlinked, and adding the label does not link it afterwards. That was
+observed rather than assumed: storage/qemu, pushed by the QEMU workflow, came out linked;
+storage/guest-kernel, pushed from a developer machine minutes earlier with the same label,
+did not. `readable_by_ci` above is what turns that into a named failure with a URL rather
+than into "not published".
+
+A pull request from a fork gets a token that cannot read a private package either; if
+forks must pass the gate, make both packages public.
 
 Then: any push runs .github/workflows/ci.yml, and its guest-inputs job stops failing.
 EOF
