@@ -136,7 +136,30 @@ CREATE TABLE volumes (
     -- leaving it defaulted is deliberate: a column that still says 'remote' is a
     -- catalog claiming a durability the data path no longer provides, and the next
     -- reader has no way to tell it is decoration.
-    block_size         INTEGER NOT NULL,                -- CoW segment granularity (64 KiB)
+    -- The logical block size reported to the guest. It is carried to the Agent in the
+    -- desired state and lands in the virtio-blk config as blk_size
+    -- (vhost.Config.BlockSize, set by VolumeManager.supervise);
+    -- controlplane.VolumeSpec.validate refuses one that is not a multiple of the
+    -- 512-byte sector, and control-plane -seed-block-size defaults it to 4096.
+    --
+    -- It said "CoW segment granularity (64 KiB)" until 2026-08-08, which is DEV-0024,
+    -- and it was wrong twice over. It is not what this column holds: nothing anywhere
+    -- reads block_size as an objectization unit. And the 64 KiB CoW segment §13.1 named
+    -- exists nowhere — cow.IntervalMap works on the guest's real extents with no grid
+    -- (its own package comment records that the second structure increment 4.4 promised
+    -- never arrived), and what leaves the host is a chunk of up to image.MaxChunkBytes
+    -- keyed by the digest of its plaintext.
+    --
+    -- Correcting the comment and not the column is the whole change, deliberately: the
+    -- value stored here has always been the guest's block size, so there is nothing to
+    -- migrate. The contract fixtures in internal/metadata/metadatatest pass 65536, which
+    -- is legal because 65536 is a sector multiple and not because anyone meant a
+    -- segment — that coincidence is presumably where the wrong comment kept its footing.
+    -- Whether the 64 KiB granularity is V2 or simply dead is the half of DEV-0024 that
+    -- stays open; it is downstream of CHUNK-ADDRESSING-SPEC.md §8, since the granularity
+    -- of what is addressed is part of the decision that spec puts to a human. Either
+    -- way it is not this column.
+    block_size         INTEGER NOT NULL,
     current_epoch      BIGINT NOT NULL DEFAULT 0,
     state              TEXT NOT NULL                                  -- §7 failover states
                          CHECK (state IN ('ACTIVE', 'PRIMARY_SUSPECTED', 'FENCING_WAIT',

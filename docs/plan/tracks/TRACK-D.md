@@ -651,3 +651,59 @@ landed. Exit 2 — superseded — was not reached in this run and the file says 
 claiming it.
 
 `docs/plan/README.md` is track A's to update; the runbook is not linked from the map yet.
+
+**D12: `block_size` says what it is, and half of DEV-0024 stays open (2026-08-08).** The
+declared schema commented the column as `CoW segment granularity (64 KiB)`. Every claim
+DEV-0024 made about that was re-checked against the tree before anything moved, and all of
+them hold: `controlplane.VolumeSpec.BlockSize`'s own doc says "the logical block size
+reported to the guest", `VolumeSpec.validate` refuses one that is not a multiple of
+`sectorSize` (512), `control-plane -seed-block-size` defaults it to 4096 with the help text
+"logical block size", and the Agent carries the desired volume's value into
+`vhost.Config.BlockSize`, which `NewDevice` writes into the virtio-blk config as `blk_size`.
+The entry says "hands it to `blockdev`"; that is the one thing in it that is not so —
+`internal/blockdev` has no block size at all, and the value reaches the guest through
+`internal/vhost`. The comment now cites the symbol that actually carries it.
+
+**Why the comment and not the column.** The value stored has always been the guest's block
+size, so nothing migrates. The fixtures in `internal/metadata/metadatatest` that pass 65536
+are legal because 65536 is a sector multiple, not because anyone meant a segment, and that
+coincidence is the likeliest reason the wrong comment survived a reader.
+
+**`task db:plan` produced nothing, and that is the fact worth recording rather than the
+step worth skipping.** A `--` comment in `schema.sql` is not a database object: pgschema
+diffs the declared state against a live database, and PostgreSQL never stored this line, so
+the diff is empty by construction. The run printed `No changes detected.` and then the
+Taskfile's own branch, `nothing to plan: the database already matches
+internal/schema/schema.sql`, and wrote no file under `migrations/`. So this increment adds
+no reviewed plan, because there is no DDL to review. `task db:verify` still passes — the
+declared state applies to an empty Postgres 18 and re-planning against the result is empty.
+A schema comment that *does* reach the database would be `COMMENT ON COLUMN`, which this
+file does not use anywhere; adopting it to make comments plannable would put the same
+sentence in two places, which is the thing a single source of truth exists to prevent.
+
+**What was not closed.** DEV-0024's second half — whether the 64 KiB CoW granularity is V2
+or simply dead — is left open, and narrowing the entry without saying so is the failure this
+paragraph exists to prevent. The tree is unambiguous that it does not exist *now*:
+`cow.IntervalMap` works on the guest's real extents with no grid (its package comment
+records `ActiveMap`'s deletion and the `SegmentSize` constant that went with it), and what
+leaves the host is a chunk of up to `image.MaxChunkBytes` keyed by the digest of its
+plaintext. But "does not exist" is not "is not coming back": `CHUNK-ADDRESSING-SPEC.md` §8
+is unreviewed, and its *structure* answer moves the chunk key space and the AAD so that a
+clone's publish writes only new digests — at which point how large a unit is addressed stops
+being an implementation detail and becomes the thing being decided. A 64 MiB chunk dedups
+almost nothing for a clone that wrote 512 bytes. Declaring the granularity dead today would
+be guessing the answer to a question a human has been handed, which is what DEV-0024 was
+opened to avoid.
+
+**A seam nothing observes, found by planting rather than by reading.** In a scratch
+worktree, `m.supervise(serveCtx, v, ln, d.GetBlockSize())` was replaced with a hardcoded
+`512` — an Agent that ignores the catalog's `block_size` entirely — and `go test
+./internal/...` stayed green, every package. Nothing in the tree asserts that this column
+reaches the guest as `blk_size`. `internal/vhost`'s `GET_CONFIG` test asserts the field, but
+against a `Config` whose `BlockSize` is zero, so it is reading the `SectorSize` default; and
+`integration/vhost` sets `BlockSize: 512` in its desired volume, which is that same default,
+so the fixture agrees with the plant by coincidence — the shape CLAUDE.md lists as "two
+Agents pointed at the same wrong bucket so they agreed". Closing it is one arm in a lane
+this track does not own (a desired volume with a non-default block size, and the guest's
+`blockdev --getss` or the config's `blk_size` read back), so it is reported rather than
+written here.
