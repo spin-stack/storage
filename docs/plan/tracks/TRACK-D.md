@@ -818,3 +818,29 @@ the next thing anyone should distrust. No DST scenario: the ceiling is an admiss
 decision with no fencing or data-path property to violate, and the mandatory set's one slot
 per window is better spent on the erasure arm step 3 asked for. No DEV entry opened;
 DEV-0020 and DEV-0024 remain track A's to close.
+
+### Placement policy lives in two processes' flags, and CI found the seam (2026-08-08)
+
+A fleet refuses to place a volume for two independent reasons, and they are configured in
+two different places:
+
+- **the cordon band** (`cpserver.Band`, `-cordon-used-ratio`) — a flag on the process that
+  *serves*, applied when a heartbeat arrives;
+- **the fill ceiling** (`placement.DefaultMaxUsedRatio`, `-max-used-ratio`) — a flag on
+  whichever process runs the *placing command*, applied by `placement.Admits`.
+
+The first CI run failed every clone because a runner's disk is 87% full and the cordon
+fires at 70%. That was fixed by letting the caller state the band, and the next run failed
+every clone again — same message, different gate: `Admits` refuses above 85% and nobody had
+told the one-shot otherwise.
+
+**An operator can hit exactly this.** Tune the band and not the ceiling and you get a fleet
+that never cordons and still answers "no host with capacity", with nothing in either
+process's output relating the two. The lane now passes both, from one helper rather than
+from a literal per call site, because the failure mode of a literal is a new placing
+command that forgets it.
+
+Worth changing rather than documenting: placement policy that lives in two processes'
+flags is policy nobody can read back. The catalog is where a fleet's own rules belong —
+`-fleet-status` could then print them, and a rule an operator cannot read is a rule they
+will tune twice and reconcile never.

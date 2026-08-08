@@ -121,7 +121,7 @@ func (d *deployment) attachVolume(t *testing.T, volumeID, hostID string) {
 			"-holder-id", "cp-attach",
 			"-attach-volume", volumeID,
 			"-attach-host", hostID,
-		}, d.storeArgs()...),
+		}, append(d.placementArgs(), d.storeArgs()...)...),
 		Env: d.agentEnv,
 	})
 	if err := p.Wait(t, startup); err != nil {

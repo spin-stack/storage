@@ -234,6 +234,23 @@ func (d *deployment) requestSnapshot(t *testing.T, volumeID string) {
 	}
 }
 
+// placementArgs is the fill ceiling every *placing* one-shot needs in this lane, and it
+// exists as one helper rather than as a literal at each call site because forgetting it
+// is invisible until CI: a runner's disk is 87% used, placement.Admits refuses above 85%,
+// and the command exits with "no host with capacity" — which reads like a fleet problem
+// and is a lane that did not say what fleet it wanted.
+//
+// **It is the sibling of the cordon band the serving Control Plane is started with, and
+// the two live in different places.** The band is a flag on the process that serves;
+// this is a flag on whichever process runs the placing command. An operator who tunes one
+// and not the other gets a fleet that never cordons and still refuses to place — which is
+// exactly what happened here after the band was fixed and this was not. Recorded in
+// TRACK-D.md as a shape worth changing: placement policy that lives in two processes'
+// flags rather than in the catalog is policy nobody can read back.
+func (d *deployment) placementArgs() []string {
+	return []string{"-max-used-ratio", "1"}
+}
+
 // cloneSnapshot runs `control-plane -clone-snapshot`, which creates a volume from a
 // published snapshot and exits. The host is not an argument: §20's placement order
 // decides it, and that decision is the point of the command.
@@ -246,7 +263,7 @@ func (d *deployment) cloneSnapshot(t *testing.T, snapshotID string) {
 			"-database-url", d.dsn,
 			"-holder-id", "cp-clone",
 			"-clone-snapshot", snapshotID,
-		}, d.storeArgs()...),
+		}, append(d.placementArgs(), d.storeArgs()...)...),
 		Env: d.agentEnv,
 	})
 	if err := p.Wait(t, startup); err != nil {
