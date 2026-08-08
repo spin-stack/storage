@@ -759,3 +759,74 @@ whether to want a property that holds on ext4 and XFS and is quietly absent on N
 ZFS versions. If yes, the Agent must say at startup which world it is in and the simulator
 must model the filesystem that refuses — otherwise every test sees a guarantee production
 may not have.
+
+## C — `parentView` walks the lineage (step 1 of the chunk-addressing chain)
+
+**What landed.** `parentView` follows `parent_snapshot_id` upward until a volume with no
+parent, loading each ancestor's snapshot manifest and layering them oldest-first, where it
+resolved exactly one link before. `image.LoadSnapshotOver` is the loader that hands a
+manifest a base; `cow` needed nothing — `NewIntervalMapOver` nests arbitrarily and both
+`Ranges` and `Read` already recurse. `descriptor.json` gains `parent_volume_id`, and
+`controlplane.Clone` writes it.
+
+**Why the descriptor grew a field, which the spec did not anticipate.** §3 says to read
+each ancestor's `descriptor.json` for the next link, and cites `ParentSnapshotID` as
+carrying it. It does not: a snapshot id addresses nothing without the volume it lives
+under (`image.SnapshotKey`), so the descriptor recorded half a link and the other half was
+in the catalog as `snapshots.volume_id`. The bucket could not state a lineage the spec
+assumes it is the authority on. It is an on-S3 format change, additive, and the §25.2
+property test covers it by drawing the link rather than leaving it empty — `omitempty`
+keeps an unset field out of the stored bytes, so a field that is never non-empty in the
+generator is a field no truncation and no bit flip ever reaches.
+
+**The thing step 3 cannot omit, and the spec does not mention.** A manifest states a
+DISCARD as *absence* — `cow.Ranges` subtracts tombstones and its comment says the
+distinction cannot survive an image that does not carry them — and absence in a layered
+chain means "ask the layer below". So the walk answers a range an intermediate clone
+discarded and then snapshotted with its grandparent's older bytes, where the snapshot it
+descends from reads zeros (§14.6). It is the same failure `fetchBase` refuses one level
+down, and it needs depth 2 to reach, which nothing outside the tests added here builds.
+**Stopping the flattening therefore cannot land without a tombstone in the manifest**: at
+that point absence carries the whole meaning of the format — it is how a delta says "the
+layer below has this" — so a discard needs a way to say the opposite. It is a format
+change and it belongs to the step that makes the manifest a delta, not to this one. The
+alternative considered was to keep the single link until then, which leaves a walk with no
+caller and moves the discovery into the step least able to afford it.
+
+**"Harmless while publishing still flattens" is true in one direction only**, and it is
+worth writing down because the forced order rests on it: while every manifest is
+self-contained, layering the ancestors below the nearest changes the answer on exactly one
+set of ranges — the ones a nearer ancestor discarded. Everywhere else the nearest
+ancestor's own extents shadow them.
+
+**Failing closed is the whole of the error handling.** A cycle, a descriptor that is not
+there, a snapshot that was never published, a snapshot id with no volume: each is refused
+by name. A walk that stopped early on any of them would install a base holding however
+much of the lineage it read, and a partial view is indistinguishable from a complete one
+to the guest reading it. `maxChainWalk` is a termination guard and deliberately not a
+depth limit — it sits far above the design document's ceiling of five, because refusing at
+attach would make a volume the fleet created successfully unreadable. Step 4 makes the
+refusal, at create.
+
+**What the tests had to fabricate, and why that is honest.** A depth-3 lineage built by
+driving three Agents proves nothing: publishing flattens, so the nearest ancestor's
+manifest alone answers every read and a walk that stops after one link changes not one
+byte. So the ancestors' snapshots are published through the real publisher from *unlayered*
+views — each manifest naming only that volume's own ranges, which is what step 3 makes the
+publisher produce. Planted, a walk that stops after one link reads
+`0x0000000000000000` at offset 0 where the great-grandparent wrote `0xa1`; stopping after
+two leaves that offset wrong and the grandparent's right. The DST arm
+(`a-clone-of-a-clone-reads-its-grandparents-bytes`, pinned in the same commit) fails the
+same plant with "read zeros at 0 for a range its grandparent wrote" and a trace carrying
+`zeros_after_restart=true`.
+
+**Three clone tests and two DST scenarios were fabricating a parent no Control Plane could
+have created** — a volume with a published snapshot and no descriptor. They now write the
+one a provisioner writes. That is the walk's new precondition made visible rather than
+worked around.
+
+**`inherited_bytes` was double-counting the moment a chain existed.** It was
+`Cost().Bytes`, which sums every layer, so a range an ancestor wrote and a nearer one
+rewrote counted once per layer; a three-link lineage would report three times the dataset
+an operator is watching upload. It is now the fold over `Ranges()` that
+`sayWhatThisImageCosts` already used, which is the bytes the publish actually moves.
