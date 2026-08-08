@@ -68,10 +68,9 @@ func TestAnAgentThatCannotPublishHoldsItsDataDirectory(t *testing.T) {
 	// rule.
 	agent.waitForLine(t, "read view recovered from the object store", startup)
 
-	prefix := "image/" + volumeID + "/"
-	if keys := storeKeys(t, d, prefix); len(keys) != 0 {
-		t.Fatalf("%d object(s) under %s before the Agent stopped: the assertions below would be vacuous:\n%v",
-			len(keys), prefix, keys)
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("%d object(s) for volume %s before the Agent stopped: the assertions below would be vacuous:\n%v",
+			len(keys), volumeID, keys)
 	}
 
 	proxy.down()
@@ -81,7 +80,7 @@ func TestAnAgentThatCannotPublishHoldsItsDataDirectory(t *testing.T) {
 	// once and goes quiet is indistinguishable from one that hung.
 	agent.waitForCount(t, holdingLine, 2, 90*time.Second)
 	if code, done := agent.exited(); done {
-		t.Fatalf("the Agent exited (%d) with %s still empty: a session that reached no bucket was released anyway", code, prefix)
+		t.Fatalf("the Agent exited (%d) with nothing published for %s: a session that reached no bucket was released anyway", code, volumeID)
 	}
 
 	// (2) It still owns the data directory, and the witness is another process being
@@ -117,8 +116,8 @@ func TestAnAgentThatCannotPublishHoldsItsDataDirectory(t *testing.T) {
 
 	// (3) And there is still nothing in the bucket, which is what makes (1) and (2) mean
 	// "holding" rather than "published and lingering".
-	if keys := storeKeys(t, d, prefix); len(keys) != 0 {
-		t.Fatalf("%s holds %v while the store is unreachable", prefix, keys)
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("volume %s has published %v while the store is unreachable", volumeID, keys)
 	}
 
 	// (4) The fleet can see it. The heartbeat is the difference between a host that is up
@@ -136,10 +135,10 @@ func TestAnAgentThatCannotPublishHoldsItsDataDirectory(t *testing.T) {
 	if code := agent.waitExit(t, 120*time.Second); code != 0 {
 		t.Fatalf("the Agent exited %d after publishing succeeded:\n%s", code, strings.Join(agent.output(), "\n"))
 	}
-	keys := storeKeys(t, d, prefix)
+	keys := volumeKeys(t, d, volumeID)
 	if len(keys) == 0 {
-		t.Fatalf("the Agent exited 0 and %s is empty: the session it held on to for all that time was dropped at the end:\n%s",
-			prefix, strings.Join(agent.output(), "\n"))
+		t.Fatalf("the Agent exited 0 and nothing was published for %s: the session it held on to for all that time was dropped at the end:\n%s",
+			volumeID, strings.Join(agent.output(), "\n"))
 	}
 	t.Logf("the held session landed as %v", keys)
 	agent.assertSaid(t, "volume-agent stopped")

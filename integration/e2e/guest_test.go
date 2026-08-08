@@ -57,8 +57,8 @@ func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
 	// Nothing may be in the bucket for this volume yet: a guest's WRITE is 0 PUTs
 	// (§5.3, INV-18), and if objects appeared here the assertion below would prove
 	// nothing about what the stop publishes.
-	if keys := storeKeys(t, d, "image/"+volumeID+"/"); len(keys) != 0 {
-		t.Fatalf("%d object(s) under image/%s/ before the guest ran: the assertion would be vacuous:\n%v",
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("%d object(s) for volume %s before the guest ran: the assertion would be vacuous:\n%v",
 			len(keys), volumeID, keys)
 	}
 
@@ -72,7 +72,7 @@ func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
 
 	// The fsync ACKed locally and put nothing in the bucket — that is §14.8, and
 	// asserting it here is what keeps the next assertion meaningful.
-	if keys := storeKeys(t, d, "image/"+volumeID+"/"); len(keys) != 0 {
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
 		t.Fatalf("a guest's fsync published %d object(s); §14.8 says the ACK is local:\n%v", len(keys), keys)
 	}
 
@@ -81,11 +81,16 @@ func TestAGuestMakesTheDeploymentWriteADurableObject(t *testing.T) {
 	// its credentials, sealed the chunks and CASed the manifest.
 	agent.Stop(t, 30*time.Second)
 
+	// Both prefixes, and the chunks are the half that carries the guest's bytes: since
+	// the chunk store moved to the lineage they are under chunks/<lineage>/, which for a
+	// volume that was created rather than cloned is its own id. A manifest naming no
+	// chunk would satisfy a count under image/ alone.
 	keys := storeKeys(t, d, "image/"+volumeID+"/")
-	if len(keys) == 0 {
-		t.Fatalf("the Agent stopped and the bucket holds nothing under image/%s/ — "+
+	chunks := storeKeys(t, d, "chunks/"+volumeID+"/")
+	if len(keys) == 0 || len(chunks) == 0 {
+		t.Fatalf("the Agent stopped and the bucket holds %d object(s) under image/%s/ and %d under chunks/%s/ — "+
 			"the session's writes exist only on a host that has released them:\n%s",
-			volumeID, testinfra.VerdictLines(out))
+			len(keys), volumeID, len(chunks), volumeID, testinfra.VerdictLines(out))
 	}
-	t.Logf("a real kernel's writes left %d object(s) under image/%s/: %v", len(keys), volumeID, keys)
+	t.Logf("a real kernel's writes left %v and %v", keys, chunks)
 }

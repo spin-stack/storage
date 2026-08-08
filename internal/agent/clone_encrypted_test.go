@@ -132,13 +132,22 @@ func TestAnEncryptedCloneReadsItsParentsChunks(t *testing.T) {
 // assertNoPlaintext fails if the guest's bytes appear anywhere in the store.
 func assertNoPlaintext(t *testing.T, store objectstore.Store, pattern []byte) {
 	t.Helper()
+	// Both prefixes: the manifests under image/, and the chunks — which carry the guest's
+	// bytes and which live under chunks/<lineage>/ since the chunk store moved. A check
+	// that listed image/ alone would now walk manifests only and pass over every object
+	// that has ever held plaintext.
 	objs, err := store.List(t.Context(), "image/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objs) == 0 {
-		t.Fatal("nothing was published, so the plaintext check would pass vacuously")
+	chunks, err := store.List(t.Context(), "chunks/")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(chunks) == 0 {
+		t.Fatal("no chunk objects were published, so the plaintext check would pass vacuously")
+	}
+	objs = append(objs, chunks...)
 	for _, o := range objs {
 		body, err := store.Get(t.Context(), o.Key)
 		if err != nil {

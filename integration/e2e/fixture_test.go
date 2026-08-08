@@ -329,6 +329,22 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// volumeKeys is everything the bucket holds for one volume: its manifests under
+// image/<volume>/ and its data under chunks/<volume>/.
+//
+// Two prefixes and not one, because the chunk store moved out of the volume's prefix when
+// it became a lineage's. Every "nothing has been published yet" assertion in these lanes
+// depends on covering both: a guest WRITE that PUT a chunk (INV-18 says it PUTs nothing)
+// would otherwise land under a prefix no assertion looks at.
+//
+// chunks/<volume>/ is this volume's own lineage, which is right for every volume these
+// lanes create — a clone's data is under its *parent's* id, and the one clone lane asserts
+// on the manifest key rather than on a count.
+func volumeKeys(t *testing.T, d *deployment, volumeID string) []string {
+	t.Helper()
+	return append(storeKeys(t, d, "image/"+volumeID+"/"), storeKeys(t, d, "chunks/"+volumeID+"/")...)
+}
+
 // storeKeys lists what is actually in the bucket under a prefix. It asks the object store
 // directly rather than the Agent, because the Agent reporting its own state is the claim
 // under test, not the evidence for it.

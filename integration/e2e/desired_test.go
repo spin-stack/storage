@@ -62,14 +62,13 @@ func TestAnEmptyDesiredStateDoesNotTearDownTheHost(t *testing.T) {
 	// that rule instead of this one.
 	agent.waitForLine(t, "read view recovered from the object store", startup)
 
-	prefix := "image/" + volumeID + "/"
 	socket := filepath.Join(d.sockDir, volumeID+".sock")
 	if _, err := os.Stat(socket); err != nil {
 		t.Fatalf("the volume's vhost socket is not there before the test begins: %v", err)
 	}
-	if keys := storeKeys(t, d, prefix); len(keys) != 0 {
-		t.Fatalf("%d object(s) under %s before the desired state went empty: the assertions below would be vacuous:\n%v",
-			len(keys), prefix, keys)
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("%d object(s) for volume %s before the desired state went empty: the assertions below would be vacuous:\n%v",
+			len(keys), volumeID, keys)
 	}
 
 	cp.listNothing()
@@ -80,7 +79,7 @@ func TestAnEmptyDesiredStateDoesNotTearDownTheHost(t *testing.T) {
 	// name the moment rather than the aftermath.
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if keys := storeKeys(t, d, prefix); len(keys) != 0 {
+		if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
 			t.Fatalf("the Control Plane listed no volumes and the Agent stopped volume %s and published %v — an empty list is not a detach order, and this host is still the volume's writer",
 				volumeID, keys)
 		}
@@ -118,8 +117,8 @@ func TestAnEmptyDesiredStateDoesNotTearDownTheHost(t *testing.T) {
 		t.Fatalf("the Agent printed %q %d time(s), want 1: the volume was restarted rather than kept:\n%s",
 			"serving volume", n, strings.Join(agent.output(), "\n"))
 	}
-	if keys := storeKeys(t, d, prefix); len(keys) != 0 {
-		t.Fatalf("%s holds %v: the session was published while the volume never stopped being this host's", prefix, keys)
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("volume %s has published %v: the session was published while the volume never stopped being this host's", volumeID, keys)
 	}
 }
 
@@ -143,16 +142,15 @@ func TestADetachedVolumeIsStillStoppedAndPublished(t *testing.T) {
 	agent.WaitForLine(t, "serving volume", startup)
 	agent.WaitForLine(t, "read view recovered from the object store", startup)
 
-	prefix := "image/" + volumeID + "/"
 	socket := filepath.Join(d.sockDir, volumeID+".sock")
-	if keys := storeKeys(t, d, prefix); len(keys) != 0 {
-		t.Fatalf("%d object(s) under %s before the detach: the assertions below would be vacuous:\n%v", len(keys), prefix, keys)
+	if keys := volumeKeys(t, d, volumeID); len(keys) != 0 {
+		t.Fatalf("%d object(s) for volume %s before the detach: the assertions below would be vacuous:\n%v", len(keys), volumeID, keys)
 	}
 
 	d.detachVolume(t, volumeID)
 
 	waitFor(t, 60*time.Second, "the detached volume's image to reach the bucket", func() bool {
-		return len(storeKeys(t, d, prefix)) != 0
+		return len(volumeKeys(t, d, volumeID)) != 0
 	})
 	waitFor(t, 60*time.Second, "the detached volume's socket to go away", func() bool {
 		_, err := os.Stat(socket)
