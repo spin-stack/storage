@@ -162,7 +162,24 @@ func PublishSnapshot(ctx context.Context, store objectstore.Store, rnd io.Reader
 // image would carry writes the parent made after the snapshot, which is not what a clone
 // descending from that snapshot is entitled to see.
 func LoadSnapshot(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, snapshotID string) (*cow.IntervalMap, Manifest, error) {
-	view, man, _, err := loadManifest(ctx, store, enc, volumeID, SnapshotKey(volumeID, snapshotID))
+	return LoadSnapshotOver(ctx, store, enc, volumeID, snapshotID, nil)
+}
+
+// LoadSnapshotOver reads a named frozen point as a layer *over* base: this snapshot's
+// ranges win, and a range it does not name is answered by base.
+//
+// It exists for one caller, agent.parentView, which composes a clone's ancestry into one
+// read view — the grandparent's snapshot at the bottom, each descendant's over it. cow
+// already nests arbitrarily (NewIntervalMapOver, and Ranges/Read recurse through
+// m.base), so this composes what is there rather than extending it.
+//
+// A nil base is exactly LoadSnapshot, and that is not a convenience: the bottom of a
+// chain must come back **unlayered**, because an unlayered map is the one that refuses
+// SetBase later (cow.IntervalMap.SetBase), and that refusal is what stops a published
+// image from having a parent slid underneath it — see agent.fetchBase for why that
+// refusal is a protection and not an obstacle.
+func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, snapshotID string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, error) {
+	view, man, _, err := loadManifest(ctx, store, enc, volumeID, SnapshotKey(volumeID, snapshotID), base)
 	return view, man, err
 }
 
@@ -253,8 +270,10 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 // A volume with no manifest is ErrNotPublished, which callers treat as "boot empty":
 // a volume being served for the first time has written nothing, and refusing it would
 // make the first boot the one case that cannot work.
+// The view it returns is unlayered on purpose: a volume's own image supersedes whatever
+// it descends from and must not be given a base afterwards (agent.fetchBase).
 func Load(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte) (*cow.IntervalMap, Manifest, string, error) {
-	return loadManifest(ctx, store, enc, volumeID, ManifestKey(volumeID))
+	return loadManifest(ctx, store, enc, volumeID, ManifestKey(volumeID), nil)
 }
 
 // loadManifest reads one manifest and the chunks it names. Shared by Load and
@@ -297,13 +316,16 @@ func readManifest(ctx context.Context, store objectstore.Store, volumeID [16]byt
 	return man, head.ETag, nil
 }
 
-func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, key string) (*cow.IntervalMap, Manifest, string, error) {
+func loadManifest(ctx context.Context, store objectstore.Store, enc *wal.Encryption, volumeID [16]byte, key string, base *cow.IntervalMap) (*cow.IntervalMap, Manifest, string, error) {
 	man, etag, err := readManifest(ctx, store, volumeID, key)
 	if err != nil {
 		return nil, Manifest{}, "", err
 	}
 
 	view := cow.NewIntervalMap()
+	if base != nil {
+		view = cow.NewIntervalMapOver(base)
+	}
 	for _, c := range man.Chunks {
 		data, err := store.Get(ctx, chunkKey(volumeID, c.Digest))
 		if err != nil {
