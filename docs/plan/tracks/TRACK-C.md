@@ -1097,3 +1097,159 @@ would make a volume the fleet created successfully unreadable, which is why the 
 belongs at create. And FLATTEN is now load-bearing for two separate reasons rather than one:
 it is the only way back under the ceiling, *and* it is the only way to delete a parent that
 has clones without destroying them.
+
+## C — FLATTEN, the operator one-shot (step 4b of the chunk-addressing chain)
+
+**What landed.** `control-plane -flatten-volume <id>` writes an image that states the whole
+dataset, re-seals it under `chunks/<that volume>/`, and rewrites the volume's descriptor so
+the bucket stops saying it descends from anything. The walk and the composition moved out of
+`internal/agent` into `internal/lineage`, which is the new package's whole reason to exist —
+`agent.fetchBase` and the flatten compose the same chain, and two implementations of a
+lineage walk is the KEK-file defect with more corners. `task ci` green, the e2e lane green,
+production coverage 90.28%.
+
+**Where it runs, and the argument is not convenience.** In the Control Plane's binary, as a
+one-shot, alongside `-seed-volume`, `-snapshot-volume`, `-clone-snapshot`, `-detach-volume`,
+`-cordon-host` and `-rebuild-metadata`. What settles it is the *precondition*: a flatten
+CASes the volume's manifest, so a host serving that volume — holding the ETag it loaded,
+about to compare against it at its stop — would have its publish fail with `ErrSuperseded`,
+which its teardown deliberately does not retry, and the session would be lost. So the volume
+must be detached, and a detached volume is in no host's desired state: **there is no Agent to
+ask.** Giving one a flatten verb means handing it a volume it is not serving, with no device
+and no data-directory lock, driven by a Control Plane ADR-0021 §4 keeps it from knowing
+about. It is the one admin one-shot here that borrows no term, because it writes no catalog
+row; the comment at the dispatch says so rather than leaving a reader to notice the absence.
+
+**It costs a full copy of the volume's dataset, and that is forced rather than chosen.** A
+volume's lineage root is *derived from its chain* (`lineage.Root`), so a volume with no chain
+is its own root by definition — leaving the bytes under the ex-parent's prefix would leave a
+manifest naming chunks no reader will ever look under. It is also the only version of the
+operation that means anything for a delete: a flattened clone whose bytes still lived in its
+parent's chunk store would keep every one of them reachable, and deleting the parent would
+free nothing, which is the point of DELETION-AND-RECLAIM-SPEC's answer B. *Rejected: naming
+the ancestors' chunk objects from the flattened manifest and moving no bytes at all.* The
+shared chunk store makes it almost possible and one thing stops it — a `Chunk` names a whole
+object and the format cannot express a slice of one, so a run composed from a parent's 8 MiB
+chunk and a clone's 512-byte write needs re-chunking. Giving `Chunk` a `skip` field is the
+cheap FLATTEN somebody could build later; it is an on-S3 format change in a review zone with
+its own §25.2 work, and folding it into the increment that first wants it is how a format
+grows a field nobody reviewed.
+
+**The catalog cannot say a lineage ended, and that is what changed the read path.**
+`volumes.parent_snapshot_id` is write-once by construction — `CreateVolume`'s conflict path
+COALESCEs it so a converging rebuild can never drop a clone's link — which
+`DELETION-AND-RECLAIM-SPEC` §9 found and handed to FLATTEN. It means no catalog write can
+produce a row saying "this volume descends from nothing any more", so an Agent taking its
+first link from the desired state would, after a flatten, walk to an ancestry the volume no
+longer reads through *and* resolve a lineage root that is no longer its own — looking for its
+own chunks under its ex-parent's prefix and finding none. So the desired state is now the
+trigger and the bucket is the answer: a volume whose desired state names a parent has its
+whole ancestry read from `volumes/<vol>/descriptor.json` upward. ADR-0021 is untouched — it
+is a read of an object, not a lookup against a Control Plane, and it is the authority
+`-rebuild-metadata` trusts precisely when the database is what was lost. The cost is one GET
+per attach **for clones only**, recorded in `TestWhatDepthCostsAtAttach` as a constant rather
+than a slope. Eleven fixtures gained the descriptor a Control Plane would have written.
+
+**Two refusals, and both are statements of fact rather than caution.**
+
+*A volume with published snapshots of its own is refused.* Those snapshots are immutable
+(§5.2, INV-16) deltas over the ancestry; clearing the link would leave a future clone of one
+of them reading zeros for everything the ancestry held — while being admitted at depth 0,
+because the ceiling compares the parent volume's depth. That is exactly the sentence track
+D's D13 asked FLATTEN not to break, and this is the answer to it: **the way to make such a
+volume flattenable is to delete its snapshots**, which is the snapshot-deletion decision
+`DELETION-AND-RECLAIM-SPEC` §6.4 already carries. There is no way to flatten a snapshot;
+rewriting one is what create-only forbids.
+
+*A volume whose own chunk prefix is not empty is refused by name.* That prefix is empty until
+a flatten writes into it, so a non-empty one is the fingerprint of a flatten that did not
+finish. It converts the one unrepairable window into a message that names the state instead
+of a confusing "chunk not found".
+
+**The order, and the window it leaves.** Chunks, then the manifest, then the descriptor. Each
+failure leaves reads refused rather than wrong, and the middle state — a self-contained image
+under a bucket that still claims an ancestry — is the one a re-run does not repair. The
+reverse order was considered and is worse: clearing the descriptor first destroys the only
+record of what the volume descends from, so a flatten that then failed could never be resumed
+by anyone.
+
+**The flattened manifest carries erasures a root volume's never would, and a plant is what
+made that claim honest.** `cow.DeltaOver` drops tombstones when it is given nil, so the
+flatten publishes over an empty map instead. The first version of that reasoning claimed the
+window protected every erasure; planting "publish over nil" went **green**, because an
+erasure an *ancestor* made is stated by that ancestor's own manifest and the composed
+ancestry answers it either way. What is actually at stake is a range **this volume**
+discarded over bytes an ancestor holds — the fixture gained the offset that can tell the
+difference, and the plant then reads `0xa1` where the guest freed the blocks (§14.6). The
+comment says the narrower true thing.
+
+**Four plants, each watched go red and reverted textually.**
+
+- Publishing the delta instead of the flattened view (the task's "skip a range"): in
+  `internal/lineage`, *"offset 0 reads 0x0000000000000000..., want 0xa1 repeated"* at both
+  ranges only the ancestors wrote; through a real `VolumeManager`, *"offset 0 reads
+  0x0000000000000000, want 0xa1 repeated — a range only the parent ever wrote, read after the
+  parent's objects were deleted"*.
+- Publishing over nil, so the volume's own erasures are dropped: *"offset 20480 reads
+  0xa1a1a1a1a1a1a1a1..., want 0x0 repeated"* on the reading that still lays the image over
+  the chain.
+- Making the Agent believe the catalog's link again (three lines in `parentChain`): the seam
+  refuses the read outright — *"lineage: snapshot … was never published, so the chain below it
+  cannot be read"* — which is the flattened volume resolving its ex-parent's root.
+- Removing the flatten from the e2e scenario and changing nothing else: agent-2 prints *"the
+  volume's ancestry could not be materialized; its reads will fail"* and the lane is red in 66
+  seconds.
+
+**What the e2e lane cannot say, found by running it rather than by reasoning.** No guest boots
+there, so nothing in it holds a byte — every `image_bytes=` is 0 — and the assertion that the
+flatten moved chunks under the clone's own prefix is *unsatisfiable*, not merely unmet. It was
+written, run against the deployment, and removed rather than weakened until it passed. That
+lane says the deployment performs the operation (the parent's snapshot manifest is deleted and
+the clone is still served, exiting 0); `internal/agent` says what the operation preserves,
+over a real WAL and a real device, at three offsets that fail differently.
+
+**No format change, and therefore no §25.2 obligation.** Not one byte of the manifest, the
+descriptor or the chunk sealing moves: the flatten writes through `image.Publish` and
+`descriptor.Write` with the fields they already have. The only new thing a manifest can now
+contain is a `discarded` span in a volume that descends from nothing, which the format has
+always allowed and `image_property_test.go` already draws.
+
+**No DST scenario, and this is the third lane in a row to say so.** The mandatory set may
+grow by one per merge window, and the property here — an operator's one-shot rewrites two
+objects — has no fencing or data-path arm a checker could hold that the two lanes above do
+not already assert on bytes. The erasure scenario step 3 asked for is still the cheapest thing
+left on this subject.
+
+### What is owed, and to whom
+
+**One catalog write, and it belongs to track D.** The flatten leaves
+`volumes.parent_snapshot_id` and `volumes.chain_depth` as they were, because no verb can
+change them: the column is write-once by construction and `metadata.Store` has no clearing
+verb at all. **Nothing reads wrong because of it** — the Agent takes the link from the
+descriptor, which is exactly why that change was made — but everything that *counts* lineage
+still counts the old one: `controlplane.Clone`'s ceiling refuses clones of a volume that is
+now at depth 0, and a delete of the old parent would still see a descendant. The staleness is
+in the safe direction (refusing what it should admit), and `-rebuild-metadata` already fixes
+both, because it reconstructs the row from the descriptor this command rewrites. The command
+says so in a `WARN` on every successful run rather than in a document.
+
+What track D needs to add is one term-guarded statement and its two implementations:
+
+```sql
+UPDATE volumes SET parent_snapshot_id = NULL, chain_depth = 0, updated_at = now()
+ WHERE volume_id = $1 AND (SELECT term FROM control_plane_leader WHERE singleton) = $2
+```
+
+as `metadata.Store.ClearVolumeParent(ctx, term, volumeID)` — `metadata.go`, `sim/sim.go`,
+`pg/pg.go`, `metadatatest/contract.go`, `db/queries/volumes.sql` — with `cmd/control-plane`'s
+`flatten` calling it after `lineage.Flatten` returns and before it prints. Its contract case
+should assert on `GetDesiredState`'s answer rather than on the column, the way
+`VolumePlacementIsChangeableAndClearingIsIdempotent` does. Once it exists, the `WARN` and the
+`-rebuild-metadata` sentence come out of `cmd/control-plane/flatten.go`.
+
+**Two things for whoever writes the delete.** A delete of a volume with descendants flattens
+them first, and "descendants" has to be read out of the *bucket* as well as the catalog now:
+a flattened volume is still a descendant in the row until the write above exists. And a
+descendant with published snapshots cannot be flattened at all, so the delete's plan for it is
+to delete those snapshots first — which is that spec's decision 4, and the reason the refusal
+here names them.
