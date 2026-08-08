@@ -8,7 +8,7 @@
 - **S3 es la autoridad de recovery**; PostgreSQL pasa a ser caché/control. Nueva regla formal del punto durable + summary objects para acelerar recovery.
 - **Término (`term`) verificado en cada transacción del Control Plane**; el advisory lock queda solo como optimización.
 - **Cifrado en reposo por volumen** (AES-256-GCM, DEK/KEK, crypto-shredding). Campos reservados en todos los formatos desde el día 1.
-- **WAL con extents reales del guest** (offset + length); los 64 KiB quedan solo como granularidad de segmentos CoW. Elimina la amplificación 4→64 KiB del data path.
+- **WAL con extents reales del guest** (offset + length). Elimina la amplificación 4→64 KiB del data path. *(La segunda mitad de este bullet decía «los 64 KiB quedan solo como granularidad de segmentos CoW»; esa granularidad **se retira** — ver §13.1 y DEV-0024.)*
 - **Batching bajo demanda**: se elimina la regla de cierre por 50 ms. PUT solo ante FLUSH/FUA pendiente, tamaño objetivo o antigüedad cercana al límite. Reduce la cardinalidad de objetos en ~2-3 órdenes de magnitud para workloads sin fsync frecuente.
 - **Compactación de WAL objects** en background y **GC mark-and-sweep sin permiso de borrado directo** (S3 Versioning + Object Lock + lifecycle).
 - **Snapshots crash-consistent sin pausa** (captura atómica de sequence, sellado en background). Freeze del guest opcional, no default.
@@ -53,7 +53,7 @@ La arquitectura utiliza:
 - Un Volume Agent por host.
 - Un único volumen persistente por VM.
 - Un volumen efímero local por VM.
-- Copy-on-Write con **segmentos de granularidad 64 KiB**; el WAL registra **extents reales** del guest.
+- Copy-on-Write sobre **los extents reales** del guest, sin grilla. *(v5.1 pedía segmentos de 64 KiB; retirado — §13.1, DEV-0024.)*
 - WAL local append-only sobre NVMe.
 - WAL remoto agrupado en objetos inmutables de **8 MiB objetivo**, subidos **bajo demanda** (no por timer).
 - **Cifrado AES-256-GCM por volumen** de todos los payloads que salen del host.
@@ -202,7 +202,7 @@ leerlas contra esta fila.
 | WAL local | Append-only en NVMe |
 | WAL remoto | Objetos inmutables en S3 |
 | Registro de WAL | **Extent real del guest (offset + length, alineado a 512 B)** |
-| Granularidad CoW (segmentos) | 64 KiB — **no existe; lo que sale del host son chunks de hasta 64 MiB direccionados por contenido (§13.1)** |
+| Granularidad CoW (segmentos) | **Retirada (DEV-0024).** No hay grilla: lo que sale del host son chunks de hasta 64 MiB (`image.MaxChunkBytes`, una **cota** y no una granularidad) direccionados por el digest de su texto plano — §13.1 |
 | Tamaño objetivo de WAL object | 8 MiB |
 | Tamaño máximo de WAL object | 16 MiB |
 | Cierre/PUT de batch | **Bajo demanda**: FLUSH/FUA pendiente, ≥ 8 MiB, o antigüedad ≥ 20 s |
@@ -807,12 +807,31 @@ produzcan los mismos bytes no pueden corromperse entre sí — la clave *es* el 
 ### 13.1 Granularidades desacopladas (cambio clave vs v4)
 
 - **WAL**: registra el **extent real** del write del guest (offset + length, alineado a 512 B). Un write de 4–16 KiB loguea 4–16 KiB, no 64 KiB. El read-modify-write desaparece del data path.
-- **Segmentos CoW**: granularidad de 64 KiB. El RMW se paga una sola vez, en objectization (clase background), donde no afecta latencia del guest.
+- **Segmentos CoW**: *retirados.* No hay grilla en ninguna parte, y no hay RMW que pagar — ni en el data path ni en background. Lo que sale del host es un chunk que **es un extent** del volumen, cortado solo donde un extent excede `image.MaxChunkBytes` (64 MiB).
 
 Esto reduce simultáneamente: bytes de WAL local, bytes subidos a S3, tiempo de replay y costo — precisamente para el peor workload (bases de datos con páginas de 8–16 KiB y fsync frecuente).
 
-> **El primer bullet es exacto y es lo mejor de v5; el segundo describe una estructura que
-> no existe.** No hay segmentos CoW de 64 KiB en ninguna parte: `cow.IntervalMap` trabaja
+> **DECIDIDO 2026-08-08 (DEV-0024, cerrado): la granularidad CoW de 64 KiB se retira, no
+> se aplaza.** El primer bullet es exacto y es lo mejor de v5; el segundo describía una
+> estructura que nunca existió, y la alternativa que la haría existir se examinó y se
+> rechazó: cortar chunks sobre una grilla fija haría los límites independientes de la
+> historia de escritura, pero una celda escrita a medias hay que completarla desde la
+> ancestría — o sea, leer a través de la cadena **al publicar**, que es exactamente el
+> aplanado que la decisión de `chain_depth` quitó, reapareciendo una capa más abajo y por
+> celda. Guardar celdas parciales devuelve los límites a donde ya están.
+>
+> Lo medido, y está fijado por `TestChunksAreExtentSizedAndDedupByContentAlone`: un write
+> de 512 B produce un chunk de 512 B; dos volúmenes de un linaje con el mismo contenido
+> comparten **un** objeto aunque lo hayan escrito en offsets distintos, porque la clave es
+> el digest del contenido y el offset vive en el manifiesto; y dos writes de 4 KiB
+> adyacentes se funden en un extent de 8 KiB. La debilidad, dicha en voz alta: la dedup
+> depende de que **coincidan los límites de extent**, así que dos volúmenes que escriben lo
+> mismo partido distinto no comparten nada. Eso no cuesta nada en el caso que V1 tiene —un
+> padre con la imagen y clones con deltas encima, cuyos chunks se heredan— y lo que lo
+> arreglaría es un chunker definido por contenido (rolling hash), que es V2 y cuyo
+> disparador es un workload, no un tamaño: varios volúmenes escribiendo **el mismo**
+> contenido con límites **distintos**.
+> No hay segmentos CoW de 64 KiB en ninguna parte: `cow.IntervalMap` trabaja
 > sobre los extents reales y nada los alinea a una grilla — el propio comentario de esa
 > estructura dice que la segunda que prometía el incremento 4.4 no llegó. Lo que la
 > reemplazó tiene otras propiedades y vale conocerlas: lo que sale del host son **chunks de
@@ -822,11 +841,10 @@ Esto reduce simultáneamente: bytes de WAL local, bytes subidos a S3, tiempo de 
 > por volumen choca contra el límite de PUT del backend y re-sube todo en cada parada; un
 > objeto chico multiplica requests.
 >
-> **`block_size` no es esta granularidad**, aunque §8 y el esquema declarado digan lo
-> contrario: es el tamaño de bloque lógico que se le reporta al guest, validado como
-> múltiplo del sector de 512 B, y `control-plane -seed-block-size` lo default-ea en 4096.
-> Es DEV-0024 en `docs/plan/STATUS.md`, porque el comentario equivocado está en un archivo
-> que este track no posee.
+> **`block_size` no es esta granularidad**: es el tamaño de bloque lógico que se le
+> reporta al guest, validado como múltiplo del sector de 512 B, y `control-plane
+> -seed-block-size` lo default-ea en 4096. El comentario del esquema declarado que decía
+> lo contrario se corrigió el 2026-08-07.
 
 ### 13.2 Read path
 

@@ -183,6 +183,38 @@ import (
 // means every stop re-uploads every byte. 64 MiB is large enough that a sequential
 // writer produces few chunks and small enough that an unchanged region is skipped at a
 // useful granularity.
+//
+// **It is a bound, not a granularity, and the difference is the whole of DEV-0024.** A
+// chunk is one of this volume's own extents, cut only where an extent is longer than this
+// — so a guest that writes 512 bytes produces a 512-byte chunk, not a padded 64 MiB one.
+// Nothing anywhere aligns a chunk to a grid, and the design document's "granularidad de
+// segmentos CoW de 64 KiB" describes a mechanism that has never existed in this tree:
+// cow.IntervalMap holds arbitrary extents and merges adjacent ones.
+//
+// Two consequences, both pinned by TestChunksAreExtentSizedAndDedupByContentAlone:
+//
+//   - **Dedup is by content alone.** The key is the digest of the bytes; the offset lives
+//     in the manifest. Two volumes of one lineage that wrote the same bytes share one
+//     object whether or not they wrote them at the same offset.
+//   - **And it therefore depends on extent boundaries coinciding.** Two volumes that wrote
+//     the same megabyte, one as a single extent and one as two, produce different chunks
+//     and share nothing. That costs nothing in the case V1 has — a parent holding the
+//     image and clones writing small deltas over it, where the parent's chunks are
+//     inherited rather than re-uploaded — and it is the weakness a content-defined
+//     chunker (a rolling hash) would remove.
+//
+// Rejected, and it is the option that sounds right until it is examined: **cutting chunks
+// on a fixed grid**, which would make boundaries independent of write history and dedup
+// deterministic. A cell written only in part has to be filled from somewhere, and the only
+// somewhere is the ancestry — so publishing would read through the chain to complete a
+// cell, which is the flattening ADR-0026's chain decision removed, reappearing one layer
+// down and per cell. Storing partial cells instead puts the boundaries back where they
+// already are and buys nothing.
+//
+// The trigger for revisiting it is not a size, it is a workload: several volumes writing
+// the *same* content with *different* extent boundaries. A golden image with clones does
+// not do that; a fleet-wide dedup ambition would, and that also needs a bucket-wide key
+// space, which the package doc above rejects for a separate reason.
 const MaxChunkBytes = 64 << 20
 
 // ErrNotPublished means the volume has no image: it has never stopped cleanly. It is a

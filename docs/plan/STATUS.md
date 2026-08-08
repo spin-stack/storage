@@ -621,7 +621,39 @@ nobody notices.
 Until then the rule is enforced by whoever reads this file, which is exactly the
 "human-shaped control" `PARALLEL-PLAN.md` says is not a control.
 
-## DEV-0024 — is the 64 KiB CoW granularity V2, or is it dead?
+## ~~DEV-0024~~ — the 64 KiB CoW granularity is retired *(resolved 2026-08-08)*
+
+**Retired, not deferred**, and the entry's own premise was the thing that had to go first.
+It assumed a chunk is a padded unit and that a clone writing one sector therefore saves
+nothing, which the spec that fed it also assumed. Measured instead of reasoned:
+`TestChunksAreExtentSizedAndDedupByContentAlone` publishes four volumes of one lineage and
+asserts on the bucket. A 512-byte write produces a **512-byte** chunk; two volumes with the
+same bytes share **one** object even at different offsets, because the key is the digest of
+the content and the offset lives in the manifest; and two adjacent 4 KiB writes merge into
+one 8 KiB extent. Four publishes, two objects.
+
+So the addressed unit is the **extent**, and `image.MaxChunkBytes` is a **bound** rather
+than a granularity — which is the naming half of the fix, and the half that let this
+survive: the design document called it a granularity in three places and the declared
+schema borrowed the number for an unrelated column.
+
+**The alternative was examined and rejected on the record**, because it is the one that
+sounds right: cutting chunks on a fixed grid would make boundaries independent of write
+history and dedup deterministic — but a partly-written cell has to be completed from the
+ancestry, so publishing would read through the chain, which is the flattening the
+`chain_depth` decision removed, one layer down and per cell. Storing partial cells puts the
+boundaries back where they already are.
+
+**The weakness is stated rather than papered over:** dedup depends on extent boundaries
+coinciding, so two volumes that wrote the same megabyte split differently share nothing.
+That costs nothing in the case V1 has — a parent holding the image, clones writing deltas
+whose inherited chunks are never re-uploaded — and what would remove it is a
+content-defined chunker. Its trigger is a workload and not a size: several volumes writing
+the *same* content with *different* boundaries.
+
+The account below is what the entry was before it was answered.
+
+## The original entry — is the 64 KiB CoW granularity V2, or is it dead?
 
 *(Narrowed 2026-08-07. The half about the declared schema's comment is closed: `schema.sql`
 now names the column for what it is, `cba356c`. A comment-only change produces no migration —
