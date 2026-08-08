@@ -80,6 +80,9 @@ func TestAnEncryptedCloneReadsItsParentsChunks(t *testing.T) {
 	parent := newManager("/var/lib/spin-parent")
 	defer func() { _ = parent.Close(t.Context()) }()
 	p := desiredVolume(t, 1)
+	// The descriptor a provisioner would have written: the clone's Agent reads it to find
+	// whether the parent descends from anything itself (agent.parentChain).
+	writeDescriptor(t, store, p.GetVolumeId(), lineageLink{})
 	if err := parent.Apply(t.Context(), []*storagev1.DesiredVolume{p}); err != nil {
 		t.Fatalf("Apply(parent): %v", err)
 	}

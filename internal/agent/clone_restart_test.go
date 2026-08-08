@@ -50,6 +50,9 @@ func TestACloneThatStoppedOnceStartsAgainAndReadsBothHalves(t *testing.T) {
 	parentDisk := sim.NewDisk()
 	parent := cloneSession(t, "/var/lib/spin-parent", parentDisk, store)
 	p := desiredVolume(t, 1)
+	// The descriptor a provisioner would have written: the clone's Agent reads it to find
+	// whether the parent descends from anything itself (agent.parentChain).
+	writeDescriptor(t, store, p.GetVolumeId(), lineageLink{})
 	pdev := serveClone(t, parent, p)
 	writeBlock(t, pdev, parentOnly, parentByte)
 	writeBlock(t, pdev, shared, parentByte)

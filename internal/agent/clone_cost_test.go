@@ -39,6 +39,10 @@ func TestAnOperatorIsToldWhenAStopIsCopyingItsParentsDataset(t *testing.T) {
 
 	parent := cloneSession(t, "/var/lib/spin-parent", sim.NewDisk(), store)
 	p := desiredVolume(t, 1)
+	// The descriptor a provisioner would have written. The clone's Agent reads it to
+	// find whether the parent descends from anything itself, and refuses to attach when
+	// it is missing rather than guessing that the lineage ends there (agent.parentChain).
+	writeDescriptor(t, store, p.GetVolumeId(), lineageLink{})
 	pdev := serveClone(t, parent, p)
 	for i := range int64(parentBlocks) {
 		writeBlock(t, pdev, i*testBlockSize, 0xA1)
