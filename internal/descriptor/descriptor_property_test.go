@@ -229,3 +229,42 @@ func TestCorruptedKeyMaterialCannotUnwrap(t *testing.T) {
 		}
 	})
 }
+
+// TestADescriptorUnderTheWrongKeyIsRefused is the half the digest cannot cover. The frame
+// proves the bytes are the bytes somebody wrote; it says nothing about where they were
+// written, so a descriptor copied under another volume's prefix — a restore that fanned
+// out wrongly, a bucket somebody rearranged — verifies perfectly and describes the wrong
+// volume's identity, geometry, wrapped key and parent link.
+//
+// It is asserted through Write and a Put of the same object under a second key, so the
+// bytes are the production writer's rather than the test's: a hand-built body could fail
+// this for a reason the real format never produces.
+func TestADescriptorUnderTheWrongKeyIsRefused(t *testing.T) {
+	ctx := t.Context()
+	store := sim.NewObjectStore()
+	mine := ids.New().String()
+	theirs := ids.New().String()
+
+	if err := descriptor.Write(ctx, store, descriptor.Descriptor{
+		VolumeID: mine, SizeBytes: 1 << 20, BlockSize: 512, CurrentEpoch: 1, DEKKeyID: 1,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	body, err := store.Get(ctx, descriptor.Key(mine))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if _, err := store.Put(ctx, descriptor.Key(theirs), body, objectstore.PutOptions{}); err != nil {
+		t.Fatalf("put under the other volume's key: %v", err)
+	}
+
+	// The control: the same bytes still open under their own key. Without it a failure
+	// below would also be consistent with a descriptor this test wrote wrongly.
+	if _, err := descriptor.Read(ctx, store, mine); err != nil {
+		t.Fatalf("the descriptor no longer reads under its own key: %v", err)
+	}
+	got, err := descriptor.Read(ctx, store, theirs)
+	if err == nil {
+		t.Fatalf("volume %s read a descriptor describing volume %s", theirs, got.VolumeID)
+	}
+}

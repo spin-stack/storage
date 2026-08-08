@@ -110,6 +110,20 @@ func Read(ctx context.Context, store objectstore.Store, volumeID string) (Descri
 	if err := json.Unmarshal(payload, &d); err != nil {
 		return Descriptor{}, fmt.Errorf("descriptor: decode %s: %w", Key(volumeID), err)
 	}
+	// The object must describe the volume it was asked for. The digest above proves the
+	// bytes are the bytes that were written; it says nothing about *where*, so a
+	// descriptor copied or restored under another volume's prefix passes it intact — and
+	// it is a whole volume's identity, geometry, wrapped key and parent link, every one
+	// of which a reader then attributes to the wrong volume.
+	//
+	// The same check, for the same reason, is in image.readManifest ("what catches a
+	// bucket copied under the wrong prefix, and every reader needs it"). It matters more
+	// here since agent.parentChain started following these objects: a descriptor under
+	// the wrong key sends the walk up a lineage that is not this volume's, and every
+	// range it then layers is another volume's data served to this guest.
+	if d.VolumeID != volumeID {
+		return Descriptor{}, fmt.Errorf("descriptor: %s describes volume %s", Key(volumeID), d.VolumeID)
+	}
 	return d, nil
 }
 
