@@ -23,6 +23,15 @@ import (
 
 func genDescriptor(t *rapid.T) descriptor.Descriptor {
 	wrapped := rapid.SliceOfN(rapid.Byte(), 1, 64).Draw(t, "dek_wrapped")
+	// One draw decides both halves of the chain link, because a descriptor naming a
+	// snapshot with no volume is half a link — a state agent.parentView refuses rather
+	// than stores, and one no writer produces. Two independent draws would generate it
+	// half the time and prove something about a shape that does not exist.
+	var parentSnapshot, parentVolume string
+	if rapid.Bool().Draw(t, "cloned") {
+		parentSnapshot = ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "parent_snapshot_ms")), rand.Reader).String()
+		parentVolume = ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "parent_volume_ms")), rand.Reader).String()
+	}
 	return descriptor.Descriptor{
 		VolumeID:     ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "ms")), rand.Reader).String(),
 		SizeBytes:    int64(rapid.IntRange(1, 1<<40).Draw(t, "size")),
@@ -35,6 +44,13 @@ func genDescriptor(t *rapid.T) descriptor.Descriptor {
 		// the write paths refuse it (metadata.CheckDEKKeyID). Generating it here would
 		// be testing a state the system does not produce.
 		DEKKeyID: uint32(rapid.IntRange(1, 1<<31).Draw(t, "dek_key_id")),
+		// The chain link is drawn — rather than left at its zero value — because a field
+		// that is always empty in the generator is a field the truncation and corruption
+		// tests below never reach: `omitempty` keeps it out of the bytes entirely, so
+		// there is nothing to truncate in the middle of and nothing to flip a bit in.
+		// That is the same gap this file was written to close for dek_key_id.
+		ParentSnapshotID: parentSnapshot,
+		ParentVolumeID:   parentVolume,
 	}
 }
 

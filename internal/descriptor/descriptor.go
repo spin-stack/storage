@@ -37,6 +37,26 @@ type Descriptor struct {
 	// rebuild-metadata reconstructs volumes from these objects: a clone rebuilt
 	// without its parent link is a clone that reads zeros, with nothing to say why.
 	ParentSnapshotID string `json:"parent_snapshot_id,omitempty"`
+	// ParentVolumeID is the volume that snapshot belongs to, and without it the link
+	// above is only half a link. A snapshot is not addressable on its own — it lives at
+	// image/<volume>/snapshots/<id>.json (image.SnapshotKey) — so "which snapshot"
+	// without "whose" names nothing a reader can open. Until this field existed the
+	// other half lived only in the catalog (snapshots.volume_id), which meant a reader
+	// holding the database could resolve a lineage and a reader holding only the bucket
+	// could not, while every claim about these objects says the bucket is the authority
+	// a rebuild trusts (§22.5, INV-20).
+	//
+	// The reader that made it necessary is agent.parentView, which walks a clone's
+	// ancestry one descriptor at a time: the desired state names the first link (ADR-0021
+	// — the Agent is told, it does not look things up), and every link above it comes
+	// from here.
+	//
+	// Rejected: putting the whole ancestry in DesiredVolume. It would save this field and
+	// one GET per link, and it makes the Control Plane responsible for bounding the
+	// length of a list in a message, and it moves the authority for a volume's lineage
+	// out of the object store — into the one component whose loss -rebuild-metadata
+	// exists to survive.
+	ParentVolumeID string `json:"parent_volume_id,omitempty"`
 }
 
 // ErrCorruptDescriptor means the stored bytes disagree with their own digest. It is

@@ -126,6 +126,13 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 		DEKWrapped:       clone.DEKWrapped,
 		DEKKeyID:         clone.DEKKeyID,
 		ParentSnapshotID: clone.ParentSnapshotID,
+		// Both halves, because either alone is unusable. A snapshot id names an object
+		// only together with the volume it lives under (image.SnapshotKey), so a
+		// descriptor carrying the snapshot alone left the bucket unable to state a
+		// lineage it claims to describe — the missing half was in the catalog, which is
+		// the component -rebuild-metadata exists to survive the loss of. It is what
+		// agent.parentView follows past the first link.
+		ParentVolumeID: clone.ParentVolumeID,
 	}); err != nil {
 		return clone, fmt.Errorf("writing the descriptor for clone %s (the row exists; rebuild-metadata cannot see it until this succeeds): %w",
 			clone.VolumeID, err)
