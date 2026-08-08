@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -17,6 +18,7 @@ const (
 	cordonedHost = "00000000-0000-7000-8000-0000000000a2"
 	servedVol    = "00000000-0000-7000-8000-0000000000b1"
 	strandedVol  = "00000000-0000-7000-8000-0000000000b2"
+	deepVol      = "00000000-0000-7000-8000-0000000000b3"
 	stuckSnap    = "00000000-0000-7000-8000-0000000000c1"
 	doneSnap     = "00000000-0000-7000-8000-0000000000c2"
 	requestID    = "00000000-0000-7000-8000-0000000000e1"
@@ -113,6 +115,18 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A clone of doneSnap that has itself been cloned to the ceiling. It is created after
+	// the snapshot it points at, because that is the order the catalog's foreign key
+	// admits — and it is the row an operator is looking for when a clone was refused.
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: deepVol, SizeBytes: 1 << 30, BlockSize: 65536, CurrentEpoch: 1,
+		State: lifecycle.VolumeActive, PrimaryHostID: activeHost,
+		ChainDepth: controlplane.MaxChainDepth, ParentSnapshotID: doneSnap,
+		DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 42,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
 	now = now.Add(5 * time.Second)
 	var buf bytes.Buffer
 	if err := fleetReport(ctx, md, &buf); err != nil {
@@ -132,20 +146,27 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 		t.Errorf("cordoned host row = %v, want %v", got, want)
 	}
 	if got, want := row(t, out, activeHost),
-		[]string{activeHost, "ACTIVE", "-", "100.0GiB", "(10%)", "1.0TiB", "1.0GiB", "5s"}; !equal(got, want) {
+		[]string{activeHost, "ACTIVE", "-", "100.0GiB", "(10%)", "1.0TiB", "2.0GiB", "5s"}; !equal(got, want) {
 		t.Errorf("active host row = %v, want %v", got, want)
 	}
 
 	// The volume nobody serves, and the count in the header that answers the question
 	// on its own.
-	mustSay(t, out, "VOLUMES (2, 1 with no primary host)")
+	mustSay(t, out, "VOLUMES (3, 1 with no primary host, 1 at the depth ceiling of 5")
 	if got, want := row(t, out, strandedVol),
-		[]string{strandedVol, "-", "DETACHED", "9", "2.0GiB", "-"}; !equal(got, want) {
+		[]string{strandedVol, "-", "DETACHED", "9", "2.0GiB", "0", "-"}; !equal(got, want) {
 		t.Errorf("unplaced volume row = %v, want %v", got, want)
 	}
 	if got, want := row(t, out, servedVol),
-		[]string{servedVol, activeHost, "ACTIVE", "3", "1.0GiB", "-"}; !equal(got, want) {
+		[]string{servedVol, activeHost, "ACTIVE", "3", "1.0GiB", "0", "-"}; !equal(got, want) {
 		t.Errorf("served volume row = %v, want %v", got, want)
+	}
+	// The volume at the ceiling, which is the one this section can answer for and the
+	// `chain_depth` series cannot: a clone of it is refused until someone flattens it,
+	// and until then its depth is a fact about the fleet rather than an event.
+	if got, want := row(t, out, deepVol),
+		[]string{deepVol, activeHost, "ACTIVE", "1", "1.0GiB", "5", doneSnap}; !equal(got, want) {
+		t.Errorf("volume at the ceiling row = %v, want %v", got, want)
 	}
 
 	// The snapshot nothing will ever take, and — the part that makes it actionable —
@@ -158,7 +179,12 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 	// A published snapshot is finished. If it appears here, the section is a listing of
 	// the snapshots table and not an answer to "what is outstanding" — and on a real
 	// catalog that difference is thousands of rows against three.
-	if strings.Contains(out, doneSnap) {
+	//
+	// Scoped to the section rather than to the whole report, which it was until a volume
+	// in this fixture acquired a parent link: a published snapshot appears legitimately in
+	// the volumes section as the thing a clone was made from, so a report-wide search now
+	// answers a question nobody asked.
+	if unfinished := out[strings.Index(out, "SNAPSHOTS NOT FINISHED"):]; strings.Contains(unfinished, doneSnap) {
 		t.Errorf("the report lists a PUBLISHED snapshot as unfinished:\n%s", out)
 	}
 }
@@ -182,7 +208,7 @@ func TestFleetStatusOfAnEmptyCatalogSaysSo(t *testing.T) {
 	mustSay(t, out, "LEADER  none")
 	for _, section := range []string{
 		"HOSTS (0, 0 not taking placements)",
-		"VOLUMES (0, 0 with no primary host)",
+		"VOLUMES (0, 0 with no primary host, 0 at the depth ceiling",
 		"SNAPSHOTS NOT FINISHED (0)",
 	} {
 		mustSay(t, out, section)

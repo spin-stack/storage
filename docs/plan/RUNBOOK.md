@@ -55,9 +55,9 @@ HOST_ID                               STATE   REASON  USED           TOTAL    CO
 019fdbe7-7baa-7553-a781-7e2998b211a1  ACTIVE  -       1.3GiB (8%)    15.3GiB  1.0GiB     2s
 019fdbf0-54d8-7ba8-9201-87e09d8cc5d3  ACTIVE  -       30.0MiB (47%)  64.0MiB  0B         0s
 
-VOLUMES (1, 0 with no primary host)
-VOLUME_ID                             PRIMARY_HOST                          STATE   EPOCH  SIZE    PARENT_SNAPSHOT
-019fdbe8-e65f-773b-8362-48a20fc3a034  019fdbe7-7baa-7553-a781-7e2998b211a1  ACTIVE  1      1.0GiB  -
+VOLUMES (1, 0 with no primary host, 0 at the depth ceiling of 5 — a clone of one is refused until it is flattened)
+VOLUME_ID                             PRIMARY_HOST                          STATE   EPOCH  SIZE    DEPTH  PARENT_SNAPSHOT
+019fdbe8-e65f-773b-8362-48a20fc3a034  019fdbe7-7baa-7553-a781-7e2998b211a1  ACTIVE  1      1.0GiB  0      -
 
 SNAPSHOTS NOT FINISHED (0)
 SNAPSHOT_ID  VOLUME_ID  STATE  EPOCH  ON_HOST
@@ -66,9 +66,13 @@ SNAPSHOT_ID  VOLUME_ID  STATE  EPOCH  ON_HOST
 
 Read it in this order.
 
-**The two header counts are the triage.** "N not taking placements" is why a placement
+**The header counts are the triage.** "N not taking placements" is why a placement
 would fail; "N with no primary host" is how many volumes nobody is serving — after
-`-rebuild-metadata` it is every volume there is.
+`-rebuild-metadata` it is every volume there is; "N at the depth ceiling" is how many
+volumes a clone request would now be refused for, and the `DEPTH` column names them. That
+last one is the only place the fleet's lineage depth is visible while nothing is changing
+it: `controlplane.Clone` records the `chain_depth` series when it creates a link, so the
+series says what was created and this says what is being held.
 
 **`HEARTBEAT` is the only liveness signal in the report.** Seconds means the Agent's
 reconciliation loop is running. Minutes means it is not, and *the row still says `ACTIVE`*:
@@ -323,7 +327,7 @@ LEADER  none — no Control Plane has ever been elected
 
 HOSTS (0, 0 not taking placements)
   (none)
-VOLUMES (0, 0 with no primary host)
+VOLUMES (0, 0 with no primary host, 0 at the depth ceiling of 5 — a clone of one is refused until it is flattened)
   (none)
 ```
 
@@ -383,9 +387,9 @@ come back on their own, by heartbeating.
 serving which volume, so every volume comes back with none:
 
 ```
-VOLUMES (1, 1 with no primary host)
-VOLUME_ID                             PRIMARY_HOST  STATE   EPOCH  SIZE    PARENT_SNAPSHOT
-019fdbe8-e65f-773b-8362-48a20fc3a034  -             ACTIVE  1      1.0GiB  -
+VOLUMES (1, 1 with no primary host, 0 at the depth ceiling of 5 — a clone of one is refused until it is flattened)
+VOLUME_ID                             PRIMARY_HOST  STATE   EPOCH  SIZE    DEPTH  PARENT_SNAPSHOT
+019fdbe8-e65f-773b-8362-48a20fc3a034  -             ACTIVE  1      1.0GiB  0      -
 ```
 
 It also does not restore anything about a volume that has no descriptor. A volume

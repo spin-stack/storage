@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/metadata"
 )
 
@@ -111,21 +112,32 @@ func reportVolumes(ctx context.Context, md metadata.Store, p *printer) ([]metada
 	if err != nil {
 		return nil, fmt.Errorf("listing volumes: %w", err)
 	}
-	var unplaced int
+	var unplaced, atCeiling int
 	for _, v := range vols {
 		if v.PrimaryHostID == "" {
 			unplaced++
+		}
+		if v.ChainDepth >= controlplane.MaxChainDepth {
+			atCeiling++
 		}
 	}
 	// The unplaced count is in the header because it is a question ("which volumes has
 	// nobody got?") rather than a detail: after -rebuild-metadata it is every volume in
 	// the catalog, and until an operator places them the fleet serves nothing.
-	p.printf("VOLUMES (%d, %d with no primary host)\n", len(vols), unplaced)
-	s := p.section("VOLUME_ID", "PRIMARY_HOST", "STATE", "EPOCH", "SIZE", "PARENT_SNAPSHOT")
+	//
+	// The ceiling count is the second question this report can answer and nothing else
+	// can. `controlplane.Clone` refuses a clone of a volume at MaxChainDepth, and the
+	// operator who hits that refusal — or who wants to not hit it — needs the list of
+	// volumes waiting on a FLATTEN. The `chain_depth` series does not answer it: it is
+	// recorded when the Control Plane changes a depth and then goes quiet, so it says what
+	// was created, while this says what the fleet is holding now.
+	p.printf("VOLUMES (%d, %d with no primary host, %d at the depth ceiling of %d — a clone of one is refused until it is flattened)\n",
+		len(vols), unplaced, atCeiling, controlplane.MaxChainDepth)
+	s := p.section("VOLUME_ID", "PRIMARY_HOST", "STATE", "EPOCH", "SIZE", "DEPTH", "PARENT_SNAPSHOT")
 	for _, v := range vols {
-		s.row("%s\t%s\t%s\t%d\t%s\t%s\n",
+		s.row("%s\t%s\t%s\t%d\t%s\t%d\t%s\n",
 			v.VolumeID, orNone(v.PrimaryHostID), v.State, v.CurrentEpoch,
-			capacity(v.SizeBytes), orNone(v.ParentSnapshotID))
+			capacity(v.SizeBytes), v.ChainDepth, orNone(v.ParentSnapshotID))
 	}
 	s.end()
 	return vols, nil
