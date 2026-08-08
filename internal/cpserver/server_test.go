@@ -36,7 +36,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{md: md, term: term}
-	f.srv = cpserver.New(md, func() int64 { return f.term }, leaseTTL)
+	f.srv = cpserver.New(md, func() int64 { return f.term }, leaseTTL, cpserver.DefaultBand())
 	return f
 }
 

@@ -37,7 +37,7 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	}
 
 	const leaseTTL = 30 * time.Second
-	httpSrv := httptest.NewServer(cpserver.Handler(cpserver.New(md, func() int64 { return term }, leaseTTL)))
+	httpSrv := httptest.NewServer(cpserver.Handler(cpserver.New(md, func() int64 { return term }, leaseTTL, cpserver.DefaultBand())))
 	defer httpSrv.Close()
 
 	// mine is served by this host under epoch 4; stolen was promoted away.
@@ -174,7 +174,7 @@ func TestTheAgentCanOpenAVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	httpSrv := httptest.NewServer(cpserver.Handler(cpserver.New(md, func() int64 { return term }, 30*time.Second)))
+	httpSrv := httptest.NewServer(cpserver.Handler(cpserver.New(md, func() int64 { return term }, 30*time.Second, cpserver.DefaultBand())))
 	defer httpSrv.Close()
 
 	loop, err := agent.New(testConfig(), agent.Deps{

@@ -116,6 +116,18 @@ func start(t *testing.T) *deployment {
 			"-database-url", dsn,
 			"-holder-id", "cp-e2e",
 			"-lease-ttl", "30s",
+			// The device-pressure cordon, out of this lane's way and deliberately so.
+			// This lane's Agents point --data-dir at the machine's temporary directory,
+			// and the Agent measures the filesystem holding it *including other
+			// tenants* — so on a CI runner, whose disk is 87% full, every host cordoned
+			// itself on its first heartbeat and every placement failed with "no host
+			// with capacity". That is the product behaving correctly and the lane
+			// depending on a developer's roomy /tmp, which is why it had never failed
+			// here. What this lane tests is placement, cloning and the shutdown
+			// publish; the band itself is tested where it belongs, against synthetic
+			// heartbeats in internal/cpserver.
+			"-cordon-used-ratio", "1",
+			"-uncordon-used-ratio", "0.99",
 			"-s3-create-bucket",
 		}, d.storeArgs()...),
 		Env: env,

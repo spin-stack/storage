@@ -1621,8 +1621,8 @@ Sin esta política, el primer cambio de formato con el fleet a medias actualizad
 > El cordon, en cambio, **lo aplica el Control Plane solo**, sobre la medición de
 > dispositivo que el heartbeat del Agent reporta (ADR-0013 §3, `internal/cpserver/pressure.go`).
 > Y no es un umbral sino una **banda de Schmitt**: cordona al 70% usado
-> (`cpserver.CordonUsedRatio`) y vuelve a ACTIVE solo por debajo del 65%
-> (`UncordonUsedRatio`). Un umbral solo es un cordon que oscila — un host parado sobre la
+> (`cpserver.DefaultBand().Cordon`) y vuelve a ACTIVE solo por debajo del 65%
+> (`.Uncordon`), ambos ajustables con `-cordon-used-ratio` / `-uncordon-used-ratio`. Un umbral solo es un cordon que oscila — un host parado sobre la
 > línea la cruza en los dos sentidos en heartbeats consecutivos, y cada cruce es una
 > escritura, un cambio de estado que lee toda decisión de placement de la flota, y una
 > línea en lo que sea que un operador esté mirando. Volver exige liberar un 5% del

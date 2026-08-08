@@ -38,6 +38,10 @@ type Server struct {
 	md       metadata.Store
 	term     func() int64
 	leaseTTL time.Duration
+	// band is the device-pressure cordon policy (ADR-0013 §3). It is stated by the
+	// caller rather than compiled in — see cpserver.Band for why the constants stopped
+	// being constants, which is a story about CI rather than about tuning.
+	band Band
 }
 
 var _ storagev1connect.ControlPlaneServiceHandler = (*Server)(nil)
@@ -45,8 +49,8 @@ var _ storagev1connect.ControlPlaneServiceHandler = (*Server)(nil)
 // New returns a Server. term is read per call rather than captured once: the term a
 // process holds is the one its Elector granted (ADR-0011), and a process that loses
 // it must start failing immediately, not from its next restart.
-func New(md metadata.Store, term func() int64, leaseTTL time.Duration) *Server {
-	return &Server{md: md, term: term, leaseTTL: leaseTTL}
+func New(md metadata.Store, term func() int64, leaseTTL time.Duration, band Band) *Server {
+	return &Server{md: md, term: term, leaseTTL: leaseTTL, band: band}
 }
 
 // Handler returns the mounted Connect handler: the path prefix the generated client

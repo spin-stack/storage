@@ -61,15 +61,15 @@ func TestHeartbeatCordonsAndUncordonsAcrossTheBand(t *testing.T) {
 		wantReason lifecycle.CordonReason
 	}{
 		{"an empty device is active", used(0.10), lifecycle.HostActive, lifecycle.CordonNone},
-		{"one byte below the cordon line changes nothing", used(cpserver.CordonUsedRatio) - 1, lifecycle.HostActive, lifecycle.CordonNone},
-		{"at the cordon line the fleet cordons it", used(cpserver.CordonUsedRatio), lifecycle.HostCordoned, lifecycle.CordonPressure},
+		{"one byte below the cordon line changes nothing", used(cpserver.DefaultBand().Cordon) - 1, lifecycle.HostActive, lifecycle.CordonNone},
+		{"at the cordon line the fleet cordons it", used(cpserver.DefaultBand().Cordon), lifecycle.HostCordoned, lifecycle.CordonPressure},
 		// The next three are the hysteresis. Each is a heartbeat that would have
 		// un-cordoned the host under a single threshold, and each leaves it cordoned.
-		{"falling one byte back below the cordon line does not release it", used(cpserver.CordonUsedRatio) - 1, lifecycle.HostCordoned, lifecycle.CordonPressure},
-		{"crossing the line again does not re-cordon it", used(cpserver.CordonUsedRatio), lifecycle.HostCordoned, lifecycle.CordonPressure},
+		{"falling one byte back below the cordon line does not release it", used(cpserver.DefaultBand().Cordon) - 1, lifecycle.HostCordoned, lifecycle.CordonPressure},
+		{"crossing the line again does not re-cordon it", used(cpserver.DefaultBand().Cordon), lifecycle.HostCordoned, lifecycle.CordonPressure},
 		{"inside the band it stays cordoned", used(0.67), lifecycle.HostCordoned, lifecycle.CordonPressure},
-		{"one byte above the release line still holds", used(cpserver.UncordonUsedRatio), lifecycle.HostCordoned, lifecycle.CordonPressure},
-		{"below the release line it comes back", used(cpserver.UncordonUsedRatio) - 1, lifecycle.HostActive, lifecycle.CordonNone},
+		{"one byte above the release line still holds", used(cpserver.DefaultBand().Uncordon), lifecycle.HostCordoned, lifecycle.CordonPressure},
+		{"below the release line it comes back", used(cpserver.DefaultBand().Uncordon) - 1, lifecycle.HostActive, lifecycle.CordonNone},
 		{"and it can be cordoned again", used(0.80), lifecycle.HostCordoned, lifecycle.CordonPressure},
 	}
 	for _, step := range steps {
@@ -207,7 +207,7 @@ func TestACordonThatCannotBeWrittenDoesNotCostTheHostItsHeartbeat(t *testing.T) 
 			}); err != nil {
 				t.Fatal(err)
 			}
-			f.srv = cpserver.New(refusingCordon{Store: f.md, err: tc.err}, func() int64 { return f.term }, leaseTTL)
+			f.srv = cpserver.New(refusingCordon{Store: f.md, err: tc.err}, func() int64 { return f.term }, leaseTTL, cpserver.DefaultBand())
 
 			resp, err := f.heartbeat(t, &storagev1.HeartbeatRequest{
 				HostId: hostA, AgentVersion: "0.1.0",
@@ -251,5 +251,64 @@ func TestPressureIgnoresAHostThatHasNotMeasuredItsDevice(t *testing.T) {
 	}
 	if h.State != lifecycle.HostActive {
 		t.Fatalf("an unmeasured host was cordoned: state = %q", h.State)
+	}
+}
+
+// The band is a policy the caller states, and this is what makes the flags that state
+// it more than decoration: with a band moved out of the way, a device that would have
+// cordoned at the default stays ACTIVE, and the *new* line is where the cordon happens.
+//
+// It exists because of what the first CI run this repository ever had found. A GitHub
+// runner's disk is 87% full, the Agent measures the filesystem holding --data-dir
+// including other tenants, and every host in the e2e lane therefore cordoned itself on
+// its first heartbeat — so every placement failed with "no host with capacity". The
+// product was right; the lane had been relying on this developer's /tmp being a roomy
+// tmpfs. The lane now states a band, and a stated band that did not actually move the
+// line would put the lane back where it was without saying so.
+func TestAStatedBandMovesTheLine(t *testing.T) {
+	f := newFixture(t)
+	f.srv = cpserver.New(f.md, func() int64 { return f.term }, leaseTTL, cpserver.Band{Cordon: 0.95, Uncordon: 0.90})
+
+	// Comfortably past the default cordon ratio, and short of the stated one.
+	if state, reason := f.beat(t, used(0.80)); state != lifecycle.HostActive || reason != lifecycle.CordonNone {
+		t.Fatalf("at 80%% used with a 95%% cordon: state = %q reason = %q, want ACTIVE — the stated band was ignored",
+			state, reason)
+	}
+	if state, reason := f.beat(t, used(0.95)); state != lifecycle.HostCordoned || reason != lifecycle.CordonPressure {
+		t.Fatalf("at the stated cordon line: state = %q reason = %q, want CORDONED/DEVICE_PRESSURE", state, reason)
+	}
+	// And the stated release line, not the default's: 0.80 is below the default's 0.85
+	// release but above this band's 0.90, so a band that fell back to the default here
+	// would hand the host back early.
+	if state, _ := f.beat(t, used(0.92)); state != lifecycle.HostCordoned {
+		t.Fatalf("between the stated lines: state = %q, want it to stay CORDONED", state)
+	}
+	if state, reason := f.beat(t, used(0.89)); state != lifecycle.HostActive || reason != lifecycle.CordonNone {
+		t.Fatalf("below the stated release line: state = %q reason = %q, want ACTIVE", state, reason)
+	}
+}
+
+// A band that would flap, or one that could never fire, is a typo rather than a tuning
+// choice — and its symptom is a host changing state on every heartbeat, which is a
+// miserable thing to debug from the other end. So it is refused at the flag.
+func TestABandThatWouldFlapIsRefused(t *testing.T) {
+	tests := []struct {
+		name string
+		band cpserver.Band
+	}{
+		{"inverted", cpserver.Band{Cordon: 0.65, Uncordon: 0.70}},
+		{"zero width", cpserver.Band{Cordon: 0.70, Uncordon: 0.70}},
+		{"a cordon above full", cpserver.Band{Cordon: 1.5, Uncordon: 0.9}},
+		{"a cordon at zero", cpserver.Band{Cordon: 0, Uncordon: 0}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.band.Validate(); err == nil {
+				t.Fatalf("%+v was accepted", tc.band)
+			}
+		})
+	}
+	if err := cpserver.DefaultBand().Validate(); err != nil {
+		t.Fatalf("the default band does not validate: %v", err)
 	}
 }

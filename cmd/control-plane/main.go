@@ -102,6 +102,17 @@ func run() error {
 		// not — and because the right value depends on the deployment: a dedicated
 		// NVMe per host tolerates a higher fill than a filesystem shared with logs
 		// and images, whose other tenants no truncation of ours can reclaim.
+		// The device-pressure cordon band (ADR-0013 §3). Flags rather than constants
+		// because the first CI run this repository ever had failed every placement in
+		// the e2e lane: a GitHub runner's disk is 87% full, the Agent measures the
+		// filesystem holding --data-dir including other tenants, so every host cordoned
+		// itself on its first heartbeat. The product was right and the lane had been
+		// relying on a developer's roomy /tmp; see cpserver.Band.
+		cordonRatio = flag.Float64("cordon-used-ratio", cpserver.DefaultBand().Cordon,
+			"used ratio at which the Control Plane stops placing new volumes on a host (ADR-0013 §3)")
+		uncordonRatio = flag.Float64("uncordon-used-ratio", cpserver.DefaultBand().Uncordon,
+			"used ratio at which a host cordoned for pressure is placed on again; must be below -cordon-used-ratio, and the gap is the hysteresis")
+
 		maxUsedRatio = flag.Float64("max-used-ratio", placement.DefaultMaxUsedRatio,
 			"with -clone-snapshot / -attach-volume: used/total a host may already measure and still receive a volume (ADR-0013)")
 
@@ -174,6 +185,14 @@ func run() error {
 		return errors.New("-holder-id is required")
 	case *databaseDSN == "":
 		return errors.New("-database-url (or $DATABASE_URL) is required")
+	}
+
+	// Validated on the flags rather than at the first heartbeat: an inverted or
+	// zero-width band is a typo whose symptom is a host changing state on every
+	// heartbeat, which is a confusing thing to debug from the other end.
+	band := cpserver.Band{Cordon: *cordonRatio, Uncordon: *uncordonRatio}
+	if err := band.Validate(); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -406,7 +425,7 @@ func run() error {
 	// which the handler answers as Aborted, and an operator restarts it.
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           cpserver.Handler(cpserver.New(md, func() int64 { return term }, *leaseTTL)),
+		Handler:           cpserver.Handler(cpserver.New(md, func() int64 { return term }, *leaseTTL, band)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -42,13 +42,46 @@ import (
 // it is a host doing precisely what the cordon exists for, and cordoning it again is
 // the right answer.
 //
-// The two numbers are constants, not configuration: ADR-0013 chose 70%, nobody has
-// asked to tune it, and a knob added before a caller needs it is a knob whose
-// default is the only value ever used.
-const (
-	CordonUsedRatio   = 0.70
-	UncordonUsedRatio = 0.65
-)
+// These were constants, with the reasoning that ADR-0013 chose 70%, nobody had asked
+// to tune it, and a knob added before a caller needs it is a knob whose default is
+// the only value ever used. **That reasoning was right and CI is the caller.** The
+// first run this repository ever had on a GitHub runner failed every placement in the
+// e2e lane: the runner's disk is 87% full, the Agent measures the filesystem holding
+// --data-dir *including other tenants* — deliberately, see agent.NewDiskUsage — so
+// every host cordoned itself on its first heartbeat and nothing could be placed.
+//
+// The product was right and the lane was wrong, which is the useful half: a fleet that
+// refuses to put new volumes on an 87%-full host is doing its job. What was wrong is
+// that a lane testing placement was at the mercy of the runner's disk, and had been
+// passing here only because this developer's /tmp is a roomy tmpfs.
+//
+// So they are a band the caller states, defaulting to the ADR's numbers. They sit
+// beside -max-used-ratio and -max-oversubscription, which are the same kind of policy
+// and were flags already.
+type Band struct {
+	// Cordon is the used ratio at which the Control Plane stops giving a host new
+	// volumes; Uncordon is where it starts again. Uncordon is strictly lower, and the
+	// gap is the hysteresis: one number would flap a host between ACTIVE and CORDONED
+	// on a device sitting at the line.
+	Cordon, Uncordon float64
+}
+
+// DefaultBand is ADR-0013 §3's cordon threshold, with the uncordon line the ADR does
+// not name — it names one number, and one number is a flapping cordon.
+func DefaultBand() Band { return Band{Cordon: 0.70, Uncordon: 0.65} }
+
+// Validate refuses a band that would flap or that could never fire. A zero-width or
+// inverted band is not a tuning choice, it is a typo that would show up as a host
+// changing state on every heartbeat.
+func (b Band) Validate() error {
+	switch {
+	case b.Cordon <= 0 || b.Cordon > 1:
+		return fmt.Errorf("cpserver: cordon ratio %v is not in (0,1]", b.Cordon)
+	case b.Uncordon <= 0 || b.Uncordon >= b.Cordon:
+		return fmt.Errorf("cpserver: uncordon ratio %v must be above 0 and below the cordon ratio %v, or a host flaps", b.Uncordon, b.Cordon)
+	}
+	return nil
+}
 
 // pressureTarget is the state the device measurement asks for, or ok=false when it
 // asks for nothing. It is a pure function of the host row, which is what makes the
@@ -69,15 +102,15 @@ const (
 // A host that has not measured its device (total 0) asks for nothing. That is the
 // whole of the "no measurement yet" case: total and used come from one statfs in one
 // heartbeat, so there is no state where one is known and the other is not.
-func pressureTarget(h metadata.Host) (lifecycle.HostState, bool) {
+func pressureTarget(h metadata.Host, band Band) (lifecycle.HostState, bool) {
 	if h.NVMeTotalBytes <= 0 {
 		return "", false
 	}
 	used := float64(h.NVMeUsedBytes) / float64(h.NVMeTotalBytes)
 	switch {
-	case h.State == lifecycle.HostActive && used >= CordonUsedRatio:
+	case h.State == lifecycle.HostActive && used >= band.Cordon:
 		return lifecycle.HostCordoned, true
-	case h.State == lifecycle.HostCordoned && h.CordonReason == lifecycle.CordonPressure && used < UncordonUsedRatio:
+	case h.State == lifecycle.HostCordoned && h.CordonReason == lifecycle.CordonPressure && used < band.Uncordon:
 		return lifecycle.HostActive, true
 	default:
 		return "", false
@@ -99,7 +132,7 @@ func pressureTarget(h metadata.Host) (lifecycle.HostState, bool) {
 // state moved. In both the operator won, which is the outcome ADR-0013 §5 wants, so
 // they are logged and the host's state is reported as it was read.
 func (s *Server) applyPressure(ctx context.Context, term int64, h metadata.Host) (lifecycle.HostState, error) {
-	target, ok := pressureTarget(h)
+	target, ok := pressureTarget(h, s.band)
 	if !ok {
 		return h.State, nil
 	}
