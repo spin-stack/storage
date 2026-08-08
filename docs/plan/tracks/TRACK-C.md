@@ -1253,3 +1253,127 @@ a flattened volume is still a descendant in the row until the write above exists
 descendant with published snapshots cannot be flattened at all, so the delete's plan for it is
 to delete those snapshots first — which is that spec's decision 4, and the reason the refusal
 here names them.
+
+---
+
+## C — a delete marks and the bucket forgets (step 5a of the deletion chain)
+
+**What landed.** `control-plane -delete-volume <id>` removes a volume: its objects, then its
+catalog rows. `metadata.Store` grew two verbs — `DeleteVolume` and the `ClearVolumeParent`
+step 4b's entry said was owed to track D and which nothing had added — and
+`internal/lineage` grew `Delete` and `Descendants`. `docs/plan/RUNBOOK.md` gained section 6.
+`task ci` green, `task cover` 90.36% against a 90% floor, the pg contract green under
+TestContainers.
+
+**The recovery window is not in this repository, and writing no code for it is the design.**
+Every object goes through `objectstore.Store.Delete`, which is a marker; the interface has no
+permanent delete and did not grow one; `real.NewS3Store` fails closed on a bucket without
+versioning. So "a couple of days, then gone" is a lifecycle rule on the bucket. That makes
+INV-14's structural claim the whole safety argument rather than an aspiration, and it makes
+the *runbook* the deliverable for half this increment: what the deployment owes, and the
+sentence that shortening the retention shortens the only recovery path a deleted volume has.
+Two honest gaps went into "what nothing can answer" with it — there is no `-restore-volume`
+even though both store implementations honour `Restore`, and nothing reads the bucket's
+lifecycle configuration, so a delete against a bucket with no rule is indistinguishable from
+one against a bucket with thirty days.
+
+**The order is the exact inverse of publish, and the plant is what made that a fact rather
+than a rule quoted from a spec.** Descriptor, snapshots, manifest, chunks. The descriptor
+first because it is what makes a volume exist to `-rebuild-metadata`; the chunks last because
+the reverse leaves a live manifest naming bytes that are gone, which `loadManifest` refuses —
+a delete in progress that reports corruption. `TestADeleteNeverLeavesAManifestOverMissingChunks`
+interrupts the delete after **every** object it marks and allows exactly two readings at each
+point: the image loads and returns its bytes, or it has no published image. Planting the
+publish order goes red inside the chunk loop — *"after 3 of 5 marks the image is neither
+readable nor gone: image: chunk 380dc225… at offset 8192: not found"*.
+
+**Which chunk store a delete may touch is decided by the key space, not by a computation, and
+that is the one thing here that could have lost data.** A chunk store is named by a lineage
+root, so the only volumes whose bytes live under this volume's id are this volume and its
+descendants — and descendants are refused. The whole prefix is therefore safe to mark without
+reading a manifest. *Rejected: the set difference between this volume's manifests and every
+other manifest in the lineage*, which CHUNK-ADDRESSING-SPEC §3 predicted would be needed. It
+is computable and it is exactly the derived reachability whose one wrong answer costs data
+rather than storage. Planting the lineage root in place of the volume's own id turns the
+ancestry assertion red — *"composing the deleted clone's ancestry, which the delete must not
+have touched: chunk 53d25efd… at offset 0: not found"*.
+
+**The consequence, which the command says out loud rather than burying.** Deleting a *clone*
+reclaims almost nothing: its writes are in its ancestry's chunk store, so only its manifests
+go, and the run reports `chunks_belong_to_lineage_of=<ancestor>`. The route to reclaiming a
+clone's bytes is the one this package already provides — flatten it, which re-homes its
+dataset under its own id, then delete it. That composition is the answer to the question
+step 4b's cost paragraph raised and did not answer.
+
+**Descendants are read from the bucket, and that reverses what the spec proposed.** §6's
+decision 1 said two indexed catalog lookups. It cannot be the catalog:
+`volumes.parent_snapshot_id` is write-once by construction, so the catalog goes on naming a
+parent a FLATTEN has already dissolved, and a delete that believed it would refuse **for
+ever** exactly the volumes that had done the work to lift the refusal. So `Descendants` lists
+`volumes/` and reads each descriptor, which is what `-rebuild-metadata` already pays. A
+descriptor it cannot read stops the scan: "might be a descendant" is what a delete has to
+treat as yes. The catalog check survives as the second line — `metadata.ErrHasDescendants`,
+in both directions, protecting the snapshot rows the two foreign keys point at.
+
+**`ClearVolumeParent` was owed and is what makes flatten-then-delete work at all.** Without
+it the flatten leaves the row naming a parent, and `DeleteVolume` on that parent hits the
+foreign key protecting its snapshots — so answer B would have been unreachable through the
+command that implements it. Removing the call from `flatten` turns the command's own test red
+at the catalog step: *"the objects of volume … are deleted but its catalog rows are not: a
+volume whose snapshots something still descends from"*. Its contract case asserts the same
+thing by what it *permits* rather than by reading the column back — a delete refused before
+the clear and accepted after it — because asserting `parent_snapshot_id IS NULL` would pass
+against a verb that cleared the column and left a snapshot nothing could reference.
+
+**A consequence for `-flatten-volume` that is a reversal, and it is written at the function
+rather than only here.** It used to take no term, on the argument that it wrote no row and
+that demanding a leader would make an operator start a Control Plane to repair a bucket. That
+argument was true only because the write it should have been making did not exist. It now
+borrows the current term like every other admin one-shot, and a flatten against a bucket
+whose Control Plane is down fails at the first read instead of half-succeeding.
+
+**The rows go last, so the row is the resume record.** A run that marked half the objects
+leaves a catalog that still names the volume; re-running walks the same deterministic key set
+and finds most of it marked. The reverse leaves objects nothing names — by hand, the orphan
+class there is no sweeper to collect. `ErrNotFound` is success at every step and at the
+catalog write, which is what makes the second run exit 0.
+
+**Verified against a real deployment, not only in the sim.** The pinned `postgres:18-alpine`,
+a serving `control-plane`, `-object-store-dir` as the store: the placed-volume refusal, the
+delete, the idempotent re-run, `-fleet-status` with the volume gone, `-rebuild-metadata`
+declining to resurrect it, the `.deleted` marker beside its object, and the marker's removal
+followed by a rebuild reporting `volumes=1`. No guest booted, so the volume had a descriptor
+and no image — that bounds the size of the numbers in the runbook's blocks, not the steps.
+
+**No format change and therefore no §25.2 obligation**: not one byte of the manifest, the
+descriptor or the chunk sealing moves. **No DST scenario**, and this is the fourth lane in a
+row to say so: the mandatory set may grow by one per merge window, and the property here —
+an operator's one-shot marks a deterministic key set in a fixed order — is asserted on bytes
+in two lanes with an interruption at every step, which is stronger than a checker that
+watches one seeded run. §8's *"a delete only ever issues keys named by a manifest it read in
+this run"* is not the property this implementation has, and should not be written as one: it
+issues keys derived from the volume's own prefixes, which is what makes it re-runnable with no
+progress state.
+
+### What is owed, and to whom
+
+- **Snapshot deletion (spec §6.4)** has no verb. It is what makes a volume with published
+  snapshots flattenable, so today "flatten this clone" can be a dead end for a clone that
+  snapshotted itself, and `-delete-volume` on its parent reports the flatten's refusal
+  verbatim. It is the next thing on this subject and it is small: read the volume's remaining
+  manifests, union their digests, mark what the doomed snapshot names and the union does not.
+- **`-restore-volume`** (runbook, "what nothing can answer"). The rule that is not obvious:
+  `ErrRestoreSuperseded` is success on a chunk and fatal on a manifest.
+- **A divergence found while writing the contract case, and not fixed here.** `metadata/sim`'s
+  `converge` does not preserve `ParentSnapshotID` and the pg upsert COALESCEs it, so a
+  re-create clears the link in one implementation and not the other. Nothing in the contract
+  pins it. It matters because it is the difference between "`-rebuild-metadata` repairs a
+  stale parent link" (sim) and "it cannot" (production) — the old `WARN` in `flatten.go`
+  claimed the first, which is why the claim was removed rather than reworded. It belongs to
+  whoever owns `metadata`, as one contract case and one line of `converge`.
+- **Local NVMe** is untouched and stays that way (spec §6.6): from the Agent's side "no longer
+  in my desired state" is also what a detach looks like.
+- **Crypto-shred (spec §6.7)** remains a divergence from design invariant 12 and still needs a
+  DEV entry in `STATUS.md`, which is track A's file. Three causes, none of them closable here:
+  a lineage shares one DEK, `crypto.KMS` has no destroy verb, and the wrapped DEK exists in
+  the descriptor, the row and any backup of either.
