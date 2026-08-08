@@ -38,6 +38,7 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/metadata/pg"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/placement"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/real"
@@ -138,6 +139,9 @@ func run() error {
 		// cordon.go carries the reasoning.
 		cordonHost   = flag.String("cordon-host", "", "stop placing new volumes on this host and exit, instead of serving")
 		uncordonHost = flag.String("uncordon-host", "", "let this host take new volumes again and exit, instead of serving")
+
+		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -156,6 +160,35 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Telemetry, before anything that records — the same wiring cmd/volume-agent has, for
+	// the same reason: a component that takes its Recorder before the exporter exists
+	// holds a no-op for the life of the process.
+	//
+	// This binary is mostly one-shots, and that decides what a series from it can mean
+	// rather than disqualifying it. `chain_depth` changes only when the Control Plane
+	// changes it (controlplane.Clone says why), so recording at the change and flushing at
+	// exit is a complete record of a value that is not allowed to move in between — where
+	// a poller would need a loop this process does not have. NewOTLPMetricExporter returns
+	// (nil, nil) for an empty endpoint and NewProvider takes that nil, so an operator who
+	// has no collector runs exactly the command they ran before.
+	exporter, err := real.NewOTLPMetricExporter(ctx, *otlpEndpoint)
+	if err != nil {
+		return err
+	}
+	telemetry, err := obs.NewProvider("control-plane", exporter)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// WithoutCancel: a one-shot's only sample is recorded microseconds before this
+		// runs, and the serving path's shutdown starts with the SIGTERM that cancelled
+		// ctx. Logged and never fatal — a collector that is down must not change what a
+		// clone's exit code says about whether the volume exists.
+		if serr := telemetry.Shutdown(context.WithoutCancel(ctx)); serr != nil {
+			slog.Error("flushing metrics", "error", serr)
+		}
+	}()
 
 	pool, err := pgxpool.New(ctx, *databaseDSN)
 	if err != nil {
@@ -308,7 +341,7 @@ func run() error {
 		}
 		vol, cerr := controlplane.Clone(ctx, md, store,
 			placement.Policy{MaxOversubscription: *oversubscribe, MaxUsedRatio: *maxUsedRatio},
-			leader.Term, *cloneSnapshot, ids.New().String())
+			telemetry.Recorder(), leader.Term, *cloneSnapshot, ids.New().String())
 		if cerr != nil {
 			return cerr
 		}
