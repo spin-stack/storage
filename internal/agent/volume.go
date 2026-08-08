@@ -1234,14 +1234,16 @@ func (m *VolumeManager) parentChain(ctx context.Context, v *Volume, d *storagev1
 // parentEncryption re-binds this volume's DEK to an ancestor's id. Returns nil for an
 // unencrypted volume.
 //
-// **The re-binding is inert for image chunks, and the comment that used to be here said
-// the opposite.** It claimed that handing this volume's own Encryption would fail to open
-// every chunk an ancestor wrote; it would not. `image.chunkAAD` takes the volume id as a
-// *parameter* and `LoadSnapshotOver` is already given the ancestor's, so what opens a
-// chunk is `enc.DEK` plus that argument — and the DEK is the same one either way, because
-// each clone inherits its parent's (controlplane.Clone) and so the whole lineage shares
-// the root's. Proven by planting it: binding to this volume's id changes nothing, while
-// passing this volume's id to the load fails immediately.
+// **The re-binding is inert for image chunks, and it is now inert twice over.** The
+// comment that used to be here claimed that handing this volume's own Encryption would
+// fail to open every chunk an ancestor wrote; it would not, because `image.open` takes
+// the id its AAD binds as a *parameter* rather than reading it off the Encryption, and
+// the DEK is the same one either way — each clone inherits its parent's
+// (controlplane.Clone), so the whole lineage shares the root's. Since the chunk AAD binds
+// the **lineage root** rather than a volume, the argument `LoadSnapshotOver` is given is
+// the same for every ancestor as for this volume, so even the parameter no longer
+// distinguishes them. Proven by planting it: binding to this volume's id changes
+// nothing.
 //
 // Kept, with the claim corrected rather than the call deleted, because an Encryption
 // bound to the wrong volume is the wrong object to be holding on a path whose whole
