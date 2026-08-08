@@ -701,3 +701,61 @@ form, reproduced rather than argued. Disabling the `Head` skip makes the snapsho
 where the assertion wants 0. Inverting the condition in `sayWhatThisImageCosts` makes the
 clone print a line with no `inherited_bytes` and the parent claim it is copying an inherited
 dataset, and four assertions go red.
+
+---
+
+## C — DEV-0011's blocker cleared, and the entry should be closed rather than fixed
+
+`docs/plan/SEGMENT-RESERVATION-SPEC.md`. A spec, no code: the deliverable of a
+review-zone item whose review concludes that the review zone is not entered.
+
+**The wait is over and nothing noticed.** DEV-0011 ends "**Waits on ADR-0013**, where the
+Agent knows a volume's share of the device budget". Wave 3 landed exactly that —
+`agent.Budget`, `Budget.Share()`, `Budget.Limits()` producing `wal.Limits.MaxLocalBytes`,
+and `NewVolumeManager` refusing to start without one — and ADR-0013's own header has said
+**Accepted** since 2026-08-03. `STATUS.md` still calls it `Proposed` in two places; that is
+track A's file and track A's correction, noted here so it is not lost.
+
+**The finding does not survive contact with the code, in either half.** DEV-0011 asks that
+a segment be charged before its first append "so out-of-space is reached at a segment
+boundary rather than mid-record", and concludes that needs `fallocate` plus a durable write
+offset — a format change. Both halves are wrong:
+
+- The *budget* is already charged before the record. `Log.backpressure` runs in
+  `Log.appendEncoded` ahead of `segments.appendRecord`, against `segments.retained()` plus
+  the encoded record plus one `format.SegmentHeaderSize` — that last term exists precisely
+  so the record that rotates a segment is not the one record the bound misses, and its
+  comment says so. A WRITE is refused whole, at a WRITE boundary, which is finer than a
+  segment boundary. Only the *device* ceiling can be met mid-record.
+- Reserving device blocks does not require growing the file. `FALLOC_FL_KEEP_SIZE` reserves
+  the range and leaves `i_size` alone, and `unix.Fallocate` is already reachable from
+  `internal/simio/real` (it is where `unix.Flock` comes from). No zero tail, no delimiter
+  problem, no format change, no §25.2 work — the on-disk byte sequence is identical, which
+  is the definition of not being a format change.
+
+**What replay does with a padded tail was measured, not argued**, with a scratch test that
+grows a real segment via `File.Truncate` (the simulated disk zero-fills a grow) and tears
+one with `sim.Disk.TornTail` + `Crash`. A healthy half-full segment becomes
+`format.ErrBadMagic` — not a corruption case, an ordinary one, and `wal.resume` surfaces it,
+so the volume does not attach. A torn header becomes `format.ErrHeaderCRC` and a torn
+payload `format.ErrPayloadCRC`, where today both are `format.ErrShortBuf` and a clean stop.
+Padding does not weaken the distinction between "the crash caught us mid-write" and "this
+file is damaged": it deletes it.
+
+**The sentence the spec turns on:** the durable write offset already exists and it is the
+file's own length — free, updated atomically by the kernel, needing no CRC because the bytes
+are not ours, and impossible to tear. `WAL-SEGMENTS-SPEC.md` already rejected writing back
+into a segment header once, for `LastSequence`/`RecordCount`; a write offset is the same
+shape and worse, because it would be rewritten on every `Sync` rather than once at seal, and
+its ordering against the record bytes would pull the FLUSH/FUA ACK rule into the change.
+
+**The recommendation is to close DEV-0011 as accepted, not fixed**, and the residue is one
+ordinary increment the owner can take or leave: reserve at `segments.create` with
+`FALLOC_FL_KEEP_SIZE`, which makes `Log.broken`'s precondition — a rollback that fails after
+a partial append, the only outcome here that costs a whole session under ADR-0026 —
+unreachable, and removes the delayed-allocation ENOSPC-at-fsync case `wal/degraded.go`
+records as unmodellable. The question left for a human is the one the code cannot settle:
+whether to want a property that holds on ext4 and XFS and is quietly absent on NFS and some
+ZFS versions. If yes, the Agent must say at startup which world it is in and the simulator
+must model the filesystem that refuses — otherwise every test sees a guarantee production
+may not have.
