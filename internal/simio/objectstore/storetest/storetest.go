@@ -6,13 +6,21 @@
 package storetest
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/internal/simio/real"
 )
 
 // NewStore returns a fresh, empty store for one subtest.
@@ -350,4 +358,257 @@ func RunContract(t *testing.T, newStore NewStore) {
 			t.Fatalf("a refused restore must not change the object: %q", got)
 		}
 	})
+
+	// The two cases above spawn goroutines, and that is as far as they can see.
+	// Every in-process store holds an in-process mutex, and a mutex makes
+	// read-compare-publish look atomic to anything running in the same process —
+	// so a check-then-act conditional write passes both of them, every time, while
+	// admitting a second winner the moment the contenders are separate processes.
+	// The filesystem store shipped exactly that for If-Match (read the key, compare
+	// the ETag, rename) and the suite that names the property never noticed. These
+	// two cases re-exec the test binary, so the exclusion has to be real.
+	//
+	// The single-machine deployment (`-object-store-dir`) is where this bites: two
+	// Agents publishing one volume's manifest are two processes on one filesystem,
+	// and the CAS on that manifest is the only fencing V1 has.
+	t.Run("create-only admits exactly one writer across processes", func(t *testing.T) {
+		dir := crossProcessDir(t, newStore(t))
+		s, err := real.NewObjectStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for round := range crossProcessRounds {
+			key := fmt.Sprintf("wal/contended-%d.wal", round)
+			winners := contend(t, dir, key, "", true)
+			if len(winners) != 1 {
+				t.Fatalf("round %d: %d of %d separate processes created %q with If-None-Match, want exactly 1 — every one of them believes it owns the object",
+					round, len(winners), crossProcessWriters, key)
+			}
+			assertStoredBodyIsTheWinners(t, s, key, winners[0])
+		}
+	})
+
+	t.Run("If-Match admits exactly one winner across processes", func(t *testing.T) {
+		dir := crossProcessDir(t, newStore(t))
+		s, err := real.NewObjectStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for round := range crossProcessRounds {
+			key := fmt.Sprintf("image/vol-%d/manifest.json", round)
+			res, err := s.Put(ctx, key, bodyOf("epoch-1"), objectstore.PutOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			winners := contend(t, dir, key, res.ETag, false)
+			if len(winners) != 1 {
+				t.Fatalf("round %d: %d of %d separate processes won the same If-Match CAS on %q from one prevETag, want exactly 1 — that is two hosts both believing they published, with no error anywhere",
+					round, len(winners), crossProcessWriters, key)
+			}
+			assertStoredBodyIsTheWinners(t, s, key, winners[0])
+		}
+	})
+}
+
+// The contention shape is the one a readiness run measured a violation with: four
+// separate processes and a 4096-byte body. The children are released from a barrier
+// rather than merely started together, which is what makes the window reliable —
+// against the check-then-act implementation this was written for, round 0 admitted
+// 2-4 winners in 8 runs out of 8. The rounds are margin for a regression that races
+// less often than that one did, and their cost is process spawns: cheap normally,
+// ~250ms each under -race, which is why there are four and not forty.
+const (
+	crossProcessWriters = 4
+	crossProcessRounds  = 4
+	crossProcessBody    = 4096
+)
+
+// crossProcessDir returns the directory a second process can open the store under
+// test from, or skips. Only the filesystem store has one: the sim store's state is
+// process memory by construction, and the S3-backed store's exclusion is evaluated
+// by the backend, which is already a separate process from every client — the
+// in-process cases above are the whole client-side story there.
+func crossProcessDir(t *testing.T, s objectstore.Store) string {
+	t.Helper()
+	rooted, ok := s.(interface{ Root() string })
+	if !ok {
+		t.Skipf("%T keeps no state a second process can open; cross-process exclusion is not a property it can have", s)
+	}
+	return rooted.Root()
+}
+
+func assertStoredBodyIsTheWinners(t *testing.T, s objectstore.Store, key, winner string) {
+	t.Helper()
+	got, err := s.Get(t.Context(), key)
+	if err != nil {
+		t.Fatalf("get %q after the contended write: %v", key, err)
+	}
+	if !bytes.Equal(got, bodyOf(winner)) {
+		t.Fatalf("stored object at %q is not the winner's: got %d bytes starting %q, want %q's body",
+			key, len(got), first32(got), winner)
+	}
+}
+
+// bodyOf makes a writer's body long enough to be worth racing over and still
+// self-identifying.
+func bodyOf(name string) []byte {
+	b := make([]byte, 0, crossProcessBody)
+	for len(b) < crossProcessBody {
+		b = append(b, (name + "|")...)
+	}
+	return b[:crossProcessBody]
+}
+
+func first32(b []byte) string {
+	if len(b) > 32 {
+		return string(b[:32])
+	}
+	return string(b)
+}
+
+// contend runs one round: crossProcessWriters child processes, released together,
+// each attempting the same conditional Put. It returns the names of the children
+// whose Put returned nil. Every other child must have been told
+// ErrPreconditionFailed — a child that failed for any other reason fails the test,
+// because "nobody won" would otherwise read as "exactly one winner" minus one.
+func contend(t *testing.T, dir, key, ifMatch string, ifNoneMatch bool) []string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locating this test binary to re-exec it: %v", err)
+	}
+
+	type child struct {
+		name string
+		cmd  *exec.Cmd
+		in   io.WriteCloser
+		out  *bufio.Reader
+	}
+	children := make([]*child, 0, crossProcessWriters)
+	for i := range crossProcessWriters {
+		name := fmt.Sprintf("writer-%d", i)
+		spec, err := json.Marshal(childSpec{
+			Dir: dir, Key: key, Body: name, IfMatch: ifMatch, IfNoneMatch: ifNoneMatch,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(self)
+		cmd.Env = append(os.Environ(), childEnvVar+"="+string(spec))
+		cmd.Stderr = os.Stderr
+		in, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("starting a contending process: %v", err)
+		}
+		c := &child{name: name, cmd: cmd, in: in, out: bufio.NewReader(out)}
+		children = append(children, c)
+		t.Cleanup(func() {
+			_ = c.in.Close()
+			_ = c.cmd.Wait()
+		})
+	}
+
+	// Every child opens the store and reports ready before any of them is released,
+	// so the race window is the conditional write itself and not process startup.
+	for _, c := range children {
+		line, err := c.out.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) != childReady {
+			t.Fatalf("%s never became ready (got %q, err=%v)", c.name, line, err)
+		}
+	}
+	for _, c := range children {
+		if _, err := io.WriteString(c.in, "go\n"); err != nil {
+			t.Fatalf("releasing %s: %v", c.name, err)
+		}
+	}
+
+	var winners []string
+	for _, c := range children {
+		line, err := c.out.ReadString('\n')
+		if err != nil {
+			t.Fatalf("%s produced no verdict: %v", c.name, err)
+		}
+		verdict := strings.TrimSpace(line)
+		waitErr := c.cmd.Wait()
+		switch verdict {
+		case childWon:
+			if waitErr != nil {
+				t.Fatalf("%s said it won but exited %v", c.name, waitErr)
+			}
+			winners = append(winners, c.name)
+		case childLost:
+		default:
+			t.Fatalf("%s neither won nor was fenced: %q (exit %v)", c.name, verdict, waitErr)
+		}
+	}
+	return winners
+}
+
+// The child half of contend. storetest is linked into the test binary, so re-execing
+// that binary with childEnvVar set is a second process running this code — no helper
+// program to build, and no TestMain to demand from the three packages that run this
+// contract. init runs before flag parsing and before any test, so the child never
+// looks like a test run.
+const (
+	childEnvVar = "SPIN_STORETEST_CONTENDER"
+	childReady  = "READY"
+	childWon    = "WON"
+	childLost   = "FENCED"
+)
+
+type childSpec struct {
+	Dir         string
+	Key         string
+	Body        string
+	IfMatch     string
+	IfNoneMatch bool
+}
+
+func init() {
+	spec := os.Getenv(childEnvVar)
+	if spec == "" {
+		return
+	}
+	os.Exit(contendAsChild(spec))
+}
+
+func contendAsChild(encoded string) int {
+	fail := func(format string, args ...any) int {
+		fmt.Printf("ERR "+format+"\n", args...)
+		return 1
+	}
+	var spec childSpec
+	if err := json.Unmarshal([]byte(encoded), &spec); err != nil {
+		return fail("bad spec: %v", err)
+	}
+	// The filesystem store is the only one whose state a second process can reach
+	// without a network; crossProcessDir skips every other implementation.
+	s, err := real.NewObjectStore(spec.Dir)
+	if err != nil {
+		return fail("opening the store: %v", err)
+	}
+	fmt.Println(childReady)
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+		return fail("waiting for the start signal: %v", err)
+	}
+	_, err = s.Put(context.Background(), spec.Key, bodyOf(spec.Body), objectstore.PutOptions{
+		IfMatch: spec.IfMatch, IfNoneMatch: spec.IfNoneMatch,
+	})
+	switch {
+	case err == nil:
+		fmt.Println(childWon)
+		return 0
+	case errors.Is(err, objectstore.ErrPreconditionFailed):
+		fmt.Println(childLost)
+		return 0
+	default:
+		return fail("put: %v", err)
+	}
 }

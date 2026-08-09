@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
+	"syscall"
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
@@ -26,9 +26,15 @@ import (
 //   - a conditional write is atomic. Create-only (§14.5, INV-21) and the If-Match
 //     CAS (§12.4, INV-10) decide which of several concurrent writers wins; a
 //     check-then-write implementation lets all of them win, silently, and two
-//     promoters believing they hold the fence is split brain. Writers serialise on
-//     mu, and create-only publishes with link(2), whose EEXIST *is* the exclusion —
-//     so it holds even for two processes sharing the directory;
+//     promoters believing they hold the fence is split brain. Create-only publishes
+//     with link(2), whose EEXIST *is* the exclusion; If-Match cannot be expressed as
+//     one syscall, so its read-compare-publish runs under a per-key flock (see
+//     lockKey). Both hold between *processes*, which is the only thing that matters:
+//     this store is what `-object-store-dir` selects, i.e. the single-machine
+//     deployment, where two Agents publishing one volume's manifest are two
+//     processes on one filesystem. An in-process mutex here excluded nothing and
+//     hid everything — under it, four processes CASing from the same prevETag all
+//     won;
 //   - an object is never partially visible. Bodies are staged in a temp file,
 //     fsynced, and then linked or renamed into place — both atomic — so a reader
 //     sees the old object or the new one, never a prefix of either. A torn WAL
@@ -36,8 +42,6 @@ import (
 //     the durable prefix and everything past it is gone.
 type ObjectStore struct {
 	root string
-	// mu serialises writers. Readers do not take it: rename gives them atomicity.
-	mu sync.Mutex
 }
 
 // NewObjectStore returns a store rooted at dir (created if absent).
@@ -47,6 +51,11 @@ func NewObjectStore(dir string) (*ObjectStore, error) {
 	}
 	return &ObjectStore{root: dir}, nil
 }
+
+// Root is the directory holding every object. It exists so a *second process* can
+// open the same store — which is the only way to test a conditional write's
+// exclusion, since an in-process lock makes any check-then-act look atomic.
+func (s *ObjectStore) Root() string { return s.root }
 
 func (s *ObjectStore) path(key string) string {
 	return filepath.Join(s.root, filepath.FromSlash(key))
@@ -71,27 +80,93 @@ const (
 	supersededSuffix = ".superseded"
 	// tmpSuffix is the staging name for an in-progress body.
 	tmpSuffix = ".tmp"
+	// lockSuffix names the file whose flock serialises the mutations of one key
+	// (see lockKey). It is never removed, and it never holds bytes.
+	lockSuffix = ".lock"
 )
 
+// isSidecar reports whether a key names one of this store's own files. Put refuses
+// such a key and every read path treats it as absent: before there were lock files a
+// sidecar existed only while a key was marked or being staged, so reading one back
+// was mostly unreachable, but a lock file sits next to every key that was ever
+// written — and `Get("x.lock")` returning the lock's zero bytes with a nil error is
+// an empty WAL object that nobody wrote.
 func isSidecar(key string) bool {
 	return strings.HasSuffix(key, markerSuffix) ||
 		strings.HasSuffix(key, supersededSuffix) ||
-		strings.HasSuffix(key, tmpSuffix)
+		strings.HasSuffix(key, tmpSuffix) ||
+		strings.HasSuffix(key, lockSuffix)
+}
+
+// lockKey takes an exclusive lock on one key and returns the release. It is held
+// across processes, because the writers this store has to exclude are processes: on
+// a single-machine deployment two Agents share `-object-store-dir`, and the CAS on a
+// volume's manifest is the whole of V1's fencing.
+//
+// flock(2), for the crash case. The kernel drops the lock when the fd is closed,
+// including when the holder is SIGKILLed or panics mid-publish, so a dead writer
+// cannot wedge a key — there is no lease, no timeout, and nothing to reap. Rejected:
+// an O_CREAT|O_EXCL lock file, which is the same atomic exclusion but leaves the key
+// locked forever when its holder dies, and the usual repair (break a lock older than
+// T) reintroduces precisely the race it was meant to remove — two writers both
+// deciding the lock is stale, both proceeding, both winning. A lock whose
+// correctness depends on a timeout is not an exclusion (§25.1 says the same thing
+// about sleeps).
+//
+// The lock file is created once per key and never unlinked. Unlinking it on release
+// would be tidier and wrong: locks live on the inode, so a writer that opens the
+// path just before it is removed locks a file nobody else can reach any more, and
+// the next writer creates a fresh inode and locks that instead — two holders, no
+// error. An empty file per key is the price; it is filtered out of List and refused
+// as a key, like every other sidecar.
+func (s *ObjectStore) lockKey(key string) (func(), error) {
+	p := s.path(key) + lockSuffix
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("simio/real: opening the lock for %q: %w", key, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("simio/real: locking %q: %w", key, err)
+	}
+	// Closing the fd releases the lock; that is also what makes the crash case
+	// self-healing, so there is deliberately no separate LOCK_UN to forget.
+	return func() { _ = f.Close() }, nil
 }
 
 func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	if isSidecar(key) {
 		return objectstore.PutResult{}, fmt.Errorf("simio/real: %q collides with the store's own bookkeeping", key)
 	}
-	// The conditional check and the write are one critical section. Splitting them
-	// is what let every concurrent create-only writer win.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	p := s.path(key)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return objectstore.PutResult{}, err
 	}
+
+	// Stage the whole body first, so publishing it is a single atomic step and no
+	// reader can ever observe a prefix of it. Staging happens outside the lock: the
+	// temp name is unique, and an fsync of a multi-megabyte WAL object is the one
+	// part of a Put that must not serialise the whole key.
+	tmp, err := stage(p, data)
+	if err != nil {
+		return objectstore.PutResult{}, err
+	}
+	defer func() { _ = os.Remove(tmp) }()
+
+	// From here to the publish is one critical section, and it has to be one across
+	// processes: reading the current ETag, comparing it, and renaming over the key
+	// is a check preceding an act, and every writer that reads before any of them
+	// renames sees the ETag it was told to expect. Under an in-process mutex, four
+	// processes CASing one manifest from the same prevETag all returned nil.
+	unlock, err := s.lockKey(key)
+	if err != nil {
+		return objectstore.PutResult{}, err
+	}
+	defer unlock()
+
 	// A delete marker is the latest version, so to a conditional write the object
 	// does not exist — the same way S3 behaves on a versioned bucket.
 	marked := s.marked(key)
@@ -101,14 +176,6 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
 		}
 	}
-
-	// Stage the whole body first, so publishing it is a single atomic step and no
-	// reader can ever observe a prefix of it.
-	tmp, err := stage(p, data)
-	if err != nil {
-		return objectstore.PutResult{}, err
-	}
-	defer func() { _ = os.Remove(tmp) }()
 
 	switch {
 	case opts.IfNoneMatch && !marked:
@@ -184,7 +251,7 @@ func syncDir(path string) error {
 }
 
 func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
-	if s.marked(key) {
+	if isSidecar(key) || s.marked(key) {
 		return nil, objectstore.ErrNotFound
 	}
 	data, err := os.ReadFile(s.path(key))
@@ -195,7 +262,7 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 }
 
 func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInfo, error) {
-	if s.marked(key) {
+	if isSidecar(key) || s.marked(key) {
 		return objectstore.ObjectInfo{}, objectstore.ErrNotFound
 	}
 	data, err := os.ReadFile(s.path(key))
@@ -261,8 +328,16 @@ func (s *ObjectStore) marked(key string) bool {
 
 // Delete places a delete marker over the object; the data stays for Restore.
 func (s *ObjectStore) Delete(_ context.Context, key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if isSidecar(key) {
+		return objectstore.ErrNotFound
+	}
+	// The same per-key lock a Put takes: a mark placed between another process's
+	// ETag comparison and its rename would otherwise publish over a retired object.
+	unlock, err := s.lockKey(key)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if _, err := os.Stat(s.path(key)); err != nil {
 		if os.IsNotExist(err) {
 			return objectstore.ErrNotFound
@@ -284,12 +359,18 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 
 // Restore removes the delete marker: the operator step behind "un-GC this" (INV-14).
 func (s *ObjectStore) Restore(_ context.Context, key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if isSidecar(key) {
+		return objectstore.ErrNotFound
+	}
+	unlock, err := s.lockKey(key)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if _, err := os.Stat(s.path(key) + supersededSuffix); err == nil {
 		return fmt.Errorf("%w: %s", objectstore.ErrRestoreSuperseded, key)
 	}
-	err := os.Remove(s.path(key) + markerSuffix)
+	err = os.Remove(s.path(key) + markerSuffix)
 	if os.IsNotExist(err) {
 		return objectstore.ErrNotFound
 	}
