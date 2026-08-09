@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/spin-stack/storage/internal/vhost"
 	"github.com/spin-stack/storage/internal/wal"
@@ -43,6 +44,30 @@ var ErrDeviceFull = errors.New("the local WAL device is out of space")
 type Device struct {
 	log *wal.Log
 	cap int64
+
+	// refusedForSpace holds the sentence describing the first guest request this
+	// device turned away for want of space, and is nil until one is.
+	//
+	// It exists because *nothing on the host sees that refusal otherwise*. It is
+	// produced here, on the guest's own goroutine, and handed to a virtqueue that
+	// completes the request with IOERR and moves on; the guest gets `I/O error, dev
+	// vda` and a failed fsync, and the Agent's log says nothing at all. A volume that
+	// has hit its share is the tenant-visible failure this Agent is most likely to
+	// have and the one it was least able to report.
+	//
+	// Latched rather than live, for two reasons. It is the transition that matters —
+	// a poller at a human cadence must not have to catch the device mid-refusal — and
+	// a guest that keeps writing produces thousands of refusals a second, so anything
+	// that logged per refusal would bury the log at the moment it is needed. Whoever
+	// reports it therefore says it once (cmd/volume-agent's watchSpacePressure).
+	//
+	// Sticky is also the honest state: the Agent sets exactly one WAL bound
+	// (agent.Budget.Limits sets MaxLocalBytes and deliberately not the unflushed
+	// ones), and nothing clears that one while the volume runs.
+	//
+	// An atomic and not a mutex, so the claim above about this type holding no lock
+	// stays true and a refused WRITE stays off any lock a READ could be waiting on.
+	refusedForSpace atomic.Pointer[string]
 }
 
 // New returns a Device of capacity bytes over l.
@@ -198,17 +223,48 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 		// lease-gated ACK (ADR-0026).
 		return fmt.Errorf("blockdev: %s refused: this volume's log cannot describe its own tail: %w", where, err)
 	case errors.Is(err, wal.ErrBackpressure):
-		return fmt.Errorf("blockdev: %s refused: the unflushed backlog is at its bound (§5.7); a successful FLUSH clears it: %w", where, err)
+		// The sentence used to end "a successful FLUSH clears it", and it named the
+		// one remedy that cannot work. A FLUSH clears MaxUnflushedBytes/Age, which the
+		// Agent does not set: agent.Budget.Limits sets MaxLocalBytes alone — the
+		// volume's share of the device — and nothing clears *that* during a session,
+		// because V1 has no mid-session reclaim (§5.7, ADR-0013 §1). What gives the
+		// space back is stopping the volume, which publishes its image and drops the
+		// local WAL. An operator told to FLUSH watches the writes keep failing.
+		d.latchSpaceRefusal("this volume has written its whole share of the local device (§5.7)")
+		return fmt.Errorf("blockdev: %s refused: this volume has written its whole share of the local device (§5.7): "+
+			"a FLUSH does not clear this bound and nothing else does while the volume runs — "+
+			"stop the volume, which publishes its image and reclaims the WAL: %w", where, err)
 	}
 	// The device state is read *after* the failed append, never before it: the
 	// out-of-space latch is cleared only by an append the device took (see
 	// wal.Degraded), so a caller that pre-checked it would refuse every write from the
 	// first ENOSPC onwards and the volume would never come back.
 	if d.log.Degraded() == wal.DegradedOutOfSpace {
+		d.latchSpaceRefusal("the device under this volume is out of space, below the share this volume was bounded by")
 		return fmt.Errorf("blockdev: %s refused: %w — truncate after a checkpoint, grow the device, or restore the object store: %w",
 			where, ErrDeviceFull, err)
 	}
 	return fmt.Errorf("blockdev: %s failed: %w", where, err)
+}
+
+// latchSpaceRefusal records the first refusal for want of space and ignores every one
+// after it — the first is the transition, and the rest are the same fact repeated once
+// per guest request.
+func (d *Device) latchSpaceRefusal(reason string) {
+	d.refusedForSpace.CompareAndSwap(nil, &reason)
+}
+
+// RefusedForSpace reports whether this device has turned a guest request away for want
+// of space, and which bound turned it away. It is the host's only view of a condition
+// the guest experiences as EIO and a failed fsync.
+//
+// It never goes back to false. See the field for why that is the honest answer and not
+// merely the cheap one.
+func (d *Device) RefusedForSpace() (string, bool) {
+	if r := d.refusedForSpace.Load(); r != nil {
+		return *r, true
+	}
+	return "", false
 }
 
 // blockdev.Device is the Backend a real guest is served from. hostio.RawFile still

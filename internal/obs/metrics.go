@@ -78,6 +78,15 @@ func Catalog() []MetricDesc {
 		{"wal_local_sequence", KindGauge, "Local sequence watermark (informative)", []string{"volume"}},
 		{"wal_durable_sequence", KindGauge, "Durable sequence watermark (informative)", []string{"volume"}},
 		{"wal_out_of_space", KindGauge, "1 while the WAL device is refusing appends for want of space (§5.7)", []string{"volume"}},
+		// Distinct from wal_out_of_space, and the distinction is the whole reason it
+		// exists: that gauge is the *device* reaching ENOSPC, which under ADR-0013 §1
+		// is supposed never to happen because every volume is bounded well below it.
+		// The bound that actually stops a guest is the volume's share, and crossing it
+		// moved nothing anywhere — the guest took EIO and a failed fsync while the
+		// host recorded not one sample and printed not one line. Recorded by
+		// cmd/volume-agent, which is the only place that holds both the devices and
+		// the budget the share was divided out of.
+		{"volume_backpressure", KindGauge, "1 once this volume's device has refused a guest write for want of its share of the local device (ADR-0013 §1); it does not clear while the volume runs", []string{"volume"}},
 
 		// --- Image and snapshots (§26.2) ---
 		//

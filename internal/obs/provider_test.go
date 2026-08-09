@@ -32,20 +32,32 @@ func TestAProviderWithoutAnExporterRecordsIntoNothing(t *testing.T) {
 	}
 }
 
-// CollectedMetrics and GaugeValues read the test provider's manual reader. A production
-// provider has no such reader, and the useful failure is a sentence saying so rather
-// than a nil dereference inside a test that was pointed at the wrong constructor.
-func TestCollectingFromAProductionProviderIsRefused(t *testing.T) {
+// This test used to assert the opposite — that collecting from a production Provider is
+// refused, because only NewTestProvider held a manual reader — and that refusal was the
+// operability blocker in miniature: the Provider a binary runs could be read by a
+// collector or by nobody, and no documented step stood a collector up. Every Provider
+// keeps a reader now, which is what /metrics serves from, so a production one answers.
+func TestAProductionProviderCanBeReadBack(t *testing.T) {
+	ctx := t.Context()
 	provider, err := obs.NewProvider("volume-agent", nil)
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
+	provider.Recorder().Gauge(ctx, "wal_out_of_space", 1, obs.String("volume", "vol-1"))
 
-	if _, err := provider.CollectedMetrics(t.Context()); err == nil {
-		t.Fatal("CollectedMetrics answered for a provider that has no manual reader")
+	collected, err := provider.CollectedMetrics(ctx)
+	if err != nil {
+		t.Fatalf("CollectedMetrics on the Provider a binary builds: %v", err)
 	}
-	if _, err := provider.GaugeValues(t.Context()); err == nil {
-		t.Fatal("GaugeValues answered for a provider that has no manual reader")
+	if !collected["wal_out_of_space"] {
+		t.Fatalf("the production Provider recorded nothing readable: %v", collected)
+	}
+	gauges, err := provider.GaugeValues(ctx)
+	if err != nil {
+		t.Fatalf("GaugeValues on the Provider a binary builds: %v", err)
+	}
+	if gauges["wal_out_of_space"] != 1 {
+		t.Fatalf("wal_out_of_space = %v, want 1", gauges["wal_out_of_space"])
 	}
 }
 

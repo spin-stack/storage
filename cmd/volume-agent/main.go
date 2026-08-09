@@ -29,6 +29,7 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/obs"
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
 	"github.com/spin-stack/storage/internal/vhost/hostio"
@@ -89,6 +90,8 @@ func run() (err error) {
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
 		grace = flag.Duration("shutdown-grace", 60*time.Second,
 			"bound on ONE publish attempt at shutdown, not on the shutdown: an Agent that cannot publish keeps its data directory and retries until it can, or until a second signal")
+		metricsListen = flag.String("metrics-listen", "",
+			"host:port for the operator endpoint: GET /metrics (Prometheus text) and GET /healthz. Empty disables it, and then this process holds no listening socket at all")
 		kekFile    = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
 		maxVolumes = flag.Int("max-volumes", agent.DefaultMaxVolumes,
 			"how many volumes this host serves at once, and what its device budget is divided by: each volume's WAL is bounded by that share (ADR-0013 §1)")
@@ -150,6 +153,13 @@ func run() (err error) {
 			slog.Error("flushing metrics", "error", err)
 		}
 	}()
+
+	// Before the disk, the object store and the KEK are opened, and that is the point:
+	// those are the startup steps that hang, and an Agent that answers /healthz while
+	// /metrics is still empty is telling an operator exactly where it is stuck.
+	if *metricsListen != "" {
+		defer serveOperatorEndpoint(*metricsListen, telemetry)()
+	}
 
 	disk, err := real.NewDisk(*dataDir)
 	if err != nil {
@@ -305,12 +315,133 @@ func run() (err error) {
 		"heartbeat_interval", cfg.HeartbeatInterval,
 		"device_bytes", budget.DeviceBytes, "guest_budget_bytes", budget.GuestBytes,
 		"reserve_bytes", budget.ReserveBytes, "max_volumes", budget.MaxVolumes,
-		"volume_share_bytes", budget.Share())
+		"volume_share_bytes", budget.Share(), "metrics_listen", *metricsListen)
+
+	// Started with the loop and stopped with it: ctx is what ends both. It reads the
+	// devices the loop's VolumeManager owns, so it cannot start before that exists.
+	go watchSpacePressure(ctx, real.NewClock(), volumes, telemetry.Recorder(),
+		budget.Share(), cfg.HeartbeatInterval)
 
 	if err := loop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil
+}
+
+// serveOperatorEndpoint starts the Agent's only listening socket and returns the
+// function that stops it.
+//
+// **The Agent held no listening socket at all before this.** There was no /metrics, no
+// /healthz and no admin port: every series it collected could reach a collector over
+// OTLP or reach nobody, and nothing in this repository stood a collector up. So the
+// operational answer to "what is this Agent doing" was "read its log", and a guest
+// taking I/O errors produced no line in it. One read-only handler over what obs already
+// collects is the whole fix, and it is deliberately not more than that — a pilot needs
+// an answer from the process, not a platform.
+//
+// INV-01 and the socket: `cmd/` is where real implementations are constructed, and this
+// is an http.Server bound in a main, the same shape cmd/control-plane already uses for
+// its RPC listener. Nothing simulable is involved — the handler is a pure function of
+// what the meter provider holds, it is on no data path, and no simulation drives it, so
+// there is nothing here for simio to model.
+//
+// A bind that fails is loud and not fatal, which is the one judgement call in this
+// function. The endpoint belongs to the operator, not to the guest: a port already in
+// use must not cost a tenant its session, and an Agent that exited here would be a new
+// way to lose one. What makes the failure detectable is the Error line — the thing that
+// must never happen is a scrape that silently never worked.
+func serveOperatorEndpoint(addr string, telemetry *obs.Provider) func() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		body, err := telemetry.Scrape(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", obs.ContentType)
+		_, _ = w.Write(body)
+	})
+	// Liveness and nothing more: this process is up and its handler loop is answering.
+	// It deliberately does not report on the Control Plane, the object store or any
+	// volume — a liveness probe that goes red because a dependency is down restarts an
+	// Agent that is holding a guest's only copy of its session, which is the opposite
+	// of what anyone wants. What the volumes are doing is /metrics' job.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("the operator endpoint is not serving: this Agent has no /metrics and no /healthz",
+				"listen", addr, "error", err)
+		}
+	}()
+	slog.Info("operator endpoint starting", "listen", addr, "metrics", "/metrics", "healthz", "/healthz")
+	return func() { _ = srv.Close() }
+}
+
+// watchSpacePressure turns a volume that has begun refusing guest writes for want of
+// space into something the host can see: one log line, and a gauge that stays up.
+//
+// The Agent had neither, and the hole was total. A guest that crossed its share got
+// `I/O error, dev vda` and a failed fsync — the tenant saw the truth — while the
+// Agent's log stayed at exactly its four start-up lines. Nothing in this process ever
+// sees that refusal on its own: it is produced in blockdev on the guest's goroutine and
+// handed straight back to a virtqueue that completes the request with IOERR.
+//
+// **Once per volume, not once per rejected write.** A guest under backpressure produces
+// thousands of refusals a second, and a line each would bury the log at the moment it
+// has to be readable. blockdev latches the fact instead of exposing a live predicate,
+// which is also what lets this poll run at the heartbeat's cadence without missing the
+// transition.
+//
+// Polled rather than called back, because a callback would have to be installed where
+// the Device is built — inside internal/agent — and the two things this line needs are
+// both here: the operator's log, and the device budget the share was divided out of.
+// The Agent's own volume share is not knowledge blockdev has or should acquire.
+func watchSpacePressure(ctx context.Context, clk clock.Clock, volumes *agent.VolumeManager,
+	rec *obs.Recorder, share int64, every time.Duration) {
+	said := map[string]bool{}
+	for {
+		if err := clk.Sleep(ctx, every); err != nil {
+			return
+		}
+		vols, err := volumes.Volumes(ctx)
+		if err != nil {
+			continue
+		}
+		live := make(map[string]bool, len(vols))
+		for _, v := range vols {
+			live[v.VolumeID] = true
+			dev, ok := volumes.Device(v.VolumeID)
+			if !ok {
+				continue
+			}
+			reason, refused := dev.RefusedForSpace()
+			if !refused {
+				rec.Gauge(ctx, "volume_backpressure", 0, obs.String("volume", v.VolumeID))
+				continue
+			}
+			rec.Gauge(ctx, "volume_backpressure", 1, obs.String("volume", v.VolumeID))
+			if said[v.VolumeID] {
+				continue
+			}
+			said[v.VolumeID] = true
+			slog.Warn("this volume is refusing guest writes for want of space; the guest is taking I/O errors and its fsync is failing",
+				"volume_id", v.VolumeID, "reason", reason, "volume_share_bytes", share,
+				"remedy", "stop the volume — publishing its image at stop is what reclaims the local WAL; nothing else does while it runs")
+		}
+		// A volume that left this host is forgotten, so that the same volume attaching
+		// again — a new session, a new WAL, a new share — is reported again rather than
+		// silently suppressed by what its predecessor did.
+		for id := range said {
+			if !live[id] {
+				delete(said, id)
+			}
+		}
+	}
 }
 
 // shutdown publishes every session this host was serving and does not come back until it

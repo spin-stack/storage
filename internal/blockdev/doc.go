@@ -81,9 +81,21 @@
 //     holds, so it will not confirm anything against it. No local action clears it;
 //     the volume needs a new epoch. Sticky by construction: every later request fails
 //     immediately.
-//   - wal.ErrBackpressure (§5.7) — the unflushed backlog hit its bound. Transient and
-//     self-clearing: a successful FLUSH resumes writes. This is the error the design
-//     chose over silently filling the host's NVMe.
+//
+//   - wal.ErrBackpressure (§5.7) — the volume has written its whole share of the local
+//     device. This is the error the design chose over silently filling the host's NVMe.
+//     **Nothing clears it while the volume runs.** The bound the Agent sets is
+//     wal.Limits.MaxLocalBytes and only that one — agent.Budget.Limits explains why it
+//     leaves MaxUnflushedBytes unset — and a FLUSH clears the unflushed counters, not
+//     the retained segments. What gives the space back is stopping the volume, which
+//     publishes its image and drops the WAL. This list said "transient and
+//     self-clearing: a successful FLUSH resumes writes" until 2026-08-09, and so did
+//     the sentence the guest's error carried, which sent an operator to do the one
+//     thing that cannot work.
+//
+//     Because nothing on the host otherwise sees this, Device latches it:
+//     RefusedForSpace is what cmd/volume-agent reports, once per volume.
+//
 //   - ErrDeviceFull — the local device is out of space (wal.Degraded() reports
 //     OUT_OF_SPACE). Local and recoverable — truncate after a checkpoint or grow the
 //     device — and explicitly *not* a fencing condition: handing a volume to another
@@ -98,23 +110,18 @@
 //
 // # DISCARD and WRITE_ZEROES
 //
-// Not offered. wal.Log has Discard and WriteZeroes, so the storage half exists, but
-// VIRTIO_BLK_F_DISCARD and VIRTIO_BLK_F_WRITE_ZEROES are two wire features with their
-// own request payload (struct virtio_blk_discard_write_zeroes), their own six
-// configuration-space fields, and in WRITE_ZEROES' case a may_unmap flag whose two
-// readings differ in whether the range is reclaimed. Offering a bit whose semantics are
-// not implemented and tested is worse than not offering it, and internal/vhost
-// currently answers both request types with UNSUPP, which is what the specification
-// says to do and what a conforming driver never has to see. They arrive together with
-// their negotiation and their tests, or not at all.
+// Offered, and reaching the WAL: Discard and WriteZeroes below are what
+// VIRTIO_BLK_T_DISCARD and VIRTIO_BLK_T_WRITE_ZEROES land on, and a real guest's
+// `fstrim` drives them (integration/guestinit's discard mode). This section said "not
+// offered" for as long as internal/vhost withheld the feature bits; it does not any
+// more, and the mechanism was complete and unreachable in between.
 //
 // # Concurrency
 //
-// wal.Log is not safe for concurrent use, and vhost.Backend does not promise its
-// methods are called from one goroutine. Every method here therefore holds one mutex
-// for the whole request. That serializes the guest's queue against itself, which is
-// what §4's single queue does anyway — but it does *not* protect the Log from a
-// caller that also holds it (a checkpointer, the Agent's reporter). Whoever owns the
-// Log owns that coordination; this device does not take ownership of it, and does not
-// close it.
+// This package holds no lock. wal.Log is safe for concurrent use and owns the
+// invariants behind its own two mutexes, so a mutex here could only re-serialize what
+// is already serialized — and would put a guest's READ behind its FLUSH for nothing.
+// See the Device type for the hazard that would have been the reason for one, and
+// where it is actually handled. The device does not take ownership of the Log and does
+// not close it.
 package blockdev

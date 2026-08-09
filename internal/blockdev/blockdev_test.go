@@ -3,6 +3,7 @@ package blockdev_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -456,6 +457,107 @@ func TestAClearOutsideTheDeviceIsRefused(t *testing.T) {
 				t.Errorf("Discard(%d, %d) = %v, want ErrOutOfRange", tc.off, tc.length, err)
 			}
 		})
+	}
+}
+
+// fillTheShare writes sector after sector until the device refuses one, and returns
+// that refusal. It is how a guest reaches the bound in production: nothing else on the
+// host consumes the volume's share, and no single request is large enough to cross it.
+func fillTheShare(t *testing.T, r *rig) error {
+	t.Helper()
+	for i := range 4096 {
+		off := int64(i%16) * vhost.SectorSize
+		if _, err := r.dev.WriteAt(pattern(byte(i), vhost.SectorSize), off); err != nil {
+			return err
+		}
+	}
+	t.Fatal("4096 writes did not reach the local bound; the rig's limits are not bounding anything")
+	return nil
+}
+
+// The bound the Agent sets is MaxLocalBytes — the volume's share of the device
+// (agent.Budget.Limits sets that one and no other) — and *nothing clears it while the
+// volume is running*. The sentence the device handed back said the opposite: "a
+// successful FLUSH clears it", which is the one remedy that cannot work. An operator
+// reading it does the FLUSH, watches the writes keep failing, and has learned nothing.
+//
+// The assertion is on the device, not on the wording alone: a FLUSH is performed and
+// the next write is still refused. A test that only grepped the string would pass on a
+// device that had been fixed in its message and nowhere else — and, more to the point,
+// would have passed on the old message too if someone had merely reworded it.
+func TestBackpressureNamesTheRemedyThatActuallyWorks(t *testing.T) {
+	ctx := t.Context()
+	r := newRig(t, withLimits(wal.Limits{MaxLocalBytes: 8 * 1024}))
+
+	err := fillTheShare(t, r)
+	if !errors.Is(err, wal.ErrBackpressure) {
+		t.Fatalf("filling the share failed with %v, want wal.ErrBackpressure", err)
+	}
+
+	// What the sentence promises, checked against the device.
+	if ferr := r.dev.Flush(ctx); ferr != nil {
+		t.Fatalf("FLUSH after backpressure: %v", ferr)
+	}
+	if _, werr := r.dev.WriteAt(pattern(0x77, vhost.SectorSize), 0); !errors.Is(werr, wal.ErrBackpressure) {
+		t.Fatalf("a FLUSH cleared the local bound (next write: %v) — then the old message was right "+
+			"and this test is the thing that is wrong", werr)
+	}
+
+	msg := err.Error()
+	if strings.Contains(msg, "a successful FLUSH clears it") {
+		t.Fatalf("the refusal still tells the operator to FLUSH, which does not clear this bound: %s", msg)
+	}
+	for _, want := range []string{"FLUSH does not clear", "stop"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the refusal does not mention %q, so it does not name what relieves the bound: %s", want, msg)
+		}
+	}
+}
+
+// The host's half of the same event. A guest that crosses its share gets EIO per
+// request and a failed fsync; before this the Agent's log stayed at its start-up lines
+// and nothing on the host knew. The Device latches the fact so that a reporter running
+// at a human cadence can find it — one line per volume, not one per rejected write.
+func TestADeviceRemembersThatItRefusedAGuestForSpace(t *testing.T) {
+	ctx := t.Context()
+	r := newRig(t, withLimits(wal.Limits{MaxLocalBytes: 8 * 1024}))
+
+	if reason, refused := r.dev.RefusedForSpace(); refused {
+		t.Fatalf("a device that has served nothing claims it refused for space: %q", reason)
+	}
+
+	if err := fillTheShare(t, r); !errors.Is(err, wal.ErrBackpressure) {
+		t.Fatalf("filling the share failed with %v, want wal.ErrBackpressure", err)
+	}
+
+	reason, refused := r.dev.RefusedForSpace()
+	if !refused {
+		t.Fatal("the device refused a guest write for want of space and remembers nothing; the host has no way to see it")
+	}
+	if !strings.Contains(reason, "share") {
+		t.Fatalf("the latched reason %q does not name the bound", reason)
+	}
+
+	// Sticky across the one thing an operator would try. If this cleared, the reporter
+	// would log the volume again on every poll for as long as the guest kept writing.
+	if err := r.dev.Flush(ctx); err != nil {
+		t.Fatalf("FLUSH: %v", err)
+	}
+	if _, still := r.dev.RefusedForSpace(); !still {
+		t.Fatal("the latch cleared on a FLUSH; the bound did not")
+	}
+}
+
+// A refusal that is not about space must not latch: a guest driver that walks off the
+// end of the device would otherwise make the Agent announce a full disk, and the
+// operator would go and grow a device that has room.
+func TestOnlySpaceRefusalsLatch(t *testing.T) {
+	r := newRig(t)
+	if _, err := r.dev.WriteAt(pattern(1, vhost.SectorSize), capacity); !errors.Is(err, vhost.ErrOutOfRange) {
+		t.Fatalf("a write past the end returned %v", err)
+	}
+	if reason, refused := r.dev.RefusedForSpace(); refused {
+		t.Fatalf("an out-of-range write latched a space refusal: %q", reason)
 	}
 }
 
