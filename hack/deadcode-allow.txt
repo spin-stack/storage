@@ -38,7 +38,6 @@ internal/ids.NewAt  # CLAUDE.md names it: ids.New() in production, ids.NewAt(ms,
 # The Agent's loop drives the clock-explicit variants (GrantAt/RenewAt); these two are the
 # now-relative spellings the tests and the vhost lane use.
 internal/lease.Manager.Grant  # used by internal/lease, internal/wal and internal/blockdev tests and by the integration/vhost lane; loop.go calls GrantAt
-internal/lease.Manager.Valid  # reached in production only through Loop.LeaseValid, itself a test/e2e accessor (above)
 
 # --- lifecycle enum listings ------------------------------------------------------------
 # Each returns every value of one enum. Their reason for existing is that a test can walk

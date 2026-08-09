@@ -214,6 +214,14 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("agent: reading the served volumes: %w", err)
 	}
 
+	// Before the heartbeat, and that placement is the whole point: the heartbeat is the
+	// call that fails during a partition, and this function returns at its first failure.
+	// Checked here, the lease left behind by the previous cycle is read on every cycle,
+	// failing or not.
+	if err := l.giveUpOnExpiredLease(ctx, vols); err != nil {
+		return err
+	}
+
 	if err := l.heartbeat(ctx, usage, vols); err != nil {
 		return err
 	}
@@ -235,6 +243,85 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 		return err
 	}
 	return l.fence(ctx)
+}
+
+// giveUpOnExpiredLease stops serving every volume on this host once its lease has
+// lapsed on the Agent's own monotonic clock.
+//
+// It is the only thing in the process that acts on a lease running out, and without it a
+// partitioned Agent served forever. Kill the network in front of one and it keeps its
+// socket bound, keeps answering the guest, and keeps ACKing its flushes — while the fleet
+// declares the host dead after one TTL and an operator moves the volume to another host.
+// Two guests then write one volume, both are told their fsyncs are durable, and one of
+// them is wrong for the whole partition. The Control Plane cannot prevent it by
+// construction: the Agent pulls (ADR-0018), so a host that cannot hear the Control Plane
+// cannot be told anything, and the only actor left is this one.
+//
+// # What "expired" means here
+//
+// The lease TTL is liveness, not a durability grant (§14.8). This is not the lease-gated
+// ACK that ADR-0026 withdrew and it is not being rebuilt: no FLUSH consults the lease, and
+// an ACK still means exactly what it meant — captured, fdatasync'd, durable_sequence
+// advanced. What is being said is narrower and it is about ownership, not durability: a
+// host that has not been able to confirm for a whole TTL that it is still a volume's
+// writer must stop acting as one. The timing works because the Control Plane's own
+// deadline is that same TTL measured from the renewal it recorded, which it stamped at or
+// after the instant this Agent anchored to (§12.2, applyLease) — so this host gives the
+// device up no later than the moment the fleet becomes entitled to hand the volume to
+// someone else, never after.
+//
+// # What the guest sees
+//
+// Its disk disappears. Dropping the socket kills QEMU's connection, the guest's I/O
+// stalls, and nothing is coming back to serve it. That is chosen, not incidental. The
+// alternative — keep serving reads, refuse writes — hands a guest bytes that another host
+// may already have overwritten, with no way for the guest to tell; and the alternative to
+// both is the behaviour being fixed, where the guest is told a write is durable by a host
+// that may no longer own the volume. A stalled guest is a visible failure. The other two
+// are silent ones.
+//
+// # It gives up rather than pauses
+//
+// Fence is reused, so a volume dropped here comes back only at a *higher* epoch — only
+// when the Control Plane grants it to this host again. A brief partition therefore costs
+// the volume on this host until the fleet says something about it, which is the side to be
+// wrong on: the alternative is a host that resumes serving on a stale desired state read
+// seconds before a promotion it never heard about.
+func (l *Loop) giveUpOnExpiredLease(ctx context.Context, vols []VolumeStatus) error {
+	l.mu.Lock()
+	lm, reconcile, ttl := l.lease, l.reconcile, l.leaseTTL
+	l.mu.Unlock()
+
+	// The trigger is "something is being served under a claim this host cannot confirm",
+	// not "the lease is invalid": a nil lease is also every Agent's first cycle, before
+	// any heartbeat has been answered, and a host serving nothing has nothing to give up.
+	// Testing the volumes rather than the lease covers both ways a claim ends — the TTL
+	// lapsing, and the Control Plane answering with a zero TTL, which is it saying this
+	// host is DEAD (applyLease).
+	if len(vols) == 0 || reconcile == nil || (lm != nil && lm.Valid()) {
+		return nil
+	}
+
+	volumeIDs := make([]string, 0, len(vols))
+	for _, v := range vols {
+		volumeIDs = append(volumeIDs, v.VolumeID)
+	}
+	// Error, not Warn: this is a guest losing its disk, and it is the one line that
+	// explains why a VM that was running is now stuck on I/O.
+	slog.Error("this host's lease has expired; it can no longer confirm that it owns these volumes and is giving them up",
+		"host_id", l.cfg.HostID, "volumes", volumeIDs, "lease_ttl", ttl)
+
+	// Revoked before the volumes go, so that from this instant the host makes no claim
+	// at all: Revoke bumps the generation, and a heartbeat answer that was already in
+	// flight when this ran cannot re-arm the lease behind the teardown (§12.2). Only a
+	// fresh grant can, which is what applyLease does when a renewal is refused.
+	if lm != nil {
+		lm.Revoke()
+	}
+	if err := reconcile.Fence(ctx, volumeIDs); err != nil {
+		return fmt.Errorf("agent: giving up the volumes of an expired lease: %w", err)
+	}
+	return nil
 }
 
 // fence stops serving whatever the Control Plane refused a report for. Until this
@@ -455,10 +542,32 @@ func (l *Loop) applyLease(gen uint64, sentAt clock.Instant, ttl time.Duration) {
 		// window must stay inside the window it is fenced against.
 		l.lease = lease.NewManager(l.clk, ttl)
 		l.leaseTTL = ttl
-		l.lease.GrantAt(gen, sentAt)
+		// The new manager's own generation, not the one read before the request was
+		// sent. gen identifies an incarnation of a manager that no longer exists, and a
+		// manager built one line ago holds no lease for a stale answer to extend — there
+		// is nothing here for the generation guard to protect. Passing gen would refuse
+		// every grant after the first Revoke, which is a host that never serves again.
+		l.lease.GrantAt(l.lease.Generation(), sentAt)
 		return
 	}
-	l.lease.RenewAt(gen, sentAt)
+	if l.lease.RenewAt(gen, sentAt) {
+		return
+	}
+	// A refused renewal is not a lost heartbeat — the Control Plane just answered, with a
+	// TTL, which is it counting this host alive. RenewAt refuses a lease that has lapsed
+	// or been revoked, and neither can be renewed by construction: only a grant arms a
+	// lease. Without this line the first expiry would be permanent, because
+	// giveUpOnExpiredLease revokes — LeaseValid would stay false for the life of the
+	// process and every volume granted afterwards would be given up on the next cycle.
+	//
+	// Re-arming is safe here and would not be earlier in this function: by the time a
+	// renewal is refused, the volumes that were held under the dead lease have already
+	// been given up (giveUpOnExpiredLease runs at the top of the cycle, before the
+	// heartbeat), so this grants a claim over nothing until the desired state says
+	// otherwise. gen is passed unchanged, so an answer that a Revoke overtook *after it
+	// was sent* is still refused, and sentAt still anchors the window to the request
+	// rather than to the reply (§12.2).
+	l.lease.GrantAt(gen, sentAt)
 }
 
 func (l *Loop) generation() uint64 {
