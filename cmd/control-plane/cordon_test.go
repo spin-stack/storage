@@ -81,7 +81,7 @@ func TestAnOperatorsCordonOutranksThePressureLoop(t *testing.T) {
 func hostRow(t *testing.T, md metadata.Store, ctx context.Context) []string {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := fleetReport(ctx, md, &buf); err != nil {
+	if err := fleetReport(ctx, md, &buf, testTTL); err != nil {
 		t.Fatalf("fleetReport: %v", err)
 	}
 	return row(t, buf.String(), activeHost)

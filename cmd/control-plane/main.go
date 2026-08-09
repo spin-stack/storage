@@ -40,6 +40,7 @@ import (
 	"github.com/spin-stack/storage/internal/metadata/pg"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/placement"
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
@@ -240,7 +241,11 @@ func run() error {
 	// make an operator name a bucket this command never touches — during an incident,
 	// possibly the very bucket that is unreachable.
 	if *fleetStatus {
-		return fleetReport(ctx, md, os.Stdout)
+		// The lease TTL is what the report renders liveness against, and it is this
+		// flag rather than a second one: a threshold an operator can set differently
+		// on the reading side from the serving side is a threshold that would let the
+		// report call a host dead that the Control Plane is still leasing to.
+		return fleetReport(ctx, md, os.Stdout, *leaseTTL)
 	}
 
 	// storeFlags.Open refuses the empty case: the object store is the recovery
@@ -420,25 +425,47 @@ func run() error {
 	}
 	slog.Info("control-plane elected", "holder_id", *holderID, "term", term, "version", version)
 
-	// The term is fixed for the life of the process. A process that loses it does
-	// not "renew" into a new one: every write it attempts fails with ErrStaleTerm,
-	// which the handler answers as Aborted, and an operator restarts it.
+	// The term is fixed for the life of the process: it is never re-acquired, because
+	// AcquireLeadership increments unconditionally and a process that re-elected
+	// itself every few seconds would leave every admin one-shot in this file — each of
+	// which reads GetLeader and then writes under that term — failing at random.
+	// Losing the term ends the process instead; watchTerm below is what notices.
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           cpserver.Handler(cpserver.New(md, func() int64 { return term }, *leaseTTL, band)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
-	slog.Info("control-plane serving", "listen", *listen, "lease_ttl", *leaseTTL)
+	// Two senders, so two slots: neither goroutine may block on a channel nobody is
+	// going to read again once the other has won the select.
+	errCh := make(chan error, 2)
+	go func() {
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("serving: %w", err)
+			return
+		}
+		errCh <- nil
+	}()
+	// §7 says a Control Plane that has been superseded "detects the condition and
+	// terminates itself". Nothing detected it: a second Control Plane took the term
+	// and the first kept listening, kept accepting connections, and failed every
+	// mutation with ErrStaleTerm for ever — which an Agent cannot tell from a Control
+	// Plane that is merely refusing this one write. The guard is what makes the socket
+	// go away, which is the signal an Agent (and a load balancer) already understands.
+	go func() { errCh <- watchTerm(ctx, md, real.NewClock(), term, *holderID, termCheckInterval(*leaseTTL)) }()
+	slog.Info("control-plane serving", "listen", *listen, "lease_ttl", *leaseTTL,
+		"term_check_interval", termCheckInterval(*leaseTTL))
 
 	select {
 	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
+		if err == nil {
 			return nil
 		}
-		return fmt.Errorf("serving: %w", err)
+		// Close rather than Shutdown: a process that has lost the term must stop
+		// answering now, and draining in-flight requests would only let it spend the
+		// grace period returning ErrStaleTerm to an Agent that is waiting on it.
+		_ = srv.Close()
+		return err
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), *shutdownGrace)
 		defer cancel()
@@ -447,6 +474,71 @@ func run() error {
 		}
 		slog.Info("control-plane stopped")
 		return nil
+	}
+}
+
+// errTermLost ends a Control Plane that another one has superseded. It is a sentinel
+// so the exit is one identifiable thing in a log and not a string somebody greps.
+var errTermLost = errors.New("this Control Plane no longer holds its term")
+
+// termCheckInterval is how often a serving Control Plane checks that it is still the
+// leader. It is derived from -lease-ttl rather than being a flag of its own: the lease
+// is already this system's unit of "how long a fact about the fleet may be believed",
+// and a superseded process has to be gone inside one, so a third of it bounds the
+// zombie's remaining life at well under the window. The one-second floor is a busy-loop
+// guard — the check is a single indexed SELECT, but a sub-second lease is a typo, and
+// hammering the catalog is not the way to find out.
+func termCheckInterval(leaseTTL time.Duration) time.Duration {
+	if d := leaseTTL / 3; d > time.Second {
+		return d
+	}
+	return time.Second
+}
+
+// watchTerm ends the process when another Control Plane has taken the term.
+//
+// It reads, and deliberately does not write. The write that belongs here is a renewal
+// of control_plane_leader.renewed_at under this term — and metadata.Store has no such
+// method: AcquireLeadership is its only leadership write and it increments the term
+// unconditionally, which is a different act (see the srv comment above for what
+// re-electing every few seconds would do to the admin one-shots). What the read gives
+// is still the whole of §7's promise for this process: a Control Plane that has been
+// superseded stops serving, instead of listening for ever and answering every mutation
+// with a stale-term error that an Agent cannot tell from a transient refusal.
+//
+// A catalog it cannot read is not a term it has lost: the check is retried and the
+// process keeps serving, because a Control Plane cut off from PostgreSQL already
+// writes nothing at all, and killing it on a connection blip would turn a database
+// hiccup into a fleet-wide outage. The failure is logged at every attempt so the
+// operator sees it.
+//
+// Returns nil when ctx ends — that is a normal shutdown, not a lost term.
+func watchTerm(ctx context.Context, md metadata.Store, clk clock.Clock, term int64, holderID string, every time.Duration) error {
+	for {
+		if err := clk.Sleep(ctx, every); err != nil {
+			return nil
+		}
+		leader, err := md.GetLeader(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			slog.Warn("could not check whether this Control Plane still leads; continuing to serve",
+				"holder_id", holderID, "term", term, "error", err)
+			continue
+		}
+		if leader.Term == term && leader.HolderID == holderID {
+			continue
+		}
+		// Logged here as well as returned, because the two say different things: the
+		// returned error ends the process, and this line is the account of *who* took
+		// over, which is what an operator needs to know they are looking at a
+		// deliberate takeover rather than a crash.
+		slog.Error("superseded by another Control Plane; exiting so a stale process stops serving",
+			"holder_id", holderID, "term", term,
+			"leader_holder_id", leader.HolderID, "leader_term", leader.Term)
+		return fmt.Errorf("%w: %s holds term %d, this process holds term %d",
+			errTermLost, leader.HolderID, leader.Term, term)
 	}
 }
 

@@ -38,7 +38,16 @@ import (
 // nothing is leading. Failing here with "start a Control Plane first" would remove
 // the view exactly when it is the only thing left. The leader line below reports that
 // state instead of refusing over it.
-func fleetReport(ctx context.Context, md metadata.Store, out io.Writer) error {
+//
+// leaseTTL is the lease the Control Plane grants on a heartbeat, and it is the only
+// new input this report needed to stop lying about a fleet that has died. Every
+// "state" in the catalog is a column something has to write, so a host killed with
+// -9 keeps reading ACTIVE for ever and a Control Plane that was SIGTERMed keeps
+// reading LEADER: the process whose job it was to write the correction is the one
+// that is gone. Liveness is therefore not read from a column at all — it is derived
+// from how old the last write is, against the interval the fleet itself uses for
+// "how long a fact may be believed".
+func fleetReport(ctx context.Context, md metadata.Store, out io.Writer, leaseTTL time.Duration) error {
 	p := &printer{out: out}
 
 	// The store's own clock, not this machine's: the heartbeat ages below are
@@ -52,6 +61,13 @@ func fleetReport(ctx context.Context, md metadata.Store, out io.Writer) error {
 	}
 	p.printf("as of %s (the catalog's clock)\n\n", now.UTC().Format(time.RFC3339))
 
+	// The hosts are read before the leader line is printed, and only here, because the
+	// leader line is written out of them: see leaderSeenAt. A read failure is carried
+	// rather than returned so the leader line still prints — the sections below keep
+	// the same property, and this is a command whose whole purpose is being usable
+	// when something is broken.
+	hosts, herr := md.ListHosts(ctx)
+
 	switch leader, lerr := md.GetLeader(ctx); {
 	case errors.Is(lerr, metadata.ErrNotFound):
 		// Not an error, and worth a line of its own: nothing is converging the fleet
@@ -61,17 +77,16 @@ func fleetReport(ctx context.Context, md metadata.Store, out io.Writer) error {
 	case lerr != nil:
 		return fmt.Errorf("reading the leader: %w", lerr)
 	default:
-		p.printf("LEADER  %s  term %d  renewed %s ago\n\n",
-			leader.HolderID, leader.Term, age(now, leader.RenewedAt))
+		reportLeader(p, leader, hosts, herr, now, leaseTTL)
 	}
 
 	// Each section is read and printed before the next is read. A later read that
 	// fails then leaves the operator holding the sections that did come back, plus the
-	// error — which is more than an all-or-nothing report gives them, and this is a
-	// command whose whole purpose is being usable when something is broken.
-	if err := reportHosts(ctx, md, p, now); err != nil {
-		return err
+	// error — which is more than an all-or-nothing report gives them.
+	if herr != nil {
+		return fmt.Errorf("listing hosts: %w", herr)
 	}
+	reportHosts(p, hosts, now, leaseTTL)
 	vols, err := reportVolumes(ctx, md, p)
 	if err != nil {
 		return err
@@ -82,27 +97,108 @@ func fleetReport(ctx context.Context, md metadata.Store, out io.Writer) error {
 	return p.err
 }
 
-func reportHosts(ctx context.Context, md metadata.Store, p *printer, now time.Time) error {
-	hosts, err := md.ListHosts(ctx)
-	if err != nil {
-		return fmt.Errorf("listing hosts: %w", err)
+// reportLeader prints who is leading and — the part that was missing — whether
+// anything has seen that process running.
+//
+// `renewed_at` was the word this line used, and it described a write nothing
+// performs: metadata.Store's only leadership write is AcquireLeadership, which
+// increments the term unconditionally, so the stamp is the election and never moves
+// again. A Control Plane dead for five minutes and one that started five minutes ago
+// printed the identical line.
+//
+// The renewal that would fix it properly is a term-guarded UPDATE of renewed_at that
+// does *not* increment — a metadata.Store method that does not exist. Renewing with
+// AcquireLeadership instead was rejected outright: it would move the term every few
+// seconds, and every admin one-shot in this binary reads GetLeader and then writes
+// under that term, so -flatten-volume and -delete-volume (both of which rewrite a
+// whole image between the two) would start failing with ErrStaleTerm at random.
+//
+// What the catalog can already prove is used instead. Every host heartbeat is a
+// term-guarded write performed by the serving Control Plane and by nothing else, so a
+// heartbeat stamped after this term was created is that process running at that
+// instant. The election is the same proof at time zero. It is a witness, not a lease:
+// a fleet with no hosts, or one whose Agents are all dead too, has nothing to witness
+// with and the line says exactly that rather than claiming the leader is gone.
+func reportLeader(p *printer, leader metadata.Leader, hosts []metadata.Host, herr error, now time.Time, leaseTTL time.Duration) {
+	head := fmt.Sprintf("LEADER  %s  term %d  elected %s ago",
+		leader.HolderID, leader.Term, age(now, leader.RenewedAt))
+	if herr != nil {
+		p.printf("%s  (whether it is still running is unknown: the hosts that would witness it could not be read)\n\n", head)
+		return
 	}
-	var cordoned int
+	seen := leaderSeenAt(leader, hosts)
+	if now.Sub(seen) <= leaseTTL {
+		p.printf("%s  last seen %s ago\n\n", head, age(now, seen))
+		return
+	}
+	p.printf("%s  NOT SEEN for %s — no host has heartbeated under this term since, so this process may be gone\n\n",
+		head, age(now, seen))
+}
+
+// leaderSeenAt is the most recent instant something proves the current term's holder
+// was running: the newest host heartbeat stamped at or after the election, or the
+// election itself. Heartbeats older than the election are excluded because they were
+// written by whoever held the *previous* term — counting them would let a Control
+// Plane that took over and died immediately inherit its predecessor's liveness.
+func leaderSeenAt(leader metadata.Leader, hosts []metadata.Host) time.Time {
+	seen := leader.RenewedAt
+	for _, h := range hosts {
+		if h.LastHeartbeat.After(seen) {
+			seen = h.LastHeartbeat
+		}
+	}
+	return seen
+}
+
+func reportHosts(p *printer, hosts []metadata.Host, now time.Time, leaseTTL time.Duration) {
+	var cordoned, stale int
 	for _, h := range hosts {
 		if !h.State.AcceptsPlacement() {
 			cordoned++
 		}
+		if staleHeartbeat(h, now, leaseTTL) {
+			stale++
+		}
 	}
-	p.printf("HOSTS (%d, %d not taking placements)\n", len(hosts), cordoned)
+	// The stale count is in the header next to the cordon count because they are the
+	// same question — "how much of this fleet is not available?" — and the sentence
+	// after it is there because the two counts do *not* mean the same thing to
+	// placement. internal/placement admits any host whose State.AcceptsPlacement() is
+	// true and never looks at last_heartbeat, so a host that has been dead for an hour
+	// is still a candidate. Teaching it otherwise is a change to internal/placement,
+	// not to this report; until then the operator has to be told, because a report
+	// that marks a host dead reads as a report that took it out of the rotation.
+	p.printf("HOSTS (%d, %d not taking placements, %d with no heartbeat in the last %s — placement does not exclude them)\n",
+		len(hosts), cordoned, stale, leaseTTL)
 	s := p.section("HOST_ID", "STATE", "REASON", "USED", "TOTAL", "COMMITTED", "HEARTBEAT")
 	for _, h := range hosts {
 		s.row("%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			h.HostID, h.State, orNone(h.CordonReason.String()),
+			h.HostID, hostState(h, now, leaseTTL), orNone(h.CordonReason.String()),
 			used(h.NVMeUsedBytes, h.NVMeTotalBytes), capacity(h.NVMeTotalBytes),
 			capacity(h.NVMeCommittedBytes), age(now, h.LastHeartbeat))
 	}
 	s.end()
-	return nil
+}
+
+// staleHeartbeat reports whether the fleet holds no current fact about a host: it has
+// never introduced itself, or its last heartbeat is older than the lease the Control
+// Plane grants on one. Not a state in the catalog, deliberately — a host that was
+// killed cannot write "I am dead", which is why ACTIVE survived every kill -9 this
+// system has seen. It is a fact about time and it is computed at read.
+func staleHeartbeat(h metadata.Host, now time.Time, leaseTTL time.Duration) bool {
+	return h.LastHeartbeat.IsZero() || now.Sub(h.LastHeartbeat) > leaseTTL
+}
+
+// hostState renders the STATE cell. A stale host keeps its catalog state inside the
+// parentheses — placement still reads it, and it is what an operator un-cordons — but
+// the cell no longer *is* that word: `ACTIVE` on a machine that has been off for an
+// hour is the single most misleading thing this report printed. One token, so
+// `awk '{print $2}'` and an eye both still work, and it sorts and greps as STALE.
+func hostState(h metadata.Host, now time.Time, leaseTTL time.Duration) string {
+	if !staleHeartbeat(h, now, leaseTTL) {
+		return string(h.State)
+	}
+	return fmt.Sprintf("STALE(%s)", h.State)
 }
 
 // reportVolumes prints the volumes and returns them, so the snapshot section can name

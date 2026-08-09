@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,7 +12,13 @@ import (
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
+	"github.com/spin-stack/storage/internal/simio/real"
 )
+
+// testTTL is the lease TTL every report below is rendered against. It is the flag's
+// default, because the staleness threshold is the flag: a heartbeat older than the
+// lease the Control Plane grants is a host the fleet has no current fact about.
+const testTTL = 30 * time.Second
 
 // Fixed UUIDv7s (INV-22), so the report's rows can be asserted by name.
 const (
@@ -129,7 +137,7 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 
 	now = now.Add(5 * time.Second)
 	var buf bytes.Buffer
-	if err := fleetReport(ctx, md, &buf); err != nil {
+	if err := fleetReport(ctx, md, &buf, testTTL); err != nil {
 		t.Fatalf("fleetReport: %v", err)
 	}
 	out := buf.String()
@@ -139,10 +147,12 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 	mustSay(t, out, "LEADER  cp-a  term 1")
 
 	// The cordoned host: an operator has to be able to read *why* it is out of service
-	// and how full it is, or the row says only that something is wrong.
-	mustSay(t, out, "HOSTS (2, 1 not taking placements)")
+	// and how full it is, or the row says only that something is wrong. Its heartbeat
+	// is 1m30s old against a 30s lease, so the STATE cell says the catalog's answer is
+	// no longer a current fact — the fixture was written before anything looked.
+	mustSay(t, out, "HOSTS (2, 1 not taking placements, 1 with no heartbeat in the last 30s")
 	if got, want := row(t, out, cordonedHost),
-		[]string{cordonedHost, "CORDONED", "DEVICE_PRESSURE", "900.0GiB", "(88%)", "1.0TiB", "0B", "1m30s"}; !equal(got, want) {
+		[]string{cordonedHost, "STALE(CORDONED)", "DEVICE_PRESSURE", "900.0GiB", "(88%)", "1.0TiB", "0B", "1m30s"}; !equal(got, want) {
 		t.Errorf("cordoned host row = %v, want %v", got, want)
 	}
 	if got, want := row(t, out, activeHost),
@@ -199,7 +209,7 @@ func TestFleetStatusOfAnEmptyCatalogSaysSo(t *testing.T) {
 	md := metasim.New(func() time.Time { return now })
 
 	var buf bytes.Buffer
-	if err := fleetReport(t.Context(), md, &buf); err != nil {
+	if err := fleetReport(t.Context(), md, &buf, testTTL); err != nil {
 		t.Fatalf("fleetReport with no leader: %v", err)
 	}
 	out := buf.String()
@@ -207,7 +217,7 @@ func TestFleetStatusOfAnEmptyCatalogSaysSo(t *testing.T) {
 
 	mustSay(t, out, "LEADER  none")
 	for _, section := range []string{
-		"HOSTS (0, 0 not taking placements)",
+		"HOSTS (0, 0 not taking placements, 0 with no heartbeat in the last 30s",
 		"VOLUMES (0, 0 with no primary host, 0 at the depth ceiling",
 		"SNAPSHOTS NOT FINISHED (0)",
 	} {
@@ -215,6 +225,235 @@ func TestFleetStatusOfAnEmptyCatalogSaysSo(t *testing.T) {
 	}
 	if n := strings.Count(out, "(none)"); n != 3 {
 		t.Errorf("empty sections marked with (none): %d, want 3:\n%s", n, out)
+	}
+}
+
+// TestFleetStatusDoesNotCallAHostWithNoHeartbeatActive is the first of the three
+// states a readiness run reproduced: `kill -9` an Agent and the report says ACTIVE
+// for ever, because ACTIVE is a column somebody has to write and the thing that
+// writes it is the process that just died.
+//
+// The fix is not a new state in the catalog — it is time. The report is rendered
+// against the lease TTL the Control Plane grants, so a host whose last heartbeat is
+// older than its own lease is one the fleet holds no current fact about, and the
+// STATE cell has to say that before it says anything else.
+func TestFleetStatusDoesNotCallAHostWithNoHeartbeatActive(t *testing.T) {
+	ctx := t.Context()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	md := metasim.New(func() time.Time { return now })
+
+	term, err := md.AcquireLeadership(ctx, "cp-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{activeHost, cordonedHost} {
+		if err := md.UpsertHost(ctx, term, metadata.Host{
+			HostID: id, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// One lease TTL and a second past the last heartbeat of both hosts: what the
+	// operator in the readiness run was looking at 40 s after a kill -9.
+	now = now.Add(testTTL + time.Second)
+	// One host comes back — the other is the dead one. Two rows, so the assertion is
+	// that the report *distinguishes* them rather than that it decorates every row.
+	if err := md.UpsertHost(ctx, term, metadata.Host{
+		HostID: activeHost, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := fleetReport(ctx, md, &buf, testTTL); err != nil {
+		t.Fatalf("fleetReport: %v", err)
+	}
+	out := buf.String()
+	t.Log("\n" + out)
+
+	// The dead host. `ACTIVE` is what the catalog still says and what placement will
+	// still read, and it is exactly the word that must not appear on its own.
+	dead := row(t, out, cordonedHost)
+	if dead[1] == "ACTIVE" {
+		t.Errorf("a host with no heartbeat for %s is printed ACTIVE:\n%s", testTTL+time.Second, out)
+	}
+	if got, want := dead[1], "STALE(ACTIVE)"; got != want {
+		t.Errorf("dead host STATE = %q, want %q:\n%s", got, want, out)
+	}
+	if got, want := dead[len(dead)-1], "31s"; got != want {
+		t.Errorf("dead host HEARTBEAT = %q, want %q:\n%s", got, want, out)
+	}
+	// The live one is untouched: a report that marks everything marks nothing.
+	if got, want := row(t, out, activeHost)[1], "ACTIVE"; got != want {
+		t.Errorf("live host STATE = %q, want %q:\n%s", got, want, out)
+	}
+	// And the count is in the header, where the answer to "is anything wrong" is,
+	// next to the sentence that says placement has not been taught this yet.
+	mustSay(t, out, "HOSTS (2, 0 not taking placements, 1 with no heartbeat in the last 30s")
+}
+
+// TestFleetStatusMarksALeaderNothingHasSeenRunning is the second state: both Control
+// Planes SIGTERMed, and 25 s later the report still printed `LEADER cp-b term 4
+// renewed 5m29s ago` — the same shape it prints for a live one, because renewed_at is
+// stamped once at election and never again.
+//
+// What the report can prove without a renewal it does not have: every host heartbeat
+// is a term-guarded write, so a heartbeat stamped after this term was created is a
+// process holding this term running at that instant. The election itself is the same
+// kind of proof at time zero. Anything older than a lease TTL is a leader nothing has
+// seen since.
+func TestFleetStatusMarksALeaderNothingHasSeenRunning(t *testing.T) {
+	tests := []struct {
+		name string
+		// gap is how long before the report the last heartbeat under this term
+		// landed. A leader that has been leading longer than that has been seen.
+		since time.Duration
+		want  string
+		notes string
+	}{
+		{
+			name:  "a heartbeat it accepted a moment ago",
+			since: 3 * time.Second,
+			want:  "last seen 3s ago",
+		},
+		{
+			name:  "nothing under this term for longer than a lease",
+			since: testTTL + 5*time.Second,
+			want:  "NOT SEEN for 35s",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			now := time.Unix(1_700_000_000, 0).UTC()
+			md := metasim.New(func() time.Time { return now })
+
+			// Elected ten minutes ago in both cases: the age of the election is what
+			// the report used to answer with, and it must not be what decides.
+			now = now.Add(-10 * time.Minute)
+			term, err := md.AcquireLeadership(ctx, "cp-b")
+			if err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(10*time.Minute - tc.since)
+			if err := md.UpsertHost(ctx, term, metadata.Host{
+				HostID: activeHost, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(tc.since)
+
+			var buf bytes.Buffer
+			if err := fleetReport(ctx, md, &buf, testTTL); err != nil {
+				t.Fatalf("fleetReport: %v", err)
+			}
+			out := buf.String()
+			t.Log("\n" + out)
+
+			mustSay(t, out, "LEADER  cp-b  term 1  elected 10m0s ago")
+			mustSay(t, out, tc.want)
+			// "renewed" was the word that made a dead process read as a live one. It
+			// described a write nothing performs.
+			if strings.Contains(out, "renewed") {
+				t.Errorf("the report still says a term is renewed, and nothing renews one:\n%s", out)
+			}
+		})
+	}
+}
+
+// countingLeaderReads is a metadata.Store that counts GetLeader. Embedding rather
+// than implementing: the guard uses one method of a thirty-method interface, and a
+// hand-written stub for the other twenty-nine would be a compile error every time
+// somebody adds one.
+type countingLeaderReads struct {
+	metadata.Store
+	n atomic.Int64
+}
+
+func (c *countingLeaderReads) GetLeader(ctx context.Context) (metadata.Leader, error) {
+	c.n.Add(1)
+	return c.Store.GetLeader(ctx)
+}
+
+// TestASupersededControlPlaneStopsRunning is the third state: a second Control Plane
+// takes the term, and the first keeps listening, keeps accepting connections, and
+// fails every mutation with `stale control-plane term` for ever. §7 says it detects
+// the condition and terminates itself; it did not, because nothing ever looked.
+func TestASupersededControlPlaneStopsRunning(t *testing.T) {
+	ctx := t.Context()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	md := metasim.New(func() time.Time { return now })
+	counting := &countingLeaderReads{Store: md}
+
+	term, err := md.AcquireLeadership(ctx, "cp-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A real clock at a millisecond cadence: the guard's own loop is what is under
+	// test, and its unit is "did it look again", not "how long did it wait".
+	clk := real.NewClock()
+
+	// While cp-a still holds the term the guard must not end the process. Proved by
+	// the loop still looking when the context is cancelled, not by it having returned
+	// nothing — a guard that returned on its first tick would also "not exit".
+	held, cancelHeld := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- watchTerm(held, counting, clk, term, "cp-a", time.Millisecond) }()
+	for counting.n.Load() < 3 {
+		if err := clk.Sleep(ctx, time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancelHeld()
+	if err := <-done; err != nil {
+		t.Fatalf("the guard ended a Control Plane that still holds its term: %v", err)
+	}
+
+	// Now a second Control Plane takes over, exactly as starting one does.
+	if _, err := md.AcquireLeadership(ctx, "cp-b"); err != nil {
+		t.Fatal(err)
+	}
+	// Bounded, so "it never exits" — the state that was reproduced — fails as an
+	// assertion here rather than as the package's test timeout. Two seconds is two
+	// thousand of the guard's intervals.
+	superseded, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	err = watchTerm(superseded, counting, clk, term, "cp-a", time.Millisecond)
+	if err == nil {
+		t.Fatal("a superseded Control Plane kept running")
+	}
+	// The message is the operator's only account of why the process is gone, so it
+	// names both terms and the holder that took over.
+	for _, want := range []string{"cp-b", "term 2", "term 1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the exit error does not say %q: %v", want, err)
+		}
+	}
+}
+
+// TestTermCheckIntervalStaysUnderTheLease: the guard's cadence is derived from
+// -lease-ttl rather than being its own flag, because the lease is the fleet's unit of
+// "how long a fact may be believed" — a superseded Control Plane has to be gone
+// before the window it was still writing in can be trusted again.
+func TestTermCheckIntervalStaysUnderTheLease(t *testing.T) {
+	tests := []struct {
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{30 * time.Second, 10 * time.Second},
+		{3 * time.Second, time.Second},
+		{time.Second, time.Second}, // the floor: never busier than once a second
+		{0, time.Second},
+	}
+	for _, tc := range tests {
+		if got := termCheckInterval(tc.ttl); got != tc.want {
+			t.Errorf("termCheckInterval(%s) = %s, want %s", tc.ttl, got, tc.want)
+		}
+		if got := termCheckInterval(tc.ttl); tc.ttl > time.Second && got >= tc.ttl {
+			t.Errorf("termCheckInterval(%s) = %s, which is not inside the lease", tc.ttl, got)
+		}
 	}
 }
 
