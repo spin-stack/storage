@@ -252,8 +252,11 @@ type Span struct {
 // the chain it descends from says (agent.parentView composes that chain; cow.DeltaOver
 // takes the delta). A reader that has one without the other has half a volume.
 type Manifest struct {
-	VolumeID string  `json:"volume_id"`
-	Chunks   []Chunk `json:"chunks"`
+	// FormatVersion is framed.FormatVersion at the time this object was written; see
+	// there for why it exists and why one number covers all three structural objects.
+	FormatVersion int     `json:"format_version"`
+	VolumeID      string  `json:"volume_id"`
+	Chunks        []Chunk `json:"chunks"`
 	// Discarded is what makes the delta expressible, and it is the field a reader is most
 	// likely to think is optional.
 	//
@@ -481,7 +484,7 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 		return Manifest{}, fmt.Errorf("image: volume %s: %w", format.UUIDString(id.Volume), err)
 	}
 
-	man := Manifest{VolumeID: format.UUIDString(id.Volume), Sequence: seq}
+	man := Manifest{FormatVersion: framed.FormatVersion, VolumeID: format.UUIDString(id.Volume), Sequence: seq}
 	// The erasures first, and they are recorded even when this volume uploads nothing at
 	// all: a stop whose only guest activity was a DISCARD still has something to say, and
 	// a manifest that omitted it would let the ancestor's bytes back through on the next
@@ -597,6 +600,13 @@ func readManifest(ctx context.Context, store objectstore.Store, volumeID [16]byt
 	var man Manifest
 	if err := json.Unmarshal(payload, &man); err != nil {
 		return Manifest{}, "", fmt.Errorf("image: parsing %s: %w", key, err)
+	}
+	// Checked before any field is used. json.Unmarshal drops what it does not recognise,
+	// so a manifest from a newer format decodes cleanly with its new fields discarded —
+	// and the fields most likely to be added here are the ones that place data. A
+	// tombstone this binary never heard of is an ancestor's bytes coming back.
+	if err := framed.CheckVersion(man.FormatVersion); err != nil {
+		return Manifest{}, "", fmt.Errorf("image: %s: %w", key, err)
 	}
 	if man.VolumeID != format.UUIDString(volumeID) {
 		return Manifest{}, "", fmt.Errorf("image: manifest at %s describes volume %s", key, man.VolumeID)

@@ -1808,6 +1808,30 @@ Sin esta política, el primer cambio de formato con el fleet a medias actualizad
 4. Misma disciplina para el API gRPC del CP (compatibilidad hacia atrás dentro de la major; deprecaciones anunciadas).
 5. Los headers ya llevan `Version` + magic distintos por tipo; los campos `Reserved` existen para extensiones sin bump de versión.
 
+   > **Era cierto sólo de la mitad que no lo necesitaba, y se corrigió el 2026-08-09.**
+   > Los formatos binarios del WAL sí llevaban `Version` y magic y rechazaban cualquier otra
+   > con `ErrBadVersion` — y son **locales**: viven una sesión y los lee el mismo binario que
+   > los escribió. Los objetos de S3 —`manifest.json`, los manifiestos de snapshot y
+   > `descriptor.json`, que son los únicos que cruzan hosts y sobreviven a una sesión— **no
+   > llevaban versión ninguna**, y son JSON: `json.Unmarshal` descarta en silencio los campos
+   > que no conoce. O sea que la estrictez estaba exactamente al revés, y el modo de fallo del
+   > lado que importa no era un rechazo sino su ausencia: un Agent leyendo un manifiesto de un
+   > formato más nuevo lo decodifica limpio, tira lo que no entiende y sirve el volumen.
+   >
+   > Los tres llevan ahora `format_version` (`framed.FormatVersion`, un número para los tres
+   > porque en este árbol cambian juntos) y todo lector rechaza lo que no sea exactamente el
+   > suyo, con **dos errores distintos** —`ErrFormatTooNew` y `ErrFormatTooOld`— porque lo que
+   > el operador tiene que hacer difiere y no se deduce del objeto: *más nuevo* es «este host
+   > está atrasado, avanzalo, no toques el objeto», *más viejo* es el caso que se vuelve
+   > trabajo de read-old el día que exista. Un objeto sin el campo se rechaza como más viejo,
+   > no se asume generación 1.
+   >
+   > **Esto no es read-old y no es una capa de compatibilidad** —CLAUDE.md prohíbe
+   > construirlas antes de que algo las exija—: es la capacidad de *detectar* que la
+   > compatibilidad se rompió. Se agrega ahora por la razón por la que §15 reservó los campos
+   > de cripto el día 1: agregar un campo obligatorio a objetos que ya viven en un bucket que
+   > alguien va a releer no es un cambio que se pueda hacer.
+
 ---
 
 ## 28. Operación de fleet (nuevo)

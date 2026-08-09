@@ -3,9 +3,11 @@ package image_test
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/cow"
+	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -89,5 +91,91 @@ func TestAManifestWithNoDigestLineIsRefused(t *testing.T) {
 	}
 	if _, _, _, err := image.Load(ctx, store, nil, image.Ident{Volume: vol, Lineage: vol}, nil); err == nil {
 		t.Fatal("a manifest with no digest line was accepted")
+	}
+}
+
+// The reason format_version exists, stated as a test rather than as a comment.
+//
+// These objects are JSON, and `json.Unmarshal` silently discards fields it does not
+// know. So the failure this guards is not a parse error — it is the absence of one: an
+// Agent meeting a manifest from a newer format decodes it cleanly, drops whatever was
+// added, and serves the volume. The fields most likely to be added to a manifest are
+// the ones that place data, and a tombstone this binary never heard of is an ancestor's
+// bytes coming back at an offset the guest freed.
+//
+// The version is bumped in the stored bytes rather than by writing a Manifest with a
+// different value, because Write stamps the constant over whatever the caller sets —
+// which is deliberate, and means the only way to produce a wrong-version object is the
+// way the world produces one: another binary wrote it.
+func TestAManifestFromAnotherFormatVersionIsRefused(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(payload []byte) []byte
+		wantErr error
+	}{
+		{
+			name: "a newer version tells the operator to roll this host forward",
+			mutate: func(p []byte) []byte {
+				return bytes.Replace(p, []byte(`"format_version":1`), []byte(`"format_version":2`), 1)
+			},
+			wantErr: framed.ErrFormatTooNew,
+		},
+		{
+			// Unreachable today — the constant has only ever been 1 — and the branch is
+			// asserted anyway, because the one time somebody sees this message it will
+			// be during an incident and there will be no second chance to get it right.
+			name: "an older version is a different error, and a different remedy",
+			mutate: func(p []byte) []byte {
+				return bytes.Replace(p, []byte(`"format_version":1`), []byte(`"format_version":0`), 1)
+			},
+			wantErr: framed.ErrFormatTooOld,
+		},
+		{
+			// What every object written before this field existed looks like. Refused
+			// rather than read as generation 1: nothing is deployed, so there is no such
+			// object to be lenient for, and the lenient branch would outlive the reason.
+			name:    "no version field at all is refused, not assumed",
+			mutate:  func(p []byte) []byte { return bytes.Replace(p, []byte(`"format_version":1,`), nil, 1) },
+			wantErr: framed.ErrFormatTooOld,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := sim.NewObjectStore()
+			var vol [16]byte
+			vol[0] = 0xC3
+			view := cow.NewIntervalMap()
+			view.Overwrite(0, bytes.Repeat([]byte{0x33}, 4096))
+			if _, err := image.Publish(ctx, store, rand.Reader, nil,
+				image.Ident{Volume: vol, Lineage: vol}, view, nil, 3, ""); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			key := image.ManifestKey(vol)
+
+			// Re-frame after mutating: the digest covers the bytes as stored, so a
+			// mutation that skipped it would be refused as corruption and this test
+			// would pass without ever reaching the version check.
+			body, err := store.Get(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := framed.Unframe(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutated := tc.mutate(payload)
+			if bytes.Equal(mutated, payload) {
+				t.Fatalf("the mutation changed nothing; the payload was %s", payload)
+			}
+			if _, err := store.Put(ctx, key, framed.Frame(mutated), objectstore.PutOptions{}); err != nil {
+				t.Fatal(err)
+			}
+
+			_, _, _, err = image.Load(ctx, store, nil, image.Ident{Volume: vol, Lineage: vol}, nil)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Load = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }

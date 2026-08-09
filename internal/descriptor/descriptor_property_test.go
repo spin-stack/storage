@@ -12,6 +12,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
+	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
@@ -33,13 +34,18 @@ func genDescriptor(t *rapid.T) descriptor.Descriptor {
 		parentVolume = ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "parent_volume_ms")), rand.Reader).String()
 	}
 	return descriptor.Descriptor{
-		VolumeID:     ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "ms")), rand.Reader).String(),
-		SizeBytes:    int64(rapid.IntRange(1, 1<<40).Draw(t, "size")),
-		BlockSize:    int32(rapid.IntRange(512, 1<<20).Draw(t, "block")),
-		CurrentEpoch: int64(rapid.IntRange(0, 1<<20).Draw(t, "epoch")),
-		ChainDepth:   int32(rapid.IntRange(0, 32).Draw(t, "chain")),
-		KEKID:        rapid.StringMatching(`[a-z0-9-]{1,16}`).Draw(t, "kek_id"),
-		DEKWrapped:   wrapped,
+		// Drawn, and deliberately allowed to be wrong: Write stamps the current version
+		// over whatever the caller set, and a generator that always supplied the right
+		// one could not tell that apart from Write trusting its argument. The round trip
+		// below asserts the stamp, not the echo.
+		FormatVersion: rapid.IntRange(0, 9).Draw(t, "format_version"),
+		VolumeID:      ids.NewAt(int64(rapid.IntRange(1, 1<<40).Draw(t, "ms")), rand.Reader).String(),
+		SizeBytes:     int64(rapid.IntRange(1, 1<<40).Draw(t, "size")),
+		BlockSize:     int32(rapid.IntRange(512, 1<<20).Draw(t, "block")),
+		CurrentEpoch:  int64(rapid.IntRange(0, 1<<20).Draw(t, "epoch")),
+		ChainDepth:    int32(rapid.IntRange(0, 32).Draw(t, "chain")),
+		KEKID:         rapid.StringMatching(`[a-z0-9-]{1,16}`).Draw(t, "kek_id"),
+		DEKWrapped:    wrapped,
 		// Never 0: a descriptor carrying 0 describes a volume nothing can open, and
 		// the write paths refuse it (metadata.CheckDEKKeyID). Generating it here would
 		// be testing a state the system does not produce.
@@ -74,10 +80,20 @@ func TestDescriptorRoundTrips(t *testing.T) {
 		if !bytes.Equal(got.DEKWrapped, want.DEKWrapped) {
 			rt.Fatalf("dek_wrapped did not survive: %x -> %x", want.DEKWrapped, got.DEKWrapped)
 		}
+		// The version is stamped by Write, not echoed from the caller, so whatever the
+		// generator drew is gone by the time it is read back. Asserted before the
+		// whole-struct comparison because that comparison would otherwise report it as
+		// "the round trip changed the descriptor", which is exactly what it should do.
+		if got.FormatVersion != framed.FormatVersion {
+			rt.Fatalf("Write stamped format_version %d over a drawn %d; want %d",
+				got.FormatVersion, want.FormatVersion, framed.FormatVersion)
+		}
+
 		// Every other field, compared as a whole rather than one assertion per field:
 		// a field added to this struct and forgotten by json is caught here.
 		gotBlank, wantBlank := got, want
 		gotBlank.DEKWrapped, wantBlank.DEKWrapped = nil, nil
+		gotBlank.FormatVersion, wantBlank.FormatVersion = 0, 0
 		if !reflect.DeepEqual(gotBlank, wantBlank) {
 			rt.Fatalf("round trip changed the descriptor:\n want %+v\n  got %+v", want, got)
 		}
@@ -266,5 +282,56 @@ func TestADescriptorUnderTheWrongKeyIsRefused(t *testing.T) {
 	got, err := descriptor.Read(ctx, store, theirs)
 	if err == nil {
 		t.Fatalf("volume %s read a descriptor describing volume %s", theirs, got.VolumeID)
+	}
+}
+
+// The manifest's version check and this one are two call sites of one primitive, so this
+// is here to prove the *call* exists rather than to re-prove framed.CheckVersion.
+//
+// It matters more here than it looks: this object is what `-rebuild-metadata` reads to
+// reconstruct a volume the database no longer describes (INV-20), and it carries the
+// volume's geometry, its wrapped DEK and the id of the key that opens it. A descriptor
+// from a newer format decoding cleanly with unknown fields dropped is a catalog rebuilt
+// wrong from an object that looked fine.
+func TestADescriptorFromAnotherFormatVersionIsRefused(t *testing.T) {
+	tests := []struct {
+		name    string
+		to      string
+		wantErr error
+	}{
+		{"newer", `"format_version":2`, framed.ErrFormatTooNew},
+		{"older", `"format_version":0`, framed.ErrFormatTooOld},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			store := sim.NewObjectStore()
+			d := descriptor.Descriptor{
+				VolumeID: ids.New().String(), SizeBytes: 1 << 20, BlockSize: 4096, DEKKeyID: 1,
+			}
+			if err := descriptor.Write(ctx, store, d); err != nil {
+				t.Fatal(err)
+			}
+			body, err := store.Get(ctx, descriptor.Key(d.VolumeID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := framed.Unframe(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Re-framed, so the digest still matches and the read reaches the version
+			// check instead of stopping at corruption.
+			mutated := bytes.Replace(payload, []byte(`"format_version":1`), []byte(tc.to), 1)
+			if bytes.Equal(mutated, payload) {
+				t.Fatalf("the mutation changed nothing: %s", payload)
+			}
+			if _, err := store.Put(ctx, descriptor.Key(d.VolumeID), framed.Frame(mutated), objectstore.PutOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := descriptor.Read(ctx, store, d.VolumeID); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Read = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }

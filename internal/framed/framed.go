@@ -47,6 +47,69 @@ import (
 // read path must refuse to act on.
 var ErrCorrupt = errors.New("framed: contents do not match the stored digest")
 
+// FormatVersion is the generation of the structural on-S3 formats: the volume manifest,
+// the snapshot manifests beside it, and the volume descriptor. Every one of them carries
+// it as `format_version`, and every reader refuses an object that does not carry this
+// exact number (CheckVersion).
+//
+// # Why one number and not one per object
+//
+// Because in this tree they change together. CLAUDE.md's rule until the spine ships is
+// that on-S3 formats change *in place* — no v2 alongside v1, no shim — so a format change
+// is a single event that rewrites whatever it needs to. Three independent version numbers
+// would produce a matrix of combinations that nobody will ever reason about, and the first
+// question in an incident would be which of the three is authoritative. One number answers
+// "which generation of this bucket's structural objects is this" and that is the only
+// question anyone asks.
+//
+// # Why this exists now, when nothing reads an old version
+//
+// It is not read-old and it is not a compatibility layer; CLAUDE.md forbids building
+// those before something requires them, and nothing does. It is the ability to *detect*
+// that compatibility was broken, and it has to be added before the first deployment for
+// the same reason §15 reserved the crypto fields on day 1: adding a required field to
+// objects that already exist in a bucket somebody re-reads is not a change you can make.
+//
+// What it buys concretely: these are JSON, and `json.Unmarshal` silently discards fields
+// it does not know. Without a version, an Agent that met a manifest written by a newer
+// one would drop the fields it had never heard of and serve the volume anyway — a wrong
+// read with no error anywhere. The binary WAL formats already had this (`VW02`, a Version
+// field, ErrBadVersion) and the S3 objects — the only ones that cross hosts and outlive a
+// session — did not, which is the strictness exactly inverted.
+const FormatVersion = 1
+
+// ErrFormatTooNew and ErrFormatTooOld are what a reader gets for an object of the wrong
+// generation. They are two errors and not one because the operator's next move differs
+// and is not guessable from the object: too-new means this host is behind the one that
+// wrote it — roll this host forward, do not touch the object — while too-old means the
+// object predates this binary's format, which is the case that becomes read-old work if
+// it ever happens. Today nothing can produce too-old, since FormatVersion has only ever
+// been 1; the branch exists so the first bump has somewhere to land and so the message
+// is right the one time anybody sees it.
+var (
+	ErrFormatTooNew = errors.New("framed: object was written by a newer format than this binary understands")
+	ErrFormatTooOld = errors.New("framed: object predates the format this binary understands")
+)
+
+// CheckVersion validates the `format_version` an object carried.
+//
+// A zero — the field absent, which is what every object written before this existed looks
+// like — is refused as too old rather than accepted as "generation 1". Nothing is
+// deployed, so there is no such object anywhere to be lenient for, and a lenient branch
+// would permanently accept an unversioned object in exchange for one that does not exist.
+// internal/descriptor made the same call for its digest line and DEV-0025 made it again
+// for the manifest; this is the third time and the reasoning has not changed.
+func CheckVersion(got int) error {
+	switch {
+	case got == FormatVersion:
+		return nil
+	case got > FormatVersion:
+		return fmt.Errorf("%w: object says version %d, this binary writes %d", ErrFormatTooNew, got, FormatVersion)
+	default:
+		return fmt.Errorf("%w: object says version %d, this binary writes %d", ErrFormatTooOld, got, FormatVersion)
+	}
+}
+
 const digestLen = sha256.Size * 2
 
 // Frame returns the bytes to store: the payload's digest, a newline, then the payload.

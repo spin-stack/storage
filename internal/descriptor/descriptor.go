@@ -17,13 +17,17 @@ import (
 
 // Descriptor is the durable, self-describing metadata of a volume (§8, §22.5).
 type Descriptor struct {
-	VolumeID     string `json:"volume_id"`
-	SizeBytes    int64  `json:"size_bytes"`
-	BlockSize    int32  `json:"block_size"`
-	CurrentEpoch int64  `json:"current_epoch"` // last known; the epoch object is authoritative
-	ChainDepth   int32  `json:"chain_depth"`
-	KEKID        string `json:"kek_id"`
-	DEKWrapped   []byte `json:"dek_wrapped"`
+	// FormatVersion is framed.FormatVersion at the time this object was written. It is
+	// first so that a human catting the object sees it before anything else, and so that
+	// a future reader that has to sniff before decoding finds it in the first bytes.
+	FormatVersion int    `json:"format_version"`
+	VolumeID      string `json:"volume_id"`
+	SizeBytes     int64  `json:"size_bytes"`
+	BlockSize     int32  `json:"block_size"`
+	CurrentEpoch  int64  `json:"current_epoch"` // last known; the epoch object is authoritative
+	ChainDepth    int32  `json:"chain_depth"`
+	KEKID         string `json:"kek_id"`
+	DEKWrapped    []byte `json:"dek_wrapped"`
 	// DEKKeyID is the DEK's version (§15.1). It is here and not only in the catalog
 	// because §22.5's rebuild-metadata reads this object to reconstruct a volume the
 	// database no longer describes — and a volume rebuilt with its wrapped DEK but
@@ -113,6 +117,10 @@ func VolumeOfKey(key string) (string, bool) {
 // promising updates nobody makes is worse than no sentence, because -rebuild-metadata
 // reads this object as the truth about a volume the database no longer describes.
 func Write(ctx context.Context, store objectstore.Store, d Descriptor) error {
+	// Stamped here rather than trusted from the caller: a Descriptor built by hand with a
+	// zero version would be written as one, and the whole point of the field is that it
+	// cannot be absent.
+	d.FormatVersion = framed.FormatVersion
 	body, err := json.Marshal(d)
 	if err != nil {
 		return err
@@ -135,6 +143,13 @@ func Read(ctx context.Context, store objectstore.Store, volumeID string) (Descri
 	}
 	if err := json.Unmarshal(payload, &d); err != nil {
 		return Descriptor{}, fmt.Errorf("descriptor: decode %s: %w", Key(volumeID), err)
+	}
+	// Before anything is read out of the struct. json.Unmarshal silently discards fields
+	// it does not know, so a descriptor from a newer format decodes without complaint into
+	// whatever subset this binary happens to understand — a volume's geometry, wrapped key
+	// and parent link, quietly missing whatever was added.
+	if err := framed.CheckVersion(d.FormatVersion); err != nil {
+		return Descriptor{}, fmt.Errorf("descriptor %s: %w", Key(volumeID), err)
 	}
 	// The object must describe the volume it was asked for. The digest above proves the
 	// bytes are the bytes that were written; it says nothing about *where*, so a
