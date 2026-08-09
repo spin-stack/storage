@@ -220,6 +220,12 @@ tasks:
   # recomputed at deploy time is the failure mode a state-based tool invites; the
   # only apply path here reads a committed plan, and pgschema refuses it if the
   # database has moved since it was made.
+  #
+  # So migrations/ is a **record, not a replay path**: nothing reads it in order, no test
+  # touches it, and `db:verify` proves the point by rebuilding from schema.sql alone and
+  # asserting the resulting plan is empty. Each change leaves a pair — `<ts>_<name>.sql`,
+  # the DDL a human reviews, and `<ts>_<name>.json`, the plan pgschema executes,
+  # fingerprinted against the database it was computed from.
 
   db:dev:up:
     desc: Start (or reuse) the local Postgres 18 development database that db:plan diffs against.
