@@ -25,17 +25,10 @@ mid-session, which is the documented shape (§5.7) and the number nobody had.
 
 ## Do this next
 
-**Nothing here blocks a pilot.** Nine blockers closed, then 22 regressions those fixes caused
-found by a re-run and closed, then the six residuals. `git log` has all of it. What is left
-is one derivation and a set of things only a running tenant can answer.
-
-1. **`MaxViewBytes` is a constant.** It defaults to 256 MiB where every other bound in the
-   Agent is derived from something measured — `agent.Budget` reads the device with `statfs`,
-   takes `GuestRatio`, subtracts `ReserveRatio` and divides by `-max-volumes`. The
-   counterpart is one volume's share of measured RAM, read from `/proc/meminfo` **and the
-   cgroup**, because an Agent in a container with a 2 GiB limit on a 256 GiB host must not
-   size itself from the host. Operational, not correctness: the bound exists, fires, and has
-   a proven escape hatch.
+**Nothing here blocks a pilot, and nothing is queued.** Nine blockers closed, then 22
+regressions those fixes caused found by a re-run and closed, then the six residuals, then the
+last derivation — every bound in the Agent is now a division of something it measured. `git
+log` has all of it. What is left is only what a running tenant can answer.
 
 ## What only a pilot can answer
 
@@ -47,8 +40,10 @@ Named here so nobody mistakes them for things that were checked.
 - **Two hosts under real load for hours** has never been run. The takeover lanes were minutes.
 - **An upgrade of a running fleet** has never been run. A restart resumes at the same epoch;
   two versions serving at once is untested, and INV-19 becomes binding exactly there.
-- **Sustained multi-volume load.** The soak was one volume; the device budget divides by
-  `-max-volumes` and that division has never been under pressure from more than one guest.
+- **Sustained multi-volume load.** The soak was one volume; the device budget and the read
+  view's memory bound both divide by `-max-volumes`, and neither division has ever been under
+  pressure from more than one guest. `ViewRatio` (a quarter of the machine, across all
+  volumes) is the number a real fleet would move first.
 
 ## Thin paths that shipped without being deepened
 

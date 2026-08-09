@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 
+	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -48,6 +49,36 @@ const (
 	ReserveRatio = 0.05
 )
 
+// The same division applied to memory, for the read view (wal.Limits.MaxViewBytes).
+//
+// ViewRatio is the share of this Agent's memory that may sit in read views across every
+// volume it serves. It is a quarter and not GuestRatio's 0.85, because a device is
+// almost entirely what the guests put on it while memory is mostly *not*: the same
+// process holds a WAL segment buffer per volume, the vhost-user mappings of every
+// guest's rings, whatever a publish is streaming through image.Publish, and the Go
+// runtime around all of it. And the failure modes are not symmetric — a device that
+// fills says ENOSPC on the volume that filled it, while memory that runs out is the OOM
+// killer taking the Agent and every other tenant's session with it. The asymmetry is
+// paid for in the ratio.
+//
+// ViewRSSFactor is measured, not chosen: cow.ExtentOverheadBytes records process RSS at
+// 2.07 and 2.04 times cow.Cost.Memory across an eight-fold change in extent density,
+// because a guest writing distinct blocks churns the extent slice on every write and the
+// heap sits at its GOGC goal of twice the live heap. The bound compares against
+// Cost.Memory, so what a volume actually costs the host is twice its bound, and dividing
+// by two here is what makes the sum of the bounds a statement about RSS.
+//
+// The two together reproduce the constant they replace on the machine that constant was
+// chosen for: 32 GiB × 0.25 ÷ 16 volumes ÷ 2 = 256 MiB, which was wal.DefaultMaxViewBytes.
+// That is the point — the judgement is unchanged, and it is now a division the machine
+// participates in rather than a number that is only right on a 32 GiB host. On an 8 GiB
+// host the old constant entitled 16 volumes to 8.5 GiB of read view; this gives them
+// 64 MiB each.
+const (
+	ViewRatio     = 0.25
+	ViewRSSFactor = 2
+)
+
 // DefaultMaxVolumes is the fan-out a host's device is divided by when nobody says
 // otherwise. It is what -max-volumes defaults to.
 //
@@ -69,8 +100,9 @@ const DefaultMaxVolumes = 16
 // every attached volume has written, and the only thing standing between a busy host
 // and ENOSPC is this division.
 //
-// The share is **static**, computed once from the measured device and the configured
-// fan-out, rather than divided among the volumes actually attached. The dynamic version
+// Both shares — the device's and the read view's — are **static**, computed once from
+// the measured machine and the configured fan-out, rather than divided among the volumes
+// actually attached. The dynamic version
 // is the obvious one and it does not work: a share that shrinks when a volume attaches
 // would put logs that are already over their new share into backpressure retroactively
 // — a guest that was writing happily starts failing WRITEs because a *different* volume
@@ -93,8 +125,15 @@ type Budget struct {
 	ReserveBytes int64
 	// GuestBytes is what every volume on this host may hold locally, together.
 	GuestBytes int64
-	// MaxVolumes is the fan-out GuestBytes is divided by, and the number of volumes
-	// this Agent will serve at once.
+	// MemoryBytes is the memory this Agent may use before something kills it, as it
+	// measured it: the machine's RAM, or the cgroup limit under it (real.MeasureMemory).
+	// The cgroup is the case that matters — an Agent in a 2 GiB container on a 256 GiB
+	// host that sized itself from the host would set a per-volume read-view bound 128x
+	// too large, and in a container the OOM killer takes the Agent, not the guest that
+	// caused it.
+	MemoryBytes int64
+	// MaxVolumes is the fan-out GuestBytes and MemoryBytes are divided by, and the
+	// number of volumes this Agent will serve at once.
 	MaxVolumes int
 }
 
@@ -106,9 +145,15 @@ type Budget struct {
 // the whole point of the type — an Agent with no budget has no write-path bound at
 // all, which is what every Agent this repository has ever run had, because nothing set
 // wal.Limits.
-func NewBudget(u disk.Usage, maxVolumes int) (Budget, error) {
+func NewBudget(u disk.Usage, memBytes int64, maxVolumes int) (Budget, error) {
 	if u.TotalBytes <= 0 {
 		return Budget{}, fmt.Errorf("agent: a device budget needs a measured device; statfs reported %d bytes", u.TotalBytes)
+	}
+	// A machine that could not be measured is refused for the same reason as a device
+	// that could not: there is no honest default for how much memory a host has. A
+	// constant here would be exactly the 256 MiB this derivation exists to remove.
+	if memBytes <= 0 {
+		return Budget{}, fmt.Errorf("agent: a budget needs a measured machine; memory was reported as %d bytes", memBytes)
 	}
 	if maxVolumes <= 0 {
 		return Budget{}, fmt.Errorf("agent: a device budget needs a volume fan-out to divide by; got %d", maxVolumes)
@@ -116,6 +161,7 @@ func NewBudget(u disk.Usage, maxVolumes int) (Budget, error) {
 	b := Budget{
 		DeviceBytes:  u.TotalBytes,
 		ReserveBytes: int64(ReserveRatio * float64(u.TotalBytes)),
+		MemoryBytes:  memBytes,
 		MaxVolumes:   maxVolumes,
 	}
 	b.GuestBytes = int64(GuestRatio*float64(u.TotalBytes)) - b.ReserveBytes
@@ -123,6 +169,36 @@ func NewBudget(u disk.Usage, maxVolumes int) (Budget, error) {
 		return Budget{}, fmt.Errorf(
 			"agent: a %d-byte device leaves %d bytes for %d volumes: no volume can be served on it",
 			u.TotalBytes, b.GuestBytes, maxVolumes)
+	}
+	// Refused rather than floored, and the threshold is derived rather than picked.
+	//
+	// **Not floored**, because a floor is only safe where exceeding it is safe. Rounding
+	// a share up would hand every volume a bound the machine cannot honour: the number
+	// would stop being one volume's share of anything, the sum across the fan-out would
+	// exceed the memory this process has, and the failure the floor was there to avoid —
+	// the OOM killer, silent, in another process, to volumes that did nothing wrong — is
+	// exactly the one it would then produce. The device side refuses for the same reason
+	// (Share() above, and NewVolumeManager).
+	//
+	// **The threshold is one extent, and no larger**, which is the only line here that
+	// is not a matter of taste: the bound is compared against cow.Cost.Memory, which
+	// charges cow.ExtentOverheadBytes for the structure of every extent, so a share
+	// under that admits no write at all — the first WRITE of the session crosses the
+	// bound, and only DISCARD shrinks a view, so there is nothing to discard and the
+	// volume never serves.
+	//
+	// Above it, a small share is served rather than refused, and that is the deliberate
+	// half. A 2 GiB container serving sixteen volumes gives each a 16 MiB view; that is
+	// a guest that meets backpressure early, which is an I/O error on the volume that
+	// caused it and a line in the log naming the share. Refusing it instead would need a
+	// threshold — "16 MiB is too small, 64 MiB is fine" — and that number would be
+	// exactly the constant somebody chose that this whole derivation exists to remove.
+	// The operator's knob is real and the error below names it: the share is memory ÷
+	// fan-out, so a host that cannot serve sixteen volumes can serve two.
+	if b.ViewShare() < cow.ExtentOverheadBytes {
+		return Budget{}, fmt.Errorf(
+			"agent: %d bytes of memory across %d volumes leaves each %d bytes of read view, less than the %d one extent costs: no volume can be served on it. Lower -max-volumes, or give this Agent more memory",
+			memBytes, maxVolumes, b.ViewShare(), cow.ExtentOverheadBytes)
 	}
 	return b, nil
 }
@@ -133,6 +209,20 @@ func (b Budget) Share() int64 {
 		return 0
 	}
 	return b.GuestBytes / int64(b.MaxVolumes)
+}
+
+// ViewShare is one volume's slice of this Agent's memory: what its read view may cost
+// (cow.Cost.Memory), which is half of what it costs the host in RSS.
+//
+// Zero when the machine was never measured — a Budget literal in a test — and a Log given
+// a zero bound falls back to wal.DefaultMaxViewBytes, which is a bound and not
+// "unbounded". Production never takes that path: NewBudget refuses a budget it cannot
+// derive this from.
+func (b Budget) ViewShare() int64 {
+	if b.MaxVolumes <= 0 || b.MemoryBytes <= 0 {
+		return 0
+	}
+	return int64(ViewRatio*float64(b.MemoryBytes)) / int64(b.MaxVolumes) / ViewRSSFactor
 }
 
 // Limits is the bound handed to one volume's Log. It is where wal.Limits comes from in
@@ -154,11 +244,18 @@ func (b Budget) Share() int64 {
 // segments would be the entire share, which is the case it would break rather than
 // protect. The 32 MiB cap is wal.SegmentBytes, the default this replaces: past it
 // segments stop buying anything and each one is a bigger crash-tail to re-scan.
+//
+// MaxViewBytes is the other half of the same idea, and the reason ViewShare exists: the
+// device bound is one volume's share of a device this host measured, and the read view's
+// counterpart is one volume's share of the memory this host measured. It was a constant
+// until this derivation replaced it — 256 MiB, on every machine, whatever the machine
+// was — and 256 MiB × 16 volumes × the measured 2x RSS factor is 8.5 GiB of read view on
+// a host that may have 8 GiB.
 func (b Budget) Limits() wal.Limits {
 	share := b.Share()
 	seg := share / 8
 	if seg > wal.SegmentBytes {
 		seg = wal.SegmentBytes
 	}
-	return wal.Limits{MaxLocalBytes: share, SegmentBytes: seg}
+	return wal.Limits{MaxLocalBytes: share, SegmentBytes: seg, MaxViewBytes: b.ViewShare()}
 }

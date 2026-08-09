@@ -8,6 +8,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -72,7 +73,7 @@ func TestABudgetIsADividedDevice(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			b, err := agent.NewBudget(disk.Usage{TotalBytes: tc.total}, tc.maxVolumes)
+			b, err := agent.NewBudget(disk.Usage{TotalBytes: tc.total}, testMemory, tc.maxVolumes)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("a %d-byte device divided by %d was accepted: %+v", tc.total, tc.maxVolumes, b)
@@ -157,5 +158,248 @@ func TestAHostServesNoMoreVolumesThanItsBudgetWasDividedBy(t *testing.T) {
 	}
 	if _, ok := m.Device(desired[2].GetVolumeId()); ok {
 		t.Fatal("the volume past the fan-out is being served: its writes are bounded by a share nobody counted")
+	}
+}
+
+// testMemory is the machine the device-budget cases above are divided on. It is a
+// separate axis from the device — a host can have a big disk and little RAM, and the
+// point of the table above is the disk — so it is held fixed there and driven on its own
+// below.
+const testMemory = 32 << 30
+
+// TestTheReadViewBoundIsOneVolumesShareOfTheMemoryThisAgentHas is the counterpart of
+// TestABudgetIsADividedDevice for the one per-volume structure the *guest* sizes.
+//
+// Before this, `wal.Limits.MaxViewBytes` came from a constant somebody chose: 256 MiB,
+// on every machine, so 16 volumes on an 8 GiB host were entitled to 8.5 GiB of read view
+// in RSS and the OOM killer was the only thing that would notice. A bound that is not
+// derived from the machine is wrong on every machine but the one it was tried on.
+//
+// The cases are the machines that break a constant: the one it was chosen for, a
+// container two orders of magnitude smaller than its host, and a host too small to be
+// divided at all.
+func TestTheReadViewBoundIsOneVolumesShareOfTheMemoryThisAgentHas(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		memory     int64
+		maxVolumes int
+		want       int64
+		wantErr    bool
+	}{
+		{
+			// The number the deleted constant was chosen for, reproduced by the
+			// derivation on the machine it was chosen on. That is the evidence that
+			// the ratios are the old judgement rewritten as a division, not a new
+			// guess: 32 GiB × 0.25 ÷ 16 ÷ 2 = 256 MiB.
+			name:   "the 32 GiB host the old constant was sized for gets the old constant",
+			memory: 32 << 30, maxVolumes: agent.DefaultMaxVolumes, want: 256 << 20,
+		},
+		{
+			// The case that matters most, and the one no constant can serve: an Agent
+			// in a 2 GiB container. 256 MiB × 16 volumes × 2 (the RSS factor) is
+			// 8 GiB of read view inside a 2 GiB limit — a 4x overcommit of a limit
+			// whose enforcement is the OOM killer taking the whole process.
+			name:   "a 2 GiB container sizes itself from the container",
+			memory: 2 << 30, maxVolumes: agent.DefaultMaxVolumes, want: 16 << 20,
+		},
+		{
+			// The same container with the fan-out an operator lowers to fit it: the
+			// remedy the refusal below names, and it has to actually work.
+			name:   "lowering the fan-out is what buys a volume a bigger view",
+			memory: 2 << 30, maxVolumes: 2, want: 128 << 20,
+		},
+		{
+			name:   "a 512 GiB host is not held to a 256 MiB constant",
+			memory: 512 << 30, maxVolumes: agent.DefaultMaxVolumes, want: 4 << 30,
+		},
+		{
+			// Not a limit, not a default: an Agent that could not measure its memory
+			// has nothing to divide, and a Budget that quietly filled in a number
+			// would be the constant this test exists to remove, wearing a fallback's
+			// clothes.
+			name:   "a machine whose memory was never measured is refused",
+			memory: 0, maxVolumes: agent.DefaultMaxVolumes, wantErr: true,
+		},
+		{
+			name:   "a negative measurement is refused",
+			memory: -1, maxVolumes: 4, wantErr: true,
+		},
+		{
+			// The only threshold that is not a matter of taste: a share under what one
+			// extent's structure costs (cow.ExtentOverheadBytes) admits no write at
+			// all, so the volume takes ErrViewBound on its first WRITE and — nothing
+			// but DISCARD shrinks a view — never gets out of it. 8 KiB × 0.25 ÷ 16 ÷ 2
+			// is 64 bytes. See NewBudget for why nothing between here and comfortable
+			// is refused, and why nothing is floored.
+			name:   "a machine that cannot give a volume a single extent is refused",
+			memory: 8 << 10, maxVolumes: agent.DefaultMaxVolumes, wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := agent.NewBudget(disk.Usage{TotalBytes: 1 << 40}, tc.memory, tc.maxVolumes)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("a %d-byte machine divided by %d was accepted, with a %d-byte view bound per volume",
+						tc.memory, tc.maxVolumes, b.ViewShare())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewBudget: %v", err)
+			}
+			if b.MemoryBytes != tc.memory {
+				t.Fatalf("the budget describes a %d-byte machine, the measurement said %d", b.MemoryBytes, tc.memory)
+			}
+			if b.ViewShare() != tc.want {
+				t.Fatalf("one volume's read view is bounded at %d bytes on a %d-byte machine serving %d volumes, want %d",
+					b.ViewShare(), tc.memory, tc.maxVolumes, tc.want)
+			}
+			// The property the division exists for, and the one a per-volume constant
+			// cannot have: every volume at its bound, at the measured RSS factor, is
+			// still inside the fraction of the machine set aside for read views. A
+			// bound that only satisfies "some bound exists" passes without it.
+			if rss := b.ViewShare() * int64(tc.maxVolumes) * agent.ViewRSSFactor; rss > int64(agent.ViewRatio*float64(tc.memory)) {
+				t.Fatalf("%d volumes at %d bytes cost %d bytes of RSS on a %d-byte machine: the machine is not divided",
+					tc.maxVolumes, b.ViewShare(), rss, tc.memory)
+			}
+			// The bound reaches the Log, which is the only place it does anything.
+			if got := b.Limits().MaxViewBytes; got != b.ViewShare() {
+				t.Fatalf("the Log is handed a %d-byte view bound; the volume's share is %d", got, b.ViewShare())
+			}
+		})
+	}
+}
+
+// TestTheViewShareDoesNotMoveWhenVolumesArrive. The share is one volume's slice of the
+// fan-out, not of the volumes attached right now, for the reason the device share is
+// static: a bound that shrank when a second volume attached would put a guest that was
+// writing happily into backpressure because a *different* volume arrived on the host,
+// and a Log documents its limits as fixed for its life.
+//
+// The evidence is the manager's, not the type's: a Budget is a value and cannot change,
+// so the way this property gets lost is a manager that recomputes. Attach volumes, and
+// ask what a Log built after them is bounded by.
+func TestTheViewShareDoesNotMoveWhenVolumesArrive(t *testing.T) {
+	t.Parallel()
+	b, err := agent.NewBudget(disk.Usage{TotalBytes: 1 << 40}, 32<<30, 4)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	before := b.Limits().MaxViewBytes
+
+	f := newListenerFactory()
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin", Budget: b,
+	}, agent.VolumeManagerDeps{
+		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+		Disk:    sim.NewDisk(),
+		Listen:  f.listen,
+		Mapper:  unusedMapper{},
+		EventFD: unusedEventFD,
+	})
+	if err != nil {
+		t.Fatalf("NewVolumeManager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close(context.Background()) }) //nolint:usetesting // see newTestManager
+
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{desiredVolume(t, 1), desiredVolume(t, 1)}); err != nil {
+		t.Fatalf("attaching two volumes: %v", err)
+	}
+	if after := b.Limits().MaxViewBytes; after != before {
+		t.Fatalf("a volume's read-view bound moved from %d to %d because other volumes attached", before, after)
+	}
+	if before != 1<<30 {
+		t.Fatalf("each of 4 volumes on a 32 GiB machine is bounded at %d bytes, want 1 GiB", before)
+	}
+}
+
+// TestAGuestIsRefusedAtTheViewBoundItsAgentDerived is the assertion that makes the
+// derivation load-bearing rather than printed.
+//
+// Everything above is arithmetic on a value type, and arithmetic is satisfied by an
+// Agent that computes the share, logs it, and hands its Logs a constant anyway — which
+// is precisely the failure this repository keeps finding: a well-tested number no caller
+// uses. So this one goes through the production path end to end (NewBudget →
+// VolumeManager → the volume's Log) and asserts on what the *guest* gets back: the
+// offset at which its writes start failing, and the sentence it fails with.
+//
+// The machine is 256 MiB across 4 volumes, which derives an 8 MiB view — deliberately
+// far below wal.DefaultMaxViewBytes, so an Agent still holding the old constant would
+// take every write this test issues and never refuse one.
+func TestAGuestIsRefusedAtTheViewBoundItsAgentDerived(t *testing.T) {
+	t.Parallel()
+	const (
+		machine   = 256 << 20
+		volumes   = 4
+		blockSize = 4096
+		// Bigger than the derived view, so the bound is reached before the device is.
+		volumeSize = 64 << 20
+	)
+	b, err := agent.NewBudget(disk.Usage{TotalBytes: 1 << 40}, machine, volumes)
+	if err != nil {
+		t.Fatalf("NewBudget: %v", err)
+	}
+	if b.ViewShare() != 8<<20 {
+		t.Fatalf("this test is built on an 8 MiB view share; the derivation gives %d", b.ViewShare())
+	}
+
+	f := newListenerFactory()
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir: "/var/lib/spin", SocketDir: "/run/spin", Budget: b,
+	}, agent.VolumeManagerDeps{
+		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+		Disk:    sim.NewDisk(),
+		Listen:  f.listen,
+		Mapper:  unusedMapper{},
+		EventFD: unusedEventFD,
+	})
+	if err != nil {
+		t.Fatalf("NewVolumeManager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close(context.Background()) }) //nolint:usetesting // see newTestManager
+
+	vol := &storagev1.DesiredVolume{
+		VolumeId: ids.New().String(), SizeBytes: volumeSize, BlockSize: blockSize,
+		Epoch: 1, State: storagev1.VolumeState_VOLUME_STATE_ACTIVE,
+	}
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{vol}); err != nil {
+		t.Fatalf("attaching the volume: %v", err)
+	}
+	dev, ok := m.Device(vol.GetVolumeId())
+	if !ok {
+		t.Fatal("the volume is not being served")
+	}
+
+	// Distinct offsets, because the bound is on the *view* — rewriting one block for
+	// ever costs nothing and would loop until the volume was full of nothing.
+	block := make([]byte, blockSize)
+	var accepted int64
+	var refusal error
+	for off := int64(0); off+blockSize <= volumeSize; off += blockSize {
+		if _, err := dev.WriteAt(block, off); err != nil {
+			refusal = err
+			break
+		}
+		accepted += blockSize
+	}
+	if refusal == nil {
+		t.Fatalf("the guest wrote %d bytes of distinct blocks — the whole volume — with no refusal; its read view was bounded at %d bytes, or at nothing",
+			accepted, b.ViewShare())
+	}
+	// The remedy in the sentence is the guest's own (DISCARD, which is exempt from this
+	// bound), not the operator's — a view bound reported as a full device would send an
+	// operator to stop and republish a volume an fstrim would have freed.
+	if !strings.Contains(refusal.Error(), "read view") {
+		t.Fatalf("the guest was refused with a sentence that does not name the read view: %v", refusal)
+	}
+	// Where it was refused, and this is the number a constant cannot produce: the view
+	// costs its payload plus cow.ExtentOverheadBytes per extent, so a guest writing
+	// 4 KiB blocks is refused a little before it has written the share itself.
+	if accepted > b.ViewShare() || accepted < b.ViewShare()/2 {
+		t.Fatalf("the guest wrote %d bytes before its read view was refused; the share this Agent derived is %d",
+			accepted, b.ViewShare())
 	}
 }

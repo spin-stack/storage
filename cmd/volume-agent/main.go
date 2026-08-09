@@ -188,7 +188,24 @@ func run() (err error) {
 	if err != nil {
 		return err
 	}
-	budget, err := agent.NewBudget(usage, *maxVolumes)
+	// And the machine, for the same reason and in the same shape. The read view is the
+	// one per-volume structure the *guest* sizes — one entry per distinct region it has
+	// written, and nothing shrinks it during a session — so its bound was the only one
+	// in this Agent that was a constant rather than a division: 256 MiB per volume,
+	// whether this host has 8 GiB or 512 GiB, times -max-volumes, with the OOM killer as
+	// the enforcement. An OOM takes the whole Agent and every other tenant's session with
+	// it, which is the one failure the guests cannot be told about.
+	//
+	// It is measured here rather than behind an interface because nothing runs through
+	// it: two numbers, read once, before any volume exists (real.MeasureMemory says why).
+	// A failure is fatal for the same reason the device's is — a machine that will not
+	// say how big it is offers no honest fallback, since guessing high ends at the OOM
+	// killer and guessing low throttles guests on a host that was fine.
+	mem, err := real.MeasureMemory()
+	if err != nil {
+		return err
+	}
+	budget, err := agent.NewBudget(usage, mem.LimitBytes, *maxVolumes)
 	if err != nil {
 		return err
 	}
@@ -328,7 +345,14 @@ func run() (err error) {
 		"heartbeat_interval", cfg.HeartbeatInterval,
 		"device_bytes", budget.DeviceBytes, "guest_budget_bytes", budget.GuestBytes,
 		"reserve_bytes", budget.ReserveBytes, "max_volumes", budget.MaxVolumes,
-		"volume_share_bytes", budget.Share(), "metrics_listen", *metricsListen)
+		"volume_share_bytes", budget.Share(),
+		// The memory half, and memory_source is what makes the number checkable: on a
+		// 256 GiB host running this Agent in a 2 GiB container, memory_bytes=2147483648
+		// looks like a parse bug until the line says it came from
+		// /sys/fs/cgroup/memory.max, which the operator can cat.
+		"memory_bytes", budget.MemoryBytes, "memory_source", mem.Source,
+		"volume_view_share_bytes", budget.ViewShare(),
+		"metrics_listen", *metricsListen)
 
 	// Started with the loop and stopped with it: ctx is what ends both. It reads the
 	// devices the loop's VolumeManager owns, so it cannot start before that exists.

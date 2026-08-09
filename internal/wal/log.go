@@ -68,29 +68,27 @@ type Watermarks struct {
 	Published uint64
 }
 
-// DefaultMaxViewBytes is the read-view bound a Log uses when its caller sets none. It
-// is a ceiling chosen from two measurements and one configured number, and it is meant
-// to be replaced by a derivation, not kept:
+// DefaultMaxViewBytes is the read-view bound a Log uses when its caller sets none — a
+// unit test, a DST scenario, anything that builds a Log without a machine behind it. It
+// is not what production runs on: an Agent derives the bound from the memory it measured
+// and divides it by its volume fan-out (agent.Budget.ViewShare), because a per-volume
+// constant is wrong on every machine but the one it was tried on. 256 MiB × 16 volumes ×
+// the 2x RSS factor below is 8.5 GiB of read view, which fits a 32 GiB host and is four
+// times an 8 GiB one.
+//
+// The number kept here is that same 32 GiB host's answer, which is where it came from:
 //
 //   - measured (cow.ExtentOverheadBytes), a view being written costs 2.0x its
 //     cow.Cost.Memory in process RSS — 2.07 and 2.04 across an eight-fold change in
 //     extent density, so the factor is stable enough to size against;
 //   - agent.DefaultMaxVolumes is 16, so a fully loaded host runs 16 of these at once;
 //   - 256 MiB × 16 × 2 ≈ 8.5 GiB of RSS in read views on a host that is full, which
-//     leaves room on the 32 GiB class of machine this is being brought up on.
+//     leaves room on the 32 GiB class of machine this was brought up on.
 //
-// It is *not* derived from anything this package can see, and that is the gap: the
-// device bound is one volume's share of a device this Agent measured (statfs, via
-// agent.Budget), and the honest counterpart is one volume's share of RAM this Agent
-// measured. Nothing in the tree reads memory yet — there is no simio equivalent of
-// disk.Usage — so the caller's derivation is missing and this constant stands in for it.
-// The Agent should compute it in agent.Budget.Limits alongside MaxLocalBytes, from a
-// measured MemTotal/MemAvailable divided by MaxVolumes and by the factor of two above.
-//
-// Sizing it is a real trade and not a formality: a volume whose session working set
-// exceeds this stops writing, because nothing shrinks the view mid-session. Raising it
-// buys a bigger working set and spends the host's RAM; the number that must never be
-// chosen is "unbounded", which is what every Agent ran with until this field existed.
+// What it must never be is "unbounded", which is what every Agent ran with until this
+// field existed and what a caller that sets nothing would otherwise get: a volume whose
+// session working set outgrows its bound stops writing, and one whose bound is absent
+// stops the host.
 const DefaultMaxViewBytes int64 = 256 << 20
 
 // Limits bound the local WAL (§5.7).
@@ -136,6 +134,9 @@ type Limits struct {
 	// RSS, 110k → 929 MB, 195,658 → 1.55 GiB, monotonic, with the OOM killer as the
 	// only limit — and an OOM takes down every other tenant's volume on the host, which
 	// is the failure the pilot bar rules out.
+	//
+	// The Agent always sets it: it is the volume's share of the memory that Agent
+	// measured, divided by the same fan-out the device share is (agent.Budget.ViewShare).
 	//
 	// Zero means DefaultMaxViewBytes, **not unbounded**, and the asymmetry with
 	// MaxLocalBytes above is deliberate. An unbounded MaxLocalBytes ends at ENOSPC,

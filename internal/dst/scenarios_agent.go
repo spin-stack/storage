@@ -1456,7 +1456,13 @@ func scenarioDeviceBudgetHoldsAcrossVolumes(s *Sim) error {
 	if err != nil {
 		return fmt.Errorf("measuring the simulated device: %w", err)
 	}
-	budget, err := agent.NewBudget(usage, 4)
+	// The memory this simulated host has. It is deliberately large next to the 4 MiB
+	// device: this scenario is about the *device* bound, and a machine small enough for
+	// the read-view bound to fire first would prove backpressure arrived without proving
+	// which bound produced it — the assertion below is on what the simulated statfs
+	// reports, and a volume stopped by its view never fills a byte of disk.
+	const machine = 8 << 30
+	budget, err := agent.NewBudget(usage, machine, 4)
 	if err != nil {
 		return fmt.Errorf("dividing a %d-byte device: %w", device, err)
 	}
