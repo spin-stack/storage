@@ -17,7 +17,7 @@ import (
 
 // ObjectStore is a filesystem-backed object store used for local/dev mode (§6.2). The
 // production S3-SDK-backed store is the §24 subsystem, and it lives next door in s3.go
-// behind this same objectstore.Store contract (ADR-0010). This one satisfies that
+// behind this same objectstore.Store contract. This one satisfies that
 // contract without a network, which is what lets the DST harness and the whole contract
 // suite run in-process.
 //

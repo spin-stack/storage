@@ -5,7 +5,8 @@
 // (Castagnoli) over the pre-CRC header bytes. Crypto fields (KeyID, AuthTag) are
 // present but zero in Phase 04; Phase 05 turns them on without a format change.
 //
-// Header sizes are 104 bytes (not the "96" in the doc — see ADR-0005 / DEV-0001).
+// Header sizes are 104 bytes, not the "96" the design doc states: the fields it
+// enumerates sum to 104, and the 96 predates v5's crypto fields.
 package format
 
 import (
@@ -18,7 +19,8 @@ import (
 // FormatVersion is the current WAL format major (magic-tagged, §27).
 const FormatVersion uint16 = 2
 
-// Header sizes are 104 bytes (ADR-0005 / DEV-0001; the doc's "96" is an erratum).
+// Header sizes are 104 bytes; the design doc's "96" is an erratum (it predates the
+// crypto fields). TestRecordHeaderSizeIs104 pins it.
 const (
 	RecordHeaderSize int = 104
 	ObjectHeaderSize int = 104

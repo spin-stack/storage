@@ -46,7 +46,7 @@ func TestRecordTypeString(t *testing.T) {
 
 func TestRecordHeaderSizeIs104(t *testing.T) {
 	if format.RecordHeaderSize != 104 || format.ObjectHeaderSize != 104 {
-		t.Fatalf("header sizes must be 104 (ADR-0005): rec=%d obj=%d",
+		t.Fatalf("header sizes must be 104 (the doc's 96 is an erratum): rec=%d obj=%d",
 			format.RecordHeaderSize, format.ObjectHeaderSize)
 	}
 	b, _ := sampleRecordHeader().MarshalBinary()

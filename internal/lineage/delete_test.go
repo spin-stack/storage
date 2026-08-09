@@ -255,7 +255,7 @@ func TestADeleteNeverLeavesAManifestOverMissingChunks(t *testing.T) {
 			switch {
 			case errors.Is(lerr, image.ErrNotPublished):
 				// The manifest is gone. Whatever is left under the volume's names is
-				// unreferenced storage, which is the acceptable half of ADR-0012's
+				// unreferenced storage, which is the acceptable half of the
 				// asymmetry: an object collected late costs storage, an object
 				// collected early costs data.
 			case lerr != nil:

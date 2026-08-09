@@ -112,8 +112,8 @@ type Removed struct {
 // manifests and every other manifest in the lineage. It is computable, it costs a read
 // of every manifest of every volume in the lineage, and it is precisely the kind of
 // derived reachability whose one wrong answer costs data rather than storage —
-// ADR-0012's own asymmetry, "an object collected one cycle late costs storage, an
-// object collected one cycle early costs data".
+// the asymmetry that governs anything that reclaims: an object collected one cycle late
+// costs storage, an object collected one cycle early costs data.
 func Delete(ctx context.Context, store objectstore.Store, volumeID string) (Removed, error) {
 	var res Removed
 	u, err := ids.Parse(volumeID)

@@ -18,7 +18,7 @@ import (
 //
 // Refusing it at construction is the difference between a five-second fix and an
 // afternoon. This is the boundary Parse belongs at: rejecting a bad value where it
-// enters, rather than letting it flow inward (ADR-0009's argument, applied to the id).
+// enters, rather than letting it flow inward.
 func TestConfigRefusesAHostIDThatIsNotAUUIDv7(t *testing.T) {
 	base := func() agent.Config {
 		return agent.Config{

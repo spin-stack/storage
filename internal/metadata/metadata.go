@@ -386,8 +386,7 @@ type Store interface {
 	// DRAINING host still renews: both are still serving the volumes they hold, and
 	// stopping their ACKs for the whole evacuation is the failure that would cause.
 	//
-	// There is no revocation window and no way to take a lease back. ADR-0016 stage 1
-	// added both so that the lease a promotion revoked to fence a source could not be
+	// There is no revocation window and no way to take a lease back. Both once existed so that the lease a promotion revoked to fence a source could not be
 	// re-armed by the source's next heartbeat; ADR-0026 then withdrew the promotion,
 	// and the ADR's own amendment says what is left of the window is empty — "a
 	// revocation stops nothing on the data path", because the lease is a liveness

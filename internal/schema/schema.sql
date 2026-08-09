@@ -27,7 +27,7 @@
 -- every identity column because a copied rule holds where somebody remembered to
 -- copy it: active_root_id and published_root_id went without one from the start, and
 -- nothing said so. A new table gets the rule by declaring the type — the same move
--- internal/lifecycle made in Go for the state vocabularies (ADR-0009).
+-- internal/lifecycle made in Go for the state vocabularies.
 --
 -- Foreign-key referencing columns stay plain `uuid`: they can only hold a value that
 -- is already in a v7-checked primary key, so the rule reaches them transitively, and
@@ -86,7 +86,7 @@ CREATE TABLE hosts (
     last_heartbeat       TIMESTAMPTZ NOT NULL,
     -- There is deliberately no renewals_blocked_until column either, and it is a
     -- different deletion from the one above: this one held a mechanism that worked.
-    -- ADR-0016 stage 1 refused a host's lease renewals for the length of one
+    -- A withdrawn mechanism refused a host's lease renewals for the length of one
     -- promotion, so that the lease the Control Plane revoked to fence a source could
     -- not be re-armed by the source's next heartbeat. ADR-0026 then withdrew the
     -- promotion, and the ADR's own amendment states the consequence: the window "is

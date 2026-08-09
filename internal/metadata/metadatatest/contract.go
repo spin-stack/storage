@@ -1252,8 +1252,8 @@ func hostLeases(t *testing.T, s metadata.Store) {
 	w := newWorld(t, s)
 
 	// A registered host that has never renewed holds no lease. Asserted here rather
-	// than after a revocation, because nothing revokes any more — ADR-0016 stage 1's
-	// Block/Unblock/RevokeHostLease went with the promotion that was their only
+	// than after a revocation, because nothing revokes any more — Block/Unblock/
+	// RevokeHostLease went with the promotion that was their only
 	// caller — and without this case the "no lease" answer would be a branch no test
 	// reaches, which is how a store that invents a zero-valued lease would pass.
 	if _, err := s.GetHostLease(ctx, w.host); !errors.Is(err, metadata.ErrNotFound) {

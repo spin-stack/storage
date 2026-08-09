@@ -80,8 +80,8 @@ const DefaultMaxVolumes = 16
 // retroactive: the volumes that never arrive cost this host unused headroom, which is
 // the failure mode an operator can see and lower -max-volumes for.
 //
-// Rejected too: deriving the share from the volume's declared size. ADR-0014 makes the
-// volume quota **soft** on purpose, and the backlog is driven by how long the session
+// Rejected too: deriving the share from the volume's declared size. The volume quota is
+// **soft** on purpose, and the backlog is driven by how long the session
 // runs, not by how big the volume was provisioned — a 10 GiB volume writing its blocks
 // over and over holds more WAL than a 1 TiB volume that was touched once.
 type Budget struct {
