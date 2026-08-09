@@ -73,7 +73,7 @@ var ErrChainTooDeep = errors.New("controlplane: the lineage is at its depth ceil
 // now a manifest states what its volume itself wrote and a read walks the ancestry
 // (`image.uploadChunks`, `agent.parentView`). That is what makes the ceiling below a real
 // bound rather than a number, and what makes deleting a parent take its descendants' data
-// with it — see DELETION-AND-RECLAIM-SPEC's answer B.
+// with it: deleting a parent whose clones still read through it is refused, not cascaded.
 //
 // **Where it lands is decided here, not passed in.** policy.Choose implements §20's
 // three steps — source host, a host with the data cached, any host with capacity — and
@@ -93,7 +93,7 @@ var ErrChainTooDeep = errors.New("controlplane: the lineage is at its depth ceil
 // outlived the thing it was a preference for. It is left in place rather than removed
 // because the preference costs nothing, is still the right destination if that cache is
 // ever built, and deleting it would also delete the only reason source_host_id is carried
-// into placement; what is removed is the claim. CHUNK-ADDRESSING-SPEC's opening section
+// into placement; what is removed is the claim. The chain-addressing decision
 // records the same finding, which is where it was found.
 //
 // The capacity ceilings travel with the write rather than being checked here

@@ -24,7 +24,7 @@
 // — CreateVolume's conflict path is
 // `parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED.parent_snapshot_id)`
 // — so no write path in the catalog can ever say "this volume no longer descends from
-// anything". Only the bucket can. DELETION-AND-RECLAIM-SPEC found that hole and made it
+// anything". Only the bucket can. That hole was found and made
 // FLATTEN's job to fill.
 //
 // # Every failure is closed

@@ -26,7 +26,7 @@ import (
 // holdingLine is what the Agent prints, on a schedule, while it refuses to let go.
 const holdingLine = "agent is holding unpublished data and will not release its data directory"
 
-// TestAnAgentThatCannotPublishHoldsItsDataDirectory is SHUTDOWN-PUBLISH-SPEC's second
+// TestAnAgentThatCannotPublishHoldsItsDataDirectory is the shutdown contract's second
 // observable, as the owner decided it on 2026-08-04: the object store is unreachable and
 // the Agent is SIGTERM'd, and the thing being asserted is that **it does not exit**.
 //

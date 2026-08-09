@@ -364,6 +364,32 @@ func (l *Log) backpressure(add int) error {
 	// headers only when they are written would mean the record that rotates a segment
 	// is the one record the bound does not cover — which is precisely the record that
 	// makes the log exceed it.
+	//
+	// # Why space is charged as it is written, and not reserved when a segment is created
+	//
+	// The rejected alternative was `fallocate` at rotation: reserve the whole segment's
+	// blocks up front so that no later append can meet ENOSPC, and carry a durable write
+	// offset in the segment header so replay knows where the records stop inside a file
+	// that is already full-size. It was examined and refused, and the refusal is here
+	// rather than in a document because this is the line a reader would question.
+	//
+	// Both halves of its case are wrong. The budget is charged *before* the record is
+	// written — this function, above — so no WRITE is ever half-accepted for want of
+	// space, which is what the reservation was meant to buy. And its stronger argument,
+	// that it would make a failed rollback unreachable, points the other way on
+	// inspection: a rollback is a Truncate *downward*, and truncating downward frees
+	// blocks. On ext4 and XFS it does not fail for want of space; what makes it fail is
+	// an I/O error, which a reservation does nothing about. The filesystems where a
+	// downward truncate genuinely can fail are the copy-on-write ones whose metadata
+	// must allocate to record the change — and those are exactly the ones where
+	// `fallocate` answers EOPNOTSUPP. The reservation buys its headline benefit where it
+	// is not needed and cannot buy it where it might be.
+	//
+	// The residual cost of not doing it is real and second-order: a device that fills
+	// from *outside* this Agent can still fail an append that this bound admitted,
+	// because the bound is over this host's own share and not over free space. That
+	// surfaces as ErrBackpressure to the guest and wal_out_of_space to the operator,
+	// which is the honest outcome, and it is why ReserveRatio exists in agent.Budget.
 	if l.limits.MaxLocalBytes > 0 &&
 		l.segs.retained()+int64(add)+int64(format.SegmentHeaderSize) > l.limits.MaxLocalBytes {
 		return ErrBackpressure

@@ -210,12 +210,12 @@ func TestLoadRefusesCorruptedChunks(t *testing.T) {
 //   - **it opens for a clone.** The clone below uploads nothing at all — its view is its
 //     parent's, so every chunk its manifest names is one its parent sealed — and it reads
 //     every byte back. An AAD that still named the writing volume would fail this, which
-//     is what §1.2 of CHUNK-ADDRESSING-SPEC reproduced before the change.
+//     is what the chain-addressing work reproduced before the change.
 //   - **it does not open for a stranger.** The same chunk objects and the same manifest
 //     are copied under an unrelated volume's identity, *with the same DEK*, and the load
 //     fails. The shared DEK is what makes this an assertion about the AAD: with a
 //     different key it would fail for a reason that says nothing about the binding, which
-//     is the mistake CHUNK-ADDRESSING-SPEC §1.2's control line exists to rule out.
+//     is the mistake this control line exists to rule out.
 //
 // The content is drawn rather than fixed because a binding that happened to hold for one
 // plaintext and not another would be a stranger defect than the one being tested for.

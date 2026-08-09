@@ -128,7 +128,7 @@ func TestAFailedPublishIsRetriedUntilTheStoreTakesIt(t *testing.T) {
 // The escape hatch, and the property that makes it safe to have one: abandoning names
 // what it abandoned, and the records are still on disk for the next incarnation.
 //
-// SHUTDOWN-PUBLISH-SPEC §6 wanted this pinned rather than left as a property nobody
+// The shutdown contract wanted this pinned rather than left as a property nobody
 // stated, because every "restart and it republishes" sentence in that document is false
 // without it.
 func TestAnAbandonedPublishNamesTheVolumeAndKeepsItsWAL(t *testing.T) {

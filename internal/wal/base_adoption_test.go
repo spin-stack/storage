@@ -16,7 +16,7 @@ import (
 // every reclaimed range — no error, no degraded flag, no log line — because Log.view was
 // rebuilt from local segments only and TruncateLocal unlinks exactly those.
 //
-// The setup below is the reproduction from VIEW-ADOPTION-SPEC.md, and the detail that
+// The setup below is the reproduction that found the defect, and the detail that
 // makes it a test rather than a formality is SegmentBytes: reclaim unlinks only *sealed*
 // segments, so a single record in the still-open one truncates nothing and the read comes
 // back correct whatever the view does. Nine Resume tests missed this by not looking.

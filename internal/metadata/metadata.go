@@ -83,7 +83,7 @@ var (
 
 	// ErrHasDescendants means a volume cannot be removed while another volume — or
 	// another volume's snapshot — still descends from one of its snapshots. It is the
-	// catalog half of DELETION-AND-RECLAIM-SPEC's first precondition, and it is a
+	// catalog half of deletion's first precondition, and it is a
 	// safety net rather than the check an operator meets: since publishing stopped
 	// flattening, `parent_snapshot_id` is write-once by construction, so the catalog
 	// keeps naming a parent a FLATTEN has already dissolved in the bucket. The command
@@ -514,7 +514,7 @@ type Store interface {
 	// DeleteVolume removes a volume and its snapshots from the catalog
 	// (term-guarded). There is no DELETING state and no timer: the row goes, and the
 	// recovery window belongs entirely to the bucket's own versioning and lifecycle
-	// policy (DELETION-AND-RECLAIM-SPEC's decision of 2026-08-07). Putting a retention
+	// policy — the recovery window is the bucket's, not ours. Putting a retention
 	// window in a column as well as in a bucket policy makes two of them, and they
 	// drift; only one of the two controls the bytes.
 	//
