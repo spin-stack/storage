@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,7 +204,7 @@ func TestFencedVolumesStopBeingServed(t *testing.T) {
 	}
 	socket := f.socketPaths()[0]
 
-	if err := m.Fence(ctx, []string{v.GetVolumeId()}); err != nil {
+	if err := m.Fence(ctx, []string{v.GetVolumeId()}, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""); err != nil {
 		t.Fatalf("Fence: %v", err)
 	}
 
@@ -236,7 +237,7 @@ func TestAFencedVolumeDoesNotComeBackAtTheSameEpoch(t *testing.T) {
 	if err := m.Apply(ctx, desired); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if err := m.Fence(ctx, []string{v.GetVolumeId()}); err != nil {
+	if err := m.Fence(ctx, []string{v.GetVolumeId()}, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""); err != nil {
 		t.Fatalf("Fence: %v", err)
 	}
 
@@ -307,7 +308,7 @@ func TestAFencedVolumeIsForgottenOnceItLeavesTheDesiredState(t *testing.T) {
 	if err := m.Apply(ctx, []*storagev1.DesiredVolume{v, other}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if err := m.Fence(ctx, []string{v.GetVolumeId()}); err != nil {
+	if err := m.Fence(ctx, []string{v.GetVolumeId()}, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""); err != nil {
 		t.Fatalf("Fence: %v", err)
 	}
 
@@ -681,12 +682,34 @@ func TestApplyReportsAFailureAndLeavesNothingHalfStarted(t *testing.T) {
 		t.Errorf("error %v does not carry the listener's failure", err)
 	}
 
+	if _, ok := m.Device(v.GetVolumeId()); ok {
+		t.Error("a half-started runtime survived the failure: the volume still has a device")
+	}
+
+	// It is reported, and this is the second half of the same rule. Nothing must be
+	// *running*, but the volume is still in the desired state, so it must still be on
+	// the wire — with a refusal on it. Until it was, a volume that could not start
+	// disappeared from the report entirely, and the fleet cannot tell an absent volume
+	// from one it never placed here: the catalog kept the watermarks of whatever last
+	// worked, and -fleet-status printed a healthy row for a volume with no runtime.
 	vols, verr := m.Volumes(ctx)
 	if verr != nil {
 		t.Fatalf("Volumes: %v", verr)
 	}
-	if len(vols) != 0 {
-		t.Errorf("a half-started runtime survived the failure: %+v", vols)
+	if len(vols) != 1 || vols[0].VolumeID != v.GetVolumeId() {
+		t.Fatalf("a volume that could not start is reported as %+v; the fleet has to be told about it", vols)
+	}
+	if got := vols[0].Refusal; got != storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED {
+		t.Errorf("refusal = %s, want ATTACH_FAILED", got)
+	}
+	if got := vols[0].Epoch; got != v.GetEpoch() {
+		t.Errorf("refusal reported under epoch %d, want %d — the Control Plane refuses any other", got, v.GetEpoch())
+	}
+	if !strings.Contains(vols[0].RefusalDetail, f.err.Error()) {
+		t.Errorf("refusal detail = %q, which does not say what went wrong", vols[0].RefusalDetail)
+	}
+	if vols[0].LocalSequence != 0 || vols[0].DurableSequence != 0 || vols[0].PublishedSequence != 0 {
+		t.Errorf("a volume that never opened reports watermarks %+v; it has observed nothing", vols[0])
 	}
 }
 

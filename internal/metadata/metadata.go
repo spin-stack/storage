@@ -297,6 +297,18 @@ type Volume struct {
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64
+	// Refusal is why the host that holds this volume is not serving it, and
+	// RefusalDetail is the sentence the Agent sent with it. RefusalNone — the zero
+	// value — is the host saying it is serving.
+	//
+	// **It is not a watermark and is deliberately not stored like one.** A watermark is
+	// the newest of a monotonic series, so GREATEST is right for it and a late report is
+	// harmless. A refusal is a *state*: it has to clear the moment the volume serves
+	// again, so the write is last-report-wins, and it must not be resurrected by a
+	// report from a host the fleet has moved past — so SetVolumeRefusal is qualified by
+	// the reporting host and epoch, which UpdateWatermarks deliberately is not.
+	Refusal       lifecycle.Refusal
+	RefusalDetail string
 	// FencingStartedAt is the instant the Control Plane observed the lease of the
 	// writer it is fencing, stamped by the store's own clock when the volume entered
 	// FENCING_WAIT (§7, ADR-0015). It is the durable half of the promotion dwell: a
@@ -573,6 +585,24 @@ type Store interface {
 	// monotonic, because promotion does not change the CP term and this number is
 	// what an operator reads during an incident.
 	UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error
+	// SetVolumeRefusal records why the host holding a volume is not serving it, or
+	// clears the record when it is (lifecycle.RefusalNone). Term-guarded.
+	//
+	// **It is qualified by the reporting host and epoch, and UpdateWatermarks
+	// deliberately is not.** The two are different kinds of fact and want opposite
+	// storage. A watermark is the newest of a monotonic series, so a late report from a
+	// fenced writer is merged with GREATEST and cannot do harm. A refusal is a *state*
+	// about right now: taking the newest would leave a volume marked NOT SERVED after it
+	// came back, and taking any report at all would let a host the fleet moved past
+	// resurrect a refusal over a volume its successor is serving perfectly well. So the
+	// write is last-report-wins **within** (hostID, epoch) and no-op outside it.
+	//
+	// A report that names the wrong host or epoch is not an error: it is a writer that
+	// has been fenced, whose opinion about whether the volume is being served is void.
+	// It affects no row and returns nil, the same shape as a placement cleared twice.
+	// ErrNotFound only for a volume that is not in the catalog at all.
+	SetVolumeRefusal(ctx context.Context, term int64, volumeID, hostID string, epoch int64,
+		refusal lifecycle.Refusal, detail string) error
 	// There is no ResizeVolume here any more, and **V1 does not resize a volume**.
 	// §3's objective 14 ("resize online (grow)") has no verb behind it; §9's promise
 	// that "el grow se propaga vía actualización del config space + notificación" has

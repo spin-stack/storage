@@ -2,6 +2,8 @@ package agent_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,17 +62,30 @@ func newLeaseHarness(t *testing.T) *leaseHarness {
 }
 
 // served is the set of volume ids the manager is serving right now.
+//
+// The refused ones are excluded, and the distinction is the point rather than a detail
+// of the helper: Volumes() reports every volume this host was told to serve, including
+// the ones it has given up, because a volume that vanishes from the report is a volume
+// the fleet cannot see. "Serving" is the subset with no refusal on it.
 func (h *leaseHarness) served(t *testing.T) []string {
+	t.Helper()
+	out := make([]string, 0)
+	for _, v := range h.reported(t) {
+		if v.Refusal == storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+			out = append(out, v.VolumeID)
+		}
+	}
+	return out
+}
+
+// reported is everything the next report will carry, refusals included.
+func (h *leaseHarness) reported(t *testing.T) []agent.VolumeStatus {
 	t.Helper()
 	vols, err := h.mgr.Volumes(t.Context())
 	if err != nil {
 		t.Fatalf("Volumes: %v", err)
 	}
-	out := make([]string, 0, len(vols))
-	for _, v := range vols {
-		out = append(out, v.VolumeID)
-	}
-	return out
+	return vols
 }
 
 func socketOf(volumeID string) string { return "/run/spin/" + volumeID + ".sock" }
@@ -137,6 +152,95 @@ func TestAnExpiredLeaseTakesTheSocketDown(t *testing.T) {
 	if h.loop.LeaseValid() {
 		t.Fatal("the loop still reports a valid lease after its TTL passed")
 	}
+
+	// And the fleet is told. Everything above is invisible from outside this process:
+	// the Control Plane still names this host the volume's primary at this epoch, so
+	// nothing moves and nothing else will notice — the volume simply stopped being
+	// reported, and an absence on the wire looks exactly like a volume that was never
+	// placed here. The partition ends, the Agent reaches the Control Plane again, and
+	// this is the sentence that says the device is gone.
+	//
+	// Asserted on the report the Agent *builds*, not on the manager's map: the map is
+	// the flag, and the report is what the fleet can act on.
+	h.cp.setErr(nil)
+	h.clk.Advance(time.Second)
+	_ = h.loop.Reconcile(ctx)
+	got := lastReportOf(t, h.cp, vol.GetVolumeId())
+	if got.GetRefusal() != storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST {
+		t.Fatalf("the report for a volume this host gave up says refusal=%s, want LEASE_LOST", got.GetRefusal())
+	}
+	if got.GetEpoch() != vol.GetEpoch() {
+		t.Fatalf("the refusal was reported under epoch %d, want %d — the Control Plane refuses any other",
+			got.GetEpoch(), vol.GetEpoch())
+	}
+	if !strings.Contains(got.GetRefusalDetail(), "lease") {
+		t.Fatalf("refusal detail = %q, and an operator has to be able to read why", got.GetRefusalDetail())
+	}
+}
+
+// TestACycleThatCouldNotStartAVolumeStillReportsIt is the hole the two real binaries
+// found, one layer above the one this field was added to close.
+//
+// The manager records the refusal, `Volumes` carries it, the report message has a field
+// for it, and the Control Plane stores it — and none of that fires, because `Reconcile`
+// returned at the first failure and the failure *is* `Apply`. So the one cycle with
+// something to say about a volume that could not start was the one cycle that never got
+// as far as saying it: an Agent stuck refusing a volume printed a WARN every second and
+// the fleet showed the volume ACTIVE for ever.
+//
+// Nothing in a unit test could see it. Every test of the refusal builds the manager and
+// asks it directly, which is the one caller that never goes through the loop; and the
+// loop's own tests use `agent.VolumeSet`, which cannot fail an Apply. It took a
+// `volume-agent` started without `-kek-file` against a real Control Plane.
+//
+// The assertion is on the report the Control Plane received, and on the cycle *still*
+// returning its error — the backoff and the WARN line are what retry it, and a fix that
+// swallowed the error to reach the report would trade one silence for another.
+func TestACycleThatCouldNotStartAVolumeStillReportsIt(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	// A socket that cannot be bound: an ordinary operational failure, and the same shape
+	// as the KEK refusal that exposed this — Apply fails, nothing starts.
+	h.lf.err = errors.New("address already in use")
+	vol := desiredVolume(t, 1)
+	h.cp.setDesired([]*storagev1.DesiredVolume{vol})
+
+	err := h.loop.Reconcile(ctx)
+	if err == nil {
+		t.Fatal("a cycle that could not start the volume it was told to serve reported success")
+	}
+	if !strings.Contains(err.Error(), "address already in use") {
+		t.Fatalf("the cycle's error does not carry the failure: %v", err)
+	}
+
+	got := lastReportOf(t, h.cp, vol.GetVolumeId())
+	if got.GetRefusal() != storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED {
+		t.Fatalf("the report says refusal=%s, want ATTACH_FAILED: the fleet still cannot see that this volume is not being served",
+			got.GetRefusal())
+	}
+	if got.GetEpoch() != vol.GetEpoch() {
+		t.Fatalf("the refusal was reported under epoch %d, want %d", got.GetEpoch(), vol.GetEpoch())
+	}
+}
+
+// lastReportOf returns the most recent VolumeReport the Control Plane received for one
+// volume. It fails when there is none, because "the volume stopped being reported" is
+// precisely the silence these assertions exist to detect.
+func lastReportOf(t *testing.T, cp *fakeCP, volumeID string) *storagev1.VolumeReport {
+	t.Helper()
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	for i := len(cp.reports) - 1; i >= 0; i-- {
+		for _, v := range cp.reports[i].GetVolumes() {
+			if v.GetVolumeId() == volumeID {
+				return v
+			}
+		}
+	}
+	t.Fatalf("no report ever named volume %s", volumeID)
+	return nil
 }
 
 // TestTheHostServesAgainOnceItsLeaseIsBack pins the other half: giving up on an expired

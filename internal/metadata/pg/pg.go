@@ -504,6 +504,10 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 	if err != nil {
 		return metadata.Volume{}, fmt.Errorf("volume %s: %w", v.VolumeID, err)
 	}
+	refusal, err := lifecycle.ParseRefusal(v.Refusal)
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("volume %s: %w", v.VolumeID, err)
+	}
 	return metadata.Volume{
 		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes,
 		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: state,
@@ -516,6 +520,8 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		DEKKeyID:      uint32(v.DekKeyID), //nolint:gosec // bounded by volumes.dek_key_id's CHECK
 		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
 		PublishedSequence: v.PublishedSequence,
+		Refusal:           refusal,
+		RefusalDetail:     v.RefusalDetail,
 		FencingStartedAt:  fromTS(v.FencingStartedAt),
 	}, nil
 }
@@ -709,6 +715,42 @@ func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID strin
 		return err
 	}
 	return metadata.ErrNotFound
+}
+
+// SetVolumeRefusal records, or clears, why the volume's host is not serving it.
+//
+// The 0-row path is the one that differs from every other write here, and volumes.sql
+// says why: the statement is qualified by the reporting host and epoch, so no rows means
+// the volume has moved on and this report's opinion about whether it is being served is
+// void. That is not an error and must not be diagnosed as one — only a volume that is
+// not in the catalog at all is. So the re-read is a bare existence check rather than the
+// four-way diagnosis SetVolumePrimaryHost does.
+func (s *Store) SetVolumeRefusal(ctx context.Context, term int64, volumeID, hostID string, epoch int64,
+	refusal lifecycle.Refusal, detail string,
+) error {
+	id, err := requireUUID("volume", volumeID)
+	if err != nil {
+		return err
+	}
+	host, err := requireUUID("host", hostID)
+	if err != nil {
+		return err
+	}
+	if !refusal.Valid() {
+		return fmt.Errorf("%w: volume refusal %q", lifecycle.ErrUnknownState, refusal)
+	}
+	rows, err := s.q.SetVolumeRefusal(ctx, db.SetVolumeRefusalParams{
+		VolumeID: id, HostID: host, Epoch: epoch, Term: term,
+		Refusal: refusal.String(), RefusalDetail: detail,
+	})
+	ok, err := s.wrote(ctx, term, rows, err)
+	if err != nil || ok {
+		return err
+	}
+	if _, gerr := s.GetVolume(ctx, volumeID); gerr != nil {
+		return gerr
+	}
+	return nil
 }
 
 // SetVolumeState moves a volume through the §7 ownership machine.

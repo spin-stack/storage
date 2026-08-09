@@ -118,6 +118,114 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	}
 }
 
+// TestARefusalCrossesTheSpineAndClears is the same seam for the fact the report could
+// not carry until now: this host is **not serving** a volume, and why.
+//
+// It is here rather than in a cpserver unit test because the failure it closes is a seam
+// failure. Every component was right on its own — the Agent refused correctly, the
+// Control Plane recorded watermarks correctly, `-fleet-status` printed the row correctly
+// — and the fleet still could not see a volume that had stopped serving, because nothing
+// on the wire said so. The proof has to be a report leaving the Agent and a catalog row
+// coming back changed.
+//
+// Three properties, and the second and third are the ones a watermark does not need:
+//
+//   - it lands, with the sentence an operator reads;
+//   - it clears when the volume serves again, with nothing sweeping it;
+//   - a host the fleet has moved past cannot write it, so a slow report from a fenced
+//     writer cannot mark a volume its successor is serving perfectly well.
+func TestARefusalCrossesTheSpineAndClears(t *testing.T) {
+	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
+	md := metasim.New(clk.Wall)
+	term, err := md.AcquireLeadership(t.Context(), "cp-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpSrv := httptest.NewServer(cpserver.Handler(cpserver.New(md, func() int64 { return term }, 30*time.Second, cpserver.DefaultBand())))
+	defer httpSrv.Close()
+
+	for _, v := range []metadata.Volume{
+		{VolumeID: "vol-mine", DEKKeyID: 1, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4,
+			PrimaryHostID: testHost, State: lifecycle.VolumeActive},
+		{VolumeID: "vol-stolen", DEKKeyID: 1, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 9,
+			PrimaryHostID: testHost, State: lifecycle.VolumeActive},
+	} {
+		if err := md.CreateVolume(t.Context(), term, v, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	vols := agent.NewVolumeSet()
+	loop, err := agent.New(testConfig(), agent.Deps{
+		Clock:        clk,
+		ControlPlane: storagev1connect.NewControlPlaneServiceClient(httpSrv.Client(), httpSrv.URL),
+		Device:       fakeDevice{usage: disk.Usage{TotalBytes: 1 << 40, UsedBytes: 1 << 30}},
+		Volumes:      vols,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The watermarks are the healthy ones a previous session left behind, on purpose:
+	// that is exactly the state the catalog was in while a volume was refusing to serve,
+	// and the reason nothing could see it.
+	const detail = "agent: volume vol-mine published up to sequence 512 and the object store holds no image for it"
+	vols.Set(agent.VolumeStatus{
+		VolumeID: "vol-mine", Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10,
+		Refusal:       storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
+		RefusalDetail: detail,
+	})
+	// A fenced writer reporting a refusal for a volume that has moved past it. Its
+	// watermarks are already refused by the epoch check; the refusal must be too, and by
+	// the same fact rather than by a second rule that can drift from it.
+	vols.Set(agent.VolumeStatus{
+		VolumeID: "vol-stolen", Epoch: 8,
+		Refusal:       storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST,
+		RefusalDetail: "this host's lease expired",
+	})
+
+	if err := loop.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	mine, err := md.GetVolume(t.Context(), "vol-mine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mine.Refusal != lifecycle.RefusalImageMissing {
+		t.Fatalf("the catalog does not record that vol-mine is not being served: %+v", mine)
+	}
+	if mine.RefusalDetail != detail {
+		t.Fatalf("refusal detail = %q, want the Agent's own sentence", mine.RefusalDetail)
+	}
+	stolen, err := md.GetVolume(t.Context(), "vol-stolen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stolen.Refusal != lifecycle.RefusalNone {
+		t.Fatalf("a writer the fleet moved past marked vol-stolen as not served: %+v", stolen)
+	}
+
+	// The volume comes back. Nothing sweeps, nothing notices: the next report simply
+	// carries no refusal, and that is the whole of the clearing mechanism.
+	vols.Set(agent.VolumeStatus{
+		VolumeID: "vol-mine", Epoch: 4, LocalSequence: 40, DurableSequence: 30, PublishedSequence: 20,
+	})
+	if err := loop.Reconcile(t.Context()); err != nil {
+		t.Fatalf("the cycle after the volume recovered failed: %v", err)
+	}
+	mine, err = md.GetVolume(t.Context(), "vol-mine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mine.Refusal != lifecycle.RefusalNone || mine.RefusalDetail != "" {
+		t.Fatalf("a volume that is serving again still reads as refused: %+v", mine)
+	}
+	if mine.LocalSequence != 40 {
+		t.Fatalf("the recovered watermarks were not applied: %+v", mine)
+	}
+}
+
 // ramp is a deterministic byte source: DEK generation and wrapping are the only
 // two consumers of randomness on this path (§15.2), and both take an injected
 // reader precisely so a test can pin them.

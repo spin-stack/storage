@@ -27,6 +27,7 @@ const (
 	servedVol    = "00000000-0000-7000-8000-0000000000b1"
 	strandedVol  = "00000000-0000-7000-8000-0000000000b2"
 	deepVol      = "00000000-0000-7000-8000-0000000000b3"
+	refusedVol   = "00000000-0000-7000-8000-0000000000b4"
 	stuckSnap    = "00000000-0000-7000-8000-0000000000c1"
 	doneSnap     = "00000000-0000-7000-8000-0000000000c2"
 	requestID    = "00000000-0000-7000-8000-0000000000e1"
@@ -219,12 +220,13 @@ func TestFleetStatusOfAnEmptyCatalogSaysSo(t *testing.T) {
 	for _, section := range []string{
 		"HOSTS (0, 0 not taking placements, 0 with no heartbeat in the last 30s",
 		"VOLUMES (0, 0 with no primary host, 0 at the depth ceiling",
+		"NOT SERVED (0)",
 		"SNAPSHOTS NOT FINISHED (0)",
 	} {
 		mustSay(t, out, section)
 	}
-	if n := strings.Count(out, "(none)"); n != 3 {
-		t.Errorf("empty sections marked with (none): %d, want 3:\n%s", n, out)
+	if n := strings.Count(out, "(none)"); n != 4 {
+		t.Errorf("empty sections marked with (none): %d, want 4:\n%s", n, out)
 	}
 }
 
@@ -459,6 +461,99 @@ func TestLeaderRenewIntervalStaysUnderTheLease(t *testing.T) {
 			t.Errorf("leaderRenewInterval(%s) = %s, which is not inside the lease", tc.ttl, got)
 		}
 	}
+}
+
+// TestFleetStatusNamesTheVolumesNobodyIsServing is the fourth state a readiness run
+// found, and the one nothing in this report could express: a volume whose Agent has
+// **refused to serve it**.
+//
+// The Agent fails closed in five places now — a missing image, a durability floor it
+// came back under, a read view that never resolved, a KEK it does not hold, a lease it
+// lost — and every one of them is correct and every one of them was invisible here. The
+// row printed `ACTIVE`, the watermarks printed the numbers the last healthy report left
+// behind, and the only signal anywhere was one ERROR line in one host's log, followed by
+// silence. Traded silent data loss for silent unavailability.
+//
+// So the assertions are the two an operator makes: the volume's own row must not read as
+// a healthy one, and the report must say *why* without them reading any source.
+func TestFleetStatusNamesTheVolumesNobodyIsServing(t *testing.T) {
+	ctx := t.Context()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	md := metasim.New(func() time.Time { return now })
+
+	term, err := md.AcquireLeadership(ctx, "cp-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := md.UpsertHost(ctx, term, metadata.Host{
+		HostID: activeHost, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Two volumes on one healthy host, and only one of them refused: a report that
+	// decorates every row answers nothing.
+	for _, v := range []metadata.Volume{
+		{VolumeID: servedVol, SizeBytes: 1 << 30, BlockSize: 65536, CurrentEpoch: 3,
+			State: lifecycle.VolumeActive, PrimaryHostID: activeHost,
+			DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 42},
+		{VolumeID: refusedVol, SizeBytes: 1 << 30, BlockSize: 65536, CurrentEpoch: 4,
+			State: lifecycle.VolumeActive, PrimaryHostID: activeHost,
+			DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 42},
+	} {
+		if err := md.CreateVolume(ctx, term, v, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The refusal as the Control Plane records it from the Agent's report. The
+	// watermarks are left healthy on purpose — that is precisely the state this whole
+	// report used to render as normal.
+	if err := md.SetVolumeRefusal(ctx, term, refusedVol, activeHost, 4,
+		lifecycle.RefusalImageMissing,
+		"agent: the catalog says this volume has published an image and the object store holds none: "+
+			"volume "+refusedVol+" published up to sequence 512 and the object store holds no image for it"); err != nil {
+		t.Fatal(err)
+	}
+	if err := md.UpdateWatermarks(ctx, term, refusedVol, 512, 512, 512); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := fleetReport(ctx, md, &buf, testTTL); err != nil {
+		t.Fatalf("fleetReport: %v", err)
+	}
+	out := buf.String()
+	t.Log("\n" + out)
+
+	// The header count: "is anything wrong" answered without reading a row.
+	mustSay(t, out, "1 not being served by the host that holds it")
+
+	// The row. `ACTIVE` is what the catalog still says about ownership and it is exactly
+	// the word that must not stand alone — the same rule, and the same one-token
+	// spelling, as a host whose heartbeat has gone stale.
+	refused := row(t, out, refusedVol)
+	if refused[2] == "ACTIVE" {
+		t.Errorf("a volume its host is refusing to serve prints STATE=ACTIVE:\n%s", out)
+	}
+	if got, want := refused[2], "NOT_SERVED(ACTIVE)"; got != want {
+		t.Errorf("refused volume STATE = %q, want %q:\n%s", got, want, out)
+	}
+	// The healthy one is untouched.
+	if got, want := row(t, out, servedVol)[2], "ACTIVE"; got != want {
+		t.Errorf("serving volume STATE = %q, want %q:\n%s", got, want, out)
+	}
+
+	// And the section that says why, in the words an operator acts on: the reason token
+	// they can grep and alert on, and the sentence with the sequence in it.
+	mustSay(t, out, "NOT SERVED (1)")
+	notServed := out[strings.Index(out, "NOT SERVED ("):]
+	if strings.Contains(notServed, servedVol) {
+		t.Errorf("a volume that is being served is listed as not served:\n%s", out)
+	}
+	if got, want := row(t, notServed, refusedVol)[:3],
+		[]string{refusedVol, activeHost, "IMAGE_MISSING"}; !equal(got, want) {
+		t.Errorf("NOT SERVED row = %v, want %v:\n%s", got, want, out)
+	}
+	mustSay(t, out, "published up to sequence 512 and the object store holds no image for it")
 }
 
 func equal(a, b []string) bool {

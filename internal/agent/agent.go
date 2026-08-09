@@ -60,6 +60,27 @@ type VolumeStatus struct {
 	// SnapshotError is why it could not be taken. A snapshot that fails silently stays
 	// CREATING in the catalog forever.
 	SnapshotError string
+
+	// Refusal says this host is **not serving** this volume, and RefusalDetail is the
+	// sentence behind it. Unset is this host saying it is serving.
+	//
+	// It is the one field here that is not a measurement. Everything above is something
+	// the WAL holds; this is a decision the Agent made — the image the catalog promised
+	// is not in the bucket, the volume came back under the durability floor, the read
+	// view never resolved, there is no key for it, the lease lapsed. Every one of those
+	// was already correct and every one was invisible: a volume that fails closed keeps
+	// reporting the watermarks its last healthy session left behind, and one that never
+	// started reported nothing at all — it stopped appearing on the wire, and an absence
+	// is not a signal.
+	//
+	// It is the proto's enum rather than a vocabulary of the Agent's own, for the reason
+	// VolumeReconciler.Apply takes proto types: this is the wire's word, the Agent is
+	// the only thing that produces it, and a third spelling between here and the message
+	// would be a mapping that can be wrong in one direction only.
+	Refusal storagev1.VolumeRefusal
+	// RefusalDetail is free text an operator reads and nothing branches on: which
+	// sequence, which KEK. Empty when there is no refusal.
+	RefusalDetail string
 }
 
 // VolumeKeys is what a host needs to seal and open one volume's payloads (§15.1).
@@ -95,10 +116,20 @@ type VolumeSource interface {
 type VolumeReconciler interface {
 	VolumeSource
 	Apply(ctx context.Context, desired []*storagev1.DesiredVolume) error
-	// Fence stops serving the volumes whose reports the Control Plane refused. This
-	// host is not their writer any more, and the data path is where that has to take
-	// effect (§16) — recording it was all the loop could ever do on its own.
-	Fence(ctx context.Context, volumeIDs []string) error
+	// Fence stops serving the given volumes. This host is not their writer any more,
+	// and the data path is where that has to take effect (§16) — recording it was all
+	// the loop could ever do on its own.
+	//
+	// why and detail are what the *next* report says about them, and
+	// VOLUME_REFUSAL_UNSPECIFIED means "say nothing". The two callers want opposite
+	// things and the difference is whether the Control Plane already knows: a fence
+	// that follows a refused report is the Control Plane's own decision coming back,
+	// and reporting it would be telling it what it just told us — and the report would
+	// be refused again anyway, on the same host-and-epoch predicate. A lease that
+	// lapsed is the other case entirely: nothing outside this process knows the device
+	// is gone, the volume stays this host's at this epoch until somebody moves it, and
+	// silence there is a guest with no disk and a fleet that reads healthy.
+	Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error
 }
 
 // VolumeSet is an in-memory VolumeSource. It is what the Agent runs against until

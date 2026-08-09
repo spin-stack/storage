@@ -205,7 +205,7 @@ func fencedVolumeStopsServing(s *Sim, ignoreFencing bool) error {
 
 	// (2) The Control Plane refuses the report. This host is not the writer.
 	if !ignoreFencing {
-		if err := m.Fence(ctx, []string{volumeID}); err != nil {
+		if err := m.Fence(ctx, []string{volumeID}, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""); err != nil {
 			return fmt.Errorf("fencing: %w", err)
 		}
 	}

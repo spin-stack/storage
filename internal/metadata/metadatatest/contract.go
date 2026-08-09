@@ -77,6 +77,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"VolumeGeometryIsImmutable", volumeGeometry},
 		{"RecreatingASnapshotIsANoOp", snapshotRecreate},
 		{"WatermarksAreOrderedAndNeverGoBackwards", watermarks},
+		{"ARefusalClearsAndCannotBeWrittenByAFencedHost", refusals},
 		{"UpsertHostDoesNotClobberStateOrCapacity", upsertHost},
 		{"ACordonRecordsWhoPlacedItAndOutranksThePressureLoop", cordonAuthority},
 		{"VolumeLifecycleIsExpressible", volumeLifecycle},
@@ -262,6 +263,9 @@ func everyMutation() []mutation {
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.ClearVolumeParent(ctx, term, w.vol)
 		}},
+		{"SetVolumeRefusal", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.SetVolumeRefusal(ctx, term, w.vol, w.host, 0, lifecycle.RefusalImageMissing, "the bucket has no manifest")
+		}},
 		// DeleteVolume builds its own row and destroys that one. Every other entry
 		// here operates on the fixture, and this one cannot: volumeGeometry runs the
 		// whole surface and then reads w.vol back, so a delete of w.vol would make the
@@ -348,6 +352,9 @@ func missingRows(t *testing.T, s metadata.Store) {
 		}},
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.ClearVolumeParent(ctx, term, ghostVol)
+		}},
+		{"SetVolumeRefusal", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.SetVolumeRefusal(ctx, term, ghostVol, w.host, 0, lifecycle.RefusalImageMissing, "the bucket has no manifest")
 		}},
 		// A re-run of a delete that already finished lands here, and it is the reason
 		// the sentinel matters rather than a detail of it: the command reads
@@ -663,6 +670,111 @@ func watermarks(t *testing.T, s metadata.Store) {
 					t.Fatalf("the refused volume was created anyway: %v", err)
 				}
 			})
+		}
+	})
+}
+
+// refusals: the storage rule that makes a refusal different from a watermark, stated as
+// the four things a caller depends on.
+//
+// A watermark is the newest of a monotonic series, so GREATEST is right and a late report
+// is harmless. A refusal is a *state*, and the two ways a state column goes wrong are
+// both here: it fails to clear when the condition ends (the volume reads NOT SERVED for
+// ever), and it is written by somebody whose opinion no longer counts (a host the fleet
+// moved past marks a volume its successor is serving perfectly well). Neither is visible
+// from an assertion on the returned error — both writes "succeed".
+func refusals(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s)
+	// newWorld places the volume on w.host at epoch 0, which is the epoch its reports
+	// are qualified by until something promotes it.
+	const epoch = 0
+
+	t.Run("a refusal from the volume's own host at its own epoch lands", func(t *testing.T) {
+		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch,
+			lifecycle.RefusalImageMissing, "published up to 512 and the bucket holds nothing"); err != nil {
+			t.Fatal(err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.Refusal != lifecycle.RefusalImageMissing || v.RefusalDetail == "" {
+			t.Fatalf("the refusal was not recorded: %+v", v)
+		}
+	})
+
+	t.Run("a report from another host does not write it", func(t *testing.T) {
+		other := id()
+		if err := s.UpsertHost(ctx, w.term, metadata.Host{
+			HostID: other, State: lifecycle.HostActive, NVMeTotalBytes: 1 << 40,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Not an error: it is a writer that has been fenced, and a caller that treated
+		// this as a failure would retry it for ever.
+		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, other, epoch,
+			lifecycle.RefusalLeaseLost, "somebody else's opinion"); err != nil {
+			t.Fatalf("a report from a host that does not hold the volume is ignored, not an error: %v", err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.Refusal != lifecycle.RefusalImageMissing {
+			t.Fatalf("a host that does not hold the volume rewrote its refusal: %+v", v)
+		}
+	})
+
+	t.Run("a report under a superseded epoch does not write it", func(t *testing.T) {
+		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch+7,
+			lifecycle.RefusalNone, ""); err != nil {
+			t.Fatalf("a report under the wrong epoch is ignored, not an error: %v", err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.Refusal != lifecycle.RefusalImageMissing {
+			t.Fatalf("a report under a foreign epoch cleared the refusal: %+v", v)
+		}
+	})
+
+	t.Run("the volume serving again clears it, detail and all", func(t *testing.T) {
+		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch, lifecycle.RefusalNone, ""); err != nil {
+			t.Fatal(err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.Refusal != lifecycle.RefusalNone || v.RefusalDetail != "" {
+			t.Fatalf("a healthy report did not clear the refusal: %+v", v)
+		}
+	})
+
+	t.Run("a detail cannot outlive the refusal it explains", func(t *testing.T) {
+		// The one shape the schema refuses outright. It is asserted through the Store
+		// rather than in SQL so both implementations answer the same way, and because a
+		// sentence with nothing to explain is exactly what the next reader believes.
+		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch,
+			lifecycle.RefusalNone, "a sentence about nothing"); err != nil {
+			t.Fatal(err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.RefusalDetail != "" {
+			t.Fatalf("a detail survived with no refusal on it: %+v", v)
+		}
+	})
+
+	t.Run("a value outside the vocabulary is refused", func(t *testing.T) {
+		err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch, lifecycle.Refusal("NOPE"), "x")
+		if !errors.Is(err, lifecycle.ErrUnknownState) {
+			t.Fatalf("want ErrUnknownState, got %v", err)
+		}
+	})
+
+	t.Run("placing the volume elsewhere clears it", func(t *testing.T) {
+		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch,
+			lifecycle.RefusalNoKey, "this host holds no KEK"); err != nil {
+			t.Fatal(err)
+		}
+		// Detach: the refusal was a statement about a host this volume no longer has,
+		// and a reason that outlives its cause is one the next reader will believe.
+		if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, ""); err != nil {
+			t.Fatal(err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.Refusal != lifecycle.RefusalNone || v.RefusalDetail != "" {
+			t.Fatalf("a detached volume still says its old host is refusing it: %+v", v)
 		}
 	})
 }
@@ -1711,6 +1823,9 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		}},
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.ClearVolumeParent(ctx, term, "")
+		}},
+		{"SetVolumeRefusal", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.SetVolumeRefusal(ctx, term, "", w.host, 0, lifecycle.RefusalNone, "")
 		}},
 		{"DeleteVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.DeleteVolume(ctx, term, "")

@@ -209,6 +209,40 @@ CREATE TABLE volumes (
     local_sequence     BIGINT NOT NULL DEFAULT 0,
     durable_sequence   BIGINT NOT NULL DEFAULT 0,
     published_sequence BIGINT NOT NULL DEFAULT 0,
+    -- Why the host that holds this volume is not serving it, empty when it is
+    -- (internal/lifecycle.Refusal). The Agent fails closed in five places — a missing
+    -- image, a durability floor it came back under, a read view that never resolved, a
+    -- KEK it does not hold, a lease it lost — and until this column existed every one
+    -- of them was invisible to the fleet: the volume kept the watermarks its last
+    -- healthy report left behind, so `-fleet-status` rendered it as normal and the only
+    -- signal anywhere was one ERROR line in one host's log.
+    --
+    -- CHECK-constrained like every other vocabulary here, and for the third time for the
+    -- same reason: the Go type, the wire enum and the column each refuse a value the
+    -- other two do not know, so a new refusal is one commit that touches all three
+    -- rather than a string that arrives in a column and is never queried.
+    --
+    -- **It is not a watermark and is written by a different rule.** The three above are
+    -- monotonic and merged with GREATEST, so a late report cannot do harm. This is a
+    -- state that must clear the moment the volume serves again, so its write is
+    -- last-report-wins — and, because "last" would otherwise include a host the fleet
+    -- has moved past, SetVolumeRefusal qualifies the UPDATE with primary_host_id and
+    -- current_epoch. That predicate is the whole difference between the two, and it is
+    -- why this is not folded into UpdateVolumeWatermarks.
+    refusal            TEXT NOT NULL DEFAULT ''
+                         CHECK (refusal IN ('', 'IMAGE_MISSING', 'DURABILITY_LOST',
+                                            'NO_READ_VIEW', 'NO_KEY', 'LEASE_LOST',
+                                            'ATTACH_FAILED')),
+    -- The sentence the Agent sent with the refusal — which sequence it came back at,
+    -- which KEK it is missing — printed verbatim by `-fleet-status` and branched on by
+    -- nothing. It is the free half of a deliberately split pair: the token above is what
+    -- a column, a grep and an alert key on, and this is what an operator's next step
+    -- needs. Emptied with the refusal, never left behind, for the reason
+    -- hosts.cordon_reason is: an explanation that outlives its cause is one the next
+    -- reader will believe.
+    refusal_detail     TEXT NOT NULL DEFAULT '',
+    CONSTRAINT volumes_refusal_detail_needs_a_refusal
+        CHECK (refusal <> '' OR refusal_detail = ''),
     CONSTRAINT volumes_watermarks_ordered
         CHECK (published_sequence <= durable_sequence AND durable_sequence <= local_sequence),
     -- When the Control Plane observed the lease of the writer it is fencing

@@ -246,6 +246,61 @@ message GetVolumeKeysResponse {
   uint32 dek_key_id = 4;
 }
 
+// VolumeRefusal is why an Agent is not serving a volume the fleet placed on it.
+//
+// The Agent fails closed in five places, and every one of them was correct and every
+// one of them was invisible to the fleet: a volume that refuses to serve keeps
+// reporting the watermarks its last healthy session left behind, so the catalog reads
+// normal, `-fleet-status` prints a normal row, and the operator's only signal is one
+// ERROR line in one host's log at attach time, followed by silence. This field is what
+// turns that into a fact the fleet holds.
+//
+// **An enum and not a free string, and the choice is worth arguing because both are
+// defensible.** A string needs no wire change when a new refusal appears and carries the
+// Agent's own sentence. But the string it would actually carry is `err.Error()`, which
+// embeds a volume id and a sequence number, so no two reports ever compare equal, the
+// `-fleet-status` column becomes a vocabulary nobody controls, and the first alert
+// anyone writes on it matches a substring of a sentence somebody is free to reword. The
+// set below is closed by construction — every value is a decision made at a named line
+// in internal/agent — so a new refusal is a new code path in this repository, and
+// extending this enum is the same commit that adds it. The cost of the closed set falls
+// on the person already editing both sides, which is the only place it is cheap.
+//
+// The sentence is carried anyway, next to it, as `refusal_detail`: nothing branches on
+// it, and it is what an operator's *next step* needs — which sequence, which KEK. Same
+// split as the snapshot fields above, an id to act on and a sentence to read.
+enum VolumeRefusal {
+  // UNSPECIFIED is the Agent saying it is serving the volume. That is what makes the
+  // field self-clearing rather than something a sweep has to notice: the proto3 default
+  // is the healthy value, so an Agent that recovers reports it without doing anything,
+  // and an Agent built before this field says the true thing about itself by omission.
+  VOLUME_REFUSAL_UNSPECIFIED = 0;
+  // The catalog says this volume published an image and the object store holds none
+  // (agent.ErrImageMissing): a stray delete, a lifecycle expiry, a restore that missed
+  // one key. Look at the bucket.
+  VOLUME_REFUSAL_IMAGE_MISSING = 1;
+  // The volume came back below the sequence a guest was already told was durable
+  // (agent.ErrDurabilityLost): this host's local WAL was lost with writes in it, and
+  // what is in the bucket is genuinely older than what the fleet promised.
+  VOLUME_REFUSAL_DURABILITY_LOST = 2;
+  // The read view never resolved, so every read fails and the session will not be
+  // published (agent.ErrNoReadView, wal.ErrBaseUnavailable) — an unreadable ancestry,
+  // an object store that would not answer.
+  VOLUME_REFUSAL_NO_READ_VIEW = 3;
+  // The catalog says the volume is encrypted and this host holds no KEK, or holds a
+  // different one (agent.ErrNoKEK). One missing flag on one process, or a
+  // key-distribution problem — the detail says which.
+  VOLUME_REFUSAL_NO_KEY = 4;
+  // The host lease lapsed on the Agent's own monotonic clock and it gave the device up
+  // rather than keep answering for a volume it can no longer confirm it owns (§12.2).
+  VOLUME_REFUSAL_LEASE_LOST = 5;
+  // Everything else that stopped the runtime from starting: a socket that could not be
+  // bound, a WAL that would not resume, this host's own -max-volumes ceiling. A
+  // catch-all on purpose — without one, the next refusal to be written would be
+  // invisible again, which is the whole failure this enum exists to close.
+  VOLUME_REFUSAL_ATTACH_FAILED = 6;
+}
+
 // VolumeReport is one volume's watermarks as the Agent observes them, qualified
 // by the epoch under which they were produced.
 message VolumeReport {
@@ -279,6 +334,25 @@ message VolumeReport {
   // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
   // that fails silently stays CREATING forever and nothing ever collects it.
   string snapshot_error = 9;
+
+  // refusal says this host is **not serving** the volume, and why; unset is it saying
+  // it is. It is reported for a volume the Agent started and then failed closed on
+  // (the read view never resolved) and for one it never managed to start at all, which
+  // is the case that used to produce no report whatsoever — the volume simply stopped
+  // appearing on the wire, and an absence is not a signal.
+  //
+  // The watermarks on a refused report are this host's honest zeros or whatever its
+  // WAL replayed, and they are safe next to a refusal precisely because the Control
+  // Plane merges them with GREATEST: a volume that could not open reports nothing that
+  // can pull the catalog's numbers backwards. The refusal itself is not merged that
+  // way — see SetVolumeRefusal, which is qualified by this host and this epoch, so a
+  // writer the fleet has moved past cannot mark a volume its successor is serving.
+  VolumeRefusal refusal = 10;
+  // refusal_detail is the sentence behind it, verbatim from the Agent, empty when
+  // there is no refusal. `-fleet-status` prints it and nothing branches on it: it
+  // carries the numbers the enum cannot — which sequence was ACKed, which KEK is
+  // missing — and those are what an operator's next step is chosen from.
+  string refusal_detail = 11;
 }
 
 message ReportVolumeStateRequest {

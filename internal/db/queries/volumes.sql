@@ -132,11 +132,20 @@ RETURNING current_epoch;
 -- fencing_started_at is cleared for the same reason SetVolumeState clears it when
 -- leaving FENCING_WAIT (ADR-0015): neither ACTIVE nor DETACHED is that state, and a
 -- dwell left behind would be inherited by the next promotion instead of being waited.
+--
+-- The refusal goes with it, and for the same shape of reason one step further out: it
+-- is a statement about a host, made by that host, and this statement is the volume
+-- leaving that host. Left behind, a volume detached from the machine that could not
+-- open it would still print NOT_SERVED after being placed somewhere that serves it
+-- perfectly, until that new host's first report happened to overwrite it — an
+-- explanation outliving its cause, which is the one failure a reason column has.
 UPDATE volumes
    SET primary_host_id = sqlc.narg(primary_host_id)::uuid,
        state = CASE WHEN sqlc.narg(primary_host_id)::uuid IS NULL
                     THEN 'DETACHED' ELSE 'ACTIVE' END,
        fencing_started_at = NULL,
+       refusal = '',
+       refusal_detail = '',
        updated_at = now()
  WHERE volume_id = sqlc.arg(volume_id)
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
@@ -164,6 +173,35 @@ UPDATE volumes
        updated_at = now()
  WHERE volume_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $5;
+
+-- name: SetVolumeRefusal :execrows
+-- Record why the host holding this volume is not serving it, or clear the record when
+-- it is. Term-guarded like every other mutation, and — unlike every other one —
+-- qualified by the *reporting* host and epoch.
+--
+-- That predicate is the whole design of this column, and it is exactly what
+-- UpdateVolumeWatermarks must not have. A watermark is the newest of a monotonic
+-- series, so GREATEST makes a late report from a fenced writer harmless. A refusal is a
+-- state about right now, so it has to be last-report-wins — and "last" over an
+-- unqualified UPDATE means a host the fleet moved past can mark a volume NOT SERVED
+-- while its successor is serving it, with the term guard passing, because promotion
+-- does not change the CP term. Written here rather than checked in Go for the reason
+-- every other guard in this file is: between a GetVolume and an UPDATE the volume can
+-- be promoted, and the window is the failure.
+--
+-- 0 rows is therefore a normal answer and not an error: it is a writer that has been
+-- fenced, whose opinion about whether the volume is being served is void.
+UPDATE volumes
+   SET refusal = sqlc.arg(refusal)::text,
+       -- One statement, so the two can never disagree: an explanation with nothing to
+       -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
+       refusal_detail = CASE WHEN sqlc.arg(refusal)::text = ''
+                            THEN '' ELSE sqlc.arg(refusal_detail)::text END,
+       updated_at = now()
+ WHERE volume_id = sqlc.arg(volume_id)
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
+   AND primary_host_id = sqlc.arg(host_id)::uuid
+   AND current_epoch = sqlc.arg(epoch);
 
 -- name: SetVolumeState :execrows
 -- The §7 ownership machine, term-guarded and transition-guarded: $4 is the set of
