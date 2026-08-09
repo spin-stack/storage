@@ -86,8 +86,13 @@ func TestALiveControlPlaneKeepsItsStampFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Term != term || !after.RenewedAt.Equal(fresh) {
-		t.Fatalf("after shutdown the leader is %s/term %d stamped %s, want term %d stamped %s",
-			after.HolderID, after.Term, after.RenewedAt, term, fresh)
+	// The stamp is asserted as "at or after the one we saw", not as an exact instant.
+	// The loop renews on its own goroutine, so between reading `fresh` and stop() taking
+	// effect it may land one more renewal — which is the loop working, not a defect. An
+	// equality here failed on CI at 22:13:23 wanting 22:13:22, which is a test that
+	// measures scheduling rather than the property it names.
+	if after.Term != term || after.HolderID != elected.HolderID || after.RenewedAt.Before(fresh) {
+		t.Fatalf("after shutdown the leader is %s/term %d stamped %s, want %s/term %d stamped at or after %s",
+			after.HolderID, after.Term, after.RenewedAt, elected.HolderID, term, fresh)
 	}
 }
