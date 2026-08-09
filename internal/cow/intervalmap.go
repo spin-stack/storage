@@ -12,6 +12,7 @@ package cow
 
 import (
 	"errors"
+	"slices"
 	"sort"
 )
 
@@ -111,6 +112,51 @@ type Cost struct {
 	Extents int
 	Layers  int
 	Cleared int
+}
+
+// ExtentOverheadBytes is what one extent costs on top of its payload, and it is
+// measured. Two maps of 100,000 extents each, one holding 4 KiB per extent and one
+// holding 512 B — same extent count, eight times the payload — were built and their live
+// heap read after a forced GC:
+//
+//	extents  Bytes      live heap  live-Bytes  per extent  process RSS
+//	100,000  409.6 MB   415.0 MB   5.424 MB    54.2 B      874.7 MB
+//	100,000   51.2 MB    56.6 MB   5.427 MB    54.3 B      130.4 MB
+//	    100  838.9 MB   840.6 MB   1.699 MB    (16 KB)     842.1 MB
+//
+// The structure term is 54 bytes per extent and does not move with the payload: that is
+// the isolation. The 32-byte record in `extents`, the spare capacity `append` keeps ahead
+// of it, and the allocator's rounding.
+//
+// **128, not 54, and the third column is why.** What kills a host is RSS, not the live
+// heap, and RSS is where the mutation path shows up: removeRange builds a fresh extent
+// slice while the old one is still reachable and append doubles underneath it, so up to
+// four copies of the 32-byte record are resident where one is live. Charging 128 makes
+// RSS/Memory 2.07 and 2.04 in the two rows above — one constant across an eight-fold
+// change in extent density — where charging the live-heap 54 gives 2.11 and 2.30. The
+// number that predicts the failure is the one to bound.
+//
+// Why the term is charged at all: Bytes alone says a million 512-byte extents and one
+// 512 MB extent cost the same, and the rows above say they do not. Worse, the map has no
+// floor on extent size — removeRange leaves a one-byte remainder when a write lands one
+// byte inside an existing extent — so a guest can drive Extents up while Bytes stays
+// flat, and a bound watching only Bytes would never see it coming.
+const ExtentOverheadBytes = 128
+
+// Memory is what this view costs, in the units that predict the host's RSS: every payload
+// byte plus the structure describing it. It is what a memory bound compares against, and
+// it is deliberately *not* what read_view_bytes reports — the gauge answers "how much has
+// the guest written", this answers "what is that costing".
+//
+// Measured (see ExtentOverheadBytes), the process RSS attributable to a view is **twice**
+// this, and that factor is the Go runtime's, not this package's: a guest writing distinct
+// blocks churns the extent slice on every write, so the heap sits at its GOGC goal of
+// twice the live heap. A view that is *not* being written — a frozen base, the `big` row
+// above — costs 1x, because nothing allocates against it. A caller sizing this against
+// real RAM must divide by 2; it is documented here rather than multiplied in, because it
+// is a property of the runtime a GOGC or GOMEMLIMIT change moves.
+func (c Cost) Memory() int64 {
+	return c.Bytes + int64(c.Extents)*ExtentOverheadBytes
 }
 
 // Cost reports what this view costs, following the whole base chain.
@@ -215,13 +261,27 @@ func (m *IntervalMap) removeRange(s, e uint64) {
 		// Counted here, on the extent being dropped, rather than by re-folding `kept` at
 		// the end — the fold is what Cost exists not to do.
 		m.liveBytes -= int64(min64(x.end(), e) - max64(x.start, s))
+		// The remainders are *copied* out of x, not re-sliced from it. A re-slice keeps
+		// the whole original payload alive — so an extent whose middle was overwritten
+		// or discarded goes on holding every byte it was allocated with, while
+		// liveBytes counts only what survived. A guest that writes in megabytes and
+		// punches holes in kilobytes would then report kilobytes and hold megabytes,
+		// which makes any bound on Cost.Bytes a bound on nothing (that is what
+		// Limits.MaxViewBytes rests on). TestTrimmingAnExtentReleasesWhatItNoLongerHolds
+		// measures the heap and fails at 128 MiB held against 32 KiB reported.
+		//
+		// It costs a copy of the surviving bytes per trimmed extent, bounded by the
+		// extent's own size, on a path that already rebuilds the whole extent slice.
+		// The alternative — count cap(x.data) in liveBytes and keep the re-slice — was
+		// rejected: it makes the number honest by making the memory permanent, and two
+		// remainders of one array would each have to claim the same bytes.
 		// Left remainder [x.start, s).
 		if x.start < s {
-			kept = append(kept, extent{start: x.start, data: x.data[:s-x.start]})
+			kept = append(kept, extent{start: x.start, data: slices.Clone(x.data[:s-x.start])})
 		}
 		// Right remainder [e, x.end()).
 		if x.end() > e {
-			kept = append(kept, extent{start: e, data: x.data[e-x.start:]})
+			kept = append(kept, extent{start: e, data: slices.Clone(x.data[e-x.start:])})
 		}
 	}
 	sort.Slice(kept, func(i, j int) bool { return kept[i].start < kept[j].start })

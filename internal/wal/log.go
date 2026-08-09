@@ -52,6 +52,31 @@ type Watermarks struct {
 	Published uint64
 }
 
+// DefaultMaxViewBytes is the read-view bound a Log uses when its caller sets none. It
+// is a ceiling chosen from two measurements and one configured number, and it is meant
+// to be replaced by a derivation, not kept:
+//
+//   - measured (cow.ExtentOverheadBytes), a view being written costs 2.0x its
+//     cow.Cost.Memory in process RSS — 2.07 and 2.04 across an eight-fold change in
+//     extent density, so the factor is stable enough to size against;
+//   - agent.DefaultMaxVolumes is 16, so a fully loaded host runs 16 of these at once;
+//   - 256 MiB × 16 × 2 ≈ 8.5 GiB of RSS in read views on a host that is full, which
+//     leaves room on the 32 GiB class of machine this is being brought up on.
+//
+// It is *not* derived from anything this package can see, and that is the gap: the
+// device bound is one volume's share of a device this Agent measured (statfs, via
+// agent.Budget), and the honest counterpart is one volume's share of RAM this Agent
+// measured. Nothing in the tree reads memory yet — there is no simio equivalent of
+// disk.Usage — so the caller's derivation is missing and this constant stands in for it.
+// The Agent should compute it in agent.Budget.Limits alongside MaxLocalBytes, from a
+// measured MemTotal/MemAvailable divided by MaxVolumes and by the factor of two above.
+//
+// Sizing it is a real trade and not a formality: a volume whose session working set
+// exceeds this stops writing, because nothing shrinks the view mid-session. Raising it
+// buys a bigger working set and spends the host's RAM; the number that must never be
+// chosen is "unbounded", which is what every Agent ran with until this field existed.
+const DefaultMaxViewBytes int64 = 256 << 20
+
 // Limits bound the local WAL (§5.7).
 type Limits struct {
 	// MaxUnflushedBytes/MaxUnflushedAge bound what fdatasync has not seen; both are
@@ -80,6 +105,37 @@ type Limits struct {
 	// it keep writing and take the device down for every other volume on the host — is
 	// the failure ADR-0013 §1 exists for.
 	MaxLocalBytes int64
+	// MaxViewBytes bounds the Go heap this volume's read view may occupy — every live
+	// extent's payload plus the structure describing it (cow.Cost.Memory), across the
+	// whole layer chain including any base adopted at resume. Crossing it fails the
+	// next WRITE with ErrBackpressure, the same error the device bound uses and the
+	// same one a guest already understands as an I/O error.
+	//
+	// **This is the one per-volume structure whose size the guest decides.** Everything
+	// else on this host is bounded by configuration or by the device; the read view
+	// holds one entry per distinct region the guest has written and, under ADR-0026,
+	// nothing shrinks it during a session — there is no mid-session objectization. So
+	// it grows with the guest's working set until the process dies. Measured on one
+	// volume with a guest issuing distinct 4 KiB O_DIRECT writes: 53k writes → 464 MB
+	// RSS, 110k → 929 MB, 195,658 → 1.55 GiB, monotonic, with the OOM killer as the
+	// only limit — and an OOM takes down every other tenant's volume on the host, which
+	// is the failure the pilot bar rules out.
+	//
+	// Zero means DefaultMaxViewBytes, **not unbounded**, and the asymmetry with
+	// MaxLocalBytes above is deliberate. An unbounded MaxLocalBytes ends at ENOSPC,
+	// which arrives as an error, sets Degraded and lights wal_out_of_space: the
+	// operator sees it. An unbounded view ends at the OOM killer, which arrives as no
+	// error at all, in a different process, to volumes that did nothing wrong. A
+	// default of "no bound" for the one failure nobody can observe is the wrong default
+	// even though it is the consistent one.
+	//
+	// Crossing it is permanent for the session, and that is the honest shape rather
+	// than an oversight: only DISCARD/WRITE_ZEROES shrink the view (they are exempt
+	// from this bound, below, precisely so a guest can trim its way out), and the
+	// volume otherwise stays in backpressure until it stops and publishes. It is the
+	// same trade §5.7 already made for the device — a guest that stops writing beats a
+	// host that stops serving.
+	MaxViewBytes int64
 	// SegmentBytes is the size at which a WAL segment is sealed and the next one
 	// started. 0 means SegmentBytes, the 32 MiB default.
 	//
@@ -371,7 +427,10 @@ func NewLogAfter(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, e
 	}
 }
 
-func (l *Log) backpressure(add int) error {
+// backpressure decides whether a record may be appended. `add` is the encoded record's
+// size on the device; `growsView` says whether the record adds payload to the read view,
+// which is what the memory bound is about and what DISCARD/WRITE_ZEROES do not do.
+func (l *Log) backpressure(add int, growsView bool) error {
 	// The device bound first, because it is the one whose breach costs the whole host:
 	// a log at its share refuses one volume's WRITE, a device at ENOSPC refuses every
 	// volume's. Measured against the retained segments, not against what this log has
@@ -420,11 +479,39 @@ func (l *Log) backpressure(add int) error {
 		l.clk.Now().Sub(l.oldestUnflushedAt) > l.limits.MaxUnflushedAge {
 		return ErrBackpressure
 	}
+	// The memory bound. It is measured against what the view already holds rather than
+	// against what it would hold after this record, and only records that grow it are
+	// asked. Both choices are load-bearing:
+	//
+	// Charging the record before it lands would refuse a guest that is rewriting blocks
+	// it already holds — whose view is not growing at all — the moment its steady-state
+	// working set reached the bound. That is a guest inside its bound being told it is
+	// over it. Asking what is already held instead lets the view exceed the bound by at
+	// most one request's payload, which the front-end caps, and never throttles a guest
+	// whose live set fits.
+	//
+	// Exempting DISCARD/WRITE_ZEROES is what stops the bound deadlocking. They are the
+	// only operations that shrink the view (§14.6), so a view over its bound that also
+	// refused the records that free it would leave the guest with no way back and the
+	// memory pinned for the rest of the session.
+	if growsView && l.view.Cost().Memory() > l.maxViewBytes() {
+		return ErrBackpressure
+	}
 	return nil
 }
 
-func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, error) {
-	if err := l.backpressure(len(enc)); err != nil {
+// maxViewBytes is the configured read-view bound, or the default when none was set.
+// Zero means the default and not "unbounded"; see Limits.MaxViewBytes for why this one
+// field inverts that convention.
+func (l *Log) maxViewBytes() int64 {
+	if l.limits.MaxViewBytes > 0 {
+		return l.limits.MaxViewBytes
+	}
+	return DefaultMaxViewBytes
+}
+
+func (l *Log) appendEncoded(seq uint64, enc []byte, growsView bool, addView func()) (uint64, error) {
+	if err := l.backpressure(len(enc), growsView); err != nil {
 		return 0, err
 	}
 	// Nothing has been appended through this log yet, but the WAL directory is not
@@ -501,7 +588,7 @@ func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	}
 	// The read view holds plaintext regardless of on-disk encryption.
 	plaintext := append([]byte(nil), data...)
-	got, err := l.appendEncoded(seq, enc, func() { l.view.Overwrite(offset, plaintext) })
+	got, err := l.appendEncoded(seq, enc, true, func() { l.view.Overwrite(offset, plaintext) })
 	if err != nil {
 		return 0, err
 	}
@@ -531,7 +618,7 @@ func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (ui
 	if err != nil {
 		return 0, err
 	}
-	got, err := l.appendEncoded(seq, enc, func() { l.view.Clear(offset, uint64(length)) })
+	got, err := l.appendEncoded(seq, enc, false, func() { l.view.Clear(offset, uint64(length)) })
 	if err != nil {
 		return 0, err
 	}
