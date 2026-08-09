@@ -16,7 +16,7 @@ import (
 
 // What a clone costs, in bytes that are actually in the bucket.
 //
-// This file was the scales CHUNK-ADDRESSING-SPEC §8 was weighed on: it measured the
+// This file was the scales the chain-depth decision was weighed on: it measured the
 // duplicate a clone paid when chunks were keyed `image/<volume>/chunks/<digest>` — a full
 // copy of the inherited dataset at the clone's first stop, 8 MiB for a 512-byte write.
 // The owner decided (2026-08-07) and the chunk store moved to the lineage, so the same
@@ -223,7 +223,7 @@ func fill(v *cow.IntervalMap, off uint64, n int, b byte) {
 // disjoint write.
 //
 // So "the storage cost of a clone becomes proportional to what the clone wrote" is finally
-// true as CHUNK-ADDRESSING-SPEC §3 stated it, rather than true at chunk granularity — and
+// true as stated, rather than true at chunk granularity — and
 // the previous entry in this file was right to insist on the weaker form while the
 // publisher still flattened.
 //
@@ -361,7 +361,7 @@ func TestACloneFirstStopPaysForWhatItTouched(t *testing.T) {
 // away.** The unreferenced chunk below is only unreferenced because *no manifest in the
 // lineage* names it: the parent's image, the parent's snapshot, the clone's image and the
 // clone's snapshot all have to be folded together to say so. Under the old key space one
-// volume's manifests answered it. This is exactly the cost DELETION-AND-RECLAIM-SPEC §3
+// volume's manifests answered it. This is exactly the cost deletion's reachability work
 // prices for reclaim, made concrete.
 func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 	store := metered(sim.NewObjectStore())
