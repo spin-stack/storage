@@ -174,6 +174,39 @@ message DesiredVolume {
   // a partition converges by doing the same thing again — and doing it again is free,
   // because the manifest is written create-only (INV-16).
   string pending_snapshot_id = 9;
+
+  // published_sequence and durable_sequence are the two numbers the catalog already
+  // holds about this volume's data and that the attach path had no way to ask for.
+  // That is the whole of the two failures they close: both were reproduced against
+  // real binaries, and in both the fact that would have caught them was sitting in
+  // Postgres while the Agent decided, alone, that finding nothing means there was
+  // never anything.
+  //
+  // published_sequence is the highest sequence a published image is known to
+  // reproduce. It is what tells "this volume has never stopped cleanly, boot it
+  // empty" apart from "its manifest is gone". Without it a stray delete, a lifecycle
+  // expiry, or a restore that missed one key produces a blank device with an INFO
+  // line — and the next graceful stop replaces the volume's real image with the
+  // blank one's successor, which makes it permanent.
+  //
+  // durable_sequence is the highest sequence this fleet ACKed to a guest's fsync. It
+  // is the floor an attach has to be able to reproduce out of its image plus whatever
+  // its local WAL replayed; coming back below it is the volume silently rolled back
+  // to an earlier state, which reads without an I/O error anywhere.
+  //
+  // They are on the wire for the same reason the parent ids are: ADR-0021 keeps the
+  // Agent from knowing what a Control Plane is, so it cannot look either of them up.
+  // They are floors to *check* against and never inputs to the read path — the object
+  // store stays the authority on what the volume holds, and these only decide whether
+  // what it holds is enough.
+  //
+  // Both can lag and neither can lead, which is what makes checking them safe. The
+  // catalog is written from a report the Agent sends after the fdatasync and after
+  // the publish, so an attach that satisfies these floors may legitimately be ahead
+  // of them; one that falls below them has lost data. Comparing with < rather than !=
+  // is that asymmetry.
+  int64 published_sequence = 10;
+  int64 durable_sequence = 11;
 }
 
 message GetDesiredStateResponse {

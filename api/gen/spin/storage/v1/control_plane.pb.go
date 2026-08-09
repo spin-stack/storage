@@ -510,6 +510,38 @@ type DesiredVolume struct {
 	// a partition converges by doing the same thing again — and doing it again is free,
 	// because the manifest is written create-only (INV-16).
 	PendingSnapshotId string `protobuf:"bytes,9,opt,name=pending_snapshot_id,json=pendingSnapshotId,proto3" json:"pending_snapshot_id,omitempty"`
+	// published_sequence and durable_sequence are the two numbers the catalog already
+	// holds about this volume's data and that the attach path had no way to ask for.
+	// That is the whole of the two failures they close: both were reproduced against
+	// real binaries, and in both the fact that would have caught them was sitting in
+	// Postgres while the Agent decided, alone, that finding nothing means there was
+	// never anything.
+	//
+	// published_sequence is the highest sequence a published image is known to
+	// reproduce. It is what tells "this volume has never stopped cleanly, boot it
+	// empty" apart from "its manifest is gone". Without it a stray delete, a lifecycle
+	// expiry, or a restore that missed one key produces a blank device with an INFO
+	// line — and the next graceful stop replaces the volume's real image with the
+	// blank one's successor, which makes it permanent.
+	//
+	// durable_sequence is the highest sequence this fleet ACKed to a guest's fsync. It
+	// is the floor an attach has to be able to reproduce out of its image plus whatever
+	// its local WAL replayed; coming back below it is the volume silently rolled back
+	// to an earlier state, which reads without an I/O error anywhere.
+	//
+	// They are on the wire for the same reason the parent ids are: ADR-0021 keeps the
+	// Agent from knowing what a Control Plane is, so it cannot look either of them up.
+	// They are floors to *check* against and never inputs to the read path — the object
+	// store stays the authority on what the volume holds, and these only decide whether
+	// what it holds is enough.
+	//
+	// Both can lag and neither can lead, which is what makes checking them safe. The
+	// catalog is written from a report the Agent sends after the fdatasync and after
+	// the publish, so an attach that satisfies these floors may legitimately be ahead
+	// of them; one that falls below them has lost data. Comparing with < rather than !=
+	// is that asymmetry.
+	PublishedSequence int64 `protobuf:"varint,10,opt,name=published_sequence,json=publishedSequence,proto3" json:"published_sequence,omitempty"`
+	DurableSequence   int64 `protobuf:"varint,11,opt,name=durable_sequence,json=durableSequence,proto3" json:"durable_sequence,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -598,6 +630,20 @@ func (x *DesiredVolume) GetPendingSnapshotId() string {
 		return x.PendingSnapshotId
 	}
 	return ""
+}
+
+func (x *DesiredVolume) GetPublishedSequence() int64 {
+	if x != nil {
+		return x.PublishedSequence
+	}
+	return 0
+}
+
+func (x *DesiredVolume) GetDurableSequence() int64 {
+	if x != nil {
+		return x.DurableSequence
+	}
+	return 0
 }
 
 type GetDesiredStateResponse struct {
@@ -1085,7 +1131,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xc2\x02\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\x9c\x03\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1096,7 +1142,10 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x12,\n" +
 	"\x12parent_snapshot_id\x18\a \x01(\tR\x10parentSnapshotId\x12(\n" +
 	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\x12.\n" +
-	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotIdJ\x04\b\x06\x10\a\"S\n" +
+	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12-\n" +
+	"\x12published_sequence\x18\n" +
+	" \x01(\x03R\x11publishedSequence\x12)\n" +
+	"\x10durable_sequence\x18\v \x01(\x03R\x0fdurableSequenceJ\x04\b\x06\x10\a\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +

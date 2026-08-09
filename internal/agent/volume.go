@@ -227,6 +227,22 @@ func (v *Volume) release() error {
 // that can end it; a restart is what re-fetches the base and republishes.
 var ErrNoReadView = errors.New("agent: the volume's read view never resolved, so its image would be missing everything it held before this session")
 
+// ErrImageMissing and ErrDurabilityLost are the two ways an attach discovers that this
+// volume's data is not where the fleet says it is. They are sentinels rather than plain
+// errors because they are the text a guest's I/O error is traced back to: they travel out
+// through wal.ErrBaseUnavailable to every read, and out through ErrNoReadView to the
+// teardown that would otherwise publish the short session over the volume's own manifest.
+//
+// Two and not one, because they are different evidence and an operator's next step differs.
+// ErrImageMissing is an object that should exist and does not — look at the bucket, its
+// lifecycle rules, and whatever last restored it. ErrDurabilityLost is an object that
+// exists and is behind: this host's local WAL was lost with writes in it, and what is in
+// the bucket is genuinely older than what a guest was promised.
+var (
+	ErrImageMissing   = errors.New("agent: the catalog says this volume has published an image and the object store holds none")
+	ErrDurabilityLost = errors.New("agent: this volume came back below the sequence a guest was already told was durable")
+)
+
 // ident is the pair image keys everything by: this volume, and the lineage whose chunk
 // store holds its bytes.
 //
@@ -1117,6 +1133,38 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		// A volume that has never stopped cleanly has no image, which is the first boot
 		// and must work. Its base is the ancestry outright — an empty delta over it is the
 		// same view — or an empty map for a volume that descends from nothing.
+		//
+		// **Only when the catalog agrees it never published.** "There is no manifest" and
+		// "this volume's data is not where it is supposed to be" are the same answer from
+		// the object store, and until the catalog's published_sequence reached this
+		// function nothing could tell them apart: a stray delete, a lifecycle expiry or a
+		// restore that missed one key produced an INFO line, `durable_sequence=0` and a
+		// blank device, and the guest read zeros for every block it had ever written.
+		//
+		// It is refused rather than served-and-alarmed, and the second half of the failure
+		// is why. Serving means the *next* teardown publishes what this session holds over
+		// a manifest key that no longer exists — create-only, so it succeeds — and the
+		// volume's real image is replaced by the blank one's successor. That is the moment
+		// the loss stops being recoverable, and it is reached by a guest doing nothing
+		// unusual. Refusing costs a volume that will not start, which an operator can see
+		// and undo; `baseFailed` is what makes the refusal cover the publish too.
+		//
+		// The check is `> 0` and not a comparison with the manifest's sequence, because
+		// there is no manifest to compare with. The quantitative case — a manifest that is
+		// *there* but behind what was ACKed — is the floor below, and the two are separate
+		// rules because the evidence is different: absence versus a number.
+		if pub := d.GetPublishedSequence(); pub > 0 {
+			err := fmt.Errorf("%w: volume %s published up to sequence %d and the object store holds no image for it",
+				ErrImageMissing, v.id, pub)
+			slog.Error("the catalog says this volume has published an image and the object store has none; it will not be served",
+				"volume_id", v.id, "epoch", v.epoch,
+				"catalog_published_sequence", pub,
+				"catalog_durable_sequence", d.GetDurableSequence(),
+				"lineage", format.UUIDString(v.lineage))
+			v.baseFailed = true
+			v.log.FailBase(err)
+			return
+		}
 		base, man = ancestry, image.Manifest{}
 		if base == nil {
 			base = cow.NewIntervalMap()
@@ -1135,6 +1183,58 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	// ETag, which is create-only, and loses to the one that did.
 	v.imageETag = etag
 	durable := man.Sequence
+
+	// The floor: whatever this attach can actually reproduce has to reach the sequence a
+	// guest's fsync already returned on.
+	//
+	// Two sources, and the higher one wins because either alone is enough to answer a read:
+	// the image covers everything up to its own sequence, and the local segments replay
+	// whatever was appended after it. `ResumeReport().RecoveredSequence` is the only place
+	// the second number exists — Watermarks().Local is max(the floor passed in, what replay
+	// found), so it reads the same whether the device held records up to N or held nothing
+	// at all.
+	//
+	// **Refuse, not alarm.** The failure this catches is a guest reading superseded data
+	// with no I/O error anywhere: a host rebooted onto an empty instance store comes back at
+	// its last publish, a verify boot reads the range out of the published image and
+	// succeeds, and the catalog then covers for it for ever, because UpdateWatermarks takes
+	// GREATEST and the old high-water mark never falls. An alarm would be a line in a log
+	// next to a volume that is serving; by the time anyone read it the guest would have
+	// written on top of the rolled-back state and there would be nothing left to reconcile.
+	// A pilot can take a volume that will not start. It cannot take one that starts with old
+	// bytes. Same reason as the branch above, and it is the same `baseFailed` that stops the
+	// publish from writing this shortened session down as the volume's new truth.
+	//
+	// The comparison is `<` and not `!=` on purpose. The catalog is written from a report
+	// the Agent sends *after* the fdatasync and after the publish, so it lags what is really
+	// durable and can never lead it: an attach that comes back ahead of these numbers is the
+	// normal case (everything since the last report), and only coming back short is loss.
+	//
+	// Nothing here trusts the catalog with the *contents* of the volume — the object store
+	// is still the only authority on what it holds (ADR-0021 is untouched). It is asked one
+	// question, about a number it is the only holder of: what did this fleet promise?
+	//
+	// `ack > 0` guards the conversion and nothing else. A negative watermark is nonsense the
+	// schema does not forbid, and it would widen to an enormous uint64 and refuse every
+	// volume on the fleet for ever — a defect strictly worse than the one this closes, so it
+	// is written out rather than reasoned about.
+	replayed := v.log.ResumeReport().RecoveredSequence
+	recovered := max(durable, replayed)
+	if ack := d.GetDurableSequence(); ack > 0 && recovered < uint64(ack) {
+		err := fmt.Errorf("%w: volume %s came back at sequence %d, and sequence %d was ACKed to a guest as durable",
+			ErrDurabilityLost, v.id, recovered, ack)
+		slog.Error("this volume came back below the sequence a guest was already told was durable; it will not be served",
+			"volume_id", v.id, "epoch", v.epoch,
+			"recovered_sequence", recovered,
+			"catalog_durable_sequence", ack,
+			"image_sequence", durable,
+			"local_wal_sequence", replayed,
+			"data_dir", m.cfg.dataDir())
+		v.baseFailed = true
+		v.log.FailBase(err)
+		return
+	}
+
 	if err := v.log.InstallBase(base, durable); err != nil {
 		slog.Error("the recovered read view could not be installed",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)

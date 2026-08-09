@@ -160,6 +160,20 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			BlockSize: v.BlockSize,
 			Epoch:     v.CurrentEpoch,
 			State:     volumeState(v.State),
+			// The two watermarks the catalog holds, sent back to the host that will
+			// serve the volume. They are the only facts on this message the Agent does
+			// not otherwise have, and they are what lets it tell "this volume is new"
+			// from "this volume's data is missing": an attach that finds no image, or
+			// replays below the sequence a guest's fsync already returned on, is a
+			// volume that has lost data rather than one that never had any.
+			//
+			// Copied verbatim rather than derived. metadata.Volume calls them
+			// informative (§5.8) and that is still true of what the Control Plane does
+			// with them — it takes no decision on either — but "informative" was read as
+			// "not worth sending", and the Agent was then left deciding with the one
+			// authority that cannot distinguish the two cases, the bucket.
+			PublishedSequence: v.PublishedSequence,
+			DurableSequence:   v.DurableSequence,
 		}
 		// A clone reads through its parent's objects (§20), and the Agent cannot look
 		// the chain up itself (ADR-0021). The parent's *volume* id lives on the
