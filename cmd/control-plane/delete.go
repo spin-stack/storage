@@ -16,7 +16,7 @@ import (
 // **What a delete means here is the owner's sentence, and it is short.** "Deleting a
 // volume means you cannot create or start a VM from it: the data is not there any more.
 // A soft delete for a couple of days to allow recovery, and after that it does not
-// exist." (DELETION-AND-RECLAIM-SPEC, 2026-08-07.)
+// exist." (the deletion decision, 2026-08-07.)
 //
 // The couple of days is **not implemented here, and could not be**. Every object goes
 // through objectstore.Store.Delete, which places a reversible marker; the interface has
@@ -57,7 +57,7 @@ import (
 //
 // # Descendants are flattened first, and this command does not invent that
 //
-// DELETION-AND-RECLAIM-SPEC §9's answer is B: a delete of a volume with descendants
+// the deletion decision's answer is B: a delete of a volume with descendants
 // flattens them. Since publishing stopped flattening, a clone reads its ancestry on
 // every attach and never becomes independent on its own, so option A — refuse until the
 // clone stops — stopped being a temporary refusal and became a permanent one. The

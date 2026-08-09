@@ -45,7 +45,7 @@ type Removed struct {
 // interface deliberately has no way to reach past it (INV-14, and `real.NewS3Store`
 // refuses a bucket without versioning, so the guarantee is structural rather than
 // promised). "A couple of days of recovery, then gone" is therefore a **lifecycle rule
-// on the bucket**, not code here — DELETION-AND-RECLAIM-SPEC's decision of 2026-08-07
+// on the bucket**, not code here — the deletion decision
 // — and the one thing this package can do about it is not offer an alternative.
 // docs/plan/RUNBOOK.md carries what the deployment owes and what shortening it costs.
 //
@@ -89,7 +89,7 @@ type Removed struct {
 // the second line, not the first.
 //
 // The caller flattens those descendants and runs this again
-// (DELETION-AND-RECLAIM-SPEC §9's answer B). This does not flatten them itself: a
+// (the deletion decision). This does not flatten them itself: a
 // flatten needs the volume's DEK and a detached volume, which are a key file and a
 // catalog read, and neither belongs behind a function whose argument is a bucket.
 //
@@ -100,7 +100,7 @@ type Removed struct {
 // live under this volume's id are this volume and its descendants — and there are
 // none, by the refusal above. That is what makes the whole prefix safe to mark without
 // reading a single manifest, and it is why this needs no reference counting and no set
-// difference over a lineage's manifests (both of which DELETION-AND-RECLAIM-SPEC
+// difference over a lineage's manifests (both of which the deletion decision
 // rejects, the first by name).
 //
 // **The consequence is that deleting a clone reclaims almost nothing**, and it is
@@ -178,7 +178,7 @@ func Delete(ctx context.Context, store objectstore.Store, volumeID string) (Remo
 	// The listing is what bounds the work, and an eventually consistent one under-reports
 	// rather than over-reports (objectstore.Store.List). A key it misses is a key nothing
 	// references, which costs storage until the delete is re-run — the one orphan class
-	// DELETION-AND-RECLAIM-SPEC §8 accepts, and the reason a re-run is cheap.
+	// the deletion decision accepts, and the reason a re-run is cheap.
 	chunks, err := store.List(ctx, image.ChunksPrefix(vol))
 	if err != nil {
 		return res, fmt.Errorf("lineage: volume %s: listing its chunk store: %w", volumeID, err)
@@ -221,7 +221,7 @@ func mark(ctx context.Context, store objectstore.Store, key string) (bool, error
 // It costs a listing of `volumes/` and a GET per descriptor, which is what
 // `-rebuild-metadata` already pays and is affordable for an admin one-shot. The
 // alternative — asking the catalog, which has both links indexed — is what
-// DELETION-AND-RECLAIM-SPEC §6 originally proposed and it is wrong here for a reason
+// the deletion decision originally proposed and it is wrong here for a reason
 // that arrived with FLATTEN: `volumes.parent_snapshot_id` cannot be written to NULL by
 // a converging create, so the catalog goes on naming a parent that the bucket says was
 // left behind. Asking it would make the refusal permanent for exactly the volumes that

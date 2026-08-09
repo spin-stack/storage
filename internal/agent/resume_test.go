@@ -172,7 +172,7 @@ func TestASecondSessionGivesBackTheWALItsImageAlreadyHolds(t *testing.T) {
 
 	// Stopping is what publishes (ADR-0026), and releasing deliberately deletes nothing:
 	// the records stay exactly as they were so a publish that had failed could be retried
-	// by the next incarnation (SHUTDOWN-PUBLISH-SPEC §6). Pinned here because the
+	// by the next incarnation (the shutdown-publish decision). Pinned here because the
 	// assertion below would also be satisfied by a release that reclaimed.
 	if err := first.Close(context.Background()); err != nil { //nolint:usetesting // t.Context is cancelled before cleanups run, and a cancelled context is how an operator abandons a publish
 		t.Fatalf("stopping the first session: %v", err)
@@ -201,7 +201,7 @@ func TestASecondSessionGivesBackTheWALItsImageAlreadyHolds(t *testing.T) {
 
 // abandonSession stops m the way an operator does when the store will not take the
 // session: one attempt, then a second signal. Everything it held stays on disk, which is
-// what the next incarnation resumes from (SHUTDOWN-PUBLISH-SPEC §6).
+// what the next incarnation resumes from (the shutdown-publish decision).
 func abandonSession(t *testing.T, m *agent.VolumeManager) {
 	t.Helper()
 	ctx, abandon := context.WithCancel(context.Background()) //nolint:usetesting // see above

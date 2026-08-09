@@ -24,7 +24,7 @@
 //
 // # A manifest states its own volume, not its ancestry
 //
-// This is the second half of CHUNK-ADDRESSING-SPEC's decision and it changes what reading
+// This is the second half of the chain-depth decision and it changes what reading
 // an image means. A manifest used to be **flattened**: a publish serialised the volume's
 // whole read view, so a clone's first stop wrote down every range its parent's snapshot
 // held, under the clone's own name, and any one manifest could be read alone. It is now a
@@ -40,7 +40,7 @@
 //     boot (§14.6).
 //   - **A clone stopped being self-contained.** Its image cannot be read without its
 //     ancestors' snapshots, so deleting a parent takes its descendants with it unless
-//     they are flattened first (DELETION-AND-RECLAIM-SPEC's decision of 2026-08-07: a
+//     they are flattened first (the deletion decision: a
 //     delete of a volume with descendants flattens them).
 //   - **The read path grows with depth.** Attaching a clone is one descriptor GET and one
 //     snapshot manifest per link, plus the chunks each names. That is what the ceiling of
@@ -52,7 +52,7 @@
 // # The chunk store belongs to a lineage, not to a volume
 //
 // This is the one thing about the layout above that cannot be read off it, and it is the
-// format change CHUNK-ADDRESSING-SPEC's decision of 2026-08-07 asked for. A clone
+// format change the chain-depth decision asked for. A clone
 // inherits its parent's DEK, KEK id and DEK version (controlplane.Clone), so a lineage —
 // the volume that was created, plus every clone that descends from it, however deep —
 // encrypts under **one key**. The chunk store is scoped to exactly that set: the lineage
@@ -82,7 +82,7 @@
 // now the lineage rather than the volume. Someone who can read the bucket can see that
 // two volumes of one lineage hold equal plaintexts — as they could within a volume
 // before — and a delete that reclaims bytes has to reason about the lineage's manifests
-// rather than one volume's (DELETION-AND-RECLAIM-SPEC §3).
+// rather than one volume's (the deletion decision).
 //
 // # Encryption (§15, INV-15)
 //
@@ -314,7 +314,7 @@ func ManifestKey(volumeID [16]byte) string { return Prefix(volumeID) + "manifest
 // than something under the root volume's image/ prefix on purpose: these bytes outlive
 // the volume that first wrote them — a clone still reads them after its parent's own
 // manifest is gone — so a delete that clears image/<root>/ must not be able to take a
-// descendant's data with it (DELETION-AND-RECLAIM-SPEC).
+// descendant's data with it (the deletion decision).
 func ChunksPrefix(lineageRoot [16]byte) string {
 	return "chunks/" + format.UUIDString(lineageRoot) + "/"
 }
@@ -432,7 +432,7 @@ func LoadSnapshotOver(ctx context.Context, store objectstore.Store, enc *wal.Enc
 // Passing nil for a clone is not a corruption, it is the old behaviour: the manifest comes
 // out flattened, naming every range the ancestry holds under this volume's name. It reads
 // back correctly and costs a copy of the inherited dataset — which is what
-// CHUNK-ADDRESSING-SPEC measured at 8 MiB for a 512-byte write. Passing the *wrong* map is
+// the chain-depth decision measured at 8 MiB for a 512-byte write. Passing the *wrong* map is
 // refused rather than guessed at (cow.DeltaOver).
 func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, id Ident, view, inherited *cow.IntervalMap, seq uint64, prevETag string) (string, error) {
 	man, err := uploadChunks(ctx, store, rnd, enc, id, view, inherited, seq)
@@ -468,7 +468,7 @@ func Publish(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 // to be forgotten.
 //
 // It walks `view.DeltaOver(inherited)` where it used to walk `view.Ranges()`, and that one
-// substitution is the whole of step 3 of CHUNK-ADDRESSING-SPEC. Ranges flattens: it
+// substitution is the whole of step 3 of the chain-depth decision. Ranges flattens: it
 // reports the base's ranges merged with this layer's, so a clone that wrote one sector
 // wrote down a manifest naming every byte of its parent's dataset — and, with the chunk
 // store now shared across a lineage, re-chunked and re-uploaded whichever of those chunks
@@ -552,7 +552,7 @@ func uploadChunks(ctx context.Context, store objectstore.Store, rnd io.Reader, e
 // reason was a real protection: a manifest was flattened, so it already held everything
 // the volume could read, and sliding a parent underneath it would have uncovered every
 // range the guest discarded — the discard having been written down as absence
-// (agent.fetchBase, CHUNK-ADDRESSING-SPEC §2).
+// (agent.fetchBase, the chain-depth decision).
 //
 // Since a manifest became a delta, both halves of that reversed. The image no longer
 // holds what the volume inherited, so it *must* be laid over the ancestry or the clone

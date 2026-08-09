@@ -21,7 +21,7 @@ import (
 //
 // It is a one-shot flag like every other admin action here — `-seed-volume`,
 // `-snapshot-volume`, `-clone-snapshot`, `-detach-volume`, `-rebuild-metadata`,
-// `-cordon-host` — and CHUNK-ADDRESSING-SPEC's decision of 2026-08-07 says so in as many
+// `-cordon-host` — and the chain-depth decision says so in as many
 // words: the `operations` table that would have scheduled it was retired with ADR-0017's
 // second capacity term, and bringing it back for one verb is a schema change, a term guard
 // and a reconciliation loop for something ADR-0021 §2 already says these binaries are for.

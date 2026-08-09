@@ -176,7 +176,7 @@ func TestASecondSessionGivesBackTheWALItsImageAlreadyHolds(t *testing.T) {
 
 	// (2) Stopping publishes the image, and releasing the volume deliberately deletes
 	// nothing — the records stay so a publish that had failed could be retried by the next
-	// incarnation (SHUTDOWN-PUBLISH-SPEC §6). Both halves are asserted, because the
+	// incarnation (the shutdown-publish decision). Both halves are asserted, because the
 	// assertion after the restart would also be satisfied by a release that reclaimed.
 	if err := m.Close(t.Context()); err != nil {
 		t.Fatalf("stopping the Agent: %v", err)

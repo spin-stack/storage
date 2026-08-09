@@ -225,7 +225,7 @@ UPDATE volumes
 -- expiry column: the recovery window for a deleted volume is the bucket's own
 -- versioning plus its lifecycle policy, and a second window in a column here would
 -- drift from the one that actually controls the bytes
--- (DELETION-AND-RECLAIM-SPEC, 2026-08-07).
+-- (the deletion decision, 2026-08-07).
 --
 -- One statement, three parts, and the order is forced by the two foreign keys that
 -- make volumes and snapshots mutually referencing:

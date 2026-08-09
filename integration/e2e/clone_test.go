@@ -41,7 +41,7 @@ func TestACloneIsPlacedWhereItsDataIs(t *testing.T) {
 }
 
 // TestACloneThatStoppedOnceIsServedAgain is the session no lane had ever run, and it did
-// not work: **a clone worked exactly once** (CHUNK-ADDRESSING-SPEC §2).
+// not work: **a clone worked exactly once** (the chain-depth decision).
 //
 // A clone has no image of its own until it stops, so every clone this repository had ever
 // read — the two DST scenarios, the test above — was reading its *first* session, where

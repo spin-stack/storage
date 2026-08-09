@@ -211,7 +211,7 @@ func (v *Volume) release() error {
 		// Nothing is waiting on the fetch any more, so whatever it is still doing is
 		// work nobody will read. The goroutine has already ended in every path that got
 		// here — the publish waits on baseDone — so this is releasing the context's
-		// resources rather than stopping anything (SHUTDOWN-PUBLISH-SPEC §5).
+		// resources rather than stopping anything (the shutdown-publish decision).
 		v.baseCancel()
 	}
 	return v.log.Close()
@@ -245,7 +245,7 @@ func (v *Volume) ident() image.Ident {
 // It runs after quiesce, because that is the first moment nothing can append.
 //
 // It returns its error instead of logging it, which it used to do. The difference is the
-// whole of SHUTDOWN-PUBLISH-SPEC: a caller that is told the publish failed can retry it,
+// whole of the shutdown-publish decision: a caller that is told the publish failed can retry it,
 // hold the data directory while it does, and exit non-zero if it never succeeds. A caller
 // that reads slog cannot do any of those things, and the process exited 0 with the
 // session in nobody's bucket.
@@ -437,7 +437,7 @@ type VolumeManagerConfig struct {
 	// ShutdownGrace bounds **one** publish attempt, and one wait for a read view, during
 	// a teardown. It is not a budget after which data is abandoned: when an attempt is
 	// cut short Close retries it, and nothing in this type ever gives a session up on a
-	// timer (SHUTDOWN-PUBLISH-SPEC, "REVIEWED AND DECIDED"). What it exists for is the
+	// timer (the shutdown-publish decision, "REVIEWED AND DECIDED"). What it exists for is the
 	// one failure a retry cannot survive — a PUT that neither succeeds nor fails, which
 	// without a bound is a teardown that hangs with nothing printed and no way in.
 	//
@@ -904,7 +904,7 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
 	if needsBase {
 		v.baseDone = make(chan struct{})
-		// **Not the serve context, and not a child of ctx either** (SHUTDOWN-PUBLISH-SPEC
+		// **Not the serve context, and not a child of ctx either** (the shutdown-publish decision
 		// §5). Both are cancelled by the thing that then waits for this fetch's result:
 		// stop() cancels the serve context and *then* blocks on baseDone, and ctx here is
 		// the Agent loop's context, which SIGTERM cancels before Close() runs at all. So
@@ -964,7 +964,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	// contiguous prefix to establish — the manifest resolves or it does not.
 	//
 	// **An image is a delta over the ancestry; it does not supersede it.** That is the
-	// sentence this function turned on 2026-08-08 (CHUNK-ADDRESSING-SPEC step 3), and the
+	// sentence this function turned on 2026-08-08 (the chain-depth decision step 3), and the
 	// previous one read the other way round: a publish flattened, so a clone's own image
 	// held its parent's bytes from its first stop onwards and the parent link stopped
 	// describing the read path the moment the manifest existed. Now `image.uploadChunks`
@@ -1330,7 +1330,7 @@ func (m *VolumeManager) Device(volumeID string) (*blockdev.Device, bool) {
 // return until it has** — holding this host's claim on the data directory for as long as
 // that takes. It is idempotent.
 //
-// That is the decision in SHUTDOWN-PUBLISH-SPEC's "REVIEWED AND DECIDED", and its
+// That is the decision in the shutdown-publish decision "REVIEWED AND DECIDED", and its
 // mechanism is this function's shape: a flock is released by the kernel when the process
 // exits, so "refuse to release the lock" can only mean "do not exit", which can only mean
 // "do not return from here". Everything else follows — the retries, the holding line, and

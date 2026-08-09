@@ -26,7 +26,7 @@ import (
 // answers the parent's byte).
 //
 // **It reads them with every object the parent owns deleted.** That is the whole point of
-// the operation — DELETION-AND-RECLAIM-SPEC's answer B is that a delete of a volume with
+// the operation — the deletion decision is that a delete of a volume with
 // descendants flattens them first — and "self-contained" is not a claim a manifest can
 // make, it is one a missing parent has to fail to refute.
 //

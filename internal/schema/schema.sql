@@ -156,7 +156,7 @@ CREATE TABLE volumes (
     -- is legal because 65536 is a sector multiple and not because anyone meant a
     -- segment — that coincidence is presumably where the wrong comment kept its footing.
     -- Whether the 64 KiB granularity is V2 or simply dead is the half of DEV-0024 that
-    -- stays open; it is downstream of CHUNK-ADDRESSING-SPEC.md §8, since the granularity
+    -- stays open; it is downstream of the chain-depth decision, since the granularity
     -- of what is addressed is part of the decision that spec puts to a human. Either
     -- way it is not this column.
     block_size         INTEGER NOT NULL,

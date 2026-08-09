@@ -449,7 +449,7 @@ func TestASecondStopPaysOnlyForWhatItTouched(t *testing.T) {
 
 // lineageManifests is every manifest that can name a chunk in this lineage: each volume's
 // image and each volume's snapshot. Nothing in the tree does this fold yet — reclaim is
-// DELETION-AND-RECLAIM-SPEC's, unimplemented — which is why it is spelled out here rather
+// the deletion decision's, unimplemented — which is why it is spelled out here rather
 // than called.
 func lineageManifests(t *testing.T, store objectstore.Store, parent [16]byte, parentSnap string, clone image.Ident, cloneSnap string) []image.Manifest {
 	t.Helper()

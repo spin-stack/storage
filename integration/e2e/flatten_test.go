@@ -37,7 +37,7 @@ import (
 // chunk belongs to the lineage rather than to the volume that wrote it, so deleting
 // `chunks/<parent>/` would take the bytes of the parent's own image too, and the test would
 // be asserting that the clone survived something no delete would ever do
-// (DELETION-AND-RECLAIM-SPEC's order removes the snapshot manifests before the chunks).
+// (the deletion decision removes the snapshot manifests before the chunks).
 //
 // # What this lane cannot say, and the first run of it is how that was found
 //

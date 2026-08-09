@@ -152,11 +152,11 @@ func run() error {
 		uncordonHost = flag.String("uncordon-host", "", "let this host take new volumes again and exit, instead of serving")
 
 		// flatten-volume: make a clone self-contained and exit — the one-shot
-		// controlplane.Clone's refusal names. CHUNK-ADDRESSING-SPEC's decision of
+		// controlplane.Clone's refusal names. the chain-depth decision of
 		// 2026-08-07 made it load-bearing for two things at once when publishing stopped
 		// flattening: it is the only way back under §20.1's depth ceiling, and the only way
 		// to delete a parent that has clones without destroying them
-		// (DELETION-AND-RECLAIM-SPEC's answer B). flatten.go carries the reasoning for this
+		// (the deletion decision). flatten.go carries the reasoning for this
 		// binary's half; the mechanism and its ordering are lineage.Flatten's.
 		flattenVolume = flag.String("flatten-volume", "",
 			"rewrite this volume's image so it owes nothing to its ancestors, and exit, instead of serving")

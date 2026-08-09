@@ -464,7 +464,7 @@ func aCloneReadsThroughItsParent(s *Sim, dropLink bool) error {
 // grandparent's bytes only because publishing flattened — every snapshot manifest held
 // everything its volume could read. The two ancestors here publish **deltas**, each
 // manifest naming only the ranges that volume itself wrote, which is what the publisher
-// produces since step 3 of CHUNK-ADDRESSING-SPEC and what makes the walk the only thing
+// produces since step 3 of the chain-depth decision and what makes the walk the only thing
 // that can answer the grandparent's offset.
 //
 // The assertion is the bytes the guest reads back at two offsets, and the checker is the
@@ -1257,7 +1257,7 @@ func (g *gatedStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return g.Store.Get(ctx, key)
 }
 
-// scenarioAVolumeStoppedMidFetchStillPublishes is SHUTDOWN-PUBLISH-SPEC §5, from the
+// scenarioAVolumeStoppedMidFetchStillPublishes is the shutdown-publish decision, from the
 // only side that can tell: what a later guest reads back.
 //
 // The Agent's base fetch used to run under the serve context, and `stop()` cancels that

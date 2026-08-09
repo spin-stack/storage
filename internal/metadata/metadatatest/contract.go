@@ -1634,7 +1634,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 	}
 }
 
-// volumeDelete is the catalog half of DELETION-AND-RECLAIM-SPEC: a volume leaves the
+// volumeDelete is the catalog half of the deletion decision: a volume leaves the
 // catalog with its snapshots, and only when nothing still descends from them.
 //
 // It asserts the refusal by what it lets an operator *do* rather than by reading a
