@@ -1292,6 +1292,56 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	v.imageETag = etag
 	durable := man.Sequence
 
+	// Take up what this host still holds for this volume under an earlier epoch, before
+	// the floor below is evaluated.
+	//
+	// **This is the difference between a volume an operator can bring back and one that
+	// is bricked with its bytes intact on the local disk.** A session ACKed to a guest's
+	// fsync and not published sits in `<data-dir>/wal/<vol>/<epoch>/`; the operator
+	// attaches the volume again, every placement grants a *fresh* epoch, and this Agent
+	// opens `<epoch+1>/`, replays nothing, and the floor below refuses it. Every retry
+	// made it worse — another attach is another epoch — and the directory could not be
+	// moved by hand because each segment header carries its own epoch. Nothing an
+	// operator could run reached those bytes, ever.
+	//
+	// The epoch fences other *hosts*; it does not fence this host's own unpublished
+	// session. Those directories are under this Agent's data directory, which one process
+	// at a time owns, so taking them up is not crossing a fence — it is picking up what
+	// this host never put down. The rules that keep it that narrow live in
+	// wal.CarryForward: this volume's directories only, below the granted epoch only, and
+	// only records the object store does not already reproduce.
+	//
+	// It is here and not in `start` because `durable` — the sequence the manifest above
+	// reproduces — is the argument, and it is not known until the manifest has been
+	// loaded. Passing it is the correctness condition, not an optimisation: a record of
+	// ours at or below the image's sequence is either the record the image was built from
+	// or a sequence a later host reissued, and in the second case *their* record is the
+	// one in the image. Carrying ours forward would lay a superseded write over the live
+	// one with no error anywhere.
+	//
+	// A failure refuses the volume rather than serving it. The records are still on the
+	// device and the directories are still there — the carry unlinks nothing it has not
+	// first written and synced — so the next attach tries again, which is exactly the
+	// property the bricked state did not have.
+	carried, err := v.log.CarryForward(durable)
+	if err != nil {
+		slog.Error("the records this host still holds for an earlier epoch of this volume could not be taken up; it will not be served",
+			"volume_id", v.id, "epoch", v.epoch, "image_sequence", durable, "error", err)
+		v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW, err)
+		return
+	}
+	if !carried.Empty() {
+		// Only when something was there. Nearly every attach holds nothing below its
+		// granted epoch, and a line printed on every restart is read on none of them.
+		slog.Warn("took up the records this host still held for an earlier epoch of this volume",
+			"volume_id", v.id, "epoch", v.epoch,
+			"drained_epochs", carried.Epochs,
+			"carried_records", carried.Records,
+			"first_sequence", carried.First, "last_sequence", carried.Last,
+			"carried_bytes", carried.Bytes, "reclaimed_bytes", carried.Reclaimed,
+			"image_sequence", durable)
+	}
+
 	// The floor: whatever this attach can actually reproduce has to reach the sequence a
 	// guest's fsync already returned on.
 	//

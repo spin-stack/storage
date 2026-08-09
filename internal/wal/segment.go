@@ -253,7 +253,13 @@ func ReplaySegments(d disk.Disk, root string, volumeID [16]byte, epoch uint64) (
 // record simply goes to a new file — so a sealed segment is immutable, and a crash
 // mid-seal leaves either no new segment or an empty one, never a half-updated header.
 type segments struct {
-	d        disk.Disk
+	d disk.Disk
+	// root is <data-dir>/wal: the directory holding every volume's every epoch. It is
+	// kept beside dir, which is one epoch of one volume under it, because carrying an
+	// earlier epoch forward has to look at its *siblings* — and deriving the parent by
+	// trimming two path components off dir would be a second spelling of the layout
+	// SegmentDir defines.
+	root     string
 	dir      string
 	volumeID [16]byte
 	epoch    uint64
@@ -291,6 +297,7 @@ func newSegments(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, e
 	}
 	return &segments{
 		d:        d,
+		root:     root,
 		dir:      SegmentDir(root, volumeID, epoch),
 		volumeID: volumeID,
 		epoch:    epoch,
