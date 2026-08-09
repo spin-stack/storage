@@ -78,10 +78,20 @@ func TestAVolumeAttachedAgainServesTheSessionItsHostWasKilledHolding(t *testing.
 	}
 
 	second := d.startAgent(t, "agent-2")
-	waitForVolumeSocket(t, d, volumeID)
 	// Either outcome, so the guest below decides this test rather than the Agent's own
 	// account of itself.
 	waitForAnyLine(t, second, startup, refusedRollback, "read view recovered from the object store")
+	// The refusal is checked here and not left to the socket wait below, because the two
+	// report the same failure with very different words. A refused volume gets no socket at
+	// all — its runtime is cancelled and its listener closed — so waiting for the socket
+	// first would turn the bricked state this test is named after into "timed out waiting
+	// for a file", naming neither the epoch nor the records that are sitting on the disk.
+	if said(second, refusedRollback) {
+		t.Fatalf("the volume was refused after being attached again at epoch %d: the session its host was "+
+			"killed holding is under wal/%s/%s and nothing an operator can run reaches it",
+			granted, volumeID, held[0])
+	}
+	waitForVolumeSocket(t, d, volumeID)
 
 	// The tenant's half. verify mode writes nothing and reads back exactly the range the
 	// first guest fsynced: "input/output error" is the volume refusing — the bricked state

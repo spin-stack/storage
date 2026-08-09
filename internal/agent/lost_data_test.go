@@ -2,15 +2,19 @@ package agent_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"testing"
+	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/wal"
 )
@@ -165,6 +169,133 @@ func reportFor(t *testing.T, m *agent.VolumeManager, volumeID string) agent.Volu
 	}
 	t.Fatalf("volume %s appears in no report at all: %+v", volumeID, vols)
 	return agent.VolumeStatus{}
+}
+
+// refusalSession is resumeSession plus the listener factory, because the assertion below
+// is about the socket rather than about the bytes. It is a second constructor and not a
+// return value added to resumeSession: a dozen callers want the manager alone, and the
+// socket is the concern of exactly this file.
+func refusalSession(t *testing.T, d *sim.Disk, store objectstore.Store) (*agent.VolumeManager, *listenerFactory) {
+	t.Helper()
+	f := newListenerFactory()
+	m, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
+		DataDir:   holdDataDir,
+		SocketDir: refusalSocketDir,
+		Budget:    testBudget(),
+	}, agent.VolumeManagerDeps{
+		Clock:   sim.NewClock(time.Unix(1_700_000_000, 0).UTC()),
+		Disk:    d,
+		Listen:  f.listen,
+		Mapper:  unusedMapper{},
+		EventFD: unusedEventFD,
+		Store:   store,
+		Rand:    rand.Reader,
+	})
+	if err != nil {
+		t.Fatalf("NewVolumeManager: %v", err)
+	}
+	return m, f
+}
+
+// refusalSocketDir is where refusalSession's manager would put its sockets. It matches
+// resumeSession's so that the two fixtures cannot drift into naming a volume's socket
+// differently.
+const refusalSocketDir = "/run/spin"
+
+// TestARefusedVolumeTakesItsSocketDownAndStaysOnTheReport is the difference between a
+// tenant seeing a disk that is absent and a tenant seeing a disk that exists and cannot
+// be read.
+//
+// Refusing used to stop only the *reads*. The listener was already bound by `start`
+// before `fetchBase` ran, the supervisor kept re-opening it, and so a guest attached a
+// perfectly ordinary 256 MiB /dev/vda and took a hard I/O error on every sector. That is
+// the least actionable signal this system can emit: a VM's own boot logic can act on a
+// disk that is not there, and it cannot act on one that answers EIO — it retries, mounts
+// degraded, or hangs in initrd with nothing naming the volume.
+//
+// The two halves are asserted together on purpose, because the obvious way to close the
+// first breaks the second. Cancelling the volume's context stops the serve loop, and the
+// report is built from the same `m.volumes` entry — if the cancellation also dropped the
+// runtime, the volume would vanish from the wire, and an absence there is exactly what a
+// volume nobody ever placed on this host looks like (see VolumeManager.Volumes).
+func TestARefusedVolumeTakesItsSocketDownAndStaysOnTheReport(t *testing.T) {
+	t.Parallel()
+	d, store := sim.NewDisk(), sim.NewObjectStore()
+	v := desiredVolume(t, 1)
+
+	seq := publishOneSession(t, resumeSession(t, d, store), v, 32)
+
+	u, err := ids.Parse(v.GetVolumeId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.InjectPermanentDelete()
+	//nolint:usetesting // the store is shared across sessions; see resumeSession
+	if err := store.Delete(context.Background(), image.ManifestKey([16]byte(u))); err != nil {
+		t.Fatalf("deleting the manifest: %v", err)
+	}
+
+	second, f := refusalSession(t, d, store)
+	//nolint:usetesting // see above
+	defer func() { _ = second.Close(context.Background()) }()
+
+	told := lostDataVolume(t, 1, seq, seq)
+	told.VolumeId = v.GetVolumeId()
+	if err := second.Apply(t.Context(), []*storagev1.DesiredVolume{told}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// The socket was bound — `start` opens the listener before the base is fetched, so
+	// there is a real listener to take away. A fixture where nothing ever listened would
+	// make the assertion below vacuous.
+	socket := path.Join(refusalSocketDir, told.GetVolumeId()+".sock")
+	ln := f.listenerFor(socket)
+	if ln == nil {
+		t.Fatalf("nothing bound %s; the volume never started, so this test proves nothing", socket)
+	}
+
+	// Waited for on the listener's own close, not on a duration: the refusal happens on
+	// the base-fetch goroutine and the supervisor observes it on another, so there is no
+	// point in this test's goroutine at which it has already happened.
+	//
+	// The deadline is this test's own and shorter than the suite's, unlike
+	// TestServeIsSupervised, which leans on t.Context(). The difference is worth the two
+	// lines: leaning on t.Context() means the *only* failure this can produce is the
+	// suite's timeout panic — a stack, with the sentence below never printed — and the
+	// sentence is the whole diagnosis. Nothing here reads a wall clock (INV-01);
+	// context.WithTimeout takes the duration and the runtime does the waiting.
+	wait, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	select {
+	case <-ln.closed:
+	case <-wait.Done():
+		t.Fatalf("%s is still bound although the catalog says volume %s published at sequence %d "+
+			"and the object store holds no image for it: a guest attaches a device it can only take I/O errors from",
+			socket, told.GetVolumeId(), seq)
+	}
+
+	// And it does not come back. The supervisor re-listens on every session error by
+	// design, so "closed once" and "not being served" are different claims — a supervisor
+	// that re-opened here would put the socket back a microsecond later, for ever.
+	//
+	// Deterministic rather than a settle window: the supervisor closes the listener and
+	// then reads ctx.Err(), which context guarantees is non-nil once Done has fired, so
+	// by the time the close above is observable the re-listen branch is already unreachable.
+	if n := countPaths(f, socket); n != 1 {
+		t.Fatalf("%s was opened %d times: the supervisor put the refused volume's socket back", socket, n)
+	}
+
+	// The half a cancellation is most likely to break. The volume has no serve loop left,
+	// and it must still be on the wire — with its reason — or the fleet cannot tell it
+	// from a volume that was never placed here.
+	got := reportFor(t, second, told.GetVolumeId())
+	if got.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING {
+		t.Fatalf("the report says refusal=%s after the socket was taken down; taking the device away "+
+			"must not take the volume off the report", got.Refusal)
+	}
+	if !strings.Contains(got.RefusalDetail, "object store holds no image") {
+		t.Fatalf("refusal detail = %q, and it is the sentence that survives the runtime being stopped", got.RefusalDetail)
+	}
 }
 
 // TestARefusedVolumeIsNotRepublishedOverItsOwnMissingImage is the second half, and the

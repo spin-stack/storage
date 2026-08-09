@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,8 +19,8 @@ import (
 )
 
 // The two ways a volume used to come back holding less than the fleet had promised, and
-// the assertion is the same in both: a real guest, on the socket a real volume-agent
-// bound, must get an I/O error rather than plausible-looking bytes.
+// the assertion is the same in both: a volume whose data cannot be found serves the guest
+// **nothing** — no device at all — and says so to the fleet.
 //
 // They are in one file because they are one hole with two faces. In both, the number that
 // distinguishes "this volume is new" from "this volume's data is missing" was already in
@@ -27,10 +28,26 @@ import (
 // differs — one is a manifest that disappeared, the other a local WAL that did — which is
 // why they are two scenarios rather than a table.
 //
+// **Why the guest left.** Both scenarios used to boot a real kernel against the refused
+// volume's socket and assert `input/output error`, and that was the strongest available
+// observation while a refused volume still got a socket. It no longer is. The Agent now
+// cancels the volume's context when it refuses, so the listener closes and the socket is
+// unlinked, and the reason is exactly what those tests were pinning: what a tenant must
+// not get is a plausible-looking device. A guest that cannot attach cannot be told
+// anything false, which is a strictly stronger statement than a guest that attaches and
+// is told EIO — and there is no variant satisfying both, because anything that stops the
+// guest seeing a working device also stops QEMU attaching one.
+//
+// So what is asserted here is the absence of the socket, the refusal reaching the fleet
+// (the catalog's column and the row `-fleet-status` prints), and the bucket: nothing
+// published over the image that went missing, nothing published over the image the
+// rollback would have replaced. A real guest still runs — in the *setup* of both, because
+// the bytes these scenarios are about have to have been written by a real kernel and
+// acknowledged by a real fsync, or there is nothing to lose.
+//
 // Neither can be seen anywhere but here. A unit test builds the VolumeManager itself and
 // hands it whatever desired state it likes, so it cannot notice that the Control Plane
-// never puts these numbers on the wire; and the failure mode is *the absence of an error*,
-// which every assertion on `err` is blind to by construction.
+// never puts these numbers on the wire, nor that the refusal never reaches Postgres.
 
 const (
 	// What the Agent prints when it refuses. Greped for verbatim, because "it refused"
@@ -40,7 +57,7 @@ const (
 	refusedRollback = "this volume came back below the sequence a guest was already told was durable"
 )
 
-// TestAVolumeWhoseImageVanishedRefusesToComeUpBlank is face 1, reproduced end to end.
+// TestAVolumeWhoseImageVanishedGetsNoDevice is face 1, reproduced end to end.
 //
 // A published image is deleted out from under a volume the catalog still describes
 // correctly — a stray delete, a lifecycle expiry, a restore that missed one key. Before
@@ -50,15 +67,15 @@ const (
 // *next* teardown publishes that blank view create-only, which is the moment the loss
 // stops being recoverable.
 //
-// So the assertions are the two halves of that sentence, from outside the process: the
-// guest gets an I/O error instead of zeros, and the bucket still has no manifest after the
-// volume is taken away from this host — the teardown that used to overwrite it now
-// refuses.
+// So the assertions are the three halves of that sentence, from outside the process: the
+// volume gets no vhost socket, so no guest can be handed anything at all; the fleet is
+// told which volume and why; and the bucket still has no manifest after the volume is
+// taken away from this host — the teardown that used to overwrite it now refuses.
 //
 // The local WAL is left **intact**, deliberately. It still holds this volume's records, so
 // the durable-sequence floor in the other test is satisfied and this scenario turns on
 // exactly one fact: the catalog says this volume has published and the bucket disagrees.
-func TestAVolumeWhoseImageVanishedRefusesToComeUpBlank(t *testing.T) {
+func TestAVolumeWhoseImageVanishedGetsNoDevice(t *testing.T) {
 	kernel, initramfs := testinfra.GuestImages(t)
 	_, _ = testinfra.QEMUPaths(t)
 
@@ -70,7 +87,9 @@ func TestAVolumeWhoseImageVanishedRefusesToComeUpBlank(t *testing.T) {
 	sock := waitForVolumeSocket(t, d, volumeID)
 	first.WaitForLine(t, "serving volume", startup)
 
-	// Session 1: a real kernel writes and fsyncs, and the stop is what publishes.
+	// Session 1: a real kernel writes and fsyncs, and the stop is what publishes. This is
+	// the only guest in this scenario and it is setup, not assertion — without it there is
+	// no image for the accident below to remove.
 	requireGuestPass(t, sock, kernel, initramfs)
 	first.Stop(t, startup)
 	manifest := "image/" + volumeID + "/manifest.json"
@@ -94,22 +113,33 @@ func TestAVolumeWhoseImageVanishedRefusesToComeUpBlank(t *testing.T) {
 	if keys := storeKeys(t, d, "image/"+volumeID+"/"); len(keys) != 0 {
 		t.Fatalf("the manifest was supposed to be gone and %v is still there", keys)
 	}
+	// The stopped Agent unlinked the socket on its way out, so the absence asserted below
+	// starts from a known state rather than from whatever the previous session left. A
+	// leftover file here would make `requireNoVolumeSocket` fail against a working fix.
+	requireSocketGone(t, d, volumeID, "agent-2 stopped")
 
 	// Session 3: the attach that used to come up blank.
 	third := d.startAgent(t, "agent-3")
-	waitForVolumeSocket(t, d, volumeID)
-	// Either outcome, so the guest is what decides this test rather than the Agent's own
-	// account of itself.
-	waitForAnyLine(t, third, startup, refusedNoImage, "read view recovered from the object store")
 
-	// What the tenant sees. Verify mode writes nothing and reads back the range session 1
-	// fsynced: an I/O error is the volume refusing, and a read-back mismatch would be the
-	// old behaviour handing it zeros.
-	_, out := testinfra.RunLinuxGuest(t, sock, kernel, initramfs, "spin.mode=verify")
-	requireGuestIOError(t, out)
+	// Waited for on the *fleet*, not on the Agent's log, and this is the ordering the
+	// whole test turns on. The refusal reaches Postgres on a heartbeat, which is well
+	// after the attach — so by the time it is visible here the Agent has long since
+	// decided, and "the socket is not there" is a settled fact rather than a race with
+	// `start` binding the listener. It is also the assertion the fleet needs in its own
+	// right: a refusal that never leaves the host is an outage with no cause.
+	detail := waitForRefusal(t, d, volumeID, "IMAGE_MISSING")
+	if !strings.Contains(detail, "object store holds no image") {
+		t.Errorf("the catalog's refusal_detail is %q; an operator reads this before touching the bucket", detail)
+	}
+
+	// What the tenant sees: nothing. No socket means QEMU's chardev has nothing to
+	// connect to and the guest boots with no /dev/vda — which its own boot logic can act
+	// on, unlike a 256 MiB disk that answers every read with EIO.
+	requireNoVolumeSocket(t, d, volumeID, 10*time.Second)
 
 	// The operator's half: which volume, and which of the two floors refused it.
 	third.WaitForLine(t, refusedNoImage, startup)
+	requireFleetStatusNotServing(t, d, volumeID, "IMAGE_MISSING")
 
 	// And the half that made it permanent. Taking the volume away from this host runs the
 	// same teardown a detach or a promotion runs, and that teardown publishes. Before this
@@ -128,7 +158,7 @@ func TestAVolumeWhoseImageVanishedRefusesToComeUpBlank(t *testing.T) {
 	}
 }
 
-// TestAnAgentThatReplaysShortOfTheACKedSequenceRefusesToServe is face 2, reproduced end
+// TestAnAgentThatReplaysShortOfTheACKedSequenceServesNoDevice is face 2, reproduced end
 // to end: the volume rolls back to its last publish and nothing anywhere reports an error.
 //
 // The shape is a cloud instance store, which is what a host's local WAL actually sits on.
@@ -137,11 +167,18 @@ func TestAVolumeWhoseImageVanishedRefusesToComeUpBlank(t *testing.T) {
 // disk empty. Replay finds nothing, the image from the previous session loads, and the
 // volume serves happily at the older sequence.
 //
-// **The guest cannot tell.** That is the whole reason this needs a real one: the range a
-// verify boot checks lives in the published image, so the read-back succeeds and returns
-// the *old* bytes. Without the floor below, this test's guest reports GUESTINIT-PASS —
-// the tenant reading superseded data with no I/O error is what "passes" here means.
-func TestAnAgentThatReplaysShortOfTheACKedSequenceRefusesToServe(t *testing.T) {
+// **The guest cannot tell**, and that is why the device has to go rather than answer. The
+// range a verify boot checks lives in the published image from session 1, so a rolled-back
+// volume answers it *correctly* — with bytes that are two sessions old. There is no read a
+// guest can make that distinguishes this from a healthy volume, which means there is no
+// assertion about a guest's bytes that could be made here at all: the only honest signal is
+// that the volume is not on the host's socket directory and the fleet says why.
+//
+// The bucket assertion is the counterpart of the other scenario's. There, nothing must be
+// published over a manifest that vanished; here, the manifest is *present* and correct, and
+// what must not happen is the short session being written over it — which would replace the
+// volume's real image with one holding strictly less than the fleet promised.
+func TestAnAgentThatReplaysShortOfTheACKedSequenceServesNoDevice(t *testing.T) {
 	kernel, initramfs := testinfra.GuestImages(t)
 	_, _ = testinfra.QEMUPaths(t)
 
@@ -154,10 +191,11 @@ func TestAnAgentThatReplaysShortOfTheACKedSequenceRefusesToServe(t *testing.T) {
 	first.WaitForLine(t, "serving volume", startup)
 
 	// Session 1: written, fsynced, and published by the stop. This is what the rollback
-	// rolls *back to*, and it is why the guest below cannot see the loss.
+	// rolls *back to*.
 	requireGuestPass(t, sock, kernel, initramfs)
 	first.Stop(t, startup)
-	requireKey(t, d, "image/"+volumeID+"/manifest.json", "the first session's stop")
+	manifest := "image/" + volumeID + "/manifest.json"
+	requireKey(t, d, manifest, "the first session's stop")
 
 	// Session 2: more writes, more fsyncs, no publish. The guest is told these are
 	// durable and the Control Plane is told the same thing — that report is the promise
@@ -172,9 +210,20 @@ func TestAnAgentThatReplaysShortOfTheACKedSequenceRefusesToServe(t *testing.T) {
 			published, durable = pub, dur
 			return pub > 0 && dur > pub
 		})
+	// Read now, while the image is still the one session 1 published. It is the thing the
+	// teardown of the refused session must not replace, and comparing bytes rather than an
+	// ETag is deliberate: a backend that re-PUT identical content would keep neither.
+	before := objectBody(t, d, manifest)
 
 	// SIGKILL, so nothing is published: the second session exists only in the local WAL.
 	second.Kill(t)
+	// A SIGKILLed process never unlinks its sockets, so the file is still there and the
+	// absence asserted below would be satisfied by nothing at all. Removed here, named,
+	// rather than left for `requireNoVolumeSocket` to be confused by — and it is exactly
+	// what a host that rebooted (which is what this scenario is) comes back without.
+	if err := os.Remove(filepath.Join(d.sockDir, volumeID+".sock")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 	// And then the instance store goes away with the host. Not a contrived deletion — it
 	// is what a reboot of a cloud instance does to the disk the WAL lives on, and the
 	// reason `durable` above is a promise this host can no longer keep on its own.
@@ -183,25 +232,36 @@ func TestAnAgentThatReplaysShortOfTheACKedSequenceRefusesToServe(t *testing.T) {
 	}
 
 	third := d.startAgent(t, "agent-3")
-	waitForVolumeSocket(t, d, volumeID)
-	// Either outcome, so that the guest below is what decides this test. Waiting for the
-	// refusal here instead would mean the assertion that matters — that a real kernel
-	// cannot read the rolled-back volume — never runs when it would fail.
-	waitForAnyLine(t, third, startup, refusedRollback, "read view recovered from the object store")
 
-	_, out := testinfra.RunLinuxGuest(t, sock, kernel, initramfs, "spin.mode=verify")
-	// GUESTINIT-PASS here is the defect, not a green test: it means the guest read the
-	// image from session 1 back and could not tell that everything session 2 fsynced is
-	// gone. That is the whole failure — old bytes, no error, nothing for a tenant to see.
-	if strings.Contains(out, "GUESTINIT-PASS") {
-		t.Fatalf("the volume rolled back from durable_sequence=%d to published_sequence=%d and a guest read it without an error:\n%s",
-			durable, published, testinfra.VerdictLines(out))
+	// The fleet first, for the ordering reason in the scenario above: the refusal reaches
+	// Postgres on a heartbeat, so once it is there the Agent's decision about this volume
+	// is long since made and the socket's absence is settled rather than raced.
+	detail := waitForRefusal(t, d, volumeID, "DURABILITY_LOST")
+	if !strings.Contains(detail, "ACKed to a guest as durable") {
+		t.Errorf("the catalog's refusal_detail is %q; it is the sentence that names the two sequences", detail)
 	}
-	requireGuestIOError(t, out)
+
+	// What the tenant gets: no device. There is no read that could have caught this — the
+	// image answers session 1's range perfectly — so the absence of the socket is the whole
+	// of what stands between a tenant and silently superseded data.
+	requireNoVolumeSocket(t, d, volumeID, 10*time.Second)
 
 	// And the operator's half: the log says which volume, what it came back with, and what
-	// it was supposed to have.
+	// it was supposed to have, and `-fleet-status` names it without anyone reading a host's
+	// log at all.
 	third.WaitForLine(t, refusedRollback, startup)
+	requireFleetStatusNotServing(t, d, volumeID, "DURABILITY_LOST")
+
+	// The bucket. Taking the volume away runs the reconciliation teardown, which publishes
+	// — and publishing this session would put the rolled-back view over the image that
+	// still holds everything session 1 wrote.
+	detachVolume(t, d, volumeID)
+	waitForAnyLine(t, third, startup, "this volume's image could not be published", "volume image published")
+	if after := objectBody(t, d, manifest); !bytes.Equal(before, after) {
+		t.Fatalf("%s was rewritten by a host that came back at published_sequence=%d with durable_sequence=%d promised:\n"+
+			"before: %s\nafter:  %s",
+			manifest, published, durable, before, after)
+	}
 }
 
 // --- helpers, local to this file ------------------------------------------------------
@@ -220,25 +280,104 @@ func requireGuestPass(t *testing.T, sock, kernel, initramfs string) {
 	}
 }
 
-// requireGuestIOError insists the guest failed *because the device refused*, not because
-// it read the wrong bytes.
+// requireNoVolumeSocket insists the volume has no vhost-user socket, and keeps insisting
+// for `window`.
 //
-// The distinction is the entire point of both scenarios and it is checkable from the
-// guest's own words: `readBack` reports "input/output error" when the backend returned an
-// error and "read-back mismatch" when it cheerfully returned zeros. A test that accepted
-// GUESTINIT-FAIL either way would pass against the behaviour being fixed.
-func requireGuestIOError(t *testing.T, out string) {
+// A negative is only worth asserting when it is anchored, and the anchor is the caller's:
+// both scenarios wait for the refusal to reach *Postgres* first, which takes a heartbeat,
+// so the Agent has long since decided about this volume by the time this runs. Without
+// that ordering this would race `start`, which binds the listener before the base is
+// fetched — a window one object-store round trip wide, and the reason the check is a
+// window rather than one `os.Stat`: a socket that reappears is a supervisor re-listening
+// on a refused volume, which is the failure that would leave a tenant with a device again.
+func requireNoVolumeSocket(t *testing.T, d *deployment, volumeID string, window time.Duration) {
 	t.Helper()
-	verdicts := testinfra.VerdictLines(out)
-	if !strings.Contains(out, "GUESTINIT-FAIL") {
-		t.Fatalf("the guest did not fail; the volume served it something:\n%s", verdicts)
+	sock := filepath.Join(d.sockDir, volumeID+".sock")
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(sock); err == nil {
+			t.Fatalf("%s exists: a volume this host refuses to serve still gets a device, so a guest attaches "+
+				"a disk it can only take I/O errors from instead of finding no disk at all", sock)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", sock, err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	if strings.Contains(out, "read-back mismatch") {
-		t.Fatalf("the volume answered the guest with the wrong bytes instead of an error — "+
-			"a mismatch is the guest noticing, and a tenant reading its own stale data would not:\n%s", verdicts)
+}
+
+// requireSocketGone is the same check once, as a precondition. It names who was supposed
+// to have removed the file, because a leftover socket from an earlier session would make
+// the window above fail against a perfectly good fix.
+func requireSocketGone(t *testing.T, d *deployment, volumeID, who string) {
+	t.Helper()
+	sock := filepath.Join(d.sockDir, volumeID+".sock")
+	if _, err := os.Stat(sock); err == nil {
+		t.Fatalf("%s is still there after %s; this scenario's assertion is about the socket not appearing "+
+			"and it cannot start from one that is already present", sock, who)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", sock, err)
 	}
-	if !strings.Contains(out, "input/output error") {
-		t.Fatalf("the guest failed for some reason other than the device refusing to read:\n%s", verdicts)
+}
+
+// waitForRefusal blocks until the catalog carries this refusal for the volume and returns
+// the sentence stored with it.
+//
+// This is the claim that "the refusal reaches the fleet", and it is read from Postgres
+// rather than from the Agent's log for the reason waitForCatalog gives: the Agent
+// reporting its own state is what is under test. It is also this lane's synchronisation
+// point — it can only become true after a heartbeat carrying the refused report was
+// accepted, which is strictly after the Agent decided not to serve the volume.
+func waitForRefusal(t *testing.T, d *deployment, volumeID, want string) string {
+	t.Helper()
+	pool, err := pgxpool.New(t.Context(), d.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	var detail string
+	waitFor(t, startup, fmt.Sprintf("the catalog to record %s for volume %s", want, volumeID), func() bool {
+		var refusal string
+		if err := pool.QueryRow(t.Context(),
+			`SELECT refusal, refusal_detail FROM volumes WHERE volume_id = $1`,
+			volumeID).Scan(&refusal, &detail); err != nil {
+			return false
+		}
+		return refusal == want
+	})
+	return detail
+}
+
+// requireFleetStatusNotServing runs the command an operator actually runs and insists the
+// volume is in its NOT SERVED section with this reason.
+//
+// The catalog check above proves the column; this proves the one thing that column exists
+// for. They are not the same assertion — a report that lands in a column no command prints
+// is a refusal an operator still cannot see — and the whole failure being closed here is a
+// volume that is down with no signal outside one host's log.
+func requireFleetStatusNotServing(t *testing.T, d *deployment, volumeID, reason string) {
+	t.Helper()
+	p := testinfra.Start(t, testinfra.ProcessConfig{
+		Name: "fleet-status",
+		Path: testinfra.Binary(t, "control-plane"),
+		Args: []string{"-database-url", d.dsn, "-fleet-status"},
+		Env:  d.agentEnv,
+	})
+	if err := p.Wait(t, startup); err != nil {
+		t.Fatalf("-fleet-status: %v", err)
+	}
+	// One line carrying both, not "the id appears and the reason appears": two unrelated
+	// rows satisfy the second, and what an operator reads is a row.
+	if !said(p, volumeID, reason) {
+		t.Fatalf("no line of -fleet-status names volume %s as %s:\n%s",
+			volumeID, reason, strings.Join(p.Output(), "\n"))
+	}
+	// And the STATE cell, which is what a scan of the table shows before anyone reads the
+	// section below it. A volume left reading ACTIVE while its host refuses it is the
+	// original silence with an extra section nobody scrolls to.
+	if !said(p, volumeID, "NOT_SERVED") {
+		t.Fatalf("the volumes table still renders %s as though it were being served:\n%s",
+			volumeID, strings.Join(p.Output(), "\n"))
 	}
 }
 

@@ -156,11 +156,11 @@ type Volume struct {
 	refusalDetail string
 }
 
-// refuse records why this volume will not serve, fails its read view, and stops its
-// session from ever being published.
+// refuse records why this volume will not serve, fails its read view, stops its session
+// from ever being published, and takes its device away.
 //
-// The three happen together or the failure is worse than what it replaces, which is why
-// this is one call and not three lines at each of the five sites that reach it. Setting
+// The four happen together or the failure is worse than what it replaces, which is why
+// this is one call and not four lines at each of the five sites that reach it. Setting
 // baseFailed without FailBase parks every read for the life of the process; FailBase
 // without baseFailed lets the teardown publish a session whose view is missing
 // everything the volume held before it, over the manifest that view was supposed to come
@@ -174,6 +174,34 @@ func (v *Volume) refuse(kind storagev1.VolumeRefusal, err error) {
 	// which is the happens-before it has always ridden on — unchanged deliberately.
 	v.baseFailed = true
 	v.log.FailBase(err)
+	// **And no device.** Until this line a refused volume kept its socket: `start` binds
+	// the listener before the base is fetched, and `supervise` re-opens it after every
+	// session, so a guest attached an ordinary 256 MiB /dev/vda and took a hard I/O error
+	// on every sector it touched. That is the least actionable signal this system can
+	// emit. A disk that is absent is something a VM's own boot logic can act on — it is
+	// the difference between "no root device" and an initrd retrying EIO with nothing
+	// anywhere naming the volume — and the honest statement about a volume whose data
+	// cannot be found is that it has no device, not that it has a broken one.
+	//
+	// Cancelling the serve context is the whole mechanism: `supervise` returns, closes
+	// its listener, and Go unlinks the socket because it is the one that bound it.
+	//
+	// **It must not take the volume's report with it, and that is the trap here.** The
+	// Volume stays in m.volumes, so `Volumes` keeps reporting it, refusal and all. A
+	// version that dropped the runtime instead would make the volume disappear from the
+	// wire — and an absence there is indistinguishable from a volume the Control Plane
+	// never placed on this host, which is the exact silence the refusal vocabulary
+	// exists to end. The teardown is still the manager's: quiesce() cancels again
+	// (idempotent) and waits on v.done, which supervise has already closed.
+	//
+	// What this does not close: the window between `start` binding the listener and this
+	// running, which is one object-store round trip wide. A front-end that connects
+	// inside it gets a device whose reads fail — the behaviour above, briefly. Binding
+	// only after the base resolves would close it and would also delay every healthy
+	// attach behind the fetch, which is the thing the lazy base exists to avoid; the
+	// window is left open deliberately and it is why the tests wait for the refusal to
+	// reach the fleet before asserting the socket is gone.
+	v.cancel()
 }
 
 // refused is the pair Status reports.
