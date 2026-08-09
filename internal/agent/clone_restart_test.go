@@ -21,7 +21,7 @@ import (
 // never run anywhere, and it did not work: fetchBase loaded the image, tried to slide the
 // parent underneath it, and cow refused, because image.Load returns an unlayered map.
 // Every read of the restarted clone then failed with ErrBaseUnavailable. A clone worked
-// exactly once (CHUNK-ADDRESSING-SPEC §2).
+// exactly once.
 //
 // The assertion is the bytes a guest reads back through the device, split three ways on
 // purpose, because a single offset cannot tell the failure modes apart:

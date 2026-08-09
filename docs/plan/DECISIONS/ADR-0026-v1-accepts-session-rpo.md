@@ -180,7 +180,7 @@ scope; recorded in `STATUS.md`.
 - The DST harness shrinks with the invariants it proves. INV-06, INV-08 and INV-13 are
   properties of the remote chain; INV-01, INV-02, INV-03, INV-04, INV-05, INV-15 and
   INV-18 are not and stay.
-- `BUILD-INVENTORY.md`'s target slice is rewritten: "FLUSH uploads a verified object" is
+- The target slice is rewritten: "FLUSH uploads a verified object" is
   no longer the definition of done.
 - **Reversal is not symmetric.** Removing the remote chain and re-adding it later is more
   than a revert: the fencing protocol is the part that is hard to get right, and it is

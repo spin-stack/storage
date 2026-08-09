@@ -101,7 +101,7 @@ consumer exists; the shape is fixed here:
 - **Host side** — "serve this volume": given a volume id, its geometry, its epoch, its
   key material, a disk root and an object store, return something that owns a
   `wal.Log`, serves a `vhost-user-blk` socket, and can be stopped. This is the keystone
-  runtime (`BUILD-INVENTORY.md`, increment 2). **It is therefore written as a
+  runtime. **It is therefore written as a
   self-contained type that `internal/agent`'s loop *uses*, never as a method on the
   loop** — so spin's runner can take the same type without the loop, its heartbeat, or
   its Control Plane client.
@@ -125,7 +125,7 @@ changing a path, with no Go import in either direction.
 ## What this does not decide
 
 - **When.** Integration starts when storage serves one volume end to end
-  (`BUILD-INVENTORY.md`'s milestone), not before. There is nothing to integrate until
+  at that milestone, not before. There is nothing to integrate until
   then, and moving code earlier would mean debugging the data path inside spin.
 - **Whether the repositories merge.** Keeping them separate is what keeps storage's DST
   harness, its invariant checkers and its 90% floor meaningful. Revisit after the first

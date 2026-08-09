@@ -35,7 +35,7 @@
 - **Status:** Accepted — 2026-08-02, amended 2026-08-05
 - **Date:** 2026-08-02
 - **Deciders:** human owner (approved the increment plan), implementer agent (proposed)
-- **Relates to:** ADR-0022 (the guest kernel, pinned and mirrored), BUILD-INVENTORY
+- **Relates to:** ADR-0022 (the guest kernel, pinned and mirrored)
   increment 8, `Dockerfile.qemu`, `.github/workflows/qemu.yml`
 
 ## Context

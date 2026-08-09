@@ -141,7 +141,7 @@ func TestDeleteRefusesWhileSomethingDescendsFromTheVolume(t *testing.T) {
 	}
 }
 
-// TestAFlattenedCloneOutlivesItsWholeAncestry is DELETION-AND-RECLAIM-SPEC's answer B
+// TestAFlattenedCloneOutlivesItsWholeAncestry pins the answer
 // end to end: flatten the clone, then delete every volume it used to read through, and
 // read its bytes back.
 //

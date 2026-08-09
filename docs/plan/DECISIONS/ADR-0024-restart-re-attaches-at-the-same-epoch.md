@@ -19,7 +19,7 @@
 - **Deciders:** human owner (approved the increment plan), implementer agent (proposed)
 - **Relates to:** §12.3 (promotion), §12.4 (the epoch object), §12.5 (late PUTs from the
   old writer), §14.5 (deterministic keys), §22.1 (recovery point), INV-08, INV-10,
-  INV-21, ADR-0016 (fencing granularity), BUILD-INVENTORY increment 4
+  INV-21
 
 ## Context
 
@@ -132,7 +132,7 @@ it, and choosing the other option would not have removed it.
 
 **Closed 2026-08-02 (DEV-0014).** The Agent takes an exclusive `flock` on `agent.lock`
 under its data directory and names the directory in the refusal, because the operator's
-next action is to find the process holding it. `DATA-DIR-LOCK-SPEC.md` records the
+next action is to find the process holding it. `git log` records the
 decisions; `TestASecondAgentRefusesTheSameDataDir` in `integration/e2e` proves it against
 two real processes.
 

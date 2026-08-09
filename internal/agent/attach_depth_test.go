@@ -11,7 +11,7 @@ import (
 // What depth costs at attach, in object-store reads, now that an image is a delta.
 //
 // This is the number the depth ceiling is chosen against (§20.1, and step 4 of
-// CHUNK-ADDRESSING-SPEC, which turns it into a refusal at create). Before this increment
+// the chain-depth decision, which turns it into a refusal at create). Before this increment
 // the question barely existed: publishing flattened, so a clone that had stopped once read
 // its own manifest and nothing else, whatever its depth. Now every attach composes the
 // whole ancestry, so the read path is linear in the chain and the constant is worth having

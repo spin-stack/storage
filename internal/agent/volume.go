@@ -205,7 +205,7 @@ func (v *Volume) quiesce() {
 // given up on — because closing the log is what ends this host's ability to publish it
 // at all. Nothing here deletes a segment: the records stay on disk exactly as they were,
 // which is what makes "restart and it republishes" true (ADR-0024, and the reason
-// SHUTDOWN-PUBLISH-SPEC §6 pins it with a test).
+// a test pins it).
 func (v *Volume) release() error {
 	if v.baseCancel != nil {
 		// Nothing is waiting on the fetch any more, so whatever it is still doing is

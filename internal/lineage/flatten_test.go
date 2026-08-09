@@ -106,7 +106,7 @@ func TestAFlattenedVolumeReadsWhatItReadBefore(t *testing.T) {
 	// (image.ChunksPrefix), so deleting the objects under chunks/<old root>/ would take the
 	// bytes of every volume in the chain including the ancestors' own. What a flatten makes
 	// this volume independent of is everything the ancestors *name*, which is what a delete
-	// of an ancestor removes first (DELETION-AND-RECLAIM-SPEC's order).
+	// of an ancestor removes first.
 	for _, anc := range vol.chain {
 		deletePrefix(t, store, image.Prefix(anc.ID))
 		deletePrefix(t, store, "volumes/"+anc.Volume+"/")

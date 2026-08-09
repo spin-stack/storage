@@ -48,10 +48,10 @@ type Result struct {
 // Flatten makes a clone self-contained: it writes an image that owes nothing to its
 // ancestors, and then stops the bucket saying it has any.
 //
-// It is the operation CHUNK-ADDRESSING-SPEC's decision of 2026-08-07 made load-bearing for
+// It is the operation the chain-depth decision made load-bearing for
 // two separate things. It is the only way back *under* the depth ceiling, now that a clone
 // reads through its ancestry on every attach rather than through a flattened copy of it.
-// And it is the only way to delete a parent that has clones — DELETION-AND-RECLAIM-SPEC's
+// And it is the only way to delete a parent that has clones:
 // answer B, "a delete of a volume with descendants flattens them first" — because since
 // publishing stopped flattening, a clone never becomes independent on its own.
 //
@@ -63,7 +63,7 @@ type Result struct {
 // volume's manifest, and a host that is serving it holds the ETag it loaded and will CAS
 // against it at its stop — so a flatten under a live Agent makes that Agent's publish fail
 // with image.ErrSuperseded, which is one of the three failures its teardown deliberately
-// does not retry (SHUTDOWN-PUBLISH-SPEC), and the session is lost. So a flatten's
+// does not retry, and the session is lost. So a flatten's
 // precondition is a detached volume, and a detached volume is in no host's desired state:
 // there is no Agent to ask. Giving one a flatten verb would mean handing it a volume it is
 // not serving, with no device and no lock, driven by a Control Plane it is not allowed to
