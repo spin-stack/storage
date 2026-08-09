@@ -25,31 +25,30 @@ mid-session, which is the documented shape (§5.7) and the number nobody had.
 
 ## Do this next
 
-Nine pilot blockers closed 2026-08-09; a readiness re-run then found 22 regressions those
-fixes caused and the worst are closed too; `CarryForward` now has a mandatory DST arm that
-crashes at every write it performs. A 70-minute soak with a real guest found nothing that
-degrades — see "What runs end to end". `git log` has all of it. What is left:
+**Nothing here blocks a pilot.** Nine blockers closed, then 22 regressions those fixes caused
+found by a re-run and closed, then the six residuals. `git log` has all of it. What is left
+is one derivation and a set of things only a running tenant can answer.
 
-1. **The soak could not reach the read-view bound, and that is a hole in the tooling, not
-   in the bound.** `guestinit`'s hold mode rewrites eight blocks in rotation, so the read
-   view stays pinned at 32 KiB however long it runs — the 256 MiB bound is unreachable by
-   the only sustained-load generator this repo has. A hold variant that writes distinct
-   offsets is a few lines in `integration/guestinit/main.go`, and without it nothing has
-   ever driven the bound that stands between a guest and the OOM killer.
-2. **No DST arm for "a volume that fails closed has no socket".** The behaviour landed with
-   unit and e2e coverage; the deep gate wants a scenario.
-3. **`published_sequence` still reaches the catalog one session late** for a volume that
-   keeps serving. The teardown now reports it, so the window is narrow.
-4. **`internal/lineage/flatten.go` reads `ErrNotPublished` as "never published".** Flattening
-   a clone whose own image vanished writes down the ancestry and drops the clone's own layer.
-   The attach path closed this; the flatten path was never on it.
-5. **The read view's bound is a constant.** `MaxViewBytes` defaults to 256 MiB where the
-   device bound is a share of a measured `statfs`; the honest counterpart is a share of
-   measured RAM.
-6. **Bring-up has three sharp edges**, all hit walking it by hand: `-holder-id` is required
-   and documented only in the error; a `-vhost-socket-dir` over ~107 bytes fails as an opaque
-   `bind: invalid argument` retried for ever (`sun_path` is 108); and applying `schema.sql`
-   to a fresh database needs a `psql` nothing in the repo provides.
+1. **`MaxViewBytes` is a constant.** It defaults to 256 MiB where every other bound in the
+   Agent is derived from something measured — `agent.Budget` reads the device with `statfs`,
+   takes `GuestRatio`, subtracts `ReserveRatio` and divides by `-max-volumes`. The
+   counterpart is one volume's share of measured RAM, read from `/proc/meminfo` **and the
+   cgroup**, because an Agent in a container with a 2 GiB limit on a 256 GiB host must not
+   size itself from the host. Operational, not correctness: the bound exists, fires, and has
+   a proven escape hatch.
+
+## What only a pilot can answer
+
+Named here so nobody mistakes them for things that were checked.
+
+- **Nothing has run against real S3.** Every lane used the filesystem store or RustFS. The
+  `If-Match` CAS we fixed is ours; S3 evaluates its own, and that path has never carried a
+  publish.
+- **Two hosts under real load for hours** has never been run. The takeover lanes were minutes.
+- **An upgrade of a running fleet** has never been run. A restart resumes at the same epoch;
+  two versions serving at once is untested, and INV-19 becomes binding exactly there.
+- **Sustained multi-volume load.** The soak was one volume; the device budget divides by
+  `-max-volumes` and that division has never been under pressure from more than one guest.
 
 ## Thin paths that shipped without being deepened
 
