@@ -5,7 +5,7 @@
 //
 // internal/vhost is proven against a simulated front-end written beside it, and
 // that proves self-consistency and nothing else — a decoder tested against its
-// own encoder always agrees with itself. RISK-10 marked QEMU 11.0.2's
+// own encoder always agrees with itself. QEMU 11.0.2's
 // vhost-user-blk behaviour Unverified for exactly this reason. What runs here is
 // the real binary (_output/bin/qemu-system-x86_64, the version task qemu:verify
 // pins), booting a real guest off a device this process serves.
@@ -310,7 +310,7 @@ func runQEMU(t *testing.T, ctx context.Context, l *lane) (int, string) {
 }
 
 // TestQEMUBootsAGuestOffTheBackend is Increment 3.1's exit criterion, and the
-// [Verify] step RISK-10 asks for.
+// [Verify] step this lane exists to perform.
 //
 // Everything asserted here happened over a real vhost-user socket:
 //
@@ -486,7 +486,8 @@ func TestQEMUPerformsTheHandshakeWeImplemented(t *testing.T) {
 //
 // QEMU 11.0.2's vhost-user-blk reconnects on its own after a backend error, with
 // no `reconnect=` on the chardev — measured here, and the thing Increment 3.2 is
-// built on top of. See docs/plan/RISKS.md, RISK-10.
+// built on top of. Inflight-shmfd is the half that stays unverified: it is not
+// announced (see vhost.ProtocolFeatures) and increment 3.3 has not started.
 func TestQEMUNeverRunsAGuestOnABackendThatCannotSpeak(t *testing.T) {
 	ctx := t.Context()
 	bin, bios := testinfra.QEMUPaths(t)

@@ -94,7 +94,7 @@ func TestALinuxGuestIssuesFLUSH(t *testing.T) {
 // snapshot is requested thirteen lines after the guest has gone. Four seams are
 // unreachable that way: a snapshot taken mid-write, an Agent restart with a guest
 // attached, a Control Plane restart under a live Agent, and the vhost reconnect path
-// (RISK-10).
+// (increment 3.3 has not started; vhost.ProtocolFeatures does not announce it).
 //
 // So this asserts liveness three different ways, because each alone has a way of being
 // true over a dead guest:

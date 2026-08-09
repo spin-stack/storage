@@ -39,7 +39,7 @@ type MetricDesc struct {
 // block, checkpoints, objectization and compaction, GC, the fencing wait, mid-session
 // recovery, the warm standby and the io-class scheduler. Declaring a series for a
 // mechanism that does not exist is not free — it reads as a plan, which is exactly how
-// this file and INVARIANTS.md both came to describe a system nobody had. Each goes back
+// this file came to describe a system nobody had. Each goes back
 // in with the thing it measures.
 //
 // `wal_published_sequence` went for a smaller reason worth writing down: nothing

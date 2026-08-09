@@ -109,7 +109,7 @@ implementar la región haría que QEMU entregue un buffer que este backend ni le
 y la garantía que el front-end creería entonces —las requests sobreviven un reinicio del
 backend— sería falsa. Anunciar de menos degrada; anunciar de más miente. Así que hoy, un
 crash o un deploy del Agent **sí** afecta a las VMs, y esta fila no tiene con qué medirse.
-Es RISK-10, abierto (`docs/plan/RISKS.md`). Las otras cinco menciones de la reconexión en
+Es el riesgo abierto más viejo del proyecto. Las otras cinco menciones de la reconexión en
 este documento —§1, §4, §10, §16, §23 y el criterio 11 de §31— describen lo mismo y hay que
 leerlas contra esta fila.
 
@@ -1532,7 +1532,7 @@ subsecciones que el código todavía cita se resuelven aquí:
 > verifique: el incremento 3.3 no se empezó, `vhost.ProtocolFeatures` no anuncia
 > `INFLIGHT_SHMFD` a propósito, y `inflight_recovered_total` es una serie sin productor. Es
 > el caso de esta sección con más distancia entre lo que promete y lo que hay, y estaba
-> bendecido como vigente. Ver §2 y RISK-10. *NVMe lleno*
+> bendecido como vigente. Ver §2. *NVMe lleno*
 > conserva del 3 en adelante — sus dos primeros pasos nombran la objectización y los
 > batches pendientes. *Reloj con deriva excesiva* conserva la alerta y pierde la
 > inelegibilidad para promoción, porque nada promociona.
@@ -2017,7 +2017,7 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 8. Stale writer incapaz de confirmar durabilidad tras `lease_ttl` (verificado con partición + acceso a S3 intacto).
 9. PUT idempotente (incluyendo respuesta perdida).
 10. Recovery cuyo punto durable se determina desde S3 y coincide con todo lo ACKeado.
-11. Crash/deploy del Agent sin reinicio de VMs (inflight recuperado, cero I/O perdido o duplicado). — **sin mecanismo: incremento 3.3 no empezado, RISK-10** (§2).
+11. Crash/deploy del Agent sin reinicio de VMs (inflight recuperado, cero I/O perdido o duplicado). — **sin mecanismo: incremento 3.3 no empezado** (§2).
 12. Todo dato de VM fuera del host cifrado; borrado de volumen = crypto-shred.
 13. Backpressure estricto antes de llenar NVMe.
 14. WAL nunca eliminado antes de durabilidad remota verificada; GC incapaz de borrado permanente directo.

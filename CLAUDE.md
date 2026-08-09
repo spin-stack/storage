@@ -102,7 +102,8 @@ New code cites the *reason*, not a pointer.
 
 ## Non-negotiable invariants
 
-Full list + checkers: `docs/plan/INVARIANTS.md`. The two enforced by lint:
+Each invariant is stated where its checker is (`internal/dst/checkers.go`), which is the
+only place it can be wrong and be noticed. The two enforced by lint instead:
 
 - **INV-01 — simulable interfaces (§25.1).** No `time.Now()`, sockets, or disk/net/S3
   syscalls outside `internal/simio`. Production code takes the `simio` interfaces
