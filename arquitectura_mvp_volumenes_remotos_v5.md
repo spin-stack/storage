@@ -388,7 +388,7 @@ El GC marca; nunca ejecuta borrado permanente. El borrado real lo ejecuta el lif
 > chunks, y lo maneja `control-plane -delete-volume`. Es exactamente la forma que §5.11
 > pide y no la que prohíbe: cada borrado es un delete marker reversible y el borrado
 > permanente lo hace —o no lo hace— el lifecycle del bucket, que **ningún código
-> configura**. Ésa es la parte que sigue faltando (`docs/plan/DELETION-AND-RECLAIM-SPEC.md`).
+> configura**. Ésa es la parte que sigue faltando.
 
 ---
 
@@ -1179,7 +1179,7 @@ Reglas:
 6. **El guest no puede detectar nada de esto.** El contrato es con el operador.
 7. **Un Agent que no puede publicar no para.** La regla 2 dice que S3 recibe el volumen al
    parar; ésta dice qué pasa cuando no puede, que es la mitad que este documento no tenía
-   (revisada y decidida el 2026-08-04, `docs/plan/SHUTDOWN-PUBLISH-SPEC.md`). El Agent
+   (revisada y decidida el 2026-08-04). El Agent
    sigue vivo, se queda con el lock de su data-dir, conserva el WAL local y reintenta con
    backoff **indefinidamente**; `-shutdown-grace` acota **un intento**, no la espera, y no
    es un presupuesto tras el cual se abandonan datos. Se eligió contra salir con código
@@ -1906,7 +1906,7 @@ Actualizado: se eliminan las resueltas por diseño en v5 y se agregan las nuevas
 > **8** (no hay objectización ni truncado a media sesión). La **4** cambia de forma: un
 > clon en otro host paga la descarga completa, y sin standby tibio ni lazy loading la
 > mitigación que queda es arrancar el clon en el host de origen (§20). **5, 6 y 7 siguen
-> en pie.** El estado de cada una vive en `docs/plan/RISKS.md`, no aquí.
+> en pie**, y lo que queda abierto de cada una vive en `docs/plan/STATUS.md`.
 
 ### 1. Latencia de FLUSH/FUA ligada al object store (sigue siendo la más importante)
 

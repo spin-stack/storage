@@ -113,7 +113,7 @@ WARN  agent is holding unpublished data and will not release its data directory 
 WARN  agent is holding unpublished data and will not release its data directory volumes=1 volume_ids=[019fdbe8-…] attempts=5 oldest_wait=30.007872403s data_dir=…/data
 ```
 
-This is the decided behaviour, not a hang: `SHUTDOWN-PUBLISH-SPEC.md`'s owner chose
+This is the decided behaviour, not a hang: the owner chose
 hold-and-retry over exit-and-release on 2026-08-04. A flock is released by the kernel when
 the process exits, so "do not release the data directory" can only mean "do not exit". The
 `oldest_wait` and `attempts` fields are how long, and the `error` is why.
