@@ -384,6 +384,25 @@ func (d *Device) fillConfig(c []byte) {
 	// it is filled because a zero here reads as "no queues" in a guest that
 	// looks at it anyway.
 	binary.LittleEndian.PutUint16(c[34:36], 1)
+	// The DISCARD and WRITE_ZEROES bounds. These are not decoration: Linux reads
+	// max_discard_sectors into the queue's discard_max_bytes and *will not send
+	// a discard at all* if it is zero, so a device that advertises the feature
+	// bit and leaves these fields at zero has advertised a feature no guest can
+	// use — the same silent gap as not advertising it, one layer further in.
+	//
+	// discard_sector_alignment is 1 sector: this backend stores extents, not
+	// cells on a grid, so there is no alignment a discard has to land on for the
+	// space to come back. A larger value here would make the guest round its
+	// ranges inward and leak the edges.
+	binary.LittleEndian.PutUint32(c[36:40], maxDiscardSectors)
+	binary.LittleEndian.PutUint32(c[40:44], maxDiscardSegments)
+	binary.LittleEndian.PutUint32(c[44:48], 1)
+	binary.LittleEndian.PutUint32(c[48:52], maxDiscardSectors)
+	binary.LittleEndian.PutUint32(c[52:56], maxDiscardSegments)
+	// write_zeroes_may_unmap = 1: this device always releases the range, so the
+	// driver is told it may not assume the allocation survives. See
+	// DeviceFeatures for why the weaker reading is not available here.
+	c[56] = 1
 }
 
 func (d *Device) setMemTable(m Message) error {

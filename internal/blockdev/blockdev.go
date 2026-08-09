@@ -111,6 +111,51 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
+// Discard implements vhost.Backend: the guest's VIRTIO_BLK_T_DISCARD, and what an
+// `fstrim` or a `mount -o discard` produces. The range leaves the read view and is not
+// published at stop, which is how the storage converges to the working set (§14.6)
+// rather than growing monotonically with everything the guest ever deleted.
+//
+// What it does NOT do is give the local byte back. The record is appended like any
+// other — a discard consumes a sequence and a header — so the WAL grows slightly while
+// the object store shrinks. That asymmetry is the honest V1 shape: there is no
+// mid-session reclaim of local space (§5.7), and a discard that pretended otherwise
+// would be a guest's answer to backpressure that does not work.
+func (d *Device) Discard(off, length int64) error {
+	return d.clear("DISCARD", off, length, d.log.Discard)
+}
+
+// WriteZeroes implements vhost.Backend: VIRTIO_BLK_T_WRITE_ZEROES.
+//
+// unmap is accepted and deliberately not branched on. The guest's may_unmap flag
+// permits releasing the range rather than requiring it, and this device always
+// releases it, so both readings produce the observable the guest is entitled to — the
+// range reads back as zeros. Branching would mean keeping a range of explicit zero
+// bytes in the WAL and in the published image to preserve an allocation that this
+// design does not track in the first place; the guest cannot observe the difference,
+// and the bytes would be real.
+func (d *Device) WriteZeroes(off, length int64, _ bool) error {
+	return d.clear("WRITE_ZEROES", off, length, d.log.WriteZeroes)
+}
+
+// clear is the shared body of Discard and WriteZeroes: the same range check, the same
+// refusal classification, and a different record type.
+func (d *Device) clear(op string, off, length int64, append func(uint64, uint32) (uint64, error)) error {
+	if err := d.inRange(int(length), off, op); err != nil {
+		return err
+	}
+	if length == 0 {
+		// Not a record, for the same reason a zero-length WRITE is not one: a
+		// sequence and a header spent describing nothing, which replay would then
+		// carry forever.
+		return nil
+	}
+	if _, err := append(uint64(off), uint32(length)); err != nil {
+		return d.refuse(op, int(length), off, err)
+	}
+	return nil
+}
+
 // Flush implements vhost.Backend, and it is the guest's VIRTIO_BLK_T_FLUSH. It returns
 // after one fdatasync of the local WAL segments and nothing else (§14.8, ADR-0026) —
 // see the package doc for what that does and does not promise the guest.

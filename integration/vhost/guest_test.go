@@ -208,3 +208,30 @@ func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() boo
 	}
 	t.Fatalf("timed out after %s waiting for %s", timeout, what)
 }
+
+// TestALinuxGuestIssuesDISCARD is the seam proof for the feature that was complete
+// and unreachable. wal.Log.Discard, cow.IntervalMap.Clear, the RecordDiscard codec
+// and the zero-read were all implemented and tested, and `internal/vhost` withheld
+// VIRTIO_BLK_F_DISCARD — so no driver could ask, and the whole mechanism was dead by
+// way of one missing bit. That is a defect no host-side test can see: a unit test
+// calls the backend method directly and never negotiates a feature.
+//
+// The guest issues BLKDISCARD, which the Linux block layer forwards **only if the
+// device advertised the feature**. So the ioctl succeeding is the assertion that the
+// bit is on the wire; the zeros that come back afterwards are the assertion that the
+// request reached the WAL; and the surviving neighbours are the assertion that it
+// cleared what it was asked to and nothing more.
+func TestALinuxGuestIssuesDISCARD(t *testing.T) {
+	kernel, initramfs := testinfra.GuestImages(t)
+	ctx := t.Context()
+	l := startWAL(t, ctx, wal.Limits{}, func(func(uint64, []byte)) {})
+
+	code, out := testinfra.RunLinuxGuest(t, l.sock, kernel, initramfs, "spin.mode=discard")
+
+	switch {
+	case strings.Contains(out, "GUESTINIT-FAIL"):
+		t.Fatalf("the guest reported a failure:\n%s", testinfra.VerdictLines(out))
+	case !strings.Contains(out, "GUESTINIT-PASS"):
+		t.Fatalf("the guest never reported a verdict (exit %d):\n%s", code, testinfra.VerdictLines(out))
+	}
+}

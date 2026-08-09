@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/spin-stack/storage/internal/vhost"
 )
 
@@ -136,6 +138,40 @@ func (d *RawFile) WriteAt(p []byte, off int64) (int, error) {
 		return n, fmt.Errorf("hostio: writing %d bytes at %d: %w", len(p), off, err)
 	}
 	return n, nil
+}
+
+// Discard implements vhost.Backend by punching a hole. FALLOC_FL_PUNCH_HOLE gives
+// exactly the two properties virtio asks of a discard — the range reads back as
+// zeros and the space is returned to the filesystem — and KEEP_SIZE stops the file
+// from being truncated, which would change the device's capacity underneath the
+// guest.
+//
+// A filesystem that does not support hole punching (tmpfs before 3.5, some network
+// mounts) returns EOPNOTSUPP, and that is passed up rather than emulated by writing
+// zeros. Writing zeros would satisfy the read-back half and quietly do the opposite
+// of the other one — consuming space to service a request whose purpose was to free
+// it — and the guest, told OK, would keep trimming a device that grows.
+func (d *RawFile) Discard(off, length int64) error {
+	if err := d.inRange(int(length), off); err != nil {
+		return err
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.closed {
+		return errClosed
+	}
+	if err := unix.Fallocate(int(d.f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, length); err != nil {
+		return fmt.Errorf("hostio: punching %d bytes at %d: %w", length, off, err)
+	}
+	return nil
+}
+
+// WriteZeroes implements vhost.Backend. The observable is the same as Discard's —
+// the range reads back as zeros — so the same hole punch serves both, and the
+// may_unmap flag is not branched on for the reason vhost.Backend gives: it permits
+// releasing the space rather than requiring it.
+func (d *RawFile) WriteZeroes(off, length int64, _ bool) error {
+	return d.Discard(off, length)
 }
 
 // Flush implements vhost.Backend. This is the guest's VIRTIO_BLK_T_FLUSH, and

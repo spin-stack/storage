@@ -158,6 +158,15 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 	if err != nil {
 		return metadata.Volume{}, fmt.Errorf("controlplane: placing a clone of snapshot %s: %w", parentSnapshotID, err)
 	}
+	// §26.2's clone_same_host_total, recorded where the placement decision is made
+	// because that is the only place that knows both what was asked for and what was
+	// chosen. Same-host is the case §20 exists to produce — the clone starts where its
+	// data already is — so a fleet where this counter stays flat is one where
+	// placement is not buying what the design says it buys.
+	if rec != nil && newHostID == snap.SourceHostID && snap.SourceHostID != "" {
+		rec.Count(ctx, "clone_same_host_total", 1)
+	}
+
 	var bound *metadata.CapacityBound
 	for _, h := range hosts {
 		if h.HostID == newHostID {

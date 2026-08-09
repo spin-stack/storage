@@ -31,10 +31,11 @@ import (
 // disk.File.WriteAt(p []byte, off int64) (int, error); ADR-0020 records why it
 // is not being added for scaffolding.
 type RawDevice struct {
-	mu     sync.Mutex
-	data   []byte
-	syncs  int
-	writes int
+	mu       sync.Mutex
+	data     []byte
+	syncs    int
+	writes   int
+	discards int
 }
 
 // NewRawDevice returns an all-zero device of size bytes.
@@ -71,6 +72,33 @@ func (d *RawDevice) WriteAt(p []byte, off int64) (int, error) {
 }
 
 // Flush implements Backend. There is nothing to make durable.
+// Discard zeroes the range, which is what every Backend in this tree makes a
+// discarded range read back as. The counter is separate from Writes() so a test can
+// tell "the guest trimmed" from "the guest wrote zeros" — on this wire they are two
+// request types and only one of them is allowed to free anything.
+func (d *RawDevice) Discard(off, length int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.check(int(length), off); err != nil {
+		return err
+	}
+	clear(d.data[off : off+length])
+	d.discards++
+	return nil
+}
+
+// WriteZeroes has the same observable as Discard here, and ignores unmap for the
+// reason vhost.Backend states: the flag permits releasing the space, it does not
+// require it.
+func (d *RawDevice) WriteZeroes(off, length int64, _ bool) error { return d.Discard(off, length) }
+
+// Discards reports how many discard ranges were applied.
+func (d *RawDevice) Discards() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.discards
+}
+
 func (d *RawDevice) Flush(context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

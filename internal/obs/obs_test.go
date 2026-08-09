@@ -1,6 +1,10 @@
 package obs_test
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/obs"
@@ -37,8 +41,8 @@ func TestMetricsCatalogWellFormed(t *testing.T) {
 		"wal_out_of_space",                // the device is refusing writes (§5.7)
 		"image_publish_duration_seconds",  // the cost of a session leaving the host (ADR-0026)
 		"snapshot_pause_duration_seconds", // ~0 invariant (§19)
-		"s3_request_latency_seconds",      // tail latency (§24)
-		"clock_offset_seconds",            // drift alert (§23)
+		"discarded_bytes_total",           // the guest trimmed, and the image shrank (§14.6)
+		"wal_fdatasync_latency_seconds",   // under ADR-0026 this syscall IS the durability contract
 	} {
 		if !seen[want] {
 			t.Fatalf("required metric %q missing from catalog", want)
@@ -62,4 +66,58 @@ func TestMetricsRegistration(t *testing.T) {
 	if _, ok := p.Metrics.Gauge("wal_unflushed_bytes"); !ok {
 		t.Fatal("wal_unflushed_bytes should be a gauge")
 	}
+}
+
+// Every declared series must have a producer somewhere outside a test, and this is the
+// check that would have caught the thirteen that did not.
+//
+// It is a source scan rather than a runtime assertion on purpose. A runtime check would
+// have to drive every producer to see the series move, which means a test that boots an
+// Agent, takes a snapshot, clones a volume and fills a device — and the failure mode it
+// is guarding against is precisely that nobody drives the producer. Grepping the tree
+// for the name answers the actual question: does any non-test file mention it at all.
+//
+// A series that legitimately has no producer yet does not get an exemption list here.
+// That was considered and rejected: an allow-list is how the catalogue drifted in the
+// first place — every one of the thirteen would have been on it, added by whoever
+// declared the series, and the list would read as a plan the same way the catalogue did.
+func TestEveryDeclaredMetricHasANonTestProducer(t *testing.T) {
+	root := repoRoot(t)
+	for _, d := range obs.Catalog() {
+		if d.Name == "obs_build_info" {
+			continue
+		}
+		t.Run(d.Name, func(t *testing.T) {
+			out, err := exec.Command("grep", "-rl", "--include=*.go", d.Name, filepath.Join(root, "internal"), filepath.Join(root, "cmd")).Output()
+			if err != nil && len(out) == 0 {
+				t.Fatalf("%q appears in no Go file at all outside this catalogue", d.Name)
+			}
+			for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if f == "" || strings.HasSuffix(f, "_test.go") || strings.HasSuffix(f, "internal/obs/metrics.go") {
+					continue
+				}
+				return // a non-test, non-catalogue file names it
+			}
+			t.Fatalf("%q is declared and recorded by nothing: it would be exported on every "+
+				"scrape and permanently empty, which reads as 'this is not happening' rather "+
+				"than 'nothing is measuring'. Wire a producer or delete the entry.", d.Name)
+		})
+	}
+}
+
+// repoRoot walks up from the test's working directory to the module root.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 10 {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatal("no go.mod above the working directory")
+	return ""
 }

@@ -366,3 +366,107 @@ func TestConcurrentRequestsDoNotRaceTheLog(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// The seam DISCARD spent months not crossing. Every piece below this test was
+// complete, tested and unreachable: wal.Log.Discard, cow.IntervalMap.Clear, the
+// RecordDiscard codec and the zero-read all worked, and internal/vhost withheld the
+// feature bit, so no guest could ask. This asserts the whole path from the Backend
+// method a virtio-blk request lands on down to the bytes a later read returns.
+//
+// It asserts on the bytes read back, not on the WAL record: a discard that appended
+// the right record and did not touch the read view would satisfy any assertion on
+// the log, and the guest would keep reading the data it just told us to forget.
+func TestADiscardMakesTheRangeReadBackAsZeros(t *testing.T) {
+	tests := []struct {
+		name  string
+		clear func(d *blockdev.Device, off, length int64) error
+	}{
+		{"DISCARD", func(d *blockdev.Device, off, length int64) error { return d.Discard(off, length) }},
+		{"WRITE_ZEROES may_unmap=0", func(d *blockdev.Device, off, length int64) error {
+			return d.WriteZeroes(off, length, false)
+		}},
+		{"WRITE_ZEROES may_unmap=1", func(d *blockdev.Device, off, length int64) error {
+			return d.WriteZeroes(off, length, true)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			pattern := make([]byte, 3*512)
+			for i := range pattern {
+				pattern[i] = byte(i%251) + 1 // never zero, so a wrong read cannot pass by accident
+			}
+			if _, err := r.dev.WriteAt(pattern, 512); err != nil {
+				t.Fatalf("WriteAt: %v", err)
+			}
+			// Clear the middle sector only: a discard that cleared more than it was
+			// asked to is data loss, and one that cleared less is the bug.
+			if err := tc.clear(r.dev, 2*512, 512); err != nil {
+				t.Fatalf("clear: %v", err)
+			}
+
+			got := make([]byte, 3*512)
+			if _, err := r.dev.ReadAt(got, 512); err != nil {
+				t.Fatalf("ReadAt: %v", err)
+			}
+			if !bytesEqual(got[512:1024], make([]byte, 512)) {
+				t.Errorf("the cleared sector reads %x, want zeros", got[512:520])
+			}
+			if !bytesEqual(got[:512], pattern[:512]) {
+				t.Errorf("the sector before the cleared range was disturbed")
+			}
+			if !bytesEqual(got[1024:], pattern[1024:]) {
+				t.Errorf("the sector after the cleared range was disturbed")
+			}
+		})
+	}
+}
+
+// A zero-length clear is a no-op rather than a record: a sequence and a header spent
+// describing nothing, which replay would carry forever. An fstrim over an already
+// empty segment produces exactly this.
+func TestAZeroLengthClearIsNotARecord(t *testing.T) {
+	r := newRig(t)
+	before := r.log.Watermarks().Local
+	if err := r.dev.Discard(0, 0); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+	if err := r.dev.WriteZeroes(0, 0, true); err != nil {
+		t.Fatalf("WriteZeroes: %v", err)
+	}
+	if got := r.log.Watermarks().Local; got != before {
+		t.Errorf("a zero-length clear consumed %d sequences", got-before)
+	}
+}
+
+// Out of range is refused rather than clamped. Clamping a discard is data loss with
+// an OK status: the guest is told the range it named is gone and a different one is.
+func TestAClearOutsideTheDeviceIsRefused(t *testing.T) {
+	r := newRig(t)
+	for _, tc := range []struct {
+		name        string
+		off, length int64
+	}{
+		{"past the end", capacity, 512},
+		{"straddling the end", capacity - 256, 512},
+		{"negative offset", -512, 512},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := r.dev.Discard(tc.off, tc.length); !errors.Is(err, vhost.ErrOutOfRange) {
+				t.Errorf("Discard(%d, %d) = %v, want ErrOutOfRange", tc.off, tc.length, err)
+			}
+		})
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

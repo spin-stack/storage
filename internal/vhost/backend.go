@@ -31,6 +31,21 @@ type Backend interface {
 	// that cannot establish durability must return an error, because the only
 	// alternative is telling the guest its data is safe when it is not.
 	Flush(ctx context.Context) error
+	// Discard releases [off, off+length). The guest is telling the device it no
+	// longer needs the contents, so the space may be reclaimed; virtio leaves
+	// what a later read returns unspecified, and this interface narrows that to
+	// zeros, because every implementation behind it serves the absence of an
+	// extent as zeros and a caller that could not rely on it would have to
+	// write the zeros itself.
+	Discard(off, length int64) error
+	// WriteZeroes makes [off, off+length) read back as zeros. unmap carries the
+	// guest's may_unmap flag: it *permits* releasing the space rather than
+	// requiring it, so an implementation that always unmaps is conforming and
+	// one that never does is too. The flag is passed through rather than
+	// swallowed because it is the guest's only way to say "I care about the
+	// allocation", and an implementation that grows a reason to honour it
+	// should not have to change this interface to hear it.
+	WriteZeroes(off, length int64, unmap bool) error
 	// Size is the capacity in bytes. The guest is told Size/512 sectors, so a
 	// capacity that is not a whole number of sectors is truncated, never
 	// rounded up into space the device does not have.

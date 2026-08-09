@@ -604,3 +604,43 @@ func TestProcessQueueIsANoOpBeforeTheQueueIsLive(t *testing.T) {
 		t.Fatalf("ProcessQueue on an unconfigured device: %d, %v, %v", served, notify, err)
 	}
 }
+
+// A feature bit whose configuration fields are zero is a feature no guest can use,
+// and that failure is silent on both sides: the device advertises DISCARD, Linux
+// reads max_discard_sectors into the queue's discard_max_bytes, finds zero, and
+// simply never sends a discard. Nothing errors. It is the same shape as not
+// advertising the bit at all, one layer further in, which is why this asserts on
+// the config bytes rather than on the feature mask.
+func TestTheDiscardConfigFieldsAreNotZero(t *testing.T) {
+	d, err := NewDevice(Config{Backend: NewRawDevice(testDeviceSize), Mapper: &fakeMapper{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	c := make([]byte, MaxConfigSize)
+	d.fillConfig(c)
+
+	// Offsets are struct virtio_blk_config's, which is why they are written as
+	// literals with the field name: a named constant per offset would hide the
+	// one thing a reader has to check against the spec.
+	fields := []struct {
+		name string
+		at   int
+	}{
+		{"max_discard_sectors", 36},
+		{"max_discard_seg", 40},
+		{"discard_sector_alignment", 44},
+		{"max_write_zeroes_sectors", 48},
+		{"max_write_zeroes_seg", 52},
+	}
+	for _, f := range fields {
+		if got := binary.LittleEndian.Uint32(c[f.at : f.at+4]); got == 0 {
+			t.Errorf("%s is 0, so a guest that negotiated the feature cannot use it", f.name)
+		}
+	}
+	// write_zeroes_may_unmap must be 1: this device always releases the range, and
+	// a 0 here promises the driver an allocation that does not survive.
+	if c[56] != 1 {
+		t.Errorf("write_zeroes_may_unmap = %d, want 1 — the device always unmaps", c[56])
+	}
+}

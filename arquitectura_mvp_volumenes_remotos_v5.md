@@ -2,8 +2,6 @@
 
 ## EROFS, CoW por bloques, vhost-user-blk, PostgreSQL y WAL durable en S3/RustFS — con fencing formal, cifrado y diseño operativo
 
-**Cambios respecto a v4**
-
 - **Fencing formal** con leases sobre reloj monotónico, espera de promoción y CAS del objeto epoch en S3. Cierra la ventana de pérdida de writes confirmados por un stale writer (era la debilidad de correctness más grave de v4).
 - **S3 es la autoridad de recovery**; PostgreSQL pasa a ser caché/control. Nueva regla formal del punto durable + summary objects para acelerar recovery.
 - **Término (`term`) verificado en cada transacción del Control Plane**; el advisory lock queda solo como optimización.
@@ -38,7 +36,8 @@
 
 ## 1. Resumen ejecutivo
 
-El MVP expone tres dispositivos a cada VM:
+El MVP expone tres dispositivos a cada VM (**el layout es del consumidor, no de este
+módulo — ver el banner de §9**):
 
 ```text
 /dev/vda  EROFS read-only       Imagen base compartida
@@ -118,8 +117,8 @@ leerlas contra esta fila.
 
 ## 3. Objetivos del MVP
 
-1. Boot con EROFS, persistente y efímero.
-2. Docker/containerd únicamente sobre el disco efímero.
+1. Boot con EROFS, persistente y efímero. — **fuera de alcance de `storage` (§9).**
+2. Docker/containerd únicamente sobre el disco efímero. — **fuera de alcance (§9).**
 3. Read, write, flush, FUA y **discard** mediante `vhost-user-blk`.
 4. Snapshots inmutables **sin pausa de I/O**.
 5. Clones independientes.
@@ -339,13 +338,19 @@ Todo payload de datos de VM (WAL records, segmentos, checkpoints) se cifra con l
 
 El GC marca; nunca ejecuta borrado permanente. El borrado real lo ejecuta el lifecycle del bucket sobre versiones no-actuales tras el grace period. Las credenciales del GC no incluyen `DeleteObject` permanente ni bypass de Object Lock.
 
-> **No hay GC (ADR-0026 incremento 1), así que este invariante no puede dispararse: es
-> INV-14, `pending`.** Lo que sobrevive está enforceado en la construcción y no en un
-> proceso: `real.NewS3Store` **se niega a usar un bucket sin versioning**
-> (`TestRequireVersioning`), de modo que cualquier borrado futuro deja un delete marker
-> reversible, y la interfaz `objectstore.Store` no tiene borrado permanente que ofrecer.
-> Nada en este repositorio elimina un objeto todavía — cuando algo lo haga, será el
-> incremento que devuelva este invariante (`docs/plan/DELETION-AND-RECLAIM-SPEC.md`).
+> **No hay GC (ADR-0026 incremento 1), así que la mitad de este invariante que habla de un
+> proceso de marcado no puede dispararse: es INV-14, `pending`.** La otra mitad —el
+> corolario que importa— **sí se cumple, y está enforceada en la construcción**:
+> `real.NewS3Store` se niega a usar un bucket sin versioning (`TestRequireVersioning`), y
+> la interfaz `objectstore.Store` no tiene borrado permanente que ofrecer.
+>
+> **Corrección de 2026-08-08: la frase «nada en este repositorio elimina un objeto
+> todavía» dejó de ser cierta y este párrafo la seguía afirmando.** `lineage.Delete`
+> marca el descriptor de un volumen, los manifiestos de sus snapshots, su manifiesto y sus
+> chunks, y lo maneja `control-plane -delete-volume`. Es exactamente la forma que §5.11
+> pide y no la que prohíbe: cada borrado es un delete marker reversible y el borrado
+> permanente lo hace —o no lo hace— el lifecycle del bucket, que **ningún código
+> configura**. Ésa es la parte que sigue faltando (`docs/plan/DELETION-AND-RECLAIM-SPEC.md`).
 
 ---
 
@@ -456,10 +461,13 @@ No participa en el data path.
 > una cosa y termina, y es lo que `integration/e2e` maneja. Existen `-seed-volume`
 > (crear), `-attach-volume` / `-detach-volume` (colocar y liberar; `-attach-volume` sin
 > `-attach-host` pregunta a `placement.Choose`), `-snapshot-volume`, `-clone-snapshot`,
-> `-rebuild-metadata` y `-fleet-status`. **No existe borrar**: nada en este repositorio
-> elimina un objeto todavía, y con ello el crypto-shredding de §15.3 no tiene ejecutor —
-> es el primer incremento que lo haría y su spec (`docs/plan/DELETION-AND-RECLAIM-SPEC.md`)
-> está escrito y sin revisar, con la pregunta abierta anotada en `STATUS.md`.
+> `-rebuild-metadata` y `-fleet-status`, y desde entonces `-flatten-volume`,
+> `-delete-volume`, `-cordon-host` y `-uncordon-host`. **Borrar sí existe** (la frase
+> anterior decía lo contrario y una auditoría la corrigió el 2026-08-08):
+> `-delete-volume` marca cada objeto del volumen y borra sus filas, llevándose con ellas
+> la DEK envuelta, que es el crypto-shredding de §15.3 — con la salvedad de que un delete
+> marker es reversible mientras el lifecycle del bucket no lo expire, y ese lifecycle no
+> lo configura nada.
 >
 > De los demás puntos: las promociones y la espera de fencing son V2 (§12), el GC no
 > existe (§21), el standby tibio no existe (§22.3), el drain se borró (§28.1 lleva lo que
@@ -636,6 +644,26 @@ Política de sobresuscripción de NVMe explícita y configurable (ej. `committed
 
 ## 9. Layout del guest
 
+> **El layout de tres dispositivos está FUERA DEL ALCANCE de este módulo (decidido
+> 2026-08-08).** Una auditoría doc↔código encontró trece claims rojas que salían todas de
+> acá: no hay EROFS, no hay efímero, no hay overlay, no hay Docker ni containerd, y
+> `grep -rn 'erofs|overlay|lowerdir|/dev/vdb|/dev/vdc|ephemeral'` sobre `internal/ cmd/
+> integration/` no encuentra nada. No estaba a medio construir: no estaba empezado.
+>
+> **Y no le corresponde.** `storage` sirve **un** dispositivo de bloques remoto por
+> vhost-user-blk. Qué discos ve una VM, cuál es su raíz, dónde monta el overlay y sobre qué
+> disco vive Docker lo compone quien arranca la VM —`spin`/`spinbox`, ADR-0021— que es el
+> que ya tiene la imagen base, el kernel y la línea de QEMU. Meter el layout acá sería un
+> módulo nuevo entero y contradiría esa ADR.
+>
+> Lo que este documento describe en §1, §3, §9 y §31 sobre los tres dispositivos es el
+> diseño del **sistema completo**, y se conserva como tal: es el contexto que explica por
+> qué el volumen persistente se parece a lo que se parece. Pero no es una promesa que
+> `storage` pueda cumplir ni fallar, y contarla como pendiente hacía que trece renglones
+> del criterio de éxito fueran permanentemente rojos por algo que nadie iba a construir
+> acá. La frontera es exacta: **de `/dev/vdb` hacia adentro es de este módulo; qué otros
+> discos hay al lado, no.**
+
 ```text
 /dev/vda  EROFS read-only
 /dev/vdb  ext4 persistente
@@ -676,7 +704,19 @@ Si el efímero falla, Docker/containerd no inician y no se usa el persistente co
 Features anunciadas al guest en `/dev/vdb`:
 
 - `VIRTIO_BLK_F_FLUSH`: write-back explícito; el guest sabe qué garantías tiene.
-- `VIRTIO_BLK_F_DISCARD` y `VIRTIO_BLK_F_WRITE_ZEROES`: el espacio liberado por el guest se recupera (ver §14.6). Montar ext4 con `discard` o correr `fstrim` periódico.
+- `VIRTIO_BLK_F_DISCARD` y `VIRTIO_BLK_F_WRITE_ZEROES`: el espacio liberado por el guest se
+  recupera (ver §14.6). Montar ext4 con `discard` o correr `fstrim` periódico.
+  **Anunciados desde 2026-08-08.** Antes no lo estaban, y ésa era la forma más cara de
+  hueco que tiene este repositorio: `wal.Log.Discard`, `cow.IntervalMap.Clear`, el codec de
+  `RecordDiscard` y la lectura de ceros estaban completos y probados, y **ningún guest
+  podía pedirlos**, porque un driver no manda un request de una feature que el dispositivo
+  no anuncia. Faltaba un bit. Lo que se agregó con él: el parseo del array de
+  `struct virtio_blk_discard_write_zeroes` (son rangos múltiples, no uno), los seis campos
+  de configuración —`max_discard_sectors` en cero es una feature que el guest negocia y no
+  usa nunca, en silencio— y `write_zeroes_may_unmap = 1`, porque este dispositivo siempre
+  libera el rango. La prueba es del lado del kernel: `spin.mode=discard` en
+  `integration/guestinit` emite `BLKDISCARD`, que el block layer sólo manda si la feature
+  se negoció.
 - ~~Resize: el grow se propaga vía actualización del config space + notificación; el guest
   expande con `resize2fs`.~~ — **V2 (§3).** Esta frase es la mitad que nunca se construyó:
   la notificación es `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG`, que viaja por el canal de
@@ -1299,19 +1339,29 @@ si chain_depth > max_chain_depth (5)  o  replay_estimado > umbral:
 
 Equivalente al `flatten` de RBD / compactación de niveles de un LSM. Sin esto, el sistema funciona en la demo y degrada en silencio durante meses. Métricas: `chain_depth{volume}`, `flatten_operations_total`.
 
-> **No hay FLATTEN, no hay techo de profundidad, y el aplanado que sí ocurre es otro y no lo
-> decidió nadie — es DEV-0020, abierto.** `controlplane.Clone` hace
-> `ChainDepth: parent.ChainDepth + 1` y ningún camino se niega por profundidad; el
-> `max_chain_depth = 5` de §4 y §10 no lo lee nadie. Lo que sí pasa es que la publicación de
-> un clon aplana **en cada parada**: `image.uploadChunks` recorre `view.Ranges()`, que
-> mezcla la base con la capa (§13.2), así que la primera parada de un clon vuelve a subir el
-> dataset entero de su padre bajo su propio prefijo — un duplicado por eslabón, y **la única
-> razón por la que un clon de profundidad 2 lee algo que no sean ceros**, porque nada
-> recorre una cadena al leer. Quitar el costo sin construir la lectura encadenada convierte
-> un defecto de costo en uno de corrección silenciosa, así que son una sola decisión, y es
-> una decisión de formato en S3 (`docs/plan/CHUNK-ADDRESSING-SPEC.md`, sin revisar). Hasta
-> que se responda, `chain_depth` describe un linaje, no un camino de lectura, y
-> `flatten_operations_total` no existe.
+> **Este párrafo describía el árbol de antes de la decisión de `chain_depth`, y una
+> auditoría doc↔código lo encontró falso en seis puntos el 2026-08-08.** Se reescribe
+> entero. Lo que decía —que no hay FLATTEN, que ningún camino se niega por profundidad, que
+> `max_chain_depth` no lo lee nadie, que `image.uploadChunks` recorre `view.Ranges()`, que
+> el re-subido es la única razón por la que un clon de profundidad 2 no lee ceros, y que
+> `chain_depth` no describe un camino de lectura— era cierto cuando se escribió y dejó de
+> serlo cuando se construyó la cadena. **Lo que hay:**
+>
+> - **Hay techo.** `controlplane.MaxChainDepth = 5` es una constante de Go, no una clave de
+>   configuración, y `controlplane.Clone` se niega **antes** de colocar cuando el clon
+>   quedaría por encima (`ErrChainTooDeep`), diciendo en el error que la salida es aplanar
+>   el padre.
+> - **Hay FLATTEN**, y es un one-shot de operador: `control-plane -flatten-volume`. No es la
+>   operación reconciliada en background que pide el bloque de arriba, y esa diferencia es
+>   deliberada — no hay tabla `operations` (§8), así que no hay dónde vivir el progreso.
+> - **La publicación ya no aplana.** `image.uploadChunks` recorre
+>   `view.DeltaOver(inherited)`: escribe sólo lo que las capas propias de este volumen
+>   afirman, más tombstones explícitos, bajo el prefijo de la raíz del linaje.
+> - **La cadena se recorre al atachar** (`agent.parentChain`) y se compone en la vista de
+>   lectura, de modo que un clon de profundidad 2 lee los bytes de sus ancestros porque los
+>   *lee*, no porque alguien se los haya vuelto a copiar. Con eso, `chain_depth` describe el
+>   camino de lectura tanto como el linaje, y `read_view_layers` (§26.2) mide la otra mitad.
+> - `flatten_operations_total` sigue sin existir.
 
 ---
 
@@ -1549,9 +1599,34 @@ hay algo que lo dice sin depender de que alguien se acuerde.
 > **no** dice es cuál tiene productor; eso está en `STATUS.md`, con su propia trampa
 > anotada.
 
-**WAL local**: `wal_append_latency_seconds`, `wal_fdatasync_latency_seconds`,
-`wal_unflushed_bytes`, `wal_oldest_unflushed_age_seconds`, `wal_local_sequence`,
-`wal_durable_sequence`,
+> **Segundo recorte, 2026-08-08: se fueron once series más, y la razón es distinta de
+> la de ADR-0026.** Aquéllas nombraban mecanismos retirados; éstas nombraban mecanismos
+> que **nunca existieron**, y estaban declaradas, instanciadas y grabadas por nadie —
+> exportadas en cada scrape y permanentemente vacías. Eso es peor que una serie ausente:
+> una serie vacía se lee como «esto no está pasando», no como «nadie está midiendo», y un
+> dashboard montado sobre `s3_errors_total` mostraba un object store sano.
+>
+> Se fueron: `wal_oldest_unflushed_age_seconds` (el Log sabe *si* hay no-flusheados, no la
+> edad del más viejo, y ningún Agent configura la cota a la que pertenece),
+> `clock_offset_seconds` (nada lee chrony), `host_nvme_committed_ratio` (se deriva al
+> colocar, no se graba), `clone_cross_host_total` (ADR-0026 borró el camino),
+> `agent_memory_bytes` (el presupuesto de memoria de §10.1 nunca se construyó;
+> `agent.Budget` es un presupuesto de *dispositivo*), `vhost_reconnects_total` e
+> `inflight_recovered_total` (el incremento 3.3 no empezó) y las cuatro `s3_*` (§24 no
+> existe como subsistema). Las que sí tenían mecanismo se **cablearon** en el mismo
+> cambio, que es la otra mitad de la regla.
+>
+> Y lo que ahora lo sostiene no es este párrafo: es
+> `TestEveryDeclaredMetricHasANonTestProducer` en `internal/obs`, que falla si una serie
+> declarada no aparece en ningún `.go` que no sea un test. Se rechazó una lista de
+> excepciones — las trece habrían estado en ella, puestas por quien declaró la serie, y la
+> lista se leería como un plan igual que se leía el catálogo.
+
+**WAL local**: `wal_append_latency_seconds` (alrededor del append, sobre el reloj
+inyectado), `wal_fdatasync_latency_seconds` (alrededor del syscall, que bajo ADR-0026 **es**
+el contrato de durabilidad, §14.8 — se graba también cuando falla, porque un dispositivo
+cuyo fdatasync tarda lo bastante como para fallar es justo el caso para el que existe la
+serie), `wal_unflushed_bytes`, `wal_local_sequence`, `wal_durable_sequence`,
 `wal_out_of_space` (1 mientras el dispositivo rechaza appends por espacio, §5.7).
 
 `wal_published_sequence` se retira con el checkpoint: en V1 nada publica, así que sería
@@ -1563,10 +1638,12 @@ al parar: en V1 es el único momento en que algo sale, así que es el coste de u
 mide alrededor del *congelado*, no de la subida).
 
 **Leases** (liveness, ya no durabilidad): `lease_remaining_seconds`,
-`lease_renewal_failures_total`, `clock_offset_seconds` (chrony).
+`lease_renewal_failures_total`.
 
-**Fleet**: `host_nvme_committed_ratio`, `clone_same_host_total`, `clone_cross_host_total`,
-`chain_depth`, `discarded_bytes_total`.
+**Fleet**: `clone_same_host_total` (se graba donde se toma la decisión de placement, que es
+el único lugar que conoce a la vez lo que se pidió y lo que se eligió), `chain_depth`,
+`discarded_bytes_total` (se graba en el momento en que el número cambia, no lo lee un
+poller).
 
 **Vista de lectura** (agregadas en 2026-08-06; §10.1 pide que nada crezca sin cota y
 `cow.IntervalMap` es la única estructura por volumen cuyo tamaño lo decide el guest y no la
@@ -1575,18 +1652,22 @@ graba el dueño del mapa bajo el lock que lo serializa, en el paso durable — n
 un poller, porque la estructura no es segura de leer en concurrencia y un poller sería una
 segunda cosa pidiendo el lock del volumen en el data path.
 
-**Agent**: `agent_memory_bytes{component}`, `vhost_reconnects_total`,
-`inflight_recovered_total`.
-
-**Cliente S3**: `s3_errors_total{type}` y lo de §24.
-
 ### 26.3 Alertas mínimas
 
-- `wal_unflushed_bytes > 80%` del límite; `wal_oldest_unflushed_age > 20 s`.
+> **Ninguna de estas alertas existe como artefacto** — no hay reglas de Prometheus, no hay
+> `deploy/`, y ninguna comparación contra un umbral vive en el código. La lista es lo que
+> habría que escribir el día que haya un colector con reglas, y hasta entonces es una
+> intención, no un mecanismo. Se dejó porque nombra los umbrales que alguien tendría que
+> elegir; se marca porque un lector la contaba como observabilidad construida.
+>
+> Las tres que nombraban series retiradas se fueron con ellas
+> (`wal_oldest_unflushed_age`, `clock_offset_seconds`, `host_nvme_committed_ratio`): una
+> alerta sobre una serie que nadie graba no dispara nunca, y es la peor clase de alerta
+> porque su silencio se lee como salud.
+
+- `wal_unflushed_bytes > 80%` del límite.
 - Cualquier `wal_out_of_space` en 1: el dispositivo está rechazando escrituras.
 - `lease_renewal_failures_total` creciendo.
-- `clock_offset_seconds > 0.5`.
-- `host_nvme_committed_ratio` sobre la política.
 - Certificados mTLS a < 30 días.
 - Cualquier error de checksum, GCM o divergencia (severidad máxima).
 - `snapshot_pause_duration_seconds > 0` sostenido (regresión del diseño sin pausa).
@@ -1771,8 +1852,9 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 > volvieron las filas sino que un Agent nuevo sirve los bytes que el guest original
 > escribió (INV-20). Lo que no vuelve es el placement, porque ningún objeto lo registra.
 
-1. Boot con los tres dispositivos.
-2. Docker/containerd solo en efímero.
+1. Boot con los tres dispositivos. — **fuera de alcance de `storage` (§9);** este módulo
+   demuestra el suyo, que es el persistente, en el lane de guest real.
+2. Docker/containerd solo en efímero. — **fuera de alcance (§9).**
 3. Un FLUSH ACKeado sobrevive a la caída del proceso, del Agent y de QEMU; el volumen entero llega al object store al parar y un arranque posterior lo lee de vuelta. **La pérdida del host pierde la sesión** (RPO de una sesión, §2, ADR-0026). Demostrado por el harness DST con checkers de invariantes y por el lane de guest real.
 4. Ningún ACK de durabilidad emitido con lease vencido (invariante DST).
 5. Snapshot portable, crash-consistent, con `snapshot_pause_duration ≈ 0`.

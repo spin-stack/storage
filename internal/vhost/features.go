@@ -47,20 +47,38 @@ func has(mask uint64, n uint) bool { return mask&bit(n) != 0 }
 //     becomes a race between the driver's published event index and the
 //     backend's completion, and getting it wrong loses a completion — the guest
 //     hangs. Flow control is not what Increment 3.1 is proving.
+//
 //   - VIRTIO_F_RING_PACKED is not offered: this backend walks split rings only.
+//
 //   - VIRTIO_BLK_F_MQ is not offered. §4's decision table fixes a single queue, and
 //     §3 lists multi-queue among the MVP's non-objectives, at
 //     depth 128; a queue count the backend does not serve is a lie the guest
 //     acts on.
-//   - VIRTIO_BLK_F_DISCARD / WRITE_ZEROES are still not offered, and the WAL
-//     wiring (internal/blockdev) did not change that. wal.Log has Discard and
-//     WriteZeroes, so the storage half exists — but each bit is a wire feature
-//     with its own request payload (struct virtio_blk_discard_write_zeroes),
-//     its own configuration-space fields, and, for WRITE_ZEROES, a may_unmap
-//     flag whose two readings differ in whether the range is reclaimed.
-//     Advertising a bit whose semantics are not implemented and tested is worse
-//     than not advertising it; they arrive with their negotiation and their
-//     tests, together, or not at all.
+//
+//   - VIRTIO_BLK_F_DISCARD and VIRTIO_BLK_F_WRITE_ZEROES *are* offered, as of
+//     the increment that wired them. They arrived the way this comment used to
+//     demand — with their negotiation and their tests, together — and the reason
+//     they arrived at all is that everything below them already existed:
+//     wal.Log.Discard, cow.IntervalMap.Clear, the RecordDiscard codec and the
+//     zero-read were complete, tested, and reachable by nothing, because this
+//     constant withheld the two bits that let a guest ask. A driver cannot send
+//     a request for a feature the device does not advertise, so the whole
+//     mechanism below was dead by way of one missing bit.
+//
+//     What each bit costs on the wire, and what this backend does with it:
+//     both carry `struct virtio_blk_discard_write_zeroes` — an array of
+//     (sector, num_sectors, flags) triples rather than a single range, bounded
+//     by max_discard_seg / max_write_zeroes_seg in the configuration space. The
+//     may_unmap flag of WRITE_ZEROES is the one place the two readings differ,
+//     and this device answers it the strong way: the range is unmapped whether
+//     or not the guest asked, because the layer below cannot express "zero but
+//     keep the allocation" — cow.IntervalMap.Clear removes the extents and the
+//     read is served as zeros from the absence. Unmapping when the guest did
+//     not ask for it is permitted (may_unmap is a permission, not a
+//     requirement); the observable contract — the range reads back as zeros —
+//     is the same either way, and that is what write_zeroes_may_unmap = 1
+//     tells the driver to expect.
+//
 //   - VIRTIO_BLK_F_CONFIG_WCE is not offered, and that is a durability
 //     decision, not an omission. It lets the guest switch the device to
 //     write-through, after which Linux stops sending FLUSH because it believes
@@ -79,6 +97,8 @@ func has(mask uint64, n uint) bool { return mask&bit(n) != 0 }
 const DeviceFeatures uint64 = 1<<featureBlkSegMax |
 	1<<featureBlkBlkSize |
 	1<<featureBlkFlush |
+	1<<featureBlkDiscard |
+	1<<featureBlkWriteZeroes |
 	1<<featureRingIndirectDesc |
 	1<<featureVersion1 |
 	1<<featureProtocol

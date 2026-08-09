@@ -291,6 +291,20 @@ func (l *Log) recordReadView(ctx context.Context, vol obs.Attr) {
 	l.rec.Gauge(ctx, "read_view_layers", float64(c.Layers), vol)
 }
 
+// observeLatency records a duration measured on the injected clock. A nil recorder is
+// a no-op, which is what the DST harness and every unit test run with.
+//
+// The clock is the injected one (INV-01), so in simulation these are the simulated
+// durations — which is the point: a scenario that injects a slow device should move the
+// series, and a series read from the wall clock inside a deterministic run would make
+// the same seed produce different traces.
+func (l *Log) observeLatency(ctx context.Context, name string, start clock.Instant) {
+	if l.rec == nil {
+		return
+	}
+	l.rec.Observe(ctx, name, l.clk.Now().Sub(start).Seconds(), obs.String("volume", l.volLabel))
+}
+
 // Broken reports whether a failed rollback left this log's tail unknown.
 //
 // It has no production caller. What it exists for is proof — the tests that plant a
@@ -391,7 +405,9 @@ func (l *Log) appendEncoded(seq uint64, enc []byte, addView func()) (uint64, err
 	// reported — otherwise the rejected write either replays as a record the guest was
 	// told failed (with a sequence the next accepted write reuses) or truncates the
 	// segment, making replay stop at the tear and silently drop everything after it.
+	appendStart := l.clk.Now()
 	err, rollbackErr := l.segs.appendRecord(seq, enc)
+	l.observeLatency(context.Background(), "wal_append_latency_seconds", appendStart)
 	// Whether the device took the bytes is the only evidence there is about its
 	// state, so it is read here, on the accepted path as well as the refused one: a
 	// full device stays full until an append proves otherwise (see Degraded).
@@ -475,6 +491,13 @@ func (l *Log) appendClear(t format.RecordType, offset uint64, length uint32) (ui
 		return 0, err
 	}
 	l.discardedBytes += int64(length)
+	// Recorded here rather than exposed for a poller to read: this is the moment the
+	// number changes, and DiscardedBytes() had no caller outside tests for exactly as
+	// long as the wire had no DISCARD bit. A counter nothing increments reads as "the
+	// guest never trimmed", which is the opposite of "nothing is measuring".
+	if l.rec != nil {
+		l.rec.Count(context.Background(), "discarded_bytes_total", int64(length), obs.String("volume", l.volLabel))
+	}
 	return got, nil
 }
 
@@ -703,8 +726,16 @@ func (l *Log) durableStep(ctx context.Context, target uint64) error {
 	if l.broken {
 		return ErrLogBroken
 	}
-	if err := l.segs.sync(); err != nil {
-		return err
+	// Timed around the syscall and nothing else: under ADR-0026 this fdatasync *is*
+	// the durability contract (§14.8), so the one latency an operator needs is this
+	// one, not the whole FLUSH path around it. Recorded on failure too — a device
+	// whose fdatasync is slow enough to fail is the case the series exists for, and
+	// timing only successes hides exactly it.
+	syncStart := l.clk.Now()
+	syncErr := l.segs.sync()
+	l.observeLatency(ctx, "wal_fdatasync_latency_seconds", syncStart)
+	if syncErr != nil {
+		return syncErr
 	}
 	if err := l.advanceDurableLocked(target); err != nil {
 		return err

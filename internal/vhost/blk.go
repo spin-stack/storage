@@ -35,6 +35,94 @@ const blkHeaderSize = 16
 // blkIDLength is the fixed length of a VIRTIO_BLK_T_GET_ID answer.
 const blkIDLength = 20
 
+// blkDiscardSegSize is `struct virtio_blk_discard_write_zeroes`: sector,
+// num_sectors, flags.
+const blkDiscardSegSize = 16
+
+// blkWriteZeroesUnmap is bit 0 of that struct's flags field
+// (VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP). Bit 1 is reserved and a segment that
+// sets anything but bit 0 is refused rather than masked — see discardRanges.
+const blkWriteZeroesUnmap uint32 = 1
+
+// maxDiscardSegments bounds how many ranges one request may carry, and is what
+// the configuration space advertises as max_discard_seg / max_write_zeroes_seg.
+// A driver that respects the bound never exceeds it; the parser enforces it
+// anyway, because the segment count is derived from a guest-controlled buffer
+// length and "the driver would not do that" is not a bound.
+const maxDiscardSegments = 256
+
+// maxDiscardSectors bounds one range, and is advertised as max_discard_sectors
+// / max_write_zeroes_sectors. 1 GiB in 512-byte units: large enough that an
+// `fstrim` of an idle filesystem is a handful of requests rather than
+// thousands, and small enough that one request cannot occupy the queue for an
+// unbounded time.
+const maxDiscardSectors = (1 << 30) / SectorSize
+
+// discardRange is one (sector, num_sectors, flags) triple, decoded.
+type discardRange struct {
+	sector  uint64
+	sectors uint32
+	unmap   bool
+}
+
+// discardRanges decodes the payload of a DISCARD or WRITE_ZEROES request.
+//
+// The whole payload is guest-controlled, so every field is checked here rather
+// than at the backend: a length that is not a whole number of segments, more
+// segments than advertised, a range longer than advertised, and an unknown flag
+// bit are all refused. The alternative — passing a partially-understood request
+// down — turns a driver bug into a data-loss bug, because the one thing these
+// two request types do is make data unreadable.
+func discardRanges(r blkRequest) ([]discardRange, error) {
+	payload := concat(r.in)
+	if len(payload) == 0 || len(payload)%blkDiscardSegSize != 0 {
+		return nil, fmt.Errorf("%w: discard payload is %d bytes, not a whole number of %d-byte segments",
+			ErrRing, len(payload), blkDiscardSegSize)
+	}
+	n := len(payload) / blkDiscardSegSize
+	if n > maxDiscardSegments {
+		return nil, fmt.Errorf("%w: discard carries %d segments, more than the %d advertised",
+			ErrRing, n, maxDiscardSegments)
+	}
+	ranges := make([]discardRange, 0, n)
+	for i := range n {
+		seg := payload[i*blkDiscardSegSize:]
+		sectors := binary.LittleEndian.Uint32(seg[8:12])
+		flags := binary.LittleEndian.Uint32(seg[12:16])
+		if flags&^blkWriteZeroesUnmap != 0 {
+			return nil, fmt.Errorf("%w: discard segment %d sets reserved flag bits %#x", ErrRing, i, flags)
+		}
+		if sectors > maxDiscardSectors {
+			return nil, fmt.Errorf("%w: discard segment %d covers %d sectors, more than the %d advertised",
+				ErrRing, i, sectors, maxDiscardSectors)
+		}
+		ranges = append(ranges, discardRange{
+			sector:  binary.LittleEndian.Uint64(seg[0:8]),
+			sectors: sectors,
+			unmap:   flags&blkWriteZeroesUnmap != 0,
+		})
+	}
+	return ranges, nil
+}
+
+// concat joins the driver-supplied segments. A discard payload is small — at
+// most maxDiscardSegments*16 bytes — and it may straddle descriptors, so it is
+// copied once rather than parsed across boundaries.
+func concat(segs [][]byte) []byte {
+	if len(segs) == 1 {
+		return segs[0]
+	}
+	var n int
+	for _, s := range segs {
+		n += len(s)
+	}
+	out := make([]byte, 0, n)
+	for _, s := range segs {
+		out = append(out, s...)
+	}
+	return out
+}
+
 // blkRequest is one decoded virtio-blk request: its header, the data the guest
 // supplied, the buffer the device must fill, and the single byte it reports
 // status in.
@@ -129,14 +217,24 @@ func (d *Device) serve(ctx context.Context, r blkRequest) uint32 {
 		return n + 1
 
 	case blkTypeDiscard, blkTypeWriteZeroes:
-		// Neither feature bit is offered (see DeviceFeatures), so a conforming
-		// driver never sends these. Answering UNSUPP is what the spec says to
-		// do with the ones that do anyway, and it is strictly better than
-		// silently writing zeros over a range the guest expected to be
-		// reclaimed. UNSUPP is also the one place the wire is more specific
-		// than IOERR: the guest's block layer reads it as ENOTSUPP and stops
-		// asking, which is exactly right for a feature we never advertised.
-		r.status[0] = blkStatusUnsupp
+		// A malformed payload is UNSUPP rather than IOERR, and the distinction
+		// is the guest's: Linux maps UNSUPP to ENOTSUPP and stops asking, which
+		// is the right outcome for a request this device could not make sense
+		// of, while IOERR would have the filesystem retry a request that will
+		// fail identically forever. A range this device understood and could
+		// not apply is IOERR, below.
+		ranges, err := discardRanges(r)
+		if err != nil {
+			r.status[0] = blkStatusUnsupp
+			d.trace(r.typ, err)
+			return 1
+		}
+		if err := d.discard(r.typ, ranges); err != nil {
+			r.status[0] = blkStatusIOErr
+			d.trace(r.typ, err)
+			return 1
+		}
+		r.status[0] = blkStatusOK
 		return 1
 
 	default:
@@ -144,6 +242,38 @@ func (d *Device) serve(ctx context.Context, r blkRequest) uint32 {
 		d.trace(r.typ, fmt.Errorf("unsupported virtio-blk request type %d", r.typ))
 		return 1
 	}
+}
+
+// discard applies every range of a DISCARD or WRITE_ZEROES request.
+//
+// The ranges are applied in order and the first failure stops the request: a
+// partially-applied discard is reported as IOERR, which is honest — the guest
+// learns the request did not complete and, since both types are idempotent over
+// a range, retrying costs nothing. Reporting OK after applying half of them
+// would leave the guest believing a range still holds data that is gone.
+func (d *Device) discard(typ uint32, ranges []discardRange) error {
+	for _, rg := range ranges {
+		off, err := byteOffset(rg.sector)
+		if err != nil {
+			return err
+		}
+		length := int64(rg.sectors) * SectorSize
+		if length == 0 {
+			// A zero-length range is a no-op, not an error: the spec does not
+			// forbid one and refusing it would fail a whole fstrim over a
+			// segment that asks for nothing.
+			continue
+		}
+		if typ == blkTypeDiscard {
+			err = d.backend.Discard(off, length)
+		} else {
+			err = d.backend.WriteZeroes(off, length, rg.unmap)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *Device) read(r blkRequest) (uint32, error) {

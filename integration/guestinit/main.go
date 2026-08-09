@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // The device the backend serves over vhost-user-blk. virtio_blk is compiled into the
@@ -70,6 +71,14 @@ const (
 // verdict lines the host test greps for. The prefix is unlikely to appear in kernel
 // output, and the host asserts on the exact strings — a lane that "passes" because its
 // pattern stopped matching is the failure mode this guards against.
+// Block-layer ioctls. They are written as literals with their kernel names because
+// that is what a reader checks against include/uapi/linux/fs.h; golang.org/x/sys is
+// not a dependency of the guest binary, which is static and deliberately tiny.
+const (
+	blkDiscard = 0x1277 // BLKDISCARD
+	blkFlsBuf  = 0x1261 // BLKFLSBUF
+)
+
 const (
 	verdictPass = "GUESTINIT-PASS"
 	verdictFail = "GUESTINIT-FAIL"
@@ -118,6 +127,14 @@ const (
 	// one boot would prove nothing — the data would still be in the page cache and in
 	// the local WAL.
 	modeVerify = "verify"
+	// modeDiscard writes a pattern, fsyncs it, then asks the KERNEL to discard part
+	// of it with BLKDISCARD and checks that the range reads back as zeros while its
+	// neighbours do not. It is the only thing in this tree that proves a real Linux
+	// block layer can reach wal.Log.Discard: the whole discard mechanism was complete
+	// and unreachable because internal/vhost withheld VIRTIO_BLK_F_DISCARD, and a
+	// host-side unit test cannot notice a missing feature bit — only a driver that
+	// refuses to send the request can.
+	modeDiscard = "discard"
 	// modeHold keeps writing until the host says stop. It exists so that something else
 	// can happen while a guest is running: until it did, every guest in this repository
 	// wrote once and powered off, and so every snapshot, restart and clone the lanes
@@ -172,6 +189,8 @@ func run(m string) error {
 		// Nothing written and nothing synced: whatever comes back was put there by a
 		// previous boot and survived whatever the host did in between.
 		return readBack(pattern, writeOffsets()...)
+	case modeDiscard:
+		return discardRoundTrip(f, pattern)
 	case modeHold:
 		return hold(f, pattern)
 	case modeWrite:
@@ -197,6 +216,90 @@ func run(m string) error {
 	}
 
 	return readBack(pattern, writeOffsets()...)
+}
+
+// discardOffsets is the three-block window modeDiscard uses: it writes all three,
+// discards the middle one, and expects the outer two to survive. A discard that took
+// the whole request range, or rounded outward to some granularity, fails on the
+// neighbours rather than on the target — which is the failure this shape is for.
+func discardOffsets() (before, target, after int64) {
+	base := int64(writeOffset)
+	return base, base + stride, base + 2*stride
+}
+
+// discardRoundTrip is the guest half of the DISCARD proof.
+//
+// The request is issued with the BLKDISCARD ioctl rather than by mounting a
+// filesystem and running fstrim: fstrim would prove the same thing through several
+// more layers, each of which can decide not to issue a discard for reasons of its own
+// (the filesystem's own free-space bookkeeping, a mount option, an alignment rule),
+// and a lane that silently stops exercising the thing it is named after is the exact
+// failure this repository keeps paying for. BLKDISCARD goes to the block layer, and
+// the block layer sends it only if the device negotiated the feature — so the ioctl
+// failing with EOPNOTSUPP *is* the assertion that the bit was advertised.
+func discardRoundTrip(f *os.File, pattern []byte) error {
+	before, target, after := discardOffsets()
+	for _, off := range []int64{before, target, after} {
+		if _, err := f.WriteAt(pattern, off); err != nil {
+			return fmt.Errorf("discard mode: writing at %d: %w", off, err)
+		}
+	}
+	// fsync first: a discard of a range still sitting in the page cache would be
+	// racing the writeback of the very data it is meant to remove.
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("discard mode: fsync before the discard: %w", err)
+	}
+
+	// BLKDISCARD takes a two-element array of u64: offset then length, in bytes.
+	rng := [2]uint64{uint64(target), uint64(len(pattern))}
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), blkDiscard,
+		uintptr(unsafe.Pointer(&rng[0]))); errno != 0 {
+		return fmt.Errorf("discard mode: BLKDISCARD of %d bytes at %d: %w "+
+			"(EOPNOTSUPP here means the device never advertised VIRTIO_BLK_F_DISCARD)",
+			len(pattern), target, errno)
+	}
+
+	// Drop the page cache for this device so the read below comes from the backend
+	// and not from pages the kernel still holds. Without this the test could pass on
+	// a backend that ignored the discard entirely.
+	if err := dropCache(f); err != nil {
+		return err
+	}
+
+	g, err := os.Open(device)
+	if err != nil {
+		return fmt.Errorf("discard mode: reopening %s: %w", device, err)
+	}
+	defer func() { _ = g.Close() }()
+
+	got := make([]byte, len(pattern))
+	if _, err := g.ReadAt(got, target); err != nil {
+		return fmt.Errorf("discard mode: reading the discarded range: %w", err)
+	}
+	for i, b := range got {
+		if b != 0 {
+			return fmt.Errorf("discard mode: byte %d of the discarded range is %#x, want 0", i, b)
+		}
+	}
+	for _, off := range []int64{before, after} {
+		if _, err := g.ReadAt(got, off); err != nil {
+			return fmt.Errorf("discard mode: reading the neighbour at %d: %w", off, err)
+		}
+		if !bytes.Equal(got, pattern) {
+			return fmt.Errorf("discard mode: the block at %d was cleared and should not have been", off)
+		}
+	}
+	return nil
+}
+
+// dropCache invalidates this device's page cache. BLKFLSBUF is the block layer's own
+// verb for it and needs no /proc tunable, so it works in an initramfs that mounted
+// nothing.
+func dropCache(f *os.File) error {
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), blkFlsBuf, 0); errno != 0 {
+		return fmt.Errorf("discard mode: BLKFLSBUF: %w", errno)
+	}
+	return nil
 }
 
 // writeOffsets is where the write/verify pair puts its pattern.

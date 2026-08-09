@@ -104,17 +104,98 @@ func TestServeReadWriteFlush(t *testing.T) {
 			},
 		},
 		{
-			name: "DISCARD is refused rather than silently emulated",
+			// The assertion is on the device's bytes, not on the status byte: a
+			// dispatch that answered OK and applied nothing is exactly the shape
+			// this backend shipped for months, and it satisfies any check on status.
+			name: "DISCARD frees the range and the range reads back as zeros",
+			drive: func(t *testing.T, g *fakeGuest, d *RawDevice) ([][]byte, byte, uint32) {
+				if _, err := d.WriteAt(bytes.Repeat([]byte{0xAB}, 2*SectorSize), SectorSize); err != nil {
+					t.Fatal(err)
+				}
+				bufs := g.publish(0,
+					readable(blkHeader(blkTypeDiscard, 1)),
+					readable(discardSeg(1, 2, 0)),
+					writable(1))
+				t.Cleanup(func() {
+					if got := d.Snapshot(SectorSize, 2*SectorSize); !bytes.Equal(got, make([]byte, 2*SectorSize)) {
+						t.Errorf("the discarded range still holds %x", got[:8])
+					}
+					if d.Discards() != 1 {
+						t.Errorf("the backend saw %d discards, want 1", d.Discards())
+					}
+				})
+				return bufs, blkStatusOK, 1
+			},
+		},
+		{
+			// One request, three ranges: virtio makes the payload an array, and a
+			// backend that read only the first segment would pass every
+			// single-range test while losing most of what an fstrim asks for.
+			name: "DISCARD applies every segment of a multi-range request",
+			drive: func(t *testing.T, g *fakeGuest, d *RawDevice) ([][]byte, byte, uint32) {
+				if _, err := d.WriteAt(bytes.Repeat([]byte{0xCD}, 6*SectorSize), 0); err != nil {
+					t.Fatal(err)
+				}
+				payload := append(append(discardSeg(0, 1, 0), discardSeg(2, 1, 0)...), discardSeg(4, 1, 0)...)
+				bufs := g.publish(0, readable(blkHeader(blkTypeDiscard, 0)), readable(payload), writable(1))
+				t.Cleanup(func() {
+					for _, sector := range []int64{0, 2, 4} {
+						if got := d.Snapshot(sector*SectorSize, SectorSize); !bytes.Equal(got, make([]byte, SectorSize)) {
+							t.Errorf("sector %d survived the discard: %x", sector, got[:8])
+						}
+					}
+					for _, sector := range []int64{1, 3, 5} {
+						if got := d.Snapshot(sector*SectorSize, 1); got[0] != 0xCD {
+							t.Errorf("sector %d was cleared and should not have been", sector)
+						}
+					}
+				})
+				return bufs, blkStatusOK, 1
+			},
+		},
+		{
+			name: "WRITE_ZEROES with may_unmap set is served",
+			drive: func(t *testing.T, g *fakeGuest, d *RawDevice) ([][]byte, byte, uint32) {
+				if _, err := d.WriteAt(bytes.Repeat([]byte{0xEF}, SectorSize), 0); err != nil {
+					t.Fatal(err)
+				}
+				bufs := g.publish(0,
+					readable(blkHeader(blkTypeWriteZeroes, 0)),
+					readable(discardSeg(0, 1, blkWriteZeroesUnmap)),
+					writable(1))
+				t.Cleanup(func() {
+					if got := d.Snapshot(0, SectorSize); !bytes.Equal(got, make([]byte, SectorSize)) {
+						t.Errorf("WRITE_ZEROES left %x", got[:8])
+					}
+				})
+				return bufs, blkStatusOK, 1
+			},
+		},
+		{
+			// UNSUPP and not IOERR, and the difference is the guest's: Linux reads
+			// ENOTSUPP and stops asking, where EIO makes the filesystem retry a
+			// request that will fail identically forever.
+			name: "a discard payload that is not a whole number of segments is UNSUPP",
 			drive: func(t *testing.T, g *fakeGuest, _ *RawDevice) ([][]byte, byte, uint32) {
-				bufs := g.publish(0, readable(blkHeader(blkTypeDiscard, 0)), readable(make([]byte, 16)), writable(1))
+				bufs := g.publish(0, readable(blkHeader(blkTypeDiscard, 0)), readable(make([]byte, 12)), writable(1))
 				return bufs, blkStatusUnsupp, 1
 			},
 		},
 		{
-			name: "WRITE_ZEROES is refused rather than silently emulated",
+			name: "a discard segment setting a reserved flag bit is UNSUPP",
 			drive: func(t *testing.T, g *fakeGuest, _ *RawDevice) ([][]byte, byte, uint32) {
-				bufs := g.publish(0, readable(blkHeader(blkTypeWriteZeroes, 0)), readable(make([]byte, 16)), writable(1))
+				bufs := g.publish(0, readable(blkHeader(blkTypeDiscard, 0)), readable(discardSeg(0, 1, 0x2)), writable(1))
 				return bufs, blkStatusUnsupp, 1
+			},
+		},
+		{
+			// Past the end of the device is the backend's refusal, so it is IOERR:
+			// the request was understood and could not be applied.
+			name: "a discard past the end of the device fails the request, not the connection",
+			drive: func(t *testing.T, g *fakeGuest, d *RawDevice) ([][]byte, byte, uint32) {
+				past := uint64(d.Size()/SectorSize) + 1
+				bufs := g.publish(0, readable(blkHeader(blkTypeDiscard, 0)), readable(discardSeg(past, 8, 0)), writable(1))
+				return bufs, blkStatusIOErr, 1
 			},
 		},
 		{
@@ -526,16 +607,20 @@ type failingBackend struct{ size int64 }
 
 var errBackendDown = errors.New("simulated backend failure")
 
-func (b failingBackend) ReadAt([]byte, int64) (int, error)  { return 0, errBackendDown }
-func (b failingBackend) WriteAt([]byte, int64) (int, error) { return 0, errBackendDown }
-func (b failingBackend) Flush(context.Context) error        { return errBackendDown }
-func (b failingBackend) Size() int64                        { return b.size }
+func (b failingBackend) Discard(int64, int64) error           { return errBackendDown }
+func (b failingBackend) WriteZeroes(int64, int64, bool) error { return errBackendDown }
+func (b failingBackend) ReadAt([]byte, int64) (int, error)    { return 0, errBackendDown }
+func (b failingBackend) WriteAt([]byte, int64) (int, error)   { return 0, errBackendDown }
+func (b failingBackend) Flush(context.Context) error          { return errBackendDown }
+func (b failingBackend) Size() int64                          { return b.size }
 
 // shortBackend reports success but moves fewer bytes than asked. virtio-blk has
 // no way to express a partial completion, so the request must fail rather than
 // be reported OK with a half-filled buffer.
 type shortBackend struct{ size int64 }
 
+func (b shortBackend) Discard(int64, int64) error             { return nil }
+func (b shortBackend) WriteZeroes(int64, int64, bool) error   { return nil }
 func (b shortBackend) ReadAt(p []byte, _ int64) (int, error)  { return len(p) / 2, nil }
 func (b shortBackend) WriteAt(p []byte, _ int64) (int, error) { return len(p) / 2, nil }
 func (b shortBackend) Flush(context.Context) error            { return nil }
@@ -680,4 +765,13 @@ func TestRawDeviceRoundTrip(t *testing.T) {
 	if d.Size() != 8*SectorSize {
 		t.Fatalf("Size %d", d.Size())
 	}
+}
+
+// discardSeg builds one `struct virtio_blk_discard_write_zeroes`.
+func discardSeg(sector uint64, sectors uint32, flags uint32) []byte {
+	b := make([]byte, blkDiscardSegSize)
+	binary.LittleEndian.PutUint64(b[0:8], sector)
+	binary.LittleEndian.PutUint32(b[8:12], sectors)
+	binary.LittleEndian.PutUint32(b[12:16], flags)
+	return b
 }

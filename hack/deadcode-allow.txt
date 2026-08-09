@@ -79,6 +79,8 @@ internal/vhost/hostio.RawFile.ReadAt  # part of the same backend
 internal/vhost/hostio.RawFile.WriteAt # part of the same backend
 internal/vhost/hostio.RawFile.Flush   # part of the same backend
 internal/vhost/hostio.RawFile.Close   # part of the same backend
+internal/vhost/hostio.RawFile.Discard     # part of the same backend (vhost.Backend grew DISCARD/WRITE_ZEROES)
+internal/vhost/hostio.RawFile.WriteZeroes # part of the same backend
 internal/vhost/hostio.RawFile.inRange # part of the same backend
 internal/vhost/hostio.NewCallEventFD  # the call-direction eventfd a fake front-end supplies; QEMU supplies the real one over the socket
 

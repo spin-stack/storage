@@ -44,13 +44,37 @@ type MetricDesc struct {
 //
 // `wal_published_sequence` went for a smaller reason worth writing down: nothing
 // publishes in V1, so it would be a series permanently at 0.
+//
+// # The eleven that went on 2026-08-08, and the rule that took them
+//
+// A doc-vs-code audit found that thirteen series in this catalogue were declared and
+// recorded by nothing: instantiated by NewMetrics, exported on every scrape, and
+// permanently empty. That is worse than an absent series, because an empty series
+// reads as "the thing being measured is not happening" rather than "nothing is
+// measuring". A dashboard built on `s3_errors_total` shows a healthy object store.
+//
+// The rule applied, and it is CLAUDE.md's: a component with no caller is a liability.
+// So the ones whose *mechanism* does not exist went with it —
+// `inflight_recovered_total` and `vhost_reconnects_total` (increment 3.3 is not
+// started), `clone_cross_host_total` (ADR-0026 removed the cross-host path),
+// `agent_memory_bytes` (§10.1's memory budget was never built; `agent.Budget` is a
+// device budget), `clock_offset_seconds` (nothing reads chrony),
+// `host_nvme_committed_ratio` (derived at placement, never recorded),
+// `wal_oldest_unflushed_age_seconds` (the Log tracks *whether* there are unflushed
+// records, not the age of the oldest, and no Agent sets the age bound it belongs to),
+// and the four `s3_*` series (§24's subsystem does not exist; the client is one file
+// with no hedging, no circuit breaker and no classes).
+//
+// The ones whose mechanism *does* exist were wired instead of deleted, in the same
+// change, which is the other half of the rule: `wal_append_latency_seconds`,
+// `wal_fdatasync_latency_seconds`, `discarded_bytes_total` (DISCARD reached the wire
+// in this same increment) and `clone_same_host_total`.
 func Catalog() []MetricDesc {
 	return []MetricDesc{
 		// --- WAL local (§26.2) ---
 		{"wal_append_latency_seconds", KindHistogram, "WAL local append latency", []string{"volume"}},
 		{"wal_fdatasync_latency_seconds", KindHistogram, "WAL local fdatasync latency", []string{"volume"}},
 		{"wal_unflushed_bytes", KindGauge, "Unflushed WAL bytes", []string{"volume"}},
-		{"wal_oldest_unflushed_age_seconds", KindGauge, "Age of the oldest unflushed record", []string{"volume"}},
 		{"wal_local_sequence", KindGauge, "Local sequence watermark (informative)", []string{"volume"}},
 		{"wal_durable_sequence", KindGauge, "Durable sequence watermark (informative)", []string{"volume"}},
 		{"wal_out_of_space", KindGauge, "1 while the WAL device is refusing appends for want of space (§5.7)", []string{"volume"}},
@@ -83,25 +107,11 @@ func Catalog() []MetricDesc {
 		// --- Leases (liveness, no longer durability — §26.2) ---
 		{"lease_remaining_seconds", KindGauge, "Remaining lease time per host", []string{"host"}},
 		{"lease_renewal_failures_total", KindCounter, "Lease renewal failures", []string{"host"}},
-		{"clock_offset_seconds", KindGauge, "chrony-reported wall-clock offset", []string{"host"}},
 
 		// --- Fleet (§26.2) ---
-		{"host_nvme_committed_ratio", KindGauge, "NVMe committed/total ratio", []string{"host"}},
 		{"clone_same_host_total", KindCounter, "Same-host clones", nil},
-		{"clone_cross_host_total", KindCounter, "Cross-host clones", nil},
 		{"chain_depth", KindGauge, "Snapshot chain depth", []string{"volume"}},
 		{"discarded_bytes_total", KindCounter, "Bytes reclaimed via DISCARD/WRITE_ZEROES", []string{"volume"}},
-
-		// --- Agent (§10.1, §26.2) ---
-		{"agent_memory_bytes", KindGauge, "Agent memory by component", []string{"component"}},
-		{"vhost_reconnects_total", KindCounter, "vhost-user reconnections", []string{"host"}},
-		{"inflight_recovered_total", KindCounter, "Inflight requests recovered via shmfd", []string{"host"}},
-
-		// --- S3 client subsystem (§24, §26.2) ---
-		{"s3_errors_total", KindCounter, "Object-store errors", []string{"type"}},
-		{"s3_request_latency_seconds", KindHistogram, "Object-store request latency", []string{"op", "class", "hedged"}},
-		{"s3_retry_budget_exhausted_total", KindCounter, "Retry-budget exhaustions", []string{"backend"}},
-		{"s3_circuit_open_seconds", KindGauge, "Time the backend circuit breaker was open", []string{"backend"}},
 	}
 }
 
