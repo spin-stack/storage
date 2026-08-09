@@ -92,7 +92,7 @@ Las decisiones "aceptadas en el MVP" solo son evaluables contra un caso de uso d
 | Latencia de FLUSH | la de `fdatasync` local. S3 no está en el camino del ACK. |
 | Pausa de I/O por snapshot | ~0 (crash-consistent, sin quiesce; el punto congelado es un número de secuencia, §19) |
 | Pausa de I/O por deploy/crash del Agent | **no medible todavía: el mecanismo no existe** (ver abajo) |
-| Boot de un clon en el host de origen | sin descarga (§20) |
+| Boot de un clon en el host de origen | **descarga completa igual que en cualquier otro** — ver §20 |
 | Boot de un clon en otro host | descarga completa; medido por GiB, no prometido |
 
 **El RPO de una sesión es una decisión, no una limitación pendiente de arreglar** (ADR-0026). Un host que muere a mitad de sesión pierde todo lo escrito desde que el volumen se atachó. Se documenta explícitamente al usuario, sin letra chica.
@@ -121,8 +121,12 @@ leerlas contra esta fila.
 2. Docker/containerd únicamente sobre el disco efímero. — **fuera de alcance (§9).**
 3. Read, write, flush, FUA y **discard** mediante `vhost-user-blk`.
 4. Snapshots inmutables **sin pausa de I/O**.
-5. Clones independientes.
-6. Clone en el mismo host sin descargar nuevamente el snapshot.
+5. Clones independientes. — **independientes para escribir, no para leer:** un clon tiene
+   su propia capa y su propio ciclo de vida, y lee a través de los objetos de su linaje
+   (§20). «Independiente» significa que escribirlo no toca a su padre, no que pueda
+   arrancar sin él.
+6. Clone en el mismo host sin descargar nuevamente el snapshot. — **no se cumple:** el
+   placement lo prefiere, la descarga ocurre igual (§20).
 7. Recovery desde checkpoint y WAL remoto, **con S3 como autoridad**.
 8. Fencing de stale writers mediante **lease + epoch**, sin ventana de pérdida de writes confirmados.
 9. Requests duplicados idempotentes.
@@ -137,14 +141,18 @@ leerlas contra esta fila.
 > no es un pendiente a medio terminar: lo único que existía era una fila que crecía. El
 > verbo del catálogo se borró — `metadata.Store` lleva la nota donde estaba
 > `ResizeVolume`, que era grow-only, term-guarded y correcto, y no tenía camino detrás.
-> El desired state ya lleva `size_bytes` a cada Agent y `agent.Loop.Apply` retorna en su
-> chequeo de epoch antes de leerlo; la capacidad de un `blockdev.Device` la fija
+> El desired state ya lleva `size_bytes` a cada Agent y el Agent retorna en su chequeo de
+> epoch antes de leerlo (`agent.Loop.Reconcile` → `readDesiredState` → el `Reconciler`;
+> no hay ningún `Loop.Apply`, y este documento lo nombró dos veces); la capacidad de un
+> `blockdev.Device` la fija
 > `blockdev.New` y nada la mueve después; y una capacidad nueva viajaría al guest como
 > `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG` por un canal de peticiones del backend que
 > `internal/vhost` no ofrece (§9 lo prometía; ver ahí).
 >
-> Peor que incompleto: `descriptor.json` guarda el mismo tamaño y solo se escribe al
-> crear y al clonar, así que un resize que llegara al catálogo y no al bucket era la única
+> Peor que incompleto: `descriptor.json` guarda el mismo tamaño y se escribe en tres
+> momentos —al crear, al clonar y al aplanar (`-flatten-volume` lo reescribe)— ninguno de
+> los cuales mueve el tamaño, así que un resize que llegara al catálogo y no al bucket era
+> la única
 > forma de que los dos discreparan sobre el tamaño de un volumen sin que nada lo notara.
 > Lo que queda en su lugar es una propiedad que las dos implementaciones de
 > `metadata.Store` tienen que cumplir — `VolumeGeometryIsImmutable`, en
@@ -254,11 +262,30 @@ Después de publicar un snapshot: su root no cambia, sus WAL objects no cambian,
 
 ### 5.3 S3 no participa en cada WRITE
 
-El dispositivo anuncia write-back cache al guest (`VIRTIO_BLK_F_FLUSH`). Un WRITE normal se completa tras persistir localmente. La garantía frente a pérdida del host se obtiene cuando el write está cubierto por un `FLUSH` exitoso, un WRITE con FUA, o un snapshot publicado.
+El dispositivo anuncia write-back cache al guest (`VIRTIO_BLK_F_FLUSH`). Un WRITE normal se completa tras persistir localmente.
+
+> **La tercera frase decía «la garantía frente a pérdida del host se obtiene con un FLUSH
+> exitoso, un WRITE con FUA, o un snapshot publicado», y de las tres sólo la última es
+> cierta en V1** — se corrige acá porque contradecía a §14.8 dentro de este mismo archivo.
+> Un FLUSH es `fdatasync` local: sobrevive a la caída del proceso, del Agent y de QEMU, y
+> **no** a la pérdida del host, que es el RPO de una sesión de §2. FUA no existe como
+> camino: virtio-blk no tiene bit de FUA —el block layer de Linux descompone `REQ_FUA` en
+> WRITE + FLUSH— y `wal.Log.Write` devuelve `ErrFUAOnWrite` si alguien pasa el flag, en vez
+> de aceptarlo y no cumplirlo. Lo único que pone bytes fuera del host antes de parar es un
+> **snapshot publicado** (§19), y por eso es la palanca que el runbook nombra cuando alguien
+> pregunta cuánto perdería si se muere la caja.
 
 ### 5.4 Localidad no es durabilidad
 
 La caché local acelera el arranque, pero no reemplaza S3.
+
+> **En V1 esta frase se lee al revés, y el código es el coherente.** No hay caché local de
+> datos: lo único que `internal/agent` cachea son `VolumeKeys`. Lo local no es una caché
+> de S3 — es **el original**. El WAL de la sesión vive en NVMe y el object store no ve un
+> byte hasta que el volumen para (§14.8), así que durante una sesión la localidad es la
+> única copia que hay y S3 es la que está atrasada. El invariante sigue en pie con su
+> sentido dado vuelta: *lo local no es durable*, porque perder el host pierde la sesión.
+> Vuelve a leerse como está escrito cuando exista durabilidad remota continua (V2).
 
 ### 5.5 El efímero puede perderse
 
@@ -271,6 +298,11 @@ published_sequence <= durable_sequence <= local_sequence
 ```
 
 ### 5.7 Límites de WAL local no flushed
+
+> **Los dos valores de abajo no son configuración de V1: `wal.Limits` los tiene y ningún
+> Agent los pone**, así que no existe el default de 1 GiB ni el de 30 s en ninguna
+> constante. Se conservan porque describen la forma de la cota que V2 necesita; la que ata
+> hoy es la tercera, `MaxLocalBytes`, y está explicada abajo.
 
 ```text
 unflushed_bytes <= max_unflushed_bytes_per_volume   (default 1 GiB)
@@ -327,8 +359,14 @@ Todo I/O del Agent pertenece a una clase (foreground / flush / background). El t
 > **V2 con §11: no hay clases y no hay background que ceder.** Los cinco productores que
 > esta regla nombra — objectización, compactación, hidratación de standby, prefetch y GC —
 > los retiró ADR-0026, y con ellos el único I/O del Agent que no era del data path. Lo que
-> queda fuera del camino del guest es la publicación al parar (§14.8), que ocurre cuando
-> el volumen ya no sirve a nadie. El invariante vuelve con su primer productor.
+> queda fuera del camino del guest son **dos** cosas, no una: la publicación al parar
+> (§14.8), que ocurre cuando el volumen ya no sirve a nadie, y —esto es lo que este banner
+> se olvidaba— la subida de un **snapshot**, que corre en una goroutine *mientras el
+> volumen sirve* (§19: ése es el punto, no hay pausa). O sea que sí hay I/O de background
+> concurrente con el data path, sin presupuesto y sin clase, y la razón por la que no
+> duele es que dura una vez por snapshot y compite por ancho de banda, no por el lock del
+> volumen. Es el primer productor de §11 y ya está acá; el invariante vuelve cuando haya
+> algo que ceder.
 
 ### 5.10 Nada sale del host en claro (nuevo)
 
@@ -362,14 +400,29 @@ El GC marca; nunca ejecuta borrado permanente. El borrado real lo ejecuta el lif
 
 | Origen | Destino | Protocolo | Uso |
 |---|---|---|---|
-| Cliente | Control Plane | gRPC/HTTP | Attach, detach, snapshot, clone (~~resize~~ — V2, §3) |
+| Cliente | Control Plane | — | **No existe.** Los verbos son flags one-shot de `cmd/control-plane` (§7) |
 | Control Plane | PostgreSQL | PostgreSQL/TLS | Metadata, leases, epochs, reconciliación |
-| Control Plane | Volume Agent | gRPC/mTLS | Operaciones administrativas |
+| Control Plane | Volume Agent | — | **No existe, y es deliberado (ADR-0021).** El Agent no corre servidor |
 | Volume Agent | Control Plane | gRPC/mTLS | **Heartbeat + renovación de lease + reporte de capacidad** |
 | Volume Agent | KMS/Vault | HTTPS/mTLS | Unwrap de DEKs (solo en attach/recovery) |
 | QEMU | Volume Agent | vhost-user Unix socket (reconectable) | I/O |
 | Volume Agent | S3 | HTTPS/S3 API | WAL, checkpoints, imágenes, descriptors |
 | Host | Otro host | Ninguno | No existe replicación directa |
+
+> **Las dos filas marcadas «no existe» tenían la dirección al revés, y el código es el
+> coherente.** Todo RPC en este sistema es **Agent → Control Plane**: el Agent late, pide
+> su desired state y reporta; el Control Plane no llama a nadie y el Agent no escucha en
+> ningún puerto. Es ADR-0021 —*el Agent es informado, nunca pregunta por permiso*— y tiene
+> una consecuencia operativa que conviene decir: el trabajo administrativo llega a un host
+> **cuando ese host vuelve a preguntar**, no cuando el operador aprieta enter. Un `-detach-volume`
+> retorna apenas el catálogo cambió; que el Agent lo haya visto es el heartbeat siguiente.
+>
+> Del lado del cliente tampoco hay una API administrativa: cada verbo es un flag de
+> `cmd/control-plane` que hace una cosa y termina (§7). El servidor Connect que sí existe
+> es el que atiende a los Agents, **sin autenticación y escuchando en `:8080` por defecto**
+> — con `GetVolumeKeys` encima, que devuelve la DEK envuelta de un volumen a quien sepa su
+> id. Para cualquier despliegue que no sea una caja de desarrollo, eso es una red privada
+> o un proxy delante; no hay interceptor en el árbol.
 
 ### mTLS y credenciales
 
@@ -479,10 +532,12 @@ No participa en el data path.
 Toda operación de larga duración (attach, detach, clone, drain, recovery, aplanado, resize) se representa como una fila con `desired_state` / `current_state`. Loops de reconciliación idempotentes y nivel-triggered convergen el estado. El CP puede crashear en cualquier punto: nada queda a medias, solo re-converge. La respuesta operativa ante incidentes es "arreglar la causa y dejar reconciliar", no cirugía manual en la base.
 
 > **La forma sobrevive; la fila no.** V1 reconcilia de verdad — el Agent pregunta su
-> desired state en cada heartbeat y converge (`agent.Loop.Apply`), que es lo que hace que
-> un snapshot pedido y un volumen despachado ocurran sin que nadie mande una orden — pero
-> el estado deseado viaja en la respuesta del heartbeat (`DesiredVolume` en
-> `api/spin/storage/v1/control_plane.proto`), no en filas de una tabla de operaciones. Esa
+> desired state en cada ciclo y converge (`agent.Loop.Reconcile`, que late, lee el desired
+> state y reporta; el `Loop.Apply` que este documento nombraba no existe), que es lo que
+> hace que un snapshot pedido y un volumen despachado ocurran sin que nadie mande una orden
+> — pero el estado deseado viaja en su **propio RPC** (`GetDesiredState`, cuyo
+> `DesiredVolume` está en `api/spin/storage/v1/control_plane.proto`) y no dentro de la
+> respuesta del heartbeat, como decía acá: son dos llamadas del mismo ciclo, no una. Esa
 > tabla se retiró (§8), y con ella las operaciones que solo ella representaba: drain,
 > recovery, aplanado y resize. Lo que queda reconciliado es lo que el desired state
 > nombra: qué volúmenes sirve este host, y qué snapshot le falta tomar.
@@ -751,8 +806,8 @@ Configuración inicial:
 ```text
 queues: 1
 queue depth: 128
-lease_ttl: 10s                  # lease POR HOST (§12.6)
-lease_renewal_interval: 3s      # en el heartbeat de capacidad
+lease_ttl: 10s                  # lease POR HOST (§12.6) — real: 30s (-lease-ttl)
+lease_renewal_interval: 3s      # en el heartbeat de capacidad — real: 5s (-heartbeat-interval)
 max_clock_skew: 2s
 max_unflushed_bytes_per_volume: 1 GiB
 max_unflushed_age: 30s
@@ -770,8 +825,14 @@ background_nvme_budget: 30% de IOPS/BW (configurable)
 > describe sobre todo V2 (batches, checkpoints, clases de I/O). Los flags que existen:
 > `-host-id`, `-control-plane`, `-data-dir`, `-vhost-socket-dir`, `-heartbeat-interval`,
 > `-retry-backoff`, `-lease-ttl`, `-rpc-timeout`, `-otlp-endpoint`, `-shutdown-grace`,
-> `-kek-file` y **`-max-volumes`** — el divisor del presupuesto del dispositivo (§5.7).
-> Tres cosas que ese bloque no dice y que un operador necesita: sin `-kek-file` el Agent
+> `-kek-file` y **`-max-volumes`** — el divisor del presupuesto del dispositivo (§5.7) —
+> más los seis del object store, que esta lista se olvidaba y uno de los cuales es
+> **obligatorio**: `-s3-bucket`, `-s3-endpoint`, `-s3-region`, `-s3-create-bucket`,
+> `-s3-access-key` y `-s3-secret-key`. Son los mismos que toma `cmd/control-plane`
+> (`internal/storecfg`), y que los dos binarios apunten al mismo bucket no lo verifica
+> nadie: el heartbeat no lleva el bucket, así que dos mitades apuntadas a lugares
+> distintos no dan error — dan un despliegue vacío.
+> Tres cosas más que ese bloque no dice y que un operador necesita: sin `-kek-file` el Agent
 > escribe datos de guest **sin cifrar** y lo advierte por log (es modo dev, §15); el
 > `lease_ttl` de acá es liveness, no durabilidad (§14.8); y `-shutdown-grace` acota **un
 > intento** de publicación, no la espera entera (§14.8).
@@ -1049,7 +1110,11 @@ El storage converge al working set en lugar de crecer monotónicamente. Métrica
 > conserva.** No hay objectizer, ni checkpoints, ni compactación. Lo que un DISCARD hace en
 > V1 es `cow.IntervalMap.Clear`: el rango sale de la vista de lectura, se lee como ceros, y
 > —esto es lo que hace que el storage converja— **no se sube**, porque lo que se publica al
-> parar son los rangos vivos de la vista (`view.Ranges()`). O sea que el espacio se recupera
+> parar es el **delta** de la vista sobre lo que el volumen heredó (`view.DeltaOver`), más
+> tombstones explícitos para lo descartado — no `view.Ranges()`, que es lo que decía acá y
+> lo que hacía el árbol antes de la cadena. El efecto sobre el espacio es el mismo y la
+> diferencia importa igual: un rango descartado no se sube **y además** queda anotado como
+> ausente, que es lo que impide que reaparezcan los bytes de un ancestro. O sea que el espacio se recupera
 > en el object store en el momento en que este documento decía que se recuperaba en el
 > objectizer. Lo que **no** se recupera es el byte local: el record de DISCARD se anexa como
 > cualquier otro y no hay reclamo a media sesión (§5.7).
@@ -1131,9 +1196,13 @@ Reglas:
    qué sesiones deja sin publicar (`agent.ErrPublishAbandoned`, que `exitCode` traduce);
    un `SIGKILL` libera el flock y **no pierde nada**, porque los records están en disco y
    el Agent siguiente sobre ese host re-atacha en el mismo epoch y los publica (ADR-0024);
-   y que el store vuelva, que es el caso para el que existe. La única excepción que sí
-   sale es `image.ErrSuperseded` — otro escritor publicó encima, reintentar sería pisar
-   una imagen más nueva con una más vieja, que es exactamente lo que INV-10 impide.
+   y que el store vuelva, que es el caso para el que existe. La excepción que sí sale es
+   `image.ErrSuperseded` — otro escritor publicó encima, reintentar sería pisar una imagen
+   más nueva con una más vieja, que es exactamente lo que INV-10 impide. **No es la única
+   que no se reintenta**, y decir «la única» ocultaba la otra: `agent.ErrNoReadView` cae en
+   la misma rama terminal, y significa algo distinto —este Agent nunca llegó a tener una
+   vista de lectura, así que no tiene una imagen que publicar—. Las dos comparten que
+   reintentar no puede mejorar nada; sólo la primera es una carrera contra otro host.
 
 ---
 
@@ -1175,9 +1244,17 @@ Por qué día 1: re-cifrar petabytes de objetos inmutables después es un proyec
 > `DETACHED → ATTACHING → ACTIVE` y `ACTIVE ⇄ SNAPSHOTTING`. Los otros cuatro
 > —`SELF_FENCED`, `FENCED`, `RECOVERY_REQUIRED`, `RECOVERING`— no tienen transición que los
 > alcance: `SELF_FENCED` era el lease gobernando el ACK y un ACK no consulta el lease
-> (§14.8); `RECOVERING` era la recuperación a media sesión, que no existe. El vocabulario
-> sigue en `internal/lifecycle` y en el CHECK del esquema, que es donde un lector debería
-> mirar antes que acá.
+> (§14.8); `RECOVERING` era la recuperación a media sesión, que no existe.
+>
+> **Corrección de 2026-08-09: en el árbol no hay ninguna máquina de estados por volumen.**
+> Este banner decía que el vocabulario «sigue en `internal/lifecycle` y en el CHECK del
+> esquema»; lo que vive ahí es el vocabulario de *propiedad* del Control Plane (§7), sobre
+> los mismos seis valores del CHECK, y `ATTACHING`, `SNAPSHOTTING`, `SELF_FENCED` y
+> `FENCED` no existen como símbolo en ninguna parte — `agent.Volume` no tiene campo de
+> estado. Lo que un Agent realmente recorre no es un autómata: es «este volumen está en mi
+> desired state y lo estoy sirviendo» o no lo está. La secuencia de abajo sigue siendo una
+> descripción útil de *lo que pasa al atachar*, y ahí es donde hay que leerla; como
+> máquina de estados, no tiene implementación.
 >
 > **De la secuencia ATTACHING → ACTIVE**, los pasos 3 y 4 (cargar checkpoint, reproducir
 > WAL local + remoto hasta el punto durable) son **un** paso: leer el manifiesto del volumen
@@ -1211,7 +1288,10 @@ fallo en RECOVERING → FAILED | RECOVERY_REQUIRED (requiere intervención)
 5. Reconstruir active map.
 6. Abrir socket vhost-user (con inflight region).
 7. Crear/preparar efímero.
-8. Publicar ACTIVE.
+8. Publicar ACTIVE. — **no ocurre:** la fila se escribe `ACTIVE` al aprovisionar y no se
+   mueve; `SetVolumeState` no tiene llamador de producción. Lo que la flota observa como
+   «este volumen está siendo servido» son las watermarks que el heartbeat reporta, no una
+   transición de estado.
 
 **ACTIVE → SELF_FENCED** (nuevo)
 
@@ -1288,6 +1368,15 @@ Guest DISCARD
 - Publicaciones de baja frecuencia (checkpoint, manifest): CAS contra el objeto de epoch (§12.4).
 - Mismo rango con hash distinto → corrupción o divergencia → fallo duro.
 
+> **Esta regla no tiene sujeto en V1, y el código es el coherente.** Presupone una clave
+> que nombra un *rango* —`(volume_id, epoch, first_seq, last_seq)`— de modo que dos
+> contenidos distintos puedan reclamar la misma. El almacenamiento es direccionado por
+> contenido: la clave de un chunk **es** el digest de su texto plano, así que «mismo rango,
+> hash distinto» son dos claves distintas y no hay colisión que detectar. La divergencia se
+> volvió imposible en vez de detectable, que es más fuerte, y la verificación que sí corre
+> es la de la lectura: un chunk cuyo contenido no hashea a su propia clave se rechaza.
+> El fallo duro que queda es el del manifiesto, y es el CAS (§12).
+
 ---
 
 ## 19. Snapshot sin pausa (rediseñado)
@@ -1323,7 +1412,23 @@ Orden de placement:
 3. cualquier host con capacidad
 ```
 
-Same-host: sin descarga; reutiliza EROFS, checkpoint y WAL cacheado; nuevo active child + efímero.
+Same-host: nuevo active child + efímero.
+
+> **Lo de «sin descarga» no es cierto y el código es el coherente; es lo más caro que
+> quedó abierto de la auditoría.** `placement` sí prefiere el host de origen, pero al
+> atachar, `agent.parentChain` + `image.Load` bajan del object store **todos** los chunks
+> de la ancestría, en el host que tomó el snapshot exactamente igual que en cualquier
+> otro. No hay caché local de datos que reutilizar (§5.4): el WAL de la sesión anterior se
+> publicó y se desenlazó al parar, y no hay nada más en disco.
+>
+> O sea que hoy la preferencia de placement **no compra nada medible**, y tres lugares de
+> este documento la contaban como comprada: la fila de SLO de §2, el objetivo 6 de §3 y el
+> criterio 6 de §31. Se corrigen los tres. Lo que la haría real es una caché de chunks por
+> host indexada por digest —que el direccionamiento por contenido hace casi trivial: la
+> clave ya es el digest, así que un chunk que ya está en disco es un `GET` que no hace
+> falta— y no está construida. Es el incremento que le devuelve el sentido a §20, y hasta
+> que exista, «boot rápido same-host» es una intención del diseño, no una propiedad del
+> sistema.
 
 Cross-host: descarga checkpoint + WAL posteriores; materializa completo; arranca. (Standby tibio y, después, lazy loading acortan esto; §22.3–22.4.)
 
@@ -1488,7 +1593,9 @@ Inflight shmfd: al reiniciar, el Agent recupera y completa/reintenta las request
 > **No existe el subsistema, y la razón por la que no duele es §14.8.** Esta sección
 > presupone que el object store está en el camino de cada FLUSH: por eso pide hedged GETs,
 > presupuesto global de retries, circuit breaker y límites de ancho de banda por clase. En
-> V1 el store se toca dos veces por sesión —al atachar, para leer el manifiesto, y al parar,
+> V1 el store se toca en dos *momentos* por sesión (que no es lo mismo que dos requests:
+> atachar es un HEAD/GET del manifiesto más un GET por chunk de la ancestría, y parar es un
+> PUT por chunk nuevo más el CAS) —al atachar, para leer el manifiesto, y al parar,
 > para publicarlo— así que no hay latencia de cola del data path que recortar. El cliente
 > real es un archivo detrás de `objectstore.Store` (`internal/simio/real/s3.go`, ADR-0010),
 > sin hedging, sin circuit breaker y sin clases; el único mecanismo de reintento que existe
@@ -1679,8 +1786,25 @@ segunda cosa pidiendo el lock del volumen en el data path.
 Sin esta política, el primer cambio de formato con el fleet a medias actualizado produce un volumen ilegible.
 
 1. **Read-old ilimitado**: un Agent vN+1 lee todo formato de su misma major (WAL, segmentos, checkpoints, manifests, descriptors).
+
+   > **Hoy el código hace lo contrario, y es lo correcto para V1.** Los decodificadores
+   > aceptan exactamente la versión actual y rechazan cualquier otra con `ErrBadVersion`, y
+   > `cmd/volume-agent` declara `maxFormatVersion = 1`: hay **una** versión de formato, así
+   > que «leer formatos viejos» no tiene objeto y aceptar una versión que este binario no
+   > entiende sería aceptar bytes que no puede interpretar. Eso es lo que dice CLAUDE.md
+   > sobre los formatos antes del primer despliegue: cambian en su lugar, sin v2 al lado de
+   > v1. Esta regla —y con ella INV-19— **empieza a atar el día que existan dos versiones**,
+   > que es exactamente cuando la compatibilidad empieza a costar algo real. Lo que hay que
+   > recordar es que la lectura estricta es una decisión con fecha de vencimiento, no una
+   > propiedad del diseño: el primer bump de formato tiene que traer el lado read-old con
+   > él, o el fleet a medias actualizado produce el volumen ilegible que esta sección
+   > existe para evitar.
 2. **Write-new gated**: los formatos nuevos se activan por feature flag **después** de que todo el fleet puede leerlos (dos fases: desplegar lectores → habilitar escritores).
 3. El CP registra `max_format_version` por host (tabla `hosts`) y **rechaza** operaciones incompatibles (ej. recuperar en un host viejo un volumen escrito con formato nuevo; placement de clones sobre hosts que no leen el formato del snapshot).
+
+   > **La columna se registra de punta a punta; el rechazo no existe.** `placement` no lee
+   > el campo, y con una sola versión de formato no tendría con qué comparar. Es la misma
+   > fecha de vencimiento del punto 1.
 4. Misma disciplina para el API gRPC del CP (compatibilidad hacia atrás dentro de la major; deprecaciones anunciadas).
 5. Los headers ya llevan `Version` + magic distintos por tipo; los campos `Reserved` existen para extensiones sin bump de versión.
 
@@ -1782,6 +1906,11 @@ Actualizado: se eliminan las resueltas por diseño en v5 y se agregan las nuevas
 
 **Mitigación**: standby tibio para volúmenes que importan (RTO en minutos); RTO frío publicado por GiB; lazy loading diseñado y compatible con el formato actual, se implementa post-MVP.
 
+> **Ninguna de las tres existe, y la que el banner de arriba ofrecía en su lugar —arrancar
+> el clon en el host de origen— tampoco mitiga nada todavía (§20).** La debilidad está sin
+> mitigar: un clon paga la descarga completa de su ancestría, en cualquier host. Tampoco
+> hay nada que mida el RTO frío, así que no se puede publicar (criterio 7 de §31).
+
 ### 5. Dependencia de semántica S3-compatible (ahora mayor: CAS, versioning, Object Lock)
 
 **Mitigación**: suite de conformidad bloqueante por versión de backend (§6.1); degradación especificada si falta CAS (lease-only sigue siendo seguro); requisito de durabilidad mínima on-prem (§6.1) elimina el caso single-node.
@@ -1858,7 +1987,8 @@ Reordenado: DST e interfaces simulables van primero (estructurales); la reconexi
 3. Un FLUSH ACKeado sobrevive a la caída del proceso, del Agent y de QEMU; el volumen entero llega al object store al parar y un arranque posterior lo lee de vuelta. **La pérdida del host pierde la sesión** (RPO de una sesión, §2, ADR-0026). Demostrado por el harness DST con checkers de invariantes y por el lane de guest real.
 4. Ningún ACK de durabilidad emitido con lease vencido (invariante DST).
 5. Snapshot portable, crash-consistent, con `snapshot_pause_duration ≈ 0`.
-6. Clone same-host sin transferencia significativa.
+6. Clone same-host sin transferencia significativa. — **no se cumple:** crear el clon no
+   transfiere nada, servirlo baja la ancestría entera (§20).
 7. Clone cross-host desde S3; RTO frío medido y publicado; RTO con standby tibio en minutos.
 8. Stale writer incapaz de confirmar durabilidad tras `lease_ttl` (verificado con partición + acceso a S3 intacto).
 9. PUT idempotente (incluyendo respuesta perdida).
