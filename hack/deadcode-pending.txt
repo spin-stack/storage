@@ -42,15 +42,6 @@
 # simulated counterpart. This is the CloneCrossHost shape — well-tested code doing real
 # work that nothing asks for — and the decision (delete it, or give the contract test a
 # home that does not ship a transport) is track E's, which owns internal/simio/real.
-internal/simio/real.NewNetwork          # track E: the constructor no binary calls
-internal/simio/real.Network.Listen      # track E: same
-internal/simio/real.Network.Dial        # track E: same
-internal/simio/real.realListener.Accept # track E: reachable only through Listen
-internal/simio/real.realListener.Addr   # track E: same
-internal/simio/real.realListener.Close  # track E: same
-internal/simio/real.realConn.Send       # track E: reachable only through Dial/Accept
-internal/simio/real.realConn.Recv       # track E: same
-internal/simio/real.realConn.Close      # track E: same
 
 # --- the lease verb nothing performs -----------------------------------------------------
 # Revoke drops the lease and bumps the generation so an in-flight grant response cannot
@@ -59,4 +50,10 @@ internal/simio/real.realConn.Close      # track E: same
 # because it is not a test affordance — it is a production verb waiting for the one caller
 # V1 still lacks. `internal/lease` belongs to no track in PARALLEL-PLAN.md's table; the
 # decision travels with detach.
-internal/lease.Manager.Revoke  # detach (track D's -detach-volume) is the caller this is waiting for; if detach lands without calling it, delete it
+internal/lease.Manager.Revoke  # NOT a simple deletion, examined 2026-08-09: -detach-volume
+# shipped without calling it, so by the old note it should go. But Revoke is the only thing
+# that can bump `gen`, and `gen` is what makes GrantAt/RenewAt refuse a request that was in
+# flight when a fence was accepted (INV-06, §12.2) — four test cases assert exactly that.
+# Deleting Revoke alone leaves a guard that cannot fire; deleting the mechanism deletes a
+# fencing assertion. Either the Agent calls it on detach, or the whole generation parameter
+# goes with its tests. That is an owner's call, not a cleanup's.

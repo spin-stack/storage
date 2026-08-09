@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/simio/network"
-	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
@@ -21,8 +20,7 @@ func networks() map[string]struct {
 		net  network.Network
 		addr string
 	}{
-		"real": {net: real.NewNetwork(), addr: "127.0.0.1:0"},
-		"sim":  {net: sim.NewNetwork(), addr: "cp:9000"},
+		"sim": {net: sim.NewNetwork(), addr: "cp:9000"},
 	}
 }
 

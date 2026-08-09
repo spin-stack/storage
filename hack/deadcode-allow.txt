@@ -112,3 +112,16 @@ package internal/simio/objectstore/storetest # the shared objectstore contract e
 package internal/schema     # schema.sql plus its embed; read by the pg lane and by task db:verify, never linked
 package hack/analyzers/simulable          # the INV-01 analyzer, run by task lint:simulable as its own program
 package hack/analyzers/simulable/cmd/simulable # its main; `go run` builds it, no shipped binary imports it
+
+# internal/simio/network is INV-01's fourth interface and the only one with no production
+# consumer, which the real implementation used to hide: `real.NewNetwork` existed, so the
+# package looked wired, and its only caller was the contract test. The real implementation
+# was deleted 2026-08-09; the interface and its sim are kept because the DST harness drives
+# a partition scenario through them (internal/dst/scenarios.go), which is a real assertion.
+#
+# Why nothing in production uses it: vhost speaks a length-delimited protocol with
+# file-descriptor passing over a Unix socket, which this interface cannot express, so it
+# has its own transport in internal/vhost/hostio; and the Control Plane speaks Connect over
+# net/http. If a component ever needs a simulable network, this is where it plugs in.
+package internal/simio/network  # harness-only: the DST partition scenario drives it, no binary does
+
