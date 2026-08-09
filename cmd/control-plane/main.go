@@ -60,8 +60,17 @@ func run() error {
 	var (
 		listen      = flag.String("listen", ":8080", "address to serve the Connect API on")
 		databaseDSN = flag.String("database-url", os.Getenv("DATABASE_URL"),
-			"PostgreSQL connection string (default $DATABASE_URL)")
-		holderID = flag.String("holder-id", "", "identity of this Control Plane process (required)")
+			"PostgreSQL connection string (required; defaults to $DATABASE_URL)")
+		// No default, and that is the answer rather than an omission. This value is what
+		// the leadership row records as its holder, so two processes sharing one identity
+		// each read a leader row bearing their own name and each conclude they are still
+		// leading — the split-brain the Elector exists to make impossible, reintroduced by
+		// a convenience. Any default that could be computed here (a hostname, a constant)
+		// is exactly the kind two processes collide on. Saying "required" in the help is
+		// the whole fix: it costs one word and it makes -h the place an operator finds
+		// out, instead of a process that starts and dies.
+		holderID = flag.String("holder-id", "",
+			"identity of this Control Plane process, distinct per process (required, except with -fleet-status)")
 		leaseTTL = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL granted on heartbeat")
 
 		// The Elector needs an object store to witness the term (ADR-0011). Either
@@ -77,7 +86,12 @@ func run() error {
 		seedHost   = flag.String("seed-host", "", "with -seed-volume: the host that will serve it (a UUIDv7)")
 		seedSize   = flag.Int64("seed-size", 1<<30, "with -seed-volume: capacity in bytes (a whole number of 512-byte sectors)")
 		seedBlock  = flag.Int("seed-block-size", 4096, "with -seed-volume: logical block size")
-		kekFile    = flag.String("kek-file", "", "file holding the 32-byte key-encryption key (required for -seed-volume)")
+		// The list is three commands long, not one, and each of the other two found out
+		// the same way an operator does: a flatten opens every chunk the volume reads and
+		// re-seals it, and a delete flattens whatever descends from the volume first, so
+		// both need the key the volume's DEK is wrapped under.
+		kekFile = flag.String("kek-file", "",
+			"file holding the 32-byte key-encryption key (required for -seed-volume and -flatten-volume, and for -delete-volume when something descends from the volume)")
 
 		// snapshot-volume: record a snapshot request and exit, the same shape as
 		// -seed-volume and for the same reason. The snapshot itself is taken by the

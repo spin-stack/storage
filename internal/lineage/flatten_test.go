@@ -68,7 +68,7 @@ func TestAFlattenedVolumeReadsWhatItReadBefore(t *testing.T) {
 	before, _ := readThroughTheChain(t, store, enc, vol)
 	assertReads(t, before, want, "before the flatten")
 
-	res, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id)
+	res, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id, 7)
 	if err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestAFlattenedImageReadsTheSameWhenItIsStillLayered(t *testing.T) {
 		offShared: 0xC3, offOwn: 0xC3, offOwnErased: 0x00,
 	}
 
-	if _, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id); err != nil {
+	if _, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id, 7); err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
 
@@ -179,8 +179,22 @@ func TestAFlattenIsRefusedRatherThanGuessedAt(t *testing.T) {
 		// breaks puts the bucket into the state under test and returns nothing; the volume
 		// it acts on is the one buildLineage produced.
 		breaks func(t *testing.T, store objectstore.Store, vol builtVolume, enc *wal.Encryption)
-		want   error
+		// published is what the catalog says the volume reached, which is the fact the
+		// bucket cannot supply. buildLineage publishes its image at sequence 7.
+		published int64
+		want      error
 	}{
+		{
+			name: "the volume's own image is gone and the catalog says it published one",
+			breaks: func(t *testing.T, store objectstore.Store, vol builtVolume, enc *wal.Encryption) {
+				t.Helper()
+				if err := store.Delete(t.Context(), image.ManifestKey(vol.u)); err != nil {
+					t.Fatalf("deleting the volume's own manifest: %v", err)
+				}
+			},
+			published: 7,
+			want:      lineage.ErrImageMissing,
+		},
 		{
 			name: "the volume has published a snapshot of its own, which is an immutable delta",
 			breaks: func(t *testing.T, store objectstore.Store, vol builtVolume, enc *wal.Encryption) {
@@ -191,7 +205,8 @@ func TestAFlattenIsRefusedRatherThanGuessedAt(t *testing.T) {
 					t.Fatalf("publishing a snapshot of the volume: %v", err)
 				}
 			},
-			want: lineage.ErrHasSnapshots,
+			published: 7,
+			want:      lineage.ErrHasSnapshots,
 		},
 		{
 			name: "a previous flatten left objects under the volume's own lineage",
@@ -202,7 +217,8 @@ func TestAFlattenIsRefusedRatherThanGuessedAt(t *testing.T) {
 					t.Fatalf("planting a chunk under the volume's own lineage: %v", err)
 				}
 			},
-			want: lineage.ErrAlreadyStarted,
+			published: 7,
+			want:      lineage.ErrAlreadyStarted,
 		},
 		{
 			name: "the volume descends from nothing",
@@ -217,7 +233,8 @@ func TestAFlattenIsRefusedRatherThanGuessedAt(t *testing.T) {
 					t.Fatalf("rewriting the descriptor: %v", err)
 				}
 			},
-			want: lineage.ErrSelfContained,
+			published: 7,
+			want:      lineage.ErrSelfContained,
 		},
 	}
 
@@ -231,7 +248,7 @@ func TestAFlattenIsRefusedRatherThanGuessedAt(t *testing.T) {
 			tc.breaks(t, store, vol, enc)
 			between := listAll(t, store)
 
-			_, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id)
+			_, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id, tc.published)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("Flatten returned %v, want %v", err, tc.want)
 			}
@@ -242,6 +259,55 @@ func TestAFlattenIsRefusedRatherThanGuessedAt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestACloneThatNeverPublishedIsFlattenedIntoItsAncestry is the other half of the case
+// above, and the two are worth reading together: **the bucket is in exactly the same state
+// in both, and only the catalog number differs.**
+//
+// "There is no manifest for this volume" is one answer from the object store to two
+// questions. For a clone that has never stopped cleanly it means the volume owns no layer
+// yet and its whole content is the ancestry — the useful case, since a clone that was made
+// and never booted is precisely the one an operator flattens to unblock a delete of its
+// parent. For a clone whose image was deleted it means the volume's own writes are missing,
+// and flattening on that reading writes the ancestry down as the volume's whole content and
+// publishes it: every byte the clone ever wrote, dropped, with the descriptor rewritten so
+// nothing will ever look for the old layer again.
+//
+// So the assertion here is bytes, not an error: the flatten succeeds and the flattened image
+// answers with the ancestry's values at every offset — including offOwn, which is 0x00
+// because the layer that held 0xC3 genuinely does not exist for a volume that never
+// published.
+func TestACloneThatNeverPublishedIsFlattenedIntoItsAncestry(t *testing.T) {
+	store := sim.NewObjectStore()
+	dek := newDEK(t)
+	vol, enc := buildLineage(t, store, dek)
+
+	// The same object the refusal case removes: the volume's own layer leaves the bucket.
+	if err := store.Delete(t.Context(), image.ManifestKey(vol.u)); err != nil {
+		t.Fatalf("deleting the volume's own manifest: %v", err)
+	}
+
+	res, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id, 0)
+	if err != nil {
+		t.Fatalf("flattening a clone the catalog says never published: %v", err)
+	}
+	if res.Ancestors != 2 {
+		t.Errorf("the flatten left %d ancestors behind, want the 2 the chain had", res.Ancestors)
+	}
+
+	alone, _, _, err := image.Load(t.Context(), store, enc, image.OwnLineage(vol.u), nil)
+	if err != nil {
+		t.Fatalf("loading the flattened image on its own: %v", err)
+	}
+	assertReads(t, alone, map[int64]byte{
+		offRootOnly:   0xA1,
+		offMiddleOnly: 0xB2,
+		offErased:     0x00,
+		offShared:     0xA1, // the volume's own overwrite is the layer it never published
+		offOwn:        0x00,
+		offOwnErased:  0xA1, // likewise its own erasure
+	}, "a clone that never published, flattened into its ancestry")
 }
 
 // builtVolume is the volume under test and everything a caller needs to read it the way its

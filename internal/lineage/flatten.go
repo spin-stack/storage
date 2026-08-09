@@ -28,6 +28,11 @@ var ErrHasSnapshots = errors.New("lineage: this volume has published snapshots, 
 // lineage. See Flatten's note on the one window that is not re-runnable.
 var ErrAlreadyStarted = errors.New("lineage: a previous flatten of this volume left chunks under its own lineage")
 
+// ErrImageMissing means the volume's own image is not in the object store although the
+// catalog says it published one. See Flatten's note on the two questions that get the same
+// answer.
+var ErrImageMissing = errors.New("lineage: the catalog says this volume has published an image and the object store holds none")
+
 // Result is what a flatten did, for the operator watching it.
 type Result struct {
 	// Ancestors is how many links the volume no longer reads through.
@@ -118,6 +123,21 @@ type Result struct {
 // clearing the descriptor first destroys the only record of what the volume descends from,
 // so a flatten that then failed could never be resumed at all, by anyone.
 //
+// # publishedSequence is a parameter, and it is a parameter on purpose
+//
+// It is the catalog's count of what this volume has published, and this package has no way
+// to learn it: `lineage` reads the bucket, and the bucket cannot tell "this clone never
+// owned a layer" from "this clone's layer was deleted". The Control Plane holds the catalog
+// and is the only caller that can answer.
+//
+// Rejected: leaving the check in cmd/control-plane, which already has the row in hand. It
+// would have to ask whether the manifest exists to know whether the check even applies —
+// the same rule stated twice, in two packages, with a window between the caller's HEAD and
+// this function's GET — and it is a check a second caller forgets by writing nothing. A
+// parameter cannot be forgotten: every call site has to produce the number, and the two
+// that existed when this was added were each made to say where theirs comes from. That is
+// worth one breaking signature for an operation whose failure mode is silent data loss.
+//
 // # Why a volume with published snapshots is refused
 //
 // A snapshot is immutable (§5.2, INV-16) and every snapshot this volume published while it
@@ -127,7 +147,7 @@ type Result struct {
 // snapshot — rewriting it is exactly what create-only forbids — so the refusal is a
 // statement of fact and not caution: the way to make such a volume flattenable is to delete
 // those snapshots.
-func Flatten(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID string) (Result, error) {
+func Flatten(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *wal.Encryption, volumeID string, publishedSequence int64) (Result, error) {
 	u, err := ids.Parse(volumeID)
 	if err != nil {
 		return Result{}, fmt.Errorf("lineage: volume %q is not a uuid: %w", volumeID, err)
@@ -191,6 +211,31 @@ func Flatten(ctx context.Context, store objectstore.Store, rnd io.Reader, enc *w
 		// is the useful case rather than an edge one: it is a volume that has read through
 		// its parent since the moment it was created. Its view is the ancestry outright,
 		// and its publish is create-only.
+		//
+		// **Only when the catalog agrees it never published**, which is why this function
+		// takes a number it cannot look up. "There is no manifest for this volume" is the
+		// object store's one answer to two questions, and until publishedSequence reached
+		// here the answer was read as the first of them unconditionally: a stray delete, a
+		// lifecycle expiry or a restore that missed one key produced a flatten that wrote
+		// the *ancestry* down as the volume's whole content, published it over the missing
+		// manifest (create-only, so it succeeds), and rewrote the descriptor so nothing
+		// would ever look for the old layer again. Every byte the clone wrote, gone, with
+		// no error anywhere and an operator running a documented command. It is the same
+		// hole the attach path closed with agent.ErrImageMissing, on the one path that was
+		// not the attach path.
+		//
+		// `> 0` rather than a comparison with the manifest's sequence, because there is no
+		// manifest to compare with: what is being told apart is absence from never-existed,
+		// and the catalog's count of what the volume published is the only fact that does
+		// it.
+		//
+		// Refusing costs a flatten that will not run, which an operator can see and repair
+		// by restoring the object — and a repair is possible precisely because nothing has
+		// been overwritten yet. Carrying on costs the data.
+		if publishedSequence > 0 {
+			return Result{}, fmt.Errorf("%w: volume %s published up to sequence %d and %s does not exist, so a flatten now would write down its ancestry alone and drop everything the volume wrote; restore that object before flattening",
+				ErrImageMissing, volumeID, publishedSequence, image.ManifestKey(vol))
+		}
 		view, man, etag = ancestry, image.Manifest{}, ""
 	case err != nil:
 		return Result{}, fmt.Errorf("lineage: volume %s: loading its own image: %w", volumeID, err)

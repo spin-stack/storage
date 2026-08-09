@@ -76,7 +76,11 @@ func flatten(ctx context.Context, md metadata.Store, store objectstore.Store, ke
 		return err
 	}
 
-	res, err := lineage.Flatten(ctx, store, rand.Reader, enc, volumeID)
+	// vol.PublishedSequence is the fact the bucket cannot supply, and this is the only
+	// place that holds it: an image missing from a volume the catalog says has published
+	// one is a deleted layer, not a clone that has never stopped, and lineage.Flatten
+	// refuses rather than writing the ancestry down as the whole of the volume.
+	res, err := lineage.Flatten(ctx, store, rand.Reader, enc, volumeID, vol.PublishedSequence)
 	switch {
 	case errors.Is(err, lineage.ErrSelfContained):
 		// Idempotent on the happy path, which is what an operator re-running a command they

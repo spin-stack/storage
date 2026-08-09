@@ -159,7 +159,7 @@ func TestAFlattenedCloneOutlivesItsWholeAncestry(t *testing.T) {
 	if _, err := lineage.Delete(t.Context(), store, mid.Volume); !errors.Is(err, lineage.ErrHasDescendants) {
 		t.Fatalf("deleting the clone's parent before the flatten: %v, want ErrHasDescendants", err)
 	}
-	if _, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id); err != nil {
+	if _, err := lineage.Flatten(t.Context(), store, rand.Reader, enc, vol.id, 7); err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
 

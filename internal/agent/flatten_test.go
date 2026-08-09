@@ -78,7 +78,11 @@ func TestAFlattenedCloneIsServedFromItsOwnImage(t *testing.T) {
 	// The operator's one-shot. It runs against the bucket with no Agent involved, which is
 	// the shape the decision settled on: the volume must be detached for its manifest to be
 	// safe to replace, and a detached volume is in no host's desired state.
-	res, err := lineage.Flatten(t.Context(), store, rand.Reader, cloneEncryption(t, dek, c.GetVolumeId()), c.GetVolumeId())
+	// The last argument is what the catalog says this clone has published, which the
+	// bucket cannot answer for itself. This clone stopped cleanly a moment ago, so the
+	// catalog would hold a positive number; the value only decides what a *missing*
+	// manifest means, and this one's manifest is there.
+	res, err := lineage.Flatten(t.Context(), store, rand.Reader, cloneEncryption(t, dek, c.GetVolumeId()), c.GetVolumeId(), 1)
 	if err != nil {
 		t.Fatalf("Flatten: %v", err)
 	}
