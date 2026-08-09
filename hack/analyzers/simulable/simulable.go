@@ -159,6 +159,19 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
+		// A *method* is not the package-level function of the same name, and the
+		// distinction is load-bearing for exactly one pair: `time.After(d)` reads the
+		// clock and hands back a channel, which is the thing INV-01 exists to keep out
+		// of production code, while `(time.Time).After(u)` compares two instants that
+		// were already obtained — pure arithmetic on values a simio clock produced.
+		// Flagging the method made every timestamp comparison a violation, which pushes
+		// a caller toward `!t.Before(u) && t != u` to satisfy a linter: worse code, same
+		// semantics, no simulability gained. Caught when a fleet-status change compared
+		// two heartbeats (2026-08-09).
+		if sig, ok := fn.Type().(*types.Signature); ok && sig.Recv() != nil {
+			return
+		}
+
 		names, ok := forbidden[fn.Pkg().Path()]
 		if !ok || !names[fn.Name()] {
 			return
