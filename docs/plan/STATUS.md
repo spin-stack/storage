@@ -17,31 +17,30 @@ DISCARD. An Agent that cannot publish holds rather than exits.
 
 ## Do this next
 
-From a readiness run that broke the system seven ways against real binaries and real Linux
-guests: 82 findings, 79 reproduced. **Six of the nine blockers closed 2026-08-09** — the
-cross-process CAS, the KEK-less Agent, the epoch per placement, the partitioned Agent, the
-silent torn tail, and the dead-things-look-alive family. `git log` has each. Three remain.
+A readiness run broke the system seven ways against real binaries and real Linux guests: 82
+findings, 79 reproduced. **All nine blockers to a pilot are closed** (2026-08-09, three
+waves — `git log`). What is below is what those fixes left behind, not what they were.
 
-1. **The catalog knows a volume's data is not where the Agent is looking, and nobody
-   compares.** Two shapes of the same hole, both reproduced. `-detach`/`-attach` after an
-   unclean kill is accepted with no warning and the guest reads **zeros** where fsync
-   returned success, because the new host's read view came from a manifest that predates
-   the lost session. Delete `image/<vol>/manifest.json` while the catalog says
-   `published_sequence=8` and the volume serves as a blank 256 MiB device, then the next
-   publish makes that permanent. In both cases the number that would catch it is already in
-   Postgres. **Fix:** carry `published_sequence` in the desired state and refuse to serve
-   when the read view is older than the catalog says, instead of booting empty.
-2. **Losing the local WAL silently rolls a volume back to its last publish**, and the
-   catalog's `GREATEST` hides it — `local_sequence` keeps the old high-water mark for ever.
-   `wal.ResumeReport` now carries what replay actually recovered (wave 1); nothing compares
-   it to `durable_sequence`. **Fix:** report the resumed sequence on the heartbeat and
-   refuse or alarm when it is below what the catalog last acknowledged.
-3. **Agent memory is unbounded and unmeasured from outside.** Measured on one volume:
-   RSS 464 MB at 53k distinct 4 KiB writes, **1.55 GiB at 195k** — about 2.18x the guest's
-   working set, with the OOM killer as the only limit. `read_view_bytes` exists and is now
-   scrapeable, so the number is visible; nothing bounds it. **Fix:** decide what a volume
-   does when its read view crosses a bound — backpressure is the honest answer and it is
-   the mechanism that already exists.
+1. **`published_sequence` reaches the catalog one session late.** The log learns it at
+   `InstallBase`, and a volume leaves the served set right after publishing, so the
+   image-missing floor only arms from the session *after* a publish. The `durable_sequence`
+   floor covers the gap wherever the loss is real, which is why this is a residual and not a
+   blocker. Closing it means the Agent reporting the sequence it just published.
+2. **A refused volume is invisible in the fleet.** Both new floors log one ERROR at attach
+   and then nothing; `-fleet-status` shows the volume as normal. It needs a field on
+   `VolumeReport` and a column.
+3. **`internal/lineage/flatten.go` still reads `ErrNotPublished` as "never published".** An
+   operator flattening a clone whose own image vanished would write down the ancestry and
+   drop the clone's own layer — the same ambiguity the attach path just closed, on the one
+   path that was not on the attach path.
+4. **The read view's bound is a constant, not a derivation.** `MaxViewBytes` defaults to
+   256 MiB. The device bound is one volume's share of a device the Agent measured with
+   `statfs`; the honest counterpart is one volume's share of measured RAM, and that lives in
+   `internal/agent`.
+5. **Bring-up has three sharp edges**, all hit walking it by hand: `-holder-id` is required
+   and documented only in the error; a `-vhost-socket-dir` over ~107 bytes fails as an
+   opaque `bind: invalid argument` retried for ever (`sun_path` is 108); and applying
+   `schema.sql` to a fresh database needs a `psql` nothing in the repo provides.
 
 ## Thin paths that shipped without being deepened
 
