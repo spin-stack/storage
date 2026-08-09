@@ -243,6 +243,23 @@ func (s *Store) AcquireLeadership(ctx context.Context, holderID string) (int64, 
 	return s.q.AcquireLeadership(ctx, holderID)
 }
 
+// RenewLeadership stamps renewed_at under the caller's own term and holder id, moving
+// neither (metadata.Store carries why it is not AcquireLeadership on a timer).
+//
+// holder_id is TEXT, not a uuid, so the empty check is here rather than in requireUUID:
+// an empty holder would otherwise match no row and be reported as a lost term, which is
+// a process exiting because of an unset flag.
+func (s *Store) RenewLeadership(ctx context.Context, term int64, holderID string) error {
+	if holderID == "" {
+		return fmt.Errorf("%w: empty holder id", metadata.ErrInvalidID)
+	}
+	rows, err := s.q.RenewLeadership(ctx, db.RenewLeadershipParams{Term: term, HolderID: holderID})
+	// staleIfZero: the predicate is the term and the holder, and there is no third way
+	// to affect no rows — the singleton row either exists and agrees, or this process is
+	// not the leader any more.
+	return s.staleIfZero(ctx, term, rows, err)
+}
+
 // Now is PostgreSQL's clock: the one that stamps last_renewal, and so the one every
 // fencing deadline has to be measured against (§12.1).
 func (s *Store) Now(ctx context.Context) (time.Time, error) {

@@ -332,7 +332,7 @@ func run() error {
 			// against: whichever host it picks has to be one the fleet would have picked
 			// itself, or the two paths that add bytes to a device disagree about what a
 			// full device is.
-			host, aerr := controlplane.Place(ctx, md,
+			placed, aerr := controlplane.Place(ctx, md,
 				placement.Policy{MaxOversubscription: *oversubscribe, MaxUsedRatio: *maxUsedRatio},
 				leader.Term, *attachVolume, *attachHost)
 			if aerr != nil {
@@ -342,8 +342,14 @@ func run() error {
 			// check (controlplane.Place says why): an operator who has just placed a
 			// volume onto a CORDONED or DRAINING host must be able to see that in the
 			// line that says it worked.
+			//
+			// epoch, because it is the WAL directory the host will open
+			// (<data-dir>/wal/<volume-id>/<epoch>) and the proof that this attach is not
+			// resuming a session from before the volume was somewhere else. An operator
+			// comparing it with the Agent's "serving volume" line can see the two agree.
 			slog.Info("volume placed", "volume_id", *attachVolume,
-				"host_id", host.HostID, "host_state", host.State, "chosen_by", chooser(*attachHost))
+				"host_id", placed.Host.HostID, "host_state", placed.Host.State,
+				"epoch", placed.Epoch, "chosen_by", chooser(*attachHost))
 			return nil
 		}
 		if err := md.SetVolumePrimaryHost(ctx, leader.Term, *detachVolume, ""); err != nil {
@@ -429,7 +435,8 @@ func run() error {
 	// AcquireLeadership increments unconditionally and a process that re-elected
 	// itself every few seconds would leave every admin one-shot in this file — each of
 	// which reads GetLeader and then writes under that term — failing at random.
-	// Losing the term ends the process instead; watchTerm below is what notices.
+	// Losing the term ends the process instead; renewLeadership below is what notices,
+	// on the same write that keeps this process's liveness stamp fresh.
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           cpserver.Handler(cpserver.New(md, func() int64 { return term }, *leaseTTL, band)),
@@ -452,9 +459,11 @@ func run() error {
 	// mutation with ErrStaleTerm for ever — which an Agent cannot tell from a Control
 	// Plane that is merely refusing this one write. The guard is what makes the socket
 	// go away, which is the signal an Agent (and a load balancer) already understands.
-	go func() { errCh <- watchTerm(ctx, md, real.NewClock(), term, *holderID, termCheckInterval(*leaseTTL)) }()
+	go func() {
+		errCh <- renewLeadership(ctx, md, real.NewClock(), term, *holderID, leaderRenewInterval(*leaseTTL))
+	}()
 	slog.Info("control-plane serving", "listen", *listen, "lease_ttl", *leaseTTL,
-		"term_check_interval", termCheckInterval(*leaseTTL))
+		"leader_renew_interval", leaderRenewInterval(*leaseTTL))
 
 	select {
 	case err := <-errCh:
@@ -481,59 +490,71 @@ func run() error {
 // so the exit is one identifiable thing in a log and not a string somebody greps.
 var errTermLost = errors.New("this Control Plane no longer holds its term")
 
-// termCheckInterval is how often a serving Control Plane checks that it is still the
-// leader. It is derived from -lease-ttl rather than being a flag of its own: the lease
-// is already this system's unit of "how long a fact about the fleet may be believed",
-// and a superseded process has to be gone inside one, so a third of it bounds the
-// zombie's remaining life at well under the window. The one-second floor is a busy-loop
-// guard — the check is a single indexed SELECT, but a sub-second lease is a typo, and
-// hammering the catalog is not the way to find out.
-func termCheckInterval(leaseTTL time.Duration) time.Duration {
+// leaderRenewInterval is how often a serving Control Plane renews its leadership. It is
+// derived from -lease-ttl rather than being a flag of its own: the lease is already this
+// system's unit of "how long a fact about the fleet may be believed", and it is what
+// -fleet-status compares the leader's stamp against. A third of it means a healthy
+// leader's renewed_at is never older than TTL/3 — three chances to renew before anything
+// reading the catalog is entitled to call this process gone — and it bounds a superseded
+// process's remaining life at a third of the same window. The one-second floor is a
+// busy-loop guard: the renewal is one indexed UPDATE, but a sub-second lease is a typo,
+// and hammering the catalog is not the way to find out.
+func leaderRenewInterval(leaseTTL time.Duration) time.Duration {
 	if d := leaseTTL / 3; d > time.Second {
 		return d
 	}
 	return time.Second
 }
 
-// watchTerm ends the process when another Control Plane has taken the term.
+// renewLeadership keeps this Control Plane's leadership fresh, and ends the process when
+// it turns out no longer to hold it.
 //
-// It reads, and deliberately does not write. The write that belongs here is a renewal
-// of control_plane_leader.renewed_at under this term — and metadata.Store has no such
-// method: AcquireLeadership is its only leadership write and it increments the term
-// unconditionally, which is a different act (see the srv comment above for what
-// re-electing every few seconds would do to the admin one-shots). What the read gives
-// is still the whole of §7's promise for this process: a Control Plane that has been
-// superseded stops serving, instead of listening for ever and answering every mutation
-// with a stale-term error that an Agent cannot tell from a transient refusal.
+// One term-guarded UPDATE does both jobs, which is why it is a write and not the read
+// this used to be. While it succeeds it is the only durable evidence that this process
+// is alive: control_plane_leader.renewed_at was stamped by the election and never touched
+// again, so a Control Plane dead for five minutes and one that started five minutes ago
+// printed the identical line in -fleet-status. When it fails with ErrStaleTerm it is §7's
+// "detects the condition and terminates itself" — the superseded process finds out on a
+// write it makes anyway, every few seconds, instead of on whichever Agent mutation
+// happens to arrive first.
 //
-// A catalog it cannot read is not a term it has lost: the check is retried and the
-// process keeps serving, because a Control Plane cut off from PostgreSQL already
-// writes nothing at all, and killing it on a connection blip would turn a database
-// hiccup into a fleet-wide outage. The failure is logged at every attempt so the
-// operator sees it.
+// It is a renewal and not a re-election: AcquireLeadership increments the term
+// unconditionally, and every admin one-shot in this file reads GetLeader and then writes
+// under that term (-flatten-volume and -delete-volume rewrite a whole image in between),
+// so a self-renewing leader would fail them at random.
+//
+// A catalog it cannot reach is not a term it has lost: those failures are logged and
+// retried, because a Control Plane cut off from PostgreSQL already writes nothing at all,
+// and killing it on a connection blip would turn a database hiccup into a fleet-wide
+// outage. Only ErrStaleTerm ends the process, because only ErrStaleTerm is the catalog
+// stating that somebody else is the leader.
 //
 // Returns nil when ctx ends — that is a normal shutdown, not a lost term.
-func watchTerm(ctx context.Context, md metadata.Store, clk clock.Clock, term int64, holderID string, every time.Duration) error {
+func renewLeadership(ctx context.Context, md metadata.Store, clk clock.Clock, term int64, holderID string, every time.Duration) error {
 	for {
 		if err := clk.Sleep(ctx, every); err != nil {
 			return nil
 		}
-		leader, err := md.GetLeader(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			slog.Warn("could not check whether this Control Plane still leads; continuing to serve",
+		err := md.RenewLeadership(ctx, term, holderID)
+		switch {
+		case err == nil:
+			continue
+		case ctx.Err() != nil:
+			return nil
+		case !errors.Is(err, metadata.ErrStaleTerm):
+			slog.Warn("could not renew this Control Plane's leadership; continuing to serve",
 				"holder_id", holderID, "term", term, "error", err)
 			continue
 		}
-		if leader.Term == term && leader.HolderID == holderID {
-			continue
+		// Superseded. The leader row is read once more, best effort, purely to name the
+		// successor: the exit is already decided, and an operator needs to know they are
+		// looking at a deliberate takeover rather than a crash.
+		leader, gerr := md.GetLeader(ctx)
+		if gerr != nil {
+			slog.Error("superseded by another Control Plane; exiting so a stale process stops serving",
+				"holder_id", holderID, "term", term, "leader_read_error", gerr)
+			return fmt.Errorf("%w: this process holds term %d", errTermLost, term)
 		}
-		// Logged here as well as returned, because the two say different things: the
-		// returned error ends the process, and this line is the account of *who* took
-		// over, which is what an operator needs to know they are looking at a
-		// deliberate takeover rather than a crash.
 		slog.Error("superseded by another Control Plane; exiting so a stale process stops serving",
 			"holder_id", holderID, "term", term,
 			"leader_holder_id", leader.HolderID, "leader_term", leader.Term)

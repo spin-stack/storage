@@ -73,6 +73,26 @@ func (s *Store) AcquireLeadership(_ context.Context, holderID string) (int64, er
 	return s.leaderTerm, nil
 }
 
+// RenewLeadership refreshes the leader's stamp under its own term and holder, moving
+// neither. metadata.Store carries why that is a different act from AcquireLeadership;
+// what this implementation adds is that the holder is compared as well as the term, so
+// the sim answers a superseded holder exactly as the SQL predicate does.
+func (s *Store) RenewLeadership(_ context.Context, term int64, holderID string) error {
+	if err := requireID("holder", holderID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	if holderID != s.leaderHolder {
+		return metadata.ErrStaleTerm
+	}
+	s.leaderAt = s.now()
+	return nil
+}
+
 // Now is the store's own clock — the one that stamps every timestamp below, and so
 // the one a fencing deadline must be measured against (§12.1).
 func (s *Store) Now(_ context.Context) (time.Time, error) {

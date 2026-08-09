@@ -88,6 +88,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"AVolumeIsRemovedOnlyWhenNothingDescendsFromIt", volumeDelete},
 		{"EmptyIdentifiersAreRejected", emptyIDs},
 		{"HostLeasesRenewAndADeadHostCannotRenew", hostLeases},
+		{"LeadershipRenewsWithoutMovingTheTerm", leadershipRenewal},
 		{"CapacityIsDerivedAndTheBoundIsAPredicateOfTheWrite", capacity},
 		{"TheStoreExposesTheClockThatStampsItsRows", authorityClock},
 	}
@@ -212,6 +213,12 @@ type mutation struct {
 // a line here is a method whose term guard nobody checks.
 func everyMutation() []mutation {
 	return []mutation{
+		// The leadership renewal is a mutation like any other and is guarded like one:
+		// the process that lost the election learns it here, on the write it makes every
+		// few seconds, rather than on the first Agent mutation that happens to arrive.
+		{"RenewLeadership", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.RenewLeadership(ctx, term, "cp-a")
+		}},
 		{"UpsertHost", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.UpsertHost(ctx, term, metadata.Host{HostID: w.host, State: lifecycle.HostActive})
 		}},
@@ -1247,6 +1254,87 @@ func volumePlacement(t *testing.T, s metadata.Store) {
 // back out of the store rather than by trusting what RenewHostLease returned, which
 // is the only way this contract can tell a store that answers correctly from one
 // that also writes correctly.
+// leadershipRenewal: a leader can say "I am still here" without becoming a new leader.
+//
+// The two halves are one property. A renewal that moved the term would be
+// AcquireLeadership with extra steps, and every admin one-shot in cmd/control-plane
+// reads GetLeader and then writes under that term — a leader renewing every few seconds
+// would make those writes fail at random. A renewal that did not refresh the stamp would
+// leave the only durable evidence that this process is alive frozen at its election, and
+// a Control Plane dead for five minutes indistinguishable from one that started five
+// minutes ago.
+//
+// The wrong-holder case is not hypothetical: it is what the *superseded* process's next
+// renewal is, and ErrStaleTerm is the answer that ends it. (The stale-*term* case is in
+// everyMutation, with the rest of the §7 surface.)
+func leadershipRenewal(t *testing.T, s metadata.Store) {
+	ctx := t.Context()
+	w := newWorld(t, s)
+
+	before, err := s.GetLeader(ctx)
+	if err != nil {
+		t.Fatalf("GetLeader: %v", err)
+	}
+	if err := s.RenewLeadership(ctx, w.term, "cp-a"); err != nil {
+		t.Fatalf("RenewLeadership by the current leader: %v", err)
+	}
+	after, err := s.GetLeader(ctx)
+	if err != nil {
+		t.Fatalf("GetLeader: %v", err)
+	}
+	if after.Term != before.Term || after.HolderID != before.HolderID {
+		t.Fatalf("a renewal moved leadership from %s/term %d to %s/term %d",
+			before.HolderID, before.Term, after.HolderID, after.Term)
+	}
+	// Not-before rather than after: the sim runs on a clock a DST scenario advances by
+	// hand, and a fixture that never advances it would fail an assertion of strict
+	// progress for a store that is behaving.
+	if after.RenewedAt.Before(before.RenewedAt) {
+		t.Fatalf("the renewal moved renewed_at backwards: %s -> %s", before.RenewedAt, after.RenewedAt)
+	}
+	// The term the renewal was made under is still usable: this is what the one-shots
+	// depend on, and asserting it here is what stops a "renewal" that silently re-elects.
+	if err := s.UpsertHost(ctx, w.term, metadata.Host{HostID: w.host, State: lifecycle.HostActive}); err != nil {
+		t.Fatalf("a write under the renewed term: %v", err)
+	}
+
+	// The holder is checked, not only the term. Renewing under someone else's identity
+	// is a process that has lost the election and does not know it.
+	if err := s.RenewLeadership(ctx, w.term, "cp-imposter"); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("renewing under another holder's term: want ErrStaleTerm, got %v", err)
+	}
+
+	// And after a real takeover the old holder's renewal is refused, which is the whole
+	// point: it is how a superseded Control Plane finds out, on a write it makes anyway,
+	// instead of on the next mutation an Agent happens to ask it for.
+	newTerm, err := s.AcquireLeadership(ctx, "cp-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenewLeadership(ctx, w.term, "cp-a"); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("the superseded leader's renewal: want ErrStaleTerm, got %v", err)
+	}
+	if err := s.RenewLeadership(ctx, newTerm, "cp-b"); err != nil {
+		t.Fatalf("the new leader's renewal: %v", err)
+	}
+
+	// The restart, which is the takeover a pilot actually performs: the *same* holder id
+	// elected again, one term higher, while the process holding the old term is still
+	// running. Only the term tells the two apart — the holder matches — so this is the
+	// one case where a renewal that guarded on identity alone would keep a zombie alive
+	// through every restart of the Control Plane.
+	restarted, err := s.AcquireLeadership(ctx, "cp-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted == newTerm {
+		t.Fatalf("re-electing the same holder did not move the term (%d): an election is not a renewal", restarted)
+	}
+	if err := s.RenewLeadership(ctx, newTerm, "cp-b"); !errors.Is(err, metadata.ErrStaleTerm) {
+		t.Fatalf("the previous incarnation of the same holder: want ErrStaleTerm, got %v", err)
+	}
+}
+
 func hostLeases(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
@@ -1581,6 +1669,9 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 	w := newWorld(t, s)
 
 	tests := []mutation{
+		{"RenewLeadership", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
+			return s.RenewLeadership(ctx, term, "")
+		}},
 		{"UpsertHost", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.UpsertHost(ctx, term, metadata.Host{HostID: "", State: lifecycle.HostActive})
 		}},

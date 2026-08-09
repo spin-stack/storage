@@ -80,11 +80,13 @@ func NewProvisioner(md metadata.Store, store objectstore.Store, kms KeyWrapper, 
 // The volume starts at **epoch 1**, not 0. Epoch 0 is the absence of an epoch, and a
 // writer cannot address a WAL namespace under it.
 //
-// It deliberately does not write the epoch object (§12.4). `recovery.VerifyPublisher`
-// treats an absent epoch object as "nothing has claimed this volume yet" and permits
-// the publisher; an object initialised to 0 while the row says 1 makes every checkpoint
-// fail with ErrEpochChanged instead. The epoch object belongs to the first promotion,
-// which is what §12.4 says it is for.
+// **Creating a volume does not grant a fresh epoch, and does not need to.** Every later
+// attach does (controlplane.Place), because a host that gets a volume back must not
+// reopen the WAL directory it wrote before the volume was somewhere else. A volume being
+// created has a v7 id nothing has ever seen, so no host holds a directory under it at
+// any epoch; and the 1 written here is the same 1 the descriptor below carries, which is
+// what -rebuild-metadata restores the row from. Bumping here would make those two
+// disagree at the one moment they are guaranteed to agree.
 func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec) (ProvisionedVolume, error) {
 	if err := spec.validate(); err != nil {
 		return ProvisionedVolume{}, err

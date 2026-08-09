@@ -362,18 +362,21 @@ func TestFleetStatusMarksALeaderNothingHasSeenRunning(t *testing.T) {
 	}
 }
 
-// countingLeaderReads is a metadata.Store that counts GetLeader. Embedding rather
-// than implementing: the guard uses one method of a thirty-method interface, and a
-// hand-written stub for the other twenty-nine would be a compile error every time
+// countingRenewals is a metadata.Store that counts leadership renewals. Embedding
+// rather than implementing: the guard uses one method of a thirty-method interface, and
+// a hand-written stub for the other twenty-nine would be a compile error every time
 // somebody adds one.
-type countingLeaderReads struct {
+//
+// It counts the *renewal* and not GetLeader because the renewal is what the loop does
+// every tick: the read happens once, on the way out, only to name the successor.
+type countingRenewals struct {
 	metadata.Store
 	n atomic.Int64
 }
 
-func (c *countingLeaderReads) GetLeader(ctx context.Context) (metadata.Leader, error) {
+func (c *countingRenewals) RenewLeadership(ctx context.Context, term int64, holderID string) error {
 	c.n.Add(1)
-	return c.Store.GetLeader(ctx)
+	return c.Store.RenewLeadership(ctx, term, holderID)
 }
 
 // TestASupersededControlPlaneStopsRunning is the third state: a second Control Plane
@@ -384,7 +387,7 @@ func TestASupersededControlPlaneStopsRunning(t *testing.T) {
 	ctx := t.Context()
 	now := time.Unix(1_700_000_000, 0).UTC()
 	md := metasim.New(func() time.Time { return now })
-	counting := &countingLeaderReads{Store: md}
+	counting := &countingRenewals{Store: md}
 
 	term, err := md.AcquireLeadership(ctx, "cp-a")
 	if err != nil {
@@ -400,7 +403,7 @@ func TestASupersededControlPlaneStopsRunning(t *testing.T) {
 	// nothing — a guard that returned on its first tick would also "not exit".
 	held, cancelHeld := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- watchTerm(held, counting, clk, term, "cp-a", time.Millisecond) }()
+	go func() { done <- renewLeadership(held, counting, clk, term, "cp-a", time.Millisecond) }()
 	for counting.n.Load() < 3 {
 		if err := clk.Sleep(ctx, time.Millisecond); err != nil {
 			t.Fatal(err)
@@ -420,7 +423,7 @@ func TestASupersededControlPlaneStopsRunning(t *testing.T) {
 	// thousand of the guard's intervals.
 	superseded, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	err = watchTerm(superseded, counting, clk, term, "cp-a", time.Millisecond)
+	err = renewLeadership(superseded, counting, clk, term, "cp-a", time.Millisecond)
 	if err == nil {
 		t.Fatal("a superseded Control Plane kept running")
 	}
@@ -433,11 +436,12 @@ func TestASupersededControlPlaneStopsRunning(t *testing.T) {
 	}
 }
 
-// TestTermCheckIntervalStaysUnderTheLease: the guard's cadence is derived from
+// TestLeaderRenewIntervalStaysUnderTheLease: the guard's cadence is derived from
 // -lease-ttl rather than being its own flag, because the lease is the fleet's unit of
 // "how long a fact may be believed" — a superseded Control Plane has to be gone
-// before the window it was still writing in can be trusted again.
-func TestTermCheckIntervalStaysUnderTheLease(t *testing.T) {
+// before the window it was still writing in can be trusted again, and a live one's
+// stamp has to be fresher than the window anything reading it compares against.
+func TestLeaderRenewIntervalStaysUnderTheLease(t *testing.T) {
 	tests := []struct {
 		ttl  time.Duration
 		want time.Duration
@@ -448,11 +452,11 @@ func TestTermCheckIntervalStaysUnderTheLease(t *testing.T) {
 		{0, time.Second},
 	}
 	for _, tc := range tests {
-		if got := termCheckInterval(tc.ttl); got != tc.want {
-			t.Errorf("termCheckInterval(%s) = %s, want %s", tc.ttl, got, tc.want)
+		if got := leaderRenewInterval(tc.ttl); got != tc.want {
+			t.Errorf("leaderRenewInterval(%s) = %s, want %s", tc.ttl, got, tc.want)
 		}
-		if got := termCheckInterval(tc.ttl); tc.ttl > time.Second && got >= tc.ttl {
-			t.Errorf("termCheckInterval(%s) = %s, which is not inside the lease", tc.ttl, got)
+		if got := leaderRenewInterval(tc.ttl); tc.ttl > time.Second && got >= tc.ttl {
+			t.Errorf("leaderRenewInterval(%s) = %s, which is not inside the lease", tc.ttl, got)
 		}
 	}
 }

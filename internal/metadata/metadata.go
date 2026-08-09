@@ -341,8 +341,30 @@ type Snapshot struct {
 // method here changes it. The note where ResizeVolume used to be, between
 // UpdateWatermarks and SetVolumeState, says why V1 has no resize at all.
 type Store interface {
-	// AcquireLeadership takes/renews leadership, incrementing and returning the term.
+	// AcquireLeadership takes leadership, incrementing and returning the term. It is
+	// an election, not a heartbeat: it moves the term unconditionally, for the same
+	// holder too. RenewLeadership is what a leader that is already leading calls.
 	AcquireLeadership(ctx context.Context, holderID string) (int64, error)
+	// RenewLeadership refreshes the leader record's renewed_at under the caller's own
+	// term and holder id, without moving either (term-guarded, §7). A caller that is
+	// not the current leader — its term was superseded, or the row names somebody else
+	// — is ErrStaleTerm, and nothing is written.
+	//
+	// It exists because the term guard alone leaves two holes that meet in the middle.
+	// The stamp on the leader row was written by an election and never touched again,
+	// so a Control Plane that has been dead for an hour is indistinguishable from one
+	// that started an hour ago; and a Control Plane that has been superseded finds out
+	// only when it next tries to mutate something — §7 says it "detects the condition
+	// and terminates itself", and reading its own refusals off Agent traffic is not
+	// detecting it. One periodic guarded write closes both: it is the liveness stamp
+	// while it succeeds, and the notice to step down when it fails.
+	//
+	// Deliberately not AcquireLeadership on a timer. That increments the term every
+	// tick, and every admin one-shot in cmd/control-plane reads GetLeader and then
+	// writes under the term it read — -flatten-volume and -delete-volume rewrite a
+	// whole image between the two — so a self-renewing leader would fail them at
+	// random with ErrStaleTerm.
+	RenewLeadership(ctx context.Context, term int64, holderID string) error
 	// GetLeader returns the current leader record.
 	GetLeader(ctx context.Context) (Leader, error)
 	// Now returns the store's own clock: the one that stamps last_renewal, and so
@@ -442,12 +464,17 @@ type Store interface {
 	ListVolumes(ctx context.Context) ([]Volume, error)
 	// BumpVolumeEpoch advances the epoch to expectedEpoch+1 and sets the primary
 	// host, term-guarded, returning the new epoch (§12.3). It is a compare-and-set,
-	// not an increment: a promotion chooses which epoch to grant by reading the
+	// not an increment: the caller chooses which epoch to grant by reading the
 	// volume first, and expectedEpoch is what it read. A volume that has moved on
 	// since is ErrEpochConflict and nothing is written — otherwise each of n racing
-	// promoters burns an epoch and the last one writes its own host into
+	// callers burns an epoch and the last one writes its own host into
 	// primary_host_id, naming an owner that never won the S3 epoch object and never
 	// got a lease.
+	//
+	// controlplane.Place is what calls it: every attach grants an epoch the volume has
+	// never been served under, so a host that gets the volume back cannot resume the WAL
+	// directory its previous session left behind. It does not write the §7 state, which
+	// is why Place follows it with SetVolumePrimaryHost rather than using it alone.
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
 	// SetVolumePrimaryHost places a volume on a host, or clears its placement when
 	// primaryHostID is empty (term-guarded). It writes the §7 state that goes with the
@@ -463,24 +490,26 @@ type Store interface {
 	// **Moving straight from one host to another is refused with ErrAlreadyPlaced.**
 	// The caller clears first and places afterwards; that sentinel carries the reason.
 	//
-	// **The epoch is not touched, in either direction.** Three things say so:
+	// **The epoch is not touched by this write, in either direction** — which is not the
+	// same as saying a placement does not move it. controlplane.Place grants the volume
+	// a fresh epoch before it calls this, and carries the reasoning for both halves; what
+	// belongs here is why the two are separate writes rather than one:
 	//
 	//   - An epoch is a fencing token, granted by BumpVolumeEpoch's compare-and-set to
-	//     a writer that won it (§12.3). Detaching grants it to nobody, so incrementing
-	//     here would burn a token no host holds.
-	//   - Nothing needs it to. What stops a released host's reports being accepted is
-	//     the ownership check, not the epoch: cpserver.applyReport compares
-	//     primary_host_id against the reporting host *before* it looks at the epoch, so
-	//     a cleared volume answers NOT_PRIMARY — which is exactly the outcome that makes
-	//     the Agent fence the volume and tear it down. That is sufficient here, and it
-	//     is sufficient because "" can never be a reporting host: the RPC refuses an
-	//     empty host_id at the boundary, so a cleared owner matches nobody rather than
-	//     matching everybody.
-	//   - It would cost a re-attach its local data. The Agent's WAL lives at
-	//     <data-dir>/wal/<volume-id>/<epoch>, so a bumped epoch is a fresh empty root:
-	//     a volume detached and re-attached to the same host would abandon whatever the
-	//     teardown publish did not carry (publish failures are logged and continue).
-	//     Detach has to be reversible.
+	//     the writer that won it (§12.3). Detaching grants it to nobody, so incrementing
+	//     inside a write that also clears the owner would burn a token no host holds.
+	//   - Nothing about the *release* needs it. What stops a released host's reports
+	//     being accepted is the ownership check, not the epoch: cpserver.applyReport
+	//     compares primary_host_id against the reporting host *before* it looks at the
+	//     epoch, so a cleared volume answers NOT_PRIMARY — which is exactly the outcome
+	//     that makes the Agent fence the volume and tear it down. That is sufficient
+	//     here, and it is sufficient because "" can never be a reporting host: the RPC
+	//     refuses an empty host_id at the boundary, so a cleared owner matches nobody
+	//     rather than matching everybody.
+	//   - An Agent restart must keep its epoch. It is not a placement — this row does
+	//     not change — so the desired state repeats the epoch, the Agent re-attaches to
+	//     its own WAL and republishes (ADR-0024). Bumping on any *read* of the placement
+	//     would break that; bumping at the attach does not reach it.
 	//
 	// A stale term is ErrStaleTerm, a missing volume ErrNotFound, a §7 move the table
 	// forbids lifecycle.ErrInvalidTransition. Re-writing the placement a volume already
