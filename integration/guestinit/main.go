@@ -18,16 +18,19 @@
 // to clean up after it. It never returns: PID 1 exiting panics the kernel, which reads as
 // a crash rather than a verdict, so it always powers the machine off itself.
 //
-// Three modes, chosen by `spin.mode=` on the kernel command line and described where they
-// are declared below. The third — hold — is the one that makes a guest something a host
+// Four modes, chosen by `spin.mode=` on the kernel command line and described where they
+// are declared below. The last — hold — is the one that makes a guest something a host
 // test can act *upon* rather than wait for: it keeps writing until the host tells it to
-// stop, over the return direction of the same serial line the verdicts go out on.
+// stop, over the return direction of the same serial line the verdicts go out on. A hold
+// run has two shapes, chosen by `spin.hold=`, and the difference between them is the
+// difference between a guest whose read view is pinned and one whose read view grows.
 package main
 
 import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -86,6 +89,19 @@ const (
 	// iteration's fsync and never before it, so a host that saw one knows a FLUSH was
 	// answered rather than knowing that time passed.
 	verdictAlive = "GUESTINIT-ALIVE"
+	// The three lines a walking hold run prints about the host's read-view bound, in the
+	// order they can legally appear. They are separate verdicts rather than one because
+	// each is a different claim and a test should be able to fail on the missing one:
+	//
+	//   - verdictRefused: a write was turned away. The bound acted at all.
+	//   - verdictTrimmed: the guest gave the walked range back with BLKDISCARD. The
+	//     escape hatch was reachable *while over the bound* — a DISCARD refused here
+	//     would make the bound a one-way door.
+	//   - verdictRecovered: the guest wrote walkRecoverBlocks more blocks afterwards.
+	//     The door opened, and stayed open long enough to work through.
+	verdictRefused   = "GUESTINIT-REFUSED"
+	verdictTrimmed   = "GUESTINIT-TRIMMED"
+	verdictRecovered = "GUESTINIT-RECOVERED"
 	// stopCommand is what the host sends down the serial line to end a hold-mode run.
 	// The guest powers itself off in response, which is the difference between "the
 	// test stopped the VM" and "the guest finished": only the second leaves the volume
@@ -139,8 +155,61 @@ const (
 	// can happen while a guest is running: until it did, every guest in this repository
 	// wrote once and powered off, and so every snapshot, restart and clone the lanes
 	// exercised happened over a device nobody was using.
+	//
+	// Where it writes is a second choice, `spin.hold=`, below.
 	modeHold = "hold"
 )
+
+// The two shapes a hold run can have, chosen by `spin.hold=` on the kernel command line.
+//
+// A second axis rather than two more `spin.mode=` values, because everything else about a
+// hold run is the same in both — the heartbeat, the stop word, the read-back at the end.
+// Only *where the writes land* differs, and that single difference decides whether the
+// host's read view grows.
+const (
+	// holdRotate rewrites holdBlocks blocks in rotation. The default, and the original
+	// behaviour, kept because it is not the weaker case: it pins the read view at 32 KiB
+	// however long the run lasts, which is the only way to show that a steady-state guest
+	// — a database checkpointing the same pages, a journal — is *never* throttled by a
+	// bound on that view. Half of what a memory bound has to get right is not firing.
+	holdRotate = "rotate"
+
+	// holdWalk writes distinct offsets, walking the device upwards from holdOffset, so
+	// the read view grows by a block per iteration.
+	//
+	// It exists because the host's read-view bound had never been crossed end to end and
+	// could not be: rotate mode's view is pinned by construction, so a soak of any length
+	// reaches 32 KiB and stops. The bound is the one per-volume structure whose size the
+	// guest decides, and the measurement behind it (1.55 GiB of host RSS for one volume at
+	// 195,658 distinct 4 KiB writes, monotonic, with the OOM killer as the only limit) is
+	// a *walking* workload. A generator that cannot walk cannot reach it.
+	//
+	// When a write is refused, this shape gives the walked range back with BLKDISCARD and
+	// carries on, because that is the other half of the bound: DISCARD deliberately
+	// carries no view charge so that a guest which has crossed has a way down. If the trim
+	// did not work the bound would be a one-way door, and this run says so rather than
+	// hanging.
+	holdWalk = "walk"
+)
+
+// walkHeartbeat is how many blocks a walk puts down between heartbeats. Rotate mode
+// announces every iteration and can afford to — it is paced at 50ms — where a walk runs
+// flat out and would bury the handful of lines that matter under thousands that do not.
+const walkHeartbeat = 32
+
+// walkRetries is how many times a refused offset is tried again before the guest trims.
+//
+// The host's bound is documented to be permanent for the session: nothing shrinks the read
+// view except a DISCARD. So a retry that succeeded with nothing given back in between
+// would mean the refusal came from somewhere else — a transient, a device bound, a
+// coincidence — and a run that then went on to "prove" the escape hatch would be proving
+// it against a door that was never shut. This makes that case a failure with a name.
+const walkRetries = 3
+
+// walkRecoverBlocks is how many blocks must land after a trim before the guest announces
+// it has recovered. One would satisfy "a write got through"; what the escape hatch has to
+// buy is a guest that can go on working, which is a different claim.
+const walkRecoverBlocks = 64
 
 // holdInterval paces the hold loop.
 //
@@ -155,17 +224,25 @@ const holdInterval = 50 * time.Millisecond
 // mode reports what this boot was asked to do. An unrecognised value is an error rather
 // than a fall-back to the default: `spin.mode=hodl` silently doing the write-and-verify
 // run would leave a lane green while testing something else entirely.
-func mode() string {
-	cmdline, err := os.ReadFile("/proc/cmdline")
+func mode() string { return cmdline("spin.mode=", modeWrite) }
+
+// shape reports which hold run this boot asked for. Same rule: an unrecognised value is
+// refused by the caller, so `spin.hold=wlak` cannot quietly deliver the rotating run and
+// leave a test that needed a growing read view green over a view that never grew.
+func shape() string { return cmdline("spin.hold=", holdRotate) }
+
+// cmdline returns the value of a `key=` word on the kernel command line, or dflt.
+func cmdline(key, dflt string) string {
+	raw, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
-		return modeWrite
+		return dflt
 	}
-	for _, word := range strings.Fields(string(cmdline)) {
-		if v, ok := strings.CutPrefix(word, "spin.mode="); ok {
+	for _, word := range strings.Fields(string(raw)) {
+		if v, ok := strings.CutPrefix(word, key); ok {
 			return v
 		}
 	}
-	return modeWrite
+	return dflt
 }
 
 func run(m string) error {
@@ -192,7 +269,14 @@ func run(m string) error {
 	case modeDiscard:
 		return discardRoundTrip(f, pattern)
 	case modeHold:
-		return hold(f, pattern)
+		switch s := shape(); s {
+		case holdRotate:
+			return hold(f, pattern)
+		case holdWalk:
+			return walk(f, pattern)
+		default:
+			return fmt.Errorf("unknown spin.hold=%s on the kernel command line", s)
+		}
 	case modeWrite:
 	default:
 		return fmt.Errorf("unknown spin.mode=%s on the kernel command line", m)
@@ -250,20 +334,15 @@ func discardRoundTrip(f *os.File, pattern []byte) error {
 		return fmt.Errorf("discard mode: fsync before the discard: %w", err)
 	}
 
-	// BLKDISCARD takes a two-element array of u64: offset then length, in bytes.
-	rng := [2]uint64{uint64(target), uint64(len(pattern))}
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), blkDiscard,
-		uintptr(unsafe.Pointer(&rng[0]))); errno != 0 {
-		return fmt.Errorf("discard mode: BLKDISCARD of %d bytes at %d: %w "+
-			"(EOPNOTSUPP here means the device never advertised VIRTIO_BLK_F_DISCARD)",
-			len(pattern), target, errno)
+	if err := discardRange(f, target, int64(len(pattern))); err != nil {
+		return fmt.Errorf("discard mode: %w", err)
 	}
 
 	// Drop the page cache for this device so the read below comes from the backend
 	// and not from pages the kernel still holds. Without this the test could pass on
 	// a backend that ignored the discard entirely.
 	if err := dropCache(f); err != nil {
-		return err
+		return fmt.Errorf("discard mode: %w", err)
 	}
 
 	g, err := os.Open(device)
@@ -292,12 +371,30 @@ func discardRoundTrip(f *os.File, pattern []byte) error {
 	return nil
 }
 
+// discardRange asks the block layer to unmap [off, off+length).
+//
+// BLKDISCARD takes a two-element array of u64: offset then length, in bytes. The block
+// layer forwards it **only if the device negotiated VIRTIO_BLK_F_DISCARD**, so the ioctl
+// failing with EOPNOTSUPP is itself the assertion that the feature bit was never on the
+// wire — which is a defect no host-side test can see, because a unit test calls the
+// backend method directly and never negotiates anything.
+func discardRange(f *os.File, off, length int64) error {
+	rng := [2]uint64{uint64(off), uint64(length)}
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), blkDiscard,
+		uintptr(unsafe.Pointer(&rng[0]))); errno != 0 {
+		return fmt.Errorf("BLKDISCARD of %d bytes at %d: %w "+
+			"(EOPNOTSUPP here means the device never advertised VIRTIO_BLK_F_DISCARD)",
+			length, off, errno)
+	}
+	return nil
+}
+
 // dropCache invalidates this device's page cache. BLKFLSBUF is the block layer's own
 // verb for it and needs no /proc tunable, so it works in an initramfs that mounted
 // nothing.
 func dropCache(f *os.File) error {
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), blkFlsBuf, 0); errno != 0 {
-		return fmt.Errorf("discard mode: BLKFLSBUF: %w", errno)
+		return fmt.Errorf("BLKFLSBUF: %w", errno)
 	}
 	return nil
 }
@@ -344,6 +441,130 @@ func hold(f *os.File, pattern []byte) error {
 		}
 		time.Sleep(holdInterval)
 	}
+}
+
+// walk is the sustained-load generator the host's read-view bound needs, and the reason
+// it had to be written is that the bound had never been crossed by anything.
+//
+// It writes **distinct** offsets — a block, an fsync, the next block — walking the device
+// upwards from holdOffset. Each block is a region of the volume nothing has written
+// before, so the host's read view gains an entry per iteration and its cost grows
+// monotonically, which is exactly the shape of the workload that put an Agent at 1.55 GiB
+// of RSS for one volume. Rotate mode, which rewrites eight blocks forever, cannot produce
+// it at any duration.
+//
+// Three things can end a walk and each is a different verdict:
+//
+//   - the host refuses a write. Expected: the bound acted. The guest trims what it walked,
+//     which is the only thing that shrinks a read view, and carries on — and the writes
+//     that land afterwards are the proof the bound is not a one-way door.
+//   - the host takes every block to the end of the device. A failure, and the one this
+//     shape exists to be able to report: a bound that refuses nothing is a bound that is
+//     not there, and every assertion downstream of it would have passed.
+//   - the host says stop. The guest reads back what it last wrote, through a cold cache,
+//     and passes.
+func walk(f *os.File, pattern []byte) error {
+	// The device's own size, asked of the device rather than assumed: the walk has to
+	// know where the end is to be able to report reaching it, and a constant here would
+	// be a second copy of a number the host already owns.
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("walk: sizing %s: %w", device, err)
+	}
+	stopped, err := watchForStop()
+	if err != nil {
+		return err
+	}
+
+	block := int64(len(pattern))
+	off := int64(holdOffset)
+	// trimFrom is the oldest offset still charged to the host's read view: everything
+	// from here to off. A trim gives back exactly that and no more, so a walk never
+	// discards a range it has already given back.
+	trimFrom := off
+	var written, trims, sinceTrim int
+	// Nothing to recover from until something has been refused, so a run that is stopped
+	// before it ever crosses the bound does not claim it recovered.
+	recovered := true
+
+	for {
+		if off+block > size {
+			return fmt.Errorf("walk: put %d distinct %d-byte blocks down to the end of the %d-byte "+
+				"device and every one of them was taken: nothing bounded the host's read view",
+				written, block, size)
+		}
+		if err := writeThrough(f, pattern, off); err != nil {
+			report("%s %d %v", verdictRefused, off, err)
+
+			// The same offset again, with nothing given back in between. See walkRetries:
+			// only a trim shrinks the view, so a success here means the refusal was not
+			// the bound and the escape hatch below would be proving nothing.
+			for i := range walkRetries {
+				if err := writeThrough(f, pattern, off); err == nil {
+					return fmt.Errorf("walk: the block at %d was refused and then taken on retry %d "+
+						"with nothing trimmed in between: whatever refused it was not a bound on the "+
+						"read view, which only a DISCARD can clear", off, i+1)
+				}
+			}
+
+			// The escape hatch. Everything walked since the last trim goes back in one
+			// BLKDISCARD; a DISCARD carries no read-view charge precisely so that a guest
+			// which has crossed the bound can issue this one.
+			length := off - trimFrom
+			if length == 0 {
+				return fmt.Errorf("walk: refused at %d with nothing written since the last trim: "+
+					"there is nothing left to give back and no way under the bound", off)
+			}
+			if err := discardRange(f, trimFrom, length); err != nil {
+				return fmt.Errorf("walk: the bound is a one-way door — a guest over it could not trim: %w", err)
+			}
+			trims++
+			sinceTrim, recovered, trimFrom = 0, false, off
+			report("%s %d %d %d", verdictTrimmed, trims, off-length, length)
+			continue
+		}
+
+		written++
+		sinceTrim++
+		if written%walkHeartbeat == 0 {
+			report("%s %d %d", verdictAlive, written, off)
+		}
+		if !recovered && sinceTrim >= walkRecoverBlocks {
+			recovered = true
+			report("%s %d %d %d", verdictRecovered, trims, sinceTrim, off)
+		}
+		off += block
+
+		// Checked after a write and never before one, so the offset read back below is
+		// always one this run put down *since the last trim* — reading back a block the
+		// guest itself discarded would fail for the one reason that is not a defect.
+		if stopped.Load() {
+			if err := dropCache(f); err != nil {
+				return fmt.Errorf("walk: %w", err)
+			}
+			return readBack(pattern, off-block)
+		}
+	}
+}
+
+// writeThrough writes one block and fsyncs it, reporting whichever step failed first.
+//
+// Both steps, because that is the shape in which a refused WRITE reaches a guest. The
+// write(2) is buffered: it dirties a page and returns success, and the device does not see
+// the request until writeback. So a backend that refuses it fails the **fsync** — which is
+// the contract that matters, since a guest whose fsync fails is entitled to consider its
+// data lost, and a database meeting this bound would meet it exactly here.
+//
+// Deliberately not O_DIRECT or O_SYNC, for the same reason the rest of this program is
+// not: either would make the write its own durable step and prove less.
+func writeThrough(f *os.File, pattern []byte, off int64) error {
+	if _, err := f.WriteAt(pattern, off); err != nil {
+		return fmt.Errorf("write at %d: %w", off, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync of the write at %d: %w", off, err)
+	}
+	return nil
 }
 
 // watchForStop reads the console — the other direction of the serial line the verdicts
