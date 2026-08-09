@@ -9,11 +9,11 @@ import (
 
 // pinnedMandatorySet is the §25.1 gate, written out by name.
 //
-// MandatoryScenarios() is assembled at run time from four per-area functions
-// (coreScenarios, harnessScenarios, walScenarios, agentScenarios) so that two
-// increments can add a scenario without both editing one literal. That is the right
-// trade for adding, and it is exactly the wrong shape for noticing a *removal*:
-// TestMandatoryScenarios ranges over whatever the four functions return, so deleting an
+// MandatoryScenarios() is assembled at run time from the per-area functions
+// (coreScenarios, harnessScenarios, walScenarios, carryScenarios, agentScenarios,
+// refusalScenarios) so that two increments can add a scenario without both editing one
+// literal. That is the right trade for adding, and it is exactly the wrong shape for
+// noticing a *removal*: TestMandatoryScenarios ranges over whatever they return, so deleting an
 // entry — or dropping an `append` line in a refactor — makes the gate run one fewer
 // proof and stay green. Nothing outside this file would say a scenario had left.
 //
@@ -59,6 +59,8 @@ var pinnedMandatorySet = []string{
 	"a-rebuilt-catalog-can-serve-its-volumes",
 	"a-volume-stopped-mid-fetch-still-publishes",
 	"device-budget-holds-across-volumes",
+	// refusal (scenarios_refusal.go)
+	"a-refused-volume-has-no-socket-and-is-still-reported",
 }
 
 // TestMandatorySetIsPinnedByName fails when MandatoryScenarios() and the pinned list

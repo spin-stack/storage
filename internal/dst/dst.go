@@ -45,6 +45,7 @@ const (
 	EventVolumeServe EventKind = "volume-serve"
 	EventDurableRead EventKind = "durable-read"
 	EventCarry       EventKind = "carry"
+	EventRefusal     EventKind = "refusal"
 )
 
 // CarryPhase says what a carry event states about one WAL record: what a guest was
@@ -110,6 +111,17 @@ type Event struct {
 	// and the same digest; a copied ciphertext has the same bytes and a different one,
 	// which is the whole reason the digest is not taken over the encoded record.
 	Digest string
+	// Refusal events: the word the *catalog* holds about a volume its host is not
+	// serving, once the report has crossed the wire, and whether that volume still has a
+	// socket bound on the host. Key carries the volume id.
+	//
+	// The two travel on one event because the failure they describe is a conjunction:
+	// either half alone is satisfied by an implementation that got the other badly
+	// wrong — a volume with no device that vanished from the wire, or one the fleet
+	// knows is refused that is still handing a guest a device that errors.
+	Refusal     string
+	SocketBound bool
+
 	// Scan groups the survived events of one observation of one device. It is what
 	// scopes "the same sequence twice under one (volume, epoch)" to a single moment,
 	// rather than to a record legitimately seen again by a later scan.
@@ -140,6 +152,8 @@ func (e Event) String() string {
 			e.Step, e.Key, e.ZerosAfterRestart, e.ForeignBytesAfterRestart)
 	case EventVolumeServe:
 		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
+	case EventRefusal:
+		return fmt.Sprintf("%04d refusal vol=%s catalog=%q socket_bound=%t", e.Step, e.Key, e.Refusal, e.SocketBound)
 	case EventCarry:
 		return fmt.Sprintf("%04d carry %s vol=%s epoch=%d seq=%d digest=%s scan=%d settled=%t",
 			e.Step, e.CarryPhase, e.Key, e.Epoch, e.Sequence, e.Digest, e.Scan, e.Settled)

@@ -40,6 +40,7 @@ func MandatoryScenarios() []MandatoryScenario {
 	all = append(all, walScenarios()...)
 	all = append(all, carryScenarios()...)
 	all = append(all, agentScenarios()...)
+	all = append(all, refusalScenarios()...)
 	return all
 }
 

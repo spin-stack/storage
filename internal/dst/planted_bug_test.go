@@ -152,6 +152,8 @@ var plantedProofs = map[string]proofKind{
 	"durable-range-survives-restart": proofBehavioural,
 	// Contributed by scenarios_carry.go; proof in planted_bug_carry_test.go.
 	"acked-records-cross-epochs-intact": proofBehavioural,
+	// Contributed by scenarios_refusal.go; proof in planted_bug_refusal_test.go.
+	"refused-volume-has-no-device": proofBehavioural,
 }
 
 // proven records which checkers a plantedBug call actually exercised in this run.
@@ -232,8 +234,9 @@ func TestPlantedBugWatermarkOrder(t *testing.T) {
 //     and has a proof that runs. The number went down because the record became true.
 //   - 5 -> 6 (2026-08-09): `acked-records-cross-epochs-intact`, with the carry-forward
 //     scenario. An increase, which is the only direction that needs no defence.
+//   - 6 -> 7 (2026-08-09): `refused-volume-has-no-device`, with the refusal scenario.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 6
+	const wantBehavioural = 7
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {

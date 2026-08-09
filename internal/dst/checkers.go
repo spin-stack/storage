@@ -151,5 +151,6 @@ func DefaultCheckers() []Checker {
 	all = append(all, walCheckers()...)
 	all = append(all, carryCheckers()...)
 	all = append(all, agentCheckers()...)
+	all = append(all, refusalCheckers()...)
 	return all
 }
