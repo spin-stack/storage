@@ -13,34 +13,43 @@ real machine 2026-08-09, binaries and a real kernel, including a clean stop and 
 an empty data directory. INV-10 holds across processes on both
 backends since 2026-08-09, and the conformance suite can now see it when it does not. A live volume can
 be snapshotted without pausing, cloned from that snapshot, flattened, and deleted. A guest can
-DISCARD. An Agent that cannot publish holds rather than exits.
+DISCARD. An Agent that cannot publish holds rather than exits, and one that cannot find a
+volume's data publishes no device at all.
+
+**Measured under sustained load** (2026-08-09, one guest, one volume, 70 minutes, 142
+samples): Agent RSS flat at ~27 MB, file descriptors flat at 17, the object store constant
+at 355 bytes while the volume served (INV-18 holds over an hour, not just over a test), the
+Agent's log flat at 5 lines for the whole run, and the guest's fsync rate steady at ~19.5/s
+end to end — no drift. The local WAL grows about 4.7 MiB/min and nothing reclaims it
+mid-session, which is the documented shape (§5.7) and the number nobody had.
 
 ## Do this next
 
-The nine pilot blockers were closed 2026-08-09; a readiness re-run against the fixed tree
-then found **22 regressions those fixes caused**, and the worst three are closed too
-(`git log`). 118 findings, 113 reproduced. What is below is what is left.
+Nine pilot blockers closed 2026-08-09; a readiness re-run then found 22 regressions those
+fixes caused and the worst are closed too; `CarryForward` now has a mandatory DST arm that
+crashes at every write it performs. A 70-minute soak with a real guest found nothing that
+degrades — see "What runs end to end". `git log` has all of it. What is left:
 
-1. **A refused volume still gets a vhost socket.** A guest boots, attaches a 256 MiB
-   `/dev/vda` and takes hard I/O errors on every read — a disk that exists and cannot be
-   read, rather than one that is absent. The one-hunk fix (cancel the volume's context in
-   `Volume.refuse`, so the listener closes and the socket unlinks) was written and measured,
-   and it breaks two `integration/e2e/lost_data_test.go` scenarios that deliberately boot a
-   guest *against* the refused volume's socket to assert the I/O error. Those tests have to
-   change shape first — assert the socket never appears — and then the fix lands.
-2. **`published_sequence` still reaches the catalog one session late** for a volume that
-   keeps serving; the teardown now reports it, so the gap is narrower than it was.
-3. **`internal/lineage/flatten.go` reads `ErrNotPublished` as "never published".** Flattening
+1. **The soak could not reach the read-view bound, and that is a hole in the tooling, not
+   in the bound.** `guestinit`'s hold mode rewrites eight blocks in rotation, so the read
+   view stays pinned at 32 KiB however long it runs — the 256 MiB bound is unreachable by
+   the only sustained-load generator this repo has. A hold variant that writes distinct
+   offsets is a few lines in `integration/guestinit/main.go`, and without it nothing has
+   ever driven the bound that stands between a guest and the OOM killer.
+2. **No DST arm for "a volume that fails closed has no socket".** The behaviour landed with
+   unit and e2e coverage; the deep gate wants a scenario.
+3. **`published_sequence` still reaches the catalog one session late** for a volume that
+   keeps serving. The teardown now reports it, so the window is narrow.
+4. **`internal/lineage/flatten.go` reads `ErrNotPublished` as "never published".** Flattening
    a clone whose own image vanished writes down the ancestry and drops the clone's own layer.
-   The attach path closed this; the flatten path is the one that was not on it.
-4. **The read view's bound is a constant.** `MaxViewBytes` defaults to 256 MiB where the
-   device bound is a share of a `statfs`; the honest counterpart is a share of measured RAM.
-5. **Bring-up has three sharp edges**, all hit walking it by hand: `-holder-id` is required
+   The attach path closed this; the flatten path was never on it.
+5. **The read view's bound is a constant.** `MaxViewBytes` defaults to 256 MiB where the
+   device bound is a share of a measured `statfs`; the honest counterpart is a share of
+   measured RAM.
+6. **Bring-up has three sharp edges**, all hit walking it by hand: `-holder-id` is required
    and documented only in the error; a `-vhost-socket-dir` over ~107 bytes fails as an opaque
    `bind: invalid argument` retried for ever (`sun_path` is 108); and applying `schema.sql`
    to a fresh database needs a `psql` nothing in the repo provides.
-6. **Nothing has been run for hours.** Every lane is minutes long. The pilot's own first week
-   is the experiment that has not been performed.
 
 ## Thin paths that shipped without being deepened
 
