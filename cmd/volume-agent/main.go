@@ -24,6 +24,9 @@ import (
 	"syscall"
 	"time"
 
+	"connectrpc.com/connect"
+
+	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
@@ -217,6 +220,12 @@ func run() (err error) {
 		slog.Warn("no -kek-file: this Agent writes guest data unencrypted (§15 requires encryption outside dev)")
 	}
 
+	// Built here rather than inline in agent.Deps because the teardown needs it too: the
+	// last thing this process does, once every image is in the bucket, is tell the Control
+	// Plane the sequence it just published (see reportSettled).
+	cp := storagev1connect.NewControlPlaneServiceClient(
+		&http.Client{Timeout: *httpTimeout}, *cpURL)
+
 	// One runtime per volume, each with its own WAL, block device and vhost-user
 	// socket. This is what the Agent serves from — before it, the binary heartbeated
 	// about an empty set forever.
@@ -281,7 +290,7 @@ func run() (err error) {
 	// process's exit status, so the Agent exited 0 whether or not the session it was
 	// serving ever reached the bucket.
 	defer func() {
-		err = errors.Join(err, shutdown(volumes, loop))
+		err = errors.Join(err, shutdown(cfg.HostID, cp, volumes, loop))
 		if err == nil {
 			// Printed here, after the images are settled, so "stopped" means stopped
 			// rather than "asked to stop". An operator greps for this line to tell a
@@ -291,9 +300,8 @@ func run() (err error) {
 	}()
 
 	loop, err = agent.New(cfg, agent.Deps{
-		Clock: real.NewClock(),
-		ControlPlane: storagev1connect.NewControlPlaneServiceClient(
-			&http.Client{Timeout: *httpTimeout}, *cpURL),
+		Clock:        real.NewClock(),
+		ControlPlane: cp,
 		// The device is measured, not declared: NewDiskUsage statfs's the
 		// filesystem holding --data-dir, so the capacity ADR-0013's thresholds
 		// divide by is the disk's own answer and includes what other tenants of
@@ -461,13 +469,25 @@ func watchSpacePressure(ctx context.Context, clk clock.Clock, volumes *agent.Vol
 //     the moment the interesting fact is that the host is alive and stuck. Not the whole
 //     reconcile loop: reading the desired state again would start runtimes this teardown
 //     has just stopped.
-func shutdown(volumes *agent.VolumeManager, loop *agent.Loop) error {
+func shutdown(hostID string, cp storagev1connect.ControlPlaneServiceClient,
+	volumes *agent.VolumeManager, loop *agent.Loop) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if loop == nil {
 		return volumes.Close(ctx) // a wiring failure: there are no runtimes and nobody to tell
 	}
+	// Read *before* Close, because Close is the only thing that knows these volumes and it
+	// leaves nothing behind: a published volume is dropped out of the served set, so after
+	// it returns `Volumes` answers with an empty list and the sequence this host just wrote
+	// into the bucket exists nowhere in this process. See reportSettled for what is done
+	// with it.
+	held, herr := volumes.Volumes(ctx)
+	if herr != nil {
+		slog.Error("could not read the volumes this host is serving before publishing them; their sequences will not reach the catalog",
+			"error", herr)
+	}
+
 	sustainCtx, done := context.WithCancel(context.Background())
 	sustained := make(chan struct{})
 	go func() {
@@ -478,5 +498,87 @@ func shutdown(volumes *agent.VolumeManager, loop *agent.Loop) error {
 	err := volumes.Close(ctx)
 	done()
 	<-sustained // joined rather than left running: it logs, and run() is about to return
-	return err
+	if err != nil {
+		return err
+	}
+	reportSettled(ctx, hostID, cp, held)
+	return nil
+}
+
+// reportSettled tells the Control Plane what this host put in the object store, after
+// every image is in it and before the process exits.
+//
+// **Without it the most common path there is loses data silently.** An operator SIGTERMs
+// an Agent to upgrade it; the teardown publishes `image/<vol>/manifest.json` at sequence 8
+// and exits 0; and the catalog still says `published_sequence = 0`, because watermarks
+// only ever reached the Control Plane on a reconcile cycle and the last one happened
+// before the publish. The volume then re-attaches on a host with no local WAL, finds no
+// image — a stray delete, a lifecycle expiry, a restore that missed a key — and, because
+// the catalog says it never published, comes up as a blank device with no error anywhere.
+// That refusal (agent.ErrImageMissing) arms on `published_sequence > 0`, so the one number
+// that arms it was the one number nothing ever sent.
+//
+// # The number, and why it is a floor rather than a measurement
+//
+// It is `local_sequence` as it stood the instant before the teardown quiesced, sent as all
+// three watermarks. A successful publish writes the image at `ViewAtRest`'s sequence,
+// which *is* the log's local sequence at quiesce, and quiesce only ever lets the sequence
+// rise — so what is in the bucket is at least this. Under-claiming is the safe direction
+// for both floors: `published > 0` arms on any positive number, and the durability floor
+// compares with `<`, so a number below the truth never refuses a volume that is fine,
+// while a number above it would refuse one that is.
+//
+// Reading the exact sequence back out of the manifest would be better and is not available
+// here: `image`'s only exported reader pulls every chunk through the volume's DEK.
+//
+// # Only when Close returned cleanly
+//
+// A teardown that ends with a volume superseded or abandoned reports nothing at all. The
+// error `Close` returns is joined across volumes and cannot be attributed to one of them,
+// and the wrong direction to guess in is "published" — a volume whose image never reached
+// the bucket, recorded as having published, is a volume the floor would then refuse
+// forever. Reporting nothing costs a watermark the next incarnation re-establishes when it
+// republishes; reporting a publish that did not happen costs the volume.
+//
+// Failures here are logged and never fatal. The images are in the bucket either way, and
+// the exit code is a statement about the guest's data, not about the catalog.
+func reportSettled(ctx context.Context, hostID string, cp storagev1connect.ControlPlaneServiceClient,
+	held []agent.VolumeStatus) {
+	reports := make([]*storagev1.VolumeReport, 0, len(held))
+	for _, v := range held {
+		if v.LocalSequence == 0 {
+			continue // nothing was ever written: there is no floor to arm and no news
+		}
+		reports = append(reports, &storagev1.VolumeReport{
+			VolumeId: v.VolumeID,
+			// The epoch the report is qualified by (§12.3). It is the one this host was
+			// serving under, which is still the volume's current epoch — nothing has
+			// promoted anyone while we held the data directory — so the Control Plane
+			// accepts it. If something did, the report is refused and the catalog keeps
+			// the successor's numbers, which is the correct outcome.
+			Epoch:             v.Epoch,
+			LocalSequence:     v.LocalSequence,
+			DurableSequence:   v.LocalSequence,
+			PublishedSequence: v.LocalSequence,
+		})
+	}
+	if len(reports) == 0 {
+		return
+	}
+	resp, err := cp.ReportVolumeState(ctx, connect.NewRequest(&storagev1.ReportVolumeStateRequest{
+		HostId: hostID, Volumes: reports,
+	}))
+	if err != nil {
+		slog.Error("the sequences this host just published did not reach the Control Plane; the catalog still says these volumes never published, and an Agent that re-attaches will treat a missing image as a first boot",
+			"volumes", len(reports), "error", err)
+		return
+	}
+	for _, r := range resp.Msg.GetResults() {
+		if r.GetOutcome() == storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED {
+			continue
+		}
+		slog.Warn("the Control Plane refused this host's final report for a volume it just published",
+			"volume_id", r.GetVolumeId(), "outcome", r.GetOutcome().String())
+	}
+	slog.Info("published sequences reported", "volumes", len(reports))
 }

@@ -135,3 +135,71 @@ func TestARefusalIsNotResurrectedByAFencedWriter(t *testing.T) {
 		t.Fatalf("a writer the fleet moved past marked a volume its successor is serving: %+v", v)
 	}
 }
+
+// Two guards stand between a stale Agent and a volume it no longer holds, and this pins
+// the first one. The store's own qualification — the UPDATE is predicated on the host
+// and the epoch — is the second, and it lives in the shared contract because both
+// implementations must have it.
+//
+// Written after a version of this test that asserted the second guard through this
+// handler and PASSED WITH THAT GUARD REMOVED: the report never reached the store,
+// because the epoch check here had already rejected it. A test that cannot fail for the
+// reason it names is the thing this repository keeps shipping, so what it pins now is
+// the guard it actually exercises.
+func TestAReportFromAHostTheFleetMovedPastIsRefusedBeforeItCanSayAnything(t *testing.T) {
+	f := newFixture(t)
+	f.createVolume(t, metadata.Volume{
+		VolumeID: "vol-moved", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 2, PrimaryHostID: hostB,
+	})
+
+	report := func(t *testing.T, host string, epoch int64, refusal storagev1.VolumeRefusal) *storagev1.ReportVolumeStateResponse {
+		t.Helper()
+		resp, err := f.srv.ReportVolumeState(t.Context(), connect.NewRequest(&storagev1.ReportVolumeStateRequest{
+			HostId: host,
+			Volumes: []*storagev1.VolumeReport{{
+				VolumeId: "vol-moved", Epoch: epoch, Refusal: refusal, RefusalDetail: "from " + host,
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("ReportVolumeState(%s): %v", host, err)
+		}
+		return resp.Msg
+	}
+
+	// The host that holds it says it cannot serve it. That is the truth and it lands.
+	report(t, hostB, 2, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING)
+	got, err := f.md.GetVolume(t.Context(), "vol-moved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Refusal != lifecycle.RefusalImageMissing {
+		t.Fatalf("the host holding the volume reported IMAGE_MISSING and the catalog says %q", got.Refusal)
+	}
+
+	// The previous host is still running and still believes it owns the volume at the
+	// epoch it was granted. Its report is refused as a whole — the RPC succeeds and the
+	// per-volume outcome says so, because one stale volume must not fail a host's entire
+	// heartbeat — and the refusal of the host that actually holds it is untouched.
+	msg := report(t, hostA, 1, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED)
+	if len(msg.GetResults()) != 1 || msg.GetResults()[0].GetOutcome() == storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED {
+		t.Errorf("a report from a host the fleet moved past was accepted: %v", msg.GetResults())
+	}
+	got, err = f.md.GetVolume(t.Context(), "vol-moved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Refusal != lifecycle.RefusalImageMissing {
+		t.Errorf("a stale host's report cleared the refusal: %q — the operator is now told a volume nobody is serving is fine", got.Refusal)
+	}
+
+	// And the holder clearing it works, or the column would never come back.
+	report(t, hostB, 2, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED)
+	got, err = f.md.GetVolume(t.Context(), "vol-moved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Refusal != lifecycle.RefusalNone || got.RefusalDetail != "" {
+		t.Errorf("the holder reported it is serving again and the catalog still says %q/%q; a reason that outlives its cause is the one way this column misleads",
+			got.Refusal, got.RefusalDetail)
+	}
+}

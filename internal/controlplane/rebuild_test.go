@@ -1,8 +1,13 @@
 package controlplane_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/spin-stack/storage/internal/framed"
 
 	"github.com/spin-stack/storage/internal/controlplane"
 	"github.com/spin-stack/storage/internal/cow"
@@ -127,6 +132,68 @@ func TestRebuildMetadataFromTheBucket(t *testing.T) {
 	}
 }
 
+// The one command an operator runs *after* losing the catalog must not disarm the two
+// floors that stop a volume being served as a blank device.
+//
+// A rebuilt row carrying published_sequence=0 tells every Agent that this volume has
+// never published an image, so a missing manifest reads as "first boot" and the guest
+// gets zeros for a volume it has written 16 sequences into — silently. The number is in
+// the manifest the rebuild is already standing in front of.
+//
+// The image is written by the real producer (image.Publish), not a fixture, so the two
+// halves of the seam — what publishes a manifest and what reads one back after a
+// catastrophe — are exercised against each other here.
+func TestRebuildMetadataRecordsWhatTheImageProves(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	vol, clone, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
+
+	u, err := ids.Parse(vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := cow.NewIntervalMap()
+	view.Overwrite(0, []byte("the guest's bytes"))
+	if _, err := image.Publish(ctx, store, &ramp{}, nil, image.OwnLineage([16]byte(u)), view, nil, 16, ""); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	fresh, _, freshTerm := cpStore(t) // a database that has never seen this fleet
+	if _, err := controlplane.RebuildMetadata(ctx, fresh, store, freshTerm); err != nil {
+		t.Fatalf("RebuildMetadata: %v", err)
+	}
+
+	got, err := fresh.GetVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("the volume was not rebuilt: %v", err)
+	}
+	// published: the manifest is in the bucket at 16, so an Agent that finds no image for
+	// this volume is looking at a loss and must refuse rather than serve zeros.
+	if got.PublishedSequence != 16 {
+		t.Errorf("published_sequence = %d, want 16: a rebuild that writes 0 tells every Agent this volume never published, and a missing image then reads as a first boot",
+			got.PublishedSequence)
+	}
+	// durable and local: the image is in the object store, which is strictly more durable
+	// than an fdatasync on a host that may no longer exist — so 16 is a floor the bucket
+	// proves, and nothing above it can be proved from any object.
+	if got.DurableSequence != 16 || got.LocalSequence != 16 {
+		t.Errorf("durable_sequence = %d, local_sequence = %d, want 16 and 16",
+			got.DurableSequence, got.LocalSequence)
+	}
+
+	// And a volume with no image gets zeros, because that is what the bucket says: the
+	// clone has a descriptor and has never published. Claiming a floor here would refuse
+	// a volume that is perfectly fine.
+	gotClone, err := fresh.GetVolume(ctx, clone)
+	if err != nil {
+		t.Fatalf("the clone was not rebuilt: %v", err)
+	}
+	if gotClone.PublishedSequence != 0 || gotClone.DurableSequence != 0 || gotClone.LocalSequence != 0 {
+		t.Errorf("a volume that never published came back at %d/%d/%d, want 0/0/0",
+			gotClone.LocalSequence, gotClone.DurableSequence, gotClone.PublishedSequence)
+	}
+}
+
 // Two operators run it at once, or one runs it twice after a partial failure. Both must
 // finish: a rebuild that aborts half-way has written an arbitrary prefix of the catalog
 // and left the operator with no way to know which.
@@ -188,4 +255,88 @@ func mustOneDescriptorKey(t *testing.T, store objectstore.Store) string {
 	}
 	id := objs[0].Key[len("volumes/") : len(objs[0].Key)-len("/descriptor.json")]
 	return id
+}
+
+// The manifest a rebuild reads is the one thing standing between "this volume published
+// at 16" and "this volume never published", and a rebuild runs exactly when the catalog
+// is gone — so every way that read can be wrong has to be a refusal, not a zero. A zero
+// is indistinguishable from a volume that was provisioned and never stopped cleanly, and
+// it disarms both of the Agent's floors: the next attach serves a blank device.
+func TestARebuildRefusesAManifestItCannotTrust(t *testing.T) {
+	tests := []struct {
+		name string
+		// corrupt rewrites the stored manifest. Each one re-frames, so the digest still
+		// matches and the read reaches the check under test rather than stopping at
+		// corruption — the framing is a different guard with its own tests.
+		corrupt func(t *testing.T, payload []byte, otherVolume string) []byte
+		want    string
+	}{
+		{
+			name: "written by a newer format",
+			corrupt: func(t *testing.T, p []byte, _ string) []byte {
+				return bytes.Replace(p, []byte(`"format_version":1`), []byte(`"format_version":2`), 1)
+			},
+			want: "newer format",
+		},
+		{
+			name: "describes another volume, which is a bucket copied under the wrong prefix",
+			corrupt: func(t *testing.T, p []byte, other string) []byte {
+				var man map[string]any
+				if err := json.Unmarshal(p, &man); err != nil {
+					t.Fatal(err)
+				}
+				man["volume_id"] = other
+				out, err := json.Marshal(man)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return out
+			},
+			want: "describes volume",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			md, store, term := cpStore(t)
+			vol, _, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
+			u, err := ids.Parse(vol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view := cow.NewIntervalMap()
+			view.Overwrite(0, []byte("the guest's bytes"))
+			if _, err := image.Publish(ctx, store, &ramp{}, nil, image.OwnLineage([16]byte(u)), view, nil, 16, ""); err != nil {
+				t.Fatal(err)
+			}
+
+			key := image.ManifestKey([16]byte(u))
+			body, err := store.Get(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := framed.Unframe(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutated := tc.corrupt(t, payload, ids.New().String())
+			if bytes.Equal(mutated, payload) {
+				t.Fatalf("the mutation changed nothing: %s", payload)
+			}
+			if _, err := store.Put(ctx, key, framed.Frame(mutated), objectstore.PutOptions{}); err != nil {
+				t.Fatal(err)
+			}
+
+			fresh, _, freshTerm := cpStore(t)
+			// The whole rebuild must fail. Recording the row with a zero and carrying on
+			// would be the silent half: the operator sees a rebuild that "worked".
+			_, err = controlplane.RebuildMetadata(ctx, fresh, store, freshTerm)
+			if err == nil {
+				t.Fatalf("the rebuild accepted a manifest it could not trust (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say %q, which is what tells the operator which object to look at", err, tc.want)
+			}
+		})
+	}
 }

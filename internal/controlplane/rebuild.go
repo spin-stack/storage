@@ -2,11 +2,14 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/spin-stack/storage/internal/descriptor"
+	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -34,7 +37,9 @@ type RebuildSummary struct {
 // # What it restores, and what it cannot
 //
 // It restores what the objects state: geometry, the wrapped DEK with the
-// version that names it, the chain depth and the parent link, and the snapshots that
+// version that names it, the chain depth and the parent link, the sequence each volume's
+// image is published at (see publishedSequence — the two floors an Agent reads at attach
+// are disarmed by a row that says zero), and the snapshots that
 // exist under each volume's prefix. It does **not** restore placement — no volume comes
 // back with a primary host — because no object records one. A rebuilt catalog therefore
 // describes volumes nobody is serving, which is the honest outcome: after losing the
@@ -69,6 +74,11 @@ func RebuildMetadata(ctx context.Context, md metadata.Store, store objectstore.S
 	for _, d := range descs {
 		v := volumeFromDescriptor(d)
 		v.ParentSnapshotID = ""
+		seq, err := publishedSequence(ctx, store, d.VolumeID)
+		if err != nil {
+			return sum, err
+		}
+		v.LocalSequence, v.DurableSequence, v.PublishedSequence = seq, seq, seq
 		if err := md.CreateVolume(ctx, term, v, nil); err != nil {
 			return sum, fmt.Errorf("controlplane: recording volume %s: %w", d.VolumeID, err)
 		}
@@ -117,6 +127,75 @@ func volumeFromDescriptor(d descriptor.Descriptor) metadata.Volume {
 		KEKID:            d.KEKID,
 		DEKKeyID:         d.DEKKeyID,
 	}
+}
+
+// publishedSequence is the sequence a volume's image is frozen at in the bucket, and 0
+// for a volume that has never published one.
+//
+// # Why the rebuild writes this, and why all three columns get it
+//
+// Both of the Agent's attach-time floors are read out of the catalog, and a rebuild that
+// left them at zero would disarm both on the one command an operator runs *after* losing
+// the catalog — which is precisely when a stale or missing image is most likely.
+//
+//   - `published_sequence` is what separates "this volume never published" from "this
+//     volume's image is gone". At zero, a missing manifest reads as a first boot and the
+//     guest is handed a blank device for a volume it has written into. The manifest's own
+//     sequence is the honest answer: the object is there, and it says what it covers.
+//   - `durable_sequence` is the floor a returning Agent must be able to reproduce. What
+//     an object in the store proves is *at least* this much — the image covers everything
+//     up to its sequence, and an object store is a strictly stronger durability claim
+//     than an fdatasync on a host that may not exist any more.
+//
+// Nothing above the manifest's sequence can be proved from any object, and claiming more
+// would be a lie in the expensive direction: the durability floor refuses to serve a
+// volume that comes back below it, so an invented number is a volume that is fine and
+// will not start. So all three columns get the one number the bucket states, and a volume
+// with no manifest keeps its zeros.
+//
+// The parse is here rather than a call into `image` because the only reader there —
+// `image.Load` — pulls every chunk through the volume's DEK, and a rebuild by definition
+// runs for an operator who has the bucket and not the key material (see the KEK note in
+// rebuildSnapshots). `image.readManifest` is the function this wants and it is
+// unexported; until it is exported, TestRebuildMetadataRecordsWhatTheImageProves is what
+// keeps the two from drifting apart — it publishes through the real `image.Publish` and
+// reads the sequence back through here.
+func publishedSequence(ctx context.Context, store objectstore.Store, volumeID string) (int64, error) {
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		return 0, fmt.Errorf("controlplane: volume %q is not a uuid (INV-22): %w", volumeID, err)
+	}
+	key := image.ManifestKey([16]byte(u))
+	body, err := store.Get(ctx, key)
+	if errors.Is(err, objectstore.ErrNotFound) {
+		// Never published. Not an error and not a gap: a volume that was provisioned and
+		// never cleanly stopped has a descriptor and no image, and that is the state its
+		// row must come back in.
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("controlplane: reading %s: %w", key, err)
+	}
+	payload, err := framed.Unframe(body)
+	if err != nil {
+		return 0, fmt.Errorf("controlplane: reading %s: %w", key, err)
+	}
+	var man image.Manifest
+	if err := json.Unmarshal(payload, &man); err != nil {
+		return 0, fmt.Errorf("controlplane: parsing %s: %w", key, err)
+	}
+	if err := framed.CheckVersion(man.FormatVersion); err != nil {
+		return 0, fmt.Errorf("controlplane: %s: %w", key, err)
+	}
+	// The same check listDescriptors makes, for the same reason: a bucket copied under
+	// the wrong prefix would otherwise stamp one volume's sequence onto another's row.
+	if man.VolumeID != volumeID {
+		return 0, fmt.Errorf("controlplane: the manifest at %s describes volume %s", key, man.VolumeID)
+	}
+	if man.Sequence > math.MaxInt64 {
+		return 0, fmt.Errorf("controlplane: the manifest at %s claims sequence %d", key, man.Sequence)
+	}
+	return int64(man.Sequence), nil
 }
 
 // listDescriptors reads every volume descriptor in the bucket. A descriptor that fails
