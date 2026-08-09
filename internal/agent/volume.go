@@ -362,17 +362,64 @@ type ListenFunc func(socket string) (vhost.Listener, error)
 // because ADR-0021 keeps this type from knowing what a Control Plane is.
 type KeysFunc func(ctx context.Context, volumeID string) (VolumeKeys, error)
 
+// ErrNoKEK is a volume the catalog records as encrypted, on an Agent that holds no
+// key-encryption key. It is a sentinel because "this host cannot open this volume" and
+// "this host was started wrong" want different answers from whoever is watching: the
+// first is a placement or a key-distribution problem, the second is one missing flag on
+// one process, and the fix is to restart it with -kek-file.
+var ErrNoKEK = errors.New("agent: this Agent holds no key-encryption key (no -kek-file) and the volume was provisioned with one")
+
 // encryptionFor unwraps this volume's DEK and binds it to the volume (§15.1). It
-// returns nil, nil for an Agent with no KMS — the dev/local mode — and an error for
-// every other failure, because the alternative to encrypting is not "encrypt later",
-// it is writing this guest's data into the bucket in the clear.
+// returns nil, nil only for a volume the catalog says was provisioned without a KEK —
+// the dev/local mode of §15 — and an error for every other failure, because the
+// alternative to encrypting is not "encrypt later", it is writing this guest's data
+// into the bucket in the clear.
+//
+// **The key material is fetched before the KMS is consulted, and that order is the
+// guard.** It used to be the other way round: an Agent with no KMS returned nil here
+// without ever asking what the volume was provisioned with, so a volume whose row
+// carries a kek_id was served unencrypted — `encrypted=false` on the serving line, the
+// guest's writes in the WAL in cleartext, and at detach an image of raw guest plaintext
+// published under keys that say `<nonce:12><ct><tag:16>`. Nothing failed, nothing was
+// retried, and §15.3's crypto-shredding guarantee was gone for that volume: destroying
+// the DEK leaves those objects readable. The only thing against it was one WARN at
+// start-up, which is process-wide, printed once, and says nothing about any volume.
+//
+// A KEK-less Agent may still serve volumes provisioned without one, which is what the
+// dev/local mode is and what the DST harness and the QEMU lane run as. What it may not
+// do is decide, on its own, that a volume the fleet encrypted is now a plaintext volume.
 func (m *VolumeManager) encryptionFor(ctx context.Context, id string, vol [16]byte) (*wal.Encryption, error) {
-	if m.deps.KMS == nil {
-		return nil, nil //nolint:nilnil // no KMS is a mode, not a failure: see VolumeManagerDeps.KMS
+	if m.deps.Keys == nil {
+		// Neither a KMS nor a source of key material: there is nothing to ask and
+		// nothing to ask about. NewVolumeManager refuses a KMS without Keys, and
+		// `cmd/volume-agent` wires Keys whether or not it was given a -kek-file, so the
+		// only callers that land here are in-process ones (the DST harness,
+		// integration/vhost) whose volumes have no catalog row behind them at all.
+		return nil, nil //nolint:nilnil // no keys at all is a mode, not a failure: see VolumeManagerDeps.KMS
 	}
 	keys, err := m.deps.Keys(ctx, id)
 	if err != nil {
+		// Fail closed, on this host's *only* way of learning whether the volume is
+		// encrypted. Not knowing is not the same as "not encrypted", and the direction
+		// of the mistake is not symmetric: refusing an unencrypted volume costs an
+		// attach that the next cycle retries, serving an encrypted one in the clear
+		// costs the guarantee outright and reports nothing.
 		return nil, fmt.Errorf("agent: volume %s: reading key material: %w", id, err)
+	}
+	if m.deps.KMS == nil {
+		// The dev/local mode is exactly this: a volume the catalog says nobody wrapped.
+		// kek_id and dek_wrapped are checked together because either one, on its own,
+		// is a row that says "this volume's bytes are sealed" — and this Agent could
+		// not open them nor produce them.
+		if keys.KEKID == "" && len(keys.DEKWrapped) == 0 {
+			return nil, nil //nolint:nilnil // provisioned without a KEK: the §15 dev mode, and it stays
+		}
+		// Per volume and by name, because that is what the start-up WARN could never
+		// be. Returned rather than logged here: `Loop.Run` prints every failed cycle,
+		// so this reaches the operator once per cycle, with the volume and the KEK in
+		// it, for as long as the host is wired this way.
+		return nil, fmt.Errorf("%w: volume %s is wrapped under KEK %q, so this host can neither read its image nor seal what a guest writes; it is not served",
+			ErrNoKEK, id, keys.KEKID)
 	}
 	if keys.KEKID != m.deps.KMS.KEKID() {
 		// Not a §15.1 rotation — that is the *DEK* rotating under one KEK. This is the
@@ -473,11 +520,17 @@ type VolumeManagerDeps struct {
 	// Store is where FLUSH makes a write durable (§14.4). Nil is local-only mode: the
 	// device serves and takes writes, and no FLUSH ever claims remote durability.
 	Store objectstore.Store
-	// KMS unwraps a volume's DEK, and Keys is where the wrapped one comes from. Both
-	// or neither: an Agent with no KMS runs unencrypted, which is the dev/local mode
-	// (§6.2) the DST harness and the QEMU lane use and which claims nothing it does
-	// not do. An Agent *with* a KMS encrypts every volume it serves or serves none of
-	// them — see start. §15.1 puts the unwrap at attach and nowhere else: one KMS call
+	// KMS unwraps a volume's DEK, and Keys is where the wrapped one comes from.
+	//
+	// An Agent with no KMS runs unencrypted, which is the dev/local mode (§6.2) the DST
+	// harness and the QEMU lane use — but only for volumes the catalog says were
+	// provisioned without a KEK. Keys is consulted whether or not there is a KMS, and it
+	// is what decides that (see encryptionFor): "this host was started without a key" is
+	// not a licence to reclassify an encrypted volume as a plaintext one. This is why
+	// `cmd/volume-agent` wires Keys even when it was given no -kek-file.
+	//
+	// An Agent *with* a KMS encrypts every volume it serves or serves none of them —
+	// see start. §15.1 puts the unwrap at attach and nowhere else: one KMS call
 	// outside the data path, and the DEK lives in memory only.
 	KMS  crypto.KMS
 	Keys KeysFunc
