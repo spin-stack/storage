@@ -146,6 +146,10 @@ type Log struct {
 	published uint64
 	replayed  bool // this log rebuilt itself from the WAL file's contents
 
+	// resume is what replay found on the device, set once by Resume and never after.
+	// See ResumeReport for why the numbers in it are not derivable from the watermarks.
+	resume ResumeReport
+
 	view   *cow.IntervalMap
 	limits Limits
 	enc    *Encryption // nil = plaintext WAL
@@ -179,6 +183,21 @@ type Log struct {
 
 	rec      *obs.Recorder // nil = telemetry not wired (no-op)
 	volLabel string
+}
+
+// ResumeReport reports what replay found when this log was rebuilt from the device: how
+// far the local WAL actually got, and what it had to throw away to get there. A log that
+// was not built by Resume returns the zero report.
+//
+// It is separate from Watermarks() because the watermarks cannot answer the question.
+// Local is max(the floor the caller handed in, the highest sequence replayed), so a
+// caller reading it cannot tell "the WAL still held records up to N" from "the WAL held
+// nothing and N was the floor" — and those two are the difference between a healthy
+// restart and one that lost acknowledged writes.
+func (l *Log) ResumeReport() ResumeReport {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.resume
 }
 
 // TruncatedUpTo reports the sequence below which local WAL has been reclaimed.

@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/simio/clock"
@@ -76,6 +77,49 @@ func ResumeAwaitingBase(d disk.Disk, root string, clk clock.Clock, volumeID [16]
 	return resume(d, root, clk, volumeID, epoch, 0, limits, enc, true)
 }
 
+// ResumeReport is what replay found on the device, returned by Log.ResumeReport.
+//
+// RecoveredSequence is the whole point of the type: it is the highest sequence the local
+// segments still held, and nothing else in the log reports it. The watermark that looks
+// like it does — Watermarks().Local — is max(the floor the caller passed in, what replay
+// found), so it reads the same whether the WAL held records up to N or held nothing at
+// all above a floor of N.
+//
+// # What the caller owes this
+//
+// The Control Plane's catalog holds durable_sequence for the volume: the sequence *this
+// host* ACKed, which is the promise a guest's fsync returned on. Resume cannot check it
+// — the number lives in Postgres and this package has no catalog, deliberately — so the
+// layer that has both must:
+//
+//	rep := log.ResumeReport()
+//	if rep.Resumed && rep.RecoveredSequence < catalogDurableSequence {
+//	        // refuse to serve; this device no longer holds writes a guest was told
+//	        // were durable, and serving the volume answers reads with the survivors
+//	}
+//
+// That comparison is the one that catches the reproduced failure: a segment whose tail
+// was lost replays 14 of 15 records, the catalog still says 15, and the only thing that
+// noticed was the tenant's guest failing a read-back. Below the durable point, "resume
+// succeeded" is not the same statement as "the volume is intact", and only the caller
+// can tell them apart.
+type ResumeReport struct {
+	// Resumed distinguishes a log rebuilt from a WAL directory from a fresh one, whose
+	// zero RecoveredSequence must not be compared against anything.
+	Resumed bool
+	// Records is how many records replay folded back into the view.
+	Records int
+	// RecoveredSequence is the highest sequence found on the device, 0 if none.
+	RecoveredSequence uint64
+
+	// TornTail is set when replay stopped short of the newest segment's end: the bytes
+	// after StoppedAtOffset were a partial record and have been cut off.
+	TornTail        bool
+	TornSegment     string
+	StoppedAtOffset int64
+	DiscardedBytes  int64
+}
+
 func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, durableInS3 uint64, limits Limits, enc *Encryption, awaitBase bool) (*Log, error) {
 	l := NewLogAfter(d, root, clk, volumeID, epoch, durableInS3, limits)
 	if awaitBase {
@@ -90,11 +134,12 @@ func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch,
 
 	scan, err := scanSegments(d, l.segs.dir, volumeID, epoch)
 	if err != nil {
-		return nil, fmt.Errorf("wal: resume: %w", err)
+		return nil, fmt.Errorf("wal: resume: %w%s", err, repairHint(d, l.segs.dir))
 	}
 	if err := l.segs.adopt(scan); err != nil {
 		return nil, fmt.Errorf("wal: resume: %w", err)
 	}
+	l.resume = describeScan(scan)
 
 	for _, rec := range scan.records {
 		if rec.VolumeID != volumeID {
@@ -111,8 +156,118 @@ func resume(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch,
 		if rec.Sequence > l.local {
 			l.local = rec.Sequence
 		}
+		if rec.Sequence > l.resume.RecoveredSequence {
+			l.resume.RecoveredSequence = rec.Sequence
+		}
 	}
+	l.announceDiscard(volumeID, epoch)
 	return l, nil
+}
+
+// describeScan turns what the scan found into the report the caller reads back.
+//
+// The stub case — a file too short to hold a header, which adopt has just removed — is
+// counted as discarded bytes too. It carried no records (a header is written and synced
+// before the segment is used), so nothing was lost, but a resume that quietly unlinks a
+// file is exactly the shape this whole change exists to stop being quiet about.
+func describeScan(scan scanResult) ResumeReport {
+	rep := ResumeReport{Resumed: true, Records: len(scan.records)}
+	if len(scan.segs) == 0 {
+		return rep
+	}
+	newest := scan.segs[len(scan.segs)-1]
+	switch {
+	case scan.torn:
+		rep.TornTail = true
+		rep.TornSegment = newest.name
+		rep.StoppedAtOffset = scan.cleanLen
+		rep.DiscardedBytes = newest.size - scan.cleanLen
+	case scan.stub && newest.size > 0:
+		rep.TornSegment = newest.name
+		rep.DiscardedBytes = newest.size
+	}
+	return rep
+}
+
+// announceDiscard is the one moment this process knows records were thrown away.
+//
+// Cutting a torn tail is correct — a partial record was never durable, INV-05 makes
+// replay return the intact prefix — and doing it in silence is not. Before this, a
+// restart over a WAL whose last append was cut short replayed the prefix, trimmed the
+// file, served the volume and logged nothing distinguishable from a clean start; the
+// tenant's guest was the only component that noticed, by failing a read-back. The line
+// carries the volume, the epoch, the segment, where parsing stopped and how much went,
+// because those are what an operator needs to decide whether the lost record mattered,
+// and recovered_sequence because that is the number to compare against the catalog's
+// durable_sequence.
+//
+// It logs nothing when nothing was discarded. A warning printed on every restart is read
+// on none of them.
+func (l *Log) announceDiscard(volumeID [16]byte, epoch uint64) {
+	if l.resume.DiscardedBytes == 0 {
+		return
+	}
+	msg := "wal resume discarded a torn tail: the bytes after this offset were a partial record, were never durable, and are gone"
+	if !l.resume.TornTail {
+		msg = "wal resume discarded a segment stub: the crash landed between creating the file and writing its header, so it held no records"
+	}
+	slog.Warn(msg,
+		"volume_id", format.UUIDString(volumeID),
+		"epoch", epoch,
+		"segment", l.resume.TornSegment,
+		"stopped_at_offset", l.resume.StoppedAtOffset,
+		"discarded_bytes", l.resume.DiscardedBytes,
+		"recovered_sequence", l.resume.RecoveredSequence,
+	)
+}
+
+// repairHint names the first byte of the WAL that cannot be decoded, so a scan failure
+// tells an operator what to do rather than only that something is wrong.
+//
+// The failure it is for: bytes that are not a partial record sit in a segment — a stray
+// append, a device that handed back garbage, a file restored over a live one. Replay
+// stops there, every record after it is unreachable, and resume fails. That is the right
+// outcome and this does not change it: a wedged volume an operator can fix is fine, a
+// silently shortened one is not. What was missing was the exit. `wal/format: bad magic`,
+// retried by the reconcile loop every five seconds forever, names no file, no offset and
+// no action; truncating the named segment to the named offset resumes at the last whole
+// record and discards exactly the bytes named.
+//
+// It re-reads the directory instead of taking the position from the scan, because the
+// scan reports no position on its error path and that path lives in a file this change
+// does not own. The cost is one extra pass over a WAL that has already failed to open,
+// and nothing at all on a WAL that opens.
+//
+// It returns "" whenever the failure is not a truncation away from readable — an
+// unreadable segment header, a foreign volume or epoch, a gap in the directory — so the
+// error never suggests a repair that would destroy data.
+func repairHint(d disk.Disk, dir string) string {
+	names, err := listSegments(d, dir)
+	if err != nil {
+		return ""
+	}
+	for i, name := range names {
+		last := i == len(names)-1
+		buf, err := readWholeFile(d, name)
+		if err != nil || len(buf) < format.SegmentHeaderSize {
+			return ""
+		}
+		if _, err := format.UnmarshalSegmentHeader(buf); err != nil {
+			return ""
+		}
+		body := buf[format.SegmentHeaderSize:]
+		_, consumed, perr := replayPrefix(body)
+		if perr == nil && (consumed == len(body) || last) {
+			// A clean segment, or the newest one ending in a torn tail — which is
+			// allowed and is not what the scan is failing on.
+			continue
+		}
+		off := int64(format.SegmentHeaderSize + consumed)
+		return fmt.Sprintf(" (repair: %s holds %d bytes and stops decoding at offset %d;"+
+			" truncating it to %d bytes discards %d unreadable bytes and resumes at the last whole record)",
+			name, len(buf), off, off, int64(len(buf))-off)
+	}
+	return ""
 }
 
 // replayRecord folds one replayed record back into the read view, decrypting a WRITE
