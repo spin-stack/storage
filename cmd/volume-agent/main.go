@@ -232,7 +232,7 @@ func run() (err error) {
 		DataDirLabel: *dataDir,
 		SocketDir:    *socketDir,
 		// One attempt's bound, not the teardown's: see -shutdown-grace, and
-		// SHUTDOWN-PUBLISH-SPEC's "REVIEWED AND DECIDED" for why there is no budget
+		// The reviewed decision: there is no budget
 		// after which this process gives a session up.
 		ShutdownGrace: *grace,
 		// Every Log this manager builds is bounded by its share of this (ADR-0013 §1).
@@ -315,7 +315,7 @@ func run() (err error) {
 
 // shutdown publishes every session this host was serving and does not come back until it
 // has — holding the data-directory lock, and therefore this process's life, for as long
-// as that takes (SHUTDOWN-PUBLISH-SPEC, "REVIEWED AND DECIDED").
+// as that takes.
 //
 // Two things make that legible instead of merely stubborn, and they are both here:
 //
