@@ -132,7 +132,7 @@ func (l *Loop) Run(ctx context.Context) error {
 // Sustain keeps this host visible to the Control Plane while the Agent is shutting down
 // and cannot yet let go — a publish that keeps failing holds the data directory, and this
 // is what keeps the fleet able to see the difference between a host that is stuck and a
-// host that is gone (SHUTDOWN-PUBLISH-SPEC, "REVIEWED AND DECIDED"). It returns when ctx
+// host that is gone. It returns when ctx
 // is done, which is when the teardown has finished one way or another.
 //
 // It is a *reduced* cycle, and each omission is deliberate:
