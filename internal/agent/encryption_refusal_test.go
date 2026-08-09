@@ -36,7 +36,13 @@ func TestAKEKlessAgentRefusesAVolumeTheCatalogSaysIsEncrypted(t *testing.T) {
 		keys func(volumeID string) (agent.VolumeKeys, error)
 		// wantErr is the sentinel the refusal must carry, where there is one to carry.
 		wantErr error
-		served  bool
+		// wantRefusal is what the *next report* says about the volume. It is the
+		// separate half of the same refusal: everything else here is what the guest
+		// cannot do, and this is the only thing anything outside the host can see.
+		// A volume that never started is in no report at all unless this is set, and
+		// an absence on the wire is indistinguishable from a volume nobody placed here.
+		wantRefusal storagev1.VolumeRefusal
+		served      bool
 	}{
 		{
 			name: "the catalog says it was wrapped under a KEK this host does not hold",
@@ -46,12 +52,17 @@ func TestAKEKlessAgentRefusesAVolumeTheCatalogSaysIsEncrypted(t *testing.T) {
 				}, nil
 			},
 			wantErr: agent.ErrNoKEK,
+			// NO_KEY and not the catch-all: the fix is one flag on one process, or a
+			// placement, and that is a different page of the runbook from a socket that
+			// would not bind.
+			wantRefusal: storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_KEY,
 		},
 		{
 			name: "the catalog cannot be asked, so whether it is encrypted is unknown",
 			keys: func(string) (agent.VolumeKeys, error) {
 				return agent.VolumeKeys{}, errors.New("the control plane refused")
 			},
+			wantRefusal: storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED,
 		},
 		{
 			name:   "the catalog says it was provisioned without one: the dev mode of §15",
@@ -123,6 +134,17 @@ func TestAKEKlessAgentRefusesAVolumeTheCatalogSaysIsEncrypted(t *testing.T) {
 			}
 			if !strings.Contains(applyErr.Error(), id) {
 				t.Fatalf("the refusal does not name the volume, so the operator cannot tell which one it is: %v", applyErr)
+			}
+			// And it reaches the fleet. `applyErr` goes to slog and the cycle's backoff
+			// and nowhere else, so before this the volume simply stopped appearing on the
+			// wire — the catalog kept whatever watermarks last worked and -fleet-status
+			// printed a healthy row for a volume with no runtime behind it.
+			got := reportFor(t, m, id)
+			if got.Refusal != tc.wantRefusal {
+				t.Fatalf("the report says refusal=%s, want %s", got.Refusal, tc.wantRefusal)
+			}
+			if !strings.Contains(got.RefusalDetail, id) {
+				t.Fatalf("refusal detail = %q, which does not name the volume", got.RefusalDetail)
 			}
 		})
 	}

@@ -285,6 +285,99 @@ func (r CordonReason) MayOverwrite(current CordonReason) bool {
 // it anyway, which is the one outcome this whole type exists to prevent.
 func (r CordonReason) OverwritableNames() []string { return names(cordonOverwrite[r]) }
 
+// --- Why a volume is not being served by the host that holds it ---
+
+// Refusal is why the Agent that holds a volume is not serving it. It is the fleet-side
+// name for the fail-closed decisions the data path makes at attach: the image the
+// catalog says exists is not in the bucket, the volume came back below the sequence a
+// guest was told was durable, the read view never resolved, the host has no key for an
+// encrypted volume, or the host's lease lapsed and it gave the device up.
+//
+// **It is a closed vocabulary and not a free string.** Both are defensible and the
+// choice is worth writing down. A string needs no schema change when a new refusal
+// appears and carries the Agent's own sentence — but the string that would actually be
+// stored is `err.Error()`, which embeds a volume id and a sequence number, so no two
+// rows ever compare equal, the `-fleet-status` column becomes a vocabulary nobody
+// controls, and the first alert anyone writes on it matches a substring. Every value
+// here is a decision made at a named line in internal/agent, so a new refusal is a new
+// code path in this repository and extending the vocabulary is the same commit: the
+// cost of the closed set falls on the person who is already editing both sides.
+//
+// The sentence an operator's next step needs — which sequence, which key — is carried
+// alongside as free text that nothing branches on (metadata.Volume.RefusalDetail). Same
+// split as a snapshot's id and its error message.
+//
+// RefusalNone is the zero value and it means "this host is serving the volume". That is
+// what makes the field self-clearing: every accepted report writes it, so a volume that
+// starts serving again overwrites the reason rather than needing anything to notice.
+type Refusal string
+
+// Refusals. The empty value is stored, never argued: a report that names no refusal is
+// a host saying it is serving the volume.
+const (
+	RefusalNone Refusal = ""
+	// RefusalImageMissing: the catalog says the volume published an image and the
+	// object store holds none (agent.ErrImageMissing).
+	RefusalImageMissing Refusal = "IMAGE_MISSING"
+	// RefusalDurabilityLost: replay came back below the sequence the catalog last
+	// recorded as ACKed to a guest (agent.ErrDurabilityLost).
+	RefusalDurabilityLost Refusal = "DURABILITY_LOST"
+	// RefusalNoReadView: the read view never resolved, so every read fails and the
+	// session will not be published (agent.ErrNoReadView, wal.ErrBaseUnavailable).
+	RefusalNoReadView Refusal = "NO_READ_VIEW"
+	// RefusalNoKey: the catalog says the volume is encrypted and this Agent holds no
+	// KEK, or holds the wrong one (agent.ErrNoKEK).
+	RefusalNoKey Refusal = "NO_KEY"
+	// RefusalLeaseLost: the host lease lapsed on the Agent's own monotonic clock, so
+	// it gave the device up rather than keep answering for a volume it can no longer
+	// confirm it owns.
+	RefusalLeaseLost Refusal = "LEASE_LOST"
+	// RefusalAttachFailed: everything else that stopped the runtime from starting — a
+	// socket that could not be bound, a WAL that would not resume, the host's own
+	// -max-volumes ceiling. It is a catch-all on purpose: without one, a refusal with
+	// no enum value of its own would be invisible again, which is the whole failure
+	// this vocabulary exists to close.
+	RefusalAttachFailed Refusal = "ATTACH_FAILED"
+)
+
+var refusals = []Refusal{
+	RefusalNone, RefusalImageMissing, RefusalDurabilityLost, RefusalNoReadView,
+	RefusalNoKey, RefusalLeaseLost, RefusalAttachFailed,
+}
+
+// Refusals returns every stored value, RefusalNone included.
+func Refusals() []Refusal { return refusals }
+
+// ParseRefusal converts a stored value, rejecting anything else.
+func ParseRefusal(raw string) (Refusal, error) {
+	r := Refusal(raw)
+	if !r.Valid() {
+		return "", fmt.Errorf("%w: volume refusal %q", ErrUnknownState, raw)
+	}
+	return r, nil
+}
+
+func (r Refusal) String() string { return string(r) }
+
+// Valid reports whether r is a declared value (RefusalNone included).
+func (r Refusal) Valid() bool {
+	for _, candidate := range refusals {
+		if candidate == r {
+			return true
+		}
+	}
+	return false
+}
+
+// Refused reports whether r says the volume is not being served. It is the predicate
+// -fleet-status counts with, and it is a method rather than `!= ""` at each call site
+// so that a value added above is covered by whoever forgets to update a comparison.
+func (r Refusal) Refused() bool { return r != RefusalNone && r.Valid() }
+
+// RefusalNames is the vocabulary as stored strings — the schema's CHECK list, and what
+// a test compares the two against so the Go type and the column cannot drift.
+func RefusalNames() []string { return names(refusals) }
+
 // --- Volume ownership state, Control Plane side (§7) ---
 
 // VolumeState is the Control Plane's view of a volume's writer ownership (§7).

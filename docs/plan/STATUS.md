@@ -26,18 +26,15 @@ waves — `git log`). What is below is what those fixes left behind, not what th
    image-missing floor only arms from the session *after* a publish. The `durable_sequence`
    floor covers the gap wherever the loss is real, which is why this is a residual and not a
    blocker. Closing it means the Agent reporting the sequence it just published.
-2. **A refused volume is invisible in the fleet.** Both new floors log one ERROR at attach
-   and then nothing; `-fleet-status` shows the volume as normal. It needs a field on
-   `VolumeReport` and a column.
-3. **`internal/lineage/flatten.go` still reads `ErrNotPublished` as "never published".** An
+2. **`internal/lineage/flatten.go` still reads `ErrNotPublished` as "never published".** An
    operator flattening a clone whose own image vanished would write down the ancestry and
    drop the clone's own layer — the same ambiguity the attach path just closed, on the one
    path that was not on the attach path.
-4. **The read view's bound is a constant, not a derivation.** `MaxViewBytes` defaults to
+3. **The read view's bound is a constant, not a derivation.** `MaxViewBytes` defaults to
    256 MiB. The device bound is one volume's share of a device the Agent measured with
    `statfs`; the honest counterpart is one volume's share of measured RAM, and that lives in
    `internal/agent`.
-5. **Bring-up has three sharp edges**, all hit walking it by hand: `-holder-id` is required
+4. **Bring-up has three sharp edges**, all hit walking it by hand: `-holder-id` is required
    and documented only in the error; a `-vhost-socket-dir` over ~107 bytes fails as an
    opaque `bind: invalid argument` retried for ever (`sun_path` is 108); and applying
    `schema.sql` to a fresh database needs a `psql` nothing in the repo provides.
@@ -52,7 +49,11 @@ waves — `git log`). What is below is what those fixes left behind, not what th
   no resume path.
 - **No bucket lifecycle is configured by any code**, so a delete marker is reversible for as
   long as nobody sets one — which is the whole recovery window.
-- **No alerting artifact exists** (no rules file, no threshold comparison in code).
+- **No alerting artifact exists** (no rules file, no threshold comparison in code) — including
+  for `volumes.refusal`, which is now the fleet's one machine-readable "this volume is down".
+- **No e2e scenario asserts a refusal reaching `-fleet-status`.** It is proven by the seam
+  tests and by hand against real binaries (2026-08-09, NO_KEY and IMAGE_MISSING); the lane
+  that boots a guest is where a refusal *caused by a guest's own history* belongs.
 - **No distributed tracing.** Metrics reach a collector over OTLP; `request_id` correlates
   nothing.
 - **No `/healthz`**, and a Control Plane that lost its term serves broken forever (the term is

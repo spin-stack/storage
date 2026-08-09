@@ -73,6 +73,8 @@ type Volume struct {
 	LocalSequence     int64              `json:"local_sequence"`
 	DurableSequence   int64              `json:"durable_sequence"`
 	PublishedSequence int64              `json:"published_sequence"`
+	Refusal           string             `json:"refusal"`
+	RefusalDetail     string             `json:"refusal_detail"`
 	FencingStartedAt  pgtype.Timestamptz `json:"fencing_started_at"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`

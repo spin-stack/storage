@@ -275,7 +275,7 @@ func (q *Queries) DeleteVolume(ctx context.Context, arg DeleteVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -299,6 +299,8 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.LocalSequence,
 		&i.DurableSequence,
 		&i.PublishedSequence,
+		&i.Refusal,
+		&i.RefusalDetail,
 		&i.FencingStartedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -307,7 +309,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumes = `-- name: ListVolumes :many
-SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
 `
 
 // Every volume, placed or not, for a human reading the catalog. The volumes with a
@@ -345,6 +347,8 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 			&i.LocalSequence,
 			&i.DurableSequence,
 			&i.PublishedSequence,
+			&i.Refusal,
+			&i.RefusalDetail,
 			&i.FencingStartedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
@@ -360,7 +364,7 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -391,6 +395,8 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.LocalSequence,
 			&i.DurableSequence,
 			&i.PublishedSequence,
+			&i.Refusal,
+			&i.RefusalDetail,
 			&i.FencingStartedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
@@ -411,6 +417,8 @@ UPDATE volumes
        state = CASE WHEN $1::uuid IS NULL
                     THEN 'DETACHED' ELSE 'ACTIVE' END,
        fencing_started_at = NULL,
+       refusal = '',
+       refusal_detail = '',
        updated_at = now()
  WHERE volume_id = $2
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
@@ -452,12 +460,73 @@ type SetVolumePrimaryHostParams struct {
 // fencing_started_at is cleared for the same reason SetVolumeState clears it when
 // leaving FENCING_WAIT (ADR-0015): neither ACTIVE nor DETACHED is that state, and a
 // dwell left behind would be inherited by the next promotion instead of being waited.
+//
+// The refusal goes with it, and for the same shape of reason one step further out: it
+// is a statement about a host, made by that host, and this statement is the volume
+// leaving that host. Left behind, a volume detached from the machine that could not
+// open it would still print NOT_SERVED after being placed somewhere that serves it
+// perfectly, until that new host's first report happened to overwrite it — an
+// explanation outliving its cause, which is the one failure a reason column has.
 func (q *Queries) SetVolumePrimaryHost(ctx context.Context, arg SetVolumePrimaryHostParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setVolumePrimaryHost,
 		arg.PrimaryHostID,
 		arg.VolumeID,
 		arg.Term,
 		arg.AllowedStates,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setVolumeRefusal = `-- name: SetVolumeRefusal :execrows
+UPDATE volumes
+   SET refusal = $1::text,
+       -- One statement, so the two can never disagree: an explanation with nothing to
+       -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
+       refusal_detail = CASE WHEN $1::text = ''
+                            THEN '' ELSE $2::text END,
+       updated_at = now()
+ WHERE volume_id = $3
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $4
+   AND primary_host_id = $5::uuid
+   AND current_epoch = $6
+`
+
+type SetVolumeRefusalParams struct {
+	Refusal       string    `json:"refusal"`
+	RefusalDetail string    `json:"refusal_detail"`
+	VolumeID      uuid.UUID `json:"volume_id"`
+	Term          int64     `json:"term"`
+	HostID        uuid.UUID `json:"host_id"`
+	Epoch         int64     `json:"epoch"`
+}
+
+// Record why the host holding this volume is not serving it, or clear the record when
+// it is. Term-guarded like every other mutation, and — unlike every other one —
+// qualified by the *reporting* host and epoch.
+//
+// That predicate is the whole design of this column, and it is exactly what
+// UpdateVolumeWatermarks must not have. A watermark is the newest of a monotonic
+// series, so GREATEST makes a late report from a fenced writer harmless. A refusal is a
+// state about right now, so it has to be last-report-wins — and "last" over an
+// unqualified UPDATE means a host the fleet moved past can mark a volume NOT SERVED
+// while its successor is serving it, with the term guard passing, because promotion
+// does not change the CP term. Written here rather than checked in Go for the reason
+// every other guard in this file is: between a GetVolume and an UPDATE the volume can
+// be promoted, and the window is the failure.
+//
+// 0 rows is therefore a normal answer and not an error: it is a writer that has been
+// fenced, whose opinion about whether the volume is being served is void.
+func (q *Queries) SetVolumeRefusal(ctx context.Context, arg SetVolumeRefusalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setVolumeRefusal,
+		arg.Refusal,
+		arg.RefusalDetail,
+		arg.VolumeID,
+		arg.Term,
+		arg.HostID,
+		arg.Epoch,
 	)
 	if err != nil {
 		return 0, err

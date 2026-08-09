@@ -449,6 +449,12 @@ func (s *Store) SetVolumePrimaryHost(_ context.Context, term int64, volumeID, pr
 	// SetVolumeState's, spelled here rather than shared: there are two lines of it and
 	// a helper would hide which write owns the field.
 	v.FencingStartedAt = time.Time{}
+	// And the refusal, for the same shape of reason one step out: it is a statement
+	// about a host, made by that host, and this write is the volume leaving that host.
+	// Left behind, a volume detached from the machine that could not open it would keep
+	// printing NOT_SERVED wherever it landed next, until that host's first report
+	// happened to overwrite it.
+	v.Refusal, v.RefusalDetail = lifecycle.RefusalNone, ""
 	s.vols[volumeID] = v
 	return nil
 }
@@ -531,6 +537,46 @@ func (s *Store) DeleteVolume(_ context.Context, term int64, volumeID string) err
 		delete(s.snaps, id)
 	}
 	delete(s.vols, volumeID)
+	return nil
+}
+
+// SetVolumeRefusal records, or clears, why the volume's host is not serving it.
+// metadata.Store carries the whole reasoning; the two lines that matter here are the
+// guard and its non-error.
+func (s *Store) SetVolumeRefusal(_ context.Context, term int64, volumeID, hostID string, epoch int64,
+	refusal lifecycle.Refusal, detail string,
+) error {
+	if err := requireID("volume", volumeID); err != nil {
+		return err
+	}
+	if !refusal.Valid() {
+		return fmt.Errorf("%w: volume refusal %q", lifecycle.ErrUnknownState, refusal)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkTerm(term); err != nil {
+		return err
+	}
+	v, ok := s.vols[volumeID]
+	if !ok {
+		return metadata.ErrNotFound
+	}
+	// The fencing guard, and the reason this is not a read-then-write in the caller:
+	// between a GetVolume and this line the volume can be promoted away, and the whole
+	// point of the column is that a host the fleet has moved past cannot write it. In
+	// Postgres it is one UPDATE ... WHERE primary_host_id = $ AND current_epoch = $;
+	// here it is these three lines, and both must answer the same way.
+	if v.PrimaryHostID != hostID || v.CurrentEpoch != epoch {
+		return nil
+	}
+	// A detail with no refusal is a sentence about nothing — it would outlive the
+	// condition it explains, which is the mistake hosts.cordon_reason exists not to
+	// repeat. Cleared together, always.
+	v.Refusal, v.RefusalDetail = refusal, detail
+	if !refusal.Refused() {
+		v.RefusalDetail = ""
+	}
+	s.vols[volumeID] = v
 	return nil
 }
 

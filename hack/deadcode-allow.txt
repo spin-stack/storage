@@ -47,6 +47,8 @@ internal/lease.Manager.Grant  # used by internal/lease, internal/wal and interna
 internal/lifecycle.HostStates       # walked by lifecycle_test and by pg_integration_test against the column's CHECK
 internal/lifecycle.CordonReasons    # same
 internal/lifecycle.VolumeStates     # same
+internal/lifecycle.Refusals         # walked by cpserver/refusal_test against every VolumeRefusal the wire declares, so a value can never exist on one side only
+internal/lifecycle.RefusalNames     # compared with volumes.refusal's CHECK list by schema/refusal_test, the same drift the three above are guarded from
 
 # --- the observability test provider ----------------------------------------------------
 # obs.NewTestProvider is why every metric in this repository is proven by reading the

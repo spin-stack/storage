@@ -200,10 +200,29 @@ func (l *Loop) nextDelay(err error) time.Duration {
 	return delay
 }
 
-// Reconcile runs one cycle: heartbeat, read the desired state, report what this
-// host observed. It stops at the first failure — a Control Plane that did not
-// answer the heartbeat has nothing useful to say to the rest of the cycle — and the
-// lease is left to run down, which is what fences this host if the condition lasts.
+// Reconcile runs one cycle: heartbeat, read the desired state, serve it, report what
+// this host observed. It stops at the first failure of the three calls to the Control
+// Plane — one that did not answer the heartbeat has nothing useful to say to the rest of
+// the cycle — and the lease is left to run down, which is what fences this host if the
+// condition lasts.
+//
+// **A failure to serve the desired state is the one exception, and it is the point.**
+// Applying it is local work, and the volumes it could not start are precisely the ones
+// this host has something to say about: they have no runtime, so the report is the only
+// thing that can tell the fleet they exist and are not being served. Returning at that
+// failure skipped the report that carries it — an Agent refusing a volume printed a WARN
+// every second and the catalog showed the volume healthy for ever, because the only cycle
+// with news never reached the sentence.
+//
+// It was found by starting the two real binaries: a volume-agent without -kek-file
+// against a Control Plane holding an encrypted volume. Nothing in the suite could see it.
+// Every test of a refusal builds the VolumeManager and asks it directly, which is the one
+// caller that does not go through this function, and the loop's own tests drive
+// agent.VolumeSet, whose Apply cannot fail.
+//
+// The error is still returned, at the end, unchanged: the backoff and the per-cycle WARN
+// are what retry it, and a fix that swallowed it to reach the report would trade one
+// silence for another.
 func (l *Loop) Reconcile(ctx context.Context) error {
 	usage, err := l.dev.Usage(ctx)
 	if err != nil {
@@ -225,12 +244,18 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 	if err := l.heartbeat(ctx, usage, vols); err != nil {
 		return err
 	}
-	if err := l.readDesiredState(ctx); err != nil {
+	desired, err := l.readDesiredState(ctx)
+	if err != nil {
+		// Nothing was read, so there is nothing new to serve and nothing new to say.
 		return err
 	}
+	// Carried rather than returned: see the note above. What could not be started is
+	// recorded on the manager as a refusal, and the report below is the only thing that
+	// carries it off this host.
+	applyErr := l.applyDesiredState(ctx, desired)
 
 	// Re-read before reporting. The set above is what the cycle *started* with, and
-	// readDesiredState has since started and stopped runtimes: reporting the old set
+	// applyDesiredState has since started and stopped runtimes: reporting the old set
 	// would put every volume one cycle behind, and a volume started and stopped within
 	// a single cycle would never be reported at all. The heartbeat still uses the
 	// earlier picture, and must — it renews the lease, and nothing may come between
@@ -242,7 +267,10 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 	if err := l.report(ctx, served); err != nil {
 		return err
 	}
-	return l.fence(ctx)
+	if err := l.fence(ctx); err != nil {
+		return err
+	}
+	return applyErr
 }
 
 // giveUpOnExpiredLease stops serving every volume on this host once its lease has
@@ -318,7 +346,16 @@ func (l *Loop) giveUpOnExpiredLease(ctx context.Context, vols []VolumeStatus) er
 	if lm != nil {
 		lm.Revoke()
 	}
-	if err := reconcile.Fence(ctx, volumeIDs); err != nil {
+	// Reported, not only logged. This is the one teardown nothing outside the process
+	// knows about: the Control Plane still names this host the volume's primary at this
+	// epoch, so nothing has moved and nothing will until somebody looks — and until this
+	// reached the report, "looking" meant reading this Agent's log. The report is refused
+	// on the same host-and-epoch predicate the watermarks are, so if the fleet *has*
+	// moved on, this says nothing rather than something wrong.
+	if err := reconcile.Fence(ctx, volumeIDs,
+		storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST,
+		fmt.Sprintf("agent: this host's lease (%s) expired and it gave the volume up; it will not serve it again until the control plane grants a higher epoch", ttl),
+	); err != nil {
 		return fmt.Errorf("agent: giving up the volumes of an expired lease: %w", err)
 	}
 	return nil
@@ -339,7 +376,12 @@ func (l *Loop) fence(ctx context.Context) error {
 	if reconcile == nil || len(fenced) == 0 {
 		return nil
 	}
-	if err := reconcile.Fence(ctx, fenced); err != nil {
+	// No refusal reported for these. The Control Plane is where the refusal came from —
+	// it refused the report a moment ago — so telling it back is telling it what it told
+	// us, and the report would be refused again on the same predicate. Silence here is
+	// what keeps a *reported* refusal meaning "something the fleet does not already
+	// know".
+	if err := reconcile.Fence(ctx, fenced, storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""); err != nil {
 		return fmt.Errorf("agent: fencing refused volumes: %w", err)
 	}
 	return nil
@@ -380,31 +422,44 @@ func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeSta
 	return nil
 }
 
-func (l *Loop) readDesiredState(ctx context.Context) error {
+// readDesiredState asks what this host should be serving and records the answer. It is
+// split from applying it because the two failures are not the same kind: not learning the
+// desired state ends the cycle, while not being able to serve it is news the cycle has to
+// go on and deliver.
+func (l *Loop) readDesiredState(ctx context.Context) ([]*storagev1.DesiredVolume, error) {
 	resp, err := l.cp.GetDesiredState(ctx, connect.NewRequest(&storagev1.GetDesiredStateRequest{
 		HostId: l.cfg.HostID,
 	}))
 	if err != nil {
-		return fmt.Errorf("agent: reading the desired state: %w", err)
+		return nil, fmt.Errorf("agent: reading the desired state: %w", err)
 	}
 	desired := resp.Msg.GetVolumes()
 
 	l.mu.Lock()
 	l.desired = desired
 	l.forgetKeysOutsideLocked(desired)
+	l.mu.Unlock()
+	return desired, nil
+}
+
+// applyDesiredState hands the desired state to whatever serves volumes. This is where
+// the loop stops being a reporter.
+//
+// It is a call of its own and not part of readDesiredState's locked section, because
+// l.mu must not be held across starting a runtime: Apply opens a WAL and binds a socket,
+// and a heartbeat blocked behind that is a lease not renewed.
+func (l *Loop) applyDesiredState(ctx context.Context, desired []*storagev1.DesiredVolume) error {
+	l.mu.Lock()
 	reconcile := l.reconcile
 	l.mu.Unlock()
-
-	// Handing the desired state to whatever serves volumes is where this loop stops
-	// being a reporter. It is a separate call and not part of the assignment above
-	// because the lock must not be held across starting a runtime: Apply opens a WAL
-	// and binds a socket, and a heartbeat blocked behind that is a lease not renewed.
 	if reconcile == nil {
 		return nil
 	}
 	if err := reconcile.Apply(ctx, desired); err != nil {
 		// Returned, not swallowed: a volume that could not be started is the whole
-		// reason this Agent exists, and the cycle's backoff is what retries it.
+		// reason this Agent exists, and the cycle's backoff is what retries it. Its
+		// caller carries it past the report rather than returning at it — Reconcile says
+		// why.
 		return fmt.Errorf("agent: applying the desired state: %w", err)
 	}
 	return nil
@@ -497,6 +552,11 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			SnapshotId:        v.SnapshotID,
 			SnapshotSequence:  v.SnapshotSequence,
 			SnapshotError:     v.SnapshotError,
+			// The one field here that is not a measurement: this host saying it is not
+			// serving the volume, and why. Unset is it saying it is, so a healthy cycle
+			// clears whatever the catalog holds without anything having to notice.
+			Refusal:       v.Refusal,
+			RefusalDetail: v.RefusalDetail,
 		})
 	}
 	resp, err := l.cp.ReportVolumeState(ctx, connect.NewRequest(&storagev1.ReportVolumeStateRequest{

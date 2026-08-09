@@ -148,6 +148,112 @@ func (VolumeState) EnumDescriptor() ([]byte, []int) {
 	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{1}
 }
 
+// VolumeRefusal is why an Agent is not serving a volume the fleet placed on it.
+//
+// The Agent fails closed in five places, and every one of them was correct and every
+// one of them was invisible to the fleet: a volume that refuses to serve keeps
+// reporting the watermarks its last healthy session left behind, so the catalog reads
+// normal, `-fleet-status` prints a normal row, and the operator's only signal is one
+// ERROR line in one host's log at attach time, followed by silence. This field is what
+// turns that into a fact the fleet holds.
+//
+// **An enum and not a free string, and the choice is worth arguing because both are
+// defensible.** A string needs no wire change when a new refusal appears and carries the
+// Agent's own sentence. But the string it would actually carry is `err.Error()`, which
+// embeds a volume id and a sequence number, so no two reports ever compare equal, the
+// `-fleet-status` column becomes a vocabulary nobody controls, and the first alert
+// anyone writes on it matches a substring of a sentence somebody is free to reword. The
+// set below is closed by construction — every value is a decision made at a named line
+// in internal/agent — so a new refusal is a new code path in this repository, and
+// extending this enum is the same commit that adds it. The cost of the closed set falls
+// on the person already editing both sides, which is the only place it is cheap.
+//
+// The sentence is carried anyway, next to it, as `refusal_detail`: nothing branches on
+// it, and it is what an operator's *next step* needs — which sequence, which KEK. Same
+// split as the snapshot fields above, an id to act on and a sentence to read.
+type VolumeRefusal int32
+
+const (
+	// UNSPECIFIED is the Agent saying it is serving the volume. That is what makes the
+	// field self-clearing rather than something a sweep has to notice: the proto3 default
+	// is the healthy value, so an Agent that recovers reports it without doing anything,
+	// and an Agent built before this field says the true thing about itself by omission.
+	VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED VolumeRefusal = 0
+	// The catalog says this volume published an image and the object store holds none
+	// (agent.ErrImageMissing): a stray delete, a lifecycle expiry, a restore that missed
+	// one key. Look at the bucket.
+	VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING VolumeRefusal = 1
+	// The volume came back below the sequence a guest was already told was durable
+	// (agent.ErrDurabilityLost): this host's local WAL was lost with writes in it, and
+	// what is in the bucket is genuinely older than what the fleet promised.
+	VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST VolumeRefusal = 2
+	// The read view never resolved, so every read fails and the session will not be
+	// published (agent.ErrNoReadView, wal.ErrBaseUnavailable) — an unreadable ancestry,
+	// an object store that would not answer.
+	VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW VolumeRefusal = 3
+	// The catalog says the volume is encrypted and this host holds no KEK, or holds a
+	// different one (agent.ErrNoKEK). One missing flag on one process, or a
+	// key-distribution problem — the detail says which.
+	VolumeRefusal_VOLUME_REFUSAL_NO_KEY VolumeRefusal = 4
+	// The host lease lapsed on the Agent's own monotonic clock and it gave the device up
+	// rather than keep answering for a volume it can no longer confirm it owns (§12.2).
+	VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST VolumeRefusal = 5
+	// Everything else that stopped the runtime from starting: a socket that could not be
+	// bound, a WAL that would not resume, this host's own -max-volumes ceiling. A
+	// catch-all on purpose — without one, the next refusal to be written would be
+	// invisible again, which is the whole failure this enum exists to close.
+	VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED VolumeRefusal = 6
+)
+
+// Enum value maps for VolumeRefusal.
+var (
+	VolumeRefusal_name = map[int32]string{
+		0: "VOLUME_REFUSAL_UNSPECIFIED",
+		1: "VOLUME_REFUSAL_IMAGE_MISSING",
+		2: "VOLUME_REFUSAL_DURABILITY_LOST",
+		3: "VOLUME_REFUSAL_NO_READ_VIEW",
+		4: "VOLUME_REFUSAL_NO_KEY",
+		5: "VOLUME_REFUSAL_LEASE_LOST",
+		6: "VOLUME_REFUSAL_ATTACH_FAILED",
+	}
+	VolumeRefusal_value = map[string]int32{
+		"VOLUME_REFUSAL_UNSPECIFIED":     0,
+		"VOLUME_REFUSAL_IMAGE_MISSING":   1,
+		"VOLUME_REFUSAL_DURABILITY_LOST": 2,
+		"VOLUME_REFUSAL_NO_READ_VIEW":    3,
+		"VOLUME_REFUSAL_NO_KEY":          4,
+		"VOLUME_REFUSAL_LEASE_LOST":      5,
+		"VOLUME_REFUSAL_ATTACH_FAILED":   6,
+	}
+)
+
+func (x VolumeRefusal) Enum() *VolumeRefusal {
+	p := new(VolumeRefusal)
+	*p = x
+	return p
+}
+
+func (x VolumeRefusal) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (VolumeRefusal) Descriptor() protoreflect.EnumDescriptor {
+	return file_spin_storage_v1_control_plane_proto_enumTypes[2].Descriptor()
+}
+
+func (VolumeRefusal) Type() protoreflect.EnumType {
+	return &file_spin_storage_v1_control_plane_proto_enumTypes[2]
+}
+
+func (x VolumeRefusal) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use VolumeRefusal.Descriptor instead.
+func (VolumeRefusal) EnumDescriptor() ([]byte, []int) {
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{2}
+}
+
 // ReportOutcome says what happened to one report. A refusal is information the
 // Agent acts on — STALE_EPOCH or NOT_PRIMARY means this host is no longer the
 // writer and must stop behaving like one.
@@ -199,11 +305,11 @@ func (x ReportOutcome) String() string {
 }
 
 func (ReportOutcome) Descriptor() protoreflect.EnumDescriptor {
-	return file_spin_storage_v1_control_plane_proto_enumTypes[2].Descriptor()
+	return file_spin_storage_v1_control_plane_proto_enumTypes[3].Descriptor()
 }
 
 func (ReportOutcome) Type() protoreflect.EnumType {
-	return &file_spin_storage_v1_control_plane_proto_enumTypes[2]
+	return &file_spin_storage_v1_control_plane_proto_enumTypes[3]
 }
 
 func (x ReportOutcome) Number() protoreflect.EnumNumber {
@@ -212,7 +318,7 @@ func (x ReportOutcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ReportOutcome.Descriptor instead.
 func (ReportOutcome) EnumDescriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{2}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{3}
 }
 
 // DeviceStatus is what the Agent observes about the NVMe device it owns
@@ -864,6 +970,24 @@ type VolumeReport struct {
 	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
 	// that fails silently stays CREATING forever and nothing ever collects it.
 	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
+	// refusal says this host is **not serving** the volume, and why; unset is it saying
+	// it is. It is reported for a volume the Agent started and then failed closed on
+	// (the read view never resolved) and for one it never managed to start at all, which
+	// is the case that used to produce no report whatsoever — the volume simply stopped
+	// appearing on the wire, and an absence is not a signal.
+	//
+	// The watermarks on a refused report are this host's honest zeros or whatever its
+	// WAL replayed, and they are safe next to a refusal precisely because the Control
+	// Plane merges them with GREATEST: a volume that could not open reports nothing that
+	// can pull the catalog's numbers backwards. The refusal itself is not merged that
+	// way — see SetVolumeRefusal, which is qualified by this host and this epoch, so a
+	// writer the fleet has moved past cannot mark a volume its successor is serving.
+	Refusal VolumeRefusal `protobuf:"varint,10,opt,name=refusal,proto3,enum=spin.storage.v1.VolumeRefusal" json:"refusal,omitempty"`
+	// refusal_detail is the sentence behind it, verbatim from the Agent, empty when
+	// there is no refusal. `-fleet-status` prints it and nothing branches on it: it
+	// carries the numbers the enum cannot — which sequence was ACKed, which KEK is
+	// missing — and those are what an operator's next step is chosen from.
+	RefusalDetail string `protobuf:"bytes,11,opt,name=refusal_detail,json=refusalDetail,proto3" json:"refusal_detail,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -957,6 +1081,20 @@ func (x *VolumeReport) GetSnapshotSequence() int64 {
 func (x *VolumeReport) GetSnapshotError() string {
 	if x != nil {
 		return x.SnapshotError
+	}
+	return ""
+}
+
+func (x *VolumeReport) GetRefusal() VolumeRefusal {
+	if x != nil {
+		return x.Refusal
+	}
+	return VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED
+}
+
+func (x *VolumeReport) GetRefusalDetail() string {
+	if x != nil {
+		return x.RefusalDetail
 	}
 	return ""
 }
@@ -1157,7 +1295,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xe1\x02\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xc2\x03\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +
@@ -1168,7 +1306,10 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\vsnapshot_id\x18\a \x01(\tR\n" +
 	"snapshotId\x12+\n" +
 	"\x11snapshot_sequence\x18\b \x01(\x03R\x10snapshotSequence\x12%\n" +
-	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\"l\n" +
+	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
+	"\arefusal\x18\n" +
+	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +
+	"\x0erefusal_detail\x18\v \x01(\tR\rrefusalDetail\"l\n" +
 	"\x18ReportVolumeStateRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x127\n" +
 	"\avolumes\x18\x02 \x03(\v2\x1d.spin.storage.v1.VolumeReportR\avolumes\"k\n" +
@@ -1190,7 +1331,15 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x19VOLUME_STATE_FENCING_WAIT\x10\x03\x12\"\n" +
 	"\x1eVOLUME_STATE_RECOVERY_REQUIRED\x10\x04\x12\x1b\n" +
 	"\x17VOLUME_STATE_RECOVERING\x10\x05\x12\x19\n" +
-	"\x15VOLUME_STATE_DETACHED\x10\x06*\xd0\x01\n" +
+	"\x15VOLUME_STATE_DETACHED\x10\x06*\xf2\x01\n" +
+	"\rVolumeRefusal\x12\x1e\n" +
+	"\x1aVOLUME_REFUSAL_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cVOLUME_REFUSAL_IMAGE_MISSING\x10\x01\x12\"\n" +
+	"\x1eVOLUME_REFUSAL_DURABILITY_LOST\x10\x02\x12\x1f\n" +
+	"\x1bVOLUME_REFUSAL_NO_READ_VIEW\x10\x03\x12\x19\n" +
+	"\x15VOLUME_REFUSAL_NO_KEY\x10\x04\x12\x1d\n" +
+	"\x19VOLUME_REFUSAL_LEASE_LOST\x10\x05\x12 \n" +
+	"\x1cVOLUME_REFUSAL_ATTACH_FAILED\x10\x06*\xd0\x01\n" +
 	"\rReportOutcome\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REPORT_OUTCOME_ACCEPTED\x10\x01\x12\x1e\n" +
@@ -1216,46 +1365,48 @@ func file_spin_storage_v1_control_plane_proto_rawDescGZIP() []byte {
 	return file_spin_storage_v1_control_plane_proto_rawDescData
 }
 
-var file_spin_storage_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_spin_storage_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
 var file_spin_storage_v1_control_plane_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_spin_storage_v1_control_plane_proto_goTypes = []any{
 	(HostState)(0),                    // 0: spin.storage.v1.HostState
 	(VolumeState)(0),                  // 1: spin.storage.v1.VolumeState
-	(ReportOutcome)(0),                // 2: spin.storage.v1.ReportOutcome
-	(*DeviceStatus)(nil),              // 3: spin.storage.v1.DeviceStatus
-	(*HeartbeatRequest)(nil),          // 4: spin.storage.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),         // 5: spin.storage.v1.HeartbeatResponse
-	(*GetDesiredStateRequest)(nil),    // 6: spin.storage.v1.GetDesiredStateRequest
-	(*DesiredVolume)(nil),             // 7: spin.storage.v1.DesiredVolume
-	(*GetDesiredStateResponse)(nil),   // 8: spin.storage.v1.GetDesiredStateResponse
-	(*GetVolumeKeysRequest)(nil),      // 9: spin.storage.v1.GetVolumeKeysRequest
-	(*GetVolumeKeysResponse)(nil),     // 10: spin.storage.v1.GetVolumeKeysResponse
-	(*VolumeReport)(nil),              // 11: spin.storage.v1.VolumeReport
-	(*ReportVolumeStateRequest)(nil),  // 12: spin.storage.v1.ReportVolumeStateRequest
-	(*VolumeReportResult)(nil),        // 13: spin.storage.v1.VolumeReportResult
-	(*ReportVolumeStateResponse)(nil), // 14: spin.storage.v1.ReportVolumeStateResponse
+	(VolumeRefusal)(0),                // 2: spin.storage.v1.VolumeRefusal
+	(ReportOutcome)(0),                // 3: spin.storage.v1.ReportOutcome
+	(*DeviceStatus)(nil),              // 4: spin.storage.v1.DeviceStatus
+	(*HeartbeatRequest)(nil),          // 5: spin.storage.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),         // 6: spin.storage.v1.HeartbeatResponse
+	(*GetDesiredStateRequest)(nil),    // 7: spin.storage.v1.GetDesiredStateRequest
+	(*DesiredVolume)(nil),             // 8: spin.storage.v1.DesiredVolume
+	(*GetDesiredStateResponse)(nil),   // 9: spin.storage.v1.GetDesiredStateResponse
+	(*GetVolumeKeysRequest)(nil),      // 10: spin.storage.v1.GetVolumeKeysRequest
+	(*GetVolumeKeysResponse)(nil),     // 11: spin.storage.v1.GetVolumeKeysResponse
+	(*VolumeReport)(nil),              // 12: spin.storage.v1.VolumeReport
+	(*ReportVolumeStateRequest)(nil),  // 13: spin.storage.v1.ReportVolumeStateRequest
+	(*VolumeReportResult)(nil),        // 14: spin.storage.v1.VolumeReportResult
+	(*ReportVolumeStateResponse)(nil), // 15: spin.storage.v1.ReportVolumeStateResponse
 }
 var file_spin_storage_v1_control_plane_proto_depIdxs = []int32{
-	3,  // 0: spin.storage.v1.HeartbeatRequest.device:type_name -> spin.storage.v1.DeviceStatus
+	4,  // 0: spin.storage.v1.HeartbeatRequest.device:type_name -> spin.storage.v1.DeviceStatus
 	0,  // 1: spin.storage.v1.HeartbeatResponse.state:type_name -> spin.storage.v1.HostState
 	1,  // 2: spin.storage.v1.DesiredVolume.state:type_name -> spin.storage.v1.VolumeState
-	7,  // 3: spin.storage.v1.GetDesiredStateResponse.volumes:type_name -> spin.storage.v1.DesiredVolume
-	11, // 4: spin.storage.v1.ReportVolumeStateRequest.volumes:type_name -> spin.storage.v1.VolumeReport
-	2,  // 5: spin.storage.v1.VolumeReportResult.outcome:type_name -> spin.storage.v1.ReportOutcome
-	13, // 6: spin.storage.v1.ReportVolumeStateResponse.results:type_name -> spin.storage.v1.VolumeReportResult
-	4,  // 7: spin.storage.v1.ControlPlaneService.Heartbeat:input_type -> spin.storage.v1.HeartbeatRequest
-	6,  // 8: spin.storage.v1.ControlPlaneService.GetDesiredState:input_type -> spin.storage.v1.GetDesiredStateRequest
-	12, // 9: spin.storage.v1.ControlPlaneService.ReportVolumeState:input_type -> spin.storage.v1.ReportVolumeStateRequest
-	9,  // 10: spin.storage.v1.ControlPlaneService.GetVolumeKeys:input_type -> spin.storage.v1.GetVolumeKeysRequest
-	5,  // 11: spin.storage.v1.ControlPlaneService.Heartbeat:output_type -> spin.storage.v1.HeartbeatResponse
-	8,  // 12: spin.storage.v1.ControlPlaneService.GetDesiredState:output_type -> spin.storage.v1.GetDesiredStateResponse
-	14, // 13: spin.storage.v1.ControlPlaneService.ReportVolumeState:output_type -> spin.storage.v1.ReportVolumeStateResponse
-	10, // 14: spin.storage.v1.ControlPlaneService.GetVolumeKeys:output_type -> spin.storage.v1.GetVolumeKeysResponse
-	11, // [11:15] is the sub-list for method output_type
-	7,  // [7:11] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	8,  // 3: spin.storage.v1.GetDesiredStateResponse.volumes:type_name -> spin.storage.v1.DesiredVolume
+	2,  // 4: spin.storage.v1.VolumeReport.refusal:type_name -> spin.storage.v1.VolumeRefusal
+	12, // 5: spin.storage.v1.ReportVolumeStateRequest.volumes:type_name -> spin.storage.v1.VolumeReport
+	3,  // 6: spin.storage.v1.VolumeReportResult.outcome:type_name -> spin.storage.v1.ReportOutcome
+	14, // 7: spin.storage.v1.ReportVolumeStateResponse.results:type_name -> spin.storage.v1.VolumeReportResult
+	5,  // 8: spin.storage.v1.ControlPlaneService.Heartbeat:input_type -> spin.storage.v1.HeartbeatRequest
+	7,  // 9: spin.storage.v1.ControlPlaneService.GetDesiredState:input_type -> spin.storage.v1.GetDesiredStateRequest
+	13, // 10: spin.storage.v1.ControlPlaneService.ReportVolumeState:input_type -> spin.storage.v1.ReportVolumeStateRequest
+	10, // 11: spin.storage.v1.ControlPlaneService.GetVolumeKeys:input_type -> spin.storage.v1.GetVolumeKeysRequest
+	6,  // 12: spin.storage.v1.ControlPlaneService.Heartbeat:output_type -> spin.storage.v1.HeartbeatResponse
+	9,  // 13: spin.storage.v1.ControlPlaneService.GetDesiredState:output_type -> spin.storage.v1.GetDesiredStateResponse
+	15, // 14: spin.storage.v1.ControlPlaneService.ReportVolumeState:output_type -> spin.storage.v1.ReportVolumeStateResponse
+	11, // 15: spin.storage.v1.ControlPlaneService.GetVolumeKeys:output_type -> spin.storage.v1.GetVolumeKeysResponse
+	12, // [12:16] is the sub-list for method output_type
+	8,  // [8:12] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_spin_storage_v1_control_plane_proto_init() }
@@ -1268,7 +1419,7 @@ func file_spin_storage_v1_control_plane_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_spin_storage_v1_control_plane_proto_rawDesc), len(file_spin_storage_v1_control_plane_proto_rawDesc)),
-			NumEnums:      3,
+			NumEnums:      4,
 			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,

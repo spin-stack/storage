@@ -289,10 +289,88 @@ func (s *Server) applyReport(ctx context.Context, term int64, hostID string, r *
 	case err != nil:
 		return 0, fmt.Errorf("cpserver: updating the watermarks of %q: %w", r.GetVolumeId(), err)
 	}
+	if err := s.applyRefusal(ctx, term, hostID, r); err != nil {
+		return 0, err
+	}
 	if err := s.applySnapshotReport(ctx, term, hostID, r); err != nil {
 		return 0, err
 	}
 	return storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED, nil
+}
+
+// applyRefusal records whether the reporting host is serving this volume, and why it is
+// not. It runs on every accepted report, including the ones that say nothing is wrong —
+// that is what clears a refusal when the volume comes back, and it is why there is no
+// sweep and nothing that has to notice a recovery.
+//
+// It is a separate write from the watermarks above rather than three more columns on
+// that statement, because the two facts want opposite storage. A watermark is monotonic
+// and merged with GREATEST, so applying a late report is harmless. A refusal is a state,
+// so it is last-report-wins — and "last" has to exclude a writer the fleet has moved
+// past, which is what SetVolumeRefusal's host-and-epoch predicate does. Folding them
+// together would force one of the two rules onto the other: GREATEST over a refusal has
+// no meaning, and a host-and-epoch predicate on the watermarks would drop exactly the
+// late reports §12.3 wants merged.
+//
+// The epoch check above already refused a stale report, so the predicate looks redundant
+// from here. It is not: between that read and this write the volume can be promoted, and
+// the window is the whole failure — a fenced host marking a volume NOT SERVED while its
+// successor is serving it perfectly well, with the term guard passing because promotion
+// does not move the CP term.
+func (s *Server) applyRefusal(ctx context.Context, term int64, hostID string, r *storagev1.VolumeReport) error {
+	refusal, err := refusalOf(r.GetRefusal())
+	if err != nil {
+		// An Agent from the future naming a refusal this Control Plane has never heard
+		// of. Refused rather than stored as unknown: the column's CHECK would refuse it
+		// anyway, and failing the RPC is what makes a fleet running two versions visible
+		// instead of quietly losing one host's answers.
+		return fmt.Errorf("cpserver: volume %q: %w", r.GetVolumeId(), err)
+	}
+	detail := r.GetRefusalDetail()
+	if refusal == lifecycle.RefusalNone {
+		// A sentence with nothing to explain outlives its cause, which is the one way a
+		// reason column misleads. Cleared here as well as in the statement, so the two
+		// stores answer the same way rather than one relying on a CASE the other lacks.
+		detail = ""
+	}
+	if err := s.md.SetVolumeRefusal(ctx, term, r.GetVolumeId(), hostID, r.GetEpoch(), refusal, detail); err != nil {
+		return fmt.Errorf("cpserver: recording that %q is not being served: %w", r.GetVolumeId(), err)
+	}
+	if refusal.Refused() {
+		// One line per refused report, not one per transition: this repeats every few
+		// seconds for as long as the condition lasts, which is what an operator who
+		// arrives an hour later needs — a line on the transition alone is a line they
+		// have to go looking for. The same reasoning as the Agent's own holding lines.
+		slog.WarnContext(ctx, "a host is refusing to serve a volume the fleet placed on it",
+			"volume_id", r.GetVolumeId(), "host_id", hostID, "epoch", r.GetEpoch(),
+			"refusal", refusal.String(), "detail", detail)
+	}
+	return nil
+}
+
+// refusalOf maps the wire enum onto the stored vocabulary. It is a switch and not a
+// string conversion of the enum's name so that the wire and the column can be renamed
+// independently, and so an unknown value is an error rather than a row Postgres rejects
+// three layers further down with no volume id in the message.
+func refusalOf(r storagev1.VolumeRefusal) (lifecycle.Refusal, error) {
+	switch r {
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED:
+		return lifecycle.RefusalNone, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING:
+		return lifecycle.RefusalImageMissing, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST:
+		return lifecycle.RefusalDurabilityLost, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW:
+		return lifecycle.RefusalNoReadView, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_KEY:
+		return lifecycle.RefusalNoKey, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST:
+		return lifecycle.RefusalLeaseLost, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED:
+		return lifecycle.RefusalAttachFailed, nil
+	default:
+		return "", fmt.Errorf("%w: volume refusal %d", lifecycle.ErrUnknownState, r)
+	}
 }
 
 // applySnapshotReport records the outcome of a snapshot this host was asked to take.

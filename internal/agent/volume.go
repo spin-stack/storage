@@ -143,6 +143,44 @@ type Volume struct {
 	// teardown is about to close, so without the wait a snapshot that was seconds from
 	// done is reported FAILED and the catalog records a failure that did not happen.
 	snapWG sync.WaitGroup
+
+	// refuseMu guards the two fields below. It is its own lock, and it is a lock at all
+	// rather than the happens-before that baseFailed rides on, because the two ends run
+	// on different goroutines with nothing between them: fetchBase writes the refusal,
+	// and the reconcile loop reads it through Status on every cycle — long before
+	// anything waits on baseDone.
+	refuseMu sync.Mutex
+	// refusal is why this volume is not being served, and refusalDetail is the sentence
+	// behind it. Unset is this volume being served.
+	refusal       storagev1.VolumeRefusal
+	refusalDetail string
+}
+
+// refuse records why this volume will not serve, fails its read view, and stops its
+// session from ever being published.
+//
+// The three happen together or the failure is worse than what it replaces, which is why
+// this is one call and not three lines at each of the five sites that reach it. Setting
+// baseFailed without FailBase parks every read for the life of the process; FailBase
+// without baseFailed lets the teardown publish a session whose view is missing
+// everything the volume held before it, over the manifest that view was supposed to come
+// from; and doing both without recording the reason is the fleet-wide silence this whole
+// field exists to end.
+func (v *Volume) refuse(kind storagev1.VolumeRefusal, err error) {
+	v.refuseMu.Lock()
+	v.refusal, v.refusalDetail = kind, err.Error()
+	v.refuseMu.Unlock()
+	// Written on fetchBase's goroutine and read by publish after a wait on baseDone,
+	// which is the happens-before it has always ridden on — unchanged deliberately.
+	v.baseFailed = true
+	v.log.FailBase(err)
+}
+
+// refused is the pair Status reports.
+func (v *Volume) refused() (storagev1.VolumeRefusal, string) {
+	v.refuseMu.Lock()
+	defer v.refuseMu.Unlock()
+	return v.refusal, v.refusalDetail
 }
 
 // snapState is one snapshot's outcome on this host.
@@ -163,6 +201,11 @@ func (v *Volume) Status() VolumeStatus {
 		DurableSequence:   int64(w.Durable),
 		PublishedSequence: int64(w.Published),
 	}
+	// Read before the early return below, not after it: a volume that has failed closed
+	// and has no snapshot to talk about is the *common* case, and reporting the refusal
+	// only on the path that also has a snapshot to report is the exact shape of gap this
+	// field was added to close.
+	st.Refusal, st.RefusalDetail = v.refused()
 	// Only a *finished* snapshot is reported, and only the one currently asked for. An
 	// upload still in flight says nothing: the Control Plane's row stays CREATING, the
 	// request arrives again next cycle, and the entry below is what makes that a no-op
@@ -581,7 +624,22 @@ type VolumeManager struct {
 	// has just been told it does not own. Only a higher epoch clears it, because a
 	// higher epoch is the Control Plane granting the volume again.
 	fencedEpoch map[string]int64
-	closed      bool
+	// refusals is why each volume in the desired state that this host is **not
+	// running** is not being served, keyed by volume id.
+	//
+	// A Volume that started and then failed closed carries its own reason (Volume.refuse)
+	// and is reported through it. This map is for the two cases where there is no Volume
+	// to carry anything: a runtime that never started — no KEK, no socket, the
+	// -max-volumes ceiling — and one this host gave up because its lease lapsed. Both
+	// used to be silence of the worst kind, because the volume simply stopped appearing
+	// in the report at all, and an absence on the wire is indistinguishable from a
+	// volume the Control Plane never asked this host for.
+	//
+	// An entry lives until the volume starts (Apply, on success), or until the Control
+	// Plane stops listing the volume for this host — the same rule as fencedEpoch, and
+	// for the same reason: at that point this host is not the one refusing anything.
+	refusals map[string]refusal
+	closed   bool
 	// lock is this host's claim on DataDir (DEV-0014). Held for the manager's life
 	// and released by Close.
 	lock io.Closer
@@ -644,7 +702,30 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		cfg: cfg, deps: deps, lock: lock,
 		volumes:     map[string]*Volume{},
 		fencedEpoch: map[string]int64{},
+		refusals:    map[string]refusal{},
 	}, nil
+}
+
+// refusal is one volume this host is not serving, and the epoch it was asked to serve it
+// under. The epoch is carried because the report is qualified by it and there is no
+// runtime left to ask: a refusal reported under the wrong epoch is one the Control Plane
+// refuses outright, which would put this back where it started.
+type refusal struct {
+	epoch  int64
+	kind   storagev1.VolumeRefusal
+	detail string
+}
+
+// refusalFor classifies what stopped a runtime from starting. Two values and not one,
+// because the operator's next step differs and the enum is what an alert keys on: a
+// missing key is a placement or a wiring problem with a named fix (-kek-file, or move the
+// volume), and everything else is this host — a socket, a WAL, its own -max-volumes
+// ceiling — which is read from the detail.
+func refusalFor(err error) storagev1.VolumeRefusal {
+	if errors.Is(err, ErrNoKEK) {
+		return storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_KEY
+	}
+	return storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED
 }
 
 // lockFile is what this Agent claims inside its data directory. Its *contents* are
@@ -713,10 +794,24 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 		v, err := m.start(ctx, d)
 		if err != nil {
 			errs = append(errs, err)
+			// The failure is recorded as this host's answer about the volume, not just
+			// returned. Returned, it reaches slog and the cycle's backoff and nothing
+			// else: the volume is in the desired state, no runtime exists, so it appears
+			// in no report at all and the fleet sees a volume with healthy watermarks
+			// that nobody is serving. Every cycle overwrites the entry, so a failure that
+			// changes reason (keys arrive, the socket frees) is described by its latest
+			// cause rather than its first.
+			m.mu.Lock()
+			m.refusals[id] = refusal{epoch: d.GetEpoch(), kind: refusalFor(err), detail: err.Error()}
+			m.mu.Unlock()
 			continue
 		}
 		m.mu.Lock()
 		m.volumes[id] = v
+		// Serving it again is what clears the record, and it is cleared here rather than
+		// by anything noticing: the runtime that just started is now the authority on
+		// whether this volume is being served, and it reports for itself.
+		delete(m.refusals, id)
 		m.mu.Unlock()
 		m.ensureSnapshot(v, d.GetPendingSnapshotId())
 	}
@@ -748,6 +843,17 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 	for id := range m.fencedEpoch {
 		if !live[id] {
 			delete(m.fencedEpoch, id)
+		}
+	}
+	// The refusal record goes on the same rule and for a plainer reason: it is this
+	// host's answer to "are you serving the volume you were asked to serve", and it has
+	// no meaning about one it is not being asked for. Left behind, it would be reported
+	// for ever against a volume that has been detached or given to somebody else — the
+	// Control Plane's host-and-epoch predicate would refuse every one of those reports,
+	// so it would be harmless and permanent noise, which is the kind that gets ignored.
+	for id := range m.refusals {
+		if !live[id] {
+			delete(m.refusals, id)
 		}
 	}
 	m.mu.Unlock()
@@ -1023,6 +1129,12 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 	if m.deps.Store == nil {
 		// Local-only mode has no object store to recover from, so the local segments
 		// are all there is and they have already been replayed. Nothing to wait for.
+		//
+		// Not v.refuse, and it is the one path here that is not a refusal: this host is
+		// serving the volume, out of the only view it was ever going to have. (start
+		// only launches this goroutine when there *is* a store, so this is the guard
+		// that keeps the "exactly one InstallBase or FailBase" contract total rather
+		// than a branch anything reaches.)
 		v.baseFailed = true
 		v.log.FailBase(errors.New("this Agent has no object store: the read view is whatever the local WAL holds"))
 		return
@@ -1080,8 +1192,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		// into — proceeding would write this session under the wrong root.
 		slog.Error("the volume's lineage could not be resolved; its reads will fail",
 			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
-		v.baseFailed = true
-		v.log.FailBase(err)
+		v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW, err)
 		return
 	}
 
@@ -1104,8 +1215,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		// image states only what the clone itself wrote.
 		slog.Error("the volume's ancestry could not be materialized; its reads will fail",
 			"volume_id", v.id, "parent_snapshot_id", d.GetParentSnapshotId(), "error", err)
-		v.baseFailed = true
-		v.log.FailBase(err)
+		v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW, err)
 		return
 	}
 	// What this volume's own layers sit over, and what its publish must not write down.
@@ -1161,8 +1271,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 				"catalog_published_sequence", pub,
 				"catalog_durable_sequence", d.GetDurableSequence(),
 				"lineage", format.UUIDString(v.lineage))
-			v.baseFailed = true
-			v.log.FailBase(err)
+			v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING, err)
 			return
 		}
 		base, man = ancestry, image.Manifest{}
@@ -1174,8 +1283,7 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 		// indistinguishable from a fresh volume, and a guest cannot tell them apart.
 		slog.Error("the volume's image could not be loaded; its reads will fail",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)
-		v.baseFailed = true
-		v.log.FailBase(err)
+		v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW, err)
 		return
 	}
 	// The ETag this volume CASes against when it publishes in turn. Carrying it is what
@@ -1230,16 +1338,14 @@ func (m *VolumeManager) fetchBase(ctx context.Context, v *Volume, volumeID [16]b
 			"image_sequence", durable,
 			"local_wal_sequence", replayed,
 			"data_dir", m.cfg.dataDir())
-		v.baseFailed = true
-		v.log.FailBase(err)
+		v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST, err)
 		return
 	}
 
 	if err := v.log.InstallBase(base, durable); err != nil {
 		slog.Error("the recovered read view could not be installed",
 			"volume_id", v.id, "epoch", v.epoch, "error", err)
-		v.baseFailed = true
-		v.log.FailBase(err)
+		v.refuse(storagev1.VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW, err)
 		return
 	}
 	// reclaimed_local_bytes is what installing that base gave back to the device: the
@@ -1393,13 +1499,21 @@ func (m *VolumeManager) supervise(ctx context.Context, v *Volume, first vhost.Li
 //
 // A volume re-granted to this host at a higher epoch starts a fresh runtime on the next
 // Apply, under the new epoch's WAL root, and the guest's pending reconnect succeeds.
-func (m *VolumeManager) Fence(ctx context.Context, volumeIDs []string) error {
+func (m *VolumeManager) Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error {
 	var errs []error
 	for _, id := range volumeIDs {
 		m.mu.Lock()
 		v, running := m.volumes[id]
 		if running && v.epoch > m.fencedEpoch[id] {
 			m.fencedEpoch[id] = v.epoch
+		}
+		// Only for a volume that was actually running, which is what makes this safe to
+		// call with the whole served set: an id that names nothing here is one this host
+		// had already stopped, and stamping a reason over it would replace a specific
+		// answer — the image that was missing, the key that was absent — with a generic
+		// one about the lease.
+		if running && why != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+			m.refusals[id] = refusal{epoch: v.epoch, kind: why, detail: detail}
 		}
 		m.mu.Unlock()
 		if !running {
@@ -1459,9 +1573,28 @@ func (m *VolumeManager) remove(ctx context.Context, id string) error {
 // empty set forever — every heartbeat said remote_backlog=0 and carried zero reports.
 func (m *VolumeManager) Volumes(context.Context) ([]VolumeStatus, error) {
 	m.mu.Lock()
-	out := make([]VolumeStatus, 0, len(m.volumes))
+	out := make([]VolumeStatus, 0, len(m.volumes)+len(m.refusals))
 	for _, v := range m.volumes {
 		out = append(out, v.Status())
+	}
+	// And the volumes this host was told to serve and is not serving. They belong on the
+	// report for the same reason the running ones do — it is what this host observes —
+	// and until they were on it, a volume that never started was reported by nothing at
+	// all: it disappeared from the wire, and a disappearance is exactly what a volume
+	// that was never placed here looks like.
+	//
+	// Their watermarks are zero, which is honest (nothing opened, so nothing was
+	// observed) and safe: the Control Plane merges watermarks with GREATEST, so a refused
+	// report cannot pull the catalog's numbers back to the zeros it is reporting. That
+	// asymmetry is why the refusal itself is stored by a different rule — see
+	// metadata.Store.SetVolumeRefusal.
+	for id, r := range m.refusals {
+		if _, running := m.volumes[id]; running {
+			continue
+		}
+		out = append(out, VolumeStatus{
+			VolumeID: id, Epoch: r.epoch, Refusal: r.kind, RefusalDetail: r.detail,
+		})
 	}
 	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeID < out[j].VolumeID })

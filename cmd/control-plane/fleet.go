@@ -91,6 +91,7 @@ func fleetReport(ctx context.Context, md metadata.Store, out io.Writer, leaseTTL
 	if err != nil {
 		return err
 	}
+	reportRefusals(p, vols)
 	if err := reportSnapshots(ctx, md, p, vols); err != nil {
 		return err
 	}
@@ -227,16 +228,80 @@ func reportVolumes(ctx context.Context, md metadata.Store, p *printer) ([]metada
 	// volumes waiting on a FLATTEN. The `chain_depth` series does not answer it: it is
 	// recorded when the Control Plane changes a depth and then goes quiet, so it says what
 	// was created, while this says what the fleet is holding now.
-	p.printf("VOLUMES (%d, %d with no primary host, %d at the depth ceiling of %d — a clone of one is refused until it is flattened)\n",
-		len(vols), unplaced, atCeiling, controlplane.MaxChainDepth)
+	//
+	// The refused count is the third, and it is the one that had no producer at all
+	// until the Agent started reporting a refusal: a volume whose host has fail-closed
+	// keeps the watermarks its last healthy report left behind, so every other number on
+	// its row reads normal. It goes last in the header so the two counts that were
+	// already asserted keep their position in the sentence.
+	p.printf("VOLUMES (%d, %d with no primary host, %d at the depth ceiling of %d — a clone of one is refused until it is flattened; %d not being served by the host that holds it)\n",
+		len(vols), unplaced, atCeiling, controlplane.MaxChainDepth, countRefused(vols))
 	s := p.section("VOLUME_ID", "PRIMARY_HOST", "STATE", "EPOCH", "SIZE", "DEPTH", "PARENT_SNAPSHOT")
 	for _, v := range vols {
 		s.row("%s\t%s\t%s\t%d\t%s\t%d\t%s\n",
-			v.VolumeID, orNone(v.PrimaryHostID), v.State, v.CurrentEpoch,
+			v.VolumeID, orNone(v.PrimaryHostID), volumeState(v), v.CurrentEpoch,
 			capacity(v.SizeBytes), v.ChainDepth, orNone(v.ParentSnapshotID))
 	}
 	s.end()
 	return vols, nil
+}
+
+// volumeState renders the STATE cell, the same move hostState makes one section above
+// and for the same reason: the catalog's word is still true about *ownership* — the
+// volume is ACTIVE, this host is its primary, placement and every §7 transition still
+// read it — and it is exactly the word that must not stand alone when the host holding
+// it is refusing to serve it.
+//
+// One token, so `awk '{print $3}'` and an eye both still work, and it greps and sorts as
+// NOT_SERVED. The reason itself is not in this cell: it belongs next to the sentence
+// that explains it, in the section below, and a fourth column here would push
+// PARENT_SNAPSHOT off an eighty-column terminal for every fleet, healthy or not.
+func volumeState(v metadata.Volume) string {
+	if !v.Refusal.Refused() {
+		return string(v.State)
+	}
+	return fmt.Sprintf("NOT_SERVED(%s)", v.State)
+}
+
+// reportRefusals is the section that answers "why", and it is a section of its own
+// rather than a column because the two questions have different shapes. "Which volumes
+// are down" is a scan of the table above; "why is this one down" is one sentence with
+// numbers in it — the sequence that went missing, the KEK that is not on the host — and
+// a sentence does not fit a column-aligned table next to six other fields.
+//
+// It prints even when it is empty, like every other section here: "nothing is refusing
+// to serve" is an answer, and a section that vanishes when it has nothing to say is
+// indistinguishable from a report that stopped early.
+//
+// It is rendered from the volumes already read rather than from a filtered query. There
+// is no such query, and there should not be one until something needs it at a scale a
+// human is not reading: the rows are in hand, and a second read would be a second answer
+// that can disagree with the table above it.
+func reportRefusals(p *printer, vols []metadata.Volume) {
+	p.printf("NOT SERVED (%d) — the fleet placed these volumes on a host that is refusing to serve them\n",
+		countRefused(vols))
+	s := p.section("VOLUME_ID", "ON_HOST", "REASON", "DETAIL")
+	for _, v := range vols {
+		if !v.Refusal.Refused() {
+			continue
+		}
+		// DETAIL last and unpadded: it is the only free-text cell in this report, it is
+		// the longest, and tabwriter would otherwise widen every row to the longest one.
+		// orNone because a refusal an older Agent reported without a sentence is still a
+		// refusal, and a blank final cell reads as a truncated line.
+		s.row("%s\t%s\t%s\t%s\n", v.VolumeID, orNone(v.PrimaryHostID), v.Refusal, orNone(v.RefusalDetail))
+	}
+	s.end()
+}
+
+func countRefused(vols []metadata.Volume) int {
+	var n int
+	for _, v := range vols {
+		if v.Refusal.Refused() {
+			n++
+		}
+	}
+	return n
 }
 
 func reportSnapshots(ctx context.Context, md metadata.Store, p *printer, vols []metadata.Volume) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
@@ -130,6 +131,40 @@ func TestAVolumeThatHasPublishedRefusesWhenItsImageIsGone(t *testing.T) {
 		t.Fatalf("the read's error does not carry %v, so nothing tells an operator which of the two floors refused: %v",
 			agent.ErrImageMissing, err)
 	}
+
+	// And the fleet is told, which is the half the guest's I/O error cannot supply. The
+	// refusal above is correct and, on its own, entirely invisible outside this process:
+	// the volume keeps reporting the watermarks its replay recovered, so the catalog and
+	// `-fleet-status` read exactly as they did while it was healthy, and the operator's
+	// only signal is one ERROR line in this host's log at attach time.
+	//
+	// Asserted on what the next report will carry, not on the Volume's field: the report
+	// is the one thing anything outside this host ever sees.
+	got := reportFor(t, second, told.GetVolumeId())
+	if got.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING {
+		t.Fatalf("the report says refusal=%s; a volume whose image is gone has to say which of the two floors refused it", got.Refusal)
+	}
+	if !strings.Contains(got.RefusalDetail, "object store holds no image") {
+		t.Fatalf("refusal detail = %q, and it is what an operator reads before touching the bucket", got.RefusalDetail)
+	}
+}
+
+// reportFor is one volume's entry in what the Agent will report next. It fails when
+// there is none: a volume that stops being reported is the silence every assertion in
+// this file is ultimately about.
+func reportFor(t *testing.T, m *agent.VolumeManager, volumeID string) agent.VolumeStatus {
+	t.Helper()
+	vols, err := m.Volumes(t.Context())
+	if err != nil {
+		t.Fatalf("Volumes: %v", err)
+	}
+	for _, v := range vols {
+		if v.VolumeID == volumeID {
+			return v
+		}
+	}
+	t.Fatalf("volume %s appears in no report at all: %+v", volumeID, vols)
+	return agent.VolumeStatus{}
 }
 
 // TestARefusedVolumeIsNotRepublishedOverItsOwnMissingImage is the second half, and the
@@ -213,6 +248,18 @@ func TestAVolumeThatComesBackShortOfTheACKedSequenceRefuses(t *testing.T) {
 			seq, seq+11)
 	case !errors.Is(err, agent.ErrDurabilityLost):
 		t.Fatalf("reading the rolled-back volume failed with %v, which does not carry %v", err, agent.ErrDurabilityLost)
+	}
+
+	// Two refusals, two enum values, and this is where that choice earns its keep: the
+	// operator's next step differs completely — an object that should be there and is not
+	// versus one that is there and is behind — and a single "REFUSED" token, or a free
+	// string nobody controls, would put both incidents in the same column.
+	got := reportFor(t, second, told.GetVolumeId())
+	if got.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST {
+		t.Fatalf("the report says refusal=%s; a volume that came back short has to be told apart from one whose image is missing", got.Refusal)
+	}
+	if !strings.Contains(got.RefusalDetail, "ACKed to a guest as durable") {
+		t.Fatalf("refusal detail = %q, and it is the sentence that names the two sequences", got.RefusalDetail)
 	}
 }
 
