@@ -164,7 +164,7 @@ type Log struct {
 	// being fetched, and until it arrives this log's view holds only what the local
 	// segments still had. Reads wait on it rather than answering out of a half-built
 	// view, because the wrong answer is *zeros*, indistinguishable from a range nobody
-	// wrote (BUILD-INVENTORY increment 5). Closed exactly once, by InstallBase or
+	// wrote. Closed exactly once, by InstallBase or
 	// FailBase; baseErr is set by the latter.
 	baseWait chan struct{}
 	baseErr  error
@@ -542,7 +542,7 @@ func (l *Log) Read(offset uint64, buf []byte) error {
 
 // InstallBase adopts the read view recovered from the object store, under everything the
 // local segments replayed, and with it the durable sequence that view covers. It is the
-// seam BUILD-INVENTORY increment 5 exists to add: image.Load produces exactly this object
+// seam a base layer exists to close: image.Load produces exactly this object
 // and nothing could consume it.
 //
 // The watermarks it sets are the point of taking `durable` here rather than at resume:

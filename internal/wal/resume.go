@@ -19,7 +19,7 @@ var ErrForeignEpoch = errors.New("wal: the WAL holds records from another epoch"
 // ErrBaseUnavailable is returned by every Read on a log whose base — the read view
 // recovered from the object store — could not be built. The volume refuses to answer
 // rather than serving zeros for ranges truncation has reclaimed locally: a guest cannot
-// tell those zeros from a range it never wrote, which is the failure BUILD-INVENTORY
+// tell those zeros from a range it never wrote, which is the failure this
 // increment 5 exists to make impossible.
 var ErrBaseUnavailable = errors.New("wal: the read view's base could not be recovered")
 

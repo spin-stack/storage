@@ -7,7 +7,7 @@
 # least safe to assume. Publishing them was documented rather than automated, and the
 # documentation was spread across four places: the workflow's failure summary, the Taskfile
 # targets `build:qemu:push` and `guest:kernel:push`, `hack/guest-kernel.sh`'s error text,
-# and TRACK-B.md. A human reconstructing a procedure from four files gets one step wrong;
+# A human reconstructing a procedure from four files gets one step wrong;
 # the interesting part is that most of the wrong steps are *silent*. Pushing the kernel to
 # a path CI does not resolve, tagging it with the version instead of the content hash,
 # publishing a package the repository's own Actions token cannot read — each of those ends

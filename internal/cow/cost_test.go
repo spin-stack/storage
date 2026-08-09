@@ -225,7 +225,7 @@ func BenchmarkReadAtDepth(b *testing.B) {
 
 // The §26.2 series exist and carry the numbers a read view produces. The recording
 // expression here is the one the WAL will hold (`internal/wal` is another track's file
-// this wave — see the handoff in docs/plan/tracks/TRACK-E.md), so what is proven is
+// this wave), so what is proven is
 // everything except the call site: that the three names are registered, that a Recorder
 // therefore *keeps* the samples instead of dropping them, and that the values collected
 // are the chain's and not the top layer's.

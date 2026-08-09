@@ -86,9 +86,8 @@ times and pays once.** Write fewer, keep them checkable, delete them when the co
 - Any doc that only narrates gets deleted; a doc that a task can verify may stay. Runbooks
   belong in the Taskfile, where CI runs them.
 
-There are 25 ADRs, 10 spec documents and ~1.800 `§`/`INV`/`ADR`/`DEV` references in the
-code. That is a symptom, not an asset. New code cites the *reason*, not a pointer.
-`REFERENCE.md` earns its place only if `task` generates it from the tree; otherwise delete it.
+The ADRs and the `§`/`INV`/`ADR`/`DEV` references in the code are a symptom, not an asset.
+New code cites the *reason*, not a pointer.
 
 ## Principles
 

@@ -238,7 +238,7 @@ type HostLease struct {
 //
 // CreateVolume is the only write that takes one today. SetVolumePrimaryHost — the
 // other way a volume comes to occupy a host — takes none, which is an open gap and
-// not a decision (recorded against D6 in docs/plan/tracks/TRACK-D.md).
+// not a decision.
 type CapacityBound struct {
 	// HostID is the host being placed on.
 	HostID string

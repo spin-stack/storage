@@ -245,7 +245,7 @@ func (d *deployment) requestSnapshot(t *testing.T, volumeID string) {
 // this is a flag on whichever process runs the placing command. An operator who tunes one
 // and not the other gets a fleet that never cordons and still refuses to place — which is
 // exactly what happened here after the band was fixed and this was not. Recorded in
-// TRACK-D.md as a shape worth changing: placement policy that lives in two processes'
+// a shape worth changing: placement policy that lives in two processes'
 // flags rather than in the catalog is policy nobody can read back.
 func (d *deployment) placementArgs() []string {
 	return []string{"-max-used-ratio", "1"}

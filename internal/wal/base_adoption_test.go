@@ -12,7 +12,7 @@ import (
 	"github.com/spin-stack/storage/internal/wal"
 )
 
-// BUILD-INVENTORY increment 5. Before this, a restart after truncation served zeros for
+// Before a base layer existed, a restart after truncation served zeros for
 // every reclaimed range — no error, no degraded flag, no log line — because Log.view was
 // rebuilt from local segments only and TruncateLocal unlinks exactly those.
 //

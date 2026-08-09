@@ -33,7 +33,7 @@ type span struct{ start, end uint64 }
 // is the view recovered from the object store — everything up to the durable point —
 // and this layer is what the local segments still hold, which is newer and therefore
 // wins. Without it, `Read` on a resumed log answers zeros for every range whose local
-// segments truncation has reclaimed, silently (BUILD-INVENTORY increment 5).
+// segments truncation has reclaimed, silently.
 //
 // The layering is why `cleared` exists. Over a base, "I hold nothing here" and "this
 // range was discarded" stop being the same statement: the first must let the base show
@@ -71,7 +71,7 @@ func NewIntervalMapOver(base *IntervalMap) *IntervalMap {
 
 // SetBase installs the base of a map created by NewIntervalMapOver. It is how a view
 // that has been serving from local segments alone adopts the one recovered from the
-// object store, which is the whole of BUILD-INVENTORY increment 5.
+// object store, which is the whole point of a base layer.
 //
 // Only legal on a layered map: an unlayered one has been discarding its tombstones, so
 // giving it a base now would uncover every range it was told to discard.

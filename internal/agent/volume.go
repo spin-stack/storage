@@ -944,7 +944,7 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 }
 
 // fetchBase rebuilds the read view from the object store and hands it to the log. This
-// is the lazy half of BUILD-INVENTORY increment 5: the volume is already being served,
+// is the lazy half of installing a base: the volume is already being served,
 // and only its *reads* are waiting on this.
 //
 // It owes the log exactly one InstallBase or FailBase on every path, which is why there
