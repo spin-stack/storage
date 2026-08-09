@@ -21,6 +21,22 @@ var ErrLogBroken = errors.New("wal: the log's tail is unknown after a failed rol
 
 var ErrBackpressure = errors.New("wal: backpressure (unflushed limit reached)")
 
+// ErrViewBound is backpressure from the read view's memory bound specifically, and it
+// wraps ErrBackpressure so every existing caller keeps behaving — a guest still gets the
+// I/O error it understands.
+//
+// It exists because the remedy is the opposite of the other bounds'. MaxLocalBytes is
+// space the volume cannot get back while it runs, so the operator is told to stop the
+// volume, which publishes and reclaims. The view bound is memory, and a DISCARD gives it
+// back **without stopping anything** — a guest can cross this bound, trim, and carry on,
+// which integration/vhost proves from inside a real kernel. One sentinel for both had
+// blockdev telling an operator to stop and republish a volume that needed an fstrim.
+//
+// The distinction is on the error and not in a flag, because it has to survive the trip
+// out to the guest's own error and back into a log line, and errors.Is is the only thing
+// on that path that carries it.
+var ErrViewBound = fmt.Errorf("%w: the read view is at its memory bound", ErrBackpressure)
+
 // ErrWatermarkOrder is returned by an attempt to advance a watermark past a higher
 // one, violating published <= durable <= local (§5.6).
 var ErrWatermarkOrder = errors.New("wal: watermark ordering violation")
@@ -495,7 +511,7 @@ func (l *Log) backpressure(add int, growsView bool) error {
 	// refused the records that free it would leave the guest with no way back and the
 	// memory pinned for the rest of the session.
 	if growsView && l.view.Cost().Memory() > l.maxViewBytes() {
-		return ErrBackpressure
+		return ErrViewBound
 	}
 	return nil
 }

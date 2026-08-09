@@ -222,6 +222,17 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 		// against it. The lease-fencing case that used to be here went with the
 		// lease-gated ACK (ADR-0026).
 		return fmt.Errorf("blockdev: %s refused: this volume's log cannot describe its own tail: %w", where, err)
+	case errors.Is(err, wal.ErrViewBound):
+		// A different bound with the opposite remedy, and it must not inherit the
+		// sentence below. This one is memory — the read view's live extents — and a
+		// DISCARD gives it back while the volume keeps running, which is exactly what
+		// the guest that hit it should do and what integration/vhost proves a real
+		// kernel can. Telling that operator to stop and republish would cost them a
+		// session's downtime for a condition an fstrim clears.
+		d.latchSpaceRefusal("this volume's read view is at its memory bound")
+		return fmt.Errorf("blockdev: %s refused: this volume's read view is at its memory bound: "+
+			"the guest can free it without stopping — DISCARD (fstrim, or mount -o discard) is the only "+
+			"thing that shrinks a read view, and it is deliberately never refused by this bound: %w", where, err)
 	case errors.Is(err, wal.ErrBackpressure):
 		// The sentence used to end "a successful FLUSH clears it", and it named the
 		// one remedy that cannot work. A FLUSH clears MaxUnflushedBytes/Age, which the

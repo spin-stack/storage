@@ -572,3 +572,78 @@ func bytesEqual(a, b []byte) bool {
 	}
 	return true
 }
+
+// The two bounds a guest can hit have opposite remedies, and an operator acts on the
+// sentence rather than on the sentinel — so the sentence has to differ. The device bound
+// is space this volume cannot get back while it runs: stop it, which publishes and
+// reclaims. The read view's bound is memory, and a DISCARD gives it back with the volume
+// still serving, which integration/vhost proves a real kernel can do from inside a guest.
+//
+// This is here because one sentinel covered four bounds, and blockdev gave a view-bound
+// refusal the device bound's advice — an operator following it would take a session's
+// downtime for a condition an fstrim clears.
+func TestTheTwoBoundsTellTheOperatorDifferentThings(t *testing.T) {
+	tests := []struct {
+		name    string
+		limits  wal.Limits
+		fill    func(t *testing.T, d *blockdev.Device)
+		wantSay string
+		notSay  string
+	}{
+		{
+			name:   "the device share is exhausted: stop the volume",
+			limits: wal.Limits{MaxLocalBytes: 64 << 10},
+			fill: func(t *testing.T, d *blockdev.Device) {
+				// Rewrite one block, so the read view stays tiny and only the retained
+				// segments grow — the device bound and nothing else.
+				for range 4096 {
+					if _, err := d.WriteAt(make([]byte, 512), 0); err != nil {
+						return
+					}
+				}
+			},
+			wantSay: "stop the volume",
+			notSay:  "DISCARD",
+		},
+		{
+			name:   "the read view is at its bound: trim, do not stop",
+			limits: wal.Limits{MaxViewBytes: 64 << 10},
+			fill: func(t *testing.T, d *blockdev.Device) {
+				// Distinct offsets, so the view grows while the segments stay small.
+				for i := range int64(4096) {
+					if _, err := d.WriteAt(make([]byte, 512), i*512); err != nil {
+						return
+					}
+				}
+			},
+			wantSay: "DISCARD",
+			notSay:  "stop the volume",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t, withLimits(tc.limits))
+			tc.fill(t, r.dev)
+
+			// The refusal itself, taken from a write the bound turned away.
+			var err error
+			for i := range int64(8192) {
+				if _, err = r.dev.WriteAt(make([]byte, 512), i*512); err != nil {
+					break
+				}
+			}
+			if err == nil {
+				t.Fatalf("nothing was refused under %+v; the bound did not act", tc.limits)
+			}
+			if !errors.Is(err, wal.ErrBackpressure) {
+				t.Fatalf("the guest got %v, which is not the error it understands as backpressure", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSay) {
+				t.Errorf("the refusal does not say %q, which is the remedy for this bound:\n  %v", tc.wantSay, err)
+			}
+			if strings.Contains(err.Error(), tc.notSay) {
+				t.Errorf("the refusal says %q, which is the OTHER bound's remedy and costs the operator the wrong thing:\n  %v", tc.notSay, err)
+			}
+		})
+	}
+}
