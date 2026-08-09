@@ -28,13 +28,14 @@ import (
 //     check-then-write implementation lets all of them win, silently, and two
 //     promoters believing they hold the fence is split brain. Create-only publishes
 //     with link(2), whose EEXIST *is* the exclusion; If-Match cannot be expressed as
-//     one syscall, so its read-compare-publish runs under a per-key flock (see
-//     lockKey). Both hold between *processes*, which is the only thing that matters:
-//     this store is what `-object-store-dir` selects, i.e. the single-machine
-//     deployment, where two Agents publishing one volume's manifest are two
-//     processes on one filesystem. An in-process mutex here excluded nothing and
-//     hid everything — under it, four processes CASing from the same prevETag all
-//     won;
+//     one syscall, so its read-compare-publish runs under an flock on the directory
+//     the key lives in (see lockKeysIn). Both hold between *processes*, which is the
+//     only thing that matters: this store is what `-object-store-dir` selects, i.e.
+//     the single-machine deployment, where two Agents publishing one volume's
+//     manifest are two processes on one filesystem. An in-process mutex here excluded
+//     nothing and hid everything — under it, four processes CASing from the same
+//     prevETag all won, and so did four processes after an operator deleted the lock
+//     file the exclusion used to live in;
 //   - an object is never partially visible. Bodies are staged in a temp file,
 //     fsynced, and then linked or renamed into place — both atomic — so a reader
 //     sees the old object or the new one, never a prefix of either. A torn WAL
@@ -80,17 +81,19 @@ const (
 	supersededSuffix = ".superseded"
 	// tmpSuffix is the staging name for an in-progress body.
 	tmpSuffix = ".tmp"
-	// lockSuffix names the file whose flock serialises the mutations of one key
-	// (see lockKey). It is never removed, and it never holds bytes.
+	// lockSuffix is a reserved name, and the only one here that names no file this
+	// store writes. It used to: the per-key `<key>.lock` whose flock serialised the
+	// mutations of one key, until an operator deleting it turned out to dissolve the
+	// exclusion (see lockKeysIn). The name stays reserved because `*.lock` is what a
+	// stale-lock sweep deletes — an object stored under one would be swept away with
+	// no error and no way back.
 	lockSuffix = ".lock"
 )
 
-// isSidecar reports whether a key names one of this store's own files. Put refuses
-// such a key and every read path treats it as absent: before there were lock files a
-// sidecar existed only while a key was marked or being staged, so reading one back
-// was mostly unreachable, but a lock file sits next to every key that was ever
-// written — and `Get("x.lock")` returning the lock's zero bytes with a nil error is
-// an empty WAL object that nobody wrote.
+// isSidecar reports whether a key names one of this store's own files, or the one
+// name it reserves. Put refuses such a key and every read path treats it as absent: a
+// key that is indistinguishable from a delete marker silently hides the object it
+// sits next to, and an object at `x.lock` is one an operator's sweep deletes.
 func isSidecar(key string) bool {
 	return strings.HasSuffix(key, markerSuffix) ||
 		strings.HasSuffix(key, supersededSuffix) ||
@@ -98,10 +101,38 @@ func isSidecar(key string) bool {
 		strings.HasSuffix(key, lockSuffix)
 }
 
-// lockKey takes an exclusive lock on one key and returns the release. It is held
-// across processes, because the writers this store has to exclude are processes: on
-// a single-machine deployment two Agents share `-object-store-dir`, and the CAS on a
-// volume's manifest is the whole of V1's fencing.
+// lockKeysIn takes the exclusive lock that serialises mutations of every key in one
+// directory. It is held across processes, because the writers this store has to
+// exclude are processes: on a single-machine deployment two Agents share
+// `-object-store-dir`, and the CAS on a volume's manifest is the whole of V1's
+// fencing.
+//
+// **The lock is the directory, not a `<key>.lock` sidecar** — which is what it was,
+// and what an operator could switch off. A POSIX lock lives on an *inode*, so it is
+// an exclusion only for as long as the path still resolves to the inode it was taken
+// on. Delete the sidecar under a holder and the next writer opens the same name, gets
+// a brand-new inode, locks that, and is inside the read-compare-publish alongside the
+// holder: two CAS winners from one prevETag, both told they published, no error
+// anywhere and nothing to recover from afterwards. Measured against the sidecar
+// version: with a holder in place, `rm <key>.lock` let a second CAS complete in 6ms
+// instead of blocking. The action that does it is a routine one — `find -name
+// '*.lock' -delete`, an rsync or a backup restore that skips sidecars, a tidy-up
+// script — which is the whole problem: nothing about it looks like it touches
+// fencing.
+//
+// A directory closes that, because there is no file named for the lock to delete, and
+// the thing that would replace it holds the objects too: `rm -rf` on a volume's
+// directory is not a cleanup anybody performs by accident, and it takes the manifest
+// with it. Rejected: keeping the per-key sidecar and verifying its inode before
+// publishing, which keeps a *routine* command as the trigger and still leaves the
+// window between the check and the rename. Rejected: one store-wide lock file, which
+// is a sidecar again — same unlink, same hole — and serialises the whole store rather
+// than one directory.
+//
+// The cost is granularity: two keys in one directory now serialise. Only the publish
+// does — staging the body and its fsync happen outside the lock — so what a second
+// writer waits for is a read-compare, a rename, and the directory fsync it was going
+// to queue behind anyway.
 //
 // flock(2), for the crash case. The kernel drops the lock when the fd is closed,
 // including when the holder is SIGKILLed or panics mid-publish, so a dead writer
@@ -112,30 +143,74 @@ func isSidecar(key string) bool {
 // deciding the lock is stale, both proceeding, both winning. A lock whose
 // correctness depends on a timeout is not an exclusion (§25.1 says the same thing
 // about sleeps).
-//
-// The lock file is created once per key and never unlinked. Unlinking it on release
-// would be tidier and wrong: locks live on the inode, so a writer that opens the
-// path just before it is removed locks a file nobody else can reach any more, and
-// the next writer creates a fresh inode and locks that instead — two holders, no
-// error. An empty file per key is the price; it is filtered out of List and refused
-// as a key, like every other sidecar.
-func (s *ObjectStore) lockKey(key string) (func(), error) {
-	p := s.path(key) + lockSuffix
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return nil, err
+func (s *ObjectStore) lockKeysIn(dir string) (*dirLock, error) {
+	for range lockAttempts {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+		f, err := os.Open(dir)
+		if os.IsNotExist(err) {
+			continue // removed between the mkdir and the open; make it again
+		}
+		if err != nil {
+			return nil, fmt.Errorf("simio/real: opening %q to lock it: %w", dir, err)
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("simio/real: locking %q: %w", dir, err)
+		}
+		held, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		l := &dirLock{dir: dir, f: f, held: held}
+		if err := l.stillExcludes(); err != nil {
+			// We hold a directory the path no longer names, so we are excluding
+			// nobody. Take whatever replaced it rather than publish under a lock
+			// that means nothing.
+			l.release()
+			continue
+		}
+		return l, nil
 	}
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("simio/real: opening the lock for %q: %w", key, err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("simio/real: locking %q: %w", key, err)
-	}
-	// Closing the fd releases the lock; that is also what makes the crash case
-	// self-healing, so there is deliberately no separate LOCK_UN to forget.
-	return func() { _ = f.Close() }, nil
+	return nil, fmt.Errorf("simio/real: %q was replaced under every one of %d attempts to lock it", dir, lockAttempts)
 }
+
+// lockAttempts bounds re-acquiring after the directory was replaced underneath us.
+// There is no sleep and no timeout in it: each attempt is a fresh mkdir + open +
+// flock, and giving up is an error naming the directory. Something recreating a
+// directory faster than a writer can lock it is not a state to wait out.
+const lockAttempts = 8
+
+// dirLock is a held exclusion over every key in one directory.
+type dirLock struct {
+	dir  string
+	f    *os.File
+	held os.FileInfo
+}
+
+// stillExcludes reports that the directory this lock is held on is still the one the
+// keys resolve through. It is checked when the lock is taken and again immediately
+// before anything is published: a lock on an inode the path no longer names excludes
+// nobody, and publishing under one is how two writers both win with no error. That
+// makes the remaining case — somebody replaces a directory full of objects
+// mid-publish — a loud failure for at least one of the writers instead of a silent
+// double publish.
+func (l *dirLock) stillExcludes() error {
+	current, err := os.Stat(l.dir)
+	if err != nil {
+		return fmt.Errorf("simio/real: the locked directory %q went away mid-write: %w", l.dir, err)
+	}
+	if !os.SameFile(l.held, current) {
+		return fmt.Errorf("simio/real: %q was replaced while it was locked, so this write is not excluding anybody: it was refused rather than published", l.dir)
+	}
+	return nil
+}
+
+// release drops the lock. Closing the fd is what releases it; that is also what makes
+// the crash case self-healing, so there is deliberately no separate LOCK_UN to forget.
+func (l *dirLock) release() { _ = l.f.Close() }
 
 func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	if isSidecar(key) {
@@ -161,11 +236,11 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	// is a check preceding an act, and every writer that reads before any of them
 	// renames sees the ETag it was told to expect. Under an in-process mutex, four
 	// processes CASing one manifest from the same prevETag all returned nil.
-	unlock, err := s.lockKey(key)
+	lock, err := s.lockKeysIn(filepath.Dir(p))
 	if err != nil {
 		return objectstore.PutResult{}, err
 	}
-	defer unlock()
+	defer lock.release()
 
 	// A delete marker is the latest version, so to a conditional write the object
 	// does not exist — the same way S3 behaves on a versioned bucket.
@@ -175,6 +250,13 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 		if err != nil || marked || etagOf(cur) != opts.IfMatch {
 			return objectstore.PutResult{}, objectstore.ErrPreconditionFailed
 		}
+	}
+
+	// Nothing is published under a lock that stopped being one: if the directory was
+	// replaced between taking it and here, this writer is not excluding the next one,
+	// and the caller hears about it instead of both of them succeeding.
+	if err := lock.stillExcludes(); err != nil {
+		return objectstore.PutResult{}, err
 	}
 
 	switch {
@@ -331,13 +413,13 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 	if isSidecar(key) {
 		return objectstore.ErrNotFound
 	}
-	// The same per-key lock a Put takes: a mark placed between another process's
-	// ETag comparison and its rename would otherwise publish over a retired object.
-	unlock, err := s.lockKey(key)
+	// The same lock a Put takes: a mark placed between another process's ETag
+	// comparison and its rename would otherwise publish over a retired object.
+	lock, err := s.lockKeysIn(filepath.Dir(s.path(key)))
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer lock.release()
 	if _, err := os.Stat(s.path(key)); err != nil {
 		if os.IsNotExist(err) {
 			return objectstore.ErrNotFound
@@ -346,6 +428,9 @@ func (s *ObjectStore) Delete(_ context.Context, key string) error {
 	}
 	if s.marked(key) {
 		return objectstore.ErrNotFound
+	}
+	if err := lock.stillExcludes(); err != nil {
+		return err
 	}
 	// The marker supersedes any record of an older one: this object is what a
 	// restore would now bring back.
@@ -362,13 +447,16 @@ func (s *ObjectStore) Restore(_ context.Context, key string) error {
 	if isSidecar(key) {
 		return objectstore.ErrNotFound
 	}
-	unlock, err := s.lockKey(key)
+	lock, err := s.lockKeysIn(filepath.Dir(s.path(key)))
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer lock.release()
 	if _, err := os.Stat(s.path(key) + supersededSuffix); err == nil {
 		return fmt.Errorf("%w: %s", objectstore.ErrRestoreSuperseded, key)
+	}
+	if err := lock.stillExcludes(); err != nil {
+		return err
 	}
 	err = os.Remove(s.path(key) + markerSuffix)
 	if os.IsNotExist(err) {

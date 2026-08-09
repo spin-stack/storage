@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/vhost"
@@ -281,3 +282,119 @@ func TestRawFileFailsAfterClose(t *testing.T) {
 }
 
 var _ vhost.Backend = (*RawFile)(nil)
+
+// Discard punches a hole, which is the one implementation that gives virtio both of the
+// things it asks of a discard at once: the range reads back as zeros AND the space goes
+// back to the filesystem. Asserted on both, because writing zeros would satisfy the
+// first while doing the exact opposite of the second — consuming space to service a
+// request whose purpose was to free it — and a guest told OK would keep trimming a
+// device that grows.
+//
+// KEEP_SIZE is what stops the file being truncated, which would change the capacity the
+// guest was told about mid-session, so the size is asserted too.
+func TestDiscardFreesTheRangeAndLeavesTheCapacityAlone(t *testing.T) {
+	const size = 1 << 20
+	d, err := CreateRawFile(tempPath(t), size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	full := pattern(0x40, size)
+	if _, err := d.WriteAt(full, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Flush(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	before := blocksUsed(t, d)
+
+	// Punch the middle half, so both edges are load-bearing: a discard that rounded
+	// outward would take bytes the guest still holds.
+	const off, length = size / 4, size / 2
+	if err := d.Discard(off, length); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+
+	got := make([]byte, size)
+	if _, err := d.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[off:off+length], make([]byte, length)) {
+		t.Errorf("the discarded range reads %x, want zeros", got[off:off+8])
+	}
+	if !bytes.Equal(got[:off], full[:off]) {
+		t.Error("the bytes before the discarded range were disturbed")
+	}
+	if !bytes.Equal(got[off+length:], full[off+length:]) {
+		t.Error("the bytes after the discarded range were disturbed")
+	}
+	if d.Size() != size {
+		t.Errorf("capacity moved to %d: KEEP_SIZE is what stops a discard changing what the guest was told", d.Size())
+	}
+	if after := blocksUsed(t, d); after >= before {
+		t.Errorf("the file occupies %d blocks after discarding %d bytes and %d before: nothing was returned to the filesystem",
+			after, length, before)
+	}
+}
+
+// WriteZeroes has the same observable and ignores may_unmap, which is conforming: the
+// flag permits releasing the space rather than requiring it. Out of range is refused for
+// both, because clamping a discard is data loss with an OK status — the guest is told
+// the range it named is gone and a different one is.
+func TestWriteZeroesAndTheRangeChecks(t *testing.T) {
+	const size = 1 << 20
+	d, err := CreateRawFile(tempPath(t), size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if _, err := d.WriteAt(pattern(0x40, size), 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, unmap := range []bool{false, true} {
+		if err := d.WriteZeroes(0, 4096, unmap); err != nil {
+			t.Fatalf("WriteZeroes(unmap=%v): %v", unmap, err)
+		}
+	}
+	got := make([]byte, 4096)
+	if _, err := d.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, 4096)) {
+		t.Errorf("WriteZeroes left %x", got[:8])
+	}
+
+	for _, tc := range []struct {
+		name        string
+		off, length int64
+	}{
+		{"past the end", size, 512},
+		{"straddling the end", size - 256, 512},
+		{"negative offset", -512, 512},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := d.Discard(tc.off, tc.length); !errors.Is(err, vhost.ErrOutOfRange) {
+				t.Errorf("Discard(%d, %d) = %v, want ErrOutOfRange", tc.off, tc.length, err)
+			}
+			if err := d.WriteZeroes(tc.off, tc.length, true); !errors.Is(err, vhost.ErrOutOfRange) {
+				t.Errorf("WriteZeroes(%d, %d) = %v, want ErrOutOfRange", tc.off, tc.length, err)
+			}
+		})
+	}
+}
+
+// blocksUsed is the filesystem's own accounting, which is the only way to tell a hole
+// from a run of zero bytes: both read back identically.
+func blocksUsed(t *testing.T, d *RawFile) int64 {
+	t.Helper()
+	fi, err := d.f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no stat blocks on this platform; a hole cannot be told from zeros")
+	}
+	return st.Blocks
+}

@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -408,6 +409,80 @@ func RunContract(t *testing.T, newStore NewStore) {
 			assertStoredBodyIsTheWinners(t, s, key, winners[0])
 		}
 	})
+
+	// An exclusion an operator can switch off by deleting a file is not an exclusion.
+	// A POSIX lock lives on an *inode*, so anything that replaces the path it was
+	// taken on replaces the lock: while one writer holds it, the next writer opens the
+	// name, gets a brand-new inode, locks that instead, and both are inside the
+	// read-compare-publish at once — two CAS winners from one prevETag, both told they
+	// published, no error anywhere. When the exclusion was a `<key>.lock` sidecar, the
+	// action that did that was `find -name '*.lock' -delete`: a stale-lock sweep, an
+	// rsync or a backup restore that skips sidecars, a tidy-up script. Every one of
+	// them is something an operator has every reason to believe is harmless, and the
+	// state it leaves — two hosts overwriting each other's session — is one nothing
+	// reports and nobody can recover from after the fact.
+	//
+	// So the contract says it from the outside, in the only place that can see it:
+	// while `*.lock` files are being deleted underneath the writers, the CAS still
+	// admits exactly one of them. An implementation that keys its exclusion off a path
+	// an operator can unlink fails here; one that holds it somewhere a `find` sweep
+	// cannot reach does not notice the sweep at all.
+	t.Run("If-Match admits exactly one winner across processes while *.lock files are swept", func(t *testing.T) {
+		dir := crossProcessDir(t, newStore(t))
+		s, err := real.NewObjectStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sweepLockFiles(t, dir)
+		for round := range crossProcessRounds {
+			key := fmt.Sprintf("image/swept-%d/manifest.json", round)
+			res, err := s.Put(ctx, key, bodyOfSize("epoch-1", sweptBody), objectstore.PutOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			winners := contendWith(t, dir, key, res.ETag, false, sweptBody)
+			if len(winners) != 1 {
+				t.Fatalf("round %d: with a `find -name '*.lock' -delete` running, %d of %d separate processes won the same If-Match CAS on %q from one prevETag, want exactly 1 — deleting a lock file is not supposed to let two hosts both publish",
+					round, len(winners), crossProcessWriters, key)
+			}
+			assertStoredBodyIsTheWinnersSized(t, s, key, winners[0], sweptBody)
+		}
+	})
+}
+
+// sweepLockFiles runs the operator's `find -name '*.lock' -delete` continuously over
+// the store until the test ends. It reports nothing: every error it can hit is one of
+// its own races with the writers (a name that vanished between the walk and the
+// unlink), and an operator's sweep would ignore those too. What it must never do is
+// touch anything else — `.tmp` staging files are a writer's in-flight body, and
+// deleting one turns this into a test about something else.
+func sweepLockFiles(t *testing.T, dir string) {
+	t.Helper()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = filepath.WalkDir(dir, func(p string, entry os.DirEntry, err error) error {
+				// An error here is this sweep racing the writers — a name that
+				// vanished between the walk and the stat. `find` ignores those too.
+				if err != nil || entry.IsDir() || !strings.HasSuffix(p, ".lock") {
+					return nil
+				}
+				_ = os.Remove(p)
+				return nil
+			})
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		<-done
+	})
 }
 
 // The contention shape is the one a readiness run measured a violation with: four
@@ -421,6 +496,18 @@ const (
 	crossProcessWriters = 4
 	crossProcessRounds  = 4
 	crossProcessBody    = 4096
+	// sweptBody is the object the swept round CASes over, and it is a megabyte for a
+	// reason: the read-compare half of a compare-and-swap is a read of the *current*
+	// object, so the window in which a second writer can slip in is as long as that
+	// read takes. A 4KB manifest reads in microseconds — shorter than the scheduling
+	// jitter between four processes — and a violation then needs the sweep and the two
+	// writers to line up inside that; measured against the sidecar implementation,
+	// 2 runs in 20 caught it. A real `image/<vol>/manifest.json` lists every chunk of
+	// the volume, so a megabyte is the ordinary size of the thing being fenced, not a
+	// weight added to make the test win: at that size the same implementation loses
+	// every run. A test whose bug reproduces one time in ten is a test that reports
+	// "fixed" nine times.
+	sweptBody = 1 << 20
 )
 
 // crossProcessDir returns the directory a second process can open the store under
@@ -439,11 +526,16 @@ func crossProcessDir(t *testing.T, s objectstore.Store) string {
 
 func assertStoredBodyIsTheWinners(t *testing.T, s objectstore.Store, key, winner string) {
 	t.Helper()
+	assertStoredBodyIsTheWinnersSized(t, s, key, winner, crossProcessBody)
+}
+
+func assertStoredBodyIsTheWinnersSized(t *testing.T, s objectstore.Store, key, winner string, size int) {
+	t.Helper()
 	got, err := s.Get(t.Context(), key)
 	if err != nil {
 		t.Fatalf("get %q after the contended write: %v", key, err)
 	}
-	if !bytes.Equal(got, bodyOf(winner)) {
+	if !bytes.Equal(got, bodyOfSize(winner, size)) {
 		t.Fatalf("stored object at %q is not the winner's: got %d bytes starting %q, want %q's body",
 			key, len(got), first32(got), winner)
 	}
@@ -451,12 +543,14 @@ func assertStoredBodyIsTheWinners(t *testing.T, s objectstore.Store, key, winner
 
 // bodyOf makes a writer's body long enough to be worth racing over and still
 // self-identifying.
-func bodyOf(name string) []byte {
-	b := make([]byte, 0, crossProcessBody)
-	for len(b) < crossProcessBody {
+func bodyOf(name string) []byte { return bodyOfSize(name, crossProcessBody) }
+
+func bodyOfSize(name string, size int) []byte {
+	b := make([]byte, 0, size)
+	for len(b) < size {
 		b = append(b, (name + "|")...)
 	}
-	return b[:crossProcessBody]
+	return b[:size]
 }
 
 func first32(b []byte) string {
@@ -473,6 +567,11 @@ func first32(b []byte) string {
 // because "nobody won" would otherwise read as "exactly one winner" minus one.
 func contend(t *testing.T, dir, key, ifMatch string, ifNoneMatch bool) []string {
 	t.Helper()
+	return contendWith(t, dir, key, ifMatch, ifNoneMatch, crossProcessBody)
+}
+
+func contendWith(t *testing.T, dir, key, ifMatch string, ifNoneMatch bool, size int) []string {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatalf("locating this test binary to re-exec it: %v", err)
@@ -488,7 +587,7 @@ func contend(t *testing.T, dir, key, ifMatch string, ifNoneMatch bool) []string 
 	for i := range crossProcessWriters {
 		name := fmt.Sprintf("writer-%d", i)
 		spec, err := json.Marshal(childSpec{
-			Dir: dir, Key: key, Body: name, IfMatch: ifMatch, IfNoneMatch: ifNoneMatch,
+			Dir: dir, Key: key, Body: name, Size: size, IfMatch: ifMatch, IfNoneMatch: ifNoneMatch,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -567,6 +666,7 @@ type childSpec struct {
 	Dir         string
 	Key         string
 	Body        string
+	Size        int
 	IfMatch     string
 	IfNoneMatch bool
 }
@@ -598,7 +698,7 @@ func contendAsChild(encoded string) int {
 	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
 		return fail("waiting for the start signal: %v", err)
 	}
-	_, err = s.Put(context.Background(), spec.Key, bodyOf(spec.Body), objectstore.PutOptions{
+	_, err = s.Put(context.Background(), spec.Key, bodyOfSize(spec.Body, spec.Size), objectstore.PutOptions{
 		IfMatch: spec.IfMatch, IfNoneMatch: spec.IfNoneMatch,
 	})
 	switch {
