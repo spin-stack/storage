@@ -237,6 +237,22 @@ tasks:
     cmds:
       - DEVDB_CONTAINER={{.DEVDB_CONTAINER}} POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh down
 
+  # Standing a *new* database up is not a plan, and this is the only task that does it.
+  # db:plan/db:apply are for changes — they diff schema.sql against a database that
+  # already exists — so before this target the documented path from an empty Postgres to
+  # the declared state was "find a psql and redirect internal/schema/schema.sql into it",
+  # which is not a task, is not what CI runs, and needs a client the machine may not have.
+  # It refuses a non-empty database; see hack/db.sh for why that gate is what keeps this
+  # from becoming a way around db:plan's review.
+  db:init:
+    desc: "Apply schema.sql to an EMPTY database — the supported way to stand a new one up. Usage: task db:init [DB_NAME=... DB_HOST=... DB_PORT=... DB_USER=...]"
+    deps: [tools:pgschema, db:dev:up]
+    cmds:
+      - >-
+        PGSCHEMA={{.TOOLS_BIN}}/pgschema POSTGRES_IMAGE={{.POSTGRES_IMAGE}}
+        TARGET_HOST={{.DB_HOST}} TARGET_PORT={{.DB_PORT}} TARGET_DB={{.DB_NAME}} TARGET_USER={{.DB_USER}}
+        bash hack/db.sh init
+
   db:plan:
     desc: "Plan schema.sql against the development database; commit the result under migrations/. Usage: task db:plan -- <name>"
     deps: [tools:pgschema, db:dev:up]
@@ -269,8 +285,10 @@ tasks:
         export PGPASSWORD="${PGPASSWORD:-cp}"
         {{.TOOLS_BIN}}/pgschema apply {{.PGSCHEMA_TARGET}} --plan "$plan" {{if .AUTO_APPROVE}}--auto-approve{{end}}
 
+  # Runs db:init's code path against a throwaway empty database, so the newcomer's
+  # command is the one the merge gate exercises rather than a second applier nothing runs.
   db:verify:
-    desc: Apply schema.sql to an empty Postgres 18 and assert a plan against the result has nothing to do (replaces atlas.sum).
+    desc: Run db:init against an empty Postgres 18 and assert a plan against the result has nothing to do (replaces atlas.sum).
     deps: [tools:pgschema]
     cmds:
       - PGSCHEMA={{.TOOLS_BIN}}/pgschema POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh verify
@@ -386,6 +404,16 @@ tasks:
       KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE}}'
     cmds:
       - bash hack/guest-kernel.sh fetch
+
+  # The start-up refusals a *process* owes an operator, driven against the real binary.
+  # Not a unit test, because the defect this exists for lives between an operator's flag
+  # and the kernel: every test that constructs a VolumeManager itself passes a short
+  # socket directory, so none of them can see a path sun_path cannot hold. Measured at
+  # 1.2s, which is why it is in `ci` and not only in the merge gate.
+  agent:verify:
+    desc: Assert the Volume Agent refuses a -vhost-socket-dir it can never bind, and starts on one it can.
+    cmds:
+      - bash hack/agent-startup.sh
 
   guest:verify:
     desc: Assert the guest lane's inputs — the initramfs we build, and that the kernel is the one we pinned.
@@ -871,6 +899,10 @@ tasks:
       - task: dev:entries
       - task: test
       - task: dst
+      # A binary, started four times, for 1.2 seconds total. It is in the fast gate
+      # because the thing it checks is a seam no package's tests can reach: what the
+      # process does with the operator's flags before any of them is used.
+      - task: agent:verify
       # Half a second, and it is in the *fast* gate rather than only in `ci:full`
       # because renaming a Taskfile target is a local edit whose only victim is a
       # workflow file — and the person renaming it runs `task ci`, not `task ci:full`.

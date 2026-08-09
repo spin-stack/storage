@@ -8,13 +8,14 @@
 # Postgres 18 image the integration lane uses, so `task db:plan` and the tests can
 # never disagree about what the server supports.
 #
-# Invoked only from Taskfile targets (task db:dev:up / db:dev:down / db:verify).
+# Invoked only from Taskfile targets (task db:dev:up / db:dev:down / db:init / db:verify).
 #
 # Subcommands:
 #   up      start (or reuse) the long-lived development database
 #   down    remove it
-#   verify  on a throwaway empty database: apply schema.sql, then assert a plan
-#           against the result has nothing left to do
+#   init    apply schema.sql to a database that does not have it yet
+#   verify  run `init` against a throwaway empty database — the check that replaces
+#           atlas.sum, and the reason `init` is exercised by CI on every run
 set -euo pipefail
 
 POSTGRES_IMAGE=${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
@@ -26,6 +27,27 @@ SCHEMA_FILE=${SCHEMA_FILE:-internal/schema/schema.sql}
 DB_USER=cp
 DB_PASSWORD=cp
 DB_NAME=cp
+
+# The database `init` applies the declared state to. It defaults to the development
+# database `up` starts, which is what makes `task db:dev:up && task db:init` the whole of
+# a newcomer's set-up; `verify` overrides it with its own throwaway.
+TARGET_HOST=${TARGET_HOST:-localhost}
+TARGET_PORT=${TARGET_PORT:-$DEVDB_PORT}
+TARGET_DB=${TARGET_DB:-$DB_NAME}
+TARGET_USER=${TARGET_USER:-$DB_USER}
+TARGET_PASSWORD=${PGPASSWORD:-$DB_PASSWORD}
+
+# One scratch directory and one container handle, cleaned up by one trap: the subcommands
+# nest (verify calls init), and two functions each installing their own EXIT trap means
+# the inner one silently replaces the outer and leaks whatever it was there to remove.
+scratch=$(mktemp -d)
+cid=
+cleanup() {
+  rm -rf "$scratch"
+  [ -n "$cid" ] && docker rm -f "$cid" >/dev/null 2>&1
+  return 0
+}
+trap cleanup EXIT
 
 # wait_ready <container> — block until the server accepts connections, or fail
 # loudly with its log rather than letting the next command report a refused socket.
@@ -50,14 +72,26 @@ run_postgres() {
     "$POSTGRES_IMAGE"
 }
 
-# conn_flags <port> — target *and* plan connection flags. --plan-* is never
-# omitted: without it pgschema falls back to an embedded PostgreSQL it downloads at
+# conn_flags — target *and* plan connection flags for `plan` and `apply`. --plan-* is
+# never omitted: without it pgschema falls back to an embedded PostgreSQL it downloads at
 # run time, which is neither pinned nor the version this project targets.
 conn_flags() {
-  local port=$1
-  echo "--host localhost --port $port --db $DB_NAME --user $DB_USER --sslmode disable" \
-    "--plan-host localhost --plan-port $port --plan-db $DB_NAME --plan-user $DB_USER" \
-    "--plan-password $DB_PASSWORD --plan-sslmode disable"
+  echo "--host $TARGET_HOST --port $TARGET_PORT --db $TARGET_DB --user $TARGET_USER --sslmode disable" \
+    "--plan-host $TARGET_HOST --plan-port $TARGET_PORT --plan-db $TARGET_DB --plan-user $TARGET_USER" \
+    "--plan-password $TARGET_PASSWORD --plan-sslmode disable"
+}
+
+# dump_flags — the same target, for `dump`, which has no plan database and rejects the
+# --plan-* flags.
+dump_flags() {
+  echo "--host $TARGET_HOST --port $TARGET_PORT --db $TARGET_DB --user $TARGET_USER --sslmode disable"
+}
+
+need_pgschema() {
+  test -x "$PGSCHEMA" || {
+    echo "missing $PGSCHEMA — run: task tools" >&2
+    exit 1
+  }
 }
 
 cmd_up() {
@@ -76,66 +110,146 @@ cmd_down() {
   echo "development database $DEVDB_CONTAINER removed"
 }
 
-# The check that replaces atlas.sum (ADR-0019): rather than checksumming the bytes
-# of a migration chain, build the schema the way production would and compare the
-# *result* against the declared state. An unrepresentable construct, a statement
-# pgschema applies but cannot read back, or an edit to schema.sql that no plan can
-# express all surface here as a non-empty second plan.
-cmd_verify() {
-  test -x "$PGSCHEMA" || {
-    echo "missing $PGSCHEMA — run: task tools" >&2
-    exit 1
-  }
-
-  local cid
-  cid=$(run_postgres -d --rm -p 127.0.0.1::5432)
-  # shellcheck disable=SC2064 # $cid must expand now, not at trap time.
-  trap "docker rm -f $cid >/dev/null 2>&1 || true" EXIT
-  wait_ready "$cid"
-
-  local port flags tmp
-  port=$(docker port "$cid" 5432/tcp | head -1)
-  port=${port##*:}
-  read -r -a flags <<<"$(conn_flags "$port")"
-  tmp=$(mktemp -d)
-  # shellcheck disable=SC2064
-  trap "docker rm -f $cid >/dev/null 2>&1 || true; rm -rf $tmp" EXIT
-
-  echo "==> applying $SCHEMA_FILE to an empty $POSTGRES_IMAGE"
-  PGPASSWORD=$DB_PASSWORD "$PGSCHEMA" apply "${flags[@]}" \
-    --file "$SCHEMA_FILE" --auto-approve --no-color >"$tmp/apply.log" || {
-    cat "$tmp/apply.log" >&2
-    exit 1
-  }
-
-  echo "==> re-planning: the declared state must already be reached"
-  PGPASSWORD=$DB_PASSWORD "$PGSCHEMA" plan "${flags[@]}" \
+# assert_declared_state_reached — re-plan against the target and require the plan to be
+# empty. Two independent readings of "nothing to do": no DDL in the SQL rendering, and no
+# groups in the JSON one. Either alone would pass on a tool that silently produced an
+# empty file.
+assert_declared_state_reached() {
+  local flags
+  read -r -a flags <<<"$(conn_flags)"
+  PGPASSWORD=$TARGET_PASSWORD "$PGSCHEMA" plan "${flags[@]}" \
     --file "$SCHEMA_FILE" --no-color \
-    --output-sql "$tmp/plan.sql" --output-json "$tmp/plan.json"
+    --output-sql "$scratch/plan.sql" --output-json "$scratch/plan.json"
 
-  # Two independent readings of "nothing to do": no DDL in the SQL rendering, and a
-  # plan with no groups in the JSON one. Either alone would pass on a tool that
-  # silently produced an empty file.
-  if [ -s "$tmp/plan.sql" ] && grep -q '[^[:space:]]' "$tmp/plan.sql"; then
+  if [ -s "$scratch/plan.sql" ] && grep -q '[^[:space:]]' "$scratch/plan.sql"; then
     echo "FAIL: applying $SCHEMA_FILE does not reach the state it declares." >&2
     echo "A plan against the result still wants to run:" >&2
-    cat "$tmp/plan.sql" >&2
+    cat "$scratch/plan.sql" >&2
     exit 1
   fi
-  if ! grep -q '"groups": *null' "$tmp/plan.json"; then
+  if ! grep -q '"groups": *null' "$scratch/plan.json"; then
     echo "FAIL: the plan against the applied schema is not empty:" >&2
-    cat "$tmp/plan.json" >&2
+    cat "$scratch/plan.json" >&2
     exit 1
   fi
+}
+
+# target_is_empty — true when the target's schema holds no objects. pgschema's own dump is
+# what answers it, so "empty" means empty *to the tool that is about to write into it*,
+# and no psql is needed anywhere. Comment lines are the whole of a dump of nothing.
+target_is_empty() {
+  local flags
+  read -r -a flags <<<"$(dump_flags)"
+  if ! PGPASSWORD=$TARGET_PASSWORD "$PGSCHEMA" dump "${flags[@]}" >"$scratch/dump.sql" 2>"$scratch/dump.err"; then
+    cat "$scratch/dump.err" >&2
+    echo "could not read $TARGET_DB on $TARGET_HOST:$TARGET_PORT. If it does not exist yet, 'task db:dev:up' starts the development one." >&2
+    exit 1
+  fi
+  ! grep -v '^--' "$scratch/dump.sql" | grep -q '[^[:space:]]'
+}
+
+# cmd_init — the only supported way to take an *empty* database to the declared state.
+#
+# It exists because there was no such way. `db:plan`/`db:apply` are for changes: they diff
+# schema.sql against a database that already exists, and the reviewable artefact is the
+# plan. A newcomer with a fresh Postgres had to find a psql — the machine may not have one
+# — and redirect internal/schema/schema.sql into it by hand, which is neither a task nor
+# something CI has ever run.
+#
+# # Why this does not undermine "apply a saved plan, never a recomputed one"
+#
+# That rule is about *diffs*. Reviewing plan A and applying plan B recomputed at deploy
+# time is the failure a state-based tool invites, and it has teeth because a recomputed
+# diff can contain a DROP nobody read. Against an empty database there is no diff: the only
+# plan is "create everything in schema.sql", it is fully determined by the file already
+# under review, and it can destroy nothing because there is nothing there. That is exactly
+# the case `db:verify` recomputes on every CI run, and it is the only case this admits.
+#
+# So the emptiness gate is the load-bearing part, not a convenience. A non-empty database
+# is refused and sent to db:plan/db:apply — otherwise this task would be the back door
+# around review that the whole section exists to close.
+#
+# # Idempotent only where that is the truth
+#
+# Re-run against a database it already initialized, and it plans, finds nothing to do, and
+# says so — a task in CI has to survive being run twice. Re-run against a database that
+# has *drifted*, and it refuses and prints the diff: "make it match" is precisely the
+# unreviewed apply that is not on offer here.
+cmd_init() {
+  need_pgschema
+  local flags
+  read -r -a flags <<<"$(conn_flags)"
+
+  if ! target_is_empty; then
+    echo "==> $TARGET_DB is not empty; checking whether it already matches $SCHEMA_FILE"
+    PGPASSWORD=$TARGET_PASSWORD "$PGSCHEMA" plan "${flags[@]}" \
+      --file "$SCHEMA_FILE" --no-color \
+      --output-sql "$scratch/pre.sql" --output-json "$scratch/pre.json" >/dev/null
+    if ! grep -q '[^[:space:]]' "$scratch/pre.sql"; then
+      echo "OK: $TARGET_DB already holds exactly what $SCHEMA_FILE declares; nothing to do"
+      return 0
+    fi
+    cat >&2 <<EOF
+FAIL: $TARGET_DB on $TARGET_HOST:$TARGET_PORT is not empty and does not match $SCHEMA_FILE.
+db:init only ever creates; taking a database that already holds objects to the declared
+state is a *diff*, and a diff is reviewed as a plan and applied from the file:
+
+  task db:plan -- <name>            # writes migrations/<ts>_<name>.{sql,json}
+  task db:apply PLAN=migrations/<ts>_<name>.json
+
+What a plan against it wants to run right now:
+EOF
+    cat "$scratch/pre.sql" >&2
+    exit 1
+  fi
+
+  echo "==> applying $SCHEMA_FILE to the empty database $TARGET_DB on $TARGET_HOST:$TARGET_PORT"
+  PGPASSWORD=$TARGET_PASSWORD "$PGSCHEMA" apply "${flags[@]}" \
+    --file "$SCHEMA_FILE" --auto-approve --no-color >"$scratch/apply.log" || {
+    cat "$scratch/apply.log" >&2
+    exit 1
+  }
+
+  # Never "applied, therefore correct": the same check db:verify is named for, run against
+  # the database a human is about to use.
+  echo "==> re-planning: the declared state must already be reached"
+  assert_declared_state_reached
+  echo "OK: $TARGET_DB matches $SCHEMA_FILE exactly"
+}
+
+# The check that replaces atlas.sum (ADR-0019): rather than checksumming the bytes of a
+# migration chain, build the schema the way a new database is built and compare the
+# *result* against the declared state. An unrepresentable construct, a statement pgschema
+# applies but cannot read back, or an edit to schema.sql that no plan can express all
+# surface here as a non-empty second plan.
+#
+# It runs `init` rather than its own apply, so the command CI proves is the command a
+# human runs. Before, the two were separate code paths and only one of them was ever
+# executed by anything.
+cmd_verify() {
+  need_pgschema
+
+  cid=$(run_postgres -d --rm -p 127.0.0.1::5432)
+  wait_ready "$cid"
+
+  TARGET_HOST=localhost
+  TARGET_PORT=$(docker port "$cid" 5432/tcp | head -1)
+  TARGET_PORT=${TARGET_PORT##*:}
+  TARGET_DB=$DB_NAME
+  TARGET_USER=$DB_USER
+  TARGET_PASSWORD=$DB_PASSWORD
+
+  cmd_init
   echo "OK: $SCHEMA_FILE applies to an empty database and the result matches it exactly"
 }
 
 case "${1:-}" in
 up) cmd_up ;;
 down) cmd_down ;;
+init) cmd_init ;;
 verify) cmd_verify ;;
 *)
-  echo "usage: $0 up|down|verify" >&2
+  echo "usage: $0 up|down|init|verify" >&2
   exit 2
   ;;
 esac

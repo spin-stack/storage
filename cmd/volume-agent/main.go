@@ -114,6 +114,11 @@ func run() (err error) {
 		return errors.New("-vhost-socket-dir is required")
 	}
 
+	// Answered once, here, and not per volume per cycle for ever. See checkSocketDir.
+	if err := checkSocketDir(*socketDir); err != nil {
+		return err
+	}
+
 	cfg := agent.Config{
 		HostID:            *hostID,
 		AgentVersion:      version,
@@ -334,6 +339,52 @@ func run() (err error) {
 		return err
 	}
 	return nil
+}
+
+// maxUnixPath is the longest filesystem path bind(2) accepts for a Unix socket:
+// sockaddr_un's sun_path is 108 bytes and the terminating NUL is one of them. Measured,
+// not read off a header — 107 binds, 108 returns EINVAL.
+const maxUnixPath = 107
+
+// socketNameLen is what every volume adds to the socket directory. The Agent binds
+// <socket-dir>/<volume-id>.sock, and a volume id is a UUID in its 36-character form, so
+// the suffix is the same 42 bytes for every volume this host will ever serve.
+const socketNameLen = len("/") + 36 + len(".sock")
+
+// checkSocketDir refuses a -vhost-socket-dir whose sockets could never be bound.
+//
+// # Why start-up, and not the place that binds
+//
+// Because start-up is where the question can be *answered*, and the binding site is
+// where it can only be discovered. The length of the directory is known before any
+// volume is, and it is the same answer for every volume, for the life of the process:
+// nothing a Control Plane says can turn a 164-byte directory into a bindable one.
+//
+// Discovered at the binding site it is not even a failure, it is a symptom. That path
+// runs inside the reconciliation loop, which treats a failed cycle as transient and
+// retries it every five seconds for ever, printing
+//
+//	WARN reconciliation cycle failed error="... bind: invalid argument" retry_in=5s
+//
+// while the Control Plane goes on reporting the volume placed. Nothing in that line says
+// which path, which limit, or that any length is involved — EINVAL from bind is the
+// kernel's only signal that sun_path overflowed — so the operator sees a volume that
+// never serves and a host that looks healthy. That is the failure this refusal ends, and
+// it is why it is fatal rather than a warning: a process that cannot serve any volume
+// should not be reporting itself as a host that can.
+//
+// The message carries the three numbers there is an action for: what was given, what the
+// kernel allows, and the longest directory that would work.
+func checkSocketDir(dir string) error {
+	// Cleaned first because the manager joins with path.Join, which cleans too: a
+	// trailing slash or a doubled separator is not what gets bound, and refusing on it
+	// would be refusing a directory that works.
+	clean := filepath.Clean(dir)
+	if len(clean)+socketNameLen <= maxUnixPath {
+		return nil
+	}
+	return fmt.Errorf("-vhost-socket-dir is %d bytes (%q), and every socket in it is that plus %d more for /<volume-id>.sock — over the %d bytes the kernel allows a Unix socket path (sun_path is %d bytes including the NUL). bind would fail with EINVAL for every volume, for ever. Use a directory of at most %d bytes",
+		len(clean), clean, socketNameLen, maxUnixPath, maxUnixPath+1, maxUnixPath-socketNameLen)
 }
 
 // serveOperatorEndpoint starts the Agent's only listening socket and returns the

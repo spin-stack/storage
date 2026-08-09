@@ -39,6 +39,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -93,7 +94,7 @@ func TestARunningAgentDeliversItsLeaseGaugeToACollector(t *testing.T) {
 		"-host-id", host,
 		"-control-plane", cpsrv.URL,
 		"-data-dir", t.TempDir(),
-		"-vhost-socket-dir", t.TempDir(),
+		"-vhost-socket-dir", shortSocketDir(t),
 		"-object-store-dir", t.TempDir(),
 		"-otlp-endpoint", otlp.URL,
 		// One cycle, then an hour of silence. The Agent's first cycle runs immediately
@@ -161,7 +162,7 @@ func TestAnAgentThatCannotReachItsControlPlaneStillDeliversTheFailureCounter(t *
 		"-host-id", host,
 		"-control-plane", deadURL,
 		"-data-dir", t.TempDir(),
-		"-vhost-socket-dir", t.TempDir(),
+		"-vhost-socket-dir", shortSocketDir(t),
 		"-object-store-dir", t.TempDir(),
 		"-otlp-endpoint", otlp.URL,
 		// Both an hour, so the failed cycle is not retried before the signal and the
@@ -402,4 +403,24 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string, p *agentProcess) {
 	case <-ctx.Done():
 		t.Fatalf("%s; it printed:\n%s", what, p.output())
 	}
+}
+
+// shortSocketDir is a socket directory the kernel can actually hold a bound socket in.
+// t.TempDir() embeds the test's name, and these names are long enough that the path plus
+// "/<volume-id>.sock" crosses sun_path's 108 bytes — so the Agent refuses it at start-up,
+// which is the check cmd/volume-agent added after a bring-up spent an afternoon on an
+// opaque "bind: invalid argument" retried every five seconds for ever. The old behaviour
+// let these tests start an Agent whose sockets could never have bound; they did not
+// notice because they assert on a metric and never serve a volume.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	// usetesting is right in general and wrong here, and the exception is the whole
+	// point of this helper: t.TempDir() embeds the test's name, which is what makes the
+	// path too long for sun_path in the first place.
+	dir, err := os.MkdirTemp("", "sk") //nolint:usetesting // t.TempDir() is the bug this works around
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
