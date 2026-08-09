@@ -336,9 +336,15 @@ func (v *Volume) ident() image.Ident {
 // hold the data directory while it does, and exit non-zero if it never succeeds. A caller
 // that reads slog cannot do any of those things, and the process exited 0 with the
 // session in nobody's bucket.
-func (v *Volume) publish(ctx context.Context) error {
+//
+// It returns the sequence it wrote, which is the number the catalog's
+// `published_sequence` is a claim about. Before this it returned nothing but an error,
+// and the number lived only in a slog line: every caller had to wait for some future
+// attach to read it back out of the manifest (wal.InstallBase), which is a session later
+// and on whichever host the volume lands on next. See VolumeManager.settled.
+func (v *Volume) publish(ctx context.Context) (uint64, error) {
 	if v.store == nil {
-		return nil // local-only Agent: the local WAL is all there is, by design
+		return 0, nil // local-only Agent: the local WAL is all there is, by design
 	}
 	if v.baseDone != nil {
 		// The fetch runs on its own goroutine and is not covered by v.done, which waits
@@ -350,7 +356,7 @@ func (v *Volume) publish(ctx context.Context) error {
 		<-v.baseDone
 	}
 	if v.baseFailed {
-		return fmt.Errorf("%w: volume %s", ErrNoReadView, v.id)
+		return 0, fmt.Errorf("%w: volume %s", ErrNoReadView, v.id)
 	}
 	view, seq := v.log.ViewAtRest()
 	v.sayWhatThisImageCosts(view)
@@ -365,11 +371,11 @@ func (v *Volume) publish(ctx context.Context) error {
 	}()
 	etag, err := image.Publish(ctx, v.store, v.rnd, v.enc, v.ident(), view, v.inherited, seq, v.imageETag)
 	if err != nil {
-		return fmt.Errorf("agent: volume %s: publishing its image at sequence %d: %w", v.id, seq, err)
+		return 0, fmt.Errorf("agent: volume %s: publishing its image at sequence %d: %w", v.id, seq, err)
 	}
 	v.imageETag = etag
 	slog.Info("volume image published", "volume_id", v.id, "sequence", seq)
-	return nil
+	return seq, nil
 }
 
 // sayWhatThisImageCosts prints the size of the image about to be written, and how much
@@ -667,7 +673,31 @@ type VolumeManager struct {
 	// Plane stops listing the volume for this host — the same rule as fencedEpoch, and
 	// for the same reason: at that point this host is not the one refusing anything.
 	refusals map[string]refusal
-	closed   bool
+	// settled is the sequence this host actually put in the object store, per volume,
+	// written the moment image.Publish returns.
+	//
+	// It exists because the log is not a witness to its own publish. `published` inside
+	// wal.Log moves in exactly one place — InstallBase, from the manifest an *attach*
+	// read — so between a publish and the next attach the number lives nowhere in this
+	// process, and the catalog learns it from whichever host picks the volume up next, a
+	// whole session later. That gap is not cosmetic: `ErrImageMissing` refuses to serve a
+	// blank device only when published_sequence > 0, so a volume publishing its first
+	// image is precisely the one the catalog still records as having published nothing.
+	//
+	// Rejected: calling log.AdvancePublished(seq) instead, which would make Status report
+	// it with no map at all. A publish covers the log's *local* sequence, and durable is
+	// only as far as the guest's last FLUSH reached — so on any volume with unflushed
+	// writes that call is published > durable, which is INV-03 and which AllowPublished
+	// refuses. Moving durable up to meet it would be widening what an ACK claims from
+	// inside a teardown, which is a review zone. The honest shape is that this is the
+	// Agent's own observation of the bucket, so it is held by the Agent.
+	//
+	// An entry lives under the same rule as refusals: until the Control Plane stops
+	// listing the volume for this host. It is deliberately *not* dropped when a runtime
+	// starts again — Volumes takes the larger of this and what the runtime reports, and
+	// the runtime reports zero for as long as its base fetch is in flight.
+	settled map[string]int64
+	closed  bool
 	// lock is this host's claim on DataDir (DEV-0014). Held for the manager's life
 	// and released by Close.
 	lock io.Closer
@@ -731,6 +761,7 @@ func NewVolumeManager(cfg VolumeManagerConfig, deps VolumeManagerDeps) (*VolumeM
 		volumes:     map[string]*Volume{},
 		fencedEpoch: map[string]int64{},
 		refusals:    map[string]refusal{},
+		settled:     map[string]int64{},
 	}, nil
 }
 
@@ -742,6 +773,47 @@ type refusal struct {
 	epoch  int64
 	kind   storagev1.VolumeRefusal
 	detail string
+}
+
+// withPublished raises a report to a sequence this host has actually put in the object
+// store — **the whole trio, not the published watermark alone.**
+//
+// That is not tidiness. A report is refused outright unless published <= durable <=
+// local (INV-03, metadata.CheckWatermarkOrder), and the refusal is for the *whole*
+// report: watermarks first, everything else after. Raising only the published field on
+// an entry whose other two are zero — which is exactly the shape of a volume this host
+// gave up and is reporting a refusal for — makes the Control Plane answer OUT_OF_ORDER
+// and drop the refusal with it. Found by running the two binaries: the catalog kept an
+// empty refusal for a volume the Agent had loudly given up, and nothing in either log
+// said why, because an outcome is not an error.
+//
+// Claiming the other two is honest, and it is the same claim cmd/volume-agent's final
+// report makes: the image in the bucket at sequence N was written from the view the log
+// held at N, so N was reached locally and N is in the object store. Both floors compare
+// with `<`, so a number at or below the truth never refuses a volume that is fine.
+func withPublished(st VolumeStatus, seq int64) VolumeStatus {
+	if seq <= st.PublishedSequence {
+		return st
+	}
+	st.PublishedSequence = seq
+	st.DurableSequence = max(st.DurableSequence, seq)
+	st.LocalSequence = max(st.LocalSequence, st.DurableSequence)
+	return st
+}
+
+// recordPublished remembers what a volume's publish put in the bucket. Only ever
+// forward: a second publish at a lower sequence is not something this Agent can produce
+// (quiesce only lets the sequence rise), and a floor that fell would be one that stopped
+// refusing a volume it should refuse.
+func (m *VolumeManager) recordPublished(volumeID string, seq uint64) {
+	if seq == 0 {
+		return // a local-only Agent, or a volume that never had a byte written to it
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.settled[volumeID] < int64(seq) {
+		m.settled[volumeID] = int64(seq)
+	}
 }
 
 // refusalFor classifies what stopped a runtime from starting. Two values and not one,
@@ -882,6 +954,16 @@ func (m *VolumeManager) Apply(ctx context.Context, desired []*storagev1.DesiredV
 	for id := range m.refusals {
 		if !live[id] {
 			delete(m.refusals, id)
+		}
+	}
+	// And what this host published for it. The number is only worth carrying while there
+	// is still a report that can carry it: once the Control Plane has stopped listing the
+	// volume for this host, every report about it is refused on the same host-and-epoch
+	// predicate, so keeping the entry would be a map that grows for the life of the
+	// process and says nothing to anyone.
+	for id := range m.settled {
+		if !live[id] {
+			delete(m.settled, id)
 		}
 	}
 	m.mu.Unlock()
@@ -1639,9 +1721,12 @@ func (m *VolumeManager) remove(ctx context.Context, id string) error {
 	// the cycle rather than be cancelled by it — a cancelled publish is the silent data
 	// loss the whole spec is about (same rule as the base fetch's context, see start).
 	m.awaitBase(context.WithoutCancel(ctx), v)
-	if err := m.publishAttempt(context.WithoutCancel(ctx), v); err != nil {
+	seq, err := m.publishAttempt(context.WithoutCancel(ctx), v)
+	if err != nil {
 		slog.Error("this volume's image could not be published; this session's writes are only in this host's local WAL, and this host is no longer the volume's writer",
 			"volume_id", id, "epoch", v.epoch, "data_dir", m.cfg.dataDir(), "error", err)
+	} else {
+		m.recordPublished(id, seq)
 	}
 	return v.release()
 }
@@ -1653,7 +1738,13 @@ func (m *VolumeManager) Volumes(context.Context) ([]VolumeStatus, error) {
 	m.mu.Lock()
 	out := make([]VolumeStatus, 0, len(m.volumes)+len(m.refusals))
 	for _, v := range m.volumes {
-		out = append(out, v.Status())
+		st := v.Status()
+		// The larger of what the log knows and what this host watched itself write. They
+		// disagree for one session at a time: a runtime learns its published point from
+		// the manifest its attach reads, so a volume that published and was started
+		// again reports zero until its base fetch lands, and one that published and is
+		// gone reports nothing at all.
+		out = append(out, withPublished(st, m.settled[v.id]))
 	}
 	// And the volumes this host was told to serve and is not serving. They belong on the
 	// report for the same reason the running ones do — it is what this host observes —
@@ -1666,13 +1757,21 @@ func (m *VolumeManager) Volumes(context.Context) ([]VolumeStatus, error) {
 	// report cannot pull the catalog's numbers back to the zeros it is reporting. That
 	// asymmetry is why the refusal itself is stored by a different rule — see
 	// metadata.Store.SetVolumeRefusal.
+	//
+	// **With one exception, and it is the point of `settled`.** A volume this host gave
+	// up because its lease lapsed was *published* on the way out, and this is the one
+	// teardown whose report the Control Plane still accepts — nothing has moved, so this
+	// host is still the volume's primary at this epoch (see Loop.giveUpOnExpiredLease).
+	// The sequence rides on the refusal rather than on an entry of its own, because a
+	// second entry for the same volume would be a second VolumeReport in one request,
+	// and an entry with no refusal is this host saying it *is* serving the volume.
 	for id, r := range m.refusals {
 		if _, running := m.volumes[id]; running {
 			continue
 		}
-		out = append(out, VolumeStatus{
+		out = append(out, withPublished(VolumeStatus{
 			VolumeID: id, Epoch: r.epoch, Refusal: r.kind, RefusalDetail: r.detail,
-		})
+		}, m.settled[id]))
 	}
 	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].VolumeID < out[j].VolumeID })
@@ -1784,9 +1883,15 @@ func (m *VolumeManager) publishHeld(ctx context.Context, held []*Volume) []error
 					"volume_id", v.id, "attempt", attempt, "volumes_remaining", len(remaining))
 			}
 			m.awaitBase(ctx, v)
-			err := m.publishAttempt(ctx, v)
+			seq, err := m.publishAttempt(ctx, v)
 			switch {
 			case err == nil:
+				// Recorded before the drop, so the Sustain loop that keeps heartbeating
+				// through a slow teardown carries the number on its very next report —
+				// while this host is still the volume's primary at this epoch and the
+				// report is still accepted. After the drop there is nothing left here
+				// that knows it.
+				m.recordPublished(v.id, seq)
 				errs = append(errs, m.drop(v))
 			case errors.Is(err, image.ErrSuperseded), errors.Is(err, ErrNoReadView):
 				// The two failures a retry cannot survive, and they are opposites.
@@ -1906,7 +2011,7 @@ func (m *VolumeManager) awaitBase(ctx context.Context, v *Volume) {
 // never fires in simulation or fires by wall-clock accident, and INV-01 exists precisely
 // so time is one of the things a scenario drives. A zero ShutdownGrace arms nothing,
 // which is what leaves every in-process caller's behaviour exactly as it was.
-func (m *VolumeManager) publishAttempt(ctx context.Context, v *Volume) error {
+func (m *VolumeManager) publishAttempt(ctx context.Context, v *Volume) (uint64, error) {
 	if m.cfg.ShutdownGrace <= 0 {
 		return v.publish(ctx)
 	}
