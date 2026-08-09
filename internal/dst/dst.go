@@ -44,6 +44,20 @@ const (
 	EventTruncate    EventKind = "truncate"
 	EventVolumeServe EventKind = "volume-serve"
 	EventDurableRead EventKind = "durable-read"
+	EventCarry       EventKind = "carry"
+)
+
+// CarryPhase says what a carry event states about one WAL record: what a guest was
+// promised, or what the device was found to hold afterwards.
+type CarryPhase string
+
+const (
+	// CarryPromised: the record's fdatasync returned, so a guest's fsync was ACKed on
+	// it. Emitted once per (volume, sequence), with the plaintext the guest wrote.
+	CarryPromised CarryPhase = "promised"
+	// CarrySurvived: the record was found on the device by a scan, under the epoch the
+	// event names, with the plaintext it reads back as.
+	CarrySurvived CarryPhase = "survived"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -83,6 +97,27 @@ type Event struct {
 	// undecrypted ciphertext being the case that shipped, since GCM leaves the length
 	// intact and nothing downstream re-checks the plaintext CRC. Must always be false.
 	ForeignBytesAfterRestart bool
+
+	// Carry events (wal.Log.CarryForward): one WAL record either promised to a guest
+	// or found on the device afterwards. Key carries the volume id.
+	CarryPhase CarryPhase
+	// Epoch is the epoch the record was promised under (promised) or is filed under
+	// (survived). Sequence is the record's, which a carry must never change.
+	Epoch    uint64
+	Sequence uint64
+	// Digest is over the *plaintext* — what the guest wrote, or what the record on the
+	// device reads back as once opened. A resealed record has different bytes on disk
+	// and the same digest; a copied ciphertext has the same bytes and a different one,
+	// which is the whole reason the digest is not taken over the encoded record.
+	Digest string
+	// Scan groups the survived events of one observation of one device. It is what
+	// scopes "the same sequence twice under one (volume, epoch)" to a single moment,
+	// rather than to a record legitimately seen again by a later scan.
+	Scan uint64
+	// Settled marks the observation taken after the carry was given its last chance to
+	// finish. Only those decide whether a record was lost; an earlier scan is a
+	// half-finished state on purpose.
+	Settled bool
 }
 
 // String renders an event deterministically for the trace.
@@ -105,6 +140,9 @@ func (e Event) String() string {
 			e.Step, e.Key, e.ZerosAfterRestart, e.ForeignBytesAfterRestart)
 	case EventVolumeServe:
 		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
+	case EventCarry:
+		return fmt.Sprintf("%04d carry %s vol=%s epoch=%d seq=%d digest=%s scan=%d settled=%t",
+			e.Step, e.CarryPhase, e.Key, e.Epoch, e.Sequence, e.Digest, e.Scan, e.Settled)
 	case EventObject:
 		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:

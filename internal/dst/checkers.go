@@ -149,6 +149,7 @@ func DefaultCheckers() []Checker {
 	all := coreCheckers()
 	all = append(all, harnessCheckers()...)
 	all = append(all, walCheckers()...)
+	all = append(all, carryCheckers()...)
 	all = append(all, agentCheckers()...)
 	return all
 }

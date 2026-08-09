@@ -47,6 +47,8 @@ var pinnedMandatorySet = []string{
 	// wal (scenarios_wal.go)
 	"wal-segments-survive-a-crash-at-every-boundary",
 	"guest-device-acks-durability-only-on-flush",
+	// carry (scenarios_carry.go)
+	"carry-forward-survives-a-crash-at-every-point",
 	// agent (scenarios_agent.go)
 	"fenced-volume-stops-serving",
 	"a-stopped-volume-comes-back-from-its-image",

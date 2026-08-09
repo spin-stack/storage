@@ -38,6 +38,7 @@ func MandatoryScenarios() []MandatoryScenario {
 	all := coreScenarios()
 	all = append(all, harnessScenarios()...)
 	all = append(all, walScenarios()...)
+	all = append(all, carryScenarios()...)
 	all = append(all, agentScenarios()...)
 	return all
 }

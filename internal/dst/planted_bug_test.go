@@ -150,6 +150,8 @@ var plantedProofs = map[string]proofKind{
 	// Contributed by scenarios_agent.go; proofs in planted_bug_agent_test.go.
 	"fenced-volume-not-served":       proofBehavioural,
 	"durable-range-survives-restart": proofBehavioural,
+	// Contributed by scenarios_carry.go; proof in planted_bug_carry_test.go.
+	"acked-records-cross-epochs-intact": proofBehavioural,
 }
 
 // proven records which checkers a plantedBug call actually exercised in this run.
@@ -228,8 +230,10 @@ func TestPlantedBugWatermarkOrder(t *testing.T) {
 //   - 7 -> 6, then 6 -> 5 (2026-08-03): `watermark-order` was *reclassified*, not
 //     removed. It had claimed a behavioural proof that did not exist; it is literal now
 //     and has a proof that runs. The number went down because the record became true.
+//   - 5 -> 6 (2026-08-09): `acked-records-cross-epochs-intact`, with the carry-forward
+//     scenario. An increase, which is the only direction that needs no defence.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 5
+	const wantBehavioural = 6
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {
