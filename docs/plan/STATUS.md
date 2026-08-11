@@ -25,10 +25,18 @@ mid-session, which is the documented shape (§5.7) and the number nobody had.
 
 ## Do this next
 
-**Nothing here blocks a pilot, and nothing is queued.** Nine blockers closed, then 22
-regressions those fixes caused found by a re-run and closed, then the six residuals, then the
-last derivation — every bound in the Agent is now a division of something it measured. `git
-log` has all of it. What is left is only what a running tenant can answer.
+**Nothing here blocks a pilot, and nothing is queued.** A code review found eight problems
+and a set of comments describing mechanisms that were deleted; all of it is closed. `git log`
+has it. Two things it left behind, both measured rather than assumed:
+
+1. **`cow.IntervalMap`'s write path is still O(n).** 1.5 ms per 4 KiB guest write at 419,430
+   extents — the density a 256 MiB read view reaches with 512-byte writes. The read path was
+   the one the numbers demanded and it is fixed (215 µs → 57 ns at the bound);
+   `BenchmarkOverwriteAtTheBound` is in place so the next person starts from a number.
+2. **A shared filesystem between empty and nearly full is still divided as if this Agent
+   owned it.** The case that cannot work — a budget whose publish reserve does not fit in the
+   free space — now refuses at start-up, naming what to free. The rest is V1's assumption:
+   give the Agent a filesystem of its own.
 
 ## What only a pilot can answer
 
