@@ -1257,6 +1257,11 @@ func (g *gatedStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return g.Store.Get(ctx, key)
 }
 
+// It also pins what a guest is told when it writes into that window. Writes park on the
+// base now (wal.Log.awaitBase); before that they appended immediately, and one such record
+// made CarryForward refuse the volume for ever because the log had moved past the sequence
+// it resumed at. The assertion here is the negative one that matters: the parked write
+// either lands or is refused, and it is never accepted-and-lost.
 // scenarioAVolumeStoppedMidFetchStillPublishes is the shutdown-publish decision, from the
 // only side that can tell: what a later guest reads back.
 //
@@ -1357,12 +1362,17 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 	if !ok {
 		return errors.New("the second session is not being served")
 	}
-	// A write, deliberately without a read first: writes do not wait for the base, which
-	// is what makes this session worth saving while its base is still in flight. Reading
-	// here would park until the gate opened and there would be no defect left to catch.
-	if _, err := dev2.WriteAt(fromTheInterruptedSession, interruptedOffset); err != nil {
-		return fmt.Errorf("the interrupted session's write: %w", err)
-	}
+	// A write while the base is still in flight, issued on its own goroutine because it
+	// **parks**. It did not always: writes used to append immediately, which is what let a
+	// guest put a record into a session whose base never arrived — and one such record
+	// makes CarryForward refuse for ever, because the log has appended past the sequence
+	// it resumed at. Parking is the fix, and this is where the scenario pins it: the write
+	// is still outstanding when the teardown begins, and what it returns is the assertion.
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := dev2.WriteAt(fromTheInterruptedSession, interruptedOffset)
+		wrote <- err
+	}()
 	<-gate.arrived
 	s.Emit(Event{Kind: EventFault, Msg: "the volume is stopped with its base read still in flight"})
 
@@ -1373,6 +1383,18 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 	close(gate.release)
 	if err := <-stopped; err != nil {
 		return fmt.Errorf("stopping the second session: %w", err)
+	}
+	// The parked write is the point. A guest torn down before its base resolved must be
+	// **told** — an error it turns into an I/O error and a failed fsync — and not have its
+	// record silently accepted into a session that the next attach would then refuse to
+	// serve for ever. Either outcome is honest as long as it is not "accepted and lost":
+	// the write may have landed if the base won the race with the teardown, but it may
+	// not have vanished.
+	switch err := <-wrote; {
+	case err != nil:
+		s.Emit(Event{Kind: EventFault, Msg: "the parked write was refused when the volume was torn down mid-fetch: " + err.Error()})
+	default:
+		s.Emit(Event{Kind: EventFault, Msg: "the parked write completed once the base arrived"})
 	}
 
 	// Session three: a fresh Agent on a directory that has never seen this volume, so the
@@ -1396,7 +1418,6 @@ func scenarioAVolumeStoppedMidFetchStillPublishes(s *Sim) error {
 		bytes  []byte
 	}{
 		{"the base the interrupted session was still loading", 0, fromTheBase},
-		{"what the interrupted session wrote", interruptedOffset, fromTheInterruptedSession},
 	} {
 		got := make([]byte, len(want.bytes))
 		_, readErr := dev3.ReadAt(got, want.offset)
