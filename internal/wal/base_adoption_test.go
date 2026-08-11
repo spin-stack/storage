@@ -190,6 +190,11 @@ func TestReadsWaitForTheBaseRatherThanAnsweringEarly(t *testing.T) {
 // it. This is the tombstone rule, tested where it actually bites: an unlayered view
 // would have forgotten the discard, and the base would hand the guest back the bytes it
 // asked to erase (§14.6).
+//
+// The DISCARD is written by a previous session and *replayed*, which is what the rule has
+// always been about and what this test used to only claim: it issued the DISCARD against
+// the resumed log instead, which never touched the replay path — and cannot, now that an
+// append waits for the base rather than racing it (see Log.awaitBase).
 func TestADiscardIsNotUndoneByTheBase(t *testing.T) {
 	base := cow.NewIntervalMap()
 	base.Overwrite(0, bytes.Repeat([]byte{0xAB}, 4096))
@@ -198,14 +203,22 @@ func TestADiscardIsNotUndoneByTheBase(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	vol := [16]byte{0x78}
 
+	prev := wal.NewLog(d, "wal", clk, vol, 1, wal.Limits{})
+	if _, err := prev.Discard(0, 4096); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+	if err := prev.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
 	l, err := wal.ResumeAwaitingBase(d, "wal", clk, vol, 1, wal.Limits{}, nil)
 	if err != nil {
 		t.Fatalf("ResumeAwaitingBase: %v", err)
 	}
 	defer func() { _ = l.Close() }()
 
-	if _, err := l.Discard(0, 4096); err != nil {
-		t.Fatalf("Discard: %v", err)
+	if got := l.ResumeReport().Records; got != 1 {
+		t.Fatalf("the resumed log replayed %d record(s); the DISCARD has to come back off the device or this proves nothing", got)
 	}
 	if err := l.InstallBase(base, 0); err != nil {
 		t.Fatalf("InstallBase: %v", err)

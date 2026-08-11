@@ -426,15 +426,26 @@ func TestAnEncryptedRecordIsResealedUnderTheGrantedEpoch(t *testing.T) {
 // and the sequences this session has already issued are the same numbers, so a carry here
 // would put two different records under one sequence in one directory — and, for an
 // encrypted volume, seal them under one nonce.
+//
+// The log is opened with Resume rather than ResumeAwaitingBase, because a log awaiting a
+// base can no longer be in this state from the outside: an append parks until the base has
+// been installed, which is after the carry (Log.awaitBase, and the attach window it closed).
+// The guard stays and is still tested, because it is the statement CarryForward makes about
+// its own precondition — a caller that carries after appending destroys the volume quietly,
+// and one line refusing is cheaper than trusting the ordering to stay true.
 func TestCarryForwardRefusesOnceThisSessionHasWritten(t *testing.T) {
 	d, clk, vol := newCarryFixture(t)
 	writeUnpublishedSession(t, d, clk, vol, 2, nil, 6)
 
-	l := resumeGranted(t, d, clk, vol, 3, nil)
+	l, err := wal.Resume(d, carryRoot, clk, vol, 3, 0, wal.Limits{SegmentBytes: carrySegmentBytes}, nil)
+	if err != nil {
+		t.Fatalf("resuming volume %x at epoch 3: %v", vol[:4], err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
 	if _, err := l.Write(0, carryPayload(0), 0); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	_, err := l.CarryForward(0)
+	_, err = l.CarryForward(0)
 	if !errors.Is(err, wal.ErrCarryUnavailable) {
 		t.Fatalf("a carry over a session that has already written failed with %v, which does not carry %v",
 			err, wal.ErrCarryUnavailable)

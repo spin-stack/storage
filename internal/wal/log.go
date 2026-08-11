@@ -219,6 +219,21 @@ type Log struct {
 	published uint64
 	replayed  bool // this log rebuilt itself from the WAL file's contents
 
+	// stopping is closed by StopWrites and is what makes quiesce mean what it says.
+	//
+	// Parking appends on the base (awaitBase) closed one hole and opened this one: a
+	// write that is parked has already passed the vhost server, so cancelling the serve
+	// context does not reach it, and when the base finally resolves it appends — after
+	// the volume was quiesced, concurrently with the publish reading the view. Found by
+	// a DST scenario that stops a volume with its base still in flight; the -race
+	// detector named the publish's read of the view against that late append.
+	//
+	// So a parked writer has a second way out. Closing this is the statement "no further
+	// append will be accepted", and it is the caller's job to close it before it reads
+	// the view for a publish.
+	stopping chan struct{}
+	stopOnce sync.Once
+
 	// resume is what replay found on the device, set once by Resume and never after.
 	// See ResumeReport for why the numbers in it are not derivable from the watermarks.
 	resume ResumeReport
@@ -397,6 +412,19 @@ func (l *Log) observeLatency(ctx context.Context, name string, start clock.Insta
 	l.rec.Observe(ctx, name, l.clk.Now().Sub(start).Seconds(), obs.String("volume", l.volLabel))
 }
 
+// StopWrites refuses every append from here on, including the ones already parked on the
+// base. It is what a teardown calls before it reads the view to publish: without it,
+// "quiesce" stops the front-end but not a write that had already passed it.
+//
+// Idempotent, because a teardown can be reached twice (remove, then Close).
+func (l *Log) StopWrites() {
+	l.stopOnce.Do(func() {
+		l.mu.Lock()
+		close(l.stopping)
+		l.mu.Unlock()
+	})
+}
+
 // Broken reports whether a failed rollback left this log's tail unknown.
 //
 // It has no production caller. What it exists for is proof — the tests that plant a
@@ -429,6 +457,7 @@ func NewLog(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch 
 // epochs together, would see two different records claiming the same sequence.
 func NewLogAfter(d disk.Disk, root string, clk clock.Clock, volumeID [16]byte, epoch, boundary uint64, limits Limits) *Log {
 	return &Log{
+		stopping:   make(chan struct{}),
 		segs:       newSegments(d, root, clk, volumeID, epoch, limits.SegmentBytes),
 		clk:        clk,
 		volumeID:   volumeID,
@@ -583,6 +612,10 @@ func (l *Log) Write(offset uint64, data []byte, flags uint32) (uint64, error) {
 	if flags&format.FlagFUA != 0 {
 		return 0, ErrFUAOnWrite
 	}
+	// Before the lock, and before the sequence is chosen: see awaitBase.
+	if err := l.awaitBase(); err != nil {
+		return 0, err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.write(offset, data, flags)
@@ -613,7 +646,15 @@ func (l *Log) write(offset uint64, data []byte, flags uint32) (uint64, error) {
 }
 
 // Discard appends a DISCARD of [offset, offset+length); the range reads as zero.
+//
+// It waits for the base exactly as Write does, and it is not a lesser case: a Linux guest
+// trims early — mkfs and the first fstrim on a fresh root both do — and a DISCARD moves the
+// sequence counter like any other record, so a rule that covered only WRITE would leave the
+// volume strandable by a guest that never wrote a byte of data.
 func (l *Log) Discard(offset uint64, length uint32) (uint64, error) {
+	if err := l.awaitBase(); err != nil {
+		return 0, err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.appendClear(format.RecordDiscard, offset, length)
@@ -621,6 +662,9 @@ func (l *Log) Discard(offset uint64, length uint32) (uint64, error) {
 
 // WriteZeroes appends a WRITE_ZEROES of [offset, offset+length); reads as zero.
 func (l *Log) WriteZeroes(offset uint64, length uint32) (uint64, error) {
+	if err := l.awaitBase(); err != nil {
+		return 0, err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.appendClear(format.RecordWriteZeroes, offset, length)
@@ -669,23 +713,71 @@ func (l *Log) DiscardedBytes() int64 {
 // zeros from a range it never wrote. Whoever resumes the log owes it exactly one call to
 // InstallBase or FailBase — a log that gets neither leaves its reads waiting forever.
 func (l *Log) Read(offset uint64, buf []byte) error {
-	l.mu.Lock()
-	wait := l.baseWait
-	l.mu.Unlock()
-
-	if wait != nil {
-		<-wait
-		l.mu.Lock()
-		err := l.baseErr
-		l.mu.Unlock()
-		if err != nil {
-			return fmt.Errorf("wal: %w: %w", ErrBaseUnavailable, err)
-		}
+	if err := l.awaitBase(); err != nil {
+		return err
 	}
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.view.Read(offset, buf)
+	return nil
+}
+
+// awaitBase blocks until the base has been installed or the attempt has failed, and is a
+// no-op on a log that was not resumed awaiting one. It must not be called with l.mu held:
+// the goroutine that resolves the base takes that lock.
+//
+// # Appends wait on it too, and that is the point of the function existing
+//
+// Reads have always waited, because the wrong answer is zeros. Writes waited on nothing,
+// and an append before the base arrives is wrong in three separate ways — each of which
+// costs a guest's bytes with no error anywhere:
+//
+//   - **The stranded session can no longer be taken up.** The records this host still holds
+//     under an earlier epoch are carried forward by the caller between resuming this log and
+//     installing the base, and CarryForward refuses once this session has appended, because
+//     the two sequence spaces are the same numbers. One guest write inside the window turned
+//     a volume whose bytes were intact on the local device into one no attach could ever
+//     start again: the granted epoch then held a record under a sequence the earlier epoch
+//     also used, so every later attach found a hole and refused, for ever.
+//   - **The sequence it was given is a lie.** InstallBase raises `local` to the image's
+//     sequence, so a record appended at 1 under an image covering 50 is a record the volume
+//     will never replay in order, and reclaim is entitled to unlink the segment holding it.
+//   - **A FLUSH would ACK it without making it durable.** The durable step compares against
+//     `local`, which the base has just moved past the early record, so the guest's fsync
+//     returns on bytes that were never fdatasynced.
+//
+// So an append waits exactly as a read does, and for the same reason: this log cannot say
+// what it holds until the base has settled. What a guest experiences is a first I/O that
+// takes as long as one object-store round trip — and the Agent no longer lets a front-end
+// attach inside that window at all, so in practice nothing is waiting here.
+//
+// Rejected: refusing the append with ErrBaseUnavailable instead of parking. It is the same
+// answer a read gets *after* a failure, but before one there is nothing wrong yet, and
+// turning a boot-time write into an I/O error would take a healthy volume down.
+func (l *Log) awaitBase() error {
+	l.mu.Lock()
+	wait := l.baseWait
+	stop := l.stopping
+	l.mu.Unlock()
+	if wait == nil {
+		return nil
+	}
+
+	select {
+	case <-wait:
+	case <-stop:
+		// The volume is being torn down while this append was parked. Refusing is the
+		// only honest answer: appending now would put a record into a session whose
+		// publish has already read the view, so the guest would be told a write
+		// succeeded that no image contains.
+		return fmt.Errorf("wal: %w: the volume was stopped while this write waited for its base", ErrBaseUnavailable)
+	}
+	l.mu.Lock()
+	err := l.baseErr
+	l.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("wal: %w: %w", ErrBaseUnavailable, err)
+	}
 	return nil
 }
 

@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -107,14 +108,41 @@ func TestStoppingAVolumePublishesItsImage(t *testing.T) {
 // fails `uploadChunks`'s Head, so the publish would die of the double rather than of the
 // rule under test.
 //
-// The volume writes a block before it stops for the same reason: with an empty view a
+// The volume holds a block before it stops for the same reason: with an empty view a
 // wrong publish has nothing to carry, and an assertion about a bucket nobody could have
 // written to proves nothing about the guard. What is asserted is the manifest — its
 // absence, and on failure the chunk count it named, which is the fact that separates
 // "published a partial view" from "correctly published nothing".
+//
+// Those bytes are written by an *earlier* session and replayed, and that is not a detail
+// of convenience. An append waits for the base now, exactly as a read does (wal.awaitBase,
+// and the attach window it closed), so a volume whose base fails takes no writes at all and
+// the old fixture — write through the device after the read has already failed — cannot
+// produce a view any more. A session abandoned without publishing leaves its records in the
+// local WAL, the next attach replays them into its view before it goes to the store, and
+// what a wrong publish would then write down is a real session rather than one block.
 func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
-	r := newPublishRig(t, sim.NewObjectStore())
+	d, store := sim.NewDisk(), sim.NewObjectStore()
 	v := desiredVolume(t, 1)
+
+	first := resumeSession(t, d, store)
+	if err := first.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if _, err := serveVolume(t, first, v).WriteAt(bytes.Repeat([]byte{0x5C}, testBlockSize), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	// Abandoned rather than stopped: a session that published would leave a manifest, and
+	// the assertion below is that no manifest exists.
+	store.InjectThrottle(1 << 20)
+	abandoned, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := first.Close(abandoned); !errors.Is(err, agent.ErrPublishAbandoned) {
+		t.Fatalf("abandoning the first session ended with %v, not %v: its records have to stay in the local WAL",
+			err, agent.ErrPublishAbandoned)
+	}
+	store.InjectThrottle(0)
+
 	// Cloned (§20) from a snapshot that is not in this bucket: fetchBase cannot
 	// materialize the parent, so it fails the read view rather than layering an empty one
 	// underneath — which would read as zeros for the parent's whole extent.
@@ -123,22 +151,19 @@ func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
 	// the Agent reads it from (lineage.Walk) and because a clone with no descriptor is a
 	// volume no Control Plane could have created — the fixture would then be refused for
 	// being unbuildable rather than for the reason this test is about.
-	descendsFrom(t, r.store, v, lineageLink{volume: ids.New().String(), snapshot: ids.New().String()})
-	if err := r.m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
+	descendsFrom(t, store, v, lineageLink{volume: ids.New().String(), snapshot: ids.New().String()})
+
+	m := resumeSession(t, d, store)
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{v}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	// The read is what waits for the base, and it must fail: the parent resolves to nothing.
-	dev, ok := r.m.Device(v.GetVolumeId())
+	dev, ok := m.Device(v.GetVolumeId())
 	if !ok {
 		t.Fatal("no device")
 	}
 	if _, err := dev.ReadAt(make([]byte, testBlockSize), 0); err == nil {
 		t.Fatal("a read was answered with no recoverable base")
-	}
-	// The bytes a wrong publish would put in the bucket. Writes do not wait on the base —
-	// only reads do — so this volume takes them and has a view to publish.
-	if _, err := dev.WriteAt(bytes.Repeat([]byte{0x5C}, testBlockSize), 0); err != nil {
-		t.Fatalf("WriteAt: %v", err)
 	}
 
 	// The refusal is *returned* now, and it is the specific one: since C5 the teardown
@@ -146,7 +171,7 @@ func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
 	// the flavour that must never be retried — the fetch that would have completed the
 	// image is over, so holding the data directory for it would be a wait with no event
 	// that could end it. A store that is merely unreachable is the retried kind.
-	err := r.m.Close(t.Context())
+	err := m.Close(t.Context())
 	if !errors.Is(err, agent.ErrNoReadView) {
 		t.Fatalf("Close reported %v; a volume whose base never resolved must be reported as one this Agent will not publish", err)
 	}
@@ -156,7 +181,7 @@ func TestAVolumeWhoseBaseFailedDoesNotPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := image.ManifestKey([16]byte(uu))
-	body, err := r.store.Get(t.Context(), key)
+	body, err := store.Get(t.Context(), key)
 	switch {
 	case err == nil:
 		var man image.Manifest

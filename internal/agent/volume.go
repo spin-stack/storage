@@ -264,6 +264,12 @@ func (v *Volume) Status() VolumeStatus {
 // idempotent, so a second call during a teardown that was already under way is free.
 func (v *Volume) quiesce() {
 	v.cancel()
+	// Before waiting on the serve loop, because a write parked on the base has already
+	// passed that loop and cancelling the context does not reach it. Without this, such a
+	// write wakes when the base resolves and appends while publish is reading the view —
+	// a data race the -race detector caught, and, worse than a race, a record the guest
+	// was told about that no published image can contain.
+	v.log.StopWrites()
 	<-v.done
 	// Before the image and before the log closes: an in-flight snapshot is holding a
 	// frozen view of this log and is the only thing that can finish it.
@@ -1175,6 +1181,12 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 		done:  make(chan struct{}),
 		snaps: map[string]*snapState{},
 	}
+	// Created here rather than beside the fetch it belongs to, because supervise waits on
+	// it and is started first: a channel published after the goroutine that reads it is a
+	// data race, and a nil read is a supervisor that serves a volume with no read view.
+	if needsBase {
+		v.baseDone = make(chan struct{})
+	}
 
 	// One listener is opened here so a socket that cannot be bound fails Apply rather
 	// than disappearing into a goroutine. The supervisor opens the later ones.
@@ -1188,7 +1200,6 @@ func (m *VolumeManager) start(ctx context.Context, d *storagev1.DesiredVolume) (
 	v.cancel = cancel
 	go m.supervise(serveCtx, v, ln, d.GetBlockSize())
 	if needsBase {
-		v.baseDone = make(chan struct{})
 		// **Not the serve context, and not a child of ctx either** (the shutdown-publish decision
 		// §5). Both are cancelled by the thing that then waits for this fetch's result:
 		// stop() cancels the serve context and *then* blocks on baseDone, and ctx here is
@@ -1605,6 +1616,35 @@ func (m *VolumeManager) supervise(ctx context.Context, v *Volume, first vhost.Li
 	defer close(v.done)
 
 	ln := first
+	// **Bound, but not yet a disk.** `start` binds the listener before the base is fetched
+	// and that stays: a socket that cannot be bound has to fail Apply rather than disappear
+	// into a goroutine, which is what the early bind buys. What does not follow is that the
+	// socket should be *answered* yet. Until the base has resolved this Agent cannot say
+	// what the volume holds, whether the session its predecessor stranded can still be taken
+	// up, or whether the volume will be served at all — and a front-end accepted in that
+	// window negotiates a size, a serial and a feature set for a device whose reads park and
+	// which `refuse` may be about to take away. A guest that boots into that gets an ordinary
+	// /dev/vda and then a hard I/O error on every sector, with nothing anywhere naming the
+	// volume; a guest whose connect simply has not been answered yet sees a disk that is not
+	// there, which is a thing its own boot logic can act on.
+	//
+	// So the socket's promise is made honest by *when* it is answered rather than by when it
+	// exists: accepted means serving. A refused volume's listener is closed on the way out of
+	// this function and Go unlinks the socket, so the connection a front-end had queued is
+	// reset and it never negotiated anything.
+	//
+	// It costs the healthy attach nothing that was real. The lazy base exists so an attach
+	// does not block on the object store — but every read already parked on it, so the only
+	// thing the earlier accept bought was a handshake that lied.
+	//
+	// Only the *first* listener waits. baseDone is closed once, and by the time a session
+	// ends and this loop re-listens the base is long resolved.
+	if v.baseDone != nil {
+		select {
+		case <-v.baseDone:
+		case <-ctx.Done():
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			_ = ln.Close()
