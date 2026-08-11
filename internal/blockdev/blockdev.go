@@ -15,8 +15,8 @@ import (
 //
 // It is a classification laid over the device's own error, never a replacement for it
 // — the underlying disk error is still in the chain — because "the device is full" is
-// the one I/O failure whose remedy (truncate after a checkpoint, grow the device,
-// restore the object store so the remote gap can close) is different from every
+// the one I/O failure whose remedy (grow the device, or give the filesystem room back
+// — stopping a volume publishes its image and drops its WAL) is different from every
 // other's, and an operator reading a log line needs to be told which one they have.
 //
 // It is deliberately not a fencing condition. See the package doc.
@@ -43,8 +43,8 @@ const (
 	// mid-session reclaim, so it ends when the session does and not before.
 	ReasonWALShare Reason = "wal_share"
 	// ReasonDeviceENOSPC is the device itself out of space, under a volume that never
-	// reached its own share. The remedy is on the host — truncate after a checkpoint,
-	// grow the device — and it does not need the volume stopped.
+	// reached its own share. The remedy is on the host — grow the device, or free
+	// space on the filesystem under it — and it does not need this volume stopped.
 	ReasonDeviceENOSPC Reason = "device_enospc"
 )
 
@@ -150,8 +150,9 @@ type Device struct {
 // capacity the guest addresses and the device refuses, or capacity silently discarded
 // — and which of the two it is should not depend on a rounding decision made here.
 //
-// The Device does not take ownership of l: the caller keeps it for checkpointing,
-// truncation and reporting, and closes it.
+// The Device does not take ownership of l: the caller keeps it to install the base
+// image an attach downloaded, to publish and freeze it, to report its watermarks and
+// degradation, and to close it.
 func New(l *wal.Log, capacity int64) (*Device, error) {
 	if l == nil {
 		return nil, errors.New("blockdev: a device needs a WAL to serve")

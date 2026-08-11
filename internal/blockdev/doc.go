@@ -5,8 +5,8 @@
 //
 // internal/vhost owns the transport — the vhost-user handshake, the virtqueue, the
 // virtio-blk request shapes — and defines vhost.Backend where it consumes it.
-// internal/wal owns durability — records, segments, watermarks, the §14.4 ACK
-// sequence. Neither should learn the other: a WAL that knew about descriptor chains
+// internal/wal owns durability — records, segments, watermarks, and the fdatasync a
+// FLUSH ACK rests on. Neither should learn the other: a WAL that knew about descriptor chains
 // could not be driven by DST, and a virtqueue that knew about epochs and object stores
 // could not be tested without one. Everything that translates between them is a policy
 // decision, and policy decisions want a name and a file. This is that file.
@@ -101,9 +101,11 @@
 //     and integration/vhost's walking guest crosses the bound, trims and writes on.
 //
 //   - ErrDeviceFull — the local device is out of space (wal.Degraded() reports
-//     OUT_OF_SPACE). Local and recoverable — truncate after a checkpoint or grow the
-//     device — and explicitly *not* a fencing condition: handing a volume to another
-//     host because a disk filled would turn a local problem into a failover.
+//     OUT_OF_SPACE). Local and recoverable — grow the device, or give the filesystem
+//     room back; stopping any volume on this host publishes its image and drops its
+//     WAL, and this volume resumes as soon as an append succeeds. Explicitly *not* a
+//     fencing condition: handing a volume to another host because a disk filled would
+//     turn a local problem into a failover.
 //
 // # What the host sees, and when it stops seeing it
 //
