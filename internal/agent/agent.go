@@ -45,9 +45,15 @@ type VolumeStatus struct {
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64
-	// RemoteGapBytes is this volume's contribution to the device's remote backlog:
-	// bytes no verified object covers yet, which no local truncation can reclaim
-	// (INV-13).
+	// RemoteGapBytes is not measured. Nothing sets it, and Loop.report does not carry it
+	// to the wire, so it is zero on every volume this host serves.
+	//
+	// It held the bytes no object in the store covered yet — a distance that existed
+	// while a FLUSH put every covering object before it ACKed. With the ACK local and one
+	// image published when the volume stops, there is no continuous distance to measure;
+	// what a host would lose if it died mid-session is bounded by the session, and
+	// deliberately nothing measures it (Loop.heartbeat says the same about the host-level
+	// number it used to send).
 	RemoteGapBytes int64
 
 	// SnapshotID is the snapshot this host was asked to take and has finished acting
@@ -169,13 +175,13 @@ func (s *VolumeSet) Volumes(context.Context) ([]VolumeStatus, error) {
 	return out, nil
 }
 
-// DiskUsage is the Device backed by the disk this Agent writes its WAL and
-// checkpoints to: it asks the device itself (a statfs in production), rather than
-// estimating from the files it happens to know about.
+// DiskUsage is the Device backed by the disk this Agent writes its WAL to: it asks the
+// device itself (a statfs in production), rather than estimating from the files it
+// happens to know about.
 //
 // The difference is what the Agent cannot reclaim. A sum of our own files says
-// nothing about the space another tenant of the same filesystem occupies, and no
-// checkpoint of ours will ever free it — so a threshold evaluated on the sum fires
+// nothing about the space another tenant of the same filesystem occupies, and nothing
+// this Agent can do will ever free it — so a threshold evaluated on the sum fires
 // after the device is already full, which is the one moment it needed to have fired
 // earlier (ADR-0013 §3).
 type DiskUsage struct {

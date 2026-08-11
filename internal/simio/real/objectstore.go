@@ -69,7 +69,8 @@ func etagOf(data []byte) string {
 
 // Sidecars this store keeps next to an object. None of them is ever an object: they
 // are filtered out of List and are not reachable through any key, because a stray key
-// is an orphan to the GC and a corrupt WAL object to recovery.
+// is a chunk no manifest names to anything that lists the bucket, and bytes that are
+// not a chunk to anything that reads it.
 const (
 	// markerSuffix is this store's delete marker: an empty sidecar file next to the
 	// object. The bytes are never removed — permanent deletion is the lifecycle's job

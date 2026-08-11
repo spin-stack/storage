@@ -36,11 +36,12 @@ import (
 // host's lifecycle; when storage lands there it must be able to take this type and the
 // manager below without taking the reconciliation loop with them.
 //
-// With an object store and a lease it runs in remote mode: a FLUSH is the §14.4 ACK
-// path, and it returns only once every covering object is verified and the lease is
-// still valid on the monotonic clock (INV-06, INV-07). Without a store it is local-only
-// — writes are taken, reads are served, and a FLUSH ACKs on fdatasync alone (§14.8)
-// rather than claiming a durability nothing backs.
+// The object store is not on the write path, and having one does not change what a write
+// costs or what a FLUSH claims: a FLUSH is the WAL's fdatasync either way (§14.8,
+// wal.Log.Flush). What a store buys this volume is its two ends — the base its read view
+// is recovered from when it starts (fetchBase) and the one image it writes when it stops
+// (publish). Without one it starts empty and publishes nothing, which is what the DST
+// harness and the tests that build a manager without a store run on.
 type Volume struct {
 	id    string
 	epoch int64
@@ -616,8 +617,16 @@ type VolumeManagerDeps struct {
 	// goroutine has already told Apply the volume started.
 	Mapper  vhost.Mapper
 	EventFD vhost.EventFDFunc
-	// Store is where FLUSH makes a write durable (§14.4). Nil is local-only mode: the
-	// device serves and takes writes, and no FLUSH ever claims remote durability.
+	// Store is where a volume's image lives: the base a starting volume recovers its read
+	// view from (image.Load, via fetchBase) and the single image it writes when it stops
+	// (image.Publish). Nothing on the FLUSH path reads this field — a FLUSH is the WAL's
+	// fdatasync whether it is set or not.
+	//
+	// Nil is a volume that recovers nothing and publishes nothing: it serves and takes
+	// writes against this host's device alone, and its bytes end with the session. Every
+	// real Agent sets it: cmd/volume-agent opens the store from -s3-bucket or
+	// -object-store-dir and refuses to start with neither. Nil is the DST harness and the
+	// unit tests.
 	Store objectstore.Store
 	// KMS unwraps a volume's DEK, and Keys is where the wrapped one comes from.
 	//
@@ -640,12 +649,12 @@ type VolumeManagerDeps struct {
 	// cannot publish an encrypted image, which is refused at construction rather than
 	// discovered at the first stop.
 	Rand io.Reader
-	// Recorder is where the §26.2 metrics this manager owns are written. Nil is a
-	// working no-op, which is what production passes today — `cmd/volume-agent` has no
-	// exporter to send them to, and wiring one is a deploy concern nobody has landed.
-	// The metrics are recorded anyway because §19 names two of them as mandatory and
-	// because the alternative is discovering, during the first incident, that the code
-	// to record them was never written.
+	// Recorder is where the §26.2 metrics this manager owns are written.
+	// `cmd/volume-agent` passes its provider's recorder, so these series reach that
+	// process's /metrics endpoint whether or not a collector is configured — an empty
+	// -otlp-endpoint costs the export, not the collection (obs.NewProvider).
+	//
+	// Nil is a working no-op, which is what the DST harness and the unit tests pass.
 	Recorder *obs.Recorder
 }
 

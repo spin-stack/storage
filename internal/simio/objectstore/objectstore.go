@@ -18,11 +18,10 @@ var (
 	// ErrPreconditionFailed is a 412: If-None-Match:* on an existing key, or a
 	// failed If-Match CAS.
 	ErrPreconditionFailed = errors.New("simio/objectstore: precondition failed")
-	// ErrRestoreSuperseded means the key was written again after it was marked, so
-	// the marked version is no longer the one a restore would surface. The un-GC
-	// runbook step ("restore what the sweep marked") cannot be honoured, and
-	// returning the newer bytes instead would hand an operator a volume rebuilt from
-	// content that was never what was marked.
+	// ErrRestoreSuperseded means the key was written again after Delete marked it, so
+	// the marked version is no longer the one a Restore would surface. Undoing the
+	// delete is refused rather than approximated: returning the newer bytes would
+	// hand an operator a volume rebuilt from content that was never what was marked.
 	ErrRestoreSuperseded = errors.New("simio/objectstore: the marked version was superseded by a later write")
 	// ErrBucketNotFound is the container itself being absent or unreachable — a
 	// misconfiguration, never "this object is not there". Recovery reads a missing
@@ -44,9 +43,12 @@ type PutResult struct {
 	ETag string
 }
 
-// ObjectInfo describes a stored object. LastModified is what the GC's grace period
-// is measured against (§21.3): an object written moments ago may belong to a manifest
-// that is still being published.
+// ObjectInfo describes a stored object. LastModified is when the backend last wrote
+// the key; it is on the interface because every backend answers a listing with it and
+// dropping it would make the two implementations disagree about what a listing is.
+// Nothing in this tree reads it — a caller that wants to know whether an object is
+// too young to touch will find the number here, and will have to say what "too young"
+// means itself.
 type ObjectInfo struct {
 	Key          string
 	Size         int64

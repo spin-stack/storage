@@ -4,10 +4,11 @@
 // client and hand them over — main is the only place in the tree where a real
 // implementation is constructed (INV-01).
 //
-// It now carries a data path: one runtime per volume the Control Plane lists for this
+// It carries a data path: one runtime per volume the Control Plane lists for this
 // host, each with its own WAL, block device and vhost-user socket a guest attaches to.
-// What it does not carry yet is the remote half — remote mode needs a lease the Log can
-// trust, and that arrives with the fencing increment.
+// A guest's FLUSH is ACKed on an fdatasync of that WAL; the object store holds a
+// volume's image, which it reads at attach and writes when the volume stops or a
+// snapshot freezes it.
 package main
 
 import (
@@ -211,10 +212,13 @@ func run() (err error) {
 		return err
 	}
 
-	// The object store is what FLUSH makes a write durable in (§14.4) and what a
-	// restart recovers from (§5.8). The Agent has never had one — which is why it
-	// could heartbeat and never upload a byte — so it is opened here, at startup,
-	// rather than discovered to be missing on the first FLUSH.
+	// The object store holds every volume's image: the chunks a volume is attached
+	// over (image.Load, composing a clone's ancestry first) and where its state is
+	// written when it stops or a snapshot freezes it. It is opened here, at startup,
+	// so a store that cannot be opened — a missing bucket, refused credentials,
+	// versioning off — stops this process instead of the first attach: a host that
+	// cannot reach it can serve nothing, and finding that out one volume at a time
+	// costs each guest the boot it was promised.
 	store, err := storeFlags.Open(ctx)
 	if err != nil {
 		return err

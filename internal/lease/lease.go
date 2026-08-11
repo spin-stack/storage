@@ -1,8 +1,10 @@
 // Package lease implements the Agent-side host lease on the monotonic clock (§12.2,
-// §12.6). One lease per host covers every volume attached to it; the durable-ACK
-// rule (a FLUSH/FUA is ACKed only while the lease is valid) is evaluated against
-// this manager's monotonic view — never wall time — which is what makes fencing of
-// a stale writer correct regardless of clock skew (§12.1).
+// §12.6). One lease per host covers every volume attached to it, and it answers one
+// question: may this host still serve? A host whose lease has lapsed gives its
+// volumes up (agent.Loop.giveUpOnExpiredLease), and it has to reach that answer
+// before the Control Plane hands the same volume to somebody else. The answer is
+// computed against this manager's monotonic view — never wall time — which is what
+// makes it correct regardless of clock skew (§12.1).
 //
 // Two properties make the Agent's validity window a *subset* of the window the
 // Control Plane fences against, which is what INV-06/INV-09 rest on:
@@ -25,8 +27,9 @@ import (
 	"github.com/spin-stack/storage/internal/simio/clock"
 )
 
-// Manager tracks a single host lease. It is safe for concurrent use: the data path
-// calls Valid on every durable ACK while the heartbeat calls RenewAt.
+// Manager tracks a single host lease. It is safe for concurrent use: the Agent's
+// reconciliation asks Valid while the heartbeat applies a renewal with RenewAt, and
+// a Revoke can land from a third goroutine at any point between the two.
 type Manager struct {
 	clk clock.Clock
 	ttl time.Duration
@@ -105,9 +108,11 @@ func (m *Manager) acceptable(gen uint64, sentAt clock.Instant) bool {
 // expiredLocked reports whether the current lease has already lapsed. Caller holds mu.
 func (m *Manager) expiredLocked() bool { return m.clk.Now().Sub(m.t0) >= m.ttl }
 
-// Valid reports whether the lease is still valid per the monotonic clock:
-// granted and now - t0 < ttl (§12.2 step 3). This is a single timestamp
-// comparison — no round-trips — as the durable-ACK rule requires.
+// Valid reports whether the lease has been granted and has not lapsed on the
+// monotonic clock: now - t0 < ttl (§12.2 step 3). One timestamp comparison and no
+// round trip, because the Agent asks it on every reconciliation cycle and an answer
+// that needed the Control Plane could not be given while the Control Plane is the
+// thing that is unreachable.
 func (m *Manager) Valid() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

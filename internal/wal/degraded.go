@@ -11,10 +11,10 @@ import (
 
 // Degradation is why the local WAL device cannot be written to. It is a vocabulary
 // in the style of internal/lifecycle — a named string type rather than a loose bool
-// — because "degraded" is not one condition: the remedy for a full device (truncate
-// after a checkpoint, grow the device, restore the object store so the remote gap can
-// close) is not the remedy for anything else, and a caller that can only see a bool
-// cannot pick one.
+// — because "degraded" is not one condition: the remedy for a full device (grow it, or
+// stop volumes on it, since a volume publishes its image at stop and gives the WAL that
+// image covers back at its next start) is not the remedy for anything else, and a caller
+// that can only see a bool cannot pick one.
 //
 // Degradation is deliberately NOT a lifecycle machine. It has no operator-driven
 // transitions and no illegal moves to reject: it is a latch over what the device just
@@ -84,13 +84,13 @@ func (l *Log) SetOutOfSpace(f OutOfSpaceFunc) {
 
 // Degraded reports what, if anything, the local device is refusing to do.
 //
-// It is orthogonal to Fenced(), and the two must not be conflated. Fenced() is about
-// the lease: this host has lost the authority to write for this volume at all, the
-// Control Plane decides it, and no local action clears it (§12.2, §16). Degraded() is
-// about the device under this one log: nothing cluster-wide has changed, the volume
-// is still this host's, and a truncation or a bigger device fixes it. In particular
-// ENOSPC never self-fences — handing a volume to another host because a disk filled
-// would turn a local, recoverable condition into a failover.
+// It is about the device under this one log, and nothing else: the volume is still this
+// host's, nothing cluster-wide has changed, and a bigger device or a stop-and-publish
+// fixes it. Whether this host may still write for this volume at all is the separate
+// question the lease answers, no field of this type carries it, and the Agent's loop is
+// what acts on it (agent.Loop.giveUpOnExpiredLease). In particular ENOSPC never costs
+// this host the volume — handing it to another host because a disk filled would turn a
+// local, recoverable condition into a failover.
 func (l *Log) Degraded() Degradation {
 	l.mu.Lock()
 	defer l.mu.Unlock()

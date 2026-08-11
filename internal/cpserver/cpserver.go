@@ -82,11 +82,9 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[storagev1.H
 		MaxFormatVersion: msg.GetMaxFormatVersion(),
 		NVMeTotalBytes:   dev.GetTotalBytes(),
 		NVMeUsedBytes:    dev.GetUsedBytes(),
-		// The remote backlog goes with the rest of what the host reports about
-		// itself. It is the only one of the three the fleet cannot recompute:
-		// committed capacity is derived from the rows naming this host (ADR-0017),
-		// but the bytes no verified object covers yet are measured on the host, in
-		// bytes, and no local truncation may reclaim them (INV-13).
+		// RemoteBacklogBytes is carried through from the wire without being read.
+		// Every Agent sends 0 and no decision here branches on it; metadata.Host
+		// says what the field is and what deleting it would cost.
 		RemoteBacklogBytes: dev.GetRemoteBacklogBytes(),
 	})
 	if err != nil {

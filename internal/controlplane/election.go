@@ -17,8 +17,10 @@ import (
 var ErrTermClaimExhausted = errors.New("controlplane: no unclaimed term within the attempt budget")
 
 // termClaimPrefix is where a term claim lives. It is not under volumes/ because it
-// belongs to no volume, and it is structural, so the GC treats it as a root — a swept
-// claim would restore precisely the incident the claim prevents.
+// belongs to no volume: it is the bucket's own record of leadership, and a claim that
+// went missing would restore precisely the incident the claim prevents — a term
+// issued twice, once before a restore and once after. Nothing here deletes one, and
+// anything that ever sweeps this bucket has to treat the prefix as a root.
 const termClaimPrefix = "control-plane/terms/"
 
 // maxTermClaimAttempts bounds the climb after a restore. Each attempt is one election

@@ -82,14 +82,15 @@ func has(mask uint64, n uint) bool { return mask&bit(n) != 0 }
 //   - VIRTIO_BLK_F_CONFIG_WCE is not offered, and that is a durability
 //     decision, not an omission. It lets the guest switch the device to
 //     write-through, after which Linux stops sending FLUSH because it believes
-//     every WRITE is already durable. Under §14.4 it would not be: durability
-//     comes from the FLUSH that is no longer arriving. Without the bit the
+//     every WRITE is already durable. It is not: the Backend behind this device
+//     makes writes durable on Flush, so the durability would come from the FLUSH
+//     that is no longer arriving. Without the bit the
 //     cache stays write-back, which is what §2 says we advertise and what the
 //     guest is told the truth about.
 //
 // VIRTIO_BLK_F_FLUSH is offered, and it is the important one: without it the
-// guest has no way to ask for durability, and every FLUSH-based ACK rule in
-// §14.4 has no counterpart on the wire. It is also how a guest asks for FUA:
+// guest has no way to ask for durability, and Backend.Flush would have no
+// counterpart on the wire. It is also how a guest asks for FUA:
 // virtio-blk has no FUA bit at all — `struct virtio_blk_outhdr` is type,
 // ioprio, sector, and the type space defines no such flag — so the Linux block
 // layer decomposes REQ_FUA into the WRITE followed by a FLUSH, which lands on

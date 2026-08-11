@@ -1,6 +1,6 @@
 // Package placement decides which host a volume lands on. It is the §20 placement
-// order — source host with capacity, then a host that already has the data cached
-// (snapshot cache or warm standby), then any host with capacity — bounded by the
+// order — source host with capacity, then a host that already holds the data, then
+// any host with capacity — bounded by the
 // declared NVMe oversubscription policy of §28.2, by the measured fill ceiling of
 // ADR-0013 §3, and by the fleet states of §28.1 (a CORDONED, DRAINING, or DEAD host
 // never receives new work).
@@ -49,8 +49,11 @@ type Policy struct {
 }
 
 // Request describes what is being placed. SourceHostID is the host that already
-// holds the data (same-host clone, §20 step 1); CachedHostIDs are hosts with the
-// snapshot cached or acting as warm standby (§20 step 2, §22.3).
+// holds the data (same-host clone, §20 step 1); CachedHostIDs are hosts that already
+// hold the snapshot's chunks, so placing there is a shorter download (§20 step 2,
+// §22.3). Both production callers pass it empty — controlplane/place.go says why,
+// and clone.go passes SourceHostID instead — so step 2 selects nothing in the fleet
+// today and step 1 is the whole of the locality placement buys.
 type Request struct {
 	SizeBytes     int64
 	SourceHostID  string
@@ -159,8 +162,8 @@ func (p Policy) Choose(hosts []metadata.Host, req Request) (string, error) {
 		}
 	}
 
-	// 2. A host that already has the data cached (snapshot cache / warm standby):
-	//    a shorter materialization than a cold one.
+	// 2. A host that already holds the snapshot's chunks: a shorter download than a
+	//    cold one. Empty from both production callers — see Request.
 	if id, ok := p.best(hosts, req.SizeBytes, req.CachedHostIDs); ok {
 		return id, nil
 	}

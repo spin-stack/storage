@@ -72,6 +72,7 @@ internal/simio/real/objectstore.go:ObjectStore.Restore:gc  # the operator step b
 internal/simio/real/s3.go:ErrBucketNotVersioned:gc         # quotes INV-14 to say what is false on an unversioned bucket. The sentinel is returned by a live check
 internal/simio/real/s3.go:NewS3Store:gc                    # "refuses a bucket the GC could not undo a delete on" — a property of the bucket, in the constructor that enforces it
 internal/simio/real/s3.go:S3Store.Delete:gc                # "the object stays recoverable and the GC cannot destroy data" — the guarantee this Delete provides, whoever ends up calling it
+internal/simio/real/s3.go:S3Store.Restore:gc               # quotes INV-14 ("a GC mistake costs a restore, not the data") as the argument this method's place on the production path rests on. The sweep that used to be named as the placer of the marker was corrected to Delete on 2026-08-11; what is left is the rule, and Restore is the half of it that runs
 
 # --- the lease is live; these say so about the right thing ----------------------------
 internal/agent/loop.go:Loop.giveUpOnExpiredLease:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use

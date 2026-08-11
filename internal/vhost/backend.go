@@ -26,10 +26,12 @@ type Backend interface {
 	// durability; that is Flush.
 	WriteAt(p []byte, off int64) (int, error)
 	// Flush makes every previously completed WriteAt durable. This is the
-	// guest's VIRTIO_BLK_T_FLUSH, and it is the request the §14.4 ACK rules
-	// hang off now that the WAL is behind this interface: an implementation
+	// guest's VIRTIO_BLK_T_FLUSH, and it is the one request a guest's fsync
+	// rests on now that the WAL is behind this interface: an implementation
 	// that cannot establish durability must return an error, because the only
-	// alternative is telling the guest its data is safe when it is not.
+	// alternative is telling the guest its data is safe when it is not. What
+	// "durable" means is the implementation's to state — internal/blockdev's
+	// package doc states it for the one in this tree.
 	Flush(ctx context.Context) error
 	// Discard releases [off, off+length). The guest is telling the device it no
 	// longer needs the contents, so the space may be reclaimed; virtio leaves

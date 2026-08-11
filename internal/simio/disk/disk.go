@@ -1,6 +1,6 @@
 // Package disk is the simulable durable-storage interface (§25.1, INV-01). It
-// models the properties the WAL and checkpoints depend on: append, read, durable
-// sync (fdatasync-level), truncate, and a crash model where data written but not
+// models the properties the WAL depends on: append, read, durable sync
+// (fdatasync-level), truncate, and a crash model where data written but not
 // synced may be lost. Production code depends on Disk/File, never on os directly.
 package disk
 
@@ -17,9 +17,9 @@ var ErrNotExist = errors.New("simio/disk: file does not exist")
 // apart from any other I/O failure with errors.Is.
 //
 // It lives here because the WAL has to distinguish "the device is full" — a sticky
-// condition with its own remedy (truncate after a checkpoint, grow the device, restore
-// the object store so the remote gap can close) — from a transient error, and it may
-// import neither syscall (denied outside simio) nor the simulator. Without a sentinel
+// condition that clears only when somebody gives the filesystem room back, and never
+// on its own — from a transient error, and it may import neither syscall (denied
+// outside simio) nor the simulator. Without a sentinel
 // on this interface the only portable test is the error's message, which is a string
 // comparison in the durability path.
 var ErrNoSpace = errors.New("simio/disk: no space left on device")
@@ -39,8 +39,8 @@ type Usage struct {
 	TotalBytes int64
 	// UsedBytes is what is occupied on it — by this process and by everything else
 	// sharing the filesystem. The difference from summing our own files is the
-	// point: those bytes are not reclaimable by any checkpoint or truncation of
-	// ours, and a threshold that ignores them fires too late.
+	// point: another tenant's bytes are not reclaimable by anything we can do to
+	// our own files, and a threshold that ignores them fires too late.
 	UsedBytes int64
 	// AvailBytes is what an unprivileged writer can still take.
 	AvailBytes int64

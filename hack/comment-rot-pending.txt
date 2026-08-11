@@ -30,103 +30,21 @@
 # Format: `<file>:<symbol>:<term>  # what the comment claims, and what the code does`.
 
 # --- the FLUSH/FUA ACK contract, which is a human-review zone -------------------------
-# Owner: whoever next touches the ACK path (internal/wal, internal/blockdev,
-# internal/vhost, integration/guestinit). CLAUDE.md calls the ACK rule "the sentence a
+# Owner: whoever next touches the ACK path (integration/guestinit).
+# CLAUDE.md calls the ACK rule "the sentence a
 # guest's fsync rests on" and makes widening it a review-zone change; these comments have
 # already widened it in prose. They are the most expensive lines in this file and the ones
 # to fix first.
-internal/wal/log.go:Log.Flush:14.4              # "following §14.4. Order: capture target, close the batch, fdatasync, then per durability mode (§14.8)". There is one mode and no batch; durableStep, three functions below, says so
-internal/wal/log.go:Log.Flush:remote            # "remote (default): upload + verify every covering object … durable advances ONLY after S3 verification (INV-07)". Nothing uploads and there is no `local` alternative to choose between
-internal/wal/log.go:Log.Flush:lease-valid       # "the ACK happens ONLY while the lease is valid (§12.2, INV-06) … the log self-fences". Nothing on this path reads a lease and there is no self-fence left to take
-internal/wal/log.go:ErrFUAOnWrite:lease-valid   # a FUA write is said to carry "fdatasync, verified PUT, valid lease". Two of those three were withdrawn; the sentinel and the refusal are right, the contract it cites is not
-internal/wal/log.go:Log.Sync:remote             # "It does not advance the durable watermark — that requires remote durability via Flush". Flush advances it after an fdatasync; what Sync does not do is advance it, and the reason is now unrelated
-internal/wal/log.go:Watermarks:remote           # "In Phase 04 only Local advances (durable/published need remote durability, Phase 06+)". Durable advances on every FLUSH and published on the publish at stop
-internal/vhost/backend.go:Backend.Flush:14.4    # "the request the §14.4 ACK rules hang off now that the WAL is behind this interface" — the interface is right, the rules it names were removed
-internal/vhost/features.go:DeviceFeatures:14.4  # twice: "Under §14.4 it would not be" and "every FLUSH-based ACK rule in §14.4". Why CONFIG_WCE is not offered is still exactly right; only the contract it is justified against is gone
-internal/blockdev/doc.go:package:14.4           # "internal/wal owns durability — records, segments, watermarks, the §14.4 ACK sequence", in the paragraph that divides the two packages. The rest of this doc was corrected on 2026-08-03 and this line was missed
-integration/guestinit/main.go:run:14.4          # "Log.Flush, which under §14.4 must not return until the record is in a verified object and the lease was valid at the instant of the ACK". This is the assertion the guest lane exists to make, so it is the worst instance in the tree
-integration/guestinit/main.go:package:14.4      # "Everything below that — the six §14.4 steps, the verified object, the lease check — is covered by unit tests". None of the three exists, so nothing covers them
 
-# --- the WAL's upload machinery: the batcher, the objects, the checkpoint --------------
-# Owner: the internal/wal lane. Every one of these describes a component ADR-0026 deleted
-# as part of how the local WAL works today.
-internal/wal/log.go:Log:batcher                 # the two-mutex rationale: "mu … is never held across an object-store PUT", "two flushes could otherwise read the same pending batches", "the double removal harmless in the batcher". The split is still right; nothing it describes exists
-internal/wal/log.go:Log:checkpoint              # "the Agent's reconciliation flushes, checkpoints and truncates" — the concurrency this type is safe against, described through a caller that was deleted
-internal/wal/log.go:Log:objectize               # "the append-only local WAL … with a read view over the not-yet-objectized extents". The view holds every written extent for the life of the session; there is no later objectization to be "not yet" before
-internal/wal/log.go:Log.appendClear:batcher     # "feeds the remote batcher (these records must reach S3 so the working set converges, §14.6)". A DISCARD clears the view and is appended locally; it reaches S3 only inside the image at stop
-internal/wal/log.go:Log.appendClear:remote      # same sentence
-internal/wal/log.go:Log.AdvancePublished:checkpoint # "that moment is the checkpoint that publishes" and "it does not un-publish the checkpoint that is already in S3". What publishes is image.Publish, at stop
-internal/wal/log.go:Log.TruncateLocal:checkpoint # "records not yet in a published, verified checkpoint must never be discarded" and "the floor of what a checkpoint can give back". The floor is real; the checkpoint is not
-internal/wal/log.go:ErrTruncateAboveDurable:checkpoint # "that would discard records not yet in a verified checkpoint" — the sentinel is live and what it protects is now the published image
-internal/wal/order_policy.go:StrictOrder.AllowPublished:checkpoint # "they live in a verified checkpoint and nowhere else on this host" and "a publisher that recomputes the point from a listing — which is what checkpoint.Create does". checkpoint.Create is not a symbol in this tree
-internal/wal/order_policy.go:StrictOrder.AllowTruncate:checkpoint  # "records not yet inside a published, verified checkpoint exist on this host only". True of the published image; there is no checkpoint
-internal/wal/segment.go:SegmentBytes:checkpoint # "100 volumes hold up to 3.2 GiB the checkpoint cannot yet reclaim". The number is the point and it survives the rewrite; what cannot reclaim it is the publish
-
-# --- the operator's remedy for a full device ------------------------------------------
-# Owner: shared — internal/wal, internal/blockdev and internal/simio/disk carry the same
-# sentence. It tells an operator to "truncate after a checkpoint" and to "restore the
-# object store so the remote gap can close". Neither is an action anybody can take: there
-# is no checkpoint to truncate after and no continuous gap to close. This is the family
-# that is visible outside the tree — blockdev's ErrDeviceFull message says it to a log
-# line an operator reads — so correcting the comments and the message belongs in one
-# increment.
-internal/wal/degraded.go:Degradation:checkpoint # the remedy for OUT_OF_SPACE, in the type that exists to make remedies distinguishable
-internal/wal/degraded.go:Degradation:remote     # same sentence, "restore the object store so the remote gap can close"
-internal/blockdev/blockdev.go:ErrDeviceFull:checkpoint # same remedy, and blockdev.go:255 puts this sentence into the error a guest's refusal is logged with — a lie the outside can observe
-internal/blockdev/blockdev.go:ErrDeviceFull:remote     # same sentence
-internal/blockdev/doc.go:package:checkpoint     # "Local and recoverable — truncate after a checkpoint or grow the device"
-internal/blockdev/blockdev.go:const.ReasonDeviceENOSPC:checkpoint # "The remedy is on the host — truncate after a checkpoint, grow the device — and it does not need the volume stopped". The second half is the useful half and it is true
-internal/simio/disk/disk.go:ErrNoSpace:checkpoint      # the same remedy in the simulated disk's sentinel, which is where the vocabulary was copied from
-internal/simio/disk/disk.go:ErrNoSpace:remote          # same sentence
-internal/simio/disk/disk.go:package:checkpoint  # "models the properties the WAL and checkpoints depend on" — the package models what the WAL depends on, and that is the whole list now
-internal/simio/disk/disk.go:Usage.UsedBytes:checkpoint # "those bytes are not reclaimable by any checkpoint or truncation of ours". Still true of truncation; there is no checkpoint to name beside it
-internal/simio/real/disk.go:Disk.Usage:checkpoint      # "the bytes no checkpoint or truncation of ours will ever give back", the statfs argument ADR-0013 rests on
-internal/agent/agent.go:DiskUsage:checkpoint    # "the disk this Agent writes its WAL and checkpoints to" and "no checkpoint of ours will ever free it"
-internal/blockdev/blockdev.go:New:checkpoint    # "The Device does not take ownership of l: the caller keeps it for checkpointing, truncation and reporting". The caller keeps it to publish, truncate after the base is installed, and report
-
-# --- the Agent's remote half, which is not coming ---------------------------------------
-# Owner: the internal/agent lane, plus cmd/volume-agent. These do not merely cite a
-# withdrawn section: they tell a reader the mode exists and is selected by whether a Store
-# and a lease are present, which is the shape of a feature flag nobody can set.
-cmd/volume-agent/main.go:package:remote         # "What it does not carry yet is the remote half — remote mode needs a lease the Log can trust, and that arrives with the fencing increment". No increment is bringing it
-cmd/volume-agent/main.go:run:14.4               # "The object store is what FLUSH makes a write durable in (§14.4) and what a restart recovers from (§5.8)", at the line that opens the store. It is where the volume lands when it stops
-internal/agent/volume.go:Volume:14.4            # "With an object store and a lease it runs in remote mode: a FLUSH is the §14.4 ACK path"
-internal/agent/volume.go:Volume:remote          # same sentence: "it returns only once every covering object is verified and the lease is still valid on the monotonic clock (INV-06, INV-07)". Both modes are described; only one has ever existed here
-internal/agent/volume.go:VolumeManagerDeps.Store:14.4  # "Store is where FLUSH makes a write durable (§14.4)". Nothing on the FLUSH path touches this field
-internal/agent/volume.go:VolumeManagerDeps.Store:remote # "Nil is local-only mode … no FLUSH ever claims remote durability", which implies a non-nil Store gives the other mode. It does not: VolumeManager.start says so 500 lines below
-internal/agent/agent.go:VolumeStatus.RemoteGapBytes:remote # "this volume's contribution to the device's remote backlog: bytes no verified object covers yet". Loop.heartbeat reports a constant zero and explains why — the field is the `nvme_remote_backlog_bytes` case, and the comment is the half that did not get the note
-internal/cpserver/cpserver.go:Server.Heartbeat:remote      # "The remote backlog goes with the rest of what the host reports about itself … measured on the host, in bytes". It is measured by nothing
-internal/metadata/metadata.go:Store.UpsertHost:remote      # lists "remote backlog" among what a host refreshes about itself
-internal/agent/loop.go:Loop.LeaseValid:lease-valid         # "It is what the data path will consult before ACKing a durable write" — a future tense that will not arrive; giveUpOnExpiredLease says so in this same file
-internal/agent/loop.go:Loop.report:self-fenced             # "the transition to SELF_FENCED and the end of guest ACKs belong to the data path". There is no such state, and the data path already gives the device up when the volume is taken away
-internal/lease/lease.go:package:lease-valid                # the package doc opens with "the durable-ACK rule (a FLUSH/FUA is ACKed only while the lease is valid)" as the reason this manager is on the monotonic clock. The manager is live; that rule is not, and the real reason (a stale writer must stop serving) is a sentence away
-internal/lease/lease.go:Manager.Valid:lease-valid          # "a single timestamp comparison — no round-trips — as the durable-ACK rule requires"
-internal/cow/intervalmap.go:package:objectize              # "an interval map of the not-yet-objectized WAL extents (§13.2)", the first sentence of the package doc. This file already carries a note about a *different* sentence that outlived its mechanism
-
-# --- the GC, described as something that runs -------------------------------------------
-# Owner: shared — internal/simio/objectstore and internal/simio/real hold most of it,
-# internal/controlplane, internal/lifecycle and internal/metadata one each. The allowlist
-# next door keeps every mention that names the GC as the hazard INV-14 is *for*; these are
-# the ones that give it a schedule, a grace period, a sweep that already happened or a
-# runbook, none of which exist. The fix is usually one word — "would", not "does".
-internal/simio/objectstore/objectstore.go:ObjectInfo:gc            # "LastModified is what the GC's grace period is measured against (§21.3)". Nothing measures a grace period
-internal/simio/objectstore/objectstore.go:var.ErrRestoreSuperseded:gc # "The un-GC runbook step ('restore what the sweep marked') cannot be honoured". The sentinel is live; the runbook and the sweep are not
-internal/simio/real/objectstore.go:const:gc     # "a stray key is an orphan to the GC and a corrupt WAL object to recovery" — two consumers, neither of which is in the tree
-internal/simio/real/s3.go:requireVersioning:gc  # "the GC — which is allowed to be wrong precisely because a mark is reversible — becomes the worst incident this system has … until the first sweep". The check is right and blocking; the actor is imaginary
-internal/simio/real/s3.go:S3Store.Restore:gc    # "removes the delete marker the sweep placed". Whatever placed it, it was not a sweep
-internal/controlplane/election.go:termClaimPrefix:gc # "it is structural, so the GC treats it as a root — a swept claim would restore precisely the incident the claim prevents". Nothing treats anything as a root
-internal/lifecycle/lifecycle.go:snapshotMachine:gc   # "deletion, which is the catalog side of the GC's reversible marking (§21.3)". The catalog side exists; the marking it is a side of does not
-internal/metadata/metadata.go:Store.SetSnapshotState:gc # "the catalog side of GC never sees it", explaining why a crashed CREATING snapshot matters. It matters for a reason that has to be restated
-
-# --- the warm standby, which nothing keeps warm -----------------------------------------
-# Owner: the internal/placement lane. §20 step 2 is implemented — Choose prefers a host in
-# CachedHostIDs — but the only production caller (controlplane/place.go) passes it empty
-# and says so, and nothing anywhere pre-warms a host. clone.go's own comment already
-# records that this locality "outlived the thing it was a preference for".
-internal/placement/placement.go:package:warm-standby      # the package doc gives the §20 order as "a host that already has the data cached (snapshot cache or warm standby)"
-internal/placement/placement.go:Request:warm-standby      # "CachedHostIDs are hosts with the snapshot cached or acting as warm standby (§20 step 2, §22.3)" — the field's documented meaning, on a field nobody fills
-internal/placement/placement.go:Policy.Choose:warm-standby # step 2 in the algorithm's own comment, "a shorter materialization than a cold one", which today is the same download
+# --- the operator's remedy for a full device, WHERE THIS CHECK CANNOT SEE IT -----------
+# No entry, and that is the point of leaving the note: blockdev.go's ENOSPC refusal
+# builds the withdrawn remedy into the latched reason and into the error a guest's
+# refusal is logged with — "truncate after a checkpoint, grow the device, or restore the
+# object store" — so an operator reads it outside the tree. Comments only match comment
+# text (hack/comment-rot.sh, rule 1), so those two literals are invisible here. The
+# comments around them, in internal/wal and internal/agent, were corrected on 2026-08-11
+# to the remedy that exists (grow the device, or stop volumes on it — each publishes its
+# image and gives that WAL back at its next start); correcting the literals is a
+# behaviour change with an assertion of its own to write, and it is still owed.
 
 # --- one straggler ----------------------------------------------------------------------
-internal/simio/real/s3.go:translate:uploader    # "stays opaque on purpose: the uploader retries anything that is not ErrNotFound". Owner: internal/simio/real. What retries an S3 error now is image.Publish and the attach-time GET, and the argument for keeping AccessDenied opaque is different for each
-integration/guestinit/main.go:const.blocks:checkpoint # "which would make the host's checkpoint-and-restart lane vacuous". Owner: the guest lane. There is no checkpoint-and-restart lane; what scattered blocks feed is segment sealing and the re-attach at the same epoch (ADR-0024)

@@ -98,7 +98,8 @@ func NewObjectStore() *ObjectStore {
 	}
 }
 
-// SetClock makes Put stamp LastModified from clk (§21.3 grace period).
+// SetClock makes Put stamp LastModified from clk, so a scenario that reads the field
+// sees the simulated instant and not a zero time.
 func (s *ObjectStore) SetClock(clk *Clock) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

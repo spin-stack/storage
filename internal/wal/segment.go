@@ -20,7 +20,7 @@ import (
 // directory entries a host carries, and how often the directory churns.
 //
 // That makes the cost scale with volume count, not volume size: 100 volumes hold up to
-// 3.2 GiB the checkpoint cannot yet reclaim. The reference points with the same shape
+// 3.2 GiB no truncation can give back. The reference points with the same shape
 // — an append-only segmented log reclaimed by segment — are PostgreSQL's WAL at 16 MB,
 // the Cassandra/Scylla commitlog at 32 MB, etcd's WAL at 64 MB and TiKV's raft-engine
 // at 128 MB; the commitlog is the closest analogue (many independent streams, a

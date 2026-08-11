@@ -568,8 +568,9 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 	}
 
 	// A refusal is information: this host is no longer the writer for that volume.
-	// Recording it is all this increment can do — the transition to SELF_FENCED and
-	// the end of guest ACKs belong to the data path (§16, §12.2).
+	// Recorded here and acted on by fence(), which Reconcile calls once this returns and
+	// which tears those runtimes down. The two are separate because closing a WAL must
+	// not happen under l.mu (§12.2).
 	var fenced []string
 	for _, r := range resp.Msg.GetResults() {
 		switch r.GetOutcome() {
@@ -645,8 +646,13 @@ func (l *Loop) setHostState(s storagev1.HostState) {
 	l.state = s
 }
 
-// LeaseValid reports whether the host lease is still valid on the monotonic clock
-// (§12.2). It is what the data path will consult before ACKing a durable write.
+// LeaseValid reports whether this host's lease has not yet lapsed on the Agent's own
+// monotonic clock (§12.2).
+//
+// Nothing on the data path reads it. What acts on a lease running out is
+// giveUpOnExpiredLease, in this file, which stops serving every volume on the host; this
+// is the observation point the loop's tests and the e2e guest lane assert against, so
+// they can read the decision rather than a flag the code set.
 func (l *Loop) LeaseValid() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()

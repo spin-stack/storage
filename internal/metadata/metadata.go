@@ -173,17 +173,19 @@ type Host struct {
 	MaxFormatVersion int32
 	NVMeTotalBytes   int64
 	NVMeUsedBytes    int64
-	// RemoteBacklogBytes is the share of NVMeUsedBytes that no verified object
-	// covers yet, summed over every volume the host holds (ADR-0013 §1). Like the
-	// two fields above it, the host reports it and a heartbeat writes it.
+	// RemoteBacklogBytes is a byte count the host reports about itself, alongside the
+	// two NVMe fields above (ADR-0013 §1). Every Agent reports 0, and the column
+	// holds 0 for every host in the fleet: a FLUSH is ACKed on an fdatasync and a
+	// volume reaches the object store when it stops, so there is no running distance
+	// between a host and S3 for anything to measure (agent.Loop.heartbeat says the
+	// same at the line that sends the zero).
 	//
 	// It is stored rather than derived — the opposite call from NVMeCommittedBytes
-	// below — because nothing else here can produce it: the distance between what a
-	// host has written and what S3 has acknowledged is measured in bytes on that
-	// host, while the catalog holds watermarks in sequence numbers. It is also the
-	// number that tells a busy host from a host whose object store has stopped
-	// answering: only the second one keeps growing, because no local truncation may
-	// reclaim records that exist nowhere else (INV-13).
+	// below — because nothing here could produce it: a measurement like this is made
+	// in bytes on the host, while the catalog holds watermarks in sequence numbers.
+	// No decision anywhere branches on it, and it costs a column, a proto field and
+	// this paragraph; deleting the three is a change to the wire and the schema,
+	// which is why it is written down here rather than left looking live.
 	RemoteBacklogBytes int64
 	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by
 	// the store on every read, and never stored anywhere (ADR-0017):
@@ -388,7 +390,7 @@ type Store interface {
 	Now(ctx context.Context) (time.Time, error)
 
 	// UpsertHost registers a host or refreshes what the host itself reports:
-	// agent version, format version, NVMe totals, remote backlog, heartbeat. It
+	// agent version, format version, NVMe totals, RemoteBacklogBytes, heartbeat. It
 	// deliberately does NOT carry the fleet state — that belongs to the Control
 	// Plane (SetHostState),
 	// and a routine heartbeat that carried it would un-cordon a draining host.
@@ -693,7 +695,9 @@ type Store interface {
 	PublishSnapshot(ctx context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error
 	// SetSnapshotState moves a snapshot through the §19 lifecycle (term-guarded,
 	// transition-guarded in the write). Without it a snapshot whose publication
-	// crashed stays CREATING forever and the catalog side of GC never sees it.
+	// crashed stays CREATING for ever: PublishSnapshot is the only other way out of
+	// that state, and it is the one the crash proved will not arrive, so nothing
+	// could mark the row FAILED and nothing could ever ask for its objects back.
 	SetSnapshotState(ctx context.Context, term int64, snapshotID string, state lifecycle.SnapshotState) error
 }
 

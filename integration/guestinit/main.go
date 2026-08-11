@@ -4,26 +4,9 @@
 //
 // It exists to prove the one thing no test in this repository can: that a **real Linux
 // guest** issues VIRTIO_BLK_T_FLUSH and that our backend's answer is the one the guest's
-// fsync(2) contract requires. Everything below that — the six §14.4 steps, the verified
-// object, the lease check — is covered by unit tests against a simulated front-end.
-// What was never covered is the top of the stack: a kernel deciding, on its own, that
-// this write must be made durable now.
-//
-// SeaBIOS cannot do it (INT 13h has no flush verb), so the previous lane booted a 512-byte
-// boot sector and stopped at READ/WRITE. This is the replacement, and it is deliberately
-// a Go program rather than an /init shell script: it can assert, and it can report *what*
-// failed rather than an exit code.
-//
-// It is PID 1 in an initramfs, so there is no libc, no shell, no mount table and nothing
-// to clean up after it. It never returns: PID 1 exiting panics the kernel, which reads as
-// a crash rather than a verdict, so it always powers the machine off itself.
-//
-// Four modes, chosen by `spin.mode=` on the kernel command line and described where they
-// are declared below. The last — hold — is the one that makes a guest something a host
-// test can act *upon* rather than wait for: it keeps writing until the host tells it to
-// stop, over the return direction of the same serial line the verdicts go out on. A hold
-// run has two shapes, chosen by `spin.hold=`, and the difference between them is the
-// difference between a guest whose read view is pinned and one whose read view grows.
+// fsync(2) contract requires. Everything below that — an fdatasync of the local WAL and
+// the durable watermark it advances — is the host's to prove; from in here the only
+// question is whether fsync returned, and whether the bytes come back afterwards.
 package main
 
 import (
@@ -53,7 +36,7 @@ const (
 	// apart. More than one block on purpose: a WAL segment is sealed by the append that
 	// would overflow it, so a single record leaves the only segment open and a
 	// truncation with nothing to reclaim — which would make the host's
-	// checkpoint-and-restart lane vacuous.
+	// stop-and-restart lane vacuous.
 	//
 	// They are *scattered* rather than consecutive for the same reason, discovered the
 	// hard way: the guest's page cache merges adjacent dirty blocks into one virtio
@@ -290,11 +273,10 @@ func run(m string) error {
 
 	// The whole reason this program exists. fsync(2) on a block device the kernel knows
 	// has a volatile write cache emits VIRTIO_BLK_T_FLUSH; our backend turns that into
-	// Log.Flush, which under §14.4 must not return until the record is in a verified
-	// object and the lease was valid at the instant of the ACK. If the backend answers
-	// with an error, fsync fails here — and a guest whose fsync fails is a guest whose
-	// database is entitled to consider its data lost, which is exactly the contract we
-	// want observed from this side.
+	// Log.Flush, which must not return until an fdatasync of the local WAL segments has
+	// returned (§14.8). If the backend answers with an error, fsync fails here — and a
+	// guest whose fsync fails is entitled to consider its data lost, which is exactly the
+	// contract this lane exists to observe from the guest's side.
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("fsync (the FLUSH this lane exists for): %w", err)
 	}

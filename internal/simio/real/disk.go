@@ -166,8 +166,8 @@ func (d *Disk) List(prefix string) ([]string, error) {
 // Usage answers ADR-0013's question with the only thing that can answer it
 // honestly: a statfs of the filesystem holding this Disk's root. Summing our own
 // files — what the Agent did before this existed — misses every byte another tenant
-// of the same filesystem occupies, and those are the bytes no checkpoint or
-// truncation of ours will ever give back.
+// of the same filesystem occupies, and those are the bytes nothing we do to our own
+// files will ever give back.
 //
 // syscall is denied everywhere but internal/simio (§25.1, depguard); this is one of
 // the two places in the tree that needs it, next to the ENOSPC translation below.

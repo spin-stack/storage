@@ -70,11 +70,12 @@ type bucketVersioningAPI interface {
 }
 
 // requireVersioning fails unless the bucket has versioning Enabled. It is the
-// precondition of INV-14: on any other bucket DeleteObject destroys the object, so
-// the GC — which is allowed to be wrong precisely because a mark is reversible —
-// becomes the worst incident this system has. A bucket whose versioning tooling
-// forgot, or an operator Suspended, is indistinguishable from a correct one at every
-// other layer until the first sweep.
+// precondition of INV-14: on any other bucket DeleteObject destroys the object
+// outright, and Delete is offered on this interface precisely because a mark is
+// reversible — a delete nobody can undo is the worst incident this system has. A
+// bucket whose versioning tooling forgot, or an operator Suspended, is
+// indistinguishable from a correct one at every other layer until the first delete,
+// which is why this is asked once, in the constructor.
 func requireVersioning(ctx context.Context, api bucketVersioningAPI, bucket string) error {
 	out, err := api.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
 	if err != nil {
@@ -187,9 +188,12 @@ func translate(err error) error {
 		}
 	}
 	// Everything else — SlowDown, ServiceUnavailable, RequestTimeout, InternalError,
-	// AccessDenied — stays opaque on purpose: the uploader retries anything that is
-	// not a precondition failure (§14.5), and mapping a throttle to a sentinel would
-	// stop it.
+	// AccessDenied — stays opaque on purpose. A sentinel is for a condition a caller
+	// *branches* on, and the two above are the only ones anything branches on: a
+	// precondition failure is a decision (somebody else published; the chunk is
+	// already there) and a missing bucket is a misconfiguration. The rest all mean
+	// "this attempt failed", they are handled the same way wherever they surface,
+	// and naming them would invite a branch on a distinction nobody makes.
 	return err
 }
 
@@ -284,13 +288,13 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	return translate(err)
 }
 
-// Restore removes the delete marker the sweep placed, so the version underneath
+// Restore removes the delete marker a Delete placed, so the version underneath
 // becomes current again (§21.3). This is the operator action the whole INV-14
 // argument rests on — "a GC mistake costs a restore, not the data" — and it did not
 // exist on the production path at all.
 //
 // It refuses rather than guess in the one case that would be silently wrong: if the
-// latest version is not a delete marker, something wrote the key after the sweep
+// latest version is not a delete marker, something wrote the key after the Delete
 // marked it, so the marked version is not what removing a marker would surface. An
 // operator who is told "restored" and gets different bytes rebuilds a volume from
 // content that was never what was marked.

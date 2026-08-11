@@ -448,7 +448,8 @@ var snapshotMachine = newMachine("snapshot state",
 	map[SnapshotState][]SnapshotState{
 		SnapshotCreating: {SnapshotPublished, SnapshotFailed},
 		// INV-16: once PUBLISHED the snapshot never changes; the only move left is
-		// deletion, which is the catalog side of the GC's reversible marking (§21.3).
+		// DELETING, which is the catalog recording that the snapshot was asked to go
+		// (§21.3). Nothing in this tree removes its objects afterwards.
 		SnapshotPublished: {SnapshotDeleting},
 		SnapshotFailed:    {SnapshotDeleting},
 		SnapshotDeleting:  {},
