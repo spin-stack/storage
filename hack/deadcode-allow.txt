@@ -57,6 +57,7 @@ internal/lifecycle.RefusalNames     # compared with volumes.refusal's CHECK list
 internal/obs.NewTestProvider          # the in-memory meter provider tests collect from; production wires the OTLP one
 internal/obs.Provider.CollectedMetrics # reading it is how agent/wal tests assert on what left the process
 internal/obs.Provider.GaugeValues      # same, for gauges (wal/degraded_test)
+internal/obs.Provider.GaugeSeries      # same, for a gauge family whose label set varies — volume_backpressure has one series per (volume, reason) and a test has to see them apart
 
 # --- vhost front-end encoders -------------------------------------------------------------
 # The Agent is the vhost-user *backend*; it decodes these messages and never encodes one.

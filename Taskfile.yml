@@ -801,6 +801,51 @@ tasks:
     cmds:
       - bash hack/dev-entries.sh
 
+  comment:rot:
+    desc: >-
+      Fail on a production comment that describes a mechanism ADR-0026 withdrew — the
+      upload chain, the checkpoint, the GC, the lease gate — as if it were still here,
+      unless hack/comment-rot-allow.txt or hack/comment-rot-pending.txt accounts for it.
+      In `ci`.
+    # The third ratchet, and it exists because the first two only cover the places a
+    # document used to be. This repository deleted ~10.000 lines of Markdown on the rule
+    # that "the decision lives in the code, at the line that makes it", and the drift
+    # moved with it: `wal.Log.Flush`'s doc comment still describes uploading and
+    # verifying every covering object and checking the lease before the ACK, three
+    # functions above a `durableStep` that does an fdatasync. Inside a comment that is
+    # worse than it was in a document — a comment has no banner, no date and no owner,
+    # and CLAUDE.md tells the reader to trust it.
+    #
+    # Same shape as deadcode and dev:entries, for the same reasons and with the same two
+    # rejected alternatives:
+    #
+    #   - list and never fail: cannot produce a false red and is easy to never run.
+    #     `backend:conformance` was broken on main for a whole increment for exactly that.
+    #   - fail on every mention: red on the day it lands, because sixty-two comments in
+    #     twenty-five files are wrong today and fixing them touches every lane. A step that is
+    #     red on the day it lands is a step someone deletes — written down twice above.
+    #
+    # So: a ratchet over a *set*. Every mention is accounted for by one of two lists —
+    # legitimate (a comment naming the mechanism to say it is gone, Go's own GC, INV-14's
+    # hazard) or a lie somebody owes a correction — and the script fails on a mention in
+    # neither, on an entry that no longer matches a finding, and on a key both lists
+    # claim. The debt is printed on green runs so it is read by whoever runs the gate.
+    #
+    # The objection this has to survive is "a word is not a mechanism": `remote` is in
+    # `nvme_remote_backlog_bytes`, a live column. It is answered twice — only comment text
+    # is matched, never code or a string literal, and matches are identifier-aware, so
+    # `nvme_remote_backlog_bytes` and `gcInterval` do not fire. And it is answered where
+    # it can be checked rather than in prose: every term carries a string it must match
+    # and a live identifier it must not, and the script re-proves all of them before it
+    # opens a file — a term whose pattern is mistyped fires on nothing and would otherwise
+    # report success for ever, which is `task dst`'s `-run` regex all over again.
+    #
+    # In `ci` rather than only `ci:full`, beside the other two: no toolchain, no Docker,
+    # one `go list` and one awk pass over the 79 files a binary links — 0.26s measured —
+    # and the person writing the comment is running `task ci`.
+    cmds:
+      - bash hack/comment-rot.sh
+
   lint:
     desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).
     cmds:
@@ -882,7 +927,7 @@ tasks:
       - TASK_EXE={{.TASK_EXE}} bash hack/workflow-tasks.sh
 
   ci:
-    desc: Fast local gate — format, build, lint, deadcode, open DEV entries, test, dst. No Docker required.
+    desc: Fast local gate — format, build, lint, deadcode, open DEV entries, comment rot, test, dst. No Docker required.
     cmds:
       - task: fmt:check
       - task: build
@@ -897,6 +942,12 @@ tasks:
       # green run on purpose, so the divergences this tree ships with are read by whoever
       # runs the gate rather than by whoever remembers to open STATUS.md.
       - task: dev:entries
+      # And beside that one, because it is the same rule pointed at the place the docs
+      # went. STATUS.md is checked by the step above; the comments that replaced ten
+      # thousand lines of Markdown were checked by nobody, and the ACK contract in
+      # wal.Log.Flush's doc comment had described a withdrawn upload-and-verify chain for
+      # two waves. Cheap enough to sit in the fast gate: one `go list`, one awk pass.
+      - task: comment:rot
       - task: test
       - task: dst
       # A binary, started four times, for 1.2 seconds total. It is in the fast gate
