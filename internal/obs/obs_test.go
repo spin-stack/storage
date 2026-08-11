@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -120,4 +121,70 @@ func repoRoot(t *testing.T) string {
 	}
 	t.Fatal("no go.mod above the working directory")
 	return ""
+}
+
+// A gauge that means "something to do with space" is a page nobody can action. The three
+// bounds a volume can hit have contradicting remedies — trim inside the guest, stop the
+// volume, grow the host's disk — so the bound has to be a label, and this is the contract
+// the recorder in cmd/volume-agent records against.
+//
+// Asserted on the catalogue rather than on a recorded sample because the catalogue is
+// what fixes cardinality up front (§26.2): a label that is not declared here is a label
+// nobody reviewed.
+func TestBackpressureCarriesTheBoundAsALabel(t *testing.T) {
+	for _, d := range obs.Catalog() {
+		if d.Name != "volume_backpressure" {
+			continue
+		}
+		for _, want := range []string{"volume", "reason"} {
+			if !slices.Contains(d.Labels, want) {
+				t.Fatalf("volume_backpressure declares labels %v, without %q: one series would "+
+					"have to mean an fstrim, a restart and a bigger disk at once", d.Labels, want)
+			}
+		}
+		return
+	}
+	t.Fatal("volume_backpressure is not in the catalogue")
+}
+
+// GaugeValues keys by name and the last data point wins, so a family with several label
+// sets collapses to whichever one the SDK handed back last — unordered, and not part of
+// any contract. volume_backpressure is now such a family, and a test reading it through
+// GaugeValues would pass or fail on map iteration order.
+func TestGaugeSeriesSeparatesOneFamilysLabelSets(t *testing.T) {
+	ctx := t.Context()
+	p := newProvider(t)
+	rec := p.Recorder()
+
+	rec.Gauge(ctx, "volume_backpressure", 1, obs.String("volume", "vol-a"), obs.String("reason", "view_memory"))
+	rec.Gauge(ctx, "volume_backpressure", 0, obs.String("volume", "vol-a"), obs.String("reason", "wal_share"))
+	rec.Gauge(ctx, "volume_backpressure", 0, obs.String("volume", "vol-b"), obs.String("reason", "view_memory"))
+
+	got, err := p.GaugeSeries(ctx, "volume_backpressure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]float64{
+		`{reason="view_memory",volume="vol-a"}`: 1,
+		`{reason="wal_share",volume="vol-a"}`:   0,
+		`{reason="view_memory",volume="vol-b"}`: 0,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("GaugeSeries returned %d series, want %d: %v", len(got), len(want), got)
+	}
+	for labels, v := range want {
+		if got[labels] != v {
+			t.Errorf("%s = %v, want %v (whole family: %v)", labels, got[labels], v, got)
+		}
+	}
+
+	// And the scrape an operator curls carries the same three lines, which is where this
+	// actually gets read from.
+	body, err := p.Scrape(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `volume_backpressure{reason="view_memory",volume="vol-a"} 1`) {
+		t.Fatalf("the scrape does not carry the reason as a label:\n%s", body)
+	}
 }

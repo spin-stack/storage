@@ -137,11 +137,47 @@ func (p *Provider) CollectedMetrics(ctx context.Context) (map[string]bool, error
 	return out, nil
 }
 
+// GaugeSeries returns every collected data point of one Float64 gauge family, keyed by
+// its label set rendered the way a scrape renders it (`{k="v",…}`, keys sorted).
+//
+// GaugeValues cannot answer for a family with more than one label set: it keys by metric
+// name, so the last data point the SDK happens to hand back wins and which one that is is
+// not defined anywhere. That was harmless while every gauge here had one series per
+// process. It stops being harmless the moment a gauge carries a reason —
+// `volume_backpressure` has one series per (volume, reason) and exists precisely so the
+// three bounds can be told apart, so reading it by name alone would be asserting on a
+// coin flip and calling it evidence.
+func (p *Provider) GaugeSeries(ctx context.Context, name string) (map[string]float64, error) {
+	var rm metricdata.ResourceMetrics
+	if err := p.reader.Collect(ctx, &rm); err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != name {
+				continue
+			}
+			g, ok := m.Data.(metricdata.Gauge[float64])
+			if !ok {
+				continue
+			}
+			for _, dp := range g.DataPoints {
+				out[labelsOf(dp.Attributes)] = dp.Value
+			}
+		}
+	}
+	return out, nil
+}
+
 // GaugeValues returns the latest value of every collected Float64 gauge. A state
 // gauge (`wal_out_of_space`) is only useful to an operator if it reads 1 while the
 // condition holds and 0 once it clears, so a test that asserts merely "the name was
 // recorded" would pass on a gauge wired backwards. The last data point wins, which
 // is what a gauge means.
+//
+// One data point per name, so it answers only for gauges with a single series. Use
+// GaugeSeries for a family whose label set varies.
 func (p *Provider) GaugeValues(ctx context.Context) (map[string]float64, error) {
 	var rm metricdata.ResourceMetrics
 	if err := p.reader.Collect(ctx, &rm); err != nil {

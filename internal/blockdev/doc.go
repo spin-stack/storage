@@ -93,13 +93,32 @@
 //     the sentence the guest's error carried, which sent an operator to do the one
 //     thing that cannot work.
 //
-//     Because nothing on the host otherwise sees this, Device latches it:
-//     RefusedForSpace is what cmd/volume-agent reports, once per volume.
+//   - wal.ErrViewBound — the read view's memory bound, which this list did not mention
+//     at all until 2026-08-11 although the code has branched on it since the sentinel
+//     existed. It wraps ErrBackpressure, so a guest still sees the I/O error it
+//     understands, and its remedy is the *opposite* of the bound above: the memory is
+//     the volume's live extents, a DISCARD gives it back with the volume still serving,
+//     and integration/vhost's walking guest crosses the bound, trims and writes on.
 //
 //   - ErrDeviceFull — the local device is out of space (wal.Degraded() reports
 //     OUT_OF_SPACE). Local and recoverable — truncate after a checkpoint or grow the
 //     device — and explicitly *not* a fencing condition: handing a volume to another
 //     host because a disk filled would turn a local problem into a failover.
+//
+// # What the host sees, and when it stops seeing it
+//
+// Nothing on the host observes any of the three otherwise: the refusal is produced on
+// the guest's goroutine and handed to a virtqueue that completes with IOERR. So Device
+// latches it, and RefusedForSpace is what cmd/volume-agent reports.
+//
+// It latches a Reason and not a sentence, because the consumer is a metric label and the
+// three remedies contradict each other — an operator reading one gauge cannot tell a
+// volume that needs an `fstrim` from one that needs a restart from a host that needs a
+// bigger disk. It also *ends*: a latch is right for the transition (thousands of refusals
+// a second, one report) and wrong for ever, and the walking guest above is the proof —
+// after it recovered, the Agent went on reporting backpressure. Device.tookAnAppend
+// carries the per-reason rule, including the one reason that has no end while the volume
+// runs.
 //
 // The first bullet used to be `wal.ErrSelfFenced (§12.2, §16) — this host's lease
 // lapsed and it has lost the authority to ACK. No local action clears it; the Control

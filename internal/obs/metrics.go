@@ -86,7 +86,16 @@ func Catalog() []MetricDesc {
 		// host recorded not one sample and printed not one line. Recorded by
 		// cmd/volume-agent, which is the only place that holds both the devices and
 		// the budget the share was divided out of.
-		{"volume_backpressure", KindGauge, "1 once this volume's device has refused a guest write for want of its share of the local device (ADR-0013 §1); it does not clear while the volume runs", []string{"volume"}},
+		//
+		// **`reason` is a label and not a suffix on the help text**, because there are
+		// three bounds and their remedies contradict each other: `view_memory` wants an
+		// fstrim inside the guest, `wal_share` wants the volume stopped and republished,
+		// `device_enospc` wants the host's disk grown. One series meaning any of them is
+		// a page that cannot be actioned without reading the Agent's log, which is the
+		// state this gauge was added to end. blockdev.Reasons() is the value set; the
+		// recorder drives the series it is not reporting to 0 on the same poll, so a
+		// reason that ends does not leave its 1 standing for ever.
+		{"volume_backpressure", KindGauge, "1 while this volume's device is refusing guest requests for want of space, per bound (blockdev.Reason: view_memory | wal_share | device_enospc); view_memory and device_enospc return to 0 when the condition ends, wal_share does not while the volume runs (§5.7)", []string{"volume", "reason"}},
 
 		// --- Image and snapshots (§26.2) ---
 		//

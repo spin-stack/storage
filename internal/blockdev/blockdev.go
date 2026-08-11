@@ -22,6 +22,75 @@ import (
 // It is deliberately not a fencing condition. See the package doc.
 var ErrDeviceFull = errors.New("the local WAL device is out of space")
 
+// Reason names which bound turned a guest request away for want of space. It exists so a
+// metric can carry the distinction as a label and an operator can act on it, which a
+// sentence cannot do: the layer above this one flattened three bounds into one gauge and
+// one WARN that always said "for want of space", so a volume needing an `fstrim` and a
+// volume needing a restart looked identical from outside the process.
+//
+// The distinction is not invented here — it exists in the Go layer already
+// (wal.ErrViewBound wraps wal.ErrBackpressure; ErrDeviceFull is its own sentinel) — it is
+// only carried out to where it can be seen. The values are label values, so they are
+// lower-case and stable: renaming one breaks a dashboard, not a compile.
+type Reason string
+
+const (
+	// ReasonViewMemory is the read view's memory bound: this volume's live extents fill
+	// the share of host memory it was given. The guest gets it back itself, with the
+	// volume still running, by discarding what it no longer needs.
+	ReasonViewMemory Reason = "view_memory"
+	// ReasonWALShare is the volume's share of the local device (§5.7). V1 has no
+	// mid-session reclaim, so it ends when the session does and not before.
+	ReasonWALShare Reason = "wal_share"
+	// ReasonDeviceENOSPC is the device itself out of space, under a volume that never
+	// reached its own share. The remedy is on the host — truncate after a checkpoint,
+	// grow the device — and it does not need the volume stopped.
+	ReasonDeviceENOSPC Reason = "device_enospc"
+)
+
+// Reasons is every value a Refusal can carry. A caller reporting the reason as a metric
+// label needs it: `volume_backpressure` has one series per (volume, reason), and the
+// series that are *not* current have to be driven to 0 explicitly or they hold whatever
+// they last held for ever — the same staleness this type exists to end, moved down a
+// level. A function and not a package-level slice, so no caller can edit the vocabulary.
+func Reasons() []Reason { return []Reason{ReasonViewMemory, ReasonWALShare, ReasonDeviceENOSPC} }
+
+// rank decides which refusal a device keeps when two bounds are refusing at once.
+//
+// It is not severity in the abstract. It is what an operator would be made to *wait for*:
+// ReasonViewMemory ends while the volume serves, ReasonDeviceENOSPC ends when someone
+// gives the device room with the volume still running, and ReasonWALShare does not end
+// until the session does. Reporting a clearable reason while an unclearable one is also
+// refusing tells the operator to wait for a recovery that cannot come — and it can never
+// be corrected afterwards, because what clears the clearable reason is a successful write
+// and the unclearable bound has made those impossible.
+func (r Reason) rank() int {
+	switch r {
+	case ReasonWALShare:
+		return 3
+	case ReasonDeviceENOSPC:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// Refusal is what the host can see of a guest request turned away for want of space: the
+// machine-readable bound, and the sentence naming the remedy for it.
+//
+// Both, and not one or the other. The Reason is what a time series can carry and what an
+// alert can route on; the Remedy is the same sentence the guest's own error carried, and
+// it is the thing an operator acts on. A latch holding only the sentence is what made the
+// two bounds indistinguishable to everything outside this process.
+type Refusal struct {
+	Reason Reason
+	Remedy string
+}
+
+// String renders a Refusal for a log line or a %s: the reason first, because that is the
+// word an operator greps for, then what to do about it.
+func (r Refusal) String() string { return string(r.Reason) + ": " + r.Remedy }
+
 // Device serves one volume's guest-visible block device out of a wal.Log. It
 // satisfies vhost.Backend; see the package doc for what each method promises.
 //
@@ -45,29 +114,33 @@ type Device struct {
 	log *wal.Log
 	cap int64
 
-	// refusedForSpace holds the sentence describing the first guest request this
-	// device turned away for want of space, and is nil until one is.
+	// refusal holds the bound that turned a guest request away for want of space, and
+	// is nil while none has.
 	//
 	// It exists because *nothing on the host sees that refusal otherwise*. It is
 	// produced here, on the guest's own goroutine, and handed to a virtqueue that
 	// completes the request with IOERR and moves on; the guest gets `I/O error, dev
 	// vda` and a failed fsync, and the Agent's log says nothing at all. A volume that
-	// has hit its share is the tenant-visible failure this Agent is most likely to
-	// have and the one it was least able to report.
+	// has hit a bound is the tenant-visible failure this Agent is most likely to have
+	// and the one it was least able to report.
 	//
-	// Latched rather than live, for two reasons. It is the transition that matters —
-	// a poller at a human cadence must not have to catch the device mid-refusal — and
-	// a guest that keeps writing produces thousands of refusals a second, so anything
-	// that logged per refusal would bury the log at the moment it is needed. Whoever
-	// reports it therefore says it once (cmd/volume-agent's watchSpacePressure).
+	// Latched rather than live, and that is right for the *transition*: a poller at a
+	// human cadence must not have to catch the device mid-refusal, and a guest that
+	// keeps writing produces thousands of refusals a second, so anything that reported
+	// per refusal would bury the log at the moment it is needed. Whoever reports it
+	// therefore says it once (cmd/volume-agent's watchSpacePressure).
 	//
-	// Sticky is also the honest state: the Agent sets exactly one WAL bound
-	// (agent.Budget.Limits sets MaxLocalBytes and deliberately not the unflushed
-	// ones), and nothing clears that one while the volume runs.
+	// **But a latch that never ends is a lie the moment the condition does.** This field
+	// held one string, set once, for the life of the volume — and integration/vhost's
+	// walking guest proves a guest can cross the read view's memory bound, BLKDISCARD
+	// its way back under it and keep writing, after which the Agent went on reporting
+	// backpressure and telling the operator to stop a volume that had recovered. So each
+	// reason carries its own end, decided in tookAnAppend: ReasonWALShare has none while
+	// the volume runs, which is V1's documented shape (§5.7) and stays.
 	//
 	// An atomic and not a mutex, so the claim above about this type holding no lock
 	// stays true and a refused WRITE stays off any lock a READ could be waiting on.
-	refusedForSpace atomic.Pointer[string]
+	refusal atomic.Pointer[Refusal]
 }
 
 // New returns a Device of capacity bytes over l.
@@ -133,6 +206,9 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 	if _, err := d.log.Write(uint64(off), p, 0); err != nil {
 		return 0, d.refuse("WRITE", len(p), off, err)
 	}
+	// A WRITE the log took is the one piece of evidence the read view's bound can
+	// produce; see tookAnAppend.
+	d.tookAnAppend(true)
 	return len(p), nil
 }
 
@@ -178,6 +254,10 @@ func (d *Device) clear(op string, off, length int64, append func(uint64, uint32)
 	if _, err := append(uint64(off), uint32(length)); err != nil {
 		return d.refuse(op, int(length), off, err)
 	}
+	// growsView is false: a clear is exempt from the read view's bound (that exemption is
+	// what lets a guest already over it escape), so its success says nothing about
+	// whether the view came back under. It does say the device took bytes.
+	d.tookAnAppend(false)
 	return nil
 }
 
@@ -229,7 +309,8 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 		// the guest that hit it should do and what integration/vhost proves a real
 		// kernel can. Telling that operator to stop and republish would cost them a
 		// session's downtime for a condition an fstrim clears.
-		d.latchSpaceRefusal("this volume's read view is at its memory bound")
+		d.latch(ReasonViewMemory, "this volume's read view is at its memory bound: a DISCARD "+
+			"(fstrim, or mount -o discard) from inside the guest gives it back without stopping anything")
 		return fmt.Errorf("blockdev: %s refused: this volume's read view is at its memory bound: "+
 			"the guest can free it without stopping — DISCARD (fstrim, or mount -o discard) is the only "+
 			"thing that shrinks a read view, and it is deliberately never refused by this bound: %w", where, err)
@@ -241,7 +322,8 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 		// because V1 has no mid-session reclaim (§5.7, ADR-0013 §1). What gives the
 		// space back is stopping the volume, which publishes its image and drops the
 		// local WAL. An operator told to FLUSH watches the writes keep failing.
-		d.latchSpaceRefusal("this volume has written its whole share of the local device (§5.7)")
+		d.latch(ReasonWALShare, "this volume has written its whole share of the local device: "+
+			"nothing reclaims it while the volume runs — stop the volume, which publishes its image and reclaims the WAL")
 		return fmt.Errorf("blockdev: %s refused: this volume has written its whole share of the local device (§5.7): "+
 			"a FLUSH does not clear this bound and nothing else does while the volume runs — "+
 			"stop the volume, which publishes its image and reclaims the WAL: %w", where, err)
@@ -251,31 +333,88 @@ func (d *Device) refuse(op string, n int, off int64, err error) error {
 	// wal.Degraded), so a caller that pre-checked it would refuse every write from the
 	// first ENOSPC onwards and the volume would never come back.
 	if d.log.Degraded() == wal.DegradedOutOfSpace {
-		d.latchSpaceRefusal("the device under this volume is out of space, below the share this volume was bounded by")
+		d.latch(ReasonDeviceENOSPC, "the device under this volume is out of space, below the share "+
+			"this volume was bounded by: truncate after a checkpoint, grow the device, or restore the object store")
 		return fmt.Errorf("blockdev: %s refused: %w — truncate after a checkpoint, grow the device, or restore the object store: %w",
 			where, ErrDeviceFull, err)
 	}
 	return fmt.Errorf("blockdev: %s failed: %w", where, err)
 }
 
-// latchSpaceRefusal records the first refusal for want of space and ignores every one
-// after it — the first is the transition, and the rest are the same fact repeated once
-// per guest request.
-func (d *Device) latchSpaceRefusal(reason string) {
-	d.refusedForSpace.CompareAndSwap(nil, &reason)
+// latch records a refusal for want of space. It keeps the first of a kind — the first is
+// the transition and the rest are the same fact repeated once per guest request, so the
+// sentence a reporter prints stays still under a storm — and it lets a higher-ranked
+// reason displace a lower one, which is the case where keeping the first would be wrong.
+// See Reason.rank.
+func (d *Device) latch(reason Reason, remedy string) {
+	next := Refusal{Reason: reason, Remedy: remedy}
+	for {
+		cur := d.refusal.Load()
+		if cur != nil && next.Reason.rank() <= cur.Reason.rank() {
+			return
+		}
+		if d.refusal.CompareAndSwap(cur, &next) {
+			return
+		}
+	}
 }
 
-// RefusedForSpace reports whether this device has turned a guest request away for want
-// of space, and which bound turned it away. It is the host's only view of a condition
-// the guest experiences as EIO and a failed fsync.
+// tookAnAppend ends a latched refusal when the append that just succeeded is evidence
+// that its condition ended. Called on the success path of every request that appends, so
+// the common cost is one atomic load of a nil pointer.
 //
-// It never goes back to false. See the field for why that is the honest answer and not
-// merely the cheap one.
-func (d *Device) RefusedForSpace() (string, bool) {
-	if r := d.refusedForSpace.Load(); r != nil {
+// Each reason gets the evidence it can actually produce, and only that:
+//
+//   - ReasonViewMemory — grewView. wal charges a WRITE against the read view's bound
+//     before appending, and only records that grow the view are charged, so a WRITE the
+//     log took *is* the statement "the view is inside its ceiling". On this path only a
+//     DISCARD or WRITE_ZEROES can have made that true, which is precisely the recovery a
+//     real guest performs (integration/vhost's walking hold run). The clear itself is not
+//     the evidence: clears are exempt from the bound, so one succeeds just as readily
+//     from over it as from under it.
+//
+//   - ReasonDeviceENOSPC — wal.Degraded, asked rather than inferred. It is a live latch
+//     over what the device just did, set by an append the device refused and cleared by
+//     one it took, so it already answers this exact question and answers it for both
+//     kinds of append.
+//
+//   - ReasonWALShare — nothing, while this Device exists. No mid-session reclaim exists
+//     (§5.7): what gives the share back is stopping the volume, which publishes its image
+//     and drops the WAL, and the volume that comes back has a new Log and a new Device.
+//     So an accepted append after this bound fires — a small record squeezing into the
+//     gap the refused one did not fit — is not recovery, and treating it as recovery
+//     would tell the operator to stand down from the one condition that needs them.
+func (d *Device) tookAnAppend(grewView bool) {
+	cur := d.refusal.Load()
+	if cur == nil {
+		return
+	}
+	switch cur.Reason {
+	case ReasonViewMemory:
+		if !grewView {
+			return
+		}
+	case ReasonDeviceENOSPC:
+		if d.log.Degraded() == wal.DegradedOutOfSpace {
+			return
+		}
+	default: // ReasonWALShare
+		return
+	}
+	d.refusal.CompareAndSwap(cur, nil)
+}
+
+// RefusedForSpace reports whether this device is turning guest requests away for want of
+// space, and which bound is doing it. It is the host's only view of a condition the guest
+// experiences as EIO and a failed fsync.
+//
+// It clears when the condition does, per reason — see tookAnAppend for what counts as
+// evidence for each, and why ReasonWALShare has none.
+func (d *Device) RefusedForSpace() (Refusal, bool) {
+	if r := d.refusal.Load(); r != nil {
 		return *r, true
 	}
-	return "", false
+	return Refusal{}, false
 }
 
 // blockdev.Device is the Backend a real guest is served from. hostio.RawFile still

@@ -29,6 +29,7 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/blockdev"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/obs"
@@ -486,7 +487,12 @@ func serveOperatorEndpoint(addr string, telemetry *obs.Provider) func() {
 // The Agent's own volume share is not knowledge blockdev has or should acquire.
 func watchSpacePressure(ctx context.Context, clk clock.Clock, volumes *agent.VolumeManager,
 	rec *obs.Recorder, share int64, every time.Duration) {
-	said := map[string]bool{}
+	// said carries the reason the WARN was said for, not just that it was said. A volume
+	// can cross the read view's bound, trim its way back under it, and later exhaust its
+	// device share — three different sentences with three different remedies, and a
+	// boolean would say the second and third out loud only if the operator happened to be
+	// reading when the first cleared.
+	said := map[string]blockdev.Reason{}
 	for {
 		if err := clk.Sleep(ctx, every); err != nil {
 			return
@@ -502,19 +508,43 @@ func watchSpacePressure(ctx context.Context, clk clock.Clock, volumes *agent.Vol
 			if !ok {
 				continue
 			}
-			reason, refused := dev.RefusedForSpace()
+			refusal, refused := dev.RefusedForSpace()
+
+			// Every reason gets a series, every cycle, and the ones that are not current
+			// are driven to 0 explicitly. A gauge only ever *set* to 1 keeps that value
+			// for ever once the condition ends — the staleness this whole change exists
+			// to remove, moved from a latch in the device into the time series instead.
+			for _, r := range blockdev.Reasons() {
+				value := 0.0
+				if refused && refusal.Reason == r {
+					value = 1
+				}
+				rec.Gauge(ctx, "volume_backpressure", value,
+					obs.String("volume", v.VolumeID), obs.String("reason", string(r)))
+			}
+
 			if !refused {
-				rec.Gauge(ctx, "volume_backpressure", 0, obs.String("volume", v.VolumeID))
+				// The recovery is worth a line of its own: a volume that trimmed its way
+				// back under the read view's bound is serving again, and an operator who
+				// saw the WARN has no other way to learn that without watching the gauge.
+				if was, ok := said[v.VolumeID]; ok {
+					delete(said, v.VolumeID)
+					slog.Info("this volume is taking guest writes again",
+						"volume_id", v.VolumeID, "was_refusing_for", string(was))
+				}
 				continue
 			}
-			rec.Gauge(ctx, "volume_backpressure", 1, obs.String("volume", v.VolumeID))
-			if said[v.VolumeID] {
+			if said[v.VolumeID] == refusal.Reason {
 				continue
 			}
-			said[v.VolumeID] = true
-			slog.Warn("this volume is refusing guest writes for want of space; the guest is taking I/O errors and its fsync is failing",
-				"volume_id", v.VolumeID, "reason", reason, "volume_share_bytes", share,
-				"remedy", "stop the volume — publishing its image at stop is what reclaims the local WAL; nothing else does while it runs")
+			said[v.VolumeID] = refusal.Reason
+			// The remedy comes from the device rather than from a sentence written here:
+			// it is the same one the guest's own error carried, and there is exactly one
+			// place that knows which bound refused. A constant here is how this line came
+			// to tell every volume to stop, including the ones that only needed a trim.
+			slog.Warn("this volume is refusing guest writes; the guest is taking I/O errors and its fsync is failing",
+				"volume_id", v.VolumeID, "reason", string(refusal.Reason),
+				"volume_share_bytes", share, "remedy", refusal.Remedy)
 		}
 		// A volume that left this host is forgotten, so that the same volume attaching
 		// again — a new session, a new WAL, a new share — is reported again rather than
