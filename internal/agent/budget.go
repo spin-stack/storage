@@ -165,6 +165,51 @@ func NewBudget(u disk.Usage, memBytes int64, maxVolumes int) (Budget, error) {
 		MaxVolumes:   maxVolumes,
 	}
 	b.GuestBytes = int64(GuestRatio*float64(u.TotalBytes)) - b.ReserveBytes
+	// The device this divides may already be somebody else's. Until this line the
+	// derivation read TotalBytes and nothing else, so an Agent brought up on a
+	// filesystem another tenant had filled to 95% handed each of its volumes the same
+	// share it would hand them on an empty one, and kept a "reserve" that was a fraction
+	// of a capacity it does not have. The guests met the difference as ENOSPC — a partial
+	// append, after which every write on that volume fails — and the publish at stop met
+	// it as an fdatasync that could not allocate, which is the whole session.
+	//
+	// **What is checked is the reserve, and that is the strongest sound statement
+	// available here.** statfs reports one number for what is occupied and cannot say
+	// whose bytes those are; at this exact moment the largest holder is usually *this
+	// Agent*. A session's WAL stays on the device for the whole session and comes back at
+	// the next attach, when the published image is installed as the log's base
+	// (wal.InstallBase, the reclaimed_local_bytes on the attach line), so a restarting
+	// Agent is looking at a device its own last session filled, minutes before that space
+	// returns. What the bound above promises is a *footprint*, and this Agent's own
+	// footprint is inside it by construction — so the one thing that must be true whoever
+	// those bytes belong to is that the reserve fits behind them.
+	//
+	// Rejected: dividing what is free instead of what exists. It is the obvious shape and
+	// it is wrong in the same way the dynamic share is (see Budget). MaxLocalBytes bounds
+	// a log's whole footprint rather than its new writes, so a restart that divided the
+	// free space would hand a resumed volume a share smaller than the log it is resuming:
+	// every guest on the host takes an I/O error on a device that is 80% free the moment
+	// the bases install. And it ratchets — each restart divides what the last one left —
+	// on the dedicated filesystem that is the normal case.
+	//
+	// Rejected: refusing a device that is "materially occupied" by anything at all. That
+	// is the same measurement read the other way, and its false positive is the whole
+	// host: it fires on every restart of a busy Agent, and the volumes it refuses to serve
+	// are the ones whose unpublished sessions are on that disk waiting for exactly this
+	// process to publish them.
+	//
+	// **The residual, said out loud:** a genuinely shared filesystem between empty and
+	// full is still divided as if the Agent owned it, so the shares can sum past what is
+	// free and the guests still find out by ENOSPC. Closing that needs a number statfs
+	// does not carry — how much of UsedBytes is this Agent's own — which only the caller
+	// can produce, by measuring --data-dir before any volume attaches and passing it in.
+	// It is left open rather than guessed: every guess here is either the ratchet above or
+	// the refusal above, and both are worse than the gap.
+	if u.AvailBytes < b.ReserveBytes {
+		return Budget{}, fmt.Errorf(
+			"agent: this device has %d bytes free of %d (%d occupied) and the budget it would hand %d volumes keeps %d bytes free for the image publish at stop: the reserve alone does not fit. Give this Agent a filesystem of its own, or free %d bytes on this one",
+			u.AvailBytes, u.TotalBytes, u.UsedBytes, maxVolumes, b.ReserveBytes, b.ReserveBytes-u.AvailBytes)
+	}
 	if b.Share() <= 0 {
 		return Budget{}, fmt.Errorf(
 			"agent: a %d-byte device leaves %d bytes for %d volumes: no volume can be served on it",
