@@ -338,12 +338,13 @@ tasks:
         # (v6 §7 forbids a parser of our own). It was in the extract stage and in
         # nothing that checked, so an _output/ built before this line could satisfy
         # `task qemu:verify` and still not run an Agent.
-        # And it is *run*, not stat'ed, which is the rest of that lesson: the extracted
-        # qemu-img is dynamically linked, so on a host without liburing it is executable,
-        # present, and exits 127. `task qemu:tools` now ships its loader and its libraries
-        # beside it, which is what makes running it here cheap enough to be the check.
-        {{.OUTPUT_DIR}}/bin/qemu-img --version >/dev/null 2>&1 || {
-          echo "{{.OUTPUT_DIR}}/bin/qemu-img is missing or cannot run — the Agent cannot create a chain without it; run: task qemu:tools"; exit 1; }
+        # Present, not runnable — this task is the files-on-host half and the binary it
+        # is checking is one `build:qemu` just exported from a build image. On the runner
+        # that builds the artefact for everyone else, it cannot run at all
+        # (`liburing.so.2: cannot open shared object file`), which is the whole reason
+        # qemu:verify:behaviour exists and asks it there instead.
+        test -x {{.OUTPUT_DIR}}/bin/qemu-img || {
+          echo "missing {{.OUTPUT_DIR}}/bin/qemu-img — the Agent cannot create a chain without it; run: task build:qemu"; exit 1; }
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
         # pvh.bin is how -kernel enters a PVH ELF kernel, which is the guest lane's
         # only boot path. Its absence fails at run time as a rom-open error, which
@@ -376,17 +377,24 @@ tasks:
       - |
         set -euo pipefail
         bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
-        where=""
-        if out=$("$bin" --version 2>/dev/null && echo --- && "$bin" -device help 2>&1); then
-          where="the binary at $bin"
+        # qemu-img is asked the same question in the same breath, because the Agent
+        # refuses to start without one and a tree that carries a qemu-system nobody can
+        # fault while its qemu-img is the wrong version is a lane that fails three tests
+        # away from the cause.
+        if out=$("$bin" --version 2>/dev/null && echo --- && "$bin" -device help 2>&1 && \
+                 {{.OUTPUT_DIR}}/bin/qemu-img --version); then
+          where="the binaries at {{.OUTPUT_DIR}}/bin"
         else
           img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
           echo "$bin cannot run here (its libraries are the build image's) — asking the runtime image instead"
           task build:qemu:image
           out=$(docker run --rm --entrypoint /bin/sh "$img" -c \
-            '/usr/local/bin/qemu-system-x86_64 --version; echo ---; /usr/local/bin/qemu-system-x86_64 -device help 2>&1')
+            '/usr/local/bin/qemu-system-x86_64 --version; echo ---; /usr/local/bin/qemu-system-x86_64 -device help 2>&1; /usr/local/bin/qemu-img --version')
           where="$img"
         fi
+        printf '%s' "$out" | grep -c 'version {{.QEMU_VERSION}}' | grep -qx 2 || {
+          echo "in $where, qemu-system and qemu-img are not both the pinned {{.QEMU_VERSION}}:"
+          printf '%s\n' "$out" | grep -i version; exit 1; }
         printf '%s' "$out" | grep -q '{{.QEMU_VERSION}}' || {
           echo "the QEMU in $where is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
         # virtio-blk-pci, not vhost-user-blk-pci. The device the guest gets is now an
