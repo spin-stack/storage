@@ -1,6 +1,8 @@
 # CLAUDE.md — Remote Volumes (storage)
 
-Design source of truth: `arquitectura_mvp_volumenes_remotos_v5.md` (v5.1).
+Design source of truth: `arquitectura_mvp_volumenes_remotos_v6.md`. It replaced v5.1 on
+2026-08-11: QEMU owns the local CoW format via qcow2, and this system owns immutable
+commits, publication and recovery. v5 is in `git log`.
 Current state: `docs/plan/STATUS.md` — short by construction, see "Documents".
 
 ## Build it thin, end to end, before you build it deep
@@ -119,7 +121,7 @@ only place it can be wrong and be noticed. The two enforced by lint instead:
 - **Tests-first.** Failing test / DST scenario / checker before the implementation. A test
   weakened to make a change pass is a stop signal.
 - **Test the seams, not only the parts.** `integration/e2e` runs the real binaries as
-  processes; `integration/vhost` boots a real kernel. A change to anything a binary wires
+  processes; the guest lane boots a real kernel under the pinned QEMU. A change to anything a binary wires
   up belongs in one of those lanes, not only in a unit test that constructs the type itself.
 - **Assert on what the outside observes.** A gate that returns the right error and does the
   wrong thing satisfies any assertion on `err`.
@@ -132,7 +134,8 @@ only place it can be wrong and be noticed. The two enforced by lint instead:
   data-path/fencing behavior gets a scenario + checker; the mandatory set stays green.
   Checkers must be able to *catch* a violation, proven with a planted bug.
 - **Property tests** (`pgregory.net/rapid`) for serialize/replay and algebraic code (the
-  WAL: truncate-at-every-byte + bit-flip → exact state XOR detected error, never silently
+  the commit manifest and HEAD: truncate-at-every-byte + bit-flip → the object is refused,
+  never silently
   wrong).
 - **Coverage.** `task cover` enforces 90% on production code, measured `-coverpkg=./...`.
   Excluded: `internal/db`, `internal/metadata/pg`, `cmd/` mains, `integration/`,
@@ -145,7 +148,8 @@ errors, don't panic in library code; wrap with `fmt.Errorf("...: %w", err)`, com
 `errors.Is`/`errors.As`, sentinel `var Err... = errors.New(...)` for conditions callers
 branch on, handle an error once. Accept interfaces, return concrete types; define
 interfaces where consumed. No package-level mutable state — time, randomness and I/O are
-injected. Short names for short scopes, no stutter (`wal.Log`). Leave concurrency decisions
+injected. Short names for short scopes, no stutter (`image.Manifest`, not `image.ImageManifest`).
+Leave concurrency decisions
 to the caller.
 
 ## Stack
@@ -181,8 +185,6 @@ task qemu:verify        # assert the built QEMU is pinned + has vhost-user-blk-p
 task build:qemu:push    # publish the runtime image (CI does this into GitHub Packages)
 task qemu:version       # print the pinned version — the single source CI tags from
 task fetch:kernel       # pinned guest kernel at _output/guest/vmlinux (ADR-0022)
-task build:guest        # build the initramfs the guest lane boots (a static Go /init)
-task guest:verify       # assert the lane's inputs: the initramfs + the pinned kernel
 task backend:conformance # §6.1 object-store conformance suite (blocking per backend)
 ```
 
@@ -204,7 +206,8 @@ lives in exactly one file (`internal/simio/real/s3.go`) behind `objectstore.Stor
   and `task db:apply` runs a *saved* plan (pgschema refuses one planned against a different
   database). `task db:verify` is in `ci:full`.
 - **Postgres 18** everywhere; `task db:dev:up` starts the pinned one.
-- **Identity columns are `uuid`** (v7) — `volume_id` is the same 16 bytes the WAL carries.
+- **Identity columns are `uuid`** (v7) — the same id names the volume in the catalog, in
+  `descriptor.json` and in every object key under its prefix.
   `metadata.Store` uses `string` at the boundary; the `pg` adapter parses `string ↔ uuid`.
 - **Indexes are part of schema review.** Every FK *referencing* column carries an index; a
   query with a filter + `ORDER BY` gets a composite index in that order. Both enforced by
@@ -227,19 +230,31 @@ the moment two Agents can run different versions.
 
 ## Human-review zones (data-loss)
 
-Three. ADR-0026 deleted two of the four (2026-08-03).
+Three, restated for v6 (2026-08-11). The WAL and the chunked image are gone; what is
+data-loss-shaped moved with them.
 
-- **On-disk / on-S3 formats.** WAL record and segment layout, `image/<vol>/manifest.json`,
-  chunk sealing (`<nonce:12><ct><tag:16>`), the snapshot manifest, `descriptor.json`. Also
-  needs the §25.2 property test.
-- **Mutual exclusion at publish.** The compare-and-set on a volume's manifest and the
-  create-only write of a snapshot's. This is *all* that is left of fencing, and the only
-  thing stopping two hosts from silently overwriting each other's session with no error
-  anywhere. DST arm: `two-hosts-cannot-both-publish-an-image`, planted bug: a backend that
-  ignores preconditions — which is why `task backend:conformance` is blocking per backend.
-- **The FLUSH/FUA ACK rule.** Capture the sequence, `fdatasync`, advance
-  `durable_sequence` — and still the sentence a guest's `fsync` rests on. Widening what an
-  ACK claims is a review-zone change even when the diff is three lines.
+- **On-S3 formats.** The commit manifest, `HEAD`, `descriptor.json`, and the seal a layer
+  carries on the way out (`<nonce:12><ct><tag:16>` under the volume's DEK). All of them
+  framed — a digest over the bytes as stored, plus `format_version` — and `HEAD` most of
+  all, because it is the one mutable object and a bit turned over in it is the whole
+  volume. Also needs the serialize/replay property test with truncations and bit flips.
+- **Mutual exclusion at publish.** The compare-and-set on `HEAD`. This is *all* that is
+  left of fencing at the object store, and the only thing stopping two hosts from silently
+  overwriting each other's history. It is not sufficient on its own — the epoch is the
+  fencing token, see below — but it is the last line. `task backend:conformance` is
+  blocking per backend for exactly this, with a planted bug of a backend that ignores
+  preconditions, and its concurrency cases fork processes because an in-process mutex hid
+  a real defect once.
+- **The commit contract.** What `Commit() → SUCCESS` promises: that this state is
+  reconstructible without the host. Everything in the ordering — `PUT layer`, `PUT
+  manifest`, `CAS HEAD`, never the reverse — and the two invariants of §11 (an idle volume
+  does not commit; nothing rotates while a sealed layer is unpublished) serve that one
+  sentence. Widening what a commit claims is a review-zone change even when the diff is
+  three lines.
+
+What is **no longer** a review zone, because its subject is gone: the WAL record and
+segment layout, the FLUSH/FUA ACK rule (a FLUSH is now QEMU's `fdatasync` and claims only
+local durability), and chunk addressing.
 
 These get a human review of the spec (in the PR) before implementation and of the diff
 before merge, plus a DST scenario.
