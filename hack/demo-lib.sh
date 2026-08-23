@@ -147,6 +147,13 @@ say "1. the two binaries, as processes"
 PIDS+=($!)
 waitfor "$DIR/logs/cp.log" "control-plane elected"
 
+# AGENT_FLAGS_TEMPLATE lets a caller name a path under the scratch directory, which it
+# cannot know before this file chose one. @DIR@ is the only substitution and it is done
+# once, here.
+if [ -n "${AGENT_FLAGS_TEMPLATE:-}" ]; then
+  AGENT_FLAGS=${AGENT_FLAGS_TEMPLATE//@DIR@/$DIR}
+fi
+
 start_agent() {
   "$AGENT" -host-id "$HOST_ID" -control-plane "http://127.0.0.1:$PORT" \
     -data-dir "$DIR/agent" -kek-file "$DIR/kek" -qemu-img "$QEMU_IMG" \

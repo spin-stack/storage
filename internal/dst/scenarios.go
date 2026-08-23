@@ -30,6 +30,7 @@ type MandatoryScenario struct {
 // add scenarios without both editing one literal.
 func MandatoryScenarios() []MandatoryScenario {
 	all := coreScenarios()
+	all = append(all, commitScenarios()...)
 	all = append(all, harnessScenarios()...)
 	return all
 }

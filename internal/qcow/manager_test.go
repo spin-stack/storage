@@ -3,6 +3,7 @@ package qcow_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -100,15 +102,21 @@ func newHarness(t *testing.T) *harness {
 
 func newHarnessRotatingAt(t *testing.T, at int64) *harness {
 	t.Helper()
-	return newHarnessWith(t, sim.NewDisk(), at)
+	return newHarnessWith(t, sim.NewDisk(), at, nil)
+}
+
+// newHarnessFull is a Manager that also publishes what it seals.
+func newHarnessFull(t *testing.T, at int64, pub qcow.Publisher) *harness {
+	t.Helper()
+	return newHarnessWith(t, sim.NewDisk(), at, pub)
 }
 
 func newHarnessOn(t *testing.T, d *sim.Disk) *harness {
 	t.Helper()
-	return newHarnessWith(t, d, 0)
+	return newHarnessWith(t, d, 0, nil)
 }
 
-func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64) *harness {
+func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64, pub qcow.Publisher) *harness {
 	t.Helper()
 	h := &harness{
 		runner: &fakeRunner{info: infoJSON("qcow2", size, false), version: "qemu-img version 11.0.2"},
@@ -119,11 +127,12 @@ func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64) *harness {
 	m, err := qcow.New(t.Context(), qcow.Config{
 		Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second, RotateAtBytes: rotateAt,
 	}, qcow.Deps{
-		Clock:  sim.NewClock(time.Unix(0, 0)),
-		Disk:   d,
-		Runner: h.runner,
-		Paths:  h.paths,
-		Dialer: h.dialer,
+		Clock:     sim.NewClock(time.Unix(0, 0)),
+		Disk:      d,
+		Runner:    h.runner,
+		Paths:     h.paths,
+		Dialer:    h.dialer,
+		Publisher: pub,
 	})
 	if err != nil {
 		t.Fatalf("building a manager: %v", err)
@@ -763,5 +772,143 @@ func TestARotationThresholdBelowAnEmptyImageIsRefused(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a threshold an empty qcow2 already exceeds was accepted")
+	}
+}
+
+// recordingPublisher is the object store, as far as the Manager is concerned.
+type recordingPublisher struct {
+	got []qcow.SealedLayer
+	err error
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, l qcow.SealedLayer) error {
+	p.got = append(p.got, l)
+	return p.err
+}
+
+// TestASealedLayerIsHandedOverForPublishing: rotation produces a layer and the commit
+// protocol takes it from there. The assertions are on *which* layer — the one that was
+// sealed, not the empty one the guest moved on to — because sealing the wrong file
+// produces an object that uploads perfectly and cannot be opened by whoever needs it.
+func TestASealedLayerIsHandedOverForPublishing(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("the cycle that should rotate and publish: %v", err)
+	}
+	if len(pub.got) != 1 {
+		t.Fatalf("%d layers were handed over, want 1", len(pub.got))
+	}
+	l := pub.got[0]
+	switch {
+	case l.Path != tip:
+		t.Errorf("the layer published is %q, want the one that was sealed, %q", l.Path, tip)
+	case l.LayerID != qcow.LayerIDOfImage(tip):
+		t.Errorf("the layer id is %q, want the sealed file's own, %q", l.LayerID, qcow.LayerIDOfImage(tip))
+	case l.VolumeID != vol:
+		t.Errorf("the volume is %q", l.VolumeID)
+	case l.Epoch != 1:
+		t.Errorf("the epoch is %d, want the one this host held", l.Epoch)
+	case l.VirtualSize != size:
+		t.Errorf("the virtual size is %d, want %d", l.VirtualSize, size)
+	case l.CommitID == "":
+		t.Error("no commit id was minted, so a retry could not be recognised as one")
+	}
+}
+
+// TestNothingRotatesWhileASealedLayerIsUnpublished is v6 §11's second invariant, and the
+// whole of what it buys is visible here: with the object store down, the tip goes on
+// growing — one file the guest was going to fill anyway — instead of the chain gaining a
+// small layer per cycle, each one a commit that never landed.
+func TestNothingRotatesWhileASealedLayerIsUnpublished(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{err: errors.New("dial tcp: connection refused")}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+
+	// The cycle that rotates, and whose publish fails.
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err == nil {
+		t.Fatal("a publish that failed was reported as a success")
+	}
+	sealedOnce := h.tip(t)
+
+	// Three more cycles with the tip well over the threshold. Not one of them rotates.
+	//
+	// Asserted as "no rotation was attempted" and not as "the pointer did not move",
+	// which is the same trap this file warns about elsewhere: with the guard removed, the
+	// second rotation *fails* anyway — the fake qemu-img still describes the first tip —
+	// so the pointer stays put and a test watching the pointer stays green while the
+	// invariant is gone. What the guard promises is that nothing is tried.
+	h.runner.reset()
+	for i := range 3 {
+		h.paths.sizes[sealedOnce] = int64(20+i) << 20
+		h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(sealedOnce)
+		_ = h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)})
+		for _, cmd := range h.runner.commands() {
+			if strings.Contains(cmd, "create -f qcow2 -b ") {
+				t.Fatalf("cycle %d started a rotation while a sealed layer was unpublished: %s", i, cmd)
+			}
+		}
+		if got := h.tip(t); got != sealedOnce {
+			t.Fatalf("cycle %d rotated to %q while a sealed layer was unpublished", i, got)
+		}
+	}
+	// And every attempt was the same commit, which is what makes the retries idempotent
+	// rather than a queue of near-identical commits waiting to be published.
+	if len(pub.got) < 2 {
+		t.Fatalf("the sealed layer was offered %d times; it must keep being retried", len(pub.got))
+	}
+	for _, l := range pub.got[1:] {
+		if l.CommitID != pub.got[0].CommitID {
+			t.Fatalf("a retry used a fresh commit id: %q then %q", pub.got[0].CommitID, l.CommitID)
+		}
+	}
+}
+
+// TestAHeadThatMovedStopsTheVolume. Every other publishing failure leaves the guest
+// alone, because a layer that could not be uploaded costs nothing yet. This one is
+// different in kind: another host published for this volume, so this host is not its
+// writer, and going on holding the disk would mean two hosts writing one volume — which
+// is the failure the whole design is arranged against.
+func TestAHeadThatMovedStopsTheVolume(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{err: fmt.Errorf("publishing: %w", commit.ErrHeadMoved)}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err == nil {
+		t.Fatal("a volume whose HEAD moved was served without complaint")
+	}
+	v, ok := h.volumes(t)[vol]
+	if !ok {
+		t.Fatal("the volume is not reported at all, so the fleet cannot see why it stopped")
+	}
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED {
+		t.Errorf("the refusal is %v, want PUBLISH_FENCED — an operator looks at ownership for this one, not at this host", v.Refusal)
+	}
+}
+
+// TestAPublishThatFailsKeepsServingTheVolume: the guest is doing nothing wrong, and
+// taking its disk away because an upload did not go through would turn "we did not
+// manage to bound this layer" into an outage.
+func TestAPublishThatFailsKeepsServingTheVolume(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{err: errors.New("503 Service Unavailable")}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err == nil {
+		t.Fatal("a publish that failed was reported as a success")
+	}
+	v := h.volumes(t)[vol]
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Errorf("the volume was refused over an upload: %v %q", v.Refusal, v.RefusalDetail)
 	}
 }

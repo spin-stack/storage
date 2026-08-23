@@ -365,6 +365,8 @@ func refusalOf(r storagev1.VolumeRefusal) (lifecycle.Refusal, error) {
 		return lifecycle.RefusalLeaseLost, nil
 	case storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED:
 		return lifecycle.RefusalAttachFailed, nil
+	case storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED:
+		return lifecycle.RefusalPublishFenced, nil
 	default:
 		return "", fmt.Errorf("%w: volume refusal %d", lifecycle.ErrUnknownState, r)
 	}

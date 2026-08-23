@@ -102,6 +102,12 @@ func (*Paths) Size(path string) (int64, error) {
 // ReadFile returns the file's contents.
 func (*Paths) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
 
+// Open returns the file as a stream. It is what a sealed layer is read through: layers
+// are the one thing here measured in tens of megabytes, and reading one into memory to
+// hand it to a sealer that is going to stream it anyway would double the only allocation
+// in the publish path that is worth counting.
+func (*Paths) Open(path string) (io.ReadCloser, error) { return os.Open(path) }
+
 // WriteAtomic replaces path's contents with data in one step.
 //
 // Temp file, fsync, rename, fsync the directory — all four, because the reader is

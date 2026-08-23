@@ -299,6 +299,17 @@ enum VolumeRefusal {
   // catch-all on purpose — without one, the next refusal to be written would be
   // invisible again, which is the whole failure this enum exists to close.
   VOLUME_REFUSAL_ATTACH_FAILED = 6;
+  // The compare-and-set on this volume's HEAD lost: another host published a commit for
+  // it, so this one is not its writer any more (commit.ErrHeadMoved, v6 §15).
+  //
+  // Its own value rather than the catch-all, which the catch-all's comment would
+  // otherwise cover, because the operator's next move is not the same and is not
+  // guessable from a detail string. Every other refusal here is answered by looking at
+  // this host; this one is answered by looking at *ownership* — who else believes it
+  // owns this volume, and why was this host not fenced first. Two hosts writing one
+  // volume is the failure this whole design is arranged against, and it is the one
+  // refusal that must be countable in a dashboard rather than greppable in a log.
+  VOLUME_REFUSAL_PUBLISH_FENCED = 7;
 }
 
 // VolumeReport is one volume's watermarks as the Agent observes them, qualified

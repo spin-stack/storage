@@ -40,8 +40,10 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/obs"
+	"github.com/spin-stack/storage/internal/publisher"
 	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/internal/storecfg"
 )
 
 // version is the build identity the Agent reports. Overridden at link time with
@@ -80,6 +82,8 @@ func run() (err error) {
 		rotateAt = flag.Int64("rotate-at-bytes", 0,
 			"seal a volume's tip and start a new layer once the tip occupies this many bytes. 0 disables rotation, which is the default until v6 §11's threshold is fixed by measurement")
 	)
+	var storeFlags storecfg.Flags
+	storeFlags.Register(flag.CommandLine)
 	flag.Parse()
 
 	switch {
@@ -148,6 +152,60 @@ func run() (err error) {
 		return fmt.Errorf("opening the data directory: %w", err)
 	}
 
+	// §15: guest data is sealed with the volume's DEK, wrapped under this KEK. A KMS is
+	// built over it because there is now something that unwraps one: v6 §10 seals every
+	// layer on its way to the object store, so an Agent that publishes needs the volume's
+	// key in the clear for exactly as long as the transfer takes.
+	//
+	// Reading it is not ceremony even on a host that publishes nothing: the Control Plane
+	// wraps every volume's DEK under the KEK *it* read, an Agent that reaches a different
+	// key from the same file has volumes it can never open, and the two binaries
+	// disagreeing about how to parse the file is a defect this repository has already
+	// shipped once. The id on this line is what makes them comparable.
+	var kms crypto.KMS
+	if *kekFile != "" {
+		kekDisk, kerr := real.NewDisk(filepath.Dir(*kekFile))
+		if kerr != nil {
+			return fmt.Errorf("opening the directory holding the KEK: %w", kerr)
+		}
+		kek, kerr := crypto.LoadKEK(kekDisk, filepath.Base(*kekFile))
+		if kerr != nil {
+			return kerr
+		}
+		kms = crypto.NewDevKMS(kek, crypto.KEKID(kek))
+		slog.Info("key-encryption key loaded", "kek_id", crypto.KEKID(kek))
+	} else {
+		slog.Warn("no -kek-file: this Agent holds no key material (§15 requires encryption outside dev)")
+	}
+
+	// The publisher, if this host is configured to publish at all.
+	//
+	// Optional, and that is deliberate: an Agent with no object store keeps every layer
+	// it seals on its own disk, which is what every lane before v6 §23.3 does and what a
+	// single-machine trial does. It is not silent — the line below says which it is, and
+	// "this Agent publishes nothing" is the sort of thing an operator must not have to
+	// infer from the absence of commits.
+	//
+	// The knot: the publisher needs the volume's key, which only agent.Loop can fetch,
+	// and the Loop needs the volume manager, which needs the publisher. It is resolved
+	// here, in the wiring, by handing the publisher a holder that is filled in once the
+	// Loop exists — rather than by giving any of the three a reason to know about the
+	// other two.
+	keys := &loopKeys{}
+	var pub qcow.Publisher
+	switch {
+	case storeFlags.Bucket == "" && storeFlags.Dir == "":
+		slog.Warn("no object store configured: this Agent seals layers and publishes none of them, so nothing it holds survives losing this host")
+	case kms == nil:
+		return errors.New("an object store is configured but -kek-file is not: a layer is sealed with the volume's DEK on the way out (v6 §10), and this Agent could not unwrap one")
+	default:
+		store, serr := storeFlags.Open(ctx)
+		if serr != nil {
+			return serr
+		}
+		pub = publisher.New(store, kms, keys, real.NewPaths())
+	}
+
 	// The volume manager, and it is constructed here rather than after the Control Plane
 	// client because it is what claims --data-dir: v6 §10 is one Agent per host, and two
 	// incarnations preparing chains under the same paths would hand one qcow2 file to two
@@ -167,11 +225,12 @@ func run() (err error) {
 		ProbeTimeout:  *probeTimeout,
 		RotateAtBytes: *rotateAt,
 	}, qcow.Deps{
-		Clock:  real.NewClock(),
-		Disk:   dataDisk,
-		Runner: real.NewRunner(),
-		Paths:  real.NewPaths(),
-		Dialer: real.NewUnixDialer(),
+		Clock:     real.NewClock(),
+		Disk:      dataDisk,
+		Runner:    real.NewRunner(),
+		Paths:     real.NewPaths(),
+		Dialer:    real.NewUnixDialer(),
+		Publisher: pub,
 	})
 	if err != nil {
 		return err
@@ -179,27 +238,6 @@ func run() (err error) {
 	// The kernel drops an flock when the process dies, so this defer is for the paths
 	// that return rather than for a crash — nothing has to clean up after one.
 	defer func() { err = errors.Join(err, volumes.Close()) }()
-
-	// §15: guest data is sealed with the volume's DEK, wrapped under this KEK. Nothing
-	// in this build unwraps one — there is no data path to seal for — so the key is read
-	// and its id derived, and no KMS is built over it. Reading it is not ceremony: the
-	// Control Plane wraps every volume's DEK under the KEK *it* read, an Agent that
-	// reaches a different key from the same file has volumes it can never open, and the
-	// two binaries disagreeing about how to parse the file is a defect this repository
-	// has already shipped once. The id on this line is what makes them comparable.
-	if *kekFile != "" {
-		kekDisk, kerr := real.NewDisk(filepath.Dir(*kekFile))
-		if kerr != nil {
-			return fmt.Errorf("opening the directory holding the KEK: %w", kerr)
-		}
-		kek, kerr := crypto.LoadKEK(kekDisk, filepath.Base(*kekFile))
-		if kerr != nil {
-			return kerr
-		}
-		slog.Info("key-encryption key loaded", "kek_id", crypto.KEKID(kek))
-	} else {
-		slog.Warn("no -kek-file: this Agent holds no key material (§15 requires encryption outside dev)")
-	}
 
 	cp := storagev1connect.NewControlPlaneServiceClient(
 		&http.Client{Timeout: *httpTimeout}, *cpURL)
@@ -217,6 +255,7 @@ func run() (err error) {
 	if err != nil {
 		return err
 	}
+	keys.loop = loop
 
 	slog.Info("volume-agent starting",
 		"host_id", cfg.HostID, "version", version, "control_plane", *cpURL,
@@ -231,6 +270,22 @@ func run() (err error) {
 	// a clean shutdown from a disappearance.
 	slog.Info("volume-agent stopped")
 	return nil
+}
+
+// loopKeys is the knot between the publisher and the loop, tied in one place.
+//
+// The Control Plane is the only thing that knows a volume's DEK and agent.Loop is the
+// only thing that talks to it, so a publisher needs the Loop; the Loop needs the volume
+// manager; the volume manager needs the publisher. Nothing about that is circular in
+// *meaning* — it is three components each needing one verb from another — and this is
+// where a wiring cycle belongs: in the main that already knows all three.
+//
+// It is read only from the reconcile cycle, which starts after loop.Run, so the
+// assignment happens-before every read.
+type loopKeys struct{ loop *agent.Loop }
+
+func (k *loopKeys) VolumeKeys(ctx context.Context, volumeID string) (agent.VolumeKeys, error) {
+	return k.loop.VolumeKeys(ctx, volumeID)
 }
 
 // serveOperatorEndpoint starts the Agent's only listening socket and returns the

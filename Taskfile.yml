@@ -484,6 +484,17 @@ tasks:
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage2-demo.sh
 
+  demo:stage3:
+    desc: >-
+      Stage 3 end to end: a Linux guest writes while the Agent seals each tip and
+      publishes it — layer, immutable manifest, compare-and-set on HEAD — and the bucket
+      is then read back with `cat` to show the chain from HEAD is complete, every layer
+      matches its digest, and none of them carries the guest's bytes in the clear. Needs
+      `task db:dev:up`, KVM, and the pinned artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage3-demo.sh
+
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
     env: *guest_kernel_env

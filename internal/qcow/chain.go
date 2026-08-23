@@ -117,6 +117,14 @@ func LayerImage(root, volumeID, layerID string) string {
 	return filepath.Join(LayersDir(root, volumeID), layerID+layerSuffix)
 }
 
+// LayerIDOfImage recovers a layer's id from its path. The id is in the filename because
+// that is the only place a layer carries its own identity — the file is a qcow2 and has
+// nowhere else to put one — and it is needed by anything that meets a layer without
+// having been the thing that created it: a publish after a restart, a sweep, a recovery.
+func LayerIDOfImage(path string) string {
+	return strings.TrimSuffix(filepath.Base(path), layerSuffix)
+}
+
 // ActivePointer is the file naming the qcow2 QEMU should be launched against. Half the
 // contract with whoever launches the VM; it holds one absolute path and no newline.
 func ActivePointer(root, volumeID string) string {

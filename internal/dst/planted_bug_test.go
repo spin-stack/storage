@@ -122,7 +122,8 @@ const (
 // for, proved by hand-written Emits, is precisely the fiction the paragraph above
 // describes — the same shape, arrived at from the other direction.
 var plantedProofs = map[string]proofKind{
-	"monotonic-clock": proofBehavioural,
+	"monotonic-clock":         proofBehavioural,
+	"effective-single-writer": proofBehavioural,
 }
 
 // proven records which checkers a plantedBug call actually exercised in this run.
@@ -181,15 +182,21 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 //
 //   - 16 -> 15 (2026-08-02): `no-permanent-delete` removed *with its subject* —
 //     ADR-0026 deleted internal/gc, so nothing issues a delete.
+//
 //   - 15 -> 14 (2026-08-02): the checkpoint-lease checker, same shape — the durability
 //     scheduler was withdrawn, so nothing publishes a checkpoint.
+//
 //   - 8 -> 7 (2026-08-02): `durable-ack-requires-lease` (INV-06), with the lease-gated ACK.
+//
 //   - 7 -> 6, then 6 -> 5 (2026-08-03): `watermark-order` was *reclassified*, not
 //     removed. It had claimed a behavioural proof that did not exist; it is literal now
 //     and has a proof that runs. The number went down because the record became true.
+//
 //   - 5 -> 6 (2026-08-09): `acked-records-cross-epochs-intact`, with the carry-forward
 //     scenario. An increase, which is the only direction that needs no defence.
+//
 //   - 6 -> 7 (2026-08-09): `refused-volume-has-no-device`, with the refusal scenario.
+//
 //   - 7 -> 1 (2026-08-22): the local block engine was withdrawn — QEMU owns the local
 //     copy-on-write format through qcow2 from here on — and six checkers went with the
 //     subjects they observed: `no-plaintext-leaves-host` and `watermark-order` (a WAL
@@ -200,8 +207,14 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 //     with no records to carry). This is the largest single decrease in this log and
 //     every one of them is the "removed with its subject" case, not a weakening. The
 //     commit protocol reinstates the subjects and this number climbs back.
+//
+//   - 2026-08-23, +1: `effective-single-writer` is back, and behaviourally. Its planted
+//     bug is the one §6.1 names — an object store whose conditional writes are advisory
+//     — injected into the simulated store and not into the protocol, and the scenario
+//     that carries it is two hosts racing to publish onto one HEAD. This is the entry
+//     that was fiction in 2026-08-03's audit; it is not fiction now.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 1
+	const wantBehavioural = 2
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {
@@ -218,4 +231,23 @@ func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
 			"(literal: %v): raise the constant when converting one, never lower it",
 			got, wantBehavioural, literal)
 	}
+}
+
+// The published history is a chain, and the compare-and-set on HEAD is the only thing
+// making it one (INV-10, v6 §9). The planted bug is a backend whose conditional writes
+// are advisory — §6.1's own worked example, and the reason `task backend:conformance` is
+// blocking per backend — injected into the simulated store, never into the protocol.
+//
+// What makes it a real proof rather than a demonstration: with preconditions ignored the
+// losing host is handed a *success*. There is no error left anywhere for a scenario to
+// assert on, and the only surviving evidence is the shape of what was published, which
+// is exactly what this checker reads.
+func TestSingleWriterCheckerCatchesAdvisoryPreconditions(t *testing.T) {
+	const seed = 20260823
+	requirePasses(t, seed, NewSingleWriterChecker(), scenarioTwoHostsCannotBothPublish)
+	plantedBug(t, seed, NewSingleWriterChecker(), "effective-single-writer", func(s *Sim) error {
+		s.Store.InjectIgnorePreconditions()
+		s.Emit(Event{Kind: EventFault, Msg: "the object store's conditional writes are advisory"})
+		return scenarioTwoHostsCannotBothPublish(s)
+	})
 }

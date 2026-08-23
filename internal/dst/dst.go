@@ -42,6 +42,13 @@ const (
 	EventNote    EventKind = "note"
 	EventDelete  EventKind = "delete"
 	EventFault   EventKind = "fault"
+	// EventPublish is one host's attempt at v6 §9's protocol, successful or not. It
+	// carries the manifest's own parent rather than what the scenario believed, so a
+	// checker reads what the protocol produced.
+	EventPublish EventKind = "publish"
+	// EventPut is an object arriving at the store, with the bytes. It is how a checker
+	// asserts on what really left the host instead of on a claim about it.
+	EventPut EventKind = "put"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -52,9 +59,18 @@ type Event struct {
 	Msg  string
 	// Clock events:
 	Mono clock.Instant
-	// Delete events:
+	// Delete and Put events:
 	Key       string
 	Permanent bool // Delete: whether it was a permanent (irreversible) delete
+	// Put events: the bytes as the store received them. Deliberately not rendered in
+	// the trace — a layer is the one object here measured in kilobytes.
+	Body []byte
+	// Publish events:
+	Host           string
+	CommitID       string
+	ParentCommitID string
+	// OK is whether the operation succeeded, for Publish and Put alike.
+	OK bool
 }
 
 // String renders an event deterministically for the trace.

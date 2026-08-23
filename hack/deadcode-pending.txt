@@ -63,6 +63,3 @@
 # Owner for both: whoever builds the qcow2 volume manager (Stage 1) and the commit
 # protocol (Stage 2).
 
-internal/agent.Loop.VolumeKeys   # the client half of the surviving GetVolumeKeys RPC: one call per volume, cached until the volume leaves this host's desired state (the eviction is still wired, in readDesiredState). Its caller was the VolumeManager, which served volumes from a local write-ahead log and is withdrawn. Stage 1's qcow2 manager is what asks for a volume's wrapped DEK next; if it turns out not to need key material, this and the cache go with it.
-internal/agent.Loop.cachedKeys   # the cache half of the same thing; it has no other caller and no separate decision
-internal/crypto.NewEncryption    # the checked binding of a volume's DEK to its volume id, carried out of internal/wal by this commit rather than deleted with it. The owner's decision, and the reason is in the type's own doc comment: the commit protocol seals each layer with the volume's DEK on the way to the object store, which is what keeps encryption independent of QEMU and keeps crypto.KMS, descriptor.DEKWrapped and crypto-shredding working unchanged. It is the one entry in this file that is a rescue rather than a debt, and it closes when the first layer is sealed.

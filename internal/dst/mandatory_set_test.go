@@ -58,6 +58,7 @@ import (
 //     The new commit protocol's HEAD compare-and-swap gets an arm of this shape back,
 //     and it is a review-zone change when it does.
 var pinnedMandatorySet = []string{
+	"two-hosts-cannot-both-publish",
 	// core (scenarios.go)
 	"clock-drift-beyond-skew",
 	"network-partition",

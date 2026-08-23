@@ -203,6 +203,17 @@ const (
 	// catch-all on purpose — without one, the next refusal to be written would be
 	// invisible again, which is the whole failure this enum exists to close.
 	VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED VolumeRefusal = 6
+	// The compare-and-set on this volume's HEAD lost: another host published a commit for
+	// it, so this one is not its writer any more (commit.ErrHeadMoved, v6 §15).
+	//
+	// Its own value rather than the catch-all, which the catch-all's comment would
+	// otherwise cover, because the operator's next move is not the same and is not
+	// guessable from a detail string. Every other refusal here is answered by looking at
+	// this host; this one is answered by looking at *ownership* — who else believes it
+	// owns this volume, and why was this host not fenced first. Two hosts writing one
+	// volume is the failure this whole design is arranged against, and it is the one
+	// refusal that must be countable in a dashboard rather than greppable in a log.
+	VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED VolumeRefusal = 7
 )
 
 // Enum value maps for VolumeRefusal.
@@ -215,6 +226,7 @@ var (
 		4: "VOLUME_REFUSAL_NO_KEY",
 		5: "VOLUME_REFUSAL_LEASE_LOST",
 		6: "VOLUME_REFUSAL_ATTACH_FAILED",
+		7: "VOLUME_REFUSAL_PUBLISH_FENCED",
 	}
 	VolumeRefusal_value = map[string]int32{
 		"VOLUME_REFUSAL_UNSPECIFIED":     0,
@@ -224,6 +236,7 @@ var (
 		"VOLUME_REFUSAL_NO_KEY":          4,
 		"VOLUME_REFUSAL_LEASE_LOST":      5,
 		"VOLUME_REFUSAL_ATTACH_FAILED":   6,
+		"VOLUME_REFUSAL_PUBLISH_FENCED":  7,
 	}
 )
 
@@ -1331,7 +1344,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x19VOLUME_STATE_FENCING_WAIT\x10\x03\x12\"\n" +
 	"\x1eVOLUME_STATE_RECOVERY_REQUIRED\x10\x04\x12\x1b\n" +
 	"\x17VOLUME_STATE_RECOVERING\x10\x05\x12\x19\n" +
-	"\x15VOLUME_STATE_DETACHED\x10\x06*\xf2\x01\n" +
+	"\x15VOLUME_STATE_DETACHED\x10\x06*\x95\x02\n" +
 	"\rVolumeRefusal\x12\x1e\n" +
 	"\x1aVOLUME_REFUSAL_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cVOLUME_REFUSAL_IMAGE_MISSING\x10\x01\x12\"\n" +
@@ -1339,7 +1352,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x1bVOLUME_REFUSAL_NO_READ_VIEW\x10\x03\x12\x19\n" +
 	"\x15VOLUME_REFUSAL_NO_KEY\x10\x04\x12\x1d\n" +
 	"\x19VOLUME_REFUSAL_LEASE_LOST\x10\x05\x12 \n" +
-	"\x1cVOLUME_REFUSAL_ATTACH_FAILED\x10\x06*\xd0\x01\n" +
+	"\x1cVOLUME_REFUSAL_ATTACH_FAILED\x10\x06\x12!\n" +
+	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a*\xd0\x01\n" +
 	"\rReportOutcome\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REPORT_OUTCOME_ACCEPTED\x10\x01\x12\x1e\n" +

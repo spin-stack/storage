@@ -126,14 +126,25 @@ de datos son inmutables; sólo `HEAD` es mutable, mediante compare-and-swap.
 
 ```text
 /var/lib/volume-agent/volumes/<volume-id>/
-├── active/current.qcow2
-├── sealed/<layer-id>.qcow2
+├── layers/<layer-id>.qcow2   # todos los tips que tuvo, tip actual incluido
+├── active/current            # una línea: el path absoluto del tip
 ├── cache/
 └── state.json
 ```
 
 El archivo que QEMU está usando nunca se procesa con herramientas offline que puedan
 modificarlo.
+
+**Un archivo de layer no se renombra, no se reusa y nunca significa dos cosas** — corregido
+2026-08-23, contra QEMU real. El árbol original tenía `active/current.qcow2` fijo y los
+sellados mudándose a `sealed/<id>.qcow2`; rotar eso significa que un path —el que QEMU
+recibió al arrancar— pasa a nombrar otro archivo, y medirlo mostró dos costos: QEMU recuerda
+para siempre el *string* con el que abrió un nodo, así que el layer sellado sigue llamándose
+`active/current.qcow2`, que ya nombra el tip vivo; y `query-block` deja de contestar con un
+path, devuelve `json:{...}`, que es exactamente el string contra el que el Agent compara para
+saber si el archivo abierto es suyo. Con ids en el nombre los dos problemas no existen en vez
+de estar manejados. `active/current` no es la imagen: es un **puntero** a ella, y es el
+contrato con quien lanza la VM.
 
 ## 6. Cadena qcow2
 
@@ -290,16 +301,29 @@ Un guest Linux real escribiendo sobre NVMe, umbral de 4 MiB, ciclo de reconcilia
 
 ```json
 {
-  "version": 1,
+  "format_version": 1,
   "volume_id": "vol-123",
   "commit_id": "01J...",
   "parent_commit_id": "01H...",
   "epoch": 17,
-  "created_at": "2026-08-19T20:00:00Z",
   "virtual_size": 53687091200,
-  "layer": { "object_key": "layers/sha256/ab/cd/...", "size": 427819008, "sha256": "abcd..." }
+  "layer": { "object_key": "layers/sha256/ab/cd/...", "size": 427819008, "sha256": "abcd...",
+             "frame_bytes": 65536, "layer_id": "01J..." }
 }
 ```
+
+Sin `created_at`: el `commit_id` es un UUID v7 (INV-22), o sea *ya es* un timestamp de
+milisegundos, y por eso los ids son v7. Un segundo timestamp tendría que salir de un reloj de
+pared que el Agent no tiene (INV-01 le da un instante monotónico) y sería un campo que puede
+contradecir al id que tiene al lado.
+
+El `sha256` es sobre el objeto **tal como está guardado** —sellado— porque esa es la mitad de
+la integridad que un recovery puede verificar sin material de claves, que es lo que §10 le
+pide a `rebuild-metadata`. El tag GCM de cada trama es la otra mitad. `frame_bytes` viaja en
+el manifest en vez de estar fijo en el formato, así que cambiarlo no es una migración: un
+layer viejo se abre con el número que trae. El default es 64 KiB —el cluster de qcow2—
+medido: 64 KiB, 256 KiB y 1 MiB sellan todos a 7.7 GiB/s y 4 MiB es más lento porque la trama
+deja de entrar en caché; el overhead a 64 KiB es 0.043%.
 
 **HEAD** (mutable, CAS):
 

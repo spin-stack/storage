@@ -338,11 +338,18 @@ const (
 	// no enum value of its own would be invisible again, which is the whole failure
 	// this vocabulary exists to close.
 	RefusalAttachFailed Refusal = "ATTACH_FAILED"
+	// RefusalPublishFenced: the compare-and-set on this volume's HEAD lost, so another
+	// host published a commit for it and this one is not its writer (commit.ErrHeadMoved).
+	//
+	// Its own value rather than the catch-all above, because it is the only refusal here
+	// that is answered by looking at *ownership* instead of at the host that reported it:
+	// who else believes they own this volume, and why was this host not fenced first.
+	RefusalPublishFenced Refusal = "PUBLISH_FENCED"
 )
 
 var refusals = []Refusal{
 	RefusalNone, RefusalImageMissing, RefusalDurabilityLost, RefusalNoReadView,
-	RefusalNoKey, RefusalLeaseLost, RefusalAttachFailed,
+	RefusalNoKey, RefusalLeaseLost, RefusalAttachFailed, RefusalPublishFenced,
 }
 
 // Refusals returns every stored value, RefusalNone included.

@@ -12,7 +12,6 @@
 # or an integration lane, because those are not binaries and never will be. What does NOT
 # belong here: a component that was written for production and never wired up. That is the
 # CloneCrossHost shape, and CLAUDE.md's answer to it is deletion, not an entry in a file.
-
 # --- the Agent's read-only accessors ---------------------------------------------------
 # A binary never asks the Loop what it thinks; it asks the Control Plane. These four
 # accessors exist so a test can observe the lease/desired-state/fencing decisions the loop
@@ -28,23 +27,14 @@ internal/agent.NewVolumeSet      # built by loop_test, spine_test and device_tes
 internal/agent.VolumeSet.Set     # how those tests state what the host is serving
 internal/agent.VolumeSet.Remove  # and how they take it away again
 internal/agent.VolumeSet.Volumes # the VolumeSource half those tests hand the loop
-internal/agent.Loop.LeaseValid   # observed by loop_test/spine_test; production reads the lease through the loop's own paths
-internal/agent.Loop.Desired      # same: the desired state a test compares against what the loop then did
-internal/agent.Loop.HostState    # same
-internal/agent.Loop.Fenced       # same
-
 # --- Control-Plane election affordances ------------------------------------------------
 internal/controlplane.ParseTermClaim            # the inverse of the claim encoder, so election_test can assert on what was written rather than on the writer's argument
 internal/controlplane.Elector.HighestClaimedTerm # read by election_test and by the pg integration lane to prove a zombie CP's term never wins
-
 # --- deterministic ids (INV-22) ---------------------------------------------------------
 internal/ids.NewAt  # CLAUDE.md names it: ids.New() in production, ids.NewAt(ms, r) for DST's reproducible ids. A binary using it would be a bug.
-
 # --- the lease manager ------------------------------------------------------------------
 # The Agent's loop drives the clock-explicit variants (GrantAt/RenewAt); these two are the
 # now-relative spellings the tests and the vhost lane use.
-internal/lease.Manager.Grant  # used by internal/lease's own tests and by the DST harness's planted-bug proof; loop.go calls GrantAt
-
 # --- lifecycle enum listings ------------------------------------------------------------
 # Each returns every value of one enum. Their reason for existing is that a test can walk
 # the whole set: lifecycle_test round-trips every value through Parse/String, and
@@ -55,7 +45,6 @@ internal/lifecycle.CordonReasons    # same
 internal/lifecycle.VolumeStates     # same
 internal/lifecycle.Refusals         # walked by cpserver/refusal_test against every VolumeRefusal the wire declares, so a value can never exist on one side only
 internal/lifecycle.RefusalNames     # compared with volumes.refusal's CHECK list by schema/refusal_test, the same drift the three above are guarded from
-
 # --- the observability test provider ----------------------------------------------------
 # obs.NewTestProvider is why every metric in this repository is proven by reading the
 # collected value rather than by checking that a recorder was called. It cannot live in a
@@ -64,8 +53,6 @@ internal/obs.NewTestProvider          # the in-memory meter provider tests colle
 internal/obs.Provider.CollectedMetrics # reading it is how a test asserts on what left the process
 internal/obs.Provider.GaugeValues      # same, for gauges
 internal/obs.Provider.GaugeSeries      # same, for a gauge family whose label set varies — chain_depth has one series per volume and a test has to see them apart
-internal/obs.Metrics.Len               # only TestMetricsRegistration calls it, and that is what it is for: every Catalog() entry must have become a live instrument, and counting them is the only way to see one that did not register
-
 # --- packages no binary imports (the coarse pass) -------------------------------------------
 package internal/dst        # the deterministic simulation harness. It is the test lane, so a binary importing it would be the defect.
 package internal/metadata/sim   # the in-memory metadata.Store DST runs against; binaries take metadata/pg
@@ -76,7 +63,6 @@ package internal/simio/objectstore/storetest # the shared objectstore contract e
 package internal/schema     # schema.sql plus its embed; read by the pg lane and by task db:verify, never linked
 package hack/analyzers/simulable          # the INV-01 analyzer, run by task lint:simulable as its own program
 package hack/analyzers/simulable/cmd/simulable # its main; `go run` builds it, no shipped binary imports it
-
 # internal/simio/network is INV-01's fourth interface and the only one with no production
 # consumer, which the real implementation used to hide: `real.NewNetwork` existed, so the
 # package looked wired, and its only caller was the contract test. The real implementation
@@ -88,4 +74,5 @@ package hack/analyzers/simulable/cmd/simulable # its main; `go run` builds it, n
 # has its own transport in internal/vhost/hostio; and the Control Plane speaks Connect over
 # net/http. If a component ever needs a simulable network, this is where it plugs in.
 package internal/simio/network  # harness-only: the DST partition scenario drives it, no binary does
-
+internal/commit.Fetch  # the inverse a published commit is proved by: the round-trip and crash-point tests in internal/commit are what assert the contract "reconstructible without the host", and there is no way to assert it without reading a commit back. Its production caller is recovery (v6 §23.4).
+internal/crypto.Encryption.OpenLayer  # reached only through commit.Fetch, which is allowed above for the same reason: unsealing is how the round-trip and crash-point tests prove a published layer can be read back, and a sealer with no opener could not be proved at all. Its production caller arrives with recovery (v6 §23.4).

@@ -14,6 +14,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/qmp"
 	"github.com/spin-stack/storage/internal/simio/clock"
@@ -100,6 +101,38 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// SealedLayer is a layer this host has finished writing and has not yet published. It
+// is what rotation produces and what a commit consumes.
+type SealedLayer struct {
+	VolumeID string
+	// LayerID names the file; it is in the nonce of every frame the layer is sealed
+	// with, so it is part of the object's identity and not a label.
+	LayerID string
+	// CommitID is minted once, when the layer is sealed, and reused by every attempt to
+	// publish it. That is what makes a retry idempotent instead of a second commit —
+	// see commit.Request, which carries the reasoning.
+	CommitID string
+	// Path is the file on this host.
+	Path string
+	// Epoch is the fencing token this host held when it sealed the layer.
+	Epoch int64
+	// PlainBytes is the file's length; VirtualSize is the guest-visible size of the
+	// volume the commit reconstructs.
+	PlainBytes  int64
+	VirtualSize int64
+}
+
+// Publisher publishes a sealed layer as a commit. It is injected rather than done here
+// because publishing needs a Control Plane (for the volume's key) and an object store,
+// and a local chain needs neither — which is the whole of ADR-0021's promise that spin's
+// runner can take this type on its own.
+//
+// A nil Publisher is a host that keeps its layers locally and publishes nothing, which
+// is every lane before v6 §23.3 and is not an error.
+type Publisher interface {
+	Publish(ctx context.Context, layer SealedLayer) error
+}
+
 // Deps are the Manager's injected collaborators (INV-01).
 type Deps struct {
 	Clock  clock.Clock
@@ -107,6 +140,8 @@ type Deps struct {
 	Runner Runner
 	Paths  Paths
 	Dialer qmp.Dialer
+	// Publisher is optional; without one, nothing this host seals ever leaves it.
+	Publisher Publisher
 }
 
 // Manager owns this host's local qcow2 chains. It is the implementation of
@@ -122,6 +157,7 @@ type Manager struct {
 	run    Runner
 	paths  Paths
 	dialer qmp.Dialer
+	pub    Publisher
 	unlock io.Closer
 
 	mu   sync.Mutex
@@ -140,6 +176,11 @@ type volume struct {
 	attached bool
 	refusal  storagev1.VolumeRefusal
 	detail   string
+	// pending is the sealed layer this volume owes the object store, nil when it owes
+	// none. At most one, ever: v6 §11 forbids rotating while a sealed layer is
+	// unpublished, so a host that cannot reach S3 grows one tip and holds one sealed
+	// layer rather than a chain of small ones that are each a commit that never landed.
+	pending *SealedLayer
 }
 
 // New validates the wiring, claims the data directory, and returns a Manager.
@@ -182,7 +223,7 @@ func New(ctx context.Context, cfg Config, deps Deps) (*Manager, error) {
 	}
 	m := &Manager{
 		cfg: cfg, clk: deps.Clock, run: deps.Runner,
-		paths: deps.Paths, dialer: deps.Dialer, unlock: unlock,
+		paths: deps.Paths, dialer: deps.Dialer, pub: deps.Publisher, unlock: unlock,
 		vols: map[string]*volume{},
 	}
 
@@ -375,20 +416,80 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	if !attached {
 		return nil
 	}
-	// Rotation last, and never a refusal. A tip that could not be sealed is a volume
-	// that keeps working and keeps growing; taking it away from a guest that is using it
-	// would turn "we did not manage to bound this layer" into an outage.
+	// Publishing before rotating, and never a refusal for either. A tip that could not
+	// be sealed, or a layer that could not be published, is a volume that keeps working
+	// and keeps growing; taking it away from a guest that is using it would turn "we did
+	// not manage to bound this layer" into an outage. The one exception is a HEAD that
+	// moved, which is not this host's volume any more — see publish.
+	// Three steps, in this order, each a no-op when there is nothing to do: publish what
+	// this volume already owes, rotate if the tip has grown past the threshold, publish
+	// what that rotation just sealed. Rotation does not publish from inside itself —
+	// that nested a refusal (which clears the chain) underneath a caller still reading
+	// it, and the caller found out by dereferencing nil.
+	pubErr := m.publish(ctx, v)
+	if v.chain == nil {
+		// Refused — the only publishing failure that stops the volume is a HEAD that
+		// moved, and after it there is no chain left to rotate.
+		return pubErr
+	}
+	// A publish that merely failed does *not* return here, and that is deliberate. The
+	// layer stays pending, and it is maybeRotate's own guard that declines to rotate
+	// over it — v6 §11's second invariant, enforced where it can be read rather than as
+	// a side effect of this function giving up early. Planting the guard's removal
+	// turned nothing red while this returned, which is what a redundant guard looks
+	// like from the outside.
+	tip := v.chain.Active
 	if err := m.maybeRotate(ctx, v); err != nil {
 		slog.Error("could not rotate this volume's tip; it keeps serving and keeps growing",
-			"volume_id", id, "image", v.chain.Active, "error", err)
-		return fmt.Errorf("volume %s: %w", id, err)
+			"volume_id", id, "image", tip, "error", err)
+		return errors.Join(pubErr, fmt.Errorf("volume %s: %w", id, err))
 	}
+	return errors.Join(pubErr, m.publish(ctx, v))
+}
+
+// publish sends this volume's sealed layer to the object store, if it owes one.
+//
+// It runs before the rotation trigger is even looked at, which is v6 §11's second
+// invariant: nothing rotates while a sealed layer is unpublished. Without it, an object
+// store that is down turns into a chain of small layers, each one a commit that never
+// landed, and the local depth grows for the whole outage. With it, the tip grows instead
+// — one file, which the guest was going to fill anyway — and at most one sealed layer
+// waits. It is also what §15 wants at restart: if there is a sealed layer, publish *it*,
+// do not rotate again.
+func (m *Manager) publish(ctx context.Context, v *volume) error {
+	if v.pending == nil || m.pub == nil {
+		return nil
+	}
+	// Not bounded by ProbeTimeout: that number is what one `qemu-img` run or one QMP
+	// exchange may take, and a transfer of a whole layer is neither. The cycle's own
+	// context is the bound, and a publish that outlives it is retried next cycle from
+	// the same SealedLayer — which is idempotent, so a duplicated attempt costs a HEAD
+	// request and nothing else.
+	layer := *v.pending
+	if err := m.pub.Publish(ctx, layer); err != nil {
+		if errors.Is(err, commit.ErrHeadMoved) {
+			// Another host published for this volume. This one is not its writer, and
+			// the worst thing it could do now is carry on holding the guest's disk: it
+			// would keep accepting writes that can never be published, and the fleet
+			// would have two hosts believing they own one volume. That is the failure
+			// the whole design is arranged against, so it is the one publishing failure
+			// that stops the volume.
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED, err)
+		}
+		slog.Error("could not publish this volume's sealed layer; it stays on this host and nothing rotates until it lands",
+			"volume_id", v.id, "layer", layer.Path, "commit_id", layer.CommitID, "error", err)
+		return fmt.Errorf("volume %s: %w", v.id, err)
+	}
+	v.pending = nil
+	slog.Info("committed: the sealed layer is in the object store and HEAD names it",
+		"volume_id", v.id, "epoch", layer.Epoch, "commit_id", layer.CommitID,
+		"layer_id", layer.LayerID, "bytes", layer.PlainBytes)
 	return nil
 }
 
 // maybeRotate applies v6 §11's size trigger.
 func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
-	if m.cfg.RotateAtBytes <= 0 {
+	if m.cfg.RotateAtBytes <= 0 || v.pending != nil {
 		return nil
 	}
 	size, err := m.paths.Size(v.chain.Active)
@@ -424,8 +525,9 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 	}
 
 	var pause time.Duration
+	layerID := ids.New().String()
 	sealed, err := v.chain.Rotate(ctx, m.run, m.paths, m.cfg.QemuImg, m.cfg.Root, v.id,
-		ids.New().String(), func(next string) error {
+		layerID, func(next string) error {
 			at := m.clk.Now()
 			if err := client.Snapshot(device, next); err != nil {
 				return err
@@ -439,6 +541,35 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 	slog.Info("rotated: the tip is sealed and the guest is writing to a new layer",
 		"volume_id", v.id, "epoch", v.epoch, "sealed", sealed, "sealed_bytes", tipBytes,
 		"tip", v.chain.Active, "pause_ms", float64(pause.Microseconds())/1000)
+
+	if m.pub == nil {
+		return nil
+	}
+	// The commit id is minted here, once, and every attempt to publish this layer reuses
+	// it. A fresh id per attempt would publish the same layer twice and read its own
+	// success as somebody else's conflict — commit.Request carries the whole reasoning.
+	//
+	// It lives in memory only. An Agent that restarts between sealing and publishing
+	// mints a new one and publishes the same layer under a second commit id, which is a
+	// duplicate entry in a history rather than a loss; closing it needs the sealed layer
+	// to be recorded on disk, which is v6 §5's state.json and arrives with recovery.
+	// LayerIDOfImage(sealed), not the id just minted: Rotate returns the layer it
+	// *sealed*, and layerID names the empty one the guest has moved on to. Publishing
+	// the sealed bytes under the new tip's id would seal every frame with the wrong
+	// nonce, and the layer would come back from the object store refusing to open —
+	// which is the sort of thing that is found on the day it is needed.
+	//
+	// Its size is measured again rather than reused from the trigger: the drain that
+	// the snapshot performs writes whatever QEMU still held, so the file is a little
+	// larger than it was when the threshold was crossed.
+	sealedBytes, err := m.paths.Size(sealed)
+	if err != nil {
+		return fmt.Errorf("qcow: measuring the sealed layer %s: %w", sealed, err)
+	}
+	v.pending = &SealedLayer{
+		VolumeID: v.id, LayerID: LayerIDOfImage(sealed), CommitID: ids.New().String(),
+		Path: sealed, Epoch: v.epoch, PlainBytes: sealedBytes, VirtualSize: v.chain.SizeBytes,
+	}
 	return nil
 }
 

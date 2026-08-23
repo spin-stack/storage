@@ -232,7 +232,7 @@ CREATE TABLE volumes (
     refusal            TEXT NOT NULL DEFAULT ''
                          CHECK (refusal IN ('', 'IMAGE_MISSING', 'DURABILITY_LOST',
                                             'NO_READ_VIEW', 'NO_KEY', 'LEASE_LOST',
-                                            'ATTACH_FAILED')),
+                                            'ATTACH_FAILED', 'PUBLISH_FENCED')),
     -- The sentence the Agent sent with the refusal — which sequence it came back at,
     -- which KEK it is missing — printed verbatim by `-fleet-status` and branched on by
     -- nothing. It is the free half of a deliberately split pair: the token above is what

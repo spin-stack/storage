@@ -63,7 +63,9 @@ func (c *MonotonicClockChecker) Check() error { return c.violation }
 //
 // They come back with the commit protocol, which reinstates every one of their subjects:
 // a sealed layer leaving the host, a HEAD that moves only forward, and a compare-and-swap
-// two hosts cannot both win.
+// two hosts cannot both win. **One of them has** — see commitCheckers, which folds the
+// second and third into a single invariant about the shape of the published history, and
+// says why the plaintext one is asserted in internal/commit instead.
 func coreCheckers() []Checker {
 	return []Checker{
 		NewMonotonicClockChecker(),
@@ -73,6 +75,7 @@ func coreCheckers() []Checker {
 // DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	all := coreCheckers()
+	all = append(all, commitCheckers()...)
 	all = append(all, harnessCheckers()...)
 	return all
 }

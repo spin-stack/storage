@@ -189,6 +189,13 @@ func TestPathsAreTheContractWithWhoeverLaunchesQEMU(t *testing.T) {
 			t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
 		}
 	}
+	// And back, because a layer met by anything other than the code that created it —
+	// a publish after a restart, a sweep, a recovery — has only its filename to learn
+	// its identity from, and that identity is in the nonce of every frame it is sealed
+	// with.
+	if got := qcow.LayerIDOfImage(qcow.LayerImage(root, vol, layerID)); got != layerID {
+		t.Errorf("LayerIDOfImage round trip = %q, want %q", got, layerID)
+	}
 }
 
 func TestOpenCreatesTheFirstLayerAndPointsAtIt(t *testing.T) {
