@@ -49,108 +49,30 @@ func (c *MonotonicClockChecker) Observe(e Event) {
 
 func (c *MonotonicClockChecker) Check() error { return c.violation }
 
-// WatermarkOrderChecker enforces INV-03 (§5.6): published <= durable <= local at
-// every observation. It watches watermark events.
-type WatermarkOrderChecker struct {
-	violation error
-}
-
-// NewWatermarkOrderChecker returns a fresh checker.
-func NewWatermarkOrderChecker() *WatermarkOrderChecker { return &WatermarkOrderChecker{} }
-
-func (c *WatermarkOrderChecker) Name() string { return "watermark-order" }
-
-func (c *WatermarkOrderChecker) Observe(e Event) {
-	if e.Kind != EventWatermark || c.violation != nil {
-		return
-	}
-	if e.Published > e.Durable || e.Durable > e.Local {
-		c.violation = fmt.Errorf("watermark ordering violated at step %d: published=%d durable=%d local=%d",
-			e.Step, e.Published, e.Durable, e.Local)
-	}
-}
-
-func (c *WatermarkOrderChecker) Check() error { return c.violation }
-
-// NoPlaintextLeavesHostChecker enforces INV-15 (§5.10): no cleartext guest data
-// leaves the host. It watches leaves-host events for a detected cleartext leak.
-type NoPlaintextLeavesHostChecker struct {
-	violation error
-}
-
-// NewNoPlaintextLeavesHostChecker returns a fresh checker.
-func NewNoPlaintextLeavesHostChecker() *NoPlaintextLeavesHostChecker {
-	return &NoPlaintextLeavesHostChecker{}
-}
-
-func (c *NoPlaintextLeavesHostChecker) Name() string { return "no-plaintext-leaves-host" }
-
-func (c *NoPlaintextLeavesHostChecker) Observe(e Event) {
-	if e.Kind == EventLeavesHost && e.ClearLeak && c.violation == nil {
-		c.violation = fmt.Errorf("cleartext guest data left the host at step %d (violates §5.10/INV-15): %s", e.Step, e.Msg)
-	}
-}
-
-func (c *NoPlaintextLeavesHostChecker) Check() error { return c.violation }
-
-// SingleWriterChecker enforces INV-10 (§12.4): a fenced/stale-epoch writer never
-// publishes.
-type SingleWriterChecker struct{ violation error }
-
-// NewSingleWriterChecker returns a fresh checker.
-func NewSingleWriterChecker() *SingleWriterChecker { return &SingleWriterChecker{} }
-
-func (c *SingleWriterChecker) Name() string { return "effective-single-writer" }
-
-func (c *SingleWriterChecker) Observe(e Event) {
-	if e.Kind == EventStalePublsh && e.StalePublishOK && c.violation == nil {
-		c.violation = fmt.Errorf("a stale-epoch writer published at step %d (violates §12.4/INV-10)", e.Step)
-	}
-}
-
-func (c *SingleWriterChecker) Check() error { return c.violation }
-
-// TruncateBelowPublishedChecker enforces INV-13 (§21.1): local WAL is never
-// truncated above the verified published point.
-type TruncateBelowPublishedChecker struct{ violation error }
-
-// NewTruncateBelowPublishedChecker returns a fresh checker.
-func NewTruncateBelowPublishedChecker() *TruncateBelowPublishedChecker {
-	return &TruncateBelowPublishedChecker{}
-}
-
-func (c *TruncateBelowPublishedChecker) Name() string { return "no-truncate-above-published" }
-
-func (c *TruncateBelowPublishedChecker) Observe(e Event) {
-	if e.Kind == EventTruncate && e.TruncatedUpTo > e.Published && c.violation == nil {
-		c.violation = fmt.Errorf("WAL truncated to %d above published %d at step %d (violates §21.1/INV-13)",
-			e.TruncatedUpTo, e.Published, e.Step)
-	}
-}
-
-func (c *TruncateBelowPublishedChecker) Check() error { return c.violation }
-
-// DefaultCheckers returns the checkers active so far. Later phases append.
-// coreCheckers are the checkers whose subjects survive V1 (ADR-0026). Four went with
-// theirs in increment 4: promotion wait, no-lost-acked-write, truncate-below-published
-// and immutable-snapshots; durable-ack-requires-lease and background-yields went in 4.5
-// with the lease-gated ACK and the io-class scheduler. A checker that cannot fire proves
-// nothing, which is this file's own rule.
+// coreCheckers are the checkers something in this tree still emits events for.
+//
+// **One, and the count is the honest number rather than a loss.** A checker that cannot
+// fire proves nothing — this file's own rule, and the rule TestMain enforces by
+// demanding every checker here have a planted bug that actually ran. Watermark ordering,
+// no-plaintext-leaves-host and effective-single-writer each read an event only the local
+// block engine produced: a WAL advancing its watermarks, a payload on its way out of the
+// host, a second incarnation racing to publish an image. With that engine withdrawn
+// nothing emits any of the three, so they would have been three checkers observing an
+// event stream that can no longer contain their subject, held up by planted bugs
+// hand-writing the events they read. That is the exact shape this package refuses.
+//
+// They come back with the commit protocol, which reinstates every one of their subjects:
+// a sealed layer leaving the host, a HEAD that moves only forward, and a compare-and-swap
+// two hosts cannot both win.
 func coreCheckers() []Checker {
 	return []Checker{
 		NewMonotonicClockChecker(),
-		NewWatermarkOrderChecker(),
-		NewNoPlaintextLeavesHostChecker(),
-		NewSingleWriterChecker(),
 	}
 }
 
+// DefaultCheckers returns the checkers active so far. Later phases append.
 func DefaultCheckers() []Checker {
 	all := coreCheckers()
 	all = append(all, harnessCheckers()...)
-	all = append(all, walCheckers()...)
-	all = append(all, carryCheckers()...)
-	all = append(all, agentCheckers()...)
-	all = append(all, refusalCheckers()...)
 	return all
 }

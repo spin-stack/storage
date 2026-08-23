@@ -65,3 +65,55 @@ func TestConfigRefusesAHostIDThatIsNotAUUIDv7(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigRefusesWiringThatWouldRunWrong walks the rest of Validate. Every field it
+// checks is a wiring mistake in `main` that produces a process which starts, looks
+// healthy and is wrong — the shape CLAUDE.md's table is entirely made of — so the
+// refusal has to land on the flag rather than behind whichever dependency happened to
+// be opened first.
+func TestConfigRefusesWiringThatWouldRunWrong(t *testing.T) {
+	base := func() agent.Config {
+		return agent.Config{
+			HostID:            ids.New().String(),
+			AgentVersion:      "test",
+			MaxFormatVersion:  3,
+			HeartbeatInterval: 5 * time.Second,
+			RetryBackoff:      time.Second,
+			LeaseTTL:          30 * time.Second,
+		}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("the base configuration must be valid, or every case below proves nothing: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// mut breaks exactly one thing, and the name says what an operator did.
+		mut  func(*agent.Config)
+		says string
+	}{
+		{"no version reported to the fleet (§27, INV-19)", func(c *agent.Config) { c.AgentVersion = "" }, "version"},
+		{"a build that reads no format", func(c *agent.Config) { c.MaxFormatVersion = 0 }, "format version"},
+		{"no cadence: the loop would spin", func(c *agent.Config) { c.HeartbeatInterval = 0 }, "heartbeat interval"},
+		{"no backoff: a failing cycle would retry without pause", func(c *agent.Config) { c.RetryBackoff = 0 }, "retry backoff"},
+		{"a backoff longer than the interval, which is not a backoff", func(c *agent.Config) { c.RetryBackoff = 10 * time.Second }, "retry backoff"},
+		{"no lease TTL", func(c *agent.Config) { c.LeaseTTL = 0 }, "lease TTL"},
+		// The one that is not obviously a typo: a TTL inside one heartbeat interval
+		// lapses during normal operation, so a perfectly healthy host fences itself and
+		// its guests lose their disks on a fleet where nothing is wrong.
+		{"a lease that expires within one heartbeat", func(c *agent.Config) { c.LeaseTTL = 5 * time.Second }, "lease TTL"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mut(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted %+v", cfg)
+			}
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("error %q does not name what to fix (%q)", err, tc.says)
+			}
+		})
+	}
+}

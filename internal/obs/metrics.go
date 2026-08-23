@@ -9,11 +9,16 @@ import (
 // MetricKind is the instrument kind.
 type MetricKind int
 
+// There is no KindHistogram. Every histogram in this catalogue measured the local block
+// engine — append and fdatasync latency, the duration of an image or snapshot publish —
+// and went with it, so the kind had no declaration, `Recorder.Observe` had no caller and
+// `Metrics.Histogram` had nothing to return. Keeping the machinery against the day a
+// duration is measured again is exactly the "reads as a plan" failure the catalogue
+// above was trimmed twice for; it comes back in the increment that declares the first
+// one, which is a Float64Histogram and eight lines.
 const (
 	// KindCounter is a monotonic Int64 counter (…_total).
 	KindCounter MetricKind = iota
-	// KindHistogram is a Float64 distribution (…_seconds, sizes).
-	KindHistogram
 	// KindGauge is a Float64 level that can go up and down.
 	KindGauge
 )
@@ -66,62 +71,23 @@ type MetricDesc struct {
 // with no hedging, no circuit breaker and no classes).
 //
 // The ones whose mechanism *does* exist were wired instead of deleted, in the same
-// change, which is the other half of the rule: `wal_append_latency_seconds`,
-// `wal_fdatasync_latency_seconds`, `discarded_bytes_total` (DISCARD reached the wire
-// in this same increment) and `clone_same_host_total`.
+// change, which is the other half of the rule.
+//
+// # The eleven that went on 2026-08-22, and it is the same rule again
+//
+// The local block engine was withdrawn — QEMU manages the local copy-on-write format
+// through qcow2 now, and this system keeps immutable commits, publication and recovery —
+// and every series that measured it went with it in the same commit: the five `wal_*`
+// series and `wal_out_of_space` (there is no write-ahead log), `volume_backpressure` (no
+// device refusing a guest), the three `read_view_*` series (no interval map),
+// `discarded_bytes_total` (no DISCARD reaching a backend), and the image and snapshot
+// publish durations (nothing publishes).
+//
+// Four are left, and that is the whole catalogue: two lease series the Agent's loop
+// records, and the two the clone path records. The commit protocol declares its own in
+// the increment that records them, which is this file's rule stated from the other end.
 func Catalog() []MetricDesc {
 	return []MetricDesc{
-		// --- WAL local (§26.2) ---
-		{"wal_append_latency_seconds", KindHistogram, "WAL local append latency", []string{"volume"}},
-		{"wal_fdatasync_latency_seconds", KindHistogram, "WAL local fdatasync latency", []string{"volume"}},
-		{"wal_unflushed_bytes", KindGauge, "Unflushed WAL bytes", []string{"volume"}},
-		{"wal_local_sequence", KindGauge, "Local sequence watermark (informative)", []string{"volume"}},
-		{"wal_durable_sequence", KindGauge, "Durable sequence watermark (informative)", []string{"volume"}},
-		{"wal_out_of_space", KindGauge, "1 while the WAL device is refusing appends for want of space (§5.7)", []string{"volume"}},
-		// Distinct from wal_out_of_space, and the distinction is the whole reason it
-		// exists: that gauge is the *device* reaching ENOSPC, which under ADR-0013 §1
-		// is supposed never to happen because every volume is bounded well below it.
-		// The bound that actually stops a guest is the volume's share, and crossing it
-		// moved nothing anywhere — the guest took EIO and a failed fsync while the
-		// host recorded not one sample and printed not one line. Recorded by
-		// cmd/volume-agent, which is the only place that holds both the devices and
-		// the budget the share was divided out of.
-		//
-		// **`reason` is a label and not a suffix on the help text**, because there are
-		// three bounds and their remedies contradict each other: `view_memory` wants an
-		// fstrim inside the guest, `wal_share` wants the volume stopped and republished,
-		// `device_enospc` wants the host's disk grown. One series meaning any of them is
-		// a page that cannot be actioned without reading the Agent's log, which is the
-		// state this gauge was added to end. blockdev.Reasons() is the value set; the
-		// recorder drives the series it is not reporting to 0 on the same poll, so a
-		// reason that ends does not leave its 1 standing for ever.
-		{"volume_backpressure", KindGauge, "1 while this volume's device is refusing guest requests for want of space, per bound (blockdev.Reason: view_memory | wal_share | device_enospc); view_memory and device_enospc return to 0 when the condition ends, wal_share does not while the volume runs (§5.7)", []string{"volume", "reason"}},
-
-		// --- Image and snapshots (§26.2) ---
-		//
-		// Publishing at stop is the only moment anything leaves the host under ADR-0026,
-		// so its duration is the cost of a session rather than one step among many.
-		{"image_publish_duration_seconds", KindHistogram, "Time to publish a volume's image at stop", []string{"volume"}},
-		{"snapshot_publish_duration_seconds", KindHistogram, "Snapshot publish duration", []string{"volume"}},
-		{"snapshot_pause_duration_seconds", KindHistogram, "Guest I/O pause during snapshot (~0 expected; measured around the freeze, not the upload)", []string{"volume"}},
-
-		// --- The read view (§13.2, §19) ---
-		//
-		// `cow.IntervalMap` is the only per-volume structure on an Agent whose size is
-		// decided by the guest rather than by configuration, and until these three
-		// existed nothing measured it: the first evidence of a host holding too many
-		// read views would have been the OOM killer. Three series and not one, because
-		// they answer different questions and a snapshotted volume moves them apart —
-		// `cow.Cost`'s doc comment carries the reasoning and the alternative rejected.
-		//
-		// Recorded by the owner of the map, under the lock that serializes it, at the
-		// cadence the watermarks already use (a flush). Not sampled by a poller: the
-		// structure is not safe to read concurrently, and a poller would be a second
-		// thing needing the volume's lock on the data path.
-		{"read_view_bytes", KindGauge, "Live extent bytes held by a volume's read view, across its whole layer chain", []string{"volume"}},
-		{"read_view_extents", KindGauge, "Live extent records in a volume's read view; Read scans them all, per layer", []string{"volume"}},
-		{"read_view_layers", KindGauge, "Layers a read traverses (1 = no snapshot; §19's Freeze adds one and no bytes)", []string{"volume"}},
-
 		// --- Leases (liveness, no longer durability — §26.2) ---
 		{"lease_remaining_seconds", KindGauge, "Remaining lease time per host", []string{"host"}},
 		{"lease_renewal_failures_total", KindCounter, "Lease renewal failures", []string{"host"}},
@@ -129,25 +95,22 @@ func Catalog() []MetricDesc {
 		// --- Fleet (§26.2) ---
 		{"clone_same_host_total", KindCounter, "Same-host clones", nil},
 		{"chain_depth", KindGauge, "Snapshot chain depth", []string{"volume"}},
-		{"discarded_bytes_total", KindCounter, "Bytes reclaimed via DISCARD/WRITE_ZEROES", []string{"volume"}},
 	}
 }
 
 // Metrics holds the instantiated instruments, keyed by name. In Phase 01 they are
 // registered but unused; later phases fetch and record against them.
 type Metrics struct {
-	counters   map[string]metric.Int64Counter
-	histograms map[string]metric.Float64Histogram
-	gauges     map[string]metric.Float64Gauge
+	counters map[string]metric.Int64Counter
+	gauges   map[string]metric.Float64Gauge
 }
 
 // NewMetrics builds every catalog instrument on the given meter. It fails if any
 // name is duplicated or any instrument cannot be created.
 func NewMetrics(m metric.Meter) (*Metrics, error) {
 	out := &Metrics{
-		counters:   map[string]metric.Int64Counter{},
-		histograms: map[string]metric.Float64Histogram{},
-		gauges:     map[string]metric.Float64Gauge{},
+		counters: map[string]metric.Int64Counter{},
+		gauges:   map[string]metric.Float64Gauge{},
 	}
 	seen := map[string]bool{}
 	for _, d := range Catalog() {
@@ -163,12 +126,6 @@ func NewMetrics(m metric.Meter) (*Metrics, error) {
 				return nil, fmt.Errorf("counter %q: %w", d.Name, err)
 			}
 			out.counters[d.Name] = inst
-		case KindHistogram:
-			inst, err := m.Float64Histogram(d.Name, metric.WithDescription(d.Help))
-			if err != nil {
-				return nil, fmt.Errorf("histogram %q: %w", d.Name, err)
-			}
-			out.histograms[d.Name] = inst
 		case KindGauge:
 			inst, err := m.Float64Gauge(d.Name, metric.WithDescription(d.Help))
 			if err != nil {
@@ -188,12 +145,6 @@ func (m *Metrics) Counter(name string) (metric.Int64Counter, bool) {
 	return c, ok
 }
 
-// Histogram returns the named histogram.
-func (m *Metrics) Histogram(name string) (metric.Float64Histogram, bool) {
-	h, ok := m.histograms[name]
-	return h, ok
-}
-
 // Gauge returns the named gauge.
 func (m *Metrics) Gauge(name string) (metric.Float64Gauge, bool) {
 	g, ok := m.gauges[name]
@@ -202,5 +153,5 @@ func (m *Metrics) Gauge(name string) (metric.Float64Gauge, bool) {
 
 // Len reports the total number of registered instruments.
 func (m *Metrics) Len() int {
-	return len(m.counters) + len(m.histograms) + len(m.gauges)
+	return len(m.counters) + len(m.gauges)
 }

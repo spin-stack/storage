@@ -34,19 +34,35 @@
 # Format is the allowlist's: `<symbol>  # who owns the decision, and what the decision is`.
 # The reason is mandatory here too — an entry with none fails the check that reads it.
 
-# --- internal/simio/real's network: a transport nothing transports over (track E) --------
+# --- internal/simio/real's network: a transport nothing transports over -------------------
 # A complete TCP implementation of the simio network interface — listen, dial, framed
 # send/recv — reachable from no binary, because the wire between the Agent and the Control
 # Plane is Connect over HTTP (ADR-0018) and neither binary opens a socket through simio.
 # Its only callers are internal/simio/network's contract test and the DST harness's
 # simulated counterpart. This is the CloneCrossHost shape — well-tested code doing real
 # work that nothing asks for — and the decision (delete it, or give the contract test a
-# home that does not ship a transport) is track E's, which owns internal/simio/real.
+# home that does not ship a transport) belongs to whoever owns internal/simio/real.
 
 # --- the lease verb nothing performs -----------------------------------------------------
 # Revoke drops the lease and bumps the generation so an in-flight grant response cannot
 # revive it (§12.2). Nothing performs it: ADR-0026 removed the fence and the lease-gated
 # ACK, so the two events that revoked a lease no longer exist. It is not in the allowlist
 # because it is not a test affordance — it is a production verb waiting for the one caller
-# V1 still lacks. `internal/lease` belongs to no track in PARALLEL-PLAN.md's table; the
-# decision travels with detach.
+# V1 still lacks. The decision travels with detach.
+
+# --- the two the demolition of the local block engine left standing (2026-08-22) ---------
+#
+# These are not the CloneCrossHost shape and it matters that the difference is written
+# down, because the entries above them are. Nothing here was written for a caller that
+# never arrived: each had a production caller last week, in code this commit deleted, and
+# each was kept deliberately by the owner of the pivot rather than by whoever was passing.
+# They are here rather than in the allowlist because the allowlist means "unreachable, and
+# that is correct **forever**", and neither of these is: both are owed a caller by the next
+# two increments, and if that caller does not arrive they are owed a deletion instead.
+#
+# Owner for both: whoever builds the qcow2 volume manager (Stage 1) and the commit
+# protocol (Stage 2).
+
+internal/agent.Loop.VolumeKeys   # the client half of the surviving GetVolumeKeys RPC: one call per volume, cached until the volume leaves this host's desired state (the eviction is still wired, in readDesiredState). Its caller was the VolumeManager, which served volumes from a local write-ahead log and is withdrawn. Stage 1's qcow2 manager is what asks for a volume's wrapped DEK next; if it turns out not to need key material, this and the cache go with it.
+internal/agent.Loop.cachedKeys   # the cache half of the same thing; it has no other caller and no separate decision
+internal/crypto.NewEncryption    # the checked binding of a volume's DEK to its volume id, carried out of internal/wal by this commit rather than deleted with it. The owner's decision, and the reason is in the type's own doc comment: the commit protocol seals each layer with the volume's DEK on the way to the object store, which is what keeps encryption independent of QEMU and keeps crypto.KMS, descriptor.DEKWrapped and crypto-shredding working unchanged. It is the one entry in this file that is a rescue rather than a debt, and it closes when the first layer is sealed.

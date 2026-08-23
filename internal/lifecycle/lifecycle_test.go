@@ -345,3 +345,42 @@ func TestValidRejectsTheZeroValue(t *testing.T) {
 		}
 	}
 }
+
+// TestServingHostStateNamesIsSerivngAsStrings pins the SQL predicate against the method
+// it is supposed to be. The pg adapter passes the returned slice straight into a query,
+// so a state that starts or stops serving in Go and does not move here is a fleet-wide
+// predicate that silently disagrees with the rule everything else reads.
+func TestServingHostStateNamesIsServingAsStrings(t *testing.T) {
+	got := map[string]bool{}
+	for _, name := range lifecycle.ServingHostStateNames() {
+		got[name] = true
+	}
+	for _, s := range lifecycle.HostStates() {
+		if want := s.Serving(); got[s.String()] != want {
+			t.Fatalf("%s is %sin the SQL predicate and %s.Serving() = %v",
+				s, map[bool]string{true: "", false: "not "}[got[s.String()]], s, want)
+		}
+	}
+	if len(got) != len(lifecycle.ServingHostStateNames()) {
+		t.Fatal("the predicate repeats a state")
+	}
+}
+
+// TestParseRefusalRoundTripsEveryDeclaredValue. The pg adapter parses whatever the
+// column holds, so a value the database accepts and this refuses is a row nothing can
+// read back — and the column's CHECK is generated from RefusalNames, which is asserted
+// against this same set in schema/refusal_test.
+func TestParseRefusalRoundTripsEveryDeclaredValue(t *testing.T) {
+	for _, r := range lifecycle.Refusals() {
+		got, err := lifecycle.ParseRefusal(r.String())
+		if err != nil {
+			t.Fatalf("%q is a declared refusal and does not parse: %v", r, err)
+		}
+		if got != r {
+			t.Fatalf("%q parsed to %q", r, got)
+		}
+	}
+	if _, err := lifecycle.ParseRefusal("NOT_A_REFUSAL"); !errors.Is(err, lifecycle.ErrUnknownState) {
+		t.Fatalf("want ErrUnknownState for an undeclared value, got %v", err)
+	}
+}

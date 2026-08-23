@@ -57,32 +57,23 @@ var forbidden = map[string]map[string]bool{
 //
 //   - internal/simio is the sanctioned home of every simulable interface and of
 //     its real implementations (ADR-0003).
-//   - internal/vhost/hostio is the one documented exception (ADR-0020):
-//     vhost-user is a SOCK_STREAM Unix socket whose messages carry file
-//     descriptors and whose central act is mapping the front-end's address space
-//     into this process. simio models none of that, and a simulation of it would
-//     be a fiction. The exception is this leaf package only — internal/vhost
-//     itself is *not* exempt, and that narrowness is what keeps the protocol,
-//     the ring and the request handling simulable.
-//   - integration/guestinit is exempt for a different reason than either of the
-//     above (DEV-0013): it is not host code. It is PID 1 *inside the guest VM*,
-//     on the far side of the interface INV-01 governs, and it is never linked
-//     into any binary this repository ships. Its purpose is to be the real world
-//     simio models — a block-device open it could simulate would prove nothing
-//     about a kernel deciding a write must be made durable, which is the one
-//     thing no test here can otherwise reach. "Under integration/" is not what
-//     earned it: the host-side lane that drives QEMU is ordinary code, is not
-//     exempt, and has a fixture proving it.
 //   - internal/testinfra is the build-tagged harness that starts containers and
 //     subprocesses for the integration and e2e lanes (DEV-0016). Every file in it
 //     carries `//go:build integration || e2e`, so none of it is linked into a
 //     binary this repository ships. There is no clock to inject into another
 //     *process*: a harness that waited on a simulated one would be measuring
 //     nothing, and the whole point of the lanes is that the real world decides.
+//
+// Two fragments left this list on 2026-08-22 with the packages they named:
+// internal/vhost/hostio — vhost-user's SOCK_STREAM socket, its SCM_RIGHTS
+// descriptors and the mmap of the front-end's address space, none of which simio
+// models — and integration/guestinit, PID 1 inside the guest and so on the far
+// side of the interface INV-01 governs. Both belonged to the local block engine,
+// which is withdrawn: QEMU manages the local copy-on-write format through qcow2
+// now. An exemption for a path nothing occupies is a rule that can only ever
+// widen by accident, so it goes with the path.
 var exemptPathFragments = []string{
 	"internal/simio",
-	"internal/vhost/hostio",
-	"integration/guestinit",
 	"internal/testinfra",
 }
 
@@ -123,7 +114,7 @@ func run(pass *analysis.Pass) (any, error) {
 	// Per-file is the entire point. The lanes' harnesses under integration/ start
 	// QEMU, Postgres and our own binaries and then wait for them: there is no clock
 	// to inject into another process, and a harness that waited on a simulated one
-	// would be measuring nothing. But integration/vhost also holds ordinary
+	// would be measuring nothing. But a lane's directory also holds ordinary
 	// host-side code, and a package-level exemption would have carried it along —
 	// so a non-test file in the very same directory stays flagged, and a fixture
 	// holds both kinds of file side by side to prove it.

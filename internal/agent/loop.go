@@ -12,11 +12,11 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
-	"github.com/spin-stack/storage/internal/wal"
 )
 
 // Deps are the Agent's injected collaborators (INV-01). None of them may be nil
@@ -125,55 +125,6 @@ func (l *Loop) Run(ctx context.Context) error {
 				"error", err,
 				"retry_in", delay,
 				"host_id", l.cfg.HostID)
-		}
-	}
-}
-
-// Sustain keeps this host visible to the Control Plane while the Agent is shutting down
-// and cannot yet let go — a publish that keeps failing holds the data directory, and this
-// is what keeps the fleet able to see the difference between a host that is stuck and a
-// host that is gone. It returns when ctx
-// is done, which is when the teardown has finished one way or another.
-//
-// It is a *reduced* cycle, and each omission is deliberate:
-//
-//   - it heartbeats, because a lease that lapses is what makes a host look dead;
-//   - it reports the volumes still being held, because a held volume is still this host's
-//     — the epoch has not moved and the Control Plane still names this host its primary,
-//     so the report is accepted and the operator can see the sequence that has not
-//     reached the object store. A volume that has published is out of the served set by
-//     then and simply stops being reported, which is the honest end state;
-//   - it does **not** read the desired state, because applying it would start runtimes
-//     the teardown has just stopped, and this loop would fight the shutdown it is
-//     supposed to narrate;
-//   - it does **not** fence on a refused report. There is nothing left to stop — every
-//     runtime is already quiesced — and the one decision a refusal could inform, whether
-//     to publish, is made by the manifest's compare-and-set, which is authoritative and
-//     cannot be raced by a slower answer over HTTP.
-func (l *Loop) Sustain(ctx context.Context) {
-	for {
-		if err := l.clk.Sleep(ctx, l.cfg.HeartbeatInterval); err != nil {
-			return
-		}
-		usage, err := l.dev.Usage(ctx)
-		if err != nil {
-			slog.Warn("reading the device while shutting down", "error", err, "host_id", l.cfg.HostID)
-			continue
-		}
-		vols, err := l.vols.Volumes(ctx)
-		if err != nil {
-			slog.Warn("reading the volumes still held while shutting down", "error", err, "host_id", l.cfg.HostID)
-			continue
-		}
-		if err := l.heartbeat(ctx, usage, vols); err != nil {
-			// Warned and retried, never returned: the Control Plane being unreachable is
-			// not a reason to stop saying we are here, and this loop's exit condition is
-			// the teardown finishing rather than anything about the fleet.
-			slog.Warn("heartbeat while shutting down", "error", err, "host_id", l.cfg.HostID)
-			continue
-		}
-		if err := l.report(ctx, vols); err != nil {
-			slog.Warn("reporting the volumes still held", "error", err, "host_id", l.cfg.HostID)
 		}
 	}
 }
@@ -365,8 +316,8 @@ func (l *Loop) giveUpOnExpiredLease(ctx context.Context, vols []VolumeStatus) er
 // existed the refusal was recorded in l.fenced and read by nothing, so a host that had
 // lost a volume kept serving it — DEV-0012.
 //
-// It runs after the report and not inside it because tearing a runtime down closes a
-// WAL, and l.mu must not be held across that.
+// It runs after the report and not inside it because tearing a runtime down closes the
+// volume's local storage, and l.mu must not be held across that.
 func (l *Loop) fence(ctx context.Context) error {
 	l.mu.Lock()
 	fenced := append([]string(nil), l.fenced...)
@@ -446,8 +397,8 @@ func (l *Loop) readDesiredState(ctx context.Context) ([]*storagev1.DesiredVolume
 // the loop stops being a reporter.
 //
 // It is a call of its own and not part of readDesiredState's locked section, because
-// l.mu must not be held across starting a runtime: Apply opens a WAL and binds a socket,
-// and a heartbeat blocked behind that is a lease not renewed.
+// l.mu must not be held across starting a runtime: Apply opens a volume's local storage
+// and binds a socket, and a heartbeat blocked behind that is a lease not renewed.
 func (l *Loop) applyDesiredState(ctx context.Context, desired []*storagev1.DesiredVolume) error {
 	l.mu.Lock()
 	reconcile := l.reconcile
@@ -512,14 +463,14 @@ func (l *Loop) VolumeKeys(ctx context.Context, volumeID string) (VolumeKeys, err
 		return VolumeKeys{}, fmt.Errorf("agent: reading the keys of volume %q: %w", volumeID, err)
 	}
 
-	// Refused here rather than carried: KeyID 0 means "plaintext record" on the WAL
-	// path (§14.1), so a 0 from the Control Plane is not a usable version — it is a
+	// Refused here rather than carried: KeyID 0 is the reserved marker for "these bytes
+	// are cleartext", so a 0 from the Control Plane is not a usable version — it is a
 	// volume whose key material this host cannot honestly use. Caching it would turn
 	// one bad answer into a permanently unopenable volume, since VolumeKeys never
 	// re-asks once it has an entry.
 	if id := resp.Msg.GetDekKeyId(); id == 0 {
 		return VolumeKeys{}, fmt.Errorf("agent: volume %q was handed a DEK with no version (§15.1): %w",
-			volumeID, wal.ErrUnversionedKey)
+			volumeID, crypto.ErrUnversionedKey)
 	}
 	keys := VolumeKeys{
 		VolumeID:   volumeID,
@@ -569,8 +520,8 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 
 	// A refusal is information: this host is no longer the writer for that volume.
 	// Recorded here and acted on by fence(), which Reconcile calls once this returns and
-	// which tears those runtimes down. The two are separate because closing a WAL must
-	// not happen under l.mu (§12.2).
+	// which tears those runtimes down. The two are separate because closing a volume's
+	// local storage must not happen under l.mu (§12.2).
 	var fenced []string
 	for _, r := range resp.Msg.GetResults() {
 		switch r.GetOutcome() {

@@ -203,3 +203,86 @@ func TestUnwrapTooShortFails(t *testing.T) {
 		t.Fatalf("unwrap short blob: want ErrUnwrap, got %v", err)
 	}
 }
+
+// TestNewEncryptionRefusesAnUnversionedDEK guards the checked constructor: KeyID 0 is
+// the reserved plaintext marker, so it can never be a DEK version. Refusing it at the
+// binding is the whole reason the constructor exists — a struct literal reaches the
+// same fields, and the failure it buys is a read that cannot open bytes this process
+// already wrote.
+func TestNewEncryptionRefusesAnUnversionedDEK(t *testing.T) {
+	unversioned, err := crypto.GenerateDEK(&fixedReader{b: 4}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := crypto.NewEncryption(unversioned, [16]byte{9}); !errors.Is(err, crypto.ErrUnversionedKey) {
+		t.Fatalf("want ErrUnversionedKey, got %v", err)
+	}
+
+	versioned, err := crypto.GenerateDEK(&fixedReader{b: 4}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := crypto.NewEncryption(versioned, [16]byte{9})
+	if err != nil {
+		t.Fatalf("a versioned DEK must be accepted: %v", err)
+	}
+	// The binding is the point: the volume id has to arrive intact, because every
+	// Seal/Open in this package takes it as AAD.
+	if enc.VolumeID != ([16]byte{9}) || enc.DEK.KeyID != 2 {
+		t.Fatalf("binding lost its subject: %+v", enc)
+	}
+}
+
+// SealRandom draws its nonce instead of deriving one, and the doc comment says why: an
+// object that has no monotonic sequence has nothing safe to derive from, and every
+// substitute considered leaks either a repeated nonce or the plaintext into it. What
+// that costs is that the nonce has to travel with the ciphertext, so the round trip and
+// the tamper case are both about the caller having stored it.
+func TestSealRandomRoundTripsAndFailsClosed(t *testing.T) {
+	dek, err := crypto.GenerateDEK(&fixedReader{b: 7}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aad := []byte("lineage/deadbeef")
+	plain := []byte("a layer on its way to the object store")
+
+	nonce, sealed, err := dek.SealRandom(&fixedReader{b: 3}, aad, plain)
+	if err != nil {
+		t.Fatalf("SealRandom: %v", err)
+	}
+	if bytes.Equal(sealed, plain) {
+		t.Fatal("the payload left in the clear")
+	}
+	got, err := dek.OpenRandom(nonce, aad, sealed)
+	if err != nil {
+		t.Fatalf("OpenRandom: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("round trip returned %q", got)
+	}
+
+	// The AAD is what binds the payload to the object it belongs to, so opening it under
+	// another object's AAD has to fail — otherwise a chunk moved between prefixes reads
+	// as that prefix's data.
+	if _, err := dek.OpenRandom(nonce, []byte("lineage/other"), sealed); !errors.Is(err, crypto.ErrOpen) {
+		t.Fatalf("a payload opened under another object's AAD: %v", err)
+	}
+	// And a flipped bit, which is the case GCM exists for.
+	corrupt := bytes.Clone(sealed)
+	corrupt[0] ^= 1
+	if _, err := dek.OpenRandom(nonce, aad, corrupt); !errors.Is(err, crypto.ErrOpen) {
+		t.Fatalf("a corrupted payload opened: %v", err)
+	}
+	// The nonce is the caller's to store, and losing it is not recoverable: a wrong one
+	// must fail rather than return something.
+	var wrong [crypto.NonceSize]byte
+	if _, err := dek.OpenRandom(wrong, aad, sealed); !errors.Is(err, crypto.ErrOpen) {
+		t.Fatalf("a payload opened under the wrong nonce: %v", err)
+	}
+
+	// A short randomness source is a nonce that was never fully drawn, and sealing under
+	// one would be sealing under a partly-zero nonce — refused rather than risked.
+	if _, _, err := dek.SealRandom(bytes.NewReader(nil), aad, plain); err == nil {
+		t.Fatal("SealRandom drew a nonce from an exhausted reader")
+	}
+}

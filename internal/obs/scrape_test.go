@@ -21,9 +21,8 @@ func TestAProductionProviderCanBeScraped(t *testing.T) {
 	t.Cleanup(func() { _ = p.Shutdown(ctx) })
 
 	r := p.Recorder()
-	r.Gauge(ctx, "wal_local_sequence", 7, obs.String("volume", "vol-1"))
-	r.Count(ctx, "discarded_bytes_total", 4096, obs.String("volume", "vol-1"))
-	r.Observe(ctx, "wal_append_latency_seconds", 0.5, obs.String("volume", "vol-1"))
+	r.Gauge(ctx, "chain_depth", 7, obs.String("volume", "vol-1"))
+	r.Count(ctx, "clone_same_host_total", 4096)
 
 	body, err := p.Scrape(ctx)
 	if err != nil {
@@ -32,14 +31,10 @@ func TestAProductionProviderCanBeScraped(t *testing.T) {
 	got := string(body)
 
 	for _, want := range []string{
-		"# TYPE wal_local_sequence gauge",
-		`wal_local_sequence{volume="vol-1"} 7`,
-		"# TYPE discarded_bytes_total counter",
-		`discarded_bytes_total{volume="vol-1"} 4096`,
-		"# TYPE wal_append_latency_seconds histogram",
-		`wal_append_latency_seconds_sum{volume="vol-1"} 0.5`,
-		`wal_append_latency_seconds_count{volume="vol-1"} 1`,
-		`wal_append_latency_seconds_bucket{le="+Inf",volume="vol-1"} 1`,
+		"# TYPE chain_depth gauge",
+		`chain_depth{volume="vol-1"} 7`,
+		"# TYPE clone_same_host_total counter",
+		"clone_same_host_total 4096",
 	} {
 		if !strings.Contains(got, want+"\n") {
 			t.Errorf("the scrape does not contain %q\n---\n%s", want, got)
@@ -49,7 +44,7 @@ func TestAProductionProviderCanBeScraped(t *testing.T) {
 	// A metric nobody recorded must not be exported at all. An empty series reads as
 	// "the thing being measured is not happening", which is the failure the catalogue
 	// was trimmed for; the reader only reports what carries data.
-	if strings.Contains(got, "snapshot_pause_duration_seconds") {
+	if strings.Contains(got, "lease_remaining_seconds") {
 		t.Errorf("a series nothing recorded was exported:\n%s", got)
 	}
 }
@@ -66,13 +61,13 @@ func TestScrapeEscapesLabelValues(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Shutdown(ctx) })
 
-	p.Recorder().Gauge(ctx, "wal_out_of_space", 1, obs.String("volume", `a"b\c`+"\n"))
+	p.Recorder().Gauge(ctx, "chain_depth", 1, obs.String("volume", `a"b\c`+"\n"))
 
 	body, err := p.Scrape(ctx)
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	want := `wal_out_of_space{volume="a\"b\\c\n"} 1`
+	want := `chain_depth{volume="a\"b\\c\n"} 1`
 	if !strings.Contains(string(body), want+"\n") {
 		t.Fatalf("the scrape does not escape the label value; want %q in\n%s", want, body)
 	}
@@ -92,8 +87,10 @@ func TestScrapeIsStable(t *testing.T) {
 
 	r := p.Recorder()
 	for _, vol := range []string{"vol-c", "vol-a", "vol-b"} {
-		r.Gauge(ctx, "wal_local_sequence", 1, obs.String("volume", vol))
-		r.Gauge(ctx, "wal_unflushed_bytes", 2, obs.String("volume", vol))
+		r.Gauge(ctx, "chain_depth", 1, obs.String("volume", vol))
+	}
+	for _, host := range []string{"host-c", "host-a", "host-b"} {
+		r.Gauge(ctx, "lease_remaining_seconds", 2, obs.String("host", host))
 	}
 
 	first, err := p.Scrape(ctx)

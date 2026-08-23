@@ -66,9 +66,9 @@ kernel_source="" # the file publish will push: $KERNEL or $SPINBOX_KERNEL
 failures=0
 ok() { printf '  ok       %s\n' "$1"; }
 # A check that could not run says so, rather than printing nothing. Silence is how a
-# reader concludes that everything above the failure was fine: `guest:verify` had four
-# states in which it reported OK having proven nothing, and this is the same trap one file
-# over. It is not counted as a failure — the input it depends on already was.
+# reader concludes that everything above the failure was fine: the preflight this replaced
+# had four states in which it reported OK having proven nothing, and this is the same trap
+# one file over. It is not counted as a failure — the input it depends on already was.
 skipped() { printf '  SKIPPED  %s\n' "$1"; }
 missing() {
 	printf '  MISSING  %s\n' "$1"
@@ -395,8 +395,7 @@ cmd_publish() {
 	if [ "$unpublished" -ne 0 ]; then
 		# Non-zero, even when everything this run could do succeeded. The sentence a human
 		# will repeat is "I ran the publish task", and that must not be able to mean "the
-		# guest jobs still cannot run" — the same reason `ci:noguest` is a separate target
-		# name and not a flag on `ci:full`. The QEMU build takes tens of minutes; re-run
+		# artefacts are still not there". The QEMU build takes tens of minutes; re-run
 		# this when it finishes, it is idempotent and will verify instead of republishing.
 		cat >&2 <<EOF
 NOT DONE: an input above is still unpublished, so CI's guest jobs will still fail.

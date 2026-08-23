@@ -86,12 +86,13 @@ func run() error {
 		seedHost   = flag.String("seed-host", "", "with -seed-volume: the host that will serve it (a UUIDv7)")
 		seedSize   = flag.Int64("seed-size", 1<<30, "with -seed-volume: capacity in bytes (a whole number of 512-byte sectors)")
 		seedBlock  = flag.Int("seed-block-size", 4096, "with -seed-volume: logical block size")
-		// The list is three commands long, not one, and each of the other two found out
-		// the same way an operator does: a flatten opens every chunk the volume reads and
-		// re-seals it, and a delete flattens whatever descends from the volume first, so
-		// both need the key the volume's DEK is wrapped under.
+		// One command needs it now. -flatten-volume and -delete-volume were the other
+		// two, and both were rewrites of a chunked image this system no longer produces
+		// — they went with it. Seeding still needs the key, because a volume's DEK is
+		// wrapped under it before the row is written and an Agent that cannot unwrap it
+		// has a volume it can never open.
 		kekFile = flag.String("kek-file", "",
-			"file holding the 32-byte key-encryption key (required for -seed-volume and -flatten-volume, and for -delete-volume when something descends from the volume)")
+			"file holding the 32-byte key-encryption key (required for -seed-volume)")
 
 		// snapshot-volume: record a snapshot request and exit, the same shape as
 		// -seed-volume and for the same reason. The snapshot itself is taken by the
@@ -165,24 +166,6 @@ func run() error {
 		// cordon.go carries the reasoning.
 		cordonHost   = flag.String("cordon-host", "", "stop placing new volumes on this host and exit, instead of serving")
 		uncordonHost = flag.String("uncordon-host", "", "let this host take new volumes again and exit, instead of serving")
-
-		// flatten-volume: make a clone self-contained and exit — the one-shot
-		// controlplane.Clone's refusal names. the chain-depth decision of
-		// 2026-08-07 made it load-bearing for two things at once when publishing stopped
-		// flattening: it is the only way back under §20.1's depth ceiling, and the only way
-		// to delete a parent that has clones without destroying them
-		// (the deletion decision). flatten.go carries the reasoning for this
-		// binary's half; the mechanism and its ordering are lineage.Flatten's.
-		flattenVolume = flag.String("flatten-volume", "",
-			"rewrite this volume's image so it owes nothing to its ancestors, and exit, instead of serving")
-
-		// delete-volume: the first verb in this repository that removes anything, and it
-		// removes nothing permanently — every object gets a delete marker and the bucket's
-		// lifecycle policy is what expires it (INV-14, docs/plan/RUNBOOK.md). It is a
-		// one-shot like the rest; delete.go carries the preconditions, the order and what a
-		// delete does *not* reclaim.
-		deleteVolumeID = flag.String("delete-volume", "",
-			"delete this volume — its objects and its catalog rows — and exit, instead of serving")
 
 		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
@@ -326,7 +309,7 @@ func run() error {
 		// loud because an operator reading "rebuilt 40 volumes" would otherwise expect
 		// the fleet to start serving them.
 		slog.Info("catalog rebuilt from the object store; no volume has a primary host — place them to resume serving",
-			"volumes", sum.Volumes, "snapshots", sum.Snapshots)
+			"volumes", sum.Volumes)
 		return nil
 	}
 
@@ -394,29 +377,6 @@ func run() error {
 			host, state = *uncordonHost, lifecycle.HostActive
 		}
 		return setCordon(ctx, md, leader.Term, host, state)
-	}
-
-	if *flattenVolume != "" {
-		// Under the current term, like every other admin command here. It did not need one
-		// until metadata.Store grew ClearVolumeParent: a flatten used to write objects and
-		// no row at all, and left a WARN where the catalog write belonged. flatten.go says
-		// what changed and what it costs.
-		leader, lerr := md.GetLeader(ctx)
-		if lerr != nil {
-			return fmt.Errorf("-flatten-volume needs a Control Plane to be leading (start one first): %w", lerr)
-		}
-		return flatten(ctx, md, store, *kekFile, *flattenVolume, leader.Term)
-	}
-
-	if *deleteVolumeID != "" {
-		// Under the current term, like every other admin command here: a delete is not a
-		// leader taking over, and AcquireLeadership would leave the serving Control Plane's
-		// writes refused as stale.
-		leader, lerr := md.GetLeader(ctx)
-		if lerr != nil {
-			return fmt.Errorf("-delete-volume needs a Control Plane to be leading (start one first): %w", lerr)
-		}
-		return deleteVolume(ctx, md, store, *kekFile, *deleteVolumeID, leader.Term)
 	}
 
 	if *cloneSnapshot != "" {
@@ -534,8 +494,7 @@ func leaderRenewInterval(leaseTTL time.Duration) time.Duration {
 //
 // It is a renewal and not a re-election: AcquireLeadership increments the term
 // unconditionally, and every admin one-shot in this file reads GetLeader and then writes
-// under that term (-flatten-volume and -delete-volume rewrite a whole image in between),
-// so a self-renewing leader would fail them at random.
+// under that term, so a self-renewing leader would fail them at random.
 //
 // A catalog it cannot reach is not a term it has lost: those failures are logged and
 // retried, because a Control Plane cut off from PostgreSQL already writes nothing at all,

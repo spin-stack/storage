@@ -88,10 +88,14 @@ func TestAReportedSnapshotStopsBeingAskedFor(t *testing.T) {
 	if snap.State != lifecycle.SnapshotPublished || snap.TargetSequence != 12 || snap.SourceHostID != hostA {
 		t.Fatalf("snapshot = %+v, want PUBLISHED at 12 on %s", snap, hostA)
 	}
-	// The key is derived from the two ids rather than taken from the report, so the
-	// catalog cannot point somewhere the reader does not look.
-	if want := "image/" + w.vol + "/snapshots/" + w.snap + ".json"; snap.ManifestKey != want {
-		t.Fatalf("manifest key = %q, want %q", snap.ManifestKey, want)
+	// No manifest key, and the empty column is the assertion. It used to be *computed*
+	// from the two ids — never taken from the report — so the catalog could not point
+	// somewhere the reader does not look. What it computed was a key into the chunked
+	// image's object layout, which is withdrawn; recording the Agent's string instead
+	// would give up the property the computation existed for, and recording a key in a
+	// layout nothing writes would point an operator at an object that is not there.
+	if snap.ManifestKey != "" {
+		t.Fatalf("manifest key = %q, want empty until the commit protocol supplies a layout", snap.ManifestKey)
 	}
 	if vols := w.desired(t, hostA); vols[0].GetPendingSnapshotId() != "" {
 		t.Fatalf("a published snapshot is still being asked for: %q", vols[0].GetPendingSnapshotId())

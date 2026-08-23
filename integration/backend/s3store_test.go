@@ -5,14 +5,10 @@ package backend_test
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
-
-	"github.com/spin-stack/storage/internal/cow"
-	"github.com/spin-stack/storage/internal/image"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -180,66 +176,5 @@ func TestConditionalWritesThroughS3StoreMapEveryLoser(t *testing.T) {
 		if !errors.Is(err, objectstore.ErrPreconditionFailed) {
 			t.Fatalf("a fenced promoter got %v, want ErrPreconditionFailed — the 'I was fenced' branch is never taken", err)
 		}
-	}
-}
-
-// TestTheImageIsIdempotentAgainstARealBackend is §6.1 for the format that actually
-// leaves the host now.
-//
-// It replaced the WAL uploader's version, which went with the uploader (ADR-0026
-// increment 4.5). The properties did not change and they are properties of the
-// *backend*, not of the producer: identical bytes at a deterministic key reconcile to
-// success when a response is lost, and If-Match must actually fence a stale writer.
-//
-// The producer is internal/image because that is what production writes. A conformance
-// suite exercising a byte source production no longer uses would certify the wrong thing.
-func TestTheImageIsIdempotentAgainstARealBackend(t *testing.T) {
-	ctx := t.Context()
-	be := backendConfig(t)
-	store := newVersionedS3Store(t, be, "image")
-
-	tests := []struct {
-		name    string
-		tag     byte
-		payload []byte
-	}{
-		{"a small image", 0x01, []byte("a short guest extent")},
-		// Above the SDK's 5 MiB multipart threshold, where the ETag stops even
-		// pretending to be a content hash.
-		{"an image past the multipart threshold", 0x02, bytes.Repeat([]byte("payload-"), 1<<19)},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			var vol [16]byte
-			vol[6], vol[8] = 0x70, 0x80
-			vol[15] = tc.tag
-
-			view := cow.NewIntervalMap()
-			view.Overwrite(0, tc.payload)
-
-			etag, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, nil, 1, "")
-			if err != nil {
-				t.Fatalf("first publish: %v", err)
-			}
-			// Republishing an unchanged view must reconcile rather than fail: the chunks
-			// are already there under their own digests.
-			if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, nil, 2, etag); err != nil {
-				t.Fatalf("republishing an unchanged image must succeed, got %v", err)
-			}
-			loaded, _, _, err := image.Load(ctx, store, nil, image.OwnLineage(vol), nil)
-			if err != nil {
-				t.Fatalf("load: %v", err)
-			}
-			got := make([]byte, len(tc.payload))
-			loaded.Read(0, got)
-			if !bytes.Equal(got, tc.payload) {
-				t.Fatal("the image did not survive a real backend round trip")
-			}
-			// The fence: a stale ETag is refused rather than silently replacing the
-			// manifest. On a real backend this is the whole of V1's fencing.
-			if _, err := image.Publish(ctx, store, rand.Reader, nil, image.OwnLineage(vol), view, nil, 3, etag); !errors.Is(err, image.ErrSuperseded) {
-				t.Fatalf("a stale ETag published against a real backend: %v, want ErrSuperseded", err)
-			}
-		})
 	}
 }

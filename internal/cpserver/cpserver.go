@@ -28,7 +28,6 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
-	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 )
@@ -396,13 +395,20 @@ func (s *Server) applySnapshotReport(ctx context.Context, term int64, hostID str
 			"snapshot_id", snapID, "volume_id", r.GetVolumeId(), "host_id", hostID, "error", msg)
 		return nil
 	}
-	// Computed, not believed: the key is a function of the two ids, and taking the
-	// Agent's word for it would let the catalog point somewhere the reader does not look.
-	key, err := image.SnapshotKeyFor(r.GetVolumeId(), snapID)
-	if err != nil {
-		return fmt.Errorf("cpserver: snapshot %q: %w", snapID, err)
-	}
-	if err := s.md.PublishSnapshot(ctx, term, snapID, r.GetSnapshotSequence(), hostID, key); err != nil {
+	// The manifest key is left empty, and it is not a placeholder for the Agent's
+	// reported one. It used to be *computed* here — a function of the two ids — rather
+	// than believed, so the catalog and the writer could not disagree about where a
+	// snapshot lives. What it computed was a key into the chunked image's object layout
+	// (`image/<vol>/snapshots/<snap>.json`), and that layout is withdrawn along with the
+	// local block engine. Recording the Agent's string instead would give up the one
+	// property the computation existed for; recording a key in a layout nothing writes
+	// would point an operator at an object that is not there. So: no key, and the commit
+	// protocol that replaces the manifest brings the computation back with a prefix that
+	// exists. Nothing reaches this branch today — no host can freeze a snapshot without
+	// a data path — and the row is still worth writing, because the sequence and the
+	// host are facts the catalog holds and the empty column says the object is not
+	// locatable yet.
+	if err := s.md.PublishSnapshot(ctx, term, snapID, r.GetSnapshotSequence(), hostID, ""); err != nil {
 		return fmt.Errorf("cpserver: publishing snapshot %q: %w", snapID, err)
 	}
 	return nil

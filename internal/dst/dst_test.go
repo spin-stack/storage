@@ -53,10 +53,10 @@ func TestCheckerNamesAndTrace(t *testing.T) {
 		// Observing an unrelated event kind must be a harmless no-op.
 		c.Observe(dst.Event{Kind: dst.EventNote, Msg: "ignored"})
 	}
-	// "no-permanent-delete" left this list on 2026-08-02 with internal/gc (ADR-0026):
-	// nothing issues a delete any more, so the checker could not fire, and INV-14 is
-	// pending until a sweeper exists again.
-	for _, want := range []string{"monotonic-clock", "watermark-order", "no-plaintext-leaves-host"} {
+	// One name, and coreCheckers says why: every other checker read an event only the
+	// local block engine emitted, and went with it on 2026-08-22. "no-permanent-delete"
+	// left the same way on 2026-08-02 with internal/gc (ADR-0026).
+	for _, want := range []string{"monotonic-clock"} {
 		if !names[want] {
 			t.Fatalf("DefaultCheckers missing %q", want)
 		}

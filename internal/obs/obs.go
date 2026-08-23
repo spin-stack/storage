@@ -21,8 +21,9 @@
 // deleted code; when the CP grows an interceptor, that increment brings back the six
 // functions it actually calls, and not the five context keys nothing will carry.
 //
-// Metrics stayed because they have real callers: the WAL's watermarks and out-of-space
-// gauge, the Agent's lease counters, and §19's snapshot histograms.
+// Metrics stayed because they have real callers: the Agent loop's lease series and the
+// two the clone path records. Everything the local block engine recorded went with it on
+// 2026-08-22 — see Catalog, which is now four entries long and says why.
 //
 // obs depends on the OTel SDK, whose internal timestamping is not our concern for
 // §25.1/INV-01: our own code never calls the time package (the simulable analyzer
@@ -142,11 +143,10 @@ func (p *Provider) CollectedMetrics(ctx context.Context) (map[string]bool, error
 //
 // GaugeValues cannot answer for a family with more than one label set: it keys by metric
 // name, so the last data point the SDK happens to hand back wins and which one that is is
-// not defined anywhere. That was harmless while every gauge here had one series per
-// process. It stops being harmless the moment a gauge carries a reason —
-// `volume_backpressure` has one series per (volume, reason) and exists precisely so the
-// three bounds can be told apart, so reading it by name alone would be asserting on a
-// coin flip and calling it evidence.
+// not defined anywhere. That is harmless only for a gauge with one series per process,
+// and neither gauge in the catalogue is one: `chain_depth` has a series per volume and
+// `lease_remaining_seconds` one per host, so reading either by name alone would be
+// asserting on a coin flip and calling it evidence.
 func (p *Provider) GaugeSeries(ctx context.Context, name string) (map[string]float64, error) {
 	var rm metricdata.ResourceMetrics
 	if err := p.reader.Collect(ctx, &rm); err != nil {
@@ -170,11 +170,10 @@ func (p *Provider) GaugeSeries(ctx context.Context, name string) (map[string]flo
 	return out, nil
 }
 
-// GaugeValues returns the latest value of every collected Float64 gauge. A state
-// gauge (`wal_out_of_space`) is only useful to an operator if it reads 1 while the
-// condition holds and 0 once it clears, so a test that asserts merely "the name was
-// recorded" would pass on a gauge wired backwards. The last data point wins, which
-// is what a gauge means.
+// GaugeValues returns the latest value of every collected Float64 gauge. A state gauge
+// is only useful to an operator if it reads 1 while the condition holds and 0 once it
+// clears, so a test that asserts merely "the name was recorded" would pass on a gauge
+// wired backwards. The last data point wins, which is what a gauge means.
 //
 // One data point per name, so it answers only for gauges with a single series. Use
 // GaugeSeries for a family whose label set varies.

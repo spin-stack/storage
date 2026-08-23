@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -37,13 +36,13 @@ func TestMetricsCatalogWellFormed(t *testing.T) {
 		}
 		seen[d.Name] = true
 	}
-	// A few load-bearing names must exist (typo/regression guard).
+	// A few load-bearing names must exist (typo/regression guard). The list is short
+	// because the catalogue is: every entry that measured the local block engine went
+	// with it, and what is left is the Agent's liveness and the clone path.
 	for _, want := range []string{
-		"wal_out_of_space",                // the device is refusing writes (§5.7)
-		"image_publish_duration_seconds",  // the cost of a session leaving the host (ADR-0026)
-		"snapshot_pause_duration_seconds", // ~0 invariant (§19)
-		"discarded_bytes_total",           // the guest trimmed, and the image shrank (§14.6)
-		"wal_fdatasync_latency_seconds",   // under ADR-0026 this syscall IS the durability contract
+		"lease_remaining_seconds",      // the host is alive and its window is this wide (§12.2)
+		"lease_renewal_failures_total", // and it stopped being able to renew
+		"chain_depth",                  // §20.1's ceiling, recorded where the clone is placed
 	} {
 		if !seen[want] {
 			t.Fatalf("required metric %q missing from catalog", want)
@@ -61,11 +60,8 @@ func TestMetricsRegistration(t *testing.T) {
 	if _, ok := p.Metrics.Counter("lease_renewal_failures_total"); !ok {
 		t.Fatal("lease_renewal_failures_total should be a counter")
 	}
-	if _, ok := p.Metrics.Histogram("image_publish_duration_seconds"); !ok {
-		t.Fatal("image_publish_duration_seconds should be a histogram")
-	}
-	if _, ok := p.Metrics.Gauge("wal_unflushed_bytes"); !ok {
-		t.Fatal("wal_unflushed_bytes should be a gauge")
+	if _, ok := p.Metrics.Gauge("lease_remaining_seconds"); !ok {
+		t.Fatal("lease_remaining_seconds should be a gauge")
 	}
 }
 
@@ -123,51 +119,27 @@ func repoRoot(t *testing.T) string {
 	return ""
 }
 
-// A gauge that means "something to do with space" is a page nobody can action. The three
-// bounds a volume can hit have contradicting remedies — trim inside the guest, stop the
-// volume, grow the host's disk — so the bound has to be a label, and this is the contract
-// the recorder in cmd/volume-agent records against.
-//
-// Asserted on the catalogue rather than on a recorded sample because the catalogue is
-// what fixes cardinality up front (§26.2): a label that is not declared here is a label
-// nobody reviewed.
-func TestBackpressureCarriesTheBoundAsALabel(t *testing.T) {
-	for _, d := range obs.Catalog() {
-		if d.Name != "volume_backpressure" {
-			continue
-		}
-		for _, want := range []string{"volume", "reason"} {
-			if !slices.Contains(d.Labels, want) {
-				t.Fatalf("volume_backpressure declares labels %v, without %q: one series would "+
-					"have to mean an fstrim, a restart and a bigger disk at once", d.Labels, want)
-			}
-		}
-		return
-	}
-	t.Fatal("volume_backpressure is not in the catalogue")
-}
-
 // GaugeValues keys by name and the last data point wins, so a family with several label
 // sets collapses to whichever one the SDK handed back last — unordered, and not part of
-// any contract. volume_backpressure is now such a family, and a test reading it through
-// GaugeValues would pass or fail on map iteration order.
+// any contract. Any gauge recorded for more than one subject is such a family, and a
+// test reading it through GaugeValues would pass or fail on map iteration order.
 func TestGaugeSeriesSeparatesOneFamilysLabelSets(t *testing.T) {
 	ctx := t.Context()
 	p := newProvider(t)
 	rec := p.Recorder()
 
-	rec.Gauge(ctx, "volume_backpressure", 1, obs.String("volume", "vol-a"), obs.String("reason", "view_memory"))
-	rec.Gauge(ctx, "volume_backpressure", 0, obs.String("volume", "vol-a"), obs.String("reason", "wal_share"))
-	rec.Gauge(ctx, "volume_backpressure", 0, obs.String("volume", "vol-b"), obs.String("reason", "view_memory"))
+	rec.Gauge(ctx, "chain_depth", 1, obs.String("volume", "vol-a"))
+	rec.Gauge(ctx, "chain_depth", 3, obs.String("volume", "vol-b"))
+	rec.Gauge(ctx, "chain_depth", 0, obs.String("volume", "vol-c"))
 
-	got, err := p.GaugeSeries(ctx, "volume_backpressure")
+	got, err := p.GaugeSeries(ctx, "chain_depth")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := map[string]float64{
-		`{reason="view_memory",volume="vol-a"}`: 1,
-		`{reason="wal_share",volume="vol-a"}`:   0,
-		`{reason="view_memory",volume="vol-b"}`: 0,
+		`{volume="vol-a"}`: 1,
+		`{volume="vol-b"}`: 3,
+		`{volume="vol-c"}`: 0,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("GaugeSeries returned %d series, want %d: %v", len(got), len(want), got)
@@ -184,7 +156,7 @@ func TestGaugeSeriesSeparatesOneFamilysLabelSets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), `volume_backpressure{reason="view_memory",volume="vol-a"} 1`) {
-		t.Fatalf("the scrape does not carry the reason as a label:\n%s", body)
+	if !strings.Contains(string(body), `chain_depth{volume="vol-b"} 3`) {
+		t.Fatalf("the scrape does not separate one gauge family's series:\n%s", body)
 	}
 }

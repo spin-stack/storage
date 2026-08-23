@@ -28,29 +28,7 @@ func TestExempt(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/internal/simio")
 }
 
-// TestExemptVHostHostIO asserts the second and only other exemption (ADR-0020):
-// internal/vhost/hostio may open the Unix socket and mmap the front-end's memory
-// that vhost-user is made of, because simio models neither.
-func TestExemptVHostHostIO(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/internal/vhost/hostio")
-}
-
-// TestExemptGuestInit asserts the third exemption (DEV-0013): integration/guestinit
-// is PID 1 inside the guest VM, not host code, and it must be able to open a block
-// device and mount /proc. Simulating those would make the one test that proves a real
-// kernel issues FLUSH prove nothing at all.
-func TestExemptGuestInit(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "exempt/integration/guestinit")
-}
-
-// TestIntegrationItselfIsNotExempt is the narrowness proof for that third exemption.
-// What earned it is "runs inside the guest", not "lives under integration/" — the
-// host-side lane that drives QEMU is ordinary code and stays simulable.
-func TestIntegrationItselfIsNotExempt(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "notexempt/integration/vhost")
-}
-
-// TestExemptTestInfra asserts the fourth exemption (DEV-0016): internal/testinfra is
+// TestExemptTestInfra asserts the second exemption (DEV-0016): internal/testinfra is
 // the build-tagged harness that starts containers and subprocesses for the lanes.
 // There is no clock to inject into another process, and nothing here is linked into a
 // binary this repository ships.
@@ -74,13 +52,4 @@ func TestTestInfraSiblingIsNotExempt(t *testing.T) {
 // both and this test is the only thing that would notice.
 func TestHarnessExemptionIsPerFile(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "harness/integration/e2e")
-}
-
-// TestVHostItselfIsNotExempt is the narrowness proof. An exemption that leaked
-// to the parent package would make the whole vhost-user backend — protocol,
-// virtqueue, request handling — unsimulable without anything failing, which is
-// precisely the retrofit INV-01 says is impossible. Every call in the fixture
-// must still be flagged.
-func TestVHostItselfIsNotExempt(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), simulable.Analyzer, "notexempt/internal/vhost")
 }

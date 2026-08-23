@@ -24,8 +24,7 @@ func TestAProviderWithoutAnExporterRecordsIntoNothing(t *testing.T) {
 		t.Fatal("a provider with no exporter handed out no Recorder, so every caller would need a nil check")
 	}
 	r.Count(ctx, "lease_renewal_failures_total", 1, obs.String("host", "host-a"))
-	r.Gauge(ctx, "wal_out_of_space", 1, obs.String("volume", "vol-1"))
-	r.Observe(ctx, "image_publish_duration_seconds", 0.25, obs.String("volume", "vol-1"))
+	r.Gauge(ctx, "lease_remaining_seconds", 27, obs.String("host", "host-a"))
 
 	if err := provider.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown of a provider with no exporter: %v", err)
@@ -43,21 +42,21 @@ func TestAProductionProviderCanBeReadBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
-	provider.Recorder().Gauge(ctx, "wal_out_of_space", 1, obs.String("volume", "vol-1"))
+	provider.Recorder().Gauge(ctx, "lease_remaining_seconds", 1, obs.String("host", "host-a"))
 
 	collected, err := provider.CollectedMetrics(ctx)
 	if err != nil {
 		t.Fatalf("CollectedMetrics on the Provider a binary builds: %v", err)
 	}
-	if !collected["wal_out_of_space"] {
+	if !collected["lease_remaining_seconds"] {
 		t.Fatalf("the production Provider recorded nothing readable: %v", collected)
 	}
 	gauges, err := provider.GaugeValues(ctx)
 	if err != nil {
 		t.Fatalf("GaugeValues on the Provider a binary builds: %v", err)
 	}
-	if gauges["wal_out_of_space"] != 1 {
-		t.Fatalf("wal_out_of_space = %v, want 1", gauges["wal_out_of_space"])
+	if gauges["lease_remaining_seconds"] != 1 {
+		t.Fatalf("lease_remaining_seconds = %v, want 1", gauges["lease_remaining_seconds"])
 	}
 }
 

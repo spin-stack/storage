@@ -171,4 +171,5 @@ func Read(ctx context.Context, store objectstore.Store, volumeID string) (Descri
 // The stored object is framed by internal/framed: a digest line over the bytes as
 // stored, then the JSON. That package carries the reasoning, including why a digest
 // field *inside* the JSON cannot work — this package's own property test is what proved
-// it, and internal/image now depends on the same primitive (DEV-0025).
+// it. It is the shape the new design's HEAD and commit manifest are built out of: a
+// small mutable JSON object under compare-and-set, and an immutable one beside it.

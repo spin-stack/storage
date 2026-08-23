@@ -29,16 +29,20 @@ import (
 // it printed, and kills it. The "restart the Agent" arm of the e2e lane is a literal
 // SIGKILL, because that is the failure ADR-0024 reasons about.
 
-// Binary resolves one of this project's binaries in _output/bin and reports it missing —
-// naming the command that produces it — when it is not there.
+// Binary resolves one of this project's binaries in _output/bin and fails — naming the
+// command that produces it — when it is not there.
 //
-// Whether that report is a skip or a failure is missingInput's decision, and it is the
-// same one the guest artefacts get: outside the gate a developer who has not run
-// `task build:cmd` has not broken anything; inside the gate, an e2e lane that quietly
-// declined to start the two binaries is the gate reporting success for work it did not do.
-// A renamed binary is the case that makes this more than theory — `task test:e2e` depends
-// on `build:cmd`, so the artefacts are always built, and the one way this site can still
-// fire under the gate is the lane and the build disagreeing about a name.
+// **A failure and never a skip.** It used to be either, decided by SPIN_REQUIRE_PROOFS:
+// outside the merge gate a developer who had not run `task build:cmd` had not broken
+// anything, and inside it a lane that quietly declined to start the two binaries was the
+// gate reporting success for work it did not do. That mechanism existed for the artefacts
+// a *guest* lane needed — a pinned QEMU, a kernel, an initramfs — which a laptop could
+// reasonably not have, and it went with those lanes.
+//
+// It does not come back for this: `task test:e2e` depends on `build:cmd`, so the binaries
+// are always built by the time a test asks for one, and the only way this site can fire is
+// the lane and the build disagreeing about a name. That is a defect on every machine, and
+// skipping it would hide it on all of them.
 func Binary(t *testing.T, name string) string {
 	t.Helper()
 	root, err := repoRoot()
@@ -47,7 +51,7 @@ func Binary(t *testing.T, name string) string {
 	}
 	path := filepath.Join(root, "_output", "bin", name)
 	if _, err := os.Stat(path); err != nil {
-		missingInput(t, fmt.Sprintf("%s is not built: %v", path, err), "task build:cmd")
+		t.Fatalf("%s is not built: %v\nrun: task build:cmd", path, err)
 	}
 	return path
 }

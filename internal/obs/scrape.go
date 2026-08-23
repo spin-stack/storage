@@ -72,11 +72,10 @@ func (p *Provider) Scrape(ctx context.Context) ([]byte, error) {
 			}
 			writeFamily(&b, m, kind)
 			writeSamples(&b, m.Name, numbers(data.DataPoints))
-		case metricdata.Histogram[float64]:
-			writeFamily(&b, m, "histogram")
-			writeHistogram(&b, m.Name, data.DataPoints)
 		default:
-			// A kind Catalog() cannot produce. Named rather than dropped: a scrape that
+			// A kind Catalog() cannot produce — every histogram left with the local block
+			// engine, so this is the branch a returning duration lands in until its
+			// renderer comes back with it. Named rather than dropped: a scrape that
 			// silently omits a series is the failure this endpoint exists to end, and a
 			// comment line is valid in the format.
 			fmt.Fprintf(&b, "# UNSUPPORTED %s\n", m.Name)
@@ -115,38 +114,6 @@ func writeSamples(b *bytes.Buffer, name string, samples []sample) {
 	for _, s := range samples {
 		fmt.Fprintf(b, "%s%s %s\n", name, s.labels, formatValue(s.value))
 	}
-}
-
-func writeHistogram(b *bytes.Buffer, name string, dps []metricdata.HistogramDataPoint[float64]) {
-	ordered := slices.Clone(dps)
-	slices.SortFunc(ordered, func(x, y metricdata.HistogramDataPoint[float64]) int {
-		return cmp.Compare(labelsOf(x.Attributes), labelsOf(y.Attributes))
-	})
-	for _, dp := range ordered {
-		base := labelsOf(dp.Attributes)
-		// Prometheus buckets are cumulative and the SDK's are not; a scraper reading
-		// them as-is would report a distribution that is wrong everywhere but the first
-		// bucket. BucketCounts always has one more entry than Bounds — the +Inf bucket.
-		var cumulative uint64
-		for i, bound := range dp.Bounds {
-			cumulative += dp.BucketCounts[i]
-			fmt.Fprintf(b, "%s_bucket%s %d\n", name, withLE(base, formatValue(bound)), cumulative)
-		}
-		cumulative += dp.BucketCounts[len(dp.Bounds)]
-		fmt.Fprintf(b, "%s_bucket%s %d\n", name, withLE(base, "+Inf"), cumulative)
-		fmt.Fprintf(b, "%s_sum%s %s\n", name, base, formatValue(dp.Sum))
-		fmt.Fprintf(b, "%s_count%s %d\n", name, base, dp.Count)
-	}
-}
-
-// withLE inserts the bucket's upper bound into an already-rendered label set. `le`
-// sorts before every label this catalogue uses (host, volume), so it goes first and the
-// result stays in the canonical order a diff depends on.
-func withLE(labels, le string) string {
-	if labels == "" {
-		return `{le="` + le + `"}`
-	}
-	return `{le="` + le + `",` + labels[1:]
 }
 
 // labelsOf renders an attribute set as `{k="v",…}`, or "" when there are none.

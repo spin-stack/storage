@@ -19,24 +19,15 @@ import (
 // could ever set it, which is the only question a regression cares about.
 //
 // So a planted bug here breaks *production behaviour* and the checker has to see it
-// through a scenario driving real code: a bucket without versioning, a backend without
-// conditional writes, a backend serving a stale read, a listing that never catches up,
-// a listing that goes backwards, a clock that goes backwards, a lease row read from a
-// replica, a lease checker that keeps saying yes, a volume created without encryption,
-// a background consumer wired without a scheduler. Every one is an operational
-// reality, and each is injected into the simulated I/O or into how the code under test
-// is built — never into the code itself.
+// through a scenario driving real code: a clock that goes backwards, a lease that
+// revalidates itself over it. The fault is injected into the simulated I/O or into how
+// the code under test is built — never into the code itself.
 //
-// Every checker now has one. TestPlantedBugCoverageIsNotSilentlyWeakened pins the
-// count, so a checker quietly downgraded to a hand-written Emit fails there rather than
-// disappearing into the absence of a test.
-//
-// Two of them are planted at a seam rather than at an I/O fault: INV-03's ordering
-// rules and INV-17's arbitration are comparisons over numbers held in memory, and no
-// disk, clock or object-store fault changes their answer. Those plants substitute one
-// named policy (wal.OrderPolicy) or omit one constructor argument (the scheduler a
-// background consumer is handed), which is how both invariants are actually lost —
-// never by editing the code under test.
+// Every checker still has one, and there is one checker: see coreCheckers for why the
+// other three left with the engine that emitted their events, and what brings them back.
+// TestPlantedBugCoverageIsNotSilentlyWeakened pins the count, so a checker quietly
+// downgraded to a hand-written Emit fails there rather than disappearing into the
+// absence of a test.
 
 // Planted-bug outcomes. A behavioural planted bug also trips the scenario's own
 // assertions; these name what went wrong for a reader of a failing run.
@@ -73,16 +64,6 @@ func requirePasses(t *testing.T, seed int64, checker Checker, sc Scenario) {
 	if res := Run(seed, sc, checker); res.Err != nil {
 		t.Fatalf("the unplanted scenario must pass: %v\n--- trace ---\n%s", res.Err, res.TraceString())
 	}
-}
-
-// INV-15: nothing leaves the host in clear. Planted by creating the volume without
-// encryption — no bug in the crypto, just a Log that was never handed a DEK, which is
-// exactly how a plaintext volume reaches production.
-func TestPlantedBugPlaintextLeavesHost(t *testing.T) {
-	requirePasses(t, 12, NewNoPlaintextLeavesHostChecker(), scenarioEncryptedWALNoPlaintextLeak)
-	plantedBug(t, 12, NewNoPlaintextLeavesHostChecker(), "no-plaintext-leaves-host", func(s *Sim) error {
-		return walPlaintextScenario(s, plaintextWAL)
-	})
 }
 
 // The monotonic clock is the basis of lease safety (§12.1). Planted by the clock
@@ -124,9 +105,7 @@ const (
 	proofLiteral
 )
 
-// plantedProofs is the registry the checks below hold to the checker list. It shrank
-// with ADR-0026: every entry removed went with the checker it named, and every one of
-// those checkers went with its subject.
+// plantedProofs is the registry the checks below hold to the checker list.
 //
 // **It is no longer only a declaration.** It used to be a map nothing cross-checked
 // against the tests, and on 2026-08-03 two of its six entries were fiction:
@@ -137,23 +116,13 @@ const (
 // oldest lesson, and it survived because the test asserted the *map* matched the checker
 // list rather than asserting the proofs exist. TestMain now closes that: plantedBug
 // records what it actually proved, and a checker nobody exercised fails the package.
+//
+// That history is why this file shrank to one entry rather than keeping the other three
+// against the day their subjects return. Three entries naming checkers nothing can emit
+// for, proved by hand-written Emits, is precisely the fiction the paragraph above
+// describes — the same shape, arrived at from the other direction.
 var plantedProofs = map[string]proofKind{
-	"effective-single-writer":  proofBehavioural,
-	"no-plaintext-leaves-host": proofBehavioural,
-	"monotonic-clock":          proofBehavioural,
-	// Literal, and honestly so: the ordering is enforced at the source
-	// (Log.AdvanceDurable/AdvancePublished return ErrWatermarkOrder, unit-tested), so no
-	// fault in the simulated disk, store or clock can make production emit an
-	// out-of-order triple. The checker is a backstop against a *reporting* path that
-	// computes them separately, and the only way to reach it is to plant the event.
-	"watermark-order": proofLiteral,
-	// Contributed by scenarios_agent.go; proofs in planted_bug_agent_test.go.
-	"fenced-volume-not-served":       proofBehavioural,
-	"durable-range-survives-restart": proofBehavioural,
-	// Contributed by scenarios_carry.go; proof in planted_bug_carry_test.go.
-	"acked-records-cross-epochs-intact": proofBehavioural,
-	// Contributed by scenarios_refusal.go; proof in planted_bug_refusal_test.go.
-	"refused-volume-has-no-device": proofBehavioural,
+	"monotonic-clock": proofBehavioural,
 }
 
 // proven records which checkers a plantedBug call actually exercised in this run.
@@ -203,20 +172,6 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 	}
 }
 
-// The watermark backstop, planted literally — see the registry entry for why that is the
-// only way in, and internal/wal's ErrWatermarkOrder tests for where it is really enforced.
-func TestPlantedBugWatermarkOrder(t *testing.T) {
-	ordered := func(s *Sim) error {
-		s.Emit(Event{Kind: EventWatermark, Local: 30, Durable: 20, Published: 10})
-		return nil
-	}
-	requirePasses(t, 41, NewWatermarkOrderChecker(), ordered)
-	plantedBug(t, 41, NewWatermarkOrderChecker(), "watermark-order", func(s *Sim) error {
-		s.Emit(Event{Kind: EventWatermark, Local: 10, Durable: 20, Published: 30})
-		return nil
-	})
-}
-
 // TestPlantedBugCoverageIsNotSilentlyWeakened pins the number of behavioural proofs.
 // Converting a literal proof to a behavioural one is progress and raises this number;
 // a checker quietly downgraded to a hand-written Emit is not, and fails here.
@@ -235,8 +190,18 @@ func TestPlantedBugWatermarkOrder(t *testing.T) {
 //   - 5 -> 6 (2026-08-09): `acked-records-cross-epochs-intact`, with the carry-forward
 //     scenario. An increase, which is the only direction that needs no defence.
 //   - 6 -> 7 (2026-08-09): `refused-volume-has-no-device`, with the refusal scenario.
+//   - 7 -> 1 (2026-08-22): the local block engine was withdrawn — QEMU owns the local
+//     copy-on-write format through qcow2 from here on — and six checkers went with the
+//     subjects they observed: `no-plaintext-leaves-host` and `watermark-order` (a WAL
+//     that no longer exists to seal payloads or advance watermarks),
+//     `effective-single-writer` and `durable-range-survives-restart` (an image nothing
+//     publishes), `fenced-volume-not-served` and `refused-volume-has-no-device` (a
+//     device nothing serves), and `acked-records-cross-epochs-intact` (a carry-forward
+//     with no records to carry). This is the largest single decrease in this log and
+//     every one of them is the "removed with its subject" case, not a weakening. The
+//     commit protocol reinstates the subjects and this number climbs back.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 7
+	const wantBehavioural = 1
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {

@@ -14,7 +14,6 @@ import (
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
 	"github.com/spin-stack/storage/internal/simio/sim"
-	"github.com/spin-stack/storage/internal/wal"
 )
 
 // Nothing in this tree creates a volume. Four RPCs exist and every one of them reads;
@@ -258,7 +257,7 @@ func TestTheKeyVersionSurvivesEveryBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := wal.NewEncryption(dek, [16]byte(u)); err != nil {
+	if _, err := crypto.NewEncryption(dek, [16]byte(u)); err != nil {
 		t.Fatalf("the unwrapped DEK cannot encrypt this volume: %v", err)
 	}
 

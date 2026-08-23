@@ -51,13 +51,3 @@ func (r *Recorder) Gauge(ctx context.Context, name string, value float64, attrs 
 		g.Record(ctx, value, metric.WithAttributes(attrs...))
 	}
 }
-
-// Observe records one sample into a registered histogram.
-func (r *Recorder) Observe(ctx context.Context, name string, value float64, attrs ...Attr) {
-	if r == nil || r.m == nil {
-		return
-	}
-	if h, ok := r.m.Histogram(name); ok {
-		h.Record(ctx, value, metric.WithAttributes(attrs...))
-	}
-}

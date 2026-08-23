@@ -23,295 +23,44 @@ permissions:
   contents: read
 
 # ---------------------------------------------------------------------------------
-# The shape of this workflow, and why it is not one job.
+# The shape of this workflow, and why it is two jobs again.
 #
-# `task ci:full` is the merge gate and it runs every proof including the guest-backed
-# ones. No single hosted runner can run it: the lanes that boot a guest need the pinned
-# QEMU, which is only executable inside the published runtime image (ADR-0025 — the
-# binaries are dynamically linked against what that image provides), and a container job
-# gets no Docker daemon of its own, which the TestContainers lanes need. So the gate is
-# assembled here from jobs, and `ci:full` is the single-machine form of the same claim.
+# It was five. Three of them existed because `task ci:full` could not run on one hosted
+# runner: the lanes that booted a guest needed the pinned QEMU, which is only executable
+# inside the published runtime image (ADR-0025 — the binaries are dynamically linked
+# against what that image provides), and a container job gets no Docker daemon of its own,
+# which the TestContainers lanes need. So the gate was assembled from jobs that each had
+# one of the two, plus a job to fetch the artefacts they shared.
 #
-# That split is exactly how a gate starts lying, which is what the `gate` job at the
-# bottom is for: it fails unless every lane *ran and passed*. A lane that was skipped —
-# because an image is not published, because a preflight could not find a kernel — makes
-# it red. Before this, `ci` alone was the gate, it called `task ci:full`, and that target
-# printed `SKIP: no QEMU in _output` and exited 0: a green tick for a run that had booted
-# no guest at all.
+# That constraint is gone with the lanes it applied to. The guest-backed proofs drove a
+# real Linux kernel against this system's own vhost-user-blk backend, and that backend is
+# withdrawn — QEMU manages the local copy-on-write format through qcow2 now, and what this
+# system keeps is immutable commits, publication and recovery. Nothing left in the merge
+# gate needs QEMU, and everything left needs Docker, which one ordinary runner has. So
+# `ci:full` runs here as the single command it is.
+#
+# The pinned QEMU is still built and published by qemu.yml, and `task fetch:kernel` still
+# resolves the pinned kernel: both are inputs the qcow2 lane needs, and when that lane
+# lands this file grows a job for it and `ci:full` grows a preflight — the shape the three
+# deleted jobs had, which is why the reasoning above is kept rather than deleted with them.
+#
+# The `gate` job stays regardless, and its reason never depended on the split: `needs`
+# alone does not make a gate, because a needed job that is *skipped* leaves the dependent
+# job free to run and a workflow of green-or-grey jobs is reported as passing.
 # ---------------------------------------------------------------------------------
 
 jobs:
-  # Everything the guest-backed lanes need that is not in this repository: the pinned
-  # QEMU runtime image (built by qemu.yml, not here — the build takes tens of minutes)
-  # and the pinned guest kernel (built by spinbox and mirrored, ADR-0022).
-  #
-  # It runs on a normal runner because both are obtained with Docker, which the container
-  # jobs below do not have. The kernel travels onward as a workflow artefact: 37 MB moved
-  # once per run, which is cheaper than giving the guest jobs a registry credential and a
-  # Docker daemon they otherwise have no use for.
-  #
-  # It FAILS rather than reports when an input is missing. ADR-0025 chose the opposite —
-  # skip the lane, visibly, so the gate is not red for a reason unrelated to the code —
-  # and that is the decision being reversed: "unrelated to the code" is exactly what a
-  # skipped guest lane is not. The proofs it carries are this system's headline claims,
-  # and a run that did not make them has not passed the gate; it has failed to reach it.
-  # Nothing regresses by saying so, because these workflows have never executed.
-  #
-  # The known cost: a pull request from a fork gets a GITHUB_TOKEN that cannot read this
-  # repository's private packages, so it will fail here and its gate will be red. There
-  # are no forks and no runner yet; when there are, the choice is to make the two packages
-  # public, and this comment is where to record having made it.
-  guest-inputs:
-    runs-on: ubuntu-latest
-    # A registry lookup and a 37 MB pull. Anything slower is a hung registry call, and
-    # the default six-hour ceiling would hold a runner for all of it.
-    timeout-minutes: 15
-    # Reading a package from ghcr.io needs read:packages; the default GITHUB_TOKEN does
-    # not carry it unless the job asks. Without it the lookups below fail closed — which
-    # reads as "nothing published" and disables the guest lanes for the wrong reason.
-    permissions:
-      contents: read
-      packages: read
-    outputs:
-      qemu-image: ${{ steps.resolve.outputs.qemu-image }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Task
-        uses: go-task/setup-task@v2
-
-      - name: Resolve the pinned QEMU image and the pinned kernel
-        id: resolve
-        run: |
-          set -euo pipefail
-          # Both versions come from the Taskfile, never from a literal here: two places
-          # to bump is how CI and production end up on different QEMUs — and, for the
-          # kernel, how a lane certifies one artefact and reports on another.
-          qemu_image="ghcr.io/${{ github.repository }}/qemu:$(task qemu:version)"
-          # The kernel mirror: an explicit repository variable if one is configured,
-          # otherwise the conventional package next to the QEMU one. The tag is the
-          # content tag (sha256-<pin>), so it names the kernel and not a moving label —
-          # and hack/guest-kernel.sh re-hashes what it pulls regardless.
-          kernel_image="${{ vars.GUEST_KERNEL_IMAGE }}"
-          if [ -z "$kernel_image" ]; then
-            kernel_image="ghcr.io/${{ github.repository }}/guest-kernel:$(task guest:kernel:tag)"
-          fi
-          echo "qemu-image=${qemu_image}" >> "$GITHUB_OUTPUT"
-          echo "kernel-image=${kernel_image}" >> "$GITHUB_OUTPUT"
-
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-
-          missing=""
-          docker manifest inspect "$qemu_image"   >/dev/null 2>&1 || missing="${missing} ${qemu_image}"
-          docker manifest inspect "$kernel_image" >/dev/null 2>&1 || missing="${missing} ${kernel_image}"
-          if [ -n "$missing" ]; then
-            {
-              echo "## The guest-backed proofs cannot run"
-              echo
-              echo "These artefacts are not published, so no lane in this run can boot a guest:"
-              for m in $missing; do echo "- \`$m\`"; done
-              echo
-              echo "Both are published by one command, which checks and names everything it"
-              echo "needs first and verifies both refs afterwards the way this job resolves"
-              echo "them. It publishes nothing twice, so re-running it is how you wait for the"
-              echo "QEMU build (tens of minutes) to finish:"
-              echo '```'
-              echo "  task guest:inputs:check      # what is missing, and the fix for each"
-              echo "  task guest:inputs:publish REPO=${{ github.repository }}"
-              echo '```'
-              echo "The kernel is the part that needs a particular machine: storage never"
-              echo "builds one (ADR-0021), so run it where a sibling spinbox checkout has"
-              echo "already built the pinned artefact. Everything else it does for itself."
-              echo
-              echo "Until they exist this gate is red, deliberately: the proofs that a real Linux"
-              echo "kernel drives this system are the ones it is least safe to assume."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::guest-backed proofs cannot run — not published:${missing}"
-            exit 1
-          fi
-
-      # Into the canonical path the whole lane reads (ADR-0022). `task fetch:kernel` is
-      # idempotent and hash-checked, so the guest jobs below re-run it against the
-      # downloaded file and it returns immediately — with the pin verified there too.
-      - name: Fetch the pinned guest kernel
-        run: task fetch:kernel GUEST_KERNEL_IMAGE=${{ steps.resolve.outputs.kernel-image }}
-
-      - name: Upload it for the guest jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: guest-kernel
-          path: _output/guest/vmlinux
-          retention-days: 1
-          if-no-files-found: error
-
-  # The lanes that boot a real Linux kernel, and nothing else. QEMU, a kernel and an
-  # initramfs are files, so this job needs no Docker at all — which is why it is separate
-  # from the e2e one below, and why a broken Docker socket cannot take it down with it.
-  guest-lane:
-    needs: guest-inputs
-    runs-on: ubuntu-latest
-    # No /dev/kvm on a hosted runner, so the guest boots under TCG and the lane's own
-    # `-timeout 15m` is the binding constraint; the rest is a Go build and an initramfs.
-    # A lane that has not finished in this long is hung, and a hung TCG guest produces no
-    # output to notice it by.
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: read
-    container:
-      image: ${{ needs.guest-inputs.outputs.qemu-image }}
-      # A container job pulls its image before any step runs, so no `docker login` step
-      # could ever authenticate it and ghcr.io packages are private by default. Without
-      # these the pull fails *after* the preflight said the image exists — a red gate
-      # that means "the registry is private".
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      # The image's ENTRYPOINT is qemu-system-x86_64; a job needs a shell instead.
-      options: --entrypoint /bin/bash
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Set up Task
-        uses: go-task/setup-task@v2
-
-      # The runtime image is ubuntu plus seven shared libraries (Dockerfile.qemu) — it
-      # carries QEMU's dependencies, not a toolchain. `task guest:verify` needs cpio to
-      # look inside the initramfs and readelf/strings to read the kernel's PVH note and
-      # its embedded config, and since 2026-08-04 it *fails* when it cannot look rather
-      # than printing OK. Installing them here rather than in Dockerfile.qemu keeps the
-      # shipped image to what QEMU needs to run; this is the preflight's tooling, and it
-      # is three packages that announce themselves by name when they are absent.
-      #
-      # ca-certificates is the third and it is not the preflight's: the image carries
-      # QEMU's seven shared libraries and no CA bundle, so `go mod download` inside it
-      # fails every module with `x509: certificate signed by unknown authority`. It goes
-      # here rather than into Dockerfile.qemu for the reason above and one more — putting
-      # it in the image means rebuilding and republishing QEMU, which is tens of minutes
-      # and leaves the already-published image stale, to fix something only a job that
-      # compiles Go inside the image ever needs.
-      - name: Install what the preflight reads artefacts with
-        run: |
-          apt-get update
-          apt-get install --no-install-recommends -y cpio binutils ca-certificates
-
-      - name: Take the kernel the preflight pinned
-        uses: actions/download-artifact@v4
-        with:
-          name: guest-kernel
-          path: _output/guest
-
-      # The image lays QEMU out as /usr/local/bin + /usr/share/spin-stack/qemu; the lane
-      # expects <root>/bin + <root>/share/spin-stack/qemu and reads QEMU_OUTPUT_DIR to
-      # find it. Symlinks rather than copies: a copy is a second thing that can be stale.
-      - name: Point the lane at the image's QEMU
-        run: |
-          set -euo pipefail
-          mkdir -p _output/share
-          ln -sfn /usr/local/bin _output/bin
-          ln -sfn /usr/share/spin-stack _output/share/spin-stack
-
-      # REQUIRE_PROOFS=1 is the whole point of this job: it makes the lane fail instead
-      # of skipping if any of the above did not produce what it claims to have produced.
-      # Without it a missing kernel is a green run that booted nothing.
-      - name: The guest lane (a real Linux kernel issues FLUSH)
-        run: task test:integration:qemu REQUIRE_PROOFS=1
-
-  # The other half of the guest-backed proofs, and the half that has never run anywhere
-  # but a laptop: integration/e2e boots a guest against the socket a real volume-agent
-  # process bound, with a real Postgres and a real RustFS behind it. It is where INV-18
-  # is established — a guest's fsync puts zero objects in the bucket — and `task ci:full`
-  # was reporting success without it.
-  #
-  # It needs what ADR-0025 said one job could not have: the pinned QEMU *and* a Docker
-  # daemon. The daemon is the host's, mounted in — TestContainers speaks the API over
-  # that socket and resolves published ports through the bridge gateway when it detects
-  # it is itself in a container. Rejected alternatives: installing QEMU's shared
-  # libraries onto a bare runner (ADR-0025 — a second dependency list, whose drift shows
-  # up as a QEMU that will not start, in the lane least able to afford that confusion),
-  # and Docker-in-Docker (a second daemon, no layer cache, and privileged).
-  #
-  # UNVERIFIED, and stated rather than discovered: no workflow in this repository has
-  # ever executed, and the socket mount is the one part of this file that cannot be
-  # reasoned to a conclusion from the Taskfile — it depends on how the runner networks a
-  # container job against the daemon's bridge. If it fails, it fails loudly here and the
-  # gate is red; it cannot make the gate green while proving nothing, which is the
-  # property that matters.
-  guest-e2e-lane:
-    needs: guest-inputs
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: read
-    container:
-      image: ${{ needs.guest-inputs.outputs.qemu-image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --entrypoint /bin/bash -v /var/run/docker.sock:/var/run/docker.sock
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Set up Task
-        uses: go-task/setup-task@v2
-
-      - name: Install what the preflight reads artefacts with
-        run: |
-          apt-get update
-          apt-get install --no-install-recommends -y cpio binutils ca-certificates
-
-      - name: Take the kernel the preflight pinned
-        uses: actions/download-artifact@v4
-        with:
-          name: guest-kernel
-          path: _output/guest
-
-      # Same symlinks as the guest lane, and one addition: _output/bin is where
-      # `task build:cmd` puts control-plane and volume-agent, and in this job it is a
-      # symlink to the image's /usr/local/bin. That is deliberate — the two binaries and
-      # QEMU end up in one directory, which is exactly what testinfra.Binary and
-      # testinfra.QEMUPaths both look in.
-      - name: Point the lane at the image's QEMU
-        run: |
-          set -euo pipefail
-          mkdir -p _output/share
-          ln -sfn /usr/local/bin _output/bin
-          ln -sfn /usr/share/spin-stack _output/share/spin-stack
-
-      - name: The e2e lane, with a guest in it
-        run: task test:e2e REQUIRE_PROOFS=1
-
-  # Everything that does not need a guest, run as the one target a developer runs.
-  #
-  # This job used to run `task ci:full` and was the whole gate. It cannot: this runner
-  # has Docker and no QEMU, and `ci:full` now refuses to skip. `ci:noguest` is that same
-  # list of lanes with the guest-backed proofs left out — one definition in the Taskfile
-  # instantiated twice, so adding a lane cannot reach one and miss the other — and it
-  # says in its name and in its last line of output what it did not prove. The `gate` job
-  # below is what makes that honest here.
+  # The merge gate, run as the one target a developer runs. It is `ci:full` and not a
+  # list of steps for the reason the Taskfile exists: a second definition of what the gate
+  # is, maintained in a workflow file, goes out of step with the first exactly when a lane
+  # is added.
   ci:
     runs-on: ubuntu-latest
     # Measured against nothing — these workflows have never executed (STATUS.md) — so
     # this is a ceiling, not a budget: enough for the race suite, the coverage run and
-    # three Docker-backed lanes (e2e alone allows itself 15m) on a two-core runner, and
-    # far below the six-hour default that would let one wedged TestContainer hold a
-    # runner for a working day.
+    # the Docker-backed lanes (e2e alone allows itself 15m) on a two-core runner, and far
+    # below the six-hour default that would let one wedged TestContainer hold a runner
+    # for a working day.
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -341,8 +90,8 @@ jobs:
       - name: Install pinned tools
         run: task tools
 
-      - name: Everything that does not need a guest (task ci:noguest)
-        run: task ci:noguest
+      - name: The merge gate (task ci:full)
+        run: task ci:full
 
   # The gate. This is the check to require on the branch, and the only job here whose
   # green means what a reader assumes it means.
@@ -351,16 +100,14 @@ jobs:
   # dependent job free to run, and a workflow all of whose jobs are green-or-grey is
   # reported as a passing run. That is the same defect as `task ci:full` exiting 0 after
   # printing SKIP, one level up, and this job is the same fix — a lane that did not run
-  # is a lane that did not pass.
+  # is a lane that did not pass. It stays a job of its own with one `needs` entry because
+  # the qcow2 lane restores the second, and a gate assembled only when there is something
+  # to assemble is a gate nobody adds back.
   #
   # `if: always()` is required, not decorative: without it this job is itself skipped the
   # moment anything it needs fails, and a skipped gate is a gate that never says no.
   gate:
-    # guest-inputs is listed even though nothing downstream of it can succeed without it:
-    # when the two artefacts are unpublished it is the job that *says so*, and a table
-    # naming it is a reader's first stop. Its absence here would show up only as two
-    # skipped guest lanes with no stated cause.
-    needs: [ci, guest-inputs, guest-lane, guest-e2e-lane]
+    needs: [ci]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -410,8 +157,8 @@ jobs:
           done <<< "$results"
           if [ "$failed" -ne 0 ]; then
             echo >> "$GITHUB_STEP_SUMMARY"
-            echo "A lane that was **skipped** counts as a failure: the guest-backed proofs are" >> "$GITHUB_STEP_SUMMARY"
-            echo "this system's headline claims, and a run that did not make them has not passed." >> "$GITHUB_STEP_SUMMARY"
+            echo "A lane that was **skipped** counts as a failure: a run that did not make a" >> "$GITHUB_STEP_SUMMARY"
+            echo "proof this repository claims has not passed the gate, it has failed to reach it." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           echo "every lane ran and passed"

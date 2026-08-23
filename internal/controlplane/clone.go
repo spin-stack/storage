@@ -209,13 +209,11 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 	}
 	// `chain_depth` acquires the producer §26.2 declared it with and it has never had.
 	//
-	// **Here rather than on the Agent, and the distinction is the whole reason it is a
-	// second series.** `read_view_layers` already reports what a read *walks* — every
-	// layer, including the ones a Freeze adds and no lineage explains — recorded by the
-	// process that walks it, at the cadence it changes. This one is the catalog's number:
-	// the one the ceiling above refuses on and the one FLATTEN reduces. An operator
-	// comparing them is comparing a claim with what the object store actually made of it,
-	// which is only possible while they are two series.
+	// **Here rather than on the Agent**, because it is the catalog's number: the one the
+	// ceiling above refuses on and the one a flatten reduces. It used to have a sibling
+	// on the Agent — `read_view_layers`, what a read actually walked — and comparing the
+	// two was comparing a claim with what the object store made of it. That one went with
+	// the read view; this one is the claim, and it is the half the Control Plane owns.
 	//
 	// Recorded at the change and not polled, because between a clone and a FLATTEN a
 	// volume's depth cannot move: a poller would re-report, at fleet cardinality and from

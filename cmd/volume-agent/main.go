@@ -4,16 +4,30 @@
 // client and hand them over — main is the only place in the tree where a real
 // implementation is constructed (INV-01).
 //
-// It carries a data path: one runtime per volume the Control Plane lists for this
-// host, each with its own WAL, block device and vhost-user socket a guest attaches to.
-// A guest's FLUSH is ACKed on an fdatasync of that WAL; the object store holds a
-// volume's image, which it reads at attach and writes when the volume stops or a
-// snapshot freezes it.
+// # It carries no data path, and that is this build's whole shape
+//
+// It used to: one runtime per volume the Control Plane listed for this host, each with
+// its own write-ahead log, block device and vhost-user socket a guest attached to. That
+// engine is withdrawn. QEMU manages the local copy-on-write format through qcow2 from
+// here on, and this system's job narrows to immutable commits, publication to object
+// storage, and recovery — none of which this binary performs yet.
+//
+// So what runs is exactly the half that talks to the Control Plane: this host claims its
+// data directory, reads its key, registers, heartbeats, holds a lease, learns which
+// volumes it is supposed to be serving, and reports an empty set. It says so on the way
+// up, on every cycle that has work it cannot do, and on the way down. An operator who
+// starts it gets a host that appears in `-fleet-status` and serves nothing, which is the
+// truth.
+//
+// **What Stage 1 adds**: a volume manager over qcow2 — create, attach, restart, detach,
+// local persistence — driven by QMP, plugged into the loop at agent.VolumeReconciler,
+// which is the seam left standing for it. Nothing remote in Stage 1: no object store
+// flags here, because an Agent that took a bucket it never wrote to would be claiming a
+// capability it does not have.
 package main
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,19 +39,12 @@ import (
 	"syscall"
 	"time"
 
-	"connectrpc.com/connect"
-
-	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
-	"github.com/spin-stack/storage/internal/blockdev"
 	"github.com/spin-stack/storage/internal/crypto"
-	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/obs"
-	"github.com/spin-stack/storage/internal/simio/clock"
+	"github.com/spin-stack/storage/internal/simio/disk"
 	"github.com/spin-stack/storage/internal/simio/real"
-	"github.com/spin-stack/storage/internal/storecfg"
-	"github.com/spin-stack/storage/internal/vhost/hostio"
 )
 
 // version is the build identity the Agent reports. Overridden at link time with
@@ -48,36 +55,15 @@ var version = "dev"
 // It is a constant of the binary, not configuration: it describes the code.
 const maxFormatVersion = 1
 
+// lockFile is this host's claim on its data directory, inside it. The name is part of
+// the operator's world — it is what a human looks for to find out whether an Agent is
+// holding a directory — so it is a constant here and not a path built at the call site.
+const lockFile = "agent.lock"
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("volume-agent exited", "error", err)
-		os.Exit(exitCode(err))
-	}
-}
-
-// exitCode turns the teardown's outcome into the number a supervisor reads. It is the
-// only thing that tells systemd whether restarting this unit is the fix or the harm.
-//
-//	0  every session this host was serving is in the object store
-//	1  something is not: restart, and the next incarnation re-attaches at the same epoch
-//	   (ADR-0024) with the local WAL intact and publishes it
-//	2  another writer published over us: this host's copy is *older* than what is in the
-//	   bucket, so do not restart — a restart would only try to lose that race again
-//
-// Abandonment is checked first, and the order is the decision. A teardown can end with
-// one volume superseded and another abandoned by an impatient operator, and those two
-// want opposite things from a supervisor. Restarting is safe for the superseded volume —
-// it re-reads the manifest, finds itself behind, and refuses again — while *not*
-// restarting leaves the abandoned session on a disk nothing will ever read. So the code
-// that asks for a restart wins whenever both are true.
-func exitCode(err error) int {
-	switch {
-	case errors.Is(err, agent.ErrPublishAbandoned):
-		return 1
-	case errors.Is(err, image.ErrSuperseded):
-		return 2
-	default:
-		return 1
+		os.Exit(1)
 	}
 }
 
@@ -85,24 +71,17 @@ func run() (err error) {
 	var (
 		hostID       = flag.String("host-id", "", "fleet identity of this host: a UUIDv7 (required; mint one with `uuidgen` only if it is v7)")
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
-		dataDir      = flag.String("data-dir", "", "directory holding this Agent's WAL, and the lock that keeps one Agent per host (required)")
-		socketDir    = flag.String("vhost-socket-dir", "", "directory this Agent binds one vhost-user socket per volume in (required)")
+		dataDir      = flag.String("data-dir", "", "directory holding this Agent's local state, and the lock that keeps one Agent per host (required)")
 		interval     = flag.Duration("heartbeat-interval", 5*time.Second, "reconciliation cadence")
 		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
 		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
-		grace = flag.Duration("shutdown-grace", 60*time.Second,
-			"bound on ONE publish attempt at shutdown, not on the shutdown: an Agent that cannot publish keeps its data directory and retries until it can, or until a second signal")
 		metricsListen = flag.String("metrics-listen", "",
 			"host:port for the operator endpoint: GET /metrics (Prometheus text) and GET /healthz. Empty disables it, and then this process holds no listening socket at all")
-		kekFile    = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent runs unencrypted, which is dev mode only")
-		maxVolumes = flag.Int("max-volumes", agent.DefaultMaxVolumes,
-			"how many volumes this host serves at once, and what its device budget is divided by: each volume's WAL is bounded by that share (ADR-0013 §1)")
+		kekFile = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent holds no key material, which is dev mode only")
 	)
-	var storeFlags storecfg.Flags
-	storeFlags.Register(flag.CommandLine)
 	flag.Parse()
 
 	switch {
@@ -112,13 +91,6 @@ func run() (err error) {
 		return errors.New("-control-plane is required")
 	case *dataDir == "":
 		return errors.New("-data-dir is required")
-	case *socketDir == "":
-		return errors.New("-vhost-socket-dir is required")
-	}
-
-	// Answered once, here, and not per volume per cycle for ever. See checkSocketDir.
-	if err := checkSocketDir(*socketDir); err != nil {
-		return err
 	}
 
 	cfg := agent.Config{
@@ -131,8 +103,7 @@ func run() (err error) {
 	}
 
 	// Validated before anything is opened: a typo'd flag should fail on the flag, not
-	// behind a connection error from whichever of the disk and the object store
-	// happened to be tried first.
+	// behind a connection error from whichever dependency happened to be tried first.
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -155,80 +126,53 @@ func run() (err error) {
 	}
 	defer func() {
 		// WithoutCancel: the final flush must outlive the SIGTERM that started the
-		// shutdown, and this Agent's most interesting samples — the publish duration,
-		// the holding line's attempts — are produced during it. Logged and never
-		// fatal: a collector that is down must not change what the Agent's exit code
-		// says about the guest's data.
+		// shutdown. Logged and never fatal: a collector that is down must not change
+		// what this process's exit code says.
 		if err := telemetry.Shutdown(context.WithoutCancel(ctx)); err != nil {
 			slog.Error("flushing metrics", "error", err)
 		}
 	}()
 
-	// Before the disk, the object store and the KEK are opened, and that is the point:
-	// those are the startup steps that hang, and an Agent that answers /healthz while
-	// /metrics is still empty is telling an operator exactly where it is stuck.
+	// Before the disk and the KEK are opened, and that is the point: those are the
+	// startup steps that hang, and an Agent that answers /healthz while /metrics is
+	// still empty is telling an operator exactly where it is stuck.
 	if *metricsListen != "" {
 		defer serveOperatorEndpoint(*metricsListen, telemetry)()
 	}
 
-	disk, err := real.NewDisk(*dataDir)
+	dataDisk, err := real.NewDisk(*dataDir)
 	if err != nil {
 		return fmt.Errorf("opening the data directory: %w", err)
 	}
 
-	// The device budget, before any volume can be served (ADR-0013 §1). It is measured
-	// and divided here because there is no honest default: an Agent that started with
-	// no budget would run with no write-path bound of any kind — which is what every
-	// Agent this repository has ever run did, since nothing set wal.Limits — and the
-	// first thing it would do about a filling device is take it to ENOSPC in the
-	// middle of a guest's WRITE.
+	// §10 opens with "un proceso por host". Two live Agents on one --data-dir is not a
+	// hypothetical: whatever local format the volumes take, both incarnations open the
+	// same files under it, and the second silently takes the guest from the first.
 	//
-	// The failure to *measure* is fatal for the same reason DiskUsage refuses to
-	// smooth it into a zero: an unreadable device that looks empty reads as headroom
-	// to every rule downstream.
-	usage, err := agent.NewDiskUsage(disk).Usage(ctx)
+	// It is taken in main, which is where the previous version deliberately did not put
+	// it: the volume manager owned the data directory and took it there, so no step was
+	// left to a caller that spin's runner would not inherit (ADR-0021). There is no
+	// volume manager now, and a claim on the directory has to outlive one anyway — this
+	// process holds it whether or not it is serving. The qcow2 manager should take it
+	// back the moment it owns the directory's layout.
+	unlock, err := dataDisk.Lock(lockFile)
 	if err != nil {
-		return err
+		if errors.Is(err, disk.ErrLocked) {
+			return fmt.Errorf("another Volume Agent is already using %s (§10: one Agent per host): %w", *dataDir, err)
+		}
+		return fmt.Errorf("claiming %s: %w", *dataDir, err)
 	}
-	// And the machine, for the same reason and in the same shape. The read view is the
-	// one per-volume structure the *guest* sizes — one entry per distinct region it has
-	// written, and nothing shrinks it during a session — so its bound was the only one
-	// in this Agent that was a constant rather than a division: 256 MiB per volume,
-	// whether this host has 8 GiB or 512 GiB, times -max-volumes, with the OOM killer as
-	// the enforcement. An OOM takes the whole Agent and every other tenant's session with
-	// it, which is the one failure the guests cannot be told about.
-	//
-	// It is measured here rather than behind an interface because nothing runs through
-	// it: two numbers, read once, before any volume exists (real.MeasureMemory says why).
-	// A failure is fatal for the same reason the device's is — a machine that will not
-	// say how big it is offers no honest fallback, since guessing high ends at the OOM
-	// killer and guessing low throttles guests on a host that was fine.
-	mem, err := real.MeasureMemory()
-	if err != nil {
-		return err
-	}
-	budget, err := agent.NewBudget(usage, mem.LimitBytes, *maxVolumes)
-	if err != nil {
-		return err
-	}
+	// The kernel drops an flock when the process dies, so this defer is for the paths
+	// that return rather than for a crash — nothing has to clean up after one.
+	defer func() { err = errors.Join(err, unlock.Close()) }()
 
-	// The object store holds every volume's image: the chunks a volume is attached
-	// over (image.Load, composing a clone's ancestry first) and where its state is
-	// written when it stops or a snapshot freezes it. It is opened here, at startup,
-	// so a store that cannot be opened — a missing bucket, refused credentials,
-	// versioning off — stops this process instead of the first attach: a host that
-	// cannot reach it can serve nothing, and finding that out one volume at a time
-	// costs each guest the boot it was promised.
-	store, err := storeFlags.Open(ctx)
-	if err != nil {
-		return err
-	}
-	// §15: every payload of guest data is sealed with the volume's DEK before any
-	// PUT. The KEK is read once, here — the Agent unwraps a DEK only at attach
-	// (§15.1) and keeps it in memory. Without -kek-file there is no KMS and the Agent
-	// runs in the clear, which is honest for dev and refused for anything else by the
-	// operator who chose not to pass the flag.
-	var kms crypto.KMS
+	// §15: guest data is sealed with the volume's DEK, wrapped under this KEK. Nothing
+	// in this build unwraps one — there is no data path to seal for — so the key is read
+	// and its id derived, and no KMS is built over it. Reading it is not ceremony: the
+	// Control Plane wraps every volume's DEK under the KEK *it* read, an Agent that
+	// reaches a different key from the same file has volumes it can never open, and the
+	// two binaries disagreeing about how to parse the file is a defect this repository
+	// has already shipped once. The id on this line is what makes them comparable.
 	if *kekFile != "" {
 		kekDisk, kerr := real.NewDisk(filepath.Dir(*kekFile))
 		if kerr != nil {
@@ -238,102 +182,28 @@ func run() (err error) {
 		if kerr != nil {
 			return kerr
 		}
-		// The id is derived from the key, never configured: it is what the volume row
-		// records and what the Agent compares against before unwrapping, and the
-		// Control Plane derives it the same way from the same file (crypto.KEKID).
-		kms = crypto.NewDevKMS(kek, crypto.KEKID(kek))
 		slog.Info("key-encryption key loaded", "kek_id", crypto.KEKID(kek))
 	} else {
-		slog.Warn("no -kek-file: this Agent writes guest data unencrypted (§15 requires encryption outside dev)")
+		slog.Warn("no -kek-file: this Agent holds no key material (§15 requires encryption outside dev)")
 	}
 
-	// Built here rather than inline in agent.Deps because the teardown needs it too: the
-	// last thing this process does, once every image is in the bucket, is tell the Control
-	// Plane the sequence it just published (see reportSettled).
 	cp := storagev1connect.NewControlPlaneServiceClient(
 		&http.Client{Timeout: *httpTimeout}, *cpURL)
 
-	// One runtime per volume, each with its own WAL, block device and vhost-user
-	// socket. This is what the Agent serves from — before it, the binary heartbeated
-	// about an empty set forever.
-	//
-	// The lease is passed as a call through to the loop, not as the loop's
-	// *lease.Manager: applyLease allocates a new manager whenever the Control Plane
-	// changes the TTL, and a Log holding the old one would be gated by something nobody
-	// renews — it would self-fence a perfectly healthy host and never recover. The
-	// closure reads `loop` after it is assigned below; until then it answers false,
-	// which is the safe direction (no lease, no durable ACK).
-	var loop *agent.Loop
-	volumes, err := agent.NewVolumeManager(agent.VolumeManagerConfig{
-		// "." and not *dataDir: the Disk above is already rooted at --data-dir, which
-		// is what keeps the Agent from writing outside it, and DataDir is a path
-		// inside that namespace. Passing the operator's absolute path here put every
-		// WAL under <data-dir>/<data-dir>/wal/... — consistent, restart-safe, and
-		// nowhere near where the operator was told to look.
-		DataDir: ".",
-		// The same directory, spelled for the human who has to find it. Without it the
-		// line that says "I am holding this directory and will not let go" said
-		// `data_dir=.`, which is true of every Agent that has ever run and useful to
-		// nobody — see DataDirLabel.
-		DataDirLabel: *dataDir,
-		SocketDir:    *socketDir,
-		// One attempt's bound, not the teardown's: see -shutdown-grace, and
-		// The reviewed decision: there is no budget
-		// after which this process gives a session up.
-		ShutdownGrace: *grace,
-		// Every Log this manager builds is bounded by its share of this (ADR-0013 §1).
-		Budget: budget,
-	}, agent.VolumeManagerDeps{
-		Clock:   real.NewClock(),
-		Disk:    disk,
-		Listen:  hostio.Listen,
-		Mapper:  hostio.NewMapper(),
-		EventFD: hostio.NewEventFD,
-		Store:   store,
-		KMS:     kms,
-		// §15: the image chunk nonces. Real randomness in the binary; the DST
-		// harness injects a seeded reader so the same seed gives the same ciphertext.
-		Rand: rand.Reader,
-		// Every volume's Log gets this too — VolumeManager hands it down at the one
-		// place a Log is built (see start).
-		Recorder: telemetry.Recorder(),
-		// Read through the loop for the same reason the lease is: the loop is assigned
-		// below, and it owns the cache whose entries are evicted when a volume leaves
-		// this host's desired state.
-		Keys: func(ctx context.Context, volumeID string) (agent.VolumeKeys, error) {
-			if loop == nil {
-				return agent.VolumeKeys{}, errors.New("the Agent loop is not running yet")
-			}
-			return loop.VolumeKeys(ctx, volumeID)
-		},
-	})
-	if err != nil {
-		return err
-	}
-	// The teardown is deferred so that every path out of run() — including the wiring
-	// failures below — releases this host's claim on the data directory. Its error is
-	// *joined into run's*, which is the whole point and used not to be: the old shape
-	// logged it from a deferred function, and a deferred function cannot change the
-	// process's exit status, so the Agent exited 0 whether or not the session it was
-	// serving ever reached the bucket.
-	defer func() {
-		err = errors.Join(err, shutdown(cfg.HostID, cp, volumes, loop))
-		if err == nil {
-			// Printed here, after the images are settled, so "stopped" means stopped
-			// rather than "asked to stop". An operator greps for this line to tell a
-			// clean shutdown from a disappearance.
-			slog.Info("volume-agent stopped")
-		}
-	}()
+	// An empty VolumeSource, and it is not a placeholder that will quietly start working:
+	// it is a set nothing ever puts a volume into, because nothing in this build can
+	// serve one. The loop hands the desired state to a VolumeReconciler when its source
+	// happens to be one, and this is not one, so the desired state is recorded and acted
+	// on by nobody. See the package doc for what fills this in.
+	volumes := agent.NewVolumeSet()
 
-	loop, err = agent.New(cfg, agent.Deps{
+	loop, err := agent.New(cfg, agent.Deps{
 		Clock:        real.NewClock(),
 		ControlPlane: cp,
-		// The device is measured, not declared: NewDiskUsage statfs's the
-		// filesystem holding --data-dir, so the capacity ADR-0013's thresholds
-		// divide by is the disk's own answer and includes what other tenants of
-		// that filesystem occupy.
-		Device:   agent.NewDiskUsage(disk),
+		// The device is measured, not declared: NewDiskUsage statfs's the filesystem
+		// holding --data-dir, so the capacity ADR-0013's thresholds divide by is the
+		// disk's own answer and includes what other tenants of that filesystem occupy.
+		Device:   agent.NewDiskUsage(dataDisk),
 		Volumes:  volumes,
 		Recorder: telemetry.Recorder(),
 	})
@@ -341,79 +211,24 @@ func run() (err error) {
 		return err
 	}
 
-	// The budget is printed with the rest of the wiring, and it is the line an operator
-	// reads to find out why a guest is getting backpressure on a device that looks
-	// half empty: the share, not the device, is what bounds one volume.
 	slog.Info("volume-agent starting",
 		"host_id", cfg.HostID, "version", version, "control_plane", *cpURL,
-		"data_dir", *dataDir, "vhost_socket_dir", *socketDir,
-		"heartbeat_interval", cfg.HeartbeatInterval,
-		"device_bytes", budget.DeviceBytes, "guest_budget_bytes", budget.GuestBytes,
-		"reserve_bytes", budget.ReserveBytes, "max_volumes", budget.MaxVolumes,
-		"volume_share_bytes", budget.Share(),
-		// The memory half, and memory_source is what makes the number checkable: on a
-		// 256 GiB host running this Agent in a 2 GiB container, memory_bytes=2147483648
-		// looks like a parse bug until the line says it came from
-		// /sys/fs/cgroup/memory.max, which the operator can cat.
-		"memory_bytes", budget.MemoryBytes, "memory_source", mem.Source,
-		"volume_view_share_bytes", budget.ViewShare(),
+		"data_dir", *dataDir, "heartbeat_interval", cfg.HeartbeatInterval,
 		"metrics_listen", *metricsListen)
-
-	// Started with the loop and stopped with it: ctx is what ends both. It reads the
-	// devices the loop's VolumeManager owns, so it cannot start before that exists.
-	go watchSpacePressure(ctx, real.NewClock(), volumes, telemetry.Recorder(),
-		budget.Share(), cfg.HeartbeatInterval)
+	// Said once, at the top, in the log an operator is already reading. A process that
+	// registers a host and then serves nothing looks like a bug from the outside, and
+	// the difference between this and a bug is one line.
+	slog.Warn("this Agent serves no volumes: the local block engine is withdrawn and the qcow2 volume manager is not built yet",
+		"serves", "nothing", "reports", "an empty volume set", "next", "Stage 1: qcow2 create/attach/restart/detach, local only")
 
 	if err := loop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
+	// Printed here rather than from a deferred function, so "stopped" means the loop
+	// returned rather than "was asked to stop". An operator greps for this line to tell
+	// a clean shutdown from a disappearance.
+	slog.Info("volume-agent stopped")
 	return nil
-}
-
-// maxUnixPath is the longest filesystem path bind(2) accepts for a Unix socket:
-// sockaddr_un's sun_path is 108 bytes and the terminating NUL is one of them. Measured,
-// not read off a header — 107 binds, 108 returns EINVAL.
-const maxUnixPath = 107
-
-// socketNameLen is what every volume adds to the socket directory. The Agent binds
-// <socket-dir>/<volume-id>.sock, and a volume id is a UUID in its 36-character form, so
-// the suffix is the same 42 bytes for every volume this host will ever serve.
-const socketNameLen = len("/") + 36 + len(".sock")
-
-// checkSocketDir refuses a -vhost-socket-dir whose sockets could never be bound.
-//
-// # Why start-up, and not the place that binds
-//
-// Because start-up is where the question can be *answered*, and the binding site is
-// where it can only be discovered. The length of the directory is known before any
-// volume is, and it is the same answer for every volume, for the life of the process:
-// nothing a Control Plane says can turn a 164-byte directory into a bindable one.
-//
-// Discovered at the binding site it is not even a failure, it is a symptom. That path
-// runs inside the reconciliation loop, which treats a failed cycle as transient and
-// retries it every five seconds for ever, printing
-//
-//	WARN reconciliation cycle failed error="... bind: invalid argument" retry_in=5s
-//
-// while the Control Plane goes on reporting the volume placed. Nothing in that line says
-// which path, which limit, or that any length is involved — EINVAL from bind is the
-// kernel's only signal that sun_path overflowed — so the operator sees a volume that
-// never serves and a host that looks healthy. That is the failure this refusal ends, and
-// it is why it is fatal rather than a warning: a process that cannot serve any volume
-// should not be reporting itself as a host that can.
-//
-// The message carries the three numbers there is an action for: what was given, what the
-// kernel allows, and the longest directory that would work.
-func checkSocketDir(dir string) error {
-	// Cleaned first because the manager joins with path.Join, which cleans too: a
-	// trailing slash or a doubled separator is not what gets bound, and refusing on it
-	// would be refusing a directory that works.
-	clean := filepath.Clean(dir)
-	if len(clean)+socketNameLen <= maxUnixPath {
-		return nil
-	}
-	return fmt.Errorf("-vhost-socket-dir is %d bytes (%q), and every socket in it is that plus %d more for /<volume-id>.sock — over the %d bytes the kernel allows a Unix socket path (sun_path is %d bytes including the NUL). bind would fail with EINVAL for every volume, for ever. Use a directory of at most %d bytes",
-		len(clean), clean, socketNameLen, maxUnixPath, maxUnixPath+1, maxUnixPath-socketNameLen)
 }
 
 // serveOperatorEndpoint starts the Agent's only listening socket and returns the
@@ -422,10 +237,9 @@ func checkSocketDir(dir string) error {
 // **The Agent held no listening socket at all before this.** There was no /metrics, no
 // /healthz and no admin port: every series it collected could reach a collector over
 // OTLP or reach nobody, and nothing in this repository stood a collector up. So the
-// operational answer to "what is this Agent doing" was "read its log", and a guest
-// taking I/O errors produced no line in it. One read-only handler over what obs already
-// collects is the whole fix, and it is deliberately not more than that — a pilot needs
-// an answer from the process, not a platform.
+// operational answer to "what is this Agent doing" was "read its log". One read-only
+// handler over what obs already collects is the whole fix, and it is deliberately not
+// more than that — a pilot needs an answer from the process, not a platform.
 //
 // INV-01 and the socket: `cmd/` is where real implementations are constructed, and this
 // is an http.Server bound in a main, the same shape cmd/control-plane already uses for
@@ -434,10 +248,9 @@ func checkSocketDir(dir string) error {
 // there is nothing here for simio to model.
 //
 // A bind that fails is loud and not fatal, which is the one judgement call in this
-// function. The endpoint belongs to the operator, not to the guest: a port already in
-// use must not cost a tenant its session, and an Agent that exited here would be a new
-// way to lose one. What makes the failure detectable is the Error line — the thing that
-// must never happen is a scrape that silently never worked.
+// function. The endpoint belongs to the operator: a port already in use must not end the
+// process. What makes the failure detectable is the Error line — the thing that must
+// never happen is a scrape that silently never worked.
 func serveOperatorEndpoint(addr string, telemetry *obs.Provider) func() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -450,10 +263,10 @@ func serveOperatorEndpoint(addr string, telemetry *obs.Provider) func() {
 		_, _ = w.Write(body)
 	})
 	// Liveness and nothing more: this process is up and its handler loop is answering.
-	// It deliberately does not report on the Control Plane, the object store or any
-	// volume — a liveness probe that goes red because a dependency is down restarts an
-	// Agent that is holding a guest's only copy of its session, which is the opposite
-	// of what anyone wants. What the volumes are doing is /metrics' job.
+	// It deliberately does not report on the Control Plane or any volume — a liveness
+	// probe that goes red because a dependency is down restarts an Agent that may be
+	// holding a guest's only copy of its session, which is the opposite of what anyone
+	// wants. What the volumes are doing is /metrics' job.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
@@ -468,226 +281,4 @@ func serveOperatorEndpoint(addr string, telemetry *obs.Provider) func() {
 	}()
 	slog.Info("operator endpoint starting", "listen", addr, "metrics", "/metrics", "healthz", "/healthz")
 	return func() { _ = srv.Close() }
-}
-
-// watchSpacePressure turns a volume that has begun refusing guest writes for want of
-// space into something the host can see: one log line, and a gauge that stays up.
-//
-// The Agent had neither, and the hole was total. A guest that crossed its share got
-// `I/O error, dev vda` and a failed fsync — the tenant saw the truth — while the
-// Agent's log stayed at exactly its four start-up lines. Nothing in this process ever
-// sees that refusal on its own: it is produced in blockdev on the guest's goroutine and
-// handed straight back to a virtqueue that completes the request with IOERR.
-//
-// **Once per volume, not once per rejected write.** A guest under backpressure produces
-// thousands of refusals a second, and a line each would bury the log at the moment it
-// has to be readable. blockdev latches the fact instead of exposing a live predicate,
-// which is also what lets this poll run at the heartbeat's cadence without missing the
-// transition.
-//
-// Polled rather than called back, because a callback would have to be installed where
-// the Device is built — inside internal/agent — and the two things this line needs are
-// both here: the operator's log, and the device budget the share was divided out of.
-// The Agent's own volume share is not knowledge blockdev has or should acquire.
-func watchSpacePressure(ctx context.Context, clk clock.Clock, volumes *agent.VolumeManager,
-	rec *obs.Recorder, share int64, every time.Duration) {
-	// said carries the reason the WARN was said for, not just that it was said. A volume
-	// can cross the read view's bound, trim its way back under it, and later exhaust its
-	// device share — three different sentences with three different remedies, and a
-	// boolean would say the second and third out loud only if the operator happened to be
-	// reading when the first cleared.
-	said := map[string]blockdev.Reason{}
-	for {
-		if err := clk.Sleep(ctx, every); err != nil {
-			return
-		}
-		vols, err := volumes.Volumes(ctx)
-		if err != nil {
-			continue
-		}
-		live := make(map[string]bool, len(vols))
-		for _, v := range vols {
-			live[v.VolumeID] = true
-			dev, ok := volumes.Device(v.VolumeID)
-			if !ok {
-				continue
-			}
-			refusal, refused := dev.RefusedForSpace()
-
-			// Every reason gets a series, every cycle, and the ones that are not current
-			// are driven to 0 explicitly. A gauge only ever *set* to 1 keeps that value
-			// for ever once the condition ends — the staleness this whole change exists
-			// to remove, moved from a latch in the device into the time series instead.
-			for _, r := range blockdev.Reasons() {
-				value := 0.0
-				if refused && refusal.Reason == r {
-					value = 1
-				}
-				rec.Gauge(ctx, "volume_backpressure", value,
-					obs.String("volume", v.VolumeID), obs.String("reason", string(r)))
-			}
-
-			if !refused {
-				// The recovery is worth a line of its own: a volume that trimmed its way
-				// back under the read view's bound is serving again, and an operator who
-				// saw the WARN has no other way to learn that without watching the gauge.
-				if was, ok := said[v.VolumeID]; ok {
-					delete(said, v.VolumeID)
-					slog.Info("this volume is taking guest writes again",
-						"volume_id", v.VolumeID, "was_refusing_for", string(was))
-				}
-				continue
-			}
-			if said[v.VolumeID] == refusal.Reason {
-				continue
-			}
-			said[v.VolumeID] = refusal.Reason
-			// The remedy comes from the device rather than from a sentence written here:
-			// it is the same one the guest's own error carried, and there is exactly one
-			// place that knows which bound refused. A constant here is how this line came
-			// to tell every volume to stop, including the ones that only needed a trim.
-			slog.Warn("this volume is refusing guest writes; the guest is taking I/O errors and its fsync is failing",
-				"volume_id", v.VolumeID, "reason", string(refusal.Reason),
-				"volume_share_bytes", share, "remedy", refusal.Remedy)
-		}
-		// A volume that left this host is forgotten, so that the same volume attaching
-		// again — a new session, a new WAL, a new share — is reported again rather than
-		// silently suppressed by what its predecessor did.
-		for id := range said {
-			if !live[id] {
-				delete(said, id)
-			}
-		}
-	}
-}
-
-// shutdown publishes every session this host was serving and does not come back until it
-// has — holding the data-directory lock, and therefore this process's life, for as long
-// as that takes.
-//
-// Two things make that legible instead of merely stubborn, and they are both here:
-//
-//   - **the second signal**, which is the operator's override. It is registered *now* and
-//     not at start-up, because the first one is what got us here and a context registered
-//     before it would already be cancelled. Catching it is safe: signal.Notify delivers to
-//     every registered channel, and run's own handler is still installed (its stop() is
-//     deferred earlier, so it runs after this), which is what keeps the next signal from
-//     killing the process outright while it is holding data.
-//   - **the heartbeat**, which keeps running while we hold. Without it the Control Plane
-//     sees a host that stopped talking — indistinguishable from a crashed one — at exactly
-//     the moment the interesting fact is that the host is alive and stuck. Not the whole
-//     reconcile loop: reading the desired state again would start runtimes this teardown
-//     has just stopped.
-func shutdown(hostID string, cp storagev1connect.ControlPlaneServiceClient,
-	volumes *agent.VolumeManager, loop *agent.Loop) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if loop == nil {
-		return volumes.Close(ctx) // a wiring failure: there are no runtimes and nobody to tell
-	}
-	// Read *before* Close, because Close is the only thing that knows these volumes and it
-	// leaves nothing behind: a published volume is dropped out of the served set, so after
-	// it returns `Volumes` answers with an empty list and the sequence this host just wrote
-	// into the bucket exists nowhere in this process. See reportSettled for what is done
-	// with it.
-	held, herr := volumes.Volumes(ctx)
-	if herr != nil {
-		slog.Error("could not read the volumes this host is serving before publishing them; their sequences will not reach the catalog",
-			"error", herr)
-	}
-
-	sustainCtx, done := context.WithCancel(context.Background())
-	sustained := make(chan struct{})
-	go func() {
-		defer close(sustained)
-		loop.Sustain(sustainCtx)
-	}()
-
-	err := volumes.Close(ctx)
-	done()
-	<-sustained // joined rather than left running: it logs, and run() is about to return
-	if err != nil {
-		return err
-	}
-	reportSettled(ctx, hostID, cp, held)
-	return nil
-}
-
-// reportSettled tells the Control Plane what this host put in the object store, after
-// every image is in it and before the process exits.
-//
-// **Without it the most common path there is loses data silently.** An operator SIGTERMs
-// an Agent to upgrade it; the teardown publishes `image/<vol>/manifest.json` at sequence 8
-// and exits 0; and the catalog still says `published_sequence = 0`, because watermarks
-// only ever reached the Control Plane on a reconcile cycle and the last one happened
-// before the publish. The volume then re-attaches on a host with no local WAL, finds no
-// image — a stray delete, a lifecycle expiry, a restore that missed a key — and, because
-// the catalog says it never published, comes up as a blank device with no error anywhere.
-// That refusal (agent.ErrImageMissing) arms on `published_sequence > 0`, so the one number
-// that arms it was the one number nothing ever sent.
-//
-// # The number, and why it is a floor rather than a measurement
-//
-// It is `local_sequence` as it stood the instant before the teardown quiesced, sent as all
-// three watermarks. A successful publish writes the image at `ViewAtRest`'s sequence,
-// which *is* the log's local sequence at quiesce, and quiesce only ever lets the sequence
-// rise — so what is in the bucket is at least this. Under-claiming is the safe direction
-// for both floors: `published > 0` arms on any positive number, and the durability floor
-// compares with `<`, so a number below the truth never refuses a volume that is fine,
-// while a number above it would refuse one that is.
-//
-// Reading the exact sequence back out of the manifest would be better and is not available
-// here: `image`'s only exported reader pulls every chunk through the volume's DEK.
-//
-// # Only when Close returned cleanly
-//
-// A teardown that ends with a volume superseded or abandoned reports nothing at all. The
-// error `Close` returns is joined across volumes and cannot be attributed to one of them,
-// and the wrong direction to guess in is "published" — a volume whose image never reached
-// the bucket, recorded as having published, is a volume the floor would then refuse
-// forever. Reporting nothing costs a watermark the next incarnation re-establishes when it
-// republishes; reporting a publish that did not happen costs the volume.
-//
-// Failures here are logged and never fatal. The images are in the bucket either way, and
-// the exit code is a statement about the guest's data, not about the catalog.
-func reportSettled(ctx context.Context, hostID string, cp storagev1connect.ControlPlaneServiceClient,
-	held []agent.VolumeStatus) {
-	reports := make([]*storagev1.VolumeReport, 0, len(held))
-	for _, v := range held {
-		if v.LocalSequence == 0 {
-			continue // nothing was ever written: there is no floor to arm and no news
-		}
-		reports = append(reports, &storagev1.VolumeReport{
-			VolumeId: v.VolumeID,
-			// The epoch the report is qualified by (§12.3). It is the one this host was
-			// serving under, which is still the volume's current epoch — nothing has
-			// promoted anyone while we held the data directory — so the Control Plane
-			// accepts it. If something did, the report is refused and the catalog keeps
-			// the successor's numbers, which is the correct outcome.
-			Epoch:             v.Epoch,
-			LocalSequence:     v.LocalSequence,
-			DurableSequence:   v.LocalSequence,
-			PublishedSequence: v.LocalSequence,
-		})
-	}
-	if len(reports) == 0 {
-		return
-	}
-	resp, err := cp.ReportVolumeState(ctx, connect.NewRequest(&storagev1.ReportVolumeStateRequest{
-		HostId: hostID, Volumes: reports,
-	}))
-	if err != nil {
-		slog.Error("the sequences this host just published did not reach the Control Plane; the catalog still says these volumes never published, and an Agent that re-attaches will treat a missing image as a first boot",
-			"volumes", len(reports), "error", err)
-		return
-	}
-	for _, r := range resp.Msg.GetResults() {
-		if r.GetOutcome() == storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED {
-			continue
-		}
-		slog.Warn("the Control Plane refused this host's final report for a volume it just published",
-			"volume_id", r.GetVolumeId(), "outcome", r.GetOutcome().String())
-	}
-	slog.Info("published sequences reported", "volumes", len(reports))
 }

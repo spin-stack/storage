@@ -6,8 +6,17 @@
 //
 // Everything the loop touches is injected (INV-01): the clock, the RPC client, the
 // device, and the set of volumes this host is serving. cmd/volume-agent is the only
-// place the real implementations are constructed. VolumeManager (volume.go) is the
-// VolumeSource a WAL actually backs, and the loop hands it the desired state.
+// place the real implementations are constructed.
+//
+// **There is no volume manager behind the VolumeSource right now.** The one that was
+// here served each volume from a local write-ahead log through a vhost-user-blk socket,
+// and it went with that engine: QEMU owns the local copy-on-write format from here on,
+// and this system's job narrows to immutable commits, publication and recovery. What is
+// left is exactly the half that talks to the Control Plane — heartbeat, lease, desired
+// state, the report — and it is deliberately unchanged, because it is the half the new
+// design keeps. VolumeReconciler is the seam the qcow2 manager plugs into, and until it
+// exists the loop learns what this host should be serving and can act on none of it,
+// which is what VolumeSet stands in for and what the Agent says on the way up.
 package agent
 
 import (
@@ -45,17 +54,6 @@ type VolumeStatus struct {
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64
-	// RemoteGapBytes is not measured. Nothing sets it, and Loop.report does not carry it
-	// to the wire, so it is zero on every volume this host serves.
-	//
-	// It held the bytes no object in the store covered yet — a distance that existed
-	// while a FLUSH put every covering object before it ACKed. With the ACK local and one
-	// image published when the volume stops, there is no continuous distance to measure;
-	// what a host would lose if it died mid-session is bounded by the session, and
-	// deliberately nothing measures it (Loop.heartbeat says the same about the host-level
-	// number it used to send).
-	RemoteGapBytes int64
-
 	// SnapshotID is the snapshot this host was asked to take and has finished acting
 	// on, empty while there is nothing to say — including while an upload is still in
 	// flight, because a half-taken snapshot is not a fact the catalog can hold. The
@@ -70,8 +68,8 @@ type VolumeStatus struct {
 	// Refusal says this host is **not serving** this volume, and RefusalDetail is the
 	// sentence behind it. Unset is this host saying it is serving.
 	//
-	// It is the one field here that is not a measurement. Everything above is something
-	// the WAL holds; this is a decision the Agent made — the image the catalog promised
+	// It is the one field here that is not a measurement. Everything above is a number
+	// the volume's own storage holds; this is a decision the Agent made — the image the catalog promised
 	// is not in the bucket, the volume came back under the durability floor, the read
 	// view never resolved, there is no key for it, the lease lapsed. Every one of those
 	// was already correct and every one was invisible: a volume that fails closed keeps
@@ -98,15 +96,15 @@ type VolumeKeys struct {
 	DEKWrapped []byte
 	// KEKID names the key that wraps it, for a host holding more than one.
 	KEKID string
-	// DEKKeyID is the DEK's version (§15.1), the value RecordHeader.KeyID carries.
-	// It is not decoration: crypto.DevKMS binds it as GCM additional authenticated
+	// DEKKeyID is the DEK's version (§15.1). It is not decoration: crypto.DevKMS binds
+	// it as GCM additional authenticated
 	// data, so unwrapping with the wrong version fails outright rather than yielding
 	// a key that decrypts nothing. Never 0 — see VolumeKeys on the Loop.
 	DEKKeyID uint32
 }
 
-// VolumeSource is the set of volumes this host is serving right now. VolumeManager
-// implements it over the live WALs; VolumeSet stands in where there is no data path.
+// VolumeSource is the set of volumes this host is serving right now. VolumeSet is the
+// only implementation today, and it is a stand-in: see the package doc.
 type VolumeSource interface {
 	Volumes(ctx context.Context) ([]VolumeStatus, error)
 }
@@ -114,7 +112,9 @@ type VolumeSource interface {
 // VolumeReconciler is a VolumeSource that can also be told what this host *should* be
 // serving. The Loop uses it when its VolumeSource happens to be one; a plain source
 // leaves the desired state recorded and unacted-on, which is what a test driving
-// VolumeSet wants.
+// VolumeSet wants — and, until the qcow2 volume manager lands, what every real Agent
+// does. Nothing implements it in this tree; it is the seam, kept because the loop on
+// this side of it is not being rewritten.
 //
 // It is deliberately the same object as the source. What is reported and what is served
 // must come from one place: two would drift, and the report is what the Control Plane
@@ -138,8 +138,8 @@ type VolumeReconciler interface {
 	Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error
 }
 
-// VolumeSet is an in-memory VolumeSource. It is what the Agent runs against until
-// there is a data path to ask, and it is what tests drive.
+// VolumeSet is an in-memory VolumeSource. It is what the Agent runs against until there
+// is a data path to ask — which is every Agent today — and it is what tests drive.
 type VolumeSet struct {
 	mu   sync.Mutex
 	vols map[string]VolumeStatus
@@ -175,9 +175,9 @@ func (s *VolumeSet) Volumes(context.Context) ([]VolumeStatus, error) {
 	return out, nil
 }
 
-// DiskUsage is the Device backed by the disk this Agent writes its WAL to: it asks the
-// device itself (a statfs in production), rather than estimating from the files it
-// happens to know about.
+// DiskUsage is the Device backed by this Agent's data disk: it asks the device itself
+// (a statfs in production), rather than estimating from the files it happens to know
+// about.
 //
 // The difference is what the Agent cannot reclaim. A sum of our own files says
 // nothing about the space another tenant of the same filesystem occupies, and nothing

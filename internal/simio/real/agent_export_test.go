@@ -4,8 +4,8 @@ package real_test
 //
 // `TestOTLPExporterDeliversARecordedMetricToACollector` next door proves the exporter
 // exports and `obs`'s own tests prove the catalog aggregates, both in-process. The Agent
-// then builds the exporter from -otlp-endpoint and hands the Recorder down to every
-// wal.Log. Every link is covered and **the chain was never run**: a `volume-agent` that
+// then builds the exporter from -otlp-endpoint and hands the Recorder down. Every link
+// is covered and **the chain was never run**: a `volume-agent` that
 // built its Provider and dropped it, or wired a Recorder nothing reached, or exited
 // without the flush, satisfies every one of those tests. That is exactly the seam
 // CLAUDE.md's "build it thin, end to end" table is made of — `HostID` never set, the WAL
@@ -39,7 +39,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -55,11 +54,10 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 )
 
-// The two series an Agent with no volume attached can produce. Everything else in
-// obs.Catalog() is recorded by the WAL, the read view or a publish, and none of those
-// exist until the Control Plane names a volume for this host — so a volume-less Agent is
-// the smallest process that can prove the telemetry path at all, and these are the only
-// two names it can prove it with.
+// The two series this Agent can produce. Everything else in obs.Catalog() was recorded
+// by the local block engine, which is withdrawn — so what used to be "the smallest
+// process that can prove the telemetry path" is now the only one there is, and these are
+// the two names it proves it with.
 const (
 	leaseGauge     = "lease_remaining_seconds"
 	failureCounter = "lease_renewal_failures_total"
@@ -94,8 +92,6 @@ func TestARunningAgentDeliversItsLeaseGaugeToACollector(t *testing.T) {
 		"-host-id", host,
 		"-control-plane", cpsrv.URL,
 		"-data-dir", t.TempDir(),
-		"-vhost-socket-dir", shortSocketDir(t),
-		"-object-store-dir", t.TempDir(),
 		"-otlp-endpoint", otlp.URL,
 		// One cycle, then an hour of silence. The Agent's first cycle runs immediately
 		// and the next waits a heartbeat interval, so an interval longer than the test
@@ -162,8 +158,6 @@ func TestAnAgentThatCannotReachItsControlPlaneStillDeliversTheFailureCounter(t *
 		"-host-id", host,
 		"-control-plane", deadURL,
 		"-data-dir", t.TempDir(),
-		"-vhost-socket-dir", shortSocketDir(t),
-		"-object-store-dir", t.TempDir(),
 		"-otlp-endpoint", otlp.URL,
 		// Both an hour, so the failed cycle is not retried before the signal and the
 		// counter's value is exactly one rather than "however many the scheduler fitted".
@@ -403,24 +397,4 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string, p *agentProcess) {
 	case <-ctx.Done():
 		t.Fatalf("%s; it printed:\n%s", what, p.output())
 	}
-}
-
-// shortSocketDir is a socket directory the kernel can actually hold a bound socket in.
-// t.TempDir() embeds the test's name, and these names are long enough that the path plus
-// "/<volume-id>.sock" crosses sun_path's 108 bytes — so the Agent refuses it at start-up,
-// which is the check cmd/volume-agent added after a bring-up spent an afternoon on an
-// opaque "bind: invalid argument" retried every five seconds for ever. The old behaviour
-// let these tests start an Agent whose sockets could never have bound; they did not
-// notice because they assert on a metric and never serve a volume.
-func shortSocketDir(t *testing.T) string {
-	t.Helper()
-	// usetesting is right in general and wrong here, and the exception is the whole
-	// point of this helper: t.TempDir() embeds the test's name, which is what makes the
-	// path too long for sun_path in the first place.
-	dir, err := os.MkdirTemp("", "sk") //nolint:usetesting // t.TempDir() is the bug this works around
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
 }

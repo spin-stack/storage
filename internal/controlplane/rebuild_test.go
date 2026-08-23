@@ -1,19 +1,12 @@
 package controlplane_test
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 
-	"github.com/spin-stack/storage/internal/framed"
-
 	"github.com/spin-stack/storage/internal/controlplane"
-	"github.com/spin-stack/storage/internal/cow"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/image"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/placement"
@@ -21,12 +14,17 @@ import (
 )
 
 // bucketWithAVolumeAndASnapshot builds the S3 side of a small fleet the way production
-// writes it — a provisioned volume, a published image, a published snapshot, and a clone
-// of that snapshot — and returns the two volume ids.
+// writes it — a provisioned volume, a snapshot of it, and a clone of that snapshot — and
+// returns the two volume ids.
 //
-// It writes through the real producers (`Provisioner`, `Clone`, `image.PublishSnapshot`)
-// rather than hand-rolling objects, because a rebuild that only works against fixtures
-// somebody wrote for it is exactly the shape of test this project keeps finding.
+// It writes through the real producers (`Provisioner`, `Clone`) rather than hand-rolling
+// objects, because a rebuild that only works against fixtures somebody wrote for it is
+// exactly the shape of test this project keeps finding.
+//
+// The snapshot is a catalog row and no object. It used to be both: `image.PublishSnapshot`
+// wrote a manifest under the volume's prefix and the rebuild read the snapshot back out of
+// it. That object layout went with the chunked image, so the row is all there is, and the
+// rebuild no longer sees a snapshot at all — which is what the assertions below say.
 func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store objectstore.Store, term int64) (vol, clone, snap string) {
 	t.Helper()
 	ctx := t.Context()
@@ -40,16 +38,7 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 		t.Fatalf("Provision: %v", err)
 	}
 
-	u, err := ids.Parse(v.VolumeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	view := cow.NewIntervalMap()
-	view.Overwrite(0, []byte("the guest's bytes"))
 	snap = ids.New().String()
-	if _, err := image.PublishSnapshot(ctx, store, &ramp{}, nil, image.OwnLineage([16]byte(u)), view, nil, 9, snap); err != nil {
-		t.Fatalf("PublishSnapshot: %v", err)
-	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
 		SnapshotID: snap, VolumeID: v.VolumeID, Epoch: 1, TargetSequence: 9,
 		State: lifecycle.SnapshotPublished, RequestID: ids.New().String(),
@@ -85,8 +74,8 @@ func TestRebuildMetadataFromTheBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RebuildMetadata: %v", err)
 	}
-	if sum.Volumes != 2 || sum.Snapshots != 1 {
-		t.Fatalf("rebuilt %+v, want 2 volumes and 1 snapshot", sum)
+	if sum.Volumes != 2 {
+		t.Fatalf("rebuilt %+v, want 2 volumes", sum)
 	}
 
 	got, err := fresh.GetVolume(ctx, vol)
@@ -106,91 +95,38 @@ func TestRebuildMetadataFromTheBucket(t *testing.T) {
 	if got.PrimaryHostID != "" {
 		t.Errorf("the rebuild invented a primary host: %q", got.PrimaryHostID)
 	}
-
-	gotSnap, err := fresh.GetSnapshot(ctx, snap)
-	if err != nil {
-		t.Fatalf("the snapshot was not rebuilt: %v", err)
-	}
-	// A manifest exists, is create-only and never changes (INV-16), so its existence is
-	// PUBLISHED — and its sequence is the point it froze, which is what a clone descends
-	// from.
-	if gotSnap.State != lifecycle.SnapshotPublished || gotSnap.TargetSequence != 9 || gotSnap.VolumeID != vol {
-		t.Fatalf("rebuilt snapshot = %+v", gotSnap)
+	// Nothing above zero can be proved from any object now: the manifest that stated a
+	// volume's published sequence is withdrawn. Zero is the safe direction for both of
+	// the Agent's floors — `published > 0` arms on any positive number and the durability
+	// floor compares with `<` — so a rebuild that under-claims never refuses a volume
+	// that is fine, while one that guessed high would refuse one that is.
+	if got.PublishedSequence != 0 || got.DurableSequence != 0 || got.LocalSequence != 0 {
+		t.Errorf("a rebuild claimed sequences it has no object for: %d/%d/%d",
+			got.LocalSequence, got.DurableSequence, got.PublishedSequence)
 	}
 
-	// The chain, which is the part a two-pass rebuild would get wrong: the clone's row
-	// references a snapshot row that references the clone's parent volume.
+	// The snapshot does not come back, and its absence is the assertion. Its existence
+	// was read out of a manifest under the volume's prefix; with that object gone there
+	// is nothing in the bucket that states a snapshot exists, and inventing the row would
+	// point a clone at a parent nothing can serve.
+	if _, err := fresh.GetSnapshot(ctx, snap); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("the rebuild recorded a snapshot it cannot have read: %v", err)
+	}
+
 	gotClone, err := fresh.GetVolume(ctx, clone)
 	if err != nil {
 		t.Fatalf("the clone was not rebuilt: %v", err)
 	}
-	if gotClone.ParentSnapshotID != snap {
-		t.Fatalf("the rebuilt clone lost its parent link: %+v", gotClone)
+	// And the clone comes back with no parent link, for the same reason and one step on:
+	// `volumes.parent_snapshot_id` references a snapshots row, so writing the link the
+	// descriptor still carries would fail the foreign key and abort the whole rebuild.
+	// The clone's data is untouched — the link is a catalog fact, and the descriptor is
+	// still where whoever re-establishes it reads the parent id from.
+	if gotClone.ParentSnapshotID != "" {
+		t.Fatalf("the rebuilt clone claims a parent snapshot no row exists for: %+v", gotClone)
 	}
 	if gotClone.ChainDepth != 1 {
 		t.Errorf("chain depth = %d, want 1", gotClone.ChainDepth)
-	}
-}
-
-// The one command an operator runs *after* losing the catalog must not disarm the two
-// floors that stop a volume being served as a blank device.
-//
-// A rebuilt row carrying published_sequence=0 tells every Agent that this volume has
-// never published an image, so a missing manifest reads as "first boot" and the guest
-// gets zeros for a volume it has written 16 sequences into — silently. The number is in
-// the manifest the rebuild is already standing in front of.
-//
-// The image is written by the real producer (image.Publish), not a fixture, so the two
-// halves of the seam — what publishes a manifest and what reads one back after a
-// catastrophe — are exercised against each other here.
-func TestRebuildMetadataRecordsWhatTheImageProves(t *testing.T) {
-	ctx := t.Context()
-	md, store, term := cpStore(t)
-	vol, clone, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
-
-	u, err := ids.Parse(vol)
-	if err != nil {
-		t.Fatal(err)
-	}
-	view := cow.NewIntervalMap()
-	view.Overwrite(0, []byte("the guest's bytes"))
-	if _, err := image.Publish(ctx, store, &ramp{}, nil, image.OwnLineage([16]byte(u)), view, nil, 16, ""); err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-
-	fresh, _, freshTerm := cpStore(t) // a database that has never seen this fleet
-	if _, err := controlplane.RebuildMetadata(ctx, fresh, store, freshTerm); err != nil {
-		t.Fatalf("RebuildMetadata: %v", err)
-	}
-
-	got, err := fresh.GetVolume(ctx, vol)
-	if err != nil {
-		t.Fatalf("the volume was not rebuilt: %v", err)
-	}
-	// published: the manifest is in the bucket at 16, so an Agent that finds no image for
-	// this volume is looking at a loss and must refuse rather than serve zeros.
-	if got.PublishedSequence != 16 {
-		t.Errorf("published_sequence = %d, want 16: a rebuild that writes 0 tells every Agent this volume never published, and a missing image then reads as a first boot",
-			got.PublishedSequence)
-	}
-	// durable and local: the image is in the object store, which is strictly more durable
-	// than an fdatasync on a host that may no longer exist — so 16 is a floor the bucket
-	// proves, and nothing above it can be proved from any object.
-	if got.DurableSequence != 16 || got.LocalSequence != 16 {
-		t.Errorf("durable_sequence = %d, local_sequence = %d, want 16 and 16",
-			got.DurableSequence, got.LocalSequence)
-	}
-
-	// And a volume with no image gets zeros, because that is what the bucket says: the
-	// clone has a descriptor and has never published. Claiming a floor here would refuse
-	// a volume that is perfectly fine.
-	gotClone, err := fresh.GetVolume(ctx, clone)
-	if err != nil {
-		t.Fatalf("the clone was not rebuilt: %v", err)
-	}
-	if gotClone.PublishedSequence != 0 || gotClone.DurableSequence != 0 || gotClone.LocalSequence != 0 {
-		t.Errorf("a volume that never published came back at %d/%d/%d, want 0/0/0",
-			gotClone.LocalSequence, gotClone.DurableSequence, gotClone.PublishedSequence)
 	}
 }
 
@@ -255,88 +191,4 @@ func mustOneDescriptorKey(t *testing.T, store objectstore.Store) string {
 	}
 	id := objs[0].Key[len("volumes/") : len(objs[0].Key)-len("/descriptor.json")]
 	return id
-}
-
-// The manifest a rebuild reads is the one thing standing between "this volume published
-// at 16" and "this volume never published", and a rebuild runs exactly when the catalog
-// is gone — so every way that read can be wrong has to be a refusal, not a zero. A zero
-// is indistinguishable from a volume that was provisioned and never stopped cleanly, and
-// it disarms both of the Agent's floors: the next attach serves a blank device.
-func TestARebuildRefusesAManifestItCannotTrust(t *testing.T) {
-	tests := []struct {
-		name string
-		// corrupt rewrites the stored manifest. Each one re-frames, so the digest still
-		// matches and the read reaches the check under test rather than stopping at
-		// corruption — the framing is a different guard with its own tests.
-		corrupt func(t *testing.T, payload []byte, otherVolume string) []byte
-		want    string
-	}{
-		{
-			name: "written by a newer format",
-			corrupt: func(t *testing.T, p []byte, _ string) []byte {
-				return bytes.Replace(p, []byte(`"format_version":1`), []byte(`"format_version":2`), 1)
-			},
-			want: "newer format",
-		},
-		{
-			name: "describes another volume, which is a bucket copied under the wrong prefix",
-			corrupt: func(t *testing.T, p []byte, other string) []byte {
-				var man map[string]any
-				if err := json.Unmarshal(p, &man); err != nil {
-					t.Fatal(err)
-				}
-				man["volume_id"] = other
-				out, err := json.Marshal(man)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return out
-			},
-			want: "describes volume",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := t.Context()
-			md, store, term := cpStore(t)
-			vol, _, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
-			u, err := ids.Parse(vol)
-			if err != nil {
-				t.Fatal(err)
-			}
-			view := cow.NewIntervalMap()
-			view.Overwrite(0, []byte("the guest's bytes"))
-			if _, err := image.Publish(ctx, store, &ramp{}, nil, image.OwnLineage([16]byte(u)), view, nil, 16, ""); err != nil {
-				t.Fatal(err)
-			}
-
-			key := image.ManifestKey([16]byte(u))
-			body, err := store.Get(ctx, key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			payload, err := framed.Unframe(body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			mutated := tc.corrupt(t, payload, ids.New().String())
-			if bytes.Equal(mutated, payload) {
-				t.Fatalf("the mutation changed nothing: %s", payload)
-			}
-			if _, err := store.Put(ctx, key, framed.Frame(mutated), objectstore.PutOptions{}); err != nil {
-				t.Fatal(err)
-			}
-
-			fresh, _, freshTerm := cpStore(t)
-			// The whole rebuild must fail. Recording the row with a zero and carrying on
-			// would be the silent half: the operator sees a rebuild that "worked".
-			_, err = controlplane.RebuildMetadata(ctx, fresh, store, freshTerm)
-			if err == nil {
-				t.Fatalf("the rebuild accepted a manifest it could not trust (%s)", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("error %q does not say %q, which is what tells the operator which object to look at", err, tc.want)
-			}
-		})
-	}
 }

@@ -28,16 +28,16 @@
 # --- naming the mechanism to say it is gone -------------------------------------------
 # The comments that do the job. Every one of them was written by the increment that
 # removed the thing it names, which is the practice CLAUDE.md asks for.
-internal/agent/budget.go:const:checkpoint                  # "its consumers were the checkpoint, the recovery point and the summary object, all deleted by ADR-0026" — the reason ReserveRatio was re-aimed at the publish
+#
+# Fifteen entries left this file on 2026-08-22 without being fixed, and the distinction is
+# worth one line: their *files* were deleted. The local block engine — the write-ahead log,
+# the virtio device, the interval map, the chunked image and the volume manager over them —
+# is withdrawn, so the comments that named a withdrawn mechanism inside it went with the
+# comments that named a live one.
 internal/agent/loop.go:Loop.giveUpOnExpiredLease:lease-gated # "This is not the lease-gated ACK that ADR-0026 withdrew and it is not being rebuilt", said where a reader would otherwise assume it
 internal/agent/loop.go:Loop.heartbeat:remote               # "The heartbeat used to carry the host's remote backlog" — past tense, and the next clause says what replaced it
 internal/agent/loop.go:Loop.heartbeat:uploader             # same sentence: "It went with the uploader (ADR-0026 increment 4.5)"
-internal/agent/volume.go:VolumeManager.start:remote        # "Nothing enables a remote path any more (ADR-0026 increment 4.5)", at the line that would have enabled one
-internal/blockdev/blockdev.go:Device.refuse:lease-gated    # "The lease-fencing case that used to be here went with the lease-gated ACK", in the switch that no longer has that branch
-internal/blockdev/doc.go:package:lease-gated               # records the exact bullet that was wrong (wal.ErrSelfFenced) and that `fenced` became `broken`
-internal/blockdev/doc.go:package:remote                    # records verbatim the withdrawn claim this doc used to make about Flush, and why keeping the record is worth the lines
 internal/controlplane/clone.go:Clone:checkpoint            # "EROFS plus a checkpoint plus a cached WAL, which ADR-0026 deleted — the preference outlived the thing it was a preference for"
-internal/image/image.go:package:remote                     # "It is what ADR-0026 put in place of the remote WAL chain" — the package doc's first job is to say what it replaced
 internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:gc     # the trailing note listing §7's OperationKind (…|recovery|flatten|gc) as vocabulary that went with the operations table
 internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:remote # same note: "ADR-0026 withdrew the remote half, so the local ACK is the *only* contract and there is nothing left to select"
 internal/obs/metrics.go:Catalog:checkpoint                 # the Catalog's trim note, listing what three quarters of the old entries measured
@@ -46,20 +46,12 @@ internal/obs/metrics.go:Catalog:gc                         # same sentence
 internal/obs/metrics.go:Catalog:objectize                  # same sentence
 internal/obs/metrics.go:Catalog:remote                     # same sentence, naming "the WAL-remote block" as the first thing ADR-0026 withdrew
 internal/obs/metrics.go:Catalog:warm-standby               # same sentence. A metric declared for a mechanism nobody has "reads as a plan", which is this check's thesis in the tree already
-internal/wal/log.go:Limits.MaxViewBytes:objectize          # "under ADR-0026, nothing shrinks it during a session — there is no mid-session objectization". It is why the bound has to exist
-internal/wal/log.go:Log.broken:lease-gated                 # "The second went with the lease-gated ACK (ADR-0026): V1 ACKs on fdatasync and nothing consults a lease on this path"
-internal/wal/log.go:Log.broken:self-fenced                 # same sentence, explaining why the field is `broken` and not `fenced` — one flag, one meaning
-internal/wal/log.go:Log.durableStep:14.4                   # "What was here was §14.4's six steps … Both went with the remote durability chain", three lines under the ACK it describes
-internal/wal/log.go:Log.durableStep:remote                 # same sentence. This is the comment Log.Flush's should have been
-internal/wal/log.go:Log.InstallBase:checkpoint             # "TruncateLocal has had no production caller since ADR-0026 deleted the checkpoint that used to call it" — the reason this function reclaims
-internal/wal/log.go:Log.ReclaimedBytes:checkpoint          # past tense about the pre-segment WAL, whose file was truncated only once the checkpoint reached the log's end. Both are gone and the sentence is why this counter exists.
+cmd/volume-agent/main.go:package:remote                    # "Nothing remote in Stage 1: no object store flags here, because an Agent that took a bucket it never wrote to would be claiming a capability it does not have" — the package doc of the binary that stopped taking them
 
 # --- somebody else's mechanism, spelled the same --------------------------------------
 # The reason this check matches whole words rather than substrings, and the reason it can
 # never be only a word list.
-internal/cow/intervalmap.go:ExtentOverheadBytes:gc         # Go's garbage collector: the extent overhead was measured from the live heap "after a forced GC"
 internal/lease/lease.go:package:gc                         # Go's garbage collector: a GC pause is one of the three slow round trips that make anchoring to the response unsafe
-integration/guestinit/main.go:const.holdRotate:checkpoint  # the *guest's* application checkpointing its own pages ("a database checkpointing the same pages, a journal"), which is the steady-state workload holdRotate models
 
 # --- a live rule that names the withdrawn component as its hazard ---------------------
 # INV-14 is enforced by this interface today: Delete is reversible, Restore exists on both

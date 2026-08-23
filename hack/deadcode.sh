@@ -9,9 +9,10 @@
 # code a human is changing is the same defect as a checker that cannot fire — it reports
 # success by not being updated.
 #
-# ROOTS ARE THE BINARIES, AND ONLY THE BINARIES: ./cmd/... plus integration/guestinit,
-# which is PID 1 inside the guest and is as much a binary this repository builds and boots
-# as the other two. `deadcode -test` was rejected outright: it makes every test's own
+# ROOTS ARE THE BINARIES, AND ONLY THE BINARIES: ./cmd/... . It used to be ./cmd/... plus
+# integration/guestinit, which was PID 1 inside the guest and as much a binary this
+# repository built and booted as the other two; it went with the local block engine it
+# booted against. `deadcode -test` was rejected outright: it makes every test's own
 # subject reachable, so it answers "is this called by anything at all", which is never the
 # question. CLAUDE.md's question is narrower and is the one that found CloneCrossHost —
 # does a *binary* reach it.
@@ -19,10 +20,9 @@
 # TWO BLIND SPOTS, both real, and they are why this is a floor rather than a proof:
 #
 #   1. Reflection. RTA conservatively marks every method of a type that reaches `reflect`
-#      as live. `wal.TruncateLocal` — STATUS.md's flagship entry, called by the DST harness
-#      and by nothing else — is therefore NOT reported here; `deadcode -whylive` answers
-#      "reachable only through reflection". A symbol absent from this report is not
-#      evidence that something calls it.
+#      as live, so a symbol whose only caller is the DST harness can be absent from this
+#      report entirely — `deadcode -whylive` answers "reachable only through reflection".
+#      A symbol absent from this report is not evidence that something calls it.
 #   2. Packages no binary imports at all are not in the program, so no function in them can
 #      be reported. That is where STATUS.md's other entry (`metadata.BumpVolumeEpoch`, in
 #      metadata/sim and metadata/pg) lives. The package pass below closes exactly that gap,
@@ -56,7 +56,7 @@ MODULE=github.com/spin-stack/storage
 DEADCODE=${DEADCODE:-.tools/bin/deadcode}
 ALLOW=${ALLOW:-hack/deadcode-allow.txt}
 PENDING=${PENDING:-hack/deadcode-pending.txt}
-ROOTS=(./cmd/... ./integration/guestinit)
+ROOTS=(./cmd/...)
 
 test -x "$DEADCODE" || {
 	echo "no deadcode binary at $DEADCODE — run: task tools:deadcode" >&2

@@ -10,9 +10,8 @@ import (
 // pinnedMandatorySet is the §25.1 gate, written out by name.
 //
 // MandatoryScenarios() is assembled at run time from the per-area functions
-// (coreScenarios, harnessScenarios, walScenarios, carryScenarios, agentScenarios,
-// refusalScenarios) so that two increments can add a scenario without both editing one
-// literal. That is the right trade for adding, and it is exactly the wrong shape for
+// (coreScenarios, harnessScenarios) so that two increments can add a scenario without
+// both editing one literal. That is the right trade for adding, and it is exactly the wrong shape for
 // noticing a *removal*: TestMandatoryScenarios ranges over whatever they return, so deleting an
 // entry — or dropping an `append` line in a refactor — makes the gate run one fewer
 // proof and stay green. Nothing outside this file would say a scenario had left.
@@ -31,36 +30,39 @@ import (
 // list, is what a reviewer reads.
 //
 // Removals:
-//   - (none yet — the set has only grown since §25.1 was first implemented)
+//
+//   - 2026-08-22, twenty of the twenty-two, with the local block engine. QEMU manages
+//     the local copy-on-write format through qcow2 from here on, and what this system
+//     keeps is immutable commits, publication and recovery — so every scenario whose
+//     subject was a write-ahead log, a virtio device, a chunked image or the volume
+//     manager over them went with that subject in one commit:
+//
+//     crash-around-fdatasync, wal-write-path-no-put, wal-backpressure,
+//     encrypted-wal-no-plaintext-leak, torn-append-leaves-nothing-behind,
+//     wal-segments-survive-a-crash-at-every-boundary,
+//     guest-device-acks-durability-only-on-flush,
+//     carry-forward-survives-a-crash-at-every-point,
+//     disk-fills-under-sustained-write-with-s3-down (internal/wal),
+//     fenced-volume-stops-serving, a-stopped-volume-comes-back-from-its-image,
+//     a-clone-reads-through-its-parent, a-clone-of-a-clone-reads-its-grandparents-bytes,
+//     a-snapshot-of-a-live-volume-is-frozen, two-hosts-cannot-both-publish-an-image,
+//     a-rebuilt-catalog-can-serve-its-volumes, a-volume-stopped-mid-fetch-still-publishes,
+//     device-budget-holds-across-volumes (internal/agent + internal/image),
+//     a-refused-volume-has-no-socket-and-is-still-reported (internal/blockdev).
+//
+//     two-hosts-cannot-both-publish-an-image is the one worth naming twice: it was the
+//     DST arm of the mutual-exclusion review zone. The primitive it exercised — the
+//     object store's compare-and-set — is untouched and is still proven, by
+//     internal/simio/objectstore/storetest, which `task backend:conformance` runs
+//     blocking per backend. What went is the *image* publish it drove that CAS through.
+//     The new commit protocol's HEAD compare-and-swap gets an arm of this shape back,
+//     and it is a review-zone change when it does.
 var pinnedMandatorySet = []string{
 	// core (scenarios.go)
-	"crash-around-fdatasync",
 	"clock-drift-beyond-skew",
 	"network-partition",
-	"wal-write-path-no-put",
-	"wal-backpressure",
-	"encrypted-wal-no-plaintext-leak",
-	"torn-append-leaves-nothing-behind",
 	// harness (scenarios_harness.go)
-	"disk-fills-under-sustained-write-with-s3-down",
 	"restored-control-plane",
-	// wal (scenarios_wal.go)
-	"wal-segments-survive-a-crash-at-every-boundary",
-	"guest-device-acks-durability-only-on-flush",
-	// carry (scenarios_carry.go)
-	"carry-forward-survives-a-crash-at-every-point",
-	// agent (scenarios_agent.go)
-	"fenced-volume-stops-serving",
-	"a-stopped-volume-comes-back-from-its-image",
-	"a-clone-reads-through-its-parent",
-	"a-clone-of-a-clone-reads-its-grandparents-bytes",
-	"a-snapshot-of-a-live-volume-is-frozen",
-	"two-hosts-cannot-both-publish-an-image",
-	"a-rebuilt-catalog-can-serve-its-volumes",
-	"a-volume-stopped-mid-fetch-still-publishes",
-	"device-budget-holds-across-volumes",
-	// refusal (scenarios_refusal.go)
-	"a-refused-volume-has-no-socket-and-is-still-reported",
 }
 
 // TestMandatorySetIsPinnedByName fails when MandatoryScenarios() and the pinned list

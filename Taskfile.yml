@@ -382,16 +382,6 @@ tasks:
           echo "the QEMU in $where has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
         echo "OK: $(printf '%s' "$out" | head -1), vhost-user-blk-pci present — verified in $where"
 
-  build:guest:
-    desc: Build the initramfs the QEMU lane boots (a static Go /init). The kernel comes from `task fetch:kernel`.
-    sources:
-      - integration/guestinit/**/*.go
-      - hack/build-guest-initramfs.sh
-    generates:
-      - '{{.OUTPUT_DIR}}/guest/initramfs.cpio.gz'
-    cmds:
-      - OUT_DIR={{.OUTPUT_DIR}}/guest bash hack/build-guest-initramfs.sh
-
   fetch:kernel:
     desc: >-
       Put the pinned guest kernel at _output/guest/vmlinux, from a sibling spinbox
@@ -404,54 +394,6 @@ tasks:
       KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE}}'
     cmds:
       - bash hack/guest-kernel.sh fetch
-
-  # The start-up refusals a *process* owes an operator, driven against the real binary.
-  # Not a unit test, because the defect this exists for lives between an operator's flag
-  # and the kernel: every test that constructs a VolumeManager itself passes a short
-  # socket directory, so none of them can see a path sun_path cannot hold. Measured at
-  # 1.2s, which is why it is in `ci` and not only in the merge gate.
-  agent:verify:
-    desc: Assert the Volume Agent refuses a -vhost-socket-dir it can never bind, and starts on one it can.
-    cmds:
-      - bash hack/agent-startup.sh
-
-  guest:verify:
-    desc: Assert the guest lane's inputs — the initramfs we build, and that the kernel is the one we pinned.
-    deps: [build:guest, fetch:kernel]
-    env: *guest_kernel_env
-    cmds:
-      # This half was one `test -f`, and `test -f` says OK for a zero-byte file, for a
-      # half-written one, and for an archive with no /init — three states whose whole
-      # symptom is a kernel panic minutes later inside QEMU, attributed to the lane. Worse,
-      # `build:guest` does not rebuild any of them: its `sources:`/`generates:` fingerprint
-      # compares the *sources*, so a truncated artefact is "up to date". Verified 2026-08-04
-      # by emptying the file: the old target printed OK and exited 0.
-      #
-      # So the artefact is opened, not stat'ed, and every failure names the task that makes
-      # a good one. cpio is required rather than optional for the same reason the kernel's
-      # readelf check is: a machine that cannot look must not report OK.
-      - |
-        set -euo pipefail
-        img={{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
-        test -f "$img" || { echo "no initramfs at $img — run: task build:guest" >&2; exit 1; }
-        command -v cpio >/dev/null || {
-          echo "cpio is missing, so $img cannot be inspected (apt-get install cpio)" >&2; exit 1; }
-        gzip -t "$img" 2>/dev/null || {
-          echo "$img is not a valid gzip stream — a truncated or interrupted build; rebuild: task build:guest" >&2
-          exit 1; }
-        # ./init is the whole contract with the kernel: it mounts the archive as rootfs and
-        # execs /init, and an archive without one panics with "no working init found",
-        # which reads like a kernel problem rather than a missing build step.
-        # `find . | cpio` stores paths as ./init, and cpio --list prints them back without
-        # the ./ — matching only the stored spelling made this fail on a perfectly good
-        # archive the first time it ran, which is the crying-wolf failure a preflight can
-        # least afford.
-        listing=$(gzip -dc "$img" | cpio --list --quiet 2>/dev/null || true)
-        grep -qE '^(\./)?init$' <<<"$listing" || {
-          echo "$img contains no ./init — the kernel would mount it and panic with no PID 1; rebuild: task build:guest" >&2
-          exit 1; }
-        echo "OK: $img — gzip cpio carrying ./init"
-      - bash hack/guest-kernel.sh verify
 
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
@@ -522,9 +464,13 @@ tasks:
   # and proves it by resolving both refs the way `.github/workflows/ci.yml` resolves them.
   # The name matches that workflow's `guest-inputs` job on purpose: the job that fails is
   # the job this task exists to unblock.
+  # The two artefacts a guest needs: the pinned QEMU and the pinned kernel. No lane
+  # consumes them today — the lanes that booted a guest against this system's own
+  # vhost-user-blk backend went with that backend — and both are kept, pinned and
+  # publishable because Stage 1 boots QEMU against a qcow2 and needs exactly these.
   guest:inputs:check:
     desc: >-
-      Name every input publishing the guest lanes' artefacts needs (gh, a token with
+      Name every input publishing the guest artefacts needs (gh, a token with
       write:packages, docker, the pinned kernel), and say which are missing. No side effects.
     env: &publish_guest_env
       REPO: '{{.REPO | default ""}}'
@@ -539,8 +485,8 @@ tasks:
 
   guest:inputs:publish:
     desc: >-
-      Publish both artefacts CI's guest jobs need — the pinned QEMU image (by dispatching
-      the QEMU workflow) and the pinned guest kernel — then verify both resolve. Idempotent.
+      Publish both guest artefacts — the pinned QEMU image (by dispatching the QEMU
+      workflow) and the pinned guest kernel — then verify both resolve. Idempotent.
       Usage: task guest:inputs:publish REPO=<owner>/<repo>
     env: *publish_guest_env
     cmds:
@@ -628,106 +574,18 @@ tasks:
 
   test:integration:
     desc: Run Docker-gated integration tests (TestContainers Postgres).
-    vars:
-      REQUIRE_PROOFS: '{{.REQUIRE_PROOFS | default ""}}'
     cmds:
       - go test -tags integration -count=1 ./internal/metadata/pg/...
-      - task: test:integration:qemu
-        vars: { REQUIRE_PROOFS: '{{.REQUIRE_PROOFS}}' }
 
   test:e2e:
     desc: >-
       Run the deployment, not the library: the real control-plane and volume-agent
       as processes, against a real Postgres 18 and the pinned RustFS. It is the only
       lane that can see the two binaries disagree — about a key file, about a flag
-      nobody passes — because everything else drives Go types in-process. Two of its
-      scenarios boot a real guest; with REQUIRE_PROOFS=1 they may not skip.
+      nobody passes — because everything else drives Go types in-process.
     deps: [build:cmd]
-    vars:
-      REQUIRE_PROOFS: '{{.REQUIRE_PROOFS | default ""}}'
-    env: &proofs_env
-      # One knob, not two. The preflights below resolve _output through OUTPUT_DIR and
-      # the tests resolve it through QEMU_OUTPUT_DIR, so a lane could verify one
-      # directory and boot out of another. Exporting one from the other makes that
-      # impossible and gives CI a single variable to point at the runtime image's layout.
-      QEMU_OUTPUT_DIR: '{{.OUTPUT_DIR}}'
-      SPIN_REQUIRE_PROOFS: '{{.REQUIRE_PROOFS}}'
     cmds:
-      - |
-        set -euo pipefail
-        if [ -n "{{.REQUIRE_PROOFS}}" ]; then {{.TASK_EXE}} guest:ready OUTPUT_DIR={{.OUTPUT_DIR}}; fi
       - RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags e2e -count=1 -timeout 15m ./integration/e2e/...
-
-  test:integration:qemu:
-    desc: >-
-      Boot a real QEMU {{.QEMU_VERSION}} guest against the vhost-user-blk backend
-      (Phase 03, increment 3.1; the [Verify] step of RISK-10). Skips with a pointer to
-      `task build:qemu` if the pinned QEMU has not been built — unless REQUIRE_PROOFS=1,
-      which is what the merge gate passes.
-    vars:
-      REQUIRE_PROOFS: '{{.REQUIRE_PROOFS | default ""}}'
-    env: *proofs_env
-    cmds:
-      # Without REQUIRE_PROOFS the Go tests skip themselves when _output has no QEMU, so
-      # this task must not hard-fail there — `deps: [qemu:verify]` used to, which made
-      # `task test:integration` unrunnable anywhere QEMU had not been built by hand. When
-      # it *is* built, verifying it is still mandatory: a QEMU that is present but not the
-      # pinned one is the failure this lane exists to notice.
-      - |
-        set -euo pipefail
-        # OUTPUT_DIR is forwarded explicitly: {{.TASK_EXE}} starts a *new* task process,
-        # which does not inherit a var overridden on this one's command line — so without
-        # it the preflight would certify _output while the tests booted out of somewhere
-        # else, which is the exact class of lie this whole section is about.
-        if [ -n "{{.REQUIRE_PROOFS}}" ]; then
-          {{.TASK_EXE}} guest:ready OUTPUT_DIR={{.OUTPUT_DIR}}
-        elif [ -x {{.OUTPUT_DIR}}/bin/qemu-system-x86_64 ]; then
-          {{.TASK_EXE}} qemu:verify OUTPUT_DIR={{.OUTPUT_DIR}}
-        else
-          echo "SKIP: no QEMU in {{.OUTPUT_DIR}} — the lane's tests will skip themselves."
-          echo "      to run them for real: task build:qemu (or pull the published image)"
-        fi
-      # -count=1 because the result depends on a binary outside the module: a
-      # cached PASS would survive a QEMU rebuild, which is the one thing this
-      # lane exists to notice.
-      - go test -tags integration -count=1 -timeout 15m ./integration/vhost/...
-
-  guest:ready:
-    desc: >-
-      Assert every input a guest-backed proof needs is present and is the one we pinned:
-      the QEMU, the kernel and the initramfs. Run before the lanes rather than inside
-      them, so "this machine has no QEMU" is answered in seconds instead of forty
-      minutes into the gate.
-    cmds:
-      - task: qemu:verify
-      - task: guest:verify
-
-  # `guest:proofs` was here: the two guest-backed lanes with skipping disabled, described
-  # as "what CI's guest jobs run". Deleted 2026-08-05 because that sentence was false and
-  # nothing called it. CI cannot run both lanes in one job — a hosted runner has the
-  # pinned QEMU or a Docker daemon, not both (ADR-0025) — so `.github/workflows/ci.yml`
-  # invokes `test:integration:qemu` and `test:e2e` in two separate container jobs, each
-  # with REQUIRE_PROOFS=1, and neither ever named this target. A target that describes
-  # itself as the thing CI runs, that CI does not run, is the same defect as a gate that
-  # reports success for a proof it skipped, one level down: it is read, believed, and
-  # wrong. On one machine `task ci:full` already runs both lanes and is the honest name
-  # for that claim.
-
-  vhost:bootsector:
-    desc: >-
-      Reassemble integration/vhost/testdata/bootsector.bin from its .S source.
-      Needs binutils (as + ld); the .bin is committed so the integration lane
-      does not.
-    cmds:
-      - |
-        set -euo pipefail
-        dir={{.ROOT_DIR}}/integration/vhost/testdata
-        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-        as --32 -o "$tmp/boot.o" "$dir/bootsector.S"
-        ld -m elf_i386 -Ttext 0x7c00 --oformat binary -o "$tmp/boot.bin" "$tmp/boot.o"
-        test "$(stat -c%s "$tmp/boot.bin")" = 512 || { echo "boot sector is not 512 bytes"; exit 1; }
-        mv "$tmp/boot.bin" "$dir/bootsector.bin"
-        echo "rebuilt $dir/bootsector.bin"
 
   cover:
     desc: Cross-package coverage report; enforces a 90% floor on production code.
@@ -904,8 +762,14 @@ tasks:
       # them. Measured cost of running both packages whole rather than filtered: 0.02s.
       # `-count=1` stays: a cached "ok" is the other way a gate reports success without
       # running.
+      #
+      # One package, and it used to be two: `./internal/wal/` was here for §25.2's
+      # serialize/replay property tests — truncate at every byte, flip a bit, and the
+      # recovered state is exactly the model's or a detected error. That package is
+      # withdrawn with the local block engine. The rule is not: the moment the commit
+      # protocol has an on-S3 format, its property test's package belongs on this list,
+      # beside the harness that will crash it at every point.
       - go test -race -count=1 ./internal/dst/
-      - go test -race -count=1 ./internal/wal/
 
   fmt:
     desc: Format code with the pinned golangci-lint formatters (gofmt + goimports).
@@ -950,121 +814,57 @@ tasks:
       - task: comment:rot
       - task: test
       - task: dst
-      # A binary, started four times, for 1.2 seconds total. It is in the fast gate
-      # because the thing it checks is a seam no package's tests can reach: what the
-      # process does with the operator's flags before any of them is used.
-      - task: agent:verify
       # Half a second, and it is in the *fast* gate rather than only in `ci:full`
       # because renaming a Taskfile target is a local edit whose only victim is a
       # workflow file — and the person renaming it runs `task ci`, not `task ci:full`.
-      # The alternative, leaving it to CI, means the report arrives from the one runner
-      # that cannot answer it: the guest jobs fail on a missing target long before they
-      # reach the proof they exist for, and their logs read like an infrastructure fault.
+      # The alternative, leaving it to CI, means the report arrives from a runner that
+      # fails on a missing target long before it reaches the proof it exists for, with
+      # logs that read like an infrastructure fault.
       - task: workflows:verify
 
   # --- the merge gate ----------------------------------------------------------
   #
-  # `ci:full` and `ci:noguest` are the same list of lanes making two different claims,
-  # and the difference between them is the whole point of this section.
+  # There is one, and there used to be two. `ci:noguest` was `ci:full` minus every proof
+  # that needed a real Linux kernel in the loop, and the pair existed because a skipped
+  # guest lane had been reported as a pass: `test:integration:qemu` printed "SKIP: no QEMU
+  # in _output" and exited 0, so the gate's exit code claimed a guest had booted on every
+  # machine except one laptop. The fix was to make the *caller* declare what it claimed
+  # (REQUIRE_PROOFS → SPIN_REQUIRE_PROOFS → a skip becomes a failure) and to give the
+  # weaker claim a second target *name*, because a name is visible in the sentence people
+  # exchange — "ci:full was green" — and an environment variable is not.
   #
-  # What was wrong: `test:integration:qemu` printed `SKIP: no QEMU in _output` and exited
-  # 0, and the tests under it skipped themselves for the same reason — so `task ci:full`
-  # reported success on a machine that had booted no guest, which is every machine except
-  # one laptop. The guest-backed lanes are where a real Linux kernel exercises this system
-  # and they carry the headline proof of every recent wave; the gate's exit code said they
-  # had run.
+  # Both are gone with the lanes they arbitrated. The guest-backed proofs drove a real
+  # kernel against this system's own vhost-user-blk backend, and that backend is
+  # withdrawn: QEMU manages the local copy-on-write format through qcow2 now. There is no
+  # lane that can skip, so there is nothing for a second target name to distinguish, and
+  # keeping `ci:noguest` would mean printing "NOT PROVEN: …" about proofs that do not
+  # exist — the same lie as the skip it was built to expose, told from the other side.
   #
-  # The mechanism: the *caller* declares what it is claiming (REQUIRE_PROOFS), the lanes
-  # pass it to the tests as SPIN_REQUIRE_PROOFS, and `internal/testinfra` turns each
-  # "input not built" skip into a failure under it. A skip cannot then be mistaken for a
-  # pass, because under the gate there is no skip.
-  #
-  # Alternatives rejected, and why:
-  #
-  #   - **Make the skip loud and leave the exit code alone.** It already was loud: the SKIP
-  #     line quoted above is printed in capitals with the remedy underneath, and it changed
-  #     nothing, because a gate is read by its exit code. In CI nobody reads the log of a
-  #     green run at all.
-  #   - **A machine-readable summary of what was skipped, checked at the end of the gate.**
-  #     That is a second record of what ran, maintained beside the thing that runs it, and
-  #     the two go out of step exactly when a lane is added — which is the same defect one
-  #     level up. It also cannot see a test that skipped for a reason the summary's author
-  #     did not anticipate.
-  #   - **An opt-out environment variable (ALLOW_SKIPPED_PROOFS=1) on a single `ci:full`.**
-  #     Rejected because an environment variable is invisible in the sentence people
-  #     actually exchange — "ci:full was green". A second *target name* is not: nobody can
-  #     paste "ci:noguest passed" and have it read as the merge gate, and CI cannot inherit
-  #     it from a shell profile by accident.
-  #   - **Delete the skips outright, so the lanes always fail without QEMU.** That is a red
-  #     build meaning "you have not run task build:qemu" — the failure mode ADR-0025 named,
-  #     and the fastest way to teach people to ignore red. `task ci` (no Docker, no QEMU)
-  #     and `task ci:noguest` (Docker, no QEMU) are what keep a partial machine usable.
+  # It comes back with the qcow2 lane, and the mechanism above is what it comes back as:
+  # that lane needs a real QEMU (`task build:qemu`, still here and still pinned) and a
+  # real kernel (`task fetch:kernel`, likewise), and a machine without them must not be
+  # able to report a green merge gate.
 
   ci:full:
     desc: >-
-      The merge gate: everything, including the proofs that need a real guest. Fails
-      rather than skips when the pinned QEMU or the pinned kernel is absent. `task ci` is
-      the fast local loop; `task ci:noguest` is this same list minus the guest-backed
-      proofs, for a machine that cannot build QEMU.
-    cmds:
-      # First, not last. Everything below takes twenty minutes to reach the guest lanes,
-      # and "this machine has no QEMU" is an answer that should cost a fraction of a
-      # second — measured at 0.026s. The failure is wrapped rather than left to
-      # qemu:verify because the one thing the reader needs to know here is the *other*
-      # target, and qemu:verify is called from places where that advice would be wrong.
-      - |
-        set -euo pipefail
-        if ! {{.TASK_EXE}} guest:ready OUTPUT_DIR={{.OUTPUT_DIR}}; then
-          cat >&2 <<'EOF'
-
-        ci:full cannot run: this machine is missing an input the guest-backed proofs need
-        (named above). It does not skip them — that is what made the gate green on
-        machines that had booted no guest.
-
-          task build:qemu && task fetch:kernel   # then: task ci:full
-          task ci:noguest                        # everything else, and it says what it did not prove
-        EOF
-          exit 1
-        fi
-      - task: ci:lanes
-        vars: { REQUIRE_PROOFS: "1" }
-
-  ci:noguest:
-    desc: >-
-      `ci:full` minus every proof that needs a real guest — for a machine that cannot
-      build QEMU, and for CI's non-guest job. It is NOT the merge gate, and its name and
-      its last line of output both say so.
+      The merge gate: everything CI runs, including the Docker-gated lanes. `task ci` is
+      the fast local loop.
     cmds:
       - task: ci:lanes
-        vars: { REQUIRE_PROOFS: "" }
-      # The disclosure. It is the last thing on the terminal precisely because the thing
-      # above it just printed a wall of "ok".
-      - |
-        cat <<'EOF'
-
-        ===============================================================================
-        ci:noguest PASSED — and it is not the merge gate.
-        NOT PROVEN: every claim that needs a real Linux kernel in the loop — the whole of
-        integration/vhost, and the scenarios in integration/e2e that boot a guest. That
-        is where INV-18 (a guest's fsync puts zero objects in the bucket) is established.
-        For the real gate: task build:qemu && task fetch:kernel && task ci:full
-        ===============================================================================
-        EOF
 
   ci:lanes:
     internal: true
     desc: >-
-      The one list of lanes both public gates run, so that adding a lane cannot reach one
-      of them and miss the other. The Docker-gated tasks live in it because a task nobody
-      runs is a task nobody notices going red: backend:conformance was broken on main for
-      a whole increment because it was documented but not gated.
+      The list of lanes the merge gate runs. It is a target of its own rather than
+      `ci:full`'s body because it was shared by two public gates and will be again when
+      the qcow2 lane restores the guest-backed half. The Docker-gated tasks live in it
+      because a task nobody runs is a task nobody notices going red: backend:conformance
+      was broken on main for a whole increment because it was documented but not gated.
     cmds:
       - task: ci
       - task: generate:check
       - task: db:verify
       - task: cover
       - task: test:integration
-        vars: { REQUIRE_PROOFS: '{{.REQUIRE_PROOFS}}' }
       - task: backend:conformance
       - task: test:e2e
-        vars: { REQUIRE_PROOFS: '{{.REQUIRE_PROOFS}}' }

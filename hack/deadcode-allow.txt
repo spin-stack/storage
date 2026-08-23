@@ -13,19 +13,18 @@
 # belong here: a component that was written for production and never wired up. That is the
 # CloneCrossHost shape, and CLAUDE.md's answer to it is deletion, not an entry in a file.
 
-# --- the Agent's read-only accessors and its no-data-path VolumeSource ----------------
+# --- the Agent's read-only accessors ---------------------------------------------------
 # A binary never asks the Loop what it thinks; it asks the Control Plane. These four
-# accessors exist so a test — and integration/e2e/guest_test.go, driving real processes —
-# can observe the lease/desired-state/fencing decisions the loop already made, instead of
-# asserting on a field it set itself, which CLAUDE.md forbids.
-internal/agent.Loop.LeaseValid   # observed by loop_test/spine_test and the e2e guest lane; production reads the lease through the loop's own paths
+# accessors exist so a test can observe the lease/desired-state/fencing decisions the loop
+# already made, instead of asserting on a field it set itself, which CLAUDE.md forbids.
+#
+# NewVolumeSet and its three methods left this list on 2026-08-22 by becoming *reachable*:
+# they were the stand-in "the Agent runs against when there is no data path", and with the
+# local block engine withdrawn there is no other VolumeSource — cmd/volume-agent builds one.
+internal/agent.Loop.LeaseValid   # observed by loop_test/spine_test; production reads the lease through the loop's own paths
 internal/agent.Loop.Desired      # same: the desired state a test compares against what the loop then did
 internal/agent.Loop.HostState    # same
 internal/agent.Loop.Fenced       # same
-internal/agent.NewVolumeSet      # the in-memory VolumeSource the Agent runs against when there is no data path (agent.go:104); every real Agent uses the WAL-backed one
-internal/agent.VolumeSet.Set     # part of that stand-in
-internal/agent.VolumeSet.Remove  # part of that stand-in
-internal/agent.VolumeSet.Volumes # part of that stand-in
 
 # --- Control-Plane election affordances ------------------------------------------------
 internal/controlplane.ParseTermClaim            # the inverse of the claim encoder, so election_test can assert on what was written rather than on the writer's argument
@@ -37,7 +36,7 @@ internal/ids.NewAt  # CLAUDE.md names it: ids.New() in production, ids.NewAt(ms,
 # --- the lease manager ------------------------------------------------------------------
 # The Agent's loop drives the clock-explicit variants (GrantAt/RenewAt); these two are the
 # now-relative spellings the tests and the vhost lane use.
-internal/lease.Manager.Grant  # used by internal/lease, internal/wal and internal/blockdev tests and by the integration/vhost lane; loop.go calls GrantAt
+internal/lease.Manager.Grant  # used by internal/lease's own tests and by the DST harness's planted-bug proof; loop.go calls GrantAt
 
 # --- lifecycle enum listings ------------------------------------------------------------
 # Each returns every value of one enum. Their reason for existing is that a test can walk
@@ -55,54 +54,10 @@ internal/lifecycle.RefusalNames     # compared with volumes.refusal's CHECK list
 # collected value rather than by checking that a recorder was called. It cannot live in a
 # _test.go file: internal/agent, internal/wal and internal/obs's own tests all import it.
 internal/obs.NewTestProvider          # the in-memory meter provider tests collect from; production wires the OTLP one
-internal/obs.Provider.CollectedMetrics # reading it is how agent/wal tests assert on what left the process
-internal/obs.Provider.GaugeValues      # same, for gauges (wal/degraded_test)
-internal/obs.Provider.GaugeSeries      # same, for a gauge family whose label set varies — volume_backpressure has one series per (volume, reason) and a test has to see them apart
-
-# --- vhost front-end encoders -------------------------------------------------------------
-# The Agent is the vhost-user *backend*; it decodes these messages and never encodes one.
-# The encoders exist so a test can play the front-end — the role QEMU plays in production —
-# which is the only way to drive the backend without a VM.
-internal/vhost.encodeMemTable     # a fake front-end's SET_MEM_TABLE; the backend only ever parses one
-internal/vhost.encodeVringAddr    # likewise SET_VRING_ADDR
-internal/vhost.writeDesc          # a test writing descriptors into a virtqueue, which in production is the guest kernel's job
-internal/vhost.Device.Features    # read back by device_test to prove the negotiated set
-internal/vhost.Server.Device      # the bound device, reached by server_test and by the QEMU lane
-
-# --- the vhost host-I/O file backend ------------------------------------------------------
-# RawFile is the lane's disk: integration/vhost/qemu_test.go backs a guest with a plain file
-# so the test can read the bytes QEMU wrote. The Agent's own backend is the WAL, so no
-# binary opens one.
-internal/vhost/hostio.CreateRawFile   # used by integration/vhost/qemu_test.go and rawfile_test
-internal/vhost/hostio.OpenRawFile     # same
-internal/vhost/hostio.checkCapacity   # only those two reach it
-internal/vhost/hostio.RawFile.Size    # part of the same backend
-internal/vhost/hostio.RawFile.ReadAt  # part of the same backend
-internal/vhost/hostio.RawFile.WriteAt # part of the same backend
-internal/vhost/hostio.RawFile.Flush   # part of the same backend
-internal/vhost/hostio.RawFile.Close   # part of the same backend
-internal/vhost/hostio.RawFile.Discard     # part of the same backend (vhost.Backend grew DISCARD/WRITE_ZEROES)
-internal/vhost/hostio.RawFile.WriteZeroes # part of the same backend
-internal/vhost/hostio.RawFile.inRange # part of the same backend
-internal/vhost/hostio.NewCallEventFD  # the call-direction eventfd a fake front-end supplies; QEMU supplies the real one over the socket
-
-# --- the WAL's reference model and its non-production entry points -------------------------
-# State/Apply/ApplyAll/At/Equal are the model §25.2's property tests replay against: encode
-# a record sequence, truncate or corrupt it at every byte, and assert the recovered state is
-# exactly the model's or an error. A model with a production caller would be the bug.
-internal/wal.NewState     # the reference model the serialize/replay property tests compare against
-internal/wal.State.Apply  # same
-internal/wal.ApplyAll     # same
-internal/wal.State.At     # same
-internal/wal.State.Equal  # same
-internal/wal.Serialize    # encodes a record sequence for those tests; the Log encodes as it appends
-internal/wal.Replay       # decodes one; production recovers through Resume/ReplaySegments inside the Log
-internal/wal.Resume       # the plain resume; production takes wal.ResumeAwaitingBase (agent/volume.go:624), this one is DST's and the wal tests'
-internal/wal.SegmentFiles    # lists a volume's segments so DST and segment_test can assert on the files themselves
-internal/wal.ReplaySegments  # replays them the same way, outside a Log
-internal/wal/format.ObjectHeader.MarshalBinary # the object header's writer; nothing publishes a WAL object under ADR-0026 — kept as the inverse the format property test round-trips
-internal/wal/format.UnmarshalObjectHeader      # same, the reading half
-internal/wal/format.WALObjectKey               # the key such an object would take; asserted by record_test so the naming survives the mechanism's return
+internal/obs.Provider.CollectedMetrics # reading it is how a test asserts on what left the process
+internal/obs.Provider.GaugeValues      # same, for gauges
+internal/obs.Provider.GaugeSeries      # same, for a gauge family whose label set varies — chain_depth has one series per volume and a test has to see them apart
+internal/obs.Metrics.Len               # only TestMetricsRegistration calls it, and that is what it is for: every Catalog() entry must have become a live instrument, and counting them is the only way to see one that did not register
 
 # --- packages no binary imports (the coarse pass) -------------------------------------------
 package internal/dst        # the deterministic simulation harness. It is the test lane, so a binary importing it would be the defect.

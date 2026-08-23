@@ -37,11 +37,11 @@ func TestBothBinariesShutDownCleanly(t *testing.T) {
 	d := start(t)
 	agent := d.startAgent(t, "agent-1")
 	d.waitForHost(t)
-	d.seedVolume(t)
-	agent.WaitForLine(t, "serving volume", 60*time.Second)
 
-	// Stopped while it is serving a volume, which is the state a supervisor restarts in
-	// and the one where Close has runtimes to tear down.
+	// Stopped mid-cycle, which is the state a supervisor restarts in. It used to be
+	// stopped while serving a volume, and the extra clause went with the volume manager:
+	// what is left is the part that was always the assertion — the signal is caught, the
+	// loop returns, and the process says so.
 	agent.Stop(t, 30*time.Second)
 	assertSaid(t, agent, "volume-agent stopped")
 

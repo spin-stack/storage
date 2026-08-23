@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/testinfra"
 )
@@ -17,16 +19,19 @@ import (
 // real processes and a real flock(2).
 //
 // §10 opens with "un proceso por host" and nothing enforced it. Two live Agents on one
-// --data-dir both resume the same segment files and both append to them, and
-// hostio.Listen unlinks a stale socket before binding — so the second silently steals
-// the guest from the first rather than failing to bind. The simulated lock in the DST
+// --data-dir both open whatever local state is under it and both write to it; the second
+// silently takes over from the first rather than failing. The simulated lock in the DST
 // harness would only be checking the simulation's own map; what makes this true in
 // production is the kernel, and this is the only place that is exercised.
 //
-// The first Agent is left running on purpose. A lock that refused *after* the holder
-// died would be the worse bug: ADR-0024 requires a kill -9'd Agent's replacement to
-// start, which is what TestAKilledAgentReAttachesAtTheSameEpoch (restart_test.go)
-// covers.
+// The lock moved into `main` when the volume manager that used to take it was withdrawn.
+// That is the change this test guards: a claim on the data directory has to be taken by
+// whatever process holds the directory, and Stage 1's qcow2 manager should take it back
+// when it owns the directory's layout — this test is what says so out loud if it does not.
+//
+// The first Agent is left running on purpose. A lock that refused *after* the holder died
+// would be the worse bug: the kernel drops an flock when a process dies, precisely so a
+// kill -9'd Agent's replacement starts.
 func TestASecondAgentRefusesTheSameDataDir(t *testing.T) {
 	d := start(t)
 	first := d.startAgent(t, "agent-1")
@@ -35,13 +40,12 @@ func TestASecondAgentRefusesTheSameDataDir(t *testing.T) {
 	second := testinfra.Start(t, testinfra.ProcessConfig{
 		Name: "agent-2",
 		Path: d.agentBin,
-		Args: append([]string{
+		Args: []string{
 			"-host-id", ids.New().String(),
 			"-control-plane", d.cpURL,
 			"-data-dir", d.dataDir, // the same one agent-1 holds
-			"-vhost-socket-dir", d.sockDir,
 			"-kek-file", d.kekFile,
-		}, d.storeArgs()...),
+		},
 		Env: d.agentEnv,
 	})
 	if err := second.Wait(t, 30*time.Second); err == nil {
@@ -59,17 +63,47 @@ func TestASecondAgentRefusesTheSameDataDir(t *testing.T) {
 		t.Fatalf("the refusal did not name %s:\n%s", d.dataDir, strings.Join(second.Output(), "\n"))
 	}
 
-	// And the first is untouched — it still holds the directory and is still serving.
-	d.seedVolume(t)
-	first.WaitForLine(t, "serving volume", 60*time.Second)
+	// And the first is untouched — it still holds the directory and is still heartbeating.
+	// Asserted on the catalog's clock rather than on the first Agent's log, because a
+	// healthy Agent prints nothing after start-up: the loop logs a cycle only when one
+	// fails. A timestamp that advances after the second process was refused is the fleet
+	// observing that the holder survived the intruder, which is the half of this that a
+	// lock releasing itself under contention would break.
+	beat := lastHeartbeat(t, d, d.hostID)
+	waitFor(t, 60*time.Second, "the first Agent to heartbeat again", func() bool {
+		return lastHeartbeat(t, d, d.hostID).After(beat)
+	})
+	// And it was never the one refused. A lock that let go and re-took under contention
+	// would put this line in the holder's log instead of the intruder's, and the
+	// heartbeat above cannot tell the two apart.
+	for _, line := range first.Output() {
+		if strings.Contains(line, "already using") {
+			t.Fatalf("the Agent holding %s was the one refused:\n%s", d.dataDir, line)
+		}
+	}
 }
 
-// TestTheAgentWritesWhereItWasTold. The Disk is rooted at --data-dir and the manager's
-// DataDir is a path inside *that* namespace, so passing the operator's absolute path in
-// both places put every WAL under <data-dir>/<data-dir>/wal/... — consistent,
-// restart-safe, and nowhere near where the operator was told to look. Nothing
-// in-process could see it: every test gives the manager a Disk spanning a whole
-// filesystem, where the two paths agree.
+// lastHeartbeat reads the instant the catalog last heard from a host.
+func lastHeartbeat(t *testing.T, d *deployment, hostID string) time.Time {
+	t.Helper()
+	pool, err := pgxpool.New(t.Context(), d.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var at time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT last_heartbeat FROM hosts WHERE host_id = $1`, hostID).Scan(&at); err != nil {
+		t.Fatalf("reading the host's last heartbeat: %v", err)
+	}
+	return at
+}
+
+// TestTheAgentWritesWhereItWasTold. The Disk is rooted at --data-dir and the paths handed
+// to it are inside *that* namespace, so passing the operator's absolute path in both
+// places put every file under <data-dir>/<data-dir>/... — consistent, restart-safe, and
+// nowhere near where the operator was told to look. Nothing in-process could see it:
+// every test gives the Disk a whole filesystem, where the two paths agree.
 //
 // The lock file is the witness because it is created at start-up, before any guest has
 // written a byte: a WAL directory would only appear on the first append.

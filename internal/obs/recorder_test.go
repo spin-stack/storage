@@ -7,7 +7,7 @@ import (
 )
 
 // DEV-0010. The §26.2 catalog was registered at startup and nothing ever recorded to
-// it: no counter, histogram, or gauge was touched by any production path, while the
+// it: no counter or gauge was touched by any production path, while the
 // phase documents said metrics were flowing. A Recorder makes recording possible
 // without every package importing OTel, and the nil Recorder has to be safe — a
 // component built without observability must still run.
@@ -18,8 +18,7 @@ func TestNilRecorderIsSafe(t *testing.T) {
 	// None of these may panic: a data path is not allowed to fail because telemetry
 	// was not wired.
 	r.Count(ctx, "clone_same_host_total", 10)
-	r.Gauge(ctx, "wal_durable_sequence", 7)
-	r.Observe(ctx, "image_publish_duration_seconds", 0.01)
+	r.Gauge(ctx, "chain_depth", 7)
 	r.Count(ctx, "not_in_the_catalog_total", 1)
 }
 
@@ -33,14 +32,13 @@ func TestRecorderWritesToTheRegisteredInstruments(t *testing.T) {
 
 	r := obs.NewRecorder(p.Metrics)
 	r.Count(ctx, "clone_same_host_total", 42)
-	r.Gauge(ctx, "wal_durable_sequence", 9)
-	r.Observe(ctx, "image_publish_duration_seconds", 0.25)
+	r.Gauge(ctx, "chain_depth", 9)
 
 	got, err := p.CollectedMetrics(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"clone_same_host_total", "wal_durable_sequence", "image_publish_duration_seconds"} {
+	for _, name := range []string{"clone_same_host_total", "chain_depth"} {
 		if !got[name] {
 			t.Fatalf("%s was never recorded; collected: %v", name, got)
 		}

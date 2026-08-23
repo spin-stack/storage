@@ -29,36 +29,19 @@ const simEpoch = 1_700_000_000
 // EventKind classifies a recorded event.
 type EventKind string
 
+// The list is short, and everything a data path used to emit is off it. The kinds that
+// went — watermark, leaves-host, stale-publish, truncate, volume-serve, durable-read,
+// carry, refusal — were the vocabulary the local block engine's scenarios spoke, and
+// each named a fact only that engine could state. A kind nothing emits is a kind the
+// next author writes a scenario against and finds no checker for, so they leave with
+// their producers; the commit protocol declares the ones it needs, in the commit that
+// emits them.
 const (
-	EventClock       EventKind = "clock"
-	EventDisk        EventKind = "disk"
-	EventObject      EventKind = "object"
-	EventNetwork     EventKind = "network"
-	EventNote        EventKind = "note"
-	EventDelete      EventKind = "delete"
-	EventFault       EventKind = "fault"
-	EventRecovery    EventKind = "recovery"
-	EventWatermark   EventKind = "watermark"
-	EventLeavesHost  EventKind = "leaves-host"
-	EventStalePublsh EventKind = "stale-publish"
-	EventTruncate    EventKind = "truncate"
-	EventVolumeServe EventKind = "volume-serve"
-	EventDurableRead EventKind = "durable-read"
-	EventCarry       EventKind = "carry"
-	EventRefusal     EventKind = "refusal"
-)
-
-// CarryPhase says what a carry event states about one WAL record: what a guest was
-// promised, or what the device was found to hold afterwards.
-type CarryPhase string
-
-const (
-	// CarryPromised: the record's fdatasync returned, so a guest's fsync was ACKed on
-	// it. Emitted once per (volume, sequence), with the plaintext the guest wrote.
-	CarryPromised CarryPhase = "promised"
-	// CarrySurvived: the record was found on the device by a scan, under the epoch the
-	// event names, with the plaintext it reads back as.
-	CarrySurvived CarryPhase = "survived"
+	EventClock   EventKind = "clock"
+	EventNetwork EventKind = "network"
+	EventNote    EventKind = "note"
+	EventDelete  EventKind = "delete"
+	EventFault   EventKind = "fault"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -69,67 +52,9 @@ type Event struct {
 	Msg  string
 	// Clock events:
 	Mono clock.Instant
-	// Object/Delete events:
+	// Delete events:
 	Key       string
 	Permanent bool // Delete: whether it was a permanent (irreversible) delete
-	// Watermark events (§5.6):
-	Local     uint64
-	Durable   uint64
-	Published uint64
-	// LeavesHost events (§5.10): true if cleartext guest data was detected in bytes
-	// bound for outside the host (a violation).
-	ClearLeak bool
-	// StalePublish events (§12.4): whether a second incarnation of a volume managed to
-	// publish over the first's image. Must always be false — under ADR-0026 this is all
-	// that is left of INV-10, and it is a compare-and-set on one object.
-	StalePublishOK bool
-	// Truncate events (§21.1): the sequence local WAL was reclaimed to, and the
-	// verified published point. TruncatedUpTo must be <= Published (INV-13).
-	TruncatedUpTo uint64
-	// VolumeServe events (§16, §12.3): whether the Agent still had something to answer
-	// a fenced volume's requests with. Must always be false (INV-10's Agent half).
-	ServedAfterFence bool
-	// DurableRead events (§5.8): whether a range the volume ACKed as durable came back
-	// as zeros after a restart. Must always be false (INV-08 from the guest's side).
-	ZerosAfterRestart bool
-	// ForeignBytesAfterRestart is the same violation wearing different clothes: the
-	// read was answered, and with neither the guest's bytes nor zeros. Zeros are the
-	// shape a *missing* base has; this is the shape a base rebuilt *wrongly* has —
-	// undecrypted ciphertext being the case that shipped, since GCM leaves the length
-	// intact and nothing downstream re-checks the plaintext CRC. Must always be false.
-	ForeignBytesAfterRestart bool
-
-	// Carry events (wal.Log.CarryForward): one WAL record either promised to a guest
-	// or found on the device afterwards. Key carries the volume id.
-	CarryPhase CarryPhase
-	// Epoch is the epoch the record was promised under (promised) or is filed under
-	// (survived). Sequence is the record's, which a carry must never change.
-	Epoch    uint64
-	Sequence uint64
-	// Digest is over the *plaintext* — what the guest wrote, or what the record on the
-	// device reads back as once opened. A resealed record has different bytes on disk
-	// and the same digest; a copied ciphertext has the same bytes and a different one,
-	// which is the whole reason the digest is not taken over the encoded record.
-	Digest string
-	// Refusal events: the word the *catalog* holds about a volume its host is not
-	// serving, once the report has crossed the wire, and whether that volume still has a
-	// socket bound on the host. Key carries the volume id.
-	//
-	// The two travel on one event because the failure they describe is a conjunction:
-	// either half alone is satisfied by an implementation that got the other badly
-	// wrong — a volume with no device that vanished from the wire, or one the fleet
-	// knows is refused that is still handing a guest a device that errors.
-	Refusal     string
-	SocketBound bool
-
-	// Scan groups the survived events of one observation of one device. It is what
-	// scopes "the same sequence twice under one (volume, epoch)" to a single moment,
-	// rather than to a record legitimately seen again by a later scan.
-	Scan uint64
-	// Settled marks the observation taken after the carry was given its last chance to
-	// finish. Only those decide whether a record was lost; an earlier scan is a
-	// half-finished state on purpose.
-	Settled bool
 }
 
 // String renders an event deterministically for the trace.
@@ -139,26 +64,6 @@ func (e Event) String() string {
 		return fmt.Sprintf("%04d clock mono=%d %s", e.Step, e.Mono, e.Msg)
 	case EventDelete:
 		return fmt.Sprintf("%04d delete key=%s permanent=%t", e.Step, e.Key, e.Permanent)
-	case EventWatermark:
-		return fmt.Sprintf("%04d watermark pub=%d dur=%d loc=%d", e.Step, e.Published, e.Durable, e.Local)
-	case EventLeavesHost:
-		return fmt.Sprintf("%04d leaves-host clear_leak=%t %s", e.Step, e.ClearLeak, e.Msg)
-	case EventStalePublsh:
-		return fmt.Sprintf("%04d stale-publish succeeded=%t", e.Step, e.StalePublishOK)
-	case EventTruncate:
-		return fmt.Sprintf("%04d truncate up_to=%d published=%d", e.Step, e.TruncatedUpTo, e.Published)
-	case EventDurableRead:
-		return fmt.Sprintf("%04d durable-read vol=%s zeros_after_restart=%t foreign_bytes_after_restart=%t",
-			e.Step, e.Key, e.ZerosAfterRestart, e.ForeignBytesAfterRestart)
-	case EventVolumeServe:
-		return fmt.Sprintf("%04d volume-serve vol=%s served_after_fence=%t", e.Step, e.Key, e.ServedAfterFence)
-	case EventRefusal:
-		return fmt.Sprintf("%04d refusal vol=%s catalog=%q socket_bound=%t", e.Step, e.Key, e.Refusal, e.SocketBound)
-	case EventCarry:
-		return fmt.Sprintf("%04d carry %s vol=%s epoch=%d seq=%d digest=%s scan=%d settled=%t",
-			e.Step, e.CarryPhase, e.Key, e.Epoch, e.Sequence, e.Digest, e.Scan, e.Settled)
-	case EventObject:
-		return fmt.Sprintf("%04d object key=%s %s", e.Step, e.Key, e.Msg)
 	default:
 		return fmt.Sprintf("%04d %s %s", e.Step, e.Kind, e.Msg)
 	}
