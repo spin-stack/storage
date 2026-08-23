@@ -1,0 +1,177 @@
+// Package qmp is a QEMU Machine Protocol client, cut down to the one question this
+// system asks today: which image file does the QEMU at this socket actually have open?
+//
+// # Why there is a client here at all, and why it is this small
+//
+// The Agent does not run QEMU (see internal/qcow). It prepares a volume's chain and
+// then has no way of its own to know whether anything is using it — a file on disk is
+// the same file whether a VM booted from it, booted from something else, or never
+// started. QMP is the only channel that answers, and v6 §7 makes it the mandatory one:
+// flush the block devices, take the external snapshot, switch to the new tip, and
+// **confirm QEMU is using it**. The last of those is the whole of Stage 1's use, and
+// the first three are what the next stage builds on this transport.
+//
+// What it is not: a general QMP library. There is no event subscription, no command
+// registry, no reconnection. Those arrive when something asks for them.
+package qmp
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// ErrNoEndpoint means nothing was listening at the socket path. It is the ordinary
+// state of a volume whose chain is ready and whose VM has not been launched, so callers
+// branch on it rather than treating it as a failure.
+var ErrNoEndpoint = errors.New("qmp: no endpoint at the socket")
+
+// Dialer opens a byte stream to a QMP socket. internal/simio/real.UnixDialer is the
+// production implementation; it binds the stream's lifetime to ctx, which is what gives
+// every read below a deadline without this package touching a clock (INV-01).
+type Dialer interface {
+	Dial(ctx context.Context, path string) (io.ReadWriteCloser, error)
+}
+
+// Client is one QMP session. It is not safe for concurrent use: a QMP connection is a
+// single request/response stream, and interleaving two exchanges on it would pair each
+// answer with the wrong question.
+type Client struct {
+	conn io.ReadWriteCloser
+	dec  *json.Decoder
+	enc  *json.Encoder
+}
+
+// BlockDevice is one entry of `query-block`: a block backend and the file behind it.
+type BlockDevice struct {
+	// Device is the backend's legacy name ("drive0"), empty for a modern -blockdev.
+	Device string
+	// QDev is the guest device's qdev path, which is what a -blockdev-configured disk
+	// is identified by. Either of the two may be empty; both being empty is a device
+	// with no name at all, which QEMU allows.
+	QDev string
+	// File is the path QEMU has open. This is the field the whole package exists for.
+	File string
+	// Format is the driver QEMU opened it with ("qcow2", "raw", ...). A volume whose
+	// image is being read as raw is a volume whose backing chain is invisible to it,
+	// which is worth being able to notice.
+	Format string
+}
+
+// Dial connects to the QMP socket at path and completes the capabilities negotiation,
+// after which the connection accepts commands.
+//
+// The negotiation is not optional and is not deferred: QEMU answers every command with
+// `CommandNotFound` until `qmp_capabilities` has been executed, so a client that skipped
+// it would fail on its first real question with an error about the wrong thing.
+func Dial(ctx context.Context, d Dialer, path string) (*Client, error) {
+	conn, err := d.Dial(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: %w", ErrNoEndpoint, path, err)
+	}
+	c := &Client{
+		conn: conn,
+		dec:  json.NewDecoder(bufio.NewReader(conn)),
+		enc:  json.NewEncoder(conn),
+	}
+	// The greeting arrives unprompted, before anything is sent. Reading it is what
+	// makes the next decode line up with the answer to our own command.
+	var greeting struct {
+		QMP *json.RawMessage `json:"QMP"`
+	}
+	if err := c.dec.Decode(&greeting); err != nil {
+		return nil, errors.Join(fmt.Errorf("qmp: reading the greeting from %q: %w", path, err), conn.Close())
+	}
+	if greeting.QMP == nil {
+		return nil, errors.Join(
+			fmt.Errorf("qmp: %q answered without a QMP greeting; it is not a QMP socket", path), conn.Close())
+	}
+	if _, err := c.execute("qmp_capabilities"); err != nil {
+		return nil, errors.Join(fmt.Errorf("qmp: negotiating capabilities with %q: %w", path, err), conn.Close())
+	}
+	return c, nil
+}
+
+// Close ends the session.
+func (c *Client) Close() error { return c.conn.Close() }
+
+// BlockDevices reports what `query-block` says QEMU has open.
+//
+// It takes no context, deliberately: the connection this runs on was created with one
+// and dies with it, so a second deadline here would be a second answer to the same
+// question. Cancel the context the client was dialled with.
+func (c *Client) BlockDevices() ([]BlockDevice, error) {
+	raw, err := c.execute("query-block")
+	if err != nil {
+		return nil, err
+	}
+	var devices []struct {
+		Device   string `json:"device"`
+		QDev     string `json:"qdev"`
+		Inserted *struct {
+			File   string `json:"file"`
+			Driver string `json:"drv"`
+		} `json:"inserted"`
+	}
+	if err := json.Unmarshal(raw, &devices); err != nil {
+		return nil, fmt.Errorf("qmp: decoding the query-block answer: %w", err)
+	}
+	out := make([]BlockDevice, 0, len(devices))
+	for _, d := range devices {
+		// A backend with no medium inserted — an empty CD-ROM tray is the usual one —
+		// has no file, and reporting it as a device with an empty path would make it
+		// indistinguishable from a device whose file we failed to read.
+		if d.Inserted == nil {
+			continue
+		}
+		out = append(out, BlockDevice{
+			Device: d.Device, QDev: d.QDev,
+			File: d.Inserted.File, Format: d.Inserted.Driver,
+		})
+	}
+	return out, nil
+}
+
+// reply is one line from QEMU. Exactly one of the three fields is set: an answer, an
+// error, or an asynchronous event that has nothing to do with the command in flight.
+type reply struct {
+	Return json.RawMessage `json:"return"`
+	Error  *struct {
+		Class string `json:"class"`
+		Desc  string `json:"desc"`
+	} `json:"error"`
+	Event string `json:"event"`
+}
+
+// execute sends one command and returns the raw `return` value.
+//
+// Events are skipped rather than delivered, and that is the one piece of protocol
+// subtlety in this file. QEMU interleaves them with command answers on the same
+// stream — a `JOB_STATUS_CHANGE` can arrive between the request and its reply — so a
+// client that treated the next line as its answer would read an event as a result, or
+// as a malformed one, depending on the day. The loop reads until something that is an
+// answer or an error.
+func (c *Client) execute(command string) (json.RawMessage, error) {
+	if err := c.enc.Encode(map[string]string{"execute": command}); err != nil {
+		return nil, fmt.Errorf("qmp: sending %s: %w", command, err)
+	}
+	for {
+		var r reply
+		if err := c.dec.Decode(&r); err != nil {
+			return nil, fmt.Errorf("qmp: reading the answer to %s: %w", command, err)
+		}
+		switch {
+		case r.Error != nil:
+			return nil, fmt.Errorf("qmp: %s failed: %s: %s", command, r.Error.Class, r.Error.Desc)
+		case r.Return != nil:
+			return r.Return, nil
+		case r.Event != "":
+			continue
+		default:
+			return nil, fmt.Errorf("qmp: %s got a line that is neither an answer, an error nor an event", command)
+		}
+	}
+}

@@ -4,26 +4,23 @@
 // client and hand them over — main is the only place in the tree where a real
 // implementation is constructed (INV-01).
 //
-// # It carries no data path, and that is this build's whole shape
+// # What it serves, and what serves it
 //
-// It used to: one runtime per volume the Control Plane listed for this host, each with
-// its own write-ahead log, block device and vhost-user socket a guest attached to. That
-// engine is withdrawn. QEMU manages the local copy-on-write format through qcow2 from
-// here on, and this system's job narrows to immutable commits, publication to object
-// storage, and recovery — none of which this binary performs yet.
+// The data path is QEMU's. This process prepares each volume's local qcow2 chain,
+// hands the paths to whoever launches the VM, and speaks QMP to the QEMU that ends up
+// there — it does not start one. internal/qcow's package comment carries the reasoning
+// and the two-path contract; the short version is that spin's runner already runs the
+// VMs on this host, and a second daemon supervising them is the responsibility this
+// pivot exists to shed.
 //
-// So what runs is exactly the half that talks to the Control Plane: this host claims its
-// data directory, reads its key, registers, heartbeats, holds a lease, learns which
-// volumes it is supposed to be serving, and reports an empty set. It says so on the way
-// up, on every cycle that has work it cannot do, and on the way down. An operator who
-// starts it gets a host that appears in `-fleet-status` and serves nothing, which is the
-// truth.
+// So: this host claims its data directory (through the volume manager, which owns the
+// layout inside it), reads its key, registers, heartbeats, holds a lease, learns which
+// volumes it should be serving, prepares a chain for each, and reports what it saw.
 //
-// **What Stage 1 adds**: a volume manager over qcow2 — create, attach, restart, detach,
-// local persistence — driven by QMP, plugged into the loop at agent.VolumeReconciler,
-// which is the seam left standing for it. Nothing remote in Stage 1: no object store
-// flags here, because an Agent that took a bucket it never wrote to would be claiming a
-// capability it does not have.
+// Nothing here talks to an object store, and there are no flags for one, because
+// nothing in this build writes an object: commits, publication and recovery are the
+// stages after this one, and a binary that accepted a bucket it never wrote to would be
+// claiming a capability it does not have.
 package main
 
 import (
@@ -43,7 +40,7 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/obs"
-	"github.com/spin-stack/storage/internal/simio/disk"
+	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/real"
 )
 
@@ -54,11 +51,6 @@ var version = "dev"
 // maxFormatVersion is the highest on-disk/on-S3 format this build reads and writes.
 // It is a constant of the binary, not configuration: it describes the code.
 const maxFormatVersion = 1
-
-// lockFile is this host's claim on its data directory, inside it. The name is part of
-// the operator's world — it is what a human looks for to find out whether an Agent is
-// holding a directory — so it is a constant here and not a path built at the call site.
-const lockFile = "agent.lock"
 
 func main() {
 	if err := run(); err != nil {
@@ -81,6 +73,10 @@ func run() (err error) {
 		metricsListen = flag.String("metrics-listen", "",
 			"host:port for the operator endpoint: GET /metrics (Prometheus text) and GET /healthz. Empty disables it, and then this process holds no listening socket at all")
 		kekFile = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent holds no key material, which is dev mode only")
+		qemuImg = flag.String("qemu-img", "",
+			"path to the pinned qemu-img binary, which creates and inspects every qcow2 chain (required)")
+		probeTimeout = flag.Duration("qemu-timeout", 5*time.Second,
+			"how long one qemu-img run or one QMP exchange may take before the Agent gives up on it for this cycle")
 	)
 	flag.Parse()
 
@@ -91,6 +87,11 @@ func run() (err error) {
 		return errors.New("-control-plane is required")
 	case *dataDir == "":
 		return errors.New("-data-dir is required")
+	case *qemuImg == "":
+		// Required rather than defaulted to PATH: v6 pins QEMU to one version for CI
+		// and production, and a chain created by whichever qemu-img a login shell found
+		// is a chain nobody pinned.
+		return errors.New("-qemu-img is required: name the pinned binary (task build:qemu puts it in _output/bin)")
 	}
 
 	cfg := agent.Config{
@@ -145,26 +146,36 @@ func run() (err error) {
 		return fmt.Errorf("opening the data directory: %w", err)
 	}
 
-	// §10 opens with "un proceso por host". Two live Agents on one --data-dir is not a
-	// hypothetical: whatever local format the volumes take, both incarnations open the
-	// same files under it, and the second silently takes the guest from the first.
+	// The volume manager, and it is constructed here rather than after the Control Plane
+	// client because it is what claims --data-dir: v6 §10 is one Agent per host, and two
+	// incarnations preparing chains under the same paths would hand one qcow2 file to two
+	// QEMUs. The claim used to be taken in this function, with a note saying the qcow2
+	// manager should take it back the moment it owned the directory's layout. It does.
 	//
-	// It is taken in main, which is where the previous version deliberately did not put
-	// it: the volume manager owned the data directory and took it there, so no step was
-	// left to a caller that spin's runner would not inherit (ADR-0021). There is no
-	// volume manager now, and a claim on the directory has to outlive one anyway — this
-	// process holds it whether or not it is serving. The qcow2 manager should take it
-	// back the moment it owns the directory's layout.
-	unlock, err := dataDisk.Lock(lockFile)
+	// The absolute path is resolved first. --data-dir is whatever an operator typed, and
+	// this string is handed to *other* processes — qemu-img on a command line, and
+	// whoever launches QEMU — whose working directory is not ours.
+	root, err := filepath.Abs(*dataDir)
 	if err != nil {
-		if errors.Is(err, disk.ErrLocked) {
-			return fmt.Errorf("another Volume Agent is already using %s (§10: one Agent per host): %w", *dataDir, err)
-		}
-		return fmt.Errorf("claiming %s: %w", *dataDir, err)
+		return fmt.Errorf("resolving %s: %w", *dataDir, err)
+	}
+	volumes, err := qcow.New(ctx, qcow.Config{
+		Root:         root,
+		QemuImg:      *qemuImg,
+		ProbeTimeout: *probeTimeout,
+	}, qcow.Deps{
+		Clock:  real.NewClock(),
+		Disk:   dataDisk,
+		Runner: real.NewRunner(),
+		Paths:  real.NewPaths(),
+		Dialer: real.NewUnixDialer(),
+	})
+	if err != nil {
+		return err
 	}
 	// The kernel drops an flock when the process dies, so this defer is for the paths
 	// that return rather than for a crash — nothing has to clean up after one.
-	defer func() { err = errors.Join(err, unlock.Close()) }()
+	defer func() { err = errors.Join(err, volumes.Close()) }()
 
 	// §15: guest data is sealed with the volume's DEK, wrapped under this KEK. Nothing
 	// in this build unwraps one — there is no data path to seal for — so the key is read
@@ -190,13 +201,6 @@ func run() (err error) {
 	cp := storagev1connect.NewControlPlaneServiceClient(
 		&http.Client{Timeout: *httpTimeout}, *cpURL)
 
-	// An empty VolumeSource, and it is not a placeholder that will quietly start working:
-	// it is a set nothing ever puts a volume into, because nothing in this build can
-	// serve one. The loop hands the desired state to a VolumeReconciler when its source
-	// happens to be one, and this is not one, so the desired state is recorded and acted
-	// on by nobody. See the package doc for what fills this in.
-	volumes := agent.NewVolumeSet()
-
 	loop, err := agent.New(cfg, agent.Deps{
 		Clock:        real.NewClock(),
 		ControlPlane: cp,
@@ -213,13 +217,8 @@ func run() (err error) {
 
 	slog.Info("volume-agent starting",
 		"host_id", cfg.HostID, "version", version, "control_plane", *cpURL,
-		"data_dir", *dataDir, "heartbeat_interval", cfg.HeartbeatInterval,
+		"data_dir", root, "qemu_img", *qemuImg, "heartbeat_interval", cfg.HeartbeatInterval,
 		"metrics_listen", *metricsListen)
-	// Said once, at the top, in the log an operator is already reading. A process that
-	// registers a host and then serves nothing looks like a bug from the outside, and
-	// the difference between this and a bug is one line.
-	slog.Warn("this Agent serves no volumes: the local block engine is withdrawn and the qcow2 volume manager is not built yet",
-		"serves", "nothing", "reports", "an empty volume set", "next", "Stage 1: qcow2 create/attach/restart/detach, local only")
 
 	if err := loop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err

@@ -56,6 +56,15 @@ jobs:
   # is added.
   ci:
     runs-on: ubuntu-latest
+    # The gate starts a Volume Agent, and the Agent creates and inspects every qcow2
+    # chain by running the pinned qemu-img — v6 §7 forbids a parser of our own — so it
+    # refuses to start without one. `task qemu:tools` pulls the image qemu.yml publishes
+    # and extracts the binary; building QEMU here would be tens of minutes inside a
+    # sixty-minute job. This is the preflight the Taskfile's own comment predicted the
+    # qcow2 lane would need.
+    permissions:
+      contents: read
+      packages: read
     # Measured against nothing — these workflows have never executed (STATUS.md) — so
     # this is a ceiling, not a budget: enough for the race suite, the coverage run and
     # the Docker-backed lanes (e2e alone allows itself 15m) on a two-core runner, and far
@@ -90,7 +99,27 @@ jobs:
       - name: Install pinned tools
         run: task tools
 
+      # A read token for the published QEMU image. The pull below is the only thing in
+      # this job that touches GitHub Packages, which is why the permission is raised at
+      # the job rather than at the workflow.
+      - name: Log in to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Named as its own step so a missing or unpublished image fails here, under a name
+      # that says what is wrong, rather than sixteen minutes into the gate as a lane that
+      # cannot start an Agent.
+      - name: The pinned qemu-img the Agent needs
+        env:
+          QEMU_IMAGE: ghcr.io/${{ github.repository }}/qemu
+        run: task qemu:tools
+
       - name: The merge gate (task ci:full)
+        env:
+          QEMU_IMAGE: ghcr.io/${{ github.repository }}/qemu
         run: task ci:full
 
   # The gate. This is the check to require on the branch, and the only job here whose

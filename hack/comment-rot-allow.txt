@@ -46,7 +46,6 @@ internal/obs/metrics.go:Catalog:gc                         # same sentence
 internal/obs/metrics.go:Catalog:objectize                  # same sentence
 internal/obs/metrics.go:Catalog:remote                     # same sentence, naming "the WAL-remote block" as the first thing ADR-0026 withdrew
 internal/obs/metrics.go:Catalog:warm-standby               # same sentence. A metric declared for a mechanism nobody has "reads as a plan", which is this check's thesis in the tree already
-cmd/volume-agent/main.go:package:remote                    # "Nothing remote in Stage 1: no object store flags here, because an Agent that took a bucket it never wrote to would be claiming a capability it does not have" — the package doc of the binary that stopped taking them
 
 # --- somebody else's mechanism, spelled the same --------------------------------------
 # The reason this check matches whole words rather than substrings, and the reason it can

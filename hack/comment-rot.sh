@@ -86,13 +86,12 @@ ALLOW=${ALLOW:-hack/comment-rot-allow.txt}
 PENDING=${PENDING:-hack/comment-rot-pending.txt}
 
 # ROOTS ARE THE BINARIES, AND THE SCOPE IS WHAT THEY LINK. hack/deadcode.sh's roots,
-# deliberately: ./cmd/... . integration/guestinit was the third until 2026-08-22, PID 1
-# inside the guest and as much a binary this repository built as the other two; it went
-# with the local block engine it booted against. "Production comments" then needs no
+# deliberately: ./cmd/... plus integration/guestinit, PID 1 inside the guest and as much a
+# binary this repository builds as the other two. "Production comments" then needs no
 # hand-maintained exclusion list — the harness (internal/dst,
 # internal/simio/sim, the *test packages) is out because no binary links it, and a package
 # that a binary starts linking is in from that moment, with no edit here.
-ROOTS=(./cmd/...)
+ROOTS=(./cmd/... ./integration/guestinit)
 
 # --- the vocabulary -----------------------------------------------------------------
 #

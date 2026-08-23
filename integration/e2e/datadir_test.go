@@ -24,10 +24,11 @@ import (
 // harness would only be checking the simulation's own map; what makes this true in
 // production is the kernel, and this is the only place that is exercised.
 //
-// The lock moved into `main` when the volume manager that used to take it was withdrawn.
-// That is the change this test guards: a claim on the data directory has to be taken by
-// whatever process holds the directory, and Stage 1's qcow2 manager should take it back
-// when it owns the directory's layout — this test is what says so out loud if it does not.
+// The lock has moved twice and this test is why the moves were safe: into `main` when the
+// volume manager that used to take it was withdrawn, and back into the volume manager
+// (internal/qcow) when Stage 1 gave it a directory layout to own. What it asserts is
+// about the *process*, not about which type inside it holds the descriptor — which is
+// exactly the property that let the second move happen without a second argument.
 //
 // The first Agent is left running on purpose. A lock that refused *after* the holder died
 // would be the worse bug: the kernel drops an flock when a process dies, precisely so a
@@ -45,6 +46,7 @@ func TestASecondAgentRefusesTheSameDataDir(t *testing.T) {
 			"-control-plane", d.cpURL,
 			"-data-dir", d.dataDir, // the same one agent-1 holds
 			"-kek-file", d.kekFile,
+			"-qemu-img", d.qemuImg,
 		},
 		Env: d.agentEnv,
 	})

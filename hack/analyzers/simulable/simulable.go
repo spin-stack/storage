@@ -63,18 +63,28 @@ var forbidden = map[string]map[string]bool{
 //     binary this repository ships. There is no clock to inject into another
 //     *process*: a harness that waited on a simulated one would be measuring
 //     nothing, and the whole point of the lanes is that the real world decides.
+//   - integration/guestinit is exempt for a different reason than either of the
+//     others: it is not host code. It is PID 1 *inside the guest VM*, on the far
+//     side of the interface INV-01 governs, and it is never linked into any
+//     binary this repository ships. Its purpose is to be the real world simio
+//     models — a block-device open it could simulate would prove nothing about a
+//     kernel finding its bytes again after the machine was shut down, which is the
+//     one thing no test here can otherwise reach. "Under integration/" is not what
+//     earned it: the host-side lane that drives QEMU is ordinary code, is not
+//     exempt, and has a fixture proving it.
 //
-// Two fragments left this list on 2026-08-22 with the packages they named:
+// One fragment left this list on 2026-08-22 with the package it named:
 // internal/vhost/hostio — vhost-user's SOCK_STREAM socket, its SCM_RIGHTS
 // descriptors and the mmap of the front-end's address space, none of which simio
-// models — and integration/guestinit, PID 1 inside the guest and so on the far
-// side of the interface INV-01 governs. Both belonged to the local block engine,
-// which is withdrawn: QEMU manages the local copy-on-write format through qcow2
-// now. An exemption for a path nothing occupies is a rule that can only ever
-// widen by accident, so it goes with the path.
+// models. It belonged to the local block engine, which is withdrawn: QEMU manages
+// the local copy-on-write format through qcow2 now. An exemption for a path
+// nothing occupies is a rule that can only ever widen by accident, so it went with
+// the path. guestinit left with it and came back with Stage 1, which boots a guest
+// against a qcow2 rather than against a backend of ours.
 var exemptPathFragments = []string{
 	"internal/simio",
 	"internal/testinfra",
+	"integration/guestinit",
 }
 
 // hasPathSegments reports whether the slash-separated path p contains frag as a

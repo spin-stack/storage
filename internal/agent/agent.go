@@ -8,15 +8,14 @@
 // device, and the set of volumes this host is serving. cmd/volume-agent is the only
 // place the real implementations are constructed.
 //
-// **There is no volume manager behind the VolumeSource right now.** The one that was
-// here served each volume from a local write-ahead log through a vhost-user-blk socket,
-// and it went with that engine: QEMU owns the local copy-on-write format from here on,
-// and this system's job narrows to immutable commits, publication and recovery. What is
-// left is exactly the half that talks to the Control Plane — heartbeat, lease, desired
+// **The volume manager behind the VolumeSource is internal/qcow.** The one before it
+// served each volume from a local write-ahead log through a vhost-user-blk socket, and
+// it went with that engine: QEMU owns the local copy-on-write format from here on, and
+// this system's job narrows to immutable commits, publication and recovery. What is left
+// here is exactly the half that talks to the Control Plane — heartbeat, lease, desired
 // state, the report — and it is deliberately unchanged, because it is the half the new
-// design keeps. VolumeReconciler is the seam the qcow2 manager plugs into, and until it
-// exists the loop learns what this host should be serving and can act on none of it,
-// which is what VolumeSet stands in for and what the Agent says on the way up.
+// design keeps. VolumeReconciler is the seam, qcow.Manager is what plugs into it, and
+// VolumeSet is what the loop's own tests drive when the point is the loop.
 package agent
 
 import (
@@ -103,8 +102,8 @@ type VolumeKeys struct {
 	DEKKeyID uint32
 }
 
-// VolumeSource is the set of volumes this host is serving right now. VolumeSet is the
-// only implementation today, and it is a stand-in: see the package doc.
+// VolumeSource is the set of volumes this host is serving right now. qcow.Manager is
+// what a binary hands over; VolumeSet is the in-memory one the loop's tests drive.
 type VolumeSource interface {
 	Volumes(ctx context.Context) ([]VolumeStatus, error)
 }
@@ -112,9 +111,7 @@ type VolumeSource interface {
 // VolumeReconciler is a VolumeSource that can also be told what this host *should* be
 // serving. The Loop uses it when its VolumeSource happens to be one; a plain source
 // leaves the desired state recorded and unacted-on, which is what a test driving
-// VolumeSet wants — and, until the qcow2 volume manager lands, what every real Agent
-// does. Nothing implements it in this tree; it is the seam, kept because the loop on
-// this side of it is not being rewritten.
+// VolumeSet wants. qcow.Manager is the implementation a binary wires up.
 //
 // It is deliberately the same object as the source. What is reported and what is served
 // must come from one place: two would drift, and the report is what the Control Plane
@@ -138,8 +135,11 @@ type VolumeReconciler interface {
 	Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error
 }
 
-// VolumeSet is an in-memory VolumeSource. It is what the Agent runs against until there
-// is a data path to ask — which is every Agent today — and it is what tests drive.
+// VolumeSet is an in-memory VolumeSource: a set of statuses a caller writes directly.
+// No binary builds one — cmd/volume-agent wires up qcow.Manager — and its reason for
+// existing is that the loop's own tests need a source whose Volumes() answer they
+// control and whose Apply cannot fail, so that what a test observes is the loop's
+// decision and not a chain's.
 type VolumeSet struct {
 	mu   sync.Mutex
 	vols map[string]VolumeStatus

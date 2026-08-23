@@ -10,57 +10,52 @@ copy-on-write format via qcow2, and this system manages only immutable commits,
 publication to object storage, and recovery (`arquitectura_mvp_volumenes_remotos_v6.md`,
 which replaced v5.1). The data path is not ours any more.
 
-Deleted whole, in one commit: `internal/vhost` (+`hostio`), `internal/blockdev`,
-`internal/wal`, `internal/cow`, `internal/image`, `internal/lineage`, `internal/agent`'s
-volume manager and device budget, `integration/vhost`, `integration/guestinit`, and every
-DST scenario, e2e scenario and metric whose subject was one of them. Nothing was deployed,
-so this cost only the code.
-
-**What survives is the control half, unchanged**: the catalog and its term guards
-(`internal/metadata`), the RPC surface (`internal/cpserver`), election/provision/place
-(`internal/controlplane`, `internal/placement`), the state machines (`internal/lifecycle`),
-the lease, `internal/obs`, `internal/ids`, `internal/storecfg`, `internal/simio` — in
-particular `simio/real`'s object store, whose cross-process `flock` CAS is the fencing
-primitive the new design's `HEAD` compare-and-swap rests on — and `internal/descriptor` +
-`internal/framed`, which are what a mutable-under-CAS `HEAD` and an immutable commit
-manifest are already built out of.
+What survives is the control half, unchanged — the catalog and its term guards, the RPC
+surface, election/provision/place, the lease — plus the two pieces the new design is built
+out of: `simio/real`'s object store, whose cross-process `flock` CAS is what a `HEAD`
+compare-and-swap rests on, and `internal/framed` + `internal/descriptor`. What went, and
+what it cost, is one commit in `git log`.
 
 ## What runs end to end
 
-Two binaries, as processes, in `integration/e2e`: a Control Plane is elected, an Agent
-claims its data directory with a real `flock`, reads its KEK and registers; both binaries
-reach the same key id from the same file; `-seed-volume` provisions a volume;
-`-fleet-status` prints the host and the volume; both stop cleanly on a signal.
+`task demo:stage1`, with the real binaries and a real Linux guest: a Control Plane is
+elected, an Agent claims its data directory and registers, `-seed-volume` provisions a
+volume, the Agent prepares its qcow2 chain, a guest boots off that file and writes, the
+Agent is SIGKILLed and restarted **under the running guest**, the guest is told to stop
+and powers off, and a second boot reads the bytes back. `integration/e2e` covers the same
+seam without a guest, and `task test:e2e` now needs the pinned `qemu-img` (`task
+qemu:tools`) because the Agent refuses to start without one.
 
-**The Agent serves no volumes, and says so on the way up.** It heartbeats, holds a lease,
-learns its desired state and reports an empty set. `agent.VolumeReconciler` is the seam
-the qcow2 manager plugs into.
+**The Agent does not launch QEMU.** It prepares the chain, owns the volume's directory,
+and speaks QMP to whatever is at the socket — spin's runner is what runs the VMs
+(ADR-0021), and v6 §4/§7 give the Agent control over QEMU, not its lifetime. The contract
+is two paths, `qcow.ActiveImage` and `qcow.QMPSocket`, and it is stated where they are
+defined.
 
 ## Do this next
 
-v6 §23's stages, and this tree is standing at the start of the first one.
+v6 §23's stages. The first has a thin path; everything below it is unbuilt.
 
-1. **qcow2 local, nothing remote.** Create, attach, restart, detach, local persistence,
-   driven by QMP. It implements `agent.VolumeReconciler` — the seam is already there — and
-   it takes the data-directory lock back from `cmd/volume-agent/main.go`, which holds it
-   only because nothing else does. Increment 1 is a command a human runs that boots a
-   guest off a qcow2 this system created.
-2. **Rotation by QMP**, then **the commit protocol** (v6 §9, §12): `HEAD` as the one
-   mutable object under compare-and-swap, commit manifests immutable and create-only, each
-   layer sealed with the volume's DEK on the way out (v6 §10 — which is why
-   `crypto.NewEncryption` was carried across rather than deleted). Both are review zones
-   from the first line. The commit protocol's DST arm has the shape of the deleted
-   `two-hosts-cannot-both-publish-an-image`, and the primitive under it is already proven
-   by `task backend:conformance`.
+1. **Stage 1's depth** (increment 2): a DST scenario for the reconciler, and the two
+   sentences nothing yet proves — that a *detach* stops the volume for a running guest,
+   and what happens to a chain whose directory is gone under it. `state.json` from v6 §5
+   is deliberately not written: nothing reads it while a chain is one link long.
+2. **Rotation by QMP** (v6 §23.2), whose exit criterion is measured — the snapshot pause
+   and the upload throughput. `internal/qmp` is the transport it needs and is already
+   driven by a real QEMU in the demo.
+3. **The commit protocol** (v6 §9, §12): `HEAD` as the one mutable object under
+   compare-and-swap, commit manifests immutable and create-only, each layer sealed with
+   the volume's DEK on the way out (v6 §10 — which is why `crypto.NewEncryption` was
+   carried across rather than deleted). A review zone from the first line. Its DST arm has
+   the shape of the deleted `two-hosts-cannot-both-publish-an-image`, and the primitive
+   under it is already proven by `task backend:conformance`.
 
 ## What the demolition left owed
 
-- **`hack/deadcode-pending.txt` has three entries**, all created by this commit and all
-  waiting on the two stages above: `agent.Loop.VolumeKeys` and its cache (the client half
-  of the surviving `GetVolumeKeys` RPC, whose caller was the volume manager), and
-  `crypto.NewEncryption` (carried out of `internal/wal` deliberately — the commit protocol
-  seals each layer with the volume's DEK). If Stage 1 and Stage 2 do not take them, they
-  are deletions.
+- **`hack/deadcode-pending.txt` still has three entries**, and Stage 1 was never going to
+  take them: v6 §10 leaves the local qcow2 in cleartext and seals a layer only on the way
+  out, so nothing local needs a DEK. `agent.Loop.VolumeKeys` and its cache, and
+  `crypto.NewEncryption`, are owed to the commit protocol or owed a deletion.
 - **`internal/dst` has three scenarios and one checker.** The harness is intact and is the
   point: the commit protocol needs exactly this — seeded, crash-at-every-point,
   same-seed-same-trace — with a new subject. `mandatory_set_test.go` records what left and
@@ -72,9 +67,6 @@ v6 §23's stages, and this tree is standing at the start of the first one.
 - **There is one merge gate again** (`task ci:full`); `ci:noguest` and the REQUIRE_PROOFS
   mechanism went with the guest-backed lanes they arbitrated. `task build:qemu` and
   `task fetch:kernel` are still here and still pinned, because Stage 1 needs both.
-- **`CLAUDE.md`'s Taskfile list still names `task build:guest` and `task guest:verify`**,
-  which went with the initramfs and the guest lane. Two lines, and nothing checks them —
-  `task workflows:verify` reads the workflows, not this file.
 
 ## What only a pilot can answer
 
@@ -86,6 +78,14 @@ Named here so nobody mistakes them for things that were checked.
 
 ## Thin paths that shipped without being deepened
 
+- **Stage 1 has no DST scenario and no checker**, by the gate's own rule for a first
+  increment. What exists is unit tests over `internal/qcow`/`internal/qmp` with the
+  process and the socket injected, plus the demo and one e2e assertion.
+- **A volume is never deleted locally.** Releasing one leaves its image on disk, because
+  nothing has decided who reclaims it; the device fills up and nothing sweeps.
+- **Nothing measures the chain.** No metric was added — depth, size, attachment — so the
+  only observation of a volume's state outside the Agent is its log and the catalog's
+  refusal column.
 - **No bucket lifecycle is configured by any code**, so a delete marker is reversible for as
   long as nobody sets one — which is the whole recovery window.
 - **No alerting artifact exists** (no rules file, no threshold comparison in code) —

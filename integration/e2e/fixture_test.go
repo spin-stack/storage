@@ -53,6 +53,7 @@ type deployment struct {
 	cp       *testinfra.Process
 	agentBin string
 	agentEnv []string
+	qemuImg  string
 }
 
 // start brings up everything except the Agent — the Agent is started per test, because
@@ -62,6 +63,12 @@ func start(t *testing.T) *deployment {
 
 	cpBin := testinfra.Binary(t, "control-plane")
 	agentBin := testinfra.Binary(t, "volume-agent")
+	// The Agent creates and inspects every qcow2 chain by running the pinned qemu-img
+	// (v6 §7 forbids a parser of our own), and refuses to start without it — so this
+	// lane needs the artefact `task build:qemu` produces. testinfra.Binary fails naming
+	// that task rather than skipping: a lane that quietly declined to start the Agent
+	// would be the gate reporting success for work it did not do.
+	qemuImg := testinfra.Binary(t, "qemu-img")
 
 	dsn := testinfra.Postgres(t)
 	store := testinfra.RustFS(t, os.Getenv("RUSTFS_IMAGE"))
@@ -87,7 +94,7 @@ func start(t *testing.T) *deployment {
 		dataDir:  filepath.Join(dir, "data"),
 		kekFile:  kekFile,
 		kekID:    crypto.KEKID([crypto.DEKSize]byte(kek)),
-		agentBin: agentBin, agentEnv: env,
+		agentBin: agentBin, agentEnv: env, qemuImg: qemuImg,
 	}
 	if err := os.MkdirAll(d.dataDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -149,6 +156,7 @@ func (d *deployment) startAgent(t *testing.T, name string) *testinfra.Process {
 			"-control-plane", d.cpURL,
 			"-data-dir", d.dataDir,
 			"-kek-file", d.kekFile,
+			"-qemu-img", d.qemuImg,
 			"-heartbeat-interval", "1s",
 		},
 		Env: d.agentEnv,

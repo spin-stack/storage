@@ -39,6 +39,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -92,6 +93,7 @@ func TestARunningAgentDeliversItsLeaseGaugeToACollector(t *testing.T) {
 		"-host-id", host,
 		"-control-plane", cpsrv.URL,
 		"-data-dir", t.TempDir(),
+		"-qemu-img", stubQemuImg(t),
 		"-otlp-endpoint", otlp.URL,
 		// One cycle, then an hour of silence. The Agent's first cycle runs immediately
 		// and the next waits a heartbeat interval, so an interval longer than the test
@@ -158,6 +160,7 @@ func TestAnAgentThatCannotReachItsControlPlaneStillDeliversTheFailureCounter(t *
 		"-host-id", host,
 		"-control-plane", deadURL,
 		"-data-dir", t.TempDir(),
+		"-qemu-img", stubQemuImg(t),
 		"-otlp-endpoint", otlp.URL,
 		// Both an hour, so the failed cycle is not retried before the signal and the
 		// counter's value is exactly one rather than "however many the scheduler fitted".
@@ -277,6 +280,23 @@ func pointAttr(dp *metricspb.NumberDataPoint, key string) string {
 // build:cmd`, so depending on it would make this proof skip on a developer's machine —
 // and a proof that skips is how this repository shipped three documents claiming a lane
 // no test performed.
+// stubQemuImg writes something that answers `qemu-img --version` and nothing else.
+//
+// The Agent runs qemu-img once at start-up, to refuse an unusable one before it
+// registers as a healthy host, and after that only when it has a volume's chain to
+// create or inspect. The Control Planes in this file hand out no volumes, so the stub is
+// never asked for anything real — and that is the reason this test can keep running in
+// `task test`, with no Docker and nothing extracted into _output, which is the property
+// the comment at the top of this file argues for.
+func stubQemuImg(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "qemu-img")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho 'qemu-img version 11.0.2 (stub)'\n"), 0o700); err != nil {
+		t.Fatalf("writing a qemu-img stub: %v", err)
+	}
+	return path
+}
+
 func buildVolumeAgent(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "volume-agent")

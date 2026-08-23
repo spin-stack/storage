@@ -18,9 +18,16 @@
 # accessors exist so a test can observe the lease/desired-state/fencing decisions the loop
 # already made, instead of asserting on a field it set itself, which CLAUDE.md forbids.
 #
-# NewVolumeSet and its three methods left this list on 2026-08-22 by becoming *reachable*:
-# they were the stand-in "the Agent runs against when there is no data path", and with the
-# local block engine withdrawn there is no other VolumeSource — cmd/volume-agent builds one.
+# NewVolumeSet and its three methods came back on this list when Stage 1 landed. They spent
+# one commit reachable, as the stand-in the Agent ran against while it had no data path;
+# cmd/volume-agent now builds a qcow.Manager, so the in-memory set is a test affordance
+# again — and permanently, which is what earns it a place here rather than in the pending
+# list: the loop's own tests need a VolumeSource whose answers they control and whose Apply
+# cannot fail, so that what they observe is the loop's decision and not a chain's.
+internal/agent.NewVolumeSet      # built by loop_test, spine_test and device_test; a binary hands the loop a qcow.Manager
+internal/agent.VolumeSet.Set     # how those tests state what the host is serving
+internal/agent.VolumeSet.Remove  # and how they take it away again
+internal/agent.VolumeSet.Volumes # the VolumeSource half those tests hand the loop
 internal/agent.Loop.LeaseValid   # observed by loop_test/spine_test; production reads the lease through the loop's own paths
 internal/agent.Loop.Desired      # same: the desired state a test compares against what the loop then did
 internal/agent.Loop.HostState    # same

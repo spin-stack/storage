@@ -333,6 +333,13 @@ tasks:
         bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
         test -x "$bin" || { echo "missing $bin — run: task build:qemu"; exit 1; }
         test -x {{.OUTPUT_DIR}}/bin/qemu-storage-daemon
+        # qemu-img is not a convenience here: the Volume Agent refuses to start without
+        # -qemu-img, because every qcow2 chain is created and inspected by running it
+        # (v6 §7 forbids a parser of our own). It was in the extract stage and in
+        # nothing that checked, so an _output/ built before this line could satisfy
+        # `task qemu:verify` and still not run an Agent.
+        test -x {{.OUTPUT_DIR}}/bin/qemu-img || {
+          echo "missing {{.OUTPUT_DIR}}/bin/qemu-img — the Agent cannot create a chain without it; run: task build:qemu"; exit 1; }
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
         # pvh.bin is how -kernel enters a PVH ELF kernel, which is the guest lane's
         # only boot path. Its absence fails at run time as a rom-open error, which
@@ -378,9 +385,24 @@ tasks:
         fi
         printf '%s' "$out" | grep -q '{{.QEMU_VERSION}}' || {
           echo "the QEMU in $where is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
-        printf '%s' "$out" | grep -q 'vhost-user-blk-pci' || {
-          echo "the QEMU in $where has no vhost-user-blk-pci device (§3 data path)"; exit 1; }
-        echo "OK: $(printf '%s' "$out" | head -1), vhost-user-blk-pci present — verified in $where"
+        # virtio-blk-pci, not vhost-user-blk-pci. The device the guest gets is now an
+        # ordinary virtio disk backed by a qcow2 file QEMU opens itself; the vhost-user
+        # backend this used to name was this repository's own, and it is withdrawn. The
+        # build still enables it (qemu-storage-daemon), which is exactly why the check
+        # had to move: it was passing on a capability nothing consumes.
+        printf '%s' "$out" | grep -q 'virtio-blk-pci' || {
+          echo "the QEMU in $where has no virtio-blk-pci device, so no guest can be given a qcow2"; exit 1; }
+        echo "OK: $(printf '%s' "$out" | head -1), virtio-blk-pci present — verified in $where"
+
+  build:guest:
+    desc: Build the initramfs the guest lane boots (a static Go /init). The kernel comes from `task fetch:kernel`.
+    sources:
+      - integration/guestinit/**/*.go
+      - hack/build-guest-initramfs.sh
+    generates:
+      - '{{.OUTPUT_DIR}}/guest/initramfs.cpio.gz'
+    cmds:
+      - OUT_DIR={{.OUTPUT_DIR}}/guest bash hack/build-guest-initramfs.sh
 
   fetch:kernel:
     desc: >-
@@ -394,6 +416,50 @@ tasks:
       KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE}}'
     cmds:
       - bash hack/guest-kernel.sh fetch
+
+  guest:verify:
+    desc: Assert the guest lane's inputs — the initramfs we build, and that the kernel is the one we pinned.
+    deps: [build:guest, fetch:kernel]
+    env: *guest_kernel_env
+    cmds:
+      # This half was one `test -f`, and `test -f` says OK for a zero-byte file, for a
+      # half-written one, and for an archive with no /init — three states whose whole
+      # symptom is a kernel panic minutes later inside QEMU, attributed to the lane. Worse,
+      # `build:guest` does not rebuild any of them: its `sources:`/`generates:` fingerprint
+      # compares the *sources*, so a truncated artefact is "up to date". Verified 2026-08-04
+      # by emptying the file: the old target printed OK and exited 0.
+      #
+      # So the artefact is opened, not stat'ed, and every failure names the task that makes
+      # a good one. cpio is required rather than optional for the same reason the kernel's
+      # readelf check is: a machine that cannot look must not report OK.
+      - |
+        set -euo pipefail
+        img={{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
+        test -f "$img" || { echo "no initramfs at $img — run: task build:guest" >&2; exit 1; }
+        command -v cpio >/dev/null || {
+          echo "cpio is missing, so $img cannot be inspected (apt-get install cpio)" >&2; exit 1; }
+        gzip -t "$img" 2>/dev/null || {
+          echo "$img is not a valid gzip stream — a truncated or interrupted build; rebuild: task build:guest" >&2
+          exit 1; }
+        # ./init is the whole contract with the kernel: it mounts the archive as rootfs and
+        # execs /init, and an archive without one panics with "no working init found",
+        # which reads like a kernel problem rather than a missing build step.
+        listing=$(gzip -dc "$img" | cpio --list --quiet 2>/dev/null || true)
+        grep -qE '^(\./)?init$' <<<"$listing" || {
+          echo "$img contains no ./init — the kernel would mount it and panic with no PID 1; rebuild: task build:guest" >&2
+          exit 1; }
+        echo "OK: $img — gzip cpio carrying ./init"
+      - bash hack/guest-kernel.sh verify
+
+  demo:stage1:
+    desc: >-
+      Stage 1 end to end with the real binaries and a real Linux guest: a volume is
+      provisioned, the Agent prepares its qcow2 chain, a guest boots off that file and
+      writes, the Agent is killed and restarted under the running guest, and a second
+      boot reads the bytes back. Needs `task db:dev:up`, KVM, and the pinned artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage1-demo.sh
 
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
@@ -577,13 +643,44 @@ tasks:
     cmds:
       - go test -tags integration -count=1 ./internal/metadata/pg/...
 
+  qemu:tools:
+    desc: >-
+      Put the pinned qemu-img at _output/bin, extracting it from the published runtime
+      image when `task build:qemu` has not run here. Idempotent.
+    status:
+      - test -x {{.OUTPUT_DIR}}/bin/qemu-img
+    cmds:
+      # A second *source* for one artefact, not a second definition of the build —
+      # the same shape hack/guest-kernel.sh already has for the kernel (a sibling
+      # checkout or the mirror). The reason is arithmetic: `task build:qemu` compiles
+      # QEMU from source, which is tens of minutes, and every lane that starts a
+      # Volume Agent now needs qemu-img, because the Agent refuses to start without it.
+      #
+      # The image is the one the QEMU workflow publishes, so what lands here is the
+      # same binary `--target extract` would produce from the same builder stage.
+      - |
+        set -euo pipefail
+        img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
+        command -v docker >/dev/null || {
+          echo "no qemu-img at {{.OUTPUT_DIR}}/bin and no docker to fetch one — run: task build:qemu" >&2; exit 1; }
+        docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img" || {
+          echo "no $img locally and it could not be pulled — build it: task build:qemu" >&2; exit 1; }
+        mkdir -p {{.OUTPUT_DIR}}/bin
+        cid=$(docker create "$img")
+        trap 'docker rm -f "$cid" >/dev/null' EXIT
+        docker cp "$cid":/usr/local/bin/qemu-img {{.OUTPUT_DIR}}/bin/qemu-img
+        echo "extracted qemu-img from $img"
+
   test:e2e:
     desc: >-
       Run the deployment, not the library: the real control-plane and volume-agent
       as processes, against a real Postgres 18 and the pinned RustFS. It is the only
       lane that can see the two binaries disagree — about a key file, about a flag
       nobody passes — because everything else drives Go types in-process.
-    deps: [build:cmd]
+    # qemu:tools and not build:qemu: the Agent creates every chain by running the pinned
+    # qemu-img, so this lane cannot start one without it, and compiling QEMU here would
+    # put tens of minutes into the merge gate.
+    deps: [build:cmd, qemu:tools]
     cmds:
       - RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags e2e -count=1 -timeout 15m ./integration/e2e/...
 
@@ -658,6 +755,23 @@ tasks:
     # `task ci`.
     cmds:
       - bash hack/dev-entries.sh
+
+  status:cap:
+    desc: "Fail when docs/plan/STATUS.md is over its 120-line cap (CLAUDE.md)."
+    cmds:
+      # CLAUDE.md says the cap is "enforced by a task" and, until this one, nothing
+      # computed it — which is the shape of every other check in this directory: a rule
+      # stated in a document and evaluated by whoever remembered. The cap is not
+      # arithmetic for its own sake. STATUS.md holds *what to do next* and *which thin
+      # paths are not deepened*; a file that outgrows a screen has started holding
+      # history, and history is `git log`.
+      - |
+        set -euo pipefail
+        n=$(wc -l <docs/plan/STATUS.md)
+        test "$n" -le 120 || {
+          echo "docs/plan/STATUS.md is $n lines, over the 120-line cap: something in it is not state" >&2
+          exit 1; }
+        echo "OK: docs/plan/STATUS.md is $n lines"
 
   comment:rot:
     desc: >-
@@ -812,6 +926,9 @@ tasks:
       # wal.Log.Flush's doc comment had described a withdrawn upload-and-verify chain for
       # two waves. Cheap enough to sit in the fast gate: one `go list`, one awk pass.
       - task: comment:rot
+      # Beside it, and the same kind of claim: a rule CLAUDE.md states as part of "done"
+      # that nothing computed. One `wc`.
+      - task: status:cap
       - task: test
       - task: dst
       # Half a second, and it is in the *fast* gate rather than only in `ci:full`

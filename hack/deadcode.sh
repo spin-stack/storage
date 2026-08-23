@@ -9,10 +9,11 @@
 # code a human is changing is the same defect as a checker that cannot fire — it reports
 # success by not being updated.
 #
-# ROOTS ARE THE BINARIES, AND ONLY THE BINARIES: ./cmd/... . It used to be ./cmd/... plus
-# integration/guestinit, which was PID 1 inside the guest and as much a binary this
-# repository built and booted as the other two; it went with the local block engine it
-# booted against. `deadcode -test` was rejected outright: it makes every test's own
+# ROOTS ARE THE BINARIES, AND ONLY THE BINARIES: ./cmd/... plus integration/guestinit,
+# which is PID 1 inside the guest and as much a binary this repository builds and boots as
+# the other two. It left this list with the local block engine it used to boot against and
+# came back with Stage 1, which boots a guest against a qcow2. `deadcode -test` was
+# rejected outright: it makes every test's own
 # subject reachable, so it answers "is this called by anything at all", which is never the
 # question. CLAUDE.md's question is narrower and is the one that found CloneCrossHost —
 # does a *binary* reach it.
@@ -56,7 +57,7 @@ MODULE=github.com/spin-stack/storage
 DEADCODE=${DEADCODE:-.tools/bin/deadcode}
 ALLOW=${ALLOW:-hack/deadcode-allow.txt}
 PENDING=${PENDING:-hack/deadcode-pending.txt}
-ROOTS=(./cmd/...)
+ROOTS=(./cmd/... ./integration/guestinit)
 
 test -x "$DEADCODE" || {
 	echo "no deadcode binary at $DEADCODE — run: task tools:deadcode" >&2
