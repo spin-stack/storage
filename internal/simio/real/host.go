@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -62,9 +63,9 @@ func (*Runner) Run(ctx context.Context, name string, args ...string) ([]byte, er
 	return stdout.Bytes(), nil
 }
 
-// Paths is the part of a real filesystem that is addressed by absolute path: making a
-// directory, and asking whether something is there. Two verbs, because those are the
-// two a chain's owner performs on paths it then hands to another process.
+// Paths is the part of a real filesystem that is addressed by absolute path. Every verb
+// here is one a chain's owner performs on paths it then hands to another process, or on
+// the little pointer file that tells that process which path to take.
 type Paths struct{}
 
 // NewPaths returns the production Paths.
@@ -84,6 +85,58 @@ func (*Paths) Exists(path string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// Size is the space the file occupies. It is the apparent size and not the allocated
+// one: a qcow2 is written sequentially as clusters are needed, so the two agree closely
+// enough for a threshold, and the apparent size is the number a `ls -l` in an incident
+// will show.
+func (*Paths) Size(path string) (int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// ReadFile returns the file's contents.
+func (*Paths) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+// WriteAtomic replaces path's contents with data in one step.
+//
+// Temp file, fsync, rename, fsync the directory — all four, because the reader is
+// another process choosing its own moment and the thing being written is which qcow2 a
+// VM is about to be launched against. A half-written pointer is a VM that does not
+// start; a pointer that reached the directory entry but not the disk is a VM that starts
+// against the wrong layer after a power cut, which is worse and silent.
+func (*Paths) WriteAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
 }
 
 // UnixDialer opens a byte stream to a Unix domain socket. QMP is a line-oriented JSON

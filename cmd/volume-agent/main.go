@@ -77,6 +77,8 @@ func run() (err error) {
 			"path to the pinned qemu-img binary, which creates and inspects every qcow2 chain (required)")
 		probeTimeout = flag.Duration("qemu-timeout", 5*time.Second,
 			"how long one qemu-img run or one QMP exchange may take before the Agent gives up on it for this cycle")
+		rotateAt = flag.Int64("rotate-at-bytes", 0,
+			"seal a volume's tip and start a new layer once the tip occupies this many bytes. 0 disables rotation, which is the default until v6 §11's threshold is fixed by measurement")
 	)
 	flag.Parse()
 
@@ -160,9 +162,10 @@ func run() (err error) {
 		return fmt.Errorf("resolving %s: %w", *dataDir, err)
 	}
 	volumes, err := qcow.New(ctx, qcow.Config{
-		Root:         root,
-		QemuImg:      *qemuImg,
-		ProbeTimeout: *probeTimeout,
+		Root:          root,
+		QemuImg:       *qemuImg,
+		ProbeTimeout:  *probeTimeout,
+		RotateAtBytes: *rotateAt,
 	}, qcow.Deps{
 		Clock:  real.NewClock(),
 		Disk:   dataDisk,

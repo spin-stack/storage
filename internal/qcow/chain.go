@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 // ErrChainMismatch means the image on disk is not the one the catalog describes — a
@@ -57,19 +58,46 @@ var ErrChainMismatch = errors.New("qcow: the local image does not match the volu
 // which one is wrong from here.
 var ErrForeignImage = errors.New("qcow: the QEMU at this volume's QMP socket has a different image open")
 
-// The layout under the Agent's data directory (v6 §5).
+// The layout under the Agent's data directory.
 //
-// `sealed/` and `cache/` are in §5's tree and are deliberately not created here.
-// Nothing seals a layer or downloads one yet; a directory that exists and stays empty
-// for two stages is a reader being told a mechanism is running.
+//	volumes/<volume-id>/
+//	├── layers/<layer-id>.qcow2   every tip this volume has ever had
+//	├── active/current            one line: the absolute path of the tip
+//	└── qmp.sock
+//
+// # A layer file is never renamed, never reused, and never means a second thing
+//
+// This is the one rule the layout exists to keep, and it was not free: v6 §5 drew the
+// tree with a fixed `active/current.qcow2` and sealed layers moved to `sealed/<id>.qcow2`,
+// which is what a person would draw. Rotating that tree means a path — the one QEMU was
+// launched with — coming to mean a different file, and measuring it against a real QEMU
+// showed what that costs:
+//
+//   - QEMU remembers the *string* it opened a node with, for ever. After a rotation that
+//     reuses `active/current.qcow2`, the node holding the sealed layer still calls itself
+//     `active/current.qcow2` — which now names the live tip. Anything that re-resolved it
+//     would open the tip as its own backing.
+//   - `query-block` stops answering with a path at all. It cannot render the graph as one
+//     filename any more, so `file` comes back as `json:{"backing": ...}` — and this
+//     Agent's one safety check on an attached VM is "is the file QEMU has open ours".
+//     Rotation would have broken it, silently, in the direction of refusing good volumes.
+//
+// With id-named layers both problems are absent rather than handled: every path QEMU ever
+// sees is a real file that will still be that file tomorrow, and `query-block` answers
+// with it. §5's tree was corrected to this one.
+//
+// `active/current` is therefore not the image — it is a *pointer* to it, and it is the
+// contract with whoever launches the VM: read the line, hand that path to QEMU. It is
+// derived state, repaired from what QEMU says (Open), never trusted over it.
 const (
 	volumesDir  = "volumes"
+	layersDir   = "layers"
 	activeDir   = "active"
-	activeImage = "current.qcow2"
+	pointerName = "current"
+	layerSuffix = ".qcow2"
 	// socketName is the QMP endpoint. It sits at the volume's root rather than under
-	// `active/` because it belongs to the *session*, not to any one tip: Stage 2 rotates
-	// the file under `active/` while the VM keeps running, and the socket must not move
-	// with it.
+	// `layers/` because it belongs to the *session*, not to any one tip: rotation
+	// replaces the tip while the VM keeps running, and the socket must not move with it.
 	socketName = "qmp.sock"
 )
 
@@ -78,10 +106,21 @@ func VolumeDir(root, volumeID string) string {
 	return filepath.Join(root, volumesDir, volumeID)
 }
 
-// ActiveImage is the qcow2 file QEMU writes to. Half the contract with whoever launches
-// the VM.
-func ActiveImage(root, volumeID string) string {
-	return filepath.Join(VolumeDir(root, volumeID), activeDir, activeImage)
+// LayersDir holds every layer of one volume, tip and sealed alike. Which one is the tip
+// is not encoded in the directory, because that is the fact that changes.
+func LayersDir(root, volumeID string) string {
+	return filepath.Join(VolumeDir(root, volumeID), layersDir)
+}
+
+// LayerImage is one layer's file.
+func LayerImage(root, volumeID, layerID string) string {
+	return filepath.Join(LayersDir(root, volumeID), layerID+layerSuffix)
+}
+
+// ActivePointer is the file naming the qcow2 QEMU should be launched against. Half the
+// contract with whoever launches the VM; it holds one absolute path and no newline.
+func ActivePointer(root, volumeID string) string {
+	return filepath.Join(VolumeDir(root, volumeID), activeDir, pointerName)
 }
 
 // QMPSocket is where the Agent expects to find QEMU's QMP endpoint for this volume. The
@@ -103,15 +142,23 @@ type Runner interface {
 type Paths interface {
 	MkdirAll(dir string) error
 	Exists(path string) (bool, error)
+	// Size is the space the file occupies, which for a qcow2 grows as the guest
+	// allocates clusters. It is what the rotation threshold is measured against.
+	Size(path string) (int64, error)
+	ReadFile(path string) ([]byte, error)
+	// WriteAtomic replaces the file's contents in one step, so a reader sees the old
+	// path or the new one and never a truncated line. The pointer is read by another
+	// process, at a moment this one does not choose.
+	WriteAtomic(path string, data []byte) error
 }
 
-// Chain is one volume's local qcow2 chain.
+// Chain is one volume's local qcow2 chain: a stack of layers, the newest of which the
+// guest writes to and all the others of which are complete and read-only.
 //
-// Stage 1 has exactly one link in it — the active tip, with no backing file — and the
-// type is still a chain rather than a path because the next stage adds the second: an
-// external snapshot seals the tip and QEMU starts writing to a new one on top of it.
-// What this type is for is naming which file is the tip, and that question only becomes
-// interesting once there is more than one.
+// What this type is for is naming which file is the tip. Everything else about the chain
+// — how deep it is, what backs what — lives in the qcow2 headers, which is the one place
+// that cannot disagree with itself, and is read back with `qemu-img` when somebody needs
+// it rather than tracked here.
 type Chain struct {
 	// Active is the tip QEMU writes to.
 	Active string
@@ -125,41 +172,72 @@ type imageInfo struct {
 	Format      string `json:"format"`
 	VirtualSize int64  `json:"virtual-size"`
 	Filename    string `json:"filename"`
-	Specific    struct {
+	// FullBackingFilename is the backing path as the header records it, resolved to an
+	// absolute one. It is how a freshly created overlay is checked before QEMU is told
+	// to write into it — see Rotate for why nothing later would catch it being wrong.
+	FullBackingFilename string `json:"full-backing-filename"`
+	Specific            struct {
 		Data struct {
 			Corrupt bool `json:"corrupt"`
 		} `json:"data"`
 	} `json:"format-specific"`
 }
 
-// Open returns the chain for one volume, creating the image the first time.
+// OpenRequest is what Open needs to know about one volume.
+type OpenRequest struct {
+	Root     string
+	VolumeID string
+	// SizeBytes is the virtual size the catalog says this volume has.
+	SizeBytes int64
+	// LiveImage is the layer a running QEMU already has open, empty when none does.
+	// It is an answer from QEMU, not a path this package composed.
+	LiveImage string
+	// NewLayerID names the volume's first layer, used only when it has none yet.
+	NewLayerID string
+}
+
+// Open returns the chain for one volume, creating the first layer the first time.
 //
-// `live` says a QEMU already has the active image open — the Agent restarted while the
-// guest kept running — and it changes what may be done, not what is reported. An image
-// in use is checked by nobody: `qemu-img` takes a lock and would fail, and forcing past
-// that lock is the one thing v6 §5 forbids outright. QEMU opened the file, which is a
-// stronger statement about it than any check made from here.
-func Open(ctx context.Context, r Runner, p Paths, qemuImg, root, volumeID string, sizeBytes int64, live bool) (*Chain, error) {
-	if sizeBytes <= 0 {
-		return nil, fmt.Errorf("%w: volume %s has a size of %d bytes", ErrChainMismatch, volumeID, sizeBytes)
+// # QEMU's answer outranks the pointer
+//
+// A live image says a QEMU has that file open — the Agent restarted while the guest kept
+// running — and it is taken as the tip even when `active/current` says otherwise, with
+// the pointer repaired to match. The disagreement is a real state and not a corruption:
+// a rotation writes the pointer before it tells QEMU to switch, so a crash in between
+// leaves the pointer one layer ahead of the guest. Believing the pointer there would hand
+// the next boot a file that is missing every write the guest has made since.
+//
+// An image in use is checked by nobody: `qemu-img` takes a lock and would fail, and
+// forcing past that lock is the one thing v6 §5 forbids outright. QEMU opened the file,
+// which is a stronger statement about it than any check made from here.
+func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest) (*Chain, error) {
+	if req.SizeBytes <= 0 {
+		return nil, fmt.Errorf("%w: volume %s has a size of %d bytes", ErrChainMismatch, req.VolumeID, req.SizeBytes)
 	}
-	image := ActiveImage(root, volumeID)
-	if live {
-		return &Chain{Active: image, SizeBytes: sizeBytes}, nil
+	pointer := ActivePointer(req.Root, req.VolumeID)
+	if req.LiveImage != "" {
+		if err := syncPointer(p, pointer, req.LiveImage); err != nil {
+			return nil, err
+		}
+		return &Chain{Active: req.LiveImage, SizeBytes: req.SizeBytes}, nil
 	}
 
-	if err := p.MkdirAll(filepath.Dir(image)); err != nil {
-		return nil, fmt.Errorf("qcow: making the directory for volume %s: %w", volumeID, err)
+	if err := p.MkdirAll(LayersDir(req.Root, req.VolumeID)); err != nil {
+		return nil, fmt.Errorf("qcow: making the layer directory for volume %s: %w", req.VolumeID, err)
 	}
-	exists, err := p.Exists(image)
+	image, err := readPointer(p, pointer)
 	if err != nil {
-		return nil, fmt.Errorf("qcow: looking for %s: %w", image, err)
+		return nil, err
 	}
-	if !exists {
-		if _, err := r.Run(ctx, qemuImg, "create", "-f", "qcow2", image, fmt.Sprint(sizeBytes)); err != nil {
+	if image == "" {
+		image = LayerImage(req.Root, req.VolumeID, req.NewLayerID)
+		if _, err := r.Run(ctx, qemuImg, "create", "-f", "qcow2", image, fmt.Sprint(req.SizeBytes)); err != nil {
 			return nil, fmt.Errorf("qcow: creating %s: %w", image, err)
 		}
-		return &Chain{Active: image, SizeBytes: sizeBytes}, nil
+		if err := writePointer(p, pointer, image); err != nil {
+			return nil, err
+		}
+		return &Chain{Active: image, SizeBytes: req.SizeBytes}, nil
 	}
 
 	info, err := inspect(ctx, r, qemuImg, image)
@@ -169,12 +247,12 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg, root, volumeID string
 	switch {
 	case info.Format != "qcow2":
 		return nil, fmt.Errorf("%w: %s is a %s image, not qcow2", ErrChainMismatch, image, info.Format)
-	case info.VirtualSize != sizeBytes:
+	case info.VirtualSize != req.SizeBytes:
 		// Not resized to match. The catalog and the image disagree about how big the
 		// guest's disk is, and growing it here would hand a guest a device that changed
 		// size behind its back on the strength of a row this Agent cannot verify.
 		return nil, fmt.Errorf("%w: %s is %d bytes and the catalog says %d",
-			ErrChainMismatch, image, info.VirtualSize, sizeBytes)
+			ErrChainMismatch, image, info.VirtualSize, req.SizeBytes)
 	case info.Specific.Data.Corrupt:
 		// The corrupt bit in the qcow2 header, which QEMU sets when it finds an
 		// inconsistency it could not resolve. `qemu-img check` is deliberately not run
@@ -184,6 +262,143 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg, root, volumeID string
 		return nil, fmt.Errorf("%w: %s has the qcow2 corrupt flag set", ErrChainMismatch, image)
 	}
 	return &Chain{Active: image, SizeBytes: info.VirtualSize}, nil
+}
+
+// Rotate seals the tip and puts a new empty layer on top of it, with the guest writing
+// throughout. It is v6 §23.2, and after it returns the previous tip is complete: nothing
+// will ever write to that file again, which is what makes it something a commit can
+// upload.
+//
+// # The order is the design, and every other order loses data
+//
+//  1. Create the new layer, with its backing path written by us.
+//  2. Read it back and check that path, before QEMU has it.
+//  3. Point `active/current` at it.
+//  4. Tell QEMU to switch (blockdev-snapshot-sync, mode=existing).
+//
+// Step 3 comes before step 4 and not after. Whichever way round they go there is a window
+// where a crash leaves the two disagreeing, and the question is only what a VM relaunched
+// in that window opens. Pointer first, it opens the new layer: an empty overlay over
+// everything the guest wrote, which is correct. Pointer last, it opens the layer that is
+// *already the backing of the live tip* and writes into it — a second writer under a file
+// QEMU is reading through, which corrupts the chain with no error anywhere. The Agent
+// converges out of the first window on its next cycle (Open); there is no converging out
+// of the second.
+//
+// Step 2 is not defensive. QEMU does not check that an overlay's recorded backing is the
+// node it attaches — that is exactly what lets step 1 name a file by a path QEMU never
+// used — so a wrong backing path is invisible for the entire life of the VM and wrong on
+// the next boot, when a guest gets somebody else's disk or a shorter one. The moment it
+// can still be caught is before step 4.
+//
+// The new layer is created with `-u`: qemu-img is told not to open the backing file. It
+// cannot, because QEMU holds its write lock, and this is the one place where "unsafe"
+// means "does not consult a file that is already known to be busy".
+func (c *Chain) Rotate(ctx context.Context, r Runner, p Paths, qemuImg, root, volumeID, layerID string, switchTo func(newTip string) error) (sealed string, err error) {
+	next := LayerImage(root, volumeID, layerID)
+	exists, err := p.Exists(next)
+	if err != nil {
+		return "", fmt.Errorf("qcow: looking for %s: %w", next, err)
+	}
+	if exists {
+		// A layer id that has been used before. Overwriting it would silently discard
+		// whatever a previous rotation left there, and every id this Agent generates is
+		// a v7 UUID, so this cannot happen by chance — only by a caller reusing one.
+		return "", fmt.Errorf("%w: layer %s already exists", ErrChainMismatch, next)
+	}
+	if _, err := r.Run(ctx, qemuImg, "create", "-f", "qcow2", "-b", c.Active, "-F", "qcow2",
+		"-u", next, fmt.Sprint(c.SizeBytes)); err != nil {
+		return "", fmt.Errorf("qcow: creating the next layer %s over %s: %w", next, c.Active, err)
+	}
+	info, err := inspect(ctx, r, qemuImg, next)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case info.VirtualSize != c.SizeBytes:
+		return "", fmt.Errorf("%w: the new layer %s is %d bytes and the chain is %d",
+			ErrChainMismatch, next, info.VirtualSize, c.SizeBytes)
+	case filepath.Clean(info.FullBackingFilename) != filepath.Clean(c.Active):
+		return "", fmt.Errorf("%w: the new layer %s is backed by %q, not by the tip %q",
+			ErrChainMismatch, next, info.FullBackingFilename, c.Active)
+	}
+	if err := writePointer(p, ActivePointer(root, volumeID), next); err != nil {
+		return "", err
+	}
+	if err := switchTo(next); err != nil {
+		return "", err
+	}
+	sealed, c.Active = c.Active, next
+	return sealed, nil
+}
+
+// readPointer returns the tip `active/current` names, or "" if the volume has none yet.
+func readPointer(p Paths, pointer string) (string, error) {
+	exists, err := p.Exists(pointer)
+	if err != nil {
+		return "", fmt.Errorf("qcow: looking for %s: %w", pointer, err)
+	}
+	if !exists {
+		return "", nil
+	}
+	body, err := p.ReadFile(pointer)
+	if err != nil {
+		return "", fmt.Errorf("qcow: reading %s: %w", pointer, err)
+	}
+	image := strings.TrimSpace(string(body))
+	if !filepath.IsAbs(image) {
+		// Including the empty string, which is what a pointer truncated by a crash
+		// looks like. Refused rather than treated as "no volume yet": creating a fresh
+		// empty layer for a volume that has one is how a guest is handed a blank disk.
+		return "", fmt.Errorf("%w: %s names %q, which is not an absolute path", ErrChainMismatch, pointer, image)
+	}
+	return image, nil
+}
+
+// SyncPointer makes `active/current` name the layer a guest is actually writing to,
+// leaving the file alone when it already does.
+//
+// It is called on every cycle a VM is attached, and reading before writing is not an
+// optimisation: writing is fsync of the file and of its directory, and doing that per
+// volume per heartbeat for a fact that changes once a rotation would be real I/O bought
+// for nothing.
+//
+// What it converges is the window Rotate opens deliberately. The pointer moves before
+// QEMU is told to switch, so a snapshot that fails — or one whose answer never came
+// back, which is the case nobody can tell apart from it — leaves the pointer one layer
+// ahead of the guest. It is left ahead rather than put back, because "the command
+// failed" and "the answer was lost after it took effect" look the same from here and
+// only one of those is safe to undo. QEMU is asked next cycle and it settles it.
+func SyncPointer(p Paths, root, volumeID, image string) error {
+	return syncPointer(p, ActivePointer(root, volumeID), image)
+}
+
+func syncPointer(p Paths, pointer, image string) error {
+	exists, err := p.Exists(pointer)
+	if err != nil {
+		return fmt.Errorf("qcow: looking for %s: %w", pointer, err)
+	}
+	if exists {
+		body, err := p.ReadFile(pointer)
+		if err != nil {
+			return fmt.Errorf("qcow: reading %s: %w", pointer, err)
+		}
+		if strings.TrimSpace(string(body)) == image {
+			return nil
+		}
+	}
+	return writePointer(p, pointer, image)
+}
+
+// writePointer publishes which layer the VM is to be launched against.
+func writePointer(p Paths, pointer, image string) error {
+	if err := p.MkdirAll(filepath.Dir(pointer)); err != nil {
+		return fmt.Errorf("qcow: making the directory for %s: %w", pointer, err)
+	}
+	if err := p.WriteAtomic(pointer, []byte(image)); err != nil {
+		return fmt.Errorf("qcow: writing %s: %w", pointer, err)
+	}
+	return nil
 }
 
 // inspect runs `qemu-img info` on an offline image.

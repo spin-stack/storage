@@ -35,6 +35,7 @@ func (*scriptConn) Close() error                  { return nil }
 type fakeDialer struct {
 	scripts map[string][]string
 	dialed  []string
+	conns   []*scriptConn
 }
 
 func (d *fakeDialer) Dial(_ context.Context, path string) (io.ReadWriteCloser, error) {
@@ -43,16 +44,44 @@ func (d *fakeDialer) Dial(_ context.Context, path string) (io.ReadWriteCloser, e
 	if !ok {
 		return nil, errors.New("connect: no such file or directory")
 	}
-	return newConn(lines...), nil
+	c := newConn(lines...)
+	d.conns = append(d.conns, c)
+	return c, nil
 }
 
-// attachedTo scripts a QEMU that has one image open.
+// sent is everything every connection carried to QEMU. Rotation is asserted on this and
+// not on the files: a Manager that moved the pointer and never told QEMU to switch would
+// satisfy every filesystem assertion and leave the guest writing to a sealed layer.
+func (d *fakeDialer) sent() string {
+	var b strings.Builder
+	for _, c := range d.conns {
+		b.WriteString(c.sent.String())
+	}
+	return b.String()
+}
+
+// attachedTo scripts a QEMU that has one image open. The trailing answers are for a
+// rotation: this connection is used once per Manager cycle, and a cycle that rotates
+// asks query-block and then issues the snapshot on the same one.
 func attachedTo(image string) []string {
 	return []string{
 		`{"QMP": {"version": {}, "capabilities": []}}`,
 		`{"return": {}}`,
-		`{"return": [{"device": "d", "inserted": {"file": "` + image + `", "drv": "qcow2"}}]}`,
+		`{"return": [{"device": "virtio0", "inserted": {"file": "` + image + `", "drv": "qcow2"}}]}`,
+		`{"return": {}}`,
 	}
+}
+
+// tip is the layer `active/current` names, which is the only way a test learns the path
+// the Manager chose: layer ids are v7 UUIDs minted per layer, so nothing outside can
+// predict one.
+func (h *harness) tip(t *testing.T) string {
+	t.Helper()
+	body, err := h.paths.ReadFile(qcow.ActivePointer(root, vol))
+	if err != nil {
+		t.Fatalf("reading the pointer: %v", err)
+	}
+	return string(body)
 }
 
 // harness is a Manager and everything a test needs to see what it did.
@@ -69,7 +98,17 @@ func newHarness(t *testing.T) *harness {
 	return newHarnessOn(t, sim.NewDisk())
 }
 
+func newHarnessRotatingAt(t *testing.T, at int64) *harness {
+	t.Helper()
+	return newHarnessWith(t, sim.NewDisk(), at)
+}
+
 func newHarnessOn(t *testing.T, d *sim.Disk) *harness {
+	t.Helper()
+	return newHarnessWith(t, d, 0)
+}
+
+func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64) *harness {
 	t.Helper()
 	h := &harness{
 		runner: &fakeRunner{info: infoJSON("qcow2", size, false), version: "qemu-img version 11.0.2"},
@@ -77,7 +116,9 @@ func newHarnessOn(t *testing.T, d *sim.Disk) *harness {
 		dialer: &fakeDialer{scripts: map[string][]string{}},
 		disk:   d,
 	}
-	m, err := qcow.New(t.Context(), qcow.Config{Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second}, qcow.Deps{
+	m, err := qcow.New(t.Context(), qcow.Config{
+		Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second, RotateAtBytes: rotateAt,
+	}, qcow.Deps{
 		Clock:  sim.NewClock(time.Unix(0, 0)),
 		Disk:   d,
 		Runner: h.runner,
@@ -124,7 +165,10 @@ func TestApplyPreparesAChainAndReportsIt(t *testing.T) {
 		t.Fatalf("applying: %v", err)
 	}
 
-	image := qcow.ActiveImage(root, vol)
+	image := h.tip(t)
+	if !strings.HasPrefix(image, qcow.LayersDir(root, vol)+"/") {
+		t.Fatalf("the pointer names %q, which is not a layer of this volume", image)
+	}
 	if cmds := h.runner.commands(); len(cmds) != 1 || !strings.HasPrefix(cmds[0], "/qemu-img create -f qcow2 "+image) {
 		t.Fatalf("qemu-img was run as %v", cmds)
 	}
@@ -235,7 +279,7 @@ func TestOnlyAnActiveVolumeGetsAChain(t *testing.T) {
 func TestARestartUnderARunningGuestDoesNotTouchTheImage(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	image := qcow.ActiveImage(root, vol)
+	image := qcow.LayerImage(root, vol, layerID)
 	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(image)
 	h.paths.present[image] = true
 	// Any offline run at all would fail the way a real one does, on QEMU's lock.
@@ -544,7 +588,7 @@ func TestAVMComingAndGoingDoesNotChangeWhoServesTheVolume(t *testing.T) {
 		t.Fatalf("preparing: %v", err)
 	}
 	// A VM arrives.
-	h.dialer.scripts[socket] = attachedTo(qcow.ActiveImage(root, vol))
+	h.dialer.scripts[socket] = attachedTo(h.tip(t))
 	if err := h.m.Apply(t.Context(), desired); err != nil {
 		t.Fatalf("with a VM attached: %v", err)
 	}
@@ -567,5 +611,157 @@ func TestAVMComingAndGoingDoesNotChangeWhoServesTheVolume(t *testing.T) {
 	// on the cycle after the guest let go of it.
 	if cmds := h.runner.commands(); len(cmds) != 1 {
 		t.Errorf("qemu-img ran %d times across three cycles: %v", len(cmds), cmds)
+	}
+}
+
+// rotating prepares a volume, attaches a VM to it, and says how large its tip has grown.
+func (h *harness) rotating(t *testing.T, tipBytes int64) string {
+	t.Helper()
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("preparing: %v", err)
+	}
+	tip := h.tip(t)
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(tip)
+	h.paths.sizes[tip] = tipBytes
+	// What `qemu-img info` says about the layer the rotation is about to create.
+	h.runner.info = overlayJSON(size, tip)
+	h.runner.reset()
+	return tip
+}
+
+// TestATipThatCrossesTheThresholdIsSealedUnderTheRunningGuest is v6 §23.2 end to end
+// inside this package: the size trigger fires, a layer is created over the tip, the
+// pointer moves and QEMU is told to switch — with the VM attached the whole time.
+func TestATipThatCrossesTheThresholdIsSealedUnderTheRunningGuest(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 9<<20)
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("the cycle that should rotate: %v", err)
+	}
+
+	next := h.tip(t)
+	if next == tip {
+		t.Fatalf("the pointer still names %q; the tip was not rotated", tip)
+	}
+	if !strings.HasPrefix(next, qcow.LayersDir(root, vol)+"/") {
+		t.Fatalf("the new tip %q is not a layer of this volume", next)
+	}
+	// The overlay is created over the old tip and QEMU is never asked to open its
+	// backing (-u): it holds the write lock on it.
+	create := "/qemu-img create -f qcow2 -b " + tip + " -F qcow2 -u " + next
+	if cmds := h.runner.commands(); len(cmds) != 2 || !strings.HasPrefix(cmds[0], create) {
+		t.Fatalf("qemu-img was run as %v, want %q first", cmds, create)
+	}
+	// And the guest was actually moved. Without this the volume looks rotated from the
+	// filesystem and the guest is still writing into a layer we have called sealed.
+	sent := h.dialer.sent()
+	if !strings.Contains(sent, "blockdev-snapshot-sync") || !strings.Contains(sent, next) {
+		t.Errorf("QEMU was never told to switch: %s", sent)
+	}
+	if !strings.Contains(sent, `"mode":"existing"`) {
+		t.Errorf("the snapshot did not use the overlay this Agent checked: %s", sent)
+	}
+}
+
+// TestAVolumeNobodyWritesIsNeverRotated is v6 §11's first invariant. Without it an idle
+// volume seals an empty layer every cycle for ever, and the RPO number stops meaning
+// what it says: a volume that wrote nothing is *inside* its target, not behind it.
+func TestAVolumeNobodyWritesIsNeverRotated(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 1<<20)
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got != tip {
+		t.Errorf("a tip under the threshold was rotated to %q", got)
+	}
+	if cmds := h.runner.commands(); len(cmds) != 0 {
+		t.Errorf("an idle volume ran %v", cmds)
+	}
+}
+
+// TestATipWithNoVMIsNotRotated: rotation runs through the QEMU that is writing. There is
+// no offline path and there must not be one — sealing a layer with qemu-img while a
+// guest could still be attached is exactly what v6 §5 forbids.
+func TestATipWithNoVMIsNotRotated(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 99<<20)
+	delete(h.dialer.scripts, qcow.QMPSocket(root, vol))
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got != tip {
+		t.Errorf("a volume with no VM was rotated to %q", got)
+	}
+}
+
+// TestARotationThatFailsKeepsServingTheVolume: a layer that could not be sealed is a
+// volume that keeps working and keeps growing. Refusing it would turn "we did not manage
+// to bound this layer" into an outage for a guest that is doing nothing wrong.
+func TestARotationThatFailsKeepsServingTheVolume(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 9<<20)
+	h.runner.err = errors.New("Formatting failed: No space left on device")
+
+	err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)})
+	if err == nil {
+		t.Fatal("a rotation that failed was reported as a success")
+	}
+	v, ok := h.volumes(t)[vol]
+	if !ok {
+		t.Fatal("the volume disappeared because a rotation failed")
+	}
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Errorf("the volume was refused over a rotation: %v %q", v.Refusal, v.RefusalDetail)
+	}
+	if got := h.tip(t); got != tip {
+		t.Errorf("the pointer moved to %q although no layer was created", got)
+	}
+}
+
+// TestAPointerThatRanAheadIsRepairedFromTheGuest closes the window Rotate leaves open on
+// purpose: the pointer is moved before QEMU is told to switch, so a snapshot that did
+// not happen leaves it naming a layer the guest never reached. Left there, the next boot
+// gets a layer with none of the guest's writes in it — and nothing looks wrong until the
+// VM stops.
+func TestAPointerThatRanAheadIsRepairedFromTheGuest(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 0)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("preparing: %v", err)
+	}
+	live := h.tip(t)
+	// The pointer ran ahead, and then everything stopped.
+	ahead := qcow.LayerImage(root, vol, nextID)
+	if err := h.paths.WriteAtomic(qcow.ActivePointer(root, vol), []byte(ahead)); err != nil {
+		t.Fatalf("moving the pointer: %v", err)
+	}
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(live)
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("coming back under a running guest: %v", err)
+	}
+	if got := h.tip(t); got != live {
+		t.Errorf("active/current names %q, want what QEMU is writing, %q", got, live)
+	}
+}
+
+func TestARotationThresholdBelowAnEmptyImageIsRefused(t *testing.T) {
+	t.Parallel()
+	_, err := qcow.New(t.Context(), qcow.Config{
+		Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second, RotateAtBytes: 4096,
+	}, qcow.Deps{
+		Clock: sim.NewClock(time.Unix(0, 0)), Disk: sim.NewDisk(),
+		Runner: &fakeRunner{}, Paths: newPaths(), Dialer: &fakeDialer{scripts: map[string][]string{}},
+	})
+	if err == nil {
+		t.Fatal("a threshold an empty qcow2 already exceeds was accepted")
 	}
 }

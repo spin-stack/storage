@@ -29,13 +29,24 @@ func TestTheAgentPreparesAQcow2ChainForADesiredVolume(t *testing.T) {
 
 	agent.WaitForLine(t, "volume ready", startup)
 	image := field(t, agent.Output(), "volume ready", "image=")
+	pointer := field(t, agent.Output(), "volume ready", "pointer=")
 	socket := field(t, agent.Output(), "volume ready", "qmp_socket=")
 
 	if !strings.HasPrefix(image, d.dataDir) {
 		t.Errorf("the image is at %q, outside the Agent's --data-dir %q", image, d.dataDir)
 	}
-	if got, want := filepath.Base(image), "current.qcow2"; got != want {
-		t.Errorf("the active tip is named %q, want %q", got, want)
+	// The tip is named by a layer id, not by a fixed name: rotation replaces the file
+	// and never reuses a path, so the stable thing is the pointer, which is what whoever
+	// launches the VM reads.
+	if got := filepath.Base(filepath.Dir(image)); got != "layers" {
+		t.Errorf("the tip is in %q, want the volume's layers directory", got)
+	}
+	named, err := os.ReadFile(pointer)
+	if err != nil {
+		t.Fatalf("reading %s, which is the whole contract with whoever launches the VM: %v", pointer, err)
+	}
+	if string(named) != image {
+		t.Errorf("active/current names %q and the Agent logged %q", named, image)
 	}
 	if got, want := filepath.Base(socket), "qmp.sock"; got != want {
 		t.Errorf("the QMP socket is named %q, want %q", got, want)

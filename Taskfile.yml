@@ -473,6 +473,17 @@ tasks:
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage1-demo.sh
 
+  demo:stage2:
+    desc: >-
+      Stage 2 end to end: a Linux guest writes continuously while the Agent seals its tip
+      and starts a new layer under it, several times, and a second boot reads every byte
+      back through the resulting chain. Prints the measured snapshot pause, which is what
+      v6 §11's defaults are waiting on. Needs `task db:dev:up`, KVM, and the pinned
+      artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage2-demo.sh
+
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
     env: *guest_kernel_env

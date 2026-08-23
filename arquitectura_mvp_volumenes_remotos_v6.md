@@ -266,6 +266,22 @@ Los defaults de `rpo_target` y del umbral de tamaño **se fijan midiendo**, no e
 pausa del external snapshot pone el piso del primero y el throughput de subida contra el
 objetivo de recovery pone el segundo. Es el criterio de salida de la Etapa 2.
 
+### Lo medido (2026-08-23, `task demo:stage2`)
+
+Un guest Linux real escribiendo sobre NVMe, umbral de 4 MiB, ciclo de reconciliación de
+300 ms, tres rotaciones bajo carga:
+
+- **Pausa del external snapshot: 1.11 / 1.46 / 1.53 ms** (min / mediana / max). No es el
+  piso de `rpo_target`: a este costo, rotar cada pocos segundos es gratis para el guest, y
+  lo que fija el default es el throughput de subida — que no se puede medir hasta la
+  Etapa 3, porque todavía nada sube.
+- **El umbral de tamaño es un piso, no una cota.** Los layers sellados salieron de 32 MiB
+  con el umbral en 4: el tip se mide una vez por ciclo, así que un layer pesa el umbral
+  más lo que el guest escribió desde la última mirada. Con QEMU en el data path no
+  podemos rechazar esa escritura, así que **no hay forma de acotar el tamaño de un
+  layer**; sólo se elige cada cuánto se mira. Quien dimensione uploads debe planificar
+  umbral + un ciclo del guest más rápido que vaya a alojar.
+
 ---
 
 ## 12. Formatos

@@ -146,6 +146,32 @@ type reply struct {
 	Event string `json:"event"`
 }
 
+// Snapshot points the device at an overlay that already exists, freezing what it was
+// writing to: after it returns, `file` is where the guest's writes land and the previous
+// file is complete and read-only. It is the whole of v6 §23.2's rotation.
+//
+// `mode: existing` — QEMU does not create the overlay, the caller does. The alternative,
+// `absolute-paths`, has QEMU create it and record its backing as *the path this QEMU was
+// launched with*, which is only the right answer as long as that path never comes to mean
+// a different file. It was measured against a real QEMU: with `absolute-paths` and a stable
+// contract path, the header of the new tip names the file that is about to become the new
+// tip — a chain that points at itself. Handing QEMU an overlay whose backing we wrote
+// ourselves is what makes the recorded path the one that is true offline.
+//
+// QEMU does not check that the overlay's recorded backing is the node it attaches. That is
+// what makes this work, and it is also why the caller verifies the file it created before
+// getting here: a wrong backing path is invisible for the life of the VM and wrong on the
+// next boot.
+func (c *Client) Snapshot(device, file string) error {
+	_, err := c.executeWith("blockdev-snapshot-sync", map[string]string{
+		"device":        device,
+		"snapshot-file": file,
+		"format":        "qcow2",
+		"mode":          "existing",
+	})
+	return err
+}
+
 // execute sends one command and returns the raw `return` value.
 //
 // Events are skipped rather than delivered, and that is the one piece of protocol
@@ -155,7 +181,18 @@ type reply struct {
 // as a malformed one, depending on the day. The loop reads until something that is an
 // answer or an error.
 func (c *Client) execute(command string) (json.RawMessage, error) {
-	if err := c.enc.Encode(map[string]string{"execute": command}); err != nil {
+	return c.executeWith(command, nil)
+}
+
+// executeWith is execute with an `arguments` object. Nil arguments are left off the wire
+// rather than sent as an empty object, because QEMU rejects `arguments` on a command that
+// takes none.
+func (c *Client) executeWith(command string, args map[string]string) (json.RawMessage, error) {
+	req := map[string]any{"execute": command}
+	if args != nil {
+		req["arguments"] = args
+	}
+	if err := c.enc.Encode(req); err != nil {
 		return nil, fmt.Errorf("qmp: sending %s: %w", command, err)
 	}
 	for {

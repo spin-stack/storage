@@ -193,3 +193,76 @@ func TestACancelledContextEndsAReadOnTheStream(t *testing.T) {
 		t.Fatal("a read on a cancelled stream returned without an error; it would have blocked for ever")
 	}
 }
+
+// TestPathsWriteAtomicReplacesInOneStep pins the property the pointer file needs and
+// that a plain create-truncate-write would not have: the reader is another process
+// picking its own moment, and what it must never see is a file that is half a path.
+//
+// Atomicity itself cannot be observed from one goroutine, so what is asserted is the
+// implementation's two consequences — a shorter payload replaces a longer one exactly,
+// with no tail of the old contents, and the temp file the rename came from is gone. A
+// truncate-and-write would fail the first; a rename that forgot to clean up would fail
+// the second, and leave a directory that grows a file per rotation.
+func TestPathsWriteAtomicReplacesInOneStep(t *testing.T) {
+	t.Parallel()
+	p := real.NewPaths()
+	dir := t.TempDir()
+	pointer := filepath.Join(dir, "current")
+
+	long := "/var/lib/volume-agent/volumes/v1/layers/0198c0de-0000-7000-8000-00000000cafe.qcow2"
+	short := "/tmp/x.qcow2"
+	for _, want := range []string{long, short} {
+		if err := p.WriteAtomic(pointer, []byte(want)); err != nil {
+			t.Fatalf("WriteAtomic(%q): %v", want, err)
+		}
+		got, err := p.ReadFile(pointer)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(got) != want {
+			t.Errorf("read back %q, want %q", got, want)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading the directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "current" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("the directory holds %v, want just the pointer", names)
+	}
+}
+
+func TestPathsSizeAndReadFileReportWhatIsThere(t *testing.T) {
+	t.Parallel()
+	p := real.NewPaths()
+	file := filepath.Join(t.TempDir(), "layer.qcow2")
+
+	if _, err := p.Size(file); err == nil {
+		t.Error("Size of a file that is not there succeeded")
+	}
+	if _, err := p.ReadFile(file); err == nil {
+		t.Error("ReadFile of a file that is not there succeeded")
+	}
+	if err := os.WriteFile(file, make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+	got, err := p.Size(file)
+	if err != nil || got != 4096 {
+		t.Errorf("Size = %d, %v; want 4096, nil", got, err)
+	}
+}
+
+// TestPathsWriteAtomicReportsADirectoryItCannotWriteIn: the pointer is how a VM finds
+// its disk, and a write that failed silently would leave the launcher pointed at a layer
+// that is no longer the tip.
+func TestPathsWriteAtomicReportsADirectoryItCannotWriteIn(t *testing.T) {
+	t.Parallel()
+	p := real.NewPaths()
+	if err := p.WriteAtomic(filepath.Join(t.TempDir(), "no", "such", "dir", "current"), []byte("x")); err == nil {
+		t.Fatal("writing into a directory that does not exist succeeded")
+	}
+}

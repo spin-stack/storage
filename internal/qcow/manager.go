@@ -14,6 +14,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/qmp"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/disk"
@@ -24,6 +25,12 @@ import (
 // holding a directory — so it is a constant here rather than a path built at a call
 // site.
 const lockFile = "agent.lock"
+
+// minRotateAtBytes is the floor under Config.RotateAtBytes. A freshly created qcow2 is
+// already ~193 KiB of header, L1 table and refcount blocks before a guest writes a byte;
+// 1 MiB is the nearest round number above that with room for the metadata a few writes
+// allocate.
+const minRotateAtBytes = 1 << 20
 
 // Config is what a Manager needs to be told.
 type Config struct {
@@ -37,6 +44,30 @@ type Config struct {
 	// from PATH: v6 pins QEMU to one version for CI and production, and a chain created
 	// by whichever qemu-img a login shell happened to find is a chain nobody pinned.
 	QemuImg string
+	// RotateAtBytes is how large a tip may get before it is sealed and a new one is
+	// started on top of it (v6 §11's size trigger). Zero disables rotation.
+	//
+	// Size and not age, for the one trigger this stage has. Age is the RPO promise and
+	// belongs to the Control Plane, which sets it per volume; size is what bounds the
+	// two things a host can lose control of on its own — how much a single layer costs
+	// to upload, and how long a recovery that downloads this chain takes. It also gives
+	// §11's "an idle volume does not commit" for free: a tip nobody writes to does not
+	// grow, so it never crosses the threshold and no empty layer is ever produced.
+	//
+	// # It is a floor, not a bound, and the gap is the reconcile interval
+	//
+	// The tip is measured once per cycle, so a layer is sealed at roughly the threshold
+	// *plus whatever the guest wrote since the last look*. Measured by `task demo:stage2`
+	// with a 4 MiB threshold, a 300 ms cycle and a guest writing about a gigabyte a
+	// second: the sealed layers came out at 32 MiB, eight times the number configured.
+	//
+	// That is not a defect to tune away here. With QEMU in the data path a guest's write
+	// cannot be refused (v6 §11), so nothing can hold a layer to a size — the only knobs
+	// are how often the tip is looked at and how fast the guest is, and the second is the
+	// tenant's. What the number is good for is the shape it gives: sealing happens *at
+	// least* this often by volume written, and an operator sizing uploads should plan for
+	// the threshold plus one cycle of the fastest guest they will host.
+	RotateAtBytes int64
 	// ProbeTimeout bounds one exchange with QEMU over QMP, and one run of `qemu-img`.
 	// Both are another process answering, and neither is allowed to park the Agent's
 	// reconciliation cycle: a heartbeat that does not go out is a lease that lapses.
@@ -58,6 +89,13 @@ func (c Config) Validate() error {
 		return errors.New("qcow: a qemu-img binary is required")
 	case c.ProbeTimeout <= 0:
 		return errors.New("qcow: the probe timeout must be positive")
+	case c.RotateAtBytes != 0 && c.RotateAtBytes < minRotateAtBytes:
+		// A threshold under an empty qcow2's own overhead would rotate a volume that
+		// has never been written to, once per cycle, for ever — which is exactly the
+		// "an idle volume does not commit" invariant inverted, and it would be found
+		// by an operator watching a disk fill rather than by anything here.
+		return fmt.Errorf("qcow: a rotation threshold of %d bytes is below the %d an empty image already occupies",
+			c.RotateAtBytes, minRotateAtBytes)
 	}
 	return nil
 }
@@ -245,8 +283,8 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 		// authority on whether a guest's disk should stop existing. Reclaiming the
 		// space is a verb the Control Plane will ask for.
 		delete(m.vols, id)
-		slog.Info("released a volume: this host is no longer serving it, and its local image is kept",
-			"volume_id", id, "epoch", v.epoch, "image", ActiveImage(m.cfg.Root, id))
+		slog.Info("released a volume: this host is no longer serving it, and its local layers are kept",
+			"volume_id", id, "epoch", v.epoch, "layers", LayersDir(m.cfg.Root, id))
 	}
 	return errors.Join(failures...)
 }
@@ -270,46 +308,162 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	}
 
 	v.epoch = d.GetEpoch()
-	image := ActiveImage(m.cfg.Root, id)
 
-	// QEMU is asked first, and the order is load-bearing. If a VM already has this
-	// image open — the Agent restarted while the guest kept running — then no offline
-	// tool may touch the file (v6 §5), and `qemu-img info` would in fact fail on
+	// QEMU is asked first, and the order is load-bearing. If a VM already has a layer of
+	// this volume open — the Agent restarted while the guest kept running — then no
+	// offline tool may touch the file (v6 §5), and `qemu-img info` would in fact fail on
 	// QEMU's write lock. QEMU having opened it is a stronger statement about the image
-	// than any check made from here.
-	attached, foreign, err := m.probe(ctx, id, image)
+	// than any check made from here, and since rotation moves the tip while a VM runs,
+	// it is also the only thing that knows *which* layer is current.
+	open, err := m.probe(ctx, id)
 	if err != nil {
 		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, err)
 	}
-	if foreign != "" {
-		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED,
-			fmt.Errorf("%w: it has %q open, this volume's image is %q", ErrForeignImage, foreign, image))
+	live := ""
+	if open != "" {
+		// Ours if it is a layer of this volume, whichever layer it is. The check is the
+		// directory and not one path, because after a rotation the tip is a file this
+		// Agent may never have named — a restarted Agent learns it here.
+		if filepath.Dir(filepath.Clean(open)) != filepath.Clean(LayersDir(m.cfg.Root, id)) {
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED,
+				fmt.Errorf("%w: it has %q open, which is not a layer of volume %s", ErrForeignImage, open, id))
+		}
+		live = open
+	}
+	attached := live != ""
+
+	if v.chain == nil {
+		// Bounded like the QMP exchange above, and for the same reason: `qemu-img` is
+		// another process, and a cycle that does not finish is a lease that does not get
+		// renewed.
+		openCtx, cancel := m.withTimeout(ctx)
+		defer cancel()
+		chain, err := Open(openCtx, m.run, m.paths, m.cfg.QemuImg, OpenRequest{
+			Root: m.cfg.Root, VolumeID: id, SizeBytes: d.GetSizeBytes(),
+			LiveImage: live, NewLayerID: ids.New().String(),
+		})
+		if err != nil {
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, err)
+		}
+		v.chain = chain
+		v.refusal, v.detail = storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""
+		v.attached = attached
+		slog.Info("volume ready: the chain is prepared and this is where the VM attaches to it",
+			"volume_id", id, "epoch", v.epoch, "image", chain.Active,
+			"pointer", ActivePointer(m.cfg.Root, id),
+			"size_bytes", chain.SizeBytes, "qmp_socket", QMPSocket(m.cfg.Root, id),
+			"attached", attached)
+	} else {
+		// Already serving. The chain is not re-checked — the file may be open, and the
+		// answer would not change if it were not — but a live image still outranks what
+		// this process remembers: a rotation this Agent did not perform, or one it
+		// performed and crashed in the middle of, shows up here as QEMU holding a
+		// different layer than the one in hand.
+		if live != "" {
+			if live != v.chain.Active {
+				slog.Info("the tip moved under this Agent: adopting what QEMU has open",
+					"volume_id", id, "was", v.chain.Active, "now", live)
+				v.chain.Active = live
+			}
+			if err := SyncPointer(m.paths, m.cfg.Root, id, live); err != nil {
+				return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, err)
+			}
+		}
+		m.setAttached(v, attached)
 	}
 
-	if v.chain != nil {
-		// Already serving. The chain is not re-checked: the file may be open, and the
-		// answer would not change if it were not.
-		m.setAttached(v, attached)
+	if !attached {
 		return nil
 	}
-
-	// Bounded like the QMP exchange above, and for the same reason: `qemu-img` is
-	// another process, and a cycle that does not finish is a lease that does not get
-	// renewed.
-	openCtx, cancel := m.withTimeout(ctx)
-	defer cancel()
-	chain, err := Open(openCtx, m.run, m.paths, m.cfg.QemuImg, m.cfg.Root, id, d.GetSizeBytes(), attached)
-	if err != nil {
-		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, err)
+	// Rotation last, and never a refusal. A tip that could not be sealed is a volume
+	// that keeps working and keeps growing; taking it away from a guest that is using it
+	// would turn "we did not manage to bound this layer" into an outage.
+	if err := m.maybeRotate(ctx, v); err != nil {
+		slog.Error("could not rotate this volume's tip; it keeps serving and keeps growing",
+			"volume_id", id, "image", v.chain.Active, "error", err)
+		return fmt.Errorf("volume %s: %w", id, err)
 	}
-	v.chain = chain
-	v.refusal, v.detail = storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""
-	slog.Info("volume ready: the chain is prepared and this is where the VM attaches to it",
-		"volume_id", id, "epoch", v.epoch, "image", chain.Active,
-		"size_bytes", chain.SizeBytes, "qmp_socket", QMPSocket(m.cfg.Root, id),
-		"attached", attached)
-	v.attached = attached
 	return nil
+}
+
+// maybeRotate applies v6 §11's size trigger.
+func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
+	if m.cfg.RotateAtBytes <= 0 {
+		return nil
+	}
+	size, err := m.paths.Size(v.chain.Active)
+	if err != nil {
+		return fmt.Errorf("qcow: measuring the tip %s: %w", v.chain.Active, err)
+	}
+	if size < m.cfg.RotateAtBytes {
+		return nil
+	}
+	return m.rotate(ctx, v, size)
+}
+
+// rotate seals the tip through the QEMU that is writing to it.
+//
+// The pause is measured around the QMP command and nothing else, because that is the
+// only part the guest experiences: creating and checking the next layer happens while the
+// VM writes normally, and it is only `blockdev-snapshot-sync` that drains the device and
+// swaps it. Fixing v6 §11's defaults is what these numbers are for (v6 §23.2), so they
+// are logged per rotation rather than averaged into a gauge.
+func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
+	ctx, cancel := m.withTimeout(ctx)
+	defer cancel()
+
+	client, err := qmp.Dial(ctx, m.dialer, QMPSocket(m.cfg.Root, v.id))
+	if err != nil {
+		return fmt.Errorf("qcow: reaching the VM writing volume %s: %w", v.id, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	device, err := deviceFor(client, v.chain.Active)
+	if err != nil {
+		return err
+	}
+
+	var pause time.Duration
+	sealed, err := v.chain.Rotate(ctx, m.run, m.paths, m.cfg.QemuImg, m.cfg.Root, v.id,
+		ids.New().String(), func(next string) error {
+			at := m.clk.Now()
+			if err := client.Snapshot(device, next); err != nil {
+				return err
+			}
+			pause = time.Duration(m.clk.Now() - at)
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+	slog.Info("rotated: the tip is sealed and the guest is writing to a new layer",
+		"volume_id", v.id, "epoch", v.epoch, "sealed", sealed, "sealed_bytes", tipBytes,
+		"tip", v.chain.Active, "pause_ms", float64(pause.Microseconds())/1000)
+	return nil
+}
+
+// deviceFor finds the drive id QEMU knows the tip by, which is what a snapshot names.
+//
+// The drive id and not the node name. Node names are what QMP documentation reaches for
+// first, but a drive QEMU created for itself — `-drive file=...,if=virtio`, which is how
+// a VM is launched here — has an anonymous one (`#block126`), and QMP refuses those as
+// input. Measured against the pinned QEMU; the drive id was `virtio0`.
+func deviceFor(c *qmp.Client, image string) (string, error) {
+	devices, err := c.BlockDevices()
+	if err != nil {
+		return "", err
+	}
+	want := filepath.Clean(image)
+	for _, d := range devices {
+		if filepath.Clean(d.File) != want {
+			continue
+		}
+		if d.Device == "" {
+			return "", fmt.Errorf("qcow: the VM has %s open under no drive id, so it cannot be named in a snapshot; launch it with -drive ...,if=virtio or an explicit id=", image)
+		}
+		return d.Device, nil
+	}
+	return "", fmt.Errorf("qcow: the VM at this volume's socket no longer has %s open", image)
 }
 
 // refuse records why a volume is not being served and returns the error for the caller
@@ -331,54 +485,51 @@ func (m *Manager) setAttached(v *volume, attached bool) {
 	}
 	v.attached = attached
 	if attached {
-		slog.Info("a VM has attached to this volume: QEMU reports the active image open",
-			"volume_id", v.id, "image", ActiveImage(m.cfg.Root, v.id))
+		slog.Info("a VM has attached to this volume: QEMU reports one of its layers open",
+			"volume_id", v.id, "image", v.chain.Active)
 		return
 	}
 	slog.Info("no VM is attached to this volume any more: nothing answers at its QMP socket",
 		"volume_id", v.id, "qmp_socket", QMPSocket(m.cfg.Root, v.id))
 }
 
-// probe asks the QEMU at this volume's QMP socket what it has open.
+// probe asks the QEMU at this volume's QMP socket what it has open, and returns the
+// first file it names.
 //
-// Three answers, and they are different things: attached (a VM has our image open), not
-// attached with no error (nothing is listening — the ordinary state of a prepared
-// volume whose VM has not been launched), and a foreign file (something is running at
-// this volume's socket against an image we did not prepare, which is the one case worth
-// refusing over).
-func (m *Manager) probe(ctx context.Context, volumeID, image string) (attached bool, foreign string, err error) {
+// It is deliberately not told what to expect. Rotation means the tip is a path this
+// Agent may not know — a restart lands mid-chain, and the file QEMU holds is the answer
+// rather than the thing to check against — so classifying what comes back is the
+// caller's job and this only reports it.
+//
+// An empty string is "nothing is listening", the ordinary state of a prepared volume
+// whose VM has not been launched, and it is not an error.
+func (m *Manager) probe(ctx context.Context, volumeID string) (string, error) {
 	ctx, cancel := m.withTimeout(ctx)
 	defer cancel()
 
 	client, err := qmp.Dial(ctx, m.dialer, QMPSocket(m.cfg.Root, volumeID))
 	if err != nil {
 		if errors.Is(err, qmp.ErrNoEndpoint) {
-			return false, "", nil
+			return "", nil
 		}
-		return false, "", err
+		return "", err
 	}
 	defer func() { _ = client.Close() }()
 
 	devices, err := client.BlockDevices()
 	if err != nil {
-		return false, "", err
-	}
-	want := filepath.Clean(image)
-	for _, d := range devices {
-		if filepath.Clean(d.File) == want {
-			return true, "", nil
-		}
+		return "", err
 	}
 	for _, d := range devices {
-		// The first file that is not ours. Reported rather than counted, because what
-		// an operator does about this starts with knowing which image it is.
+		// The first file, reported rather than counted: what an operator does about a
+		// VM running the wrong image starts with knowing which image it is.
 		if d.File != "" {
-			return false, d.File, nil
+			return d.File, nil
 		}
 	}
 	// A QEMU with no block devices at all. It is not this volume's VM and it is not
 	// running anything else's image either, so there is nothing to refuse over.
-	return false, "", nil
+	return "", nil
 }
 
 // withTimeout bounds one exchange with another process, using the injected clock so the

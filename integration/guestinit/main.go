@@ -16,6 +16,22 @@
 // Agent restarting under a running guest is the case that needs it: an Agent that ran an
 // offline tool over a live image would be refused by QEMU's own write lock, and nothing
 // can observe that while every guest writes once and powers itself off.
+//
+// A hold run also takes `spin.churn=<MiB>`, and then it does not sit still: it rewrites
+// that much of a region of its own, over and over, until the host says stop. It is what
+// gives the host a guest that is *still writing* rather than one that is merely still
+// running — rotation seals the tip under a live VM, and a guest sitting idle would prove
+// that a chain can be rotated, not that a guest can be rotated out from under.
+//
+// It writes until told to stop rather than a fixed amount because the host is waiting on
+// something else entirely: the rotations the writing causes. A fixed amount is a guess at
+// how much data that takes on a disk nobody has measured, and the first guess was wrong
+// in the direction that makes a demonstration pass while proving nothing — 64 MiB landed
+// inside a single reconcile cycle, so the guest was finished before the Agent had looked
+// once.
+//
+// The churn is deliberately elsewhere on the device, so the pattern the verify boot reads
+// back is untouched by it and stays the assertion it was.
 package main
 
 import (
@@ -23,6 +39,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -42,6 +59,11 @@ const (
 	// writes would reach the image as one, and prove one thing rather than eight.
 	blocks = 8
 	stride = 64 << 10
+	// churnOffset is where a hold run's churn goes: far enough past the pattern that no
+	// amount of it can reach the bytes the verify boot asserts on.
+	churnOffset    = 32 << 20
+	churnChunk     = 1 << 20
+	churnSyncEvery = 4 << 20
 )
 
 // The verdict lines the host greps for. The host asserts on these exact strings: a lane
@@ -58,6 +80,10 @@ const (
 	// killed the VM" and "the guest finished" — and only the second leaves a volume in a
 	// state something inside the guest agreed to.
 	stopCommand = "GUESTCTL-STOP"
+	// verdictChurned is printed once the churn has stopped and its last fsync has
+	// returned, so a host that saw it knows the bytes reached the image rather than the
+	// page cache. It carries how many MiB the run wrote in total.
+	verdictChurned = "GUESTINIT-CHURNED"
 )
 
 const (
@@ -142,11 +168,89 @@ func run(m string) error {
 	}
 	if m == modeHold {
 		report("%s", verdictHeld)
-		if err := waitForStop(); err != nil {
+		if err := churn(f, cmdlineMiB("spin.churn"), stopped()); err != nil {
 			return err
 		}
 	}
 	return readBack(pattern)
+}
+
+// churn rewrites a region of mib megabytes, round and round, until stop closes.
+//
+// Rewriting the same region rather than marching down the device is what keeps every
+// tip growing: a rotation puts an empty layer on top, so the next pass over those
+// offsets allocates every cluster again in the new one. Marching would fill the device
+// and stop being about rotation.
+func churn(f *os.File, mib int64, stop <-chan struct{}) error {
+	if mib <= 0 {
+		<-stop
+		return nil
+	}
+	block := make([]byte, churnChunk)
+	for i := range block {
+		block[i] = byte('a' + (i % 26))
+	}
+	var written, since int64
+	for {
+		select {
+		case <-stop:
+			if err := f.Sync(); err != nil {
+				return fmt.Errorf("final fsync while churning: %w", err)
+			}
+			report("%s %d", verdictChurned, written/churnChunk)
+			return nil
+		default:
+		}
+		off := churnOffset + written%(mib*churnChunk)
+		if _, err := f.WriteAt(block, off); err != nil {
+			return fmt.Errorf("churning at %d: %w", off, err)
+		}
+		written += churnChunk
+		if since += churnChunk; since >= churnSyncEvery {
+			// The host is watching the *file* grow, and writes that never left the
+			// guest do not grow it.
+			if err := f.Sync(); err != nil {
+				return fmt.Errorf("fsync while churning: %w", err)
+			}
+			since = 0
+		}
+	}
+}
+
+// stopped is the stop word, as a channel. A hold run has to keep writing while it
+// listens, so the console read moves off the path that does the work.
+func stopped() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := waitForStop(); err != nil {
+			// Nothing to report it to that is not also the console this just lost.
+			// Closing the channel ends the run, which is what a lost console means.
+			return
+		}
+	}()
+	return done
+}
+
+// cmdlineMiB reads a numeric kernel-command-line parameter, in MiB. Absent or unreadable
+// is zero, which is the shape this had before the parameter existed.
+func cmdlineMiB(key string) int64 {
+	raw, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return 0
+	}
+	for _, word := range strings.Fields(string(raw)) {
+		v, ok := strings.CutPrefix(word, key+"=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // waitForStop blocks until the host sends the stop word down the serial line. There is

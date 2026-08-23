@@ -8,13 +8,9 @@ decision is made. If something here is finished, delete it.
 **The custom block storage engine is withdrawn (2026-08-11).** QEMU manages the local
 copy-on-write format via qcow2, and this system manages only immutable commits,
 publication to object storage, and recovery (`arquitectura_mvp_volumenes_remotos_v6.md`,
-which replaced v5.1). The data path is not ours any more.
-
-What survives is the control half, unchanged — the catalog and its term guards, the RPC
-surface, election/provision/place, the lease — plus the two pieces the new design is built
-out of: `simio/real`'s object store, whose cross-process `flock` CAS is what a `HEAD`
-compare-and-swap rests on, and `internal/framed` + `internal/descriptor`. What went, and
-what it cost, is one commit in `git log`.
+which replaced v5.1). The data path is not ours any more. What survives is the control
+half unchanged, plus `simio/real`'s object store — whose cross-process `flock` CAS is what
+a `HEAD` compare-and-swap rests on — and `internal/framed` + `internal/descriptor`.
 
 ## What runs end to end
 
@@ -22,51 +18,49 @@ what it cost, is one commit in `git log`.
 elected, an Agent claims its data directory and registers, `-seed-volume` provisions a
 volume, the Agent prepares its qcow2 chain, a guest boots off that file and writes, the
 Agent is SIGKILLed and restarted **under the running guest**, the guest is told to stop
-and powers off, and a second boot reads the bytes back. `integration/e2e` covers the same
-seam without a guest, and `task test:e2e` now needs the pinned `qemu-img` (`task
-qemu:tools`) because the Agent refuses to start without one.
+and powers off, and a second boot reads the bytes back.
+
+`task demo:stage2` adds rotation: the guest writes without stopping while the Agent seals
+the tip and starts a new layer under it, three times, and a second boot reads every byte
+back through the four-layer chain. `integration/e2e` covers the same seams without a
+guest, and `task test:e2e` needs the pinned `qemu-img` (`task qemu:tools`, which now ships
+its loader and libraries beside it) because the Agent refuses to start without one.
 
 **The Agent does not launch QEMU.** It prepares the chain, owns the volume's directory,
 and speaks QMP to whatever is at the socket — spin's runner is what runs the VMs
 (ADR-0021), and v6 §4/§7 give the Agent control over QEMU, not its lifetime. The contract
-is two paths, `qcow.ActiveImage` and `qcow.QMPSocket`, and it is stated where they are
-defined.
+is `qcow.QMPSocket` and `qcow.ActivePointer` — a file holding the path of the layer to
+launch against, because rotation means the tip is a different file every time.
 
 ## Do this next
 
 v6 §23's stages. The first has a thin path; everything below it is unbuilt.
 
-1. **Stage 1's depth** (increment 2): a DST scenario for the reconciler, and the two
-   sentences nothing yet proves — that a *detach* stops the volume for a running guest,
-   and what happens to a chain whose directory is gone under it. `state.json` from v6 §5
-   is deliberately not written: nothing reads it while a chain is one link long.
-2. **Rotation by QMP** (v6 §23.2), whose exit criterion is measured — the snapshot pause
-   and the upload throughput. `internal/qmp` is the transport it needs and is already
-   driven by a real QEMU in the demo.
-3. **The commit protocol** (v6 §9, §12): `HEAD` as the one mutable object under
+1. **The commit protocol** (v6 §9, §12): `HEAD` as the one mutable object under
    compare-and-swap, commit manifests immutable and create-only, each layer sealed with
    the volume's DEK on the way out (v6 §10 — which is why `crypto.NewEncryption` was
    carried across rather than deleted). A review zone from the first line. Its DST arm has
    the shape of the deleted `two-hosts-cannot-both-publish-an-image`, and the primitive
-   under it is already proven by `task backend:conformance`.
+   under it is already proven by `task backend:conformance`. It also closes Stage 2's half
+   of §11: the upload throughput is the other number the defaults are waiting on, and
+   "do not rotate while a sealed layer is unpublished" cannot exist until something
+   publishes.
+2. **Stages 1 and 2's depth** (increment 2): a DST scenario for the reconciler and for
+   rotation, and the sentences nothing yet proves — that a *detach* stops the volume for a
+   running guest, and what happens to a chain whose directory is gone under it.
 
 ## What the demolition left owed
 
-- **`hack/deadcode-pending.txt` still has three entries**, and Stage 1 was never going to
-  take them: v6 §10 leaves the local qcow2 in cleartext and seals a layer only on the way
-  out, so nothing local needs a DEK. `agent.Loop.VolumeKeys` and its cache, and
-  `crypto.NewEncryption`, are owed to the commit protocol or owed a deletion.
+- **`hack/deadcode-pending.txt` still has three entries**: `agent.Loop.VolumeKeys` and its
+  cache, and `crypto.NewEncryption`. v6 §10 seals a layer only on the way out, so nothing
+  local needs a DEK — they are owed to the commit protocol or owed a deletion.
 - **`internal/dst` has three scenarios and one checker.** The harness is intact and is the
-  point: the commit protocol needs exactly this — seeded, crash-at-every-point,
-  same-seed-same-trace — with a new subject. `mandatory_set_test.go` records what left and
-  why.
-- **`RebuildMetadata` restores volumes only.** Snapshots and published sequences were read
-  out of the chunked image's manifests; a rebuilt volume now comes back with zeroed
-  sequences and no parent link, and the commit protocol is what restores both.
-- **`cpserver` records a published snapshot with no manifest key**, for the same reason.
-- **There is one merge gate again** (`task ci:full`); `ci:noguest` and the REQUIRE_PROOFS
-  mechanism went with the guest-backed lanes they arbitrated. `task build:qemu` and
-  `task fetch:kernel` are still here and still pinned, because Stage 1 needs both.
+  point: the commit protocol needs exactly this, with a new subject.
+- **`RebuildMetadata` restores volumes only**, and **`cpserver` records a published
+  snapshot with no manifest key** — both because snapshots were read out of the chunked
+  image's manifests. The commit protocol is what restores them.
+- **There is one merge gate again** (`task ci:full`); `ci:noguest` and REQUIRE_PROOFS went
+  with the guest-backed lanes they arbitrated.
 
 ## What only a pilot can answer
 
@@ -78,9 +72,15 @@ Named here so nobody mistakes them for things that were checked.
 
 ## Thin paths that shipped without being deepened
 
-- **Stage 1 has no DST scenario and no checker**, by the gate's own rule for a first
-  increment. What exists is unit tests over `internal/qcow`/`internal/qmp` with the
-  process and the socket injected, plus the demo and one e2e assertion.
+- **Stages 1 and 2 have no DST scenario and no checker**, by the gate's own rule for a
+  first increment. What exists is unit tests over `internal/qcow`/`internal/qmp` with the
+  process and the socket injected, plus the two demos and one e2e assertion.
+- **Rotation has no production caller.** `-rotate-at-bytes` defaults to 0, because v6 §11
+  forbids choosing that default instead of measuring it and half the measurement (upload
+  throughput) needs Stage 3. The demo is what drives it until then.
+- **A layer's size is bounded by the reconcile interval, not by the threshold** — measured
+  at 8x with a 300 ms cycle. Nothing can hold a layer to a size while QEMU takes the
+  guest's writes; the number is a floor. Stated at `qcow.Config.RotateAtBytes`.
 - **A volume is never deleted locally.** Releasing one leaves its image on disk, because
   nothing has decided who reclaims it; the device fills up and nothing sweeps.
 - **Nothing measures the chain.** No metric was added — depth, size, attachment — so the
