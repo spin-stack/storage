@@ -84,7 +84,10 @@ cleanup() {
   fi
   return $status
 }
-trap cleanup EXIT
+# INT and TERM as well as EXIT, so a demonstration that is stopped from outside still
+# takes its processes and its database with it. A soak kills these on purpose, and one
+# that leaked a Control Plane and a Postgres database per round would run out of both.
+trap cleanup EXIT INT TERM
 
 # waituntil greps a growing file until the pattern appears at least n times. It is what
 # a demonstration waits on when the thing it is about is a repeated event rather than a

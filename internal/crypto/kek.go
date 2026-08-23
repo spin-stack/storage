@@ -61,9 +61,19 @@ func LoadKEK(d disk.Disk, name string) ([DEKSize]byte, error) {
 	if _, err := f.ReadAt(raw, 0); err != nil && !errors.Is(err, io.EOF) {
 		return kek, fmt.Errorf("crypto: reading the KEK file %s: %w", name, err)
 	}
-	raw = bytes.TrimSpace(raw)
-
-	if decoded, derr := hex.DecodeString(string(raw)); derr == nil && len(decoded) == DEKSize {
+	// Whitespace is trimmed for the *hex* reading and never for the raw one.
+	//
+	// They were both trimmed until a soak found the consequence, in its first round: a
+	// raw 32-byte key whose first or last byte happens to be 0x0a, 0x20, 0x09, 0x0d,
+	// 0x0b or 0x0c comes back one byte short and is refused, with a message telling an
+	// operator their key file is malformed when it is exactly right. Six whitespace
+	// bytes at either end of a random key is 1 - (250/256)^2, about one key in
+	// twenty-two — which is why it was not found by anyone generating a key once.
+	//
+	// The trim is there for a real case and keeps it: `openssl rand -hex 32 > kek`
+	// writes a trailing newline, and a hex key is text, where trailing whitespace means
+	// nothing. Raw bytes are not text and every one of them is the key.
+	if decoded, derr := hex.DecodeString(string(bytes.TrimSpace(raw))); derr == nil && len(decoded) == DEKSize {
 		copy(kek[:], decoded)
 		return kek, nil
 	}

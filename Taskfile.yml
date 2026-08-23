@@ -495,6 +495,17 @@ tasks:
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage3-demo.sh
 
+  soak:
+    desc: >-
+      Run everything, over and over, until something breaks — the DST set across hundreds
+      of seeds, the suites under -race, the three demonstrations with their parameters
+      moved, and one with the Agent killed while it publishes. Runs in a git worktree
+      pinned to a commit, so the checkout it came from can be edited while it runs.
+      SOAK_SEEDS, SOAK_ROUNDS (0 = until stopped), SOAK_REF, SOAK_DIR.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/soak.sh
+
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
     env: *guest_kernel_env

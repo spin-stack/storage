@@ -67,7 +67,8 @@ func run() (err error) {
 		cpURL        = flag.String("control-plane", "", "base URL of the Control Plane, e.g. http://cp:8080 (required)")
 		dataDir      = flag.String("data-dir", "", "directory holding this Agent's local state, and the lock that keeps one Agent per host (required)")
 		interval     = flag.Duration("heartbeat-interval", 5*time.Second, "reconciliation cadence")
-		retryBackoff = flag.Duration("retry-backoff", time.Second, "delay after the first failed cycle; doubles up to the interval")
+		retryBackoff = flag.Duration("retry-backoff", time.Second,
+			"delay after the first failed cycle; doubles up to the interval. Defaults to the interval when that is shorter")
 		leaseTTL     = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL to expect from the Control Plane")
 		httpTimeout  = flag.Duration("rpc-timeout", 10*time.Second, "per-request timeout for Control Plane calls")
 		otlpEndpoint = flag.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
@@ -105,7 +106,7 @@ func run() (err error) {
 		AgentVersion:      version,
 		MaxFormatVersion:  maxFormatVersion,
 		HeartbeatInterval: *interval,
-		RetryBackoff:      *retryBackoff,
+		RetryBackoff:      backoffFor(*retryBackoff, *interval),
 		LeaseTTL:          *leaseTTL,
 	}
 
@@ -270,6 +271,30 @@ func run() (err error) {
 	// a clean shutdown from a disappearance.
 	slog.Info("volume-agent stopped")
 	return nil
+}
+
+// backoffFor keeps the two flags in step so an operator does not have to.
+//
+// The Loop refuses a backoff longer than the interval — a retry that lands after the next
+// cycle would have started is not a backoff — and that check is right. What was wrong is
+// where it landed: the default backoff was a second, so `-heartbeat-interval 300ms`, which
+// is an ordinary thing to want, made the process refuse to start over a flag the operator
+// had never touched, naming that flag. A soak found it by moving the interval around.
+//
+// An explicitly given backoff is left alone and still validated. Silently shrinking a
+// number somebody typed would be worse than the refusal: they asked for something, and if
+// it cannot be had they should be told.
+func backoffFor(backoff, interval time.Duration) time.Duration {
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "retry-backoff" {
+			explicit = true
+		}
+	})
+	if explicit || backoff <= interval {
+		return backoff
+	}
+	return interval
 }
 
 // loopKeys is the knot between the publisher and the loop, tied in one place.

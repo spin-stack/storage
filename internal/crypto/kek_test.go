@@ -2,7 +2,9 @@ package crypto_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -176,4 +178,62 @@ func (r *ramp) Read(p []byte) (int, error) {
 		p[i] = r.n
 	}
 	return len(p), nil
+}
+
+// TestLoadKEKTakesEveryByteOfARawKey is what a soak found in its first round: the
+// whitespace trim that lets a hex key carry a trailing newline was also applied to raw
+// bytes, so about one randomly generated key in twenty-two came back a byte short and
+// was refused as malformed.
+//
+// Table-driven over the actual whitespace set rather than over "a newline", because the
+// bug is not about newlines — it is about six byte values that a random key contains as
+// readily as any other.
+func TestLoadKEKTakesEveryByteOfARawKey(t *testing.T) {
+	t.Parallel()
+	for _, b := range []byte{'\n', ' ', '\t', '\r', '\v', '\f'} {
+		for _, where := range []string{"first", "last"} {
+			t.Run(fmt.Sprintf("%s byte is %#x", where, b), func(t *testing.T) {
+				t.Parallel()
+				raw := make([]byte, crypto.DEKSize)
+				for i := range raw {
+					raw[i] = byte(i + 1)
+				}
+				if where == "first" {
+					raw[0] = b
+				} else {
+					raw[crypto.DEKSize-1] = b
+				}
+				d := sim.NewDisk()
+				writeKEKFile(t, d, "kek", raw)
+
+				got, err := crypto.LoadKEK(d, "kek")
+				if err != nil {
+					t.Fatalf("a 32-byte key was refused: %v", err)
+				}
+				if !bytes.Equal(got[:], raw) {
+					t.Errorf("the key came back changed:\n want %x\n  got %x", raw, got)
+				}
+			})
+		}
+	}
+}
+
+// TestLoadKEKStillTakesAHexKeyWithATrailingNewline is the case the trim exists for, and
+// the control on the test above: `openssl rand -hex 32 > kek` writes one.
+func TestLoadKEKStillTakesAHexKeyWithATrailingNewline(t *testing.T) {
+	t.Parallel()
+	raw := make([]byte, crypto.DEKSize)
+	for i := range raw {
+		raw[i] = byte(255 - i)
+	}
+	d := sim.NewDisk()
+	writeKEKFile(t, d, "kek", []byte(hex.EncodeToString(raw)+"\n"))
+
+	got, err := crypto.LoadKEK(d, "kek")
+	if err != nil {
+		t.Fatalf("a hex key with a trailing newline was refused: %v", err)
+	}
+	if !bytes.Equal(got[:], raw) {
+		t.Errorf("the key came back changed:\n want %x\n  got %x", raw, got)
+	}
 }

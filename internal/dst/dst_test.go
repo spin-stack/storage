@@ -1,12 +1,36 @@
 package dst_test
 
 import (
+	"os"
+	"strconv"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/dst"
 )
 
-var seeds = []int64{1, 2, 42, 1337, 2024, 99999}
+// seeds are the six the gate runs on every push, plus however many `task soak` asks for.
+//
+// The six are pinned and are not a sample: a scenario that fails on one of them fails on
+// every machine, in every branch, for ever, which is what makes a DST failure a bug
+// report rather than a rumour. SOAK_SEEDS widens the set for a long unattended run and
+// cannot narrow it — a soak that could turn the gate down would be a way to make a
+// failing seed disappear.
+//
+// The extra seeds are consecutive from a fixed origin rather than drawn, so a soak that
+// finds something names a number anyone can re-run with `SOAK_SEEDS=<n> go test`.
+var seeds = soakSeeds()
+
+func soakSeeds() []int64 {
+	pinned := []int64{1, 2, 42, 1337, 2024, 99999}
+	extra, err := strconv.Atoi(os.Getenv("SOAK_SEEDS"))
+	if err != nil || extra <= 0 {
+		return pinned
+	}
+	for i := range int64(extra) {
+		pinned = append(pinned, 1_000_000+i)
+	}
+	return pinned
+}
 
 // TestMandatoryScenarios runs the §25.1 mandatory set across several seeds with
 // the default checkers; every run must pass.
