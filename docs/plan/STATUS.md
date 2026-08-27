@@ -20,8 +20,9 @@ bucket back with `cat`: every structural object is a digest line and JSON, so th
 from `HEAD` is walked to the first commit, checking each layer is present, matches its
 recorded digest, and carries none of the guest's bytes in the clear.
 
-`demo:stage4` is written and **has never been run**: it destroys the host — the process
-killed and the data directory deleted — and brings the volume back from the bucket alone.
+`demo:stage4` closes v6 §26's cycle: it destroys the host — the process killed and the
+data directory deleted — and a rebuilt machine brings the volume back from the bucket
+alone, with a guest reading bytes another guest wrote on a host that no longer exists.
 `integration/e2e` covers the same seams without a guest; `task test:e2e` needs the pinned
 `qemu-img` (`task qemu:tools`).
 
@@ -57,12 +58,10 @@ no equivalent of vSphere's datastore lock to stop the successor's guest from sta
 
 1. **What a lapsed lease should do** — the section above. It is first because it is the
    only open question that decides whether a guest is stopped.
-2. **`task demo:stage4` has never been run.** It is written and registered; nothing has
-   executed it, so recovery is proven by unit and adversary tests and by no guest.
-3. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
+2. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
    sealed layer is unpublished" are in; `rpo_target` on `DesiredVolume` and a commit fired
    by age are not, and the upload-throughput half of the measurement is now possible.
-4. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
+3. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
    reconciler nor the rebuild has one. Also unproven: that a *detach* stops a running
    guest's volume, and what a chain whose directory vanished under it does.
 
