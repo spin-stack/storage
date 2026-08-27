@@ -36,7 +36,7 @@ func TestAdversaryTheRealAgentRefusesToStartBecauseNothingWiresTheGuard(t *testi
 	// A qemu-img that answers `--version`, which is the one thing New runs before it
 	// would reach the loop. It is never reached: the wiring check comes first.
 	stub := filepath.Join(dir, "qemu-img")
-	if err := real.NewPaths().WriteAtomic(stub, []byte("#!/bin/sh\necho 'qemu-img version 11.0.2'\n")); err != nil {
+	if err := real.NewPaths().WriteAtomic(stub, []byte("#!/bin/sh\necho 'qemu-img version 11.1.1'\n")); err != nil {
 		t.Fatalf("writing the stub qemu-img: %v", err)
 	}
 	data := filepath.Join(dir, "data")

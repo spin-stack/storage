@@ -33,7 +33,7 @@ type fakeRunner struct {
 	// chainErr, when set, is what only `info --backing-chain` fails with. It models the
 	// one behaviour the walk exists for: a tip whose backing file is gone passes plain
 	// `info` with exit 0 and fails the walk with exit 1 (both measured against the
-	// pinned 11.0.2), so a fake that failed both would keep a plain-info build green.
+	// pinned 11.1.1), so a fake that failed both would keep a plain-info build green.
 	chainErr error
 }
 
@@ -833,31 +833,45 @@ func TestOpenWalksTheWholeChainOfAnImageItAdopts(t *testing.T) {
 	})
 }
 
-// TestDeviceForNamesTheDriveASnapshotCanUse. A snapshot is issued against the drive id,
-// not the node name: QEMU gives a drive it created for itself an anonymous node
-// (`#block126`) and QMP refuses those as input. Measured against the pinned 11.0.2, where
-// the drive id was `virtio0`.
-func TestDeviceForNamesTheDriveASnapshotCanUse(t *testing.T) {
+// TestTargetForNamesWhateverTheLauncherLeftUsToNameItWith.
+//
+// A snapshot has to name the node it acts on, and there is no single way to do that: this
+// Agent does not launch the VM (ADR-0021). A `-drive file=...,if=virtio` disk has a
+// generated drive id and an anonymous node QMP refuses as input; a `-blockdev
+// node-name=vol` disk has a real node and no drive id at all. This took the drive id and
+// refused everything else — which is a VM shaped the way any libvirt-derived runner
+// shapes one, so rotation broke on exactly the launcher we expect to meet.
+func TestTargetForNamesWhateverTheLauncherLeftUsToNameItWith(t *testing.T) {
 	t.Parallel()
 	image := qcow.LayerImage(root, vol, layerID)
+	open := func(device, node string) []string {
+		return []string{
+			`{"QMP": {"version": {}, "capabilities": []}}`,
+			`{"return": {}}`,
+			`{"return": [{"device": "` + device + `", "inserted": {"file": "` + image +
+				`", "drv": "qcow2", "node-name": "` + node + `"}}]}`,
+			`{"return": [{"node-name": "spin1"}]}`,
+		}
+	}
 
 	tests := []struct {
 		name, want string
 		script     []string
 	}{
 		{
-			name:   "the drive holding our image",
-			script: attachedTo(image),
-			want:   "virtio0",
+			name:   "launched with -drive: the generated id, and no overlay name needed",
+			script: open("virtio0", "#block126"),
+			want:   "drive virtio0",
 		},
 		{
-			name: "a drive with no id at all",
-			script: []string{
-				`{"QMP": {"version": {}, "capabilities": []}}`,
-				`{"return": {}}`,
-				`{"return": [{"device": "", "inserted": {"file": "` + image + `", "drv": "qcow2"}}]}`,
-			},
-			want: "under no drive id",
+			name:   "launched with -blockdev: the node, because there is no drive id",
+			script: open("", "vol"),
+			want:   "node vol",
+		},
+		{
+			name:   "neither, which nothing can name",
+			script: open("", "#block126"),
+			want:   "neither a drive id nor a node name",
 		},
 		{
 			name:   "a VM that has moved on to another image",
@@ -878,7 +892,7 @@ func TestDeviceForNamesTheDriveASnapshotCanUse(t *testing.T) {
 				return
 			}
 			if got != tt.want {
-				t.Errorf("the drive is %q, want %q", got, tt.want)
+				t.Errorf("the target is %q, want %q", got, tt.want)
 			}
 		})
 	}

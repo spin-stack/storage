@@ -277,12 +277,16 @@ Los defaults de `rpo_target` y del umbral de tamaño **se fijan midiendo**, no e
 pausa del external snapshot pone el piso del primero y el throughput de subida contra el
 objetivo de recovery pone el segundo. Es el criterio de salida de la Etapa 2.
 
-### Lo medido (2026-08-23, `task demo:stage2`)
+### Lo medido (`task demo:stage2`)
 
 Un guest Linux real escribiendo sobre NVMe, umbral de 4 MiB, ciclo de reconciliación de
 300 ms, tres rotaciones bajo carga:
 
-- **Pausa del external snapshot: 1.11 / 1.46 / 1.53 ms** (min / mediana / max). No es el
+- **Pausa del external snapshot: 1.59 / 2.36 / 2.40 ms** (min / mediana / max) sobre QEMU
+  11.1.1 con el guest lanzado por `-blockdev` y nodos nombrados. Sobre 11.0.2 con
+  `-drive ...,if=virtio` habían sido 1.11 / 1.46 / 1.53. Mismo orden de magnitud, y no
+  vale leer la diferencia como un costo de la forma nueva: son tres muestras en una
+  máquina que no estaba quieta. No es el
   piso de `rpo_target`: a este costo, rotar cada pocos segundos es gratis para el guest, y
   lo que fija el default es el throughput de subida — que no se puede medir hasta la
   Etapa 3, porque todavía nada sube.

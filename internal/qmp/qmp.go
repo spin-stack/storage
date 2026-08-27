@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // ErrNoEndpoint means nothing was listening at the socket path. It is the ordinary
@@ -59,6 +60,45 @@ type BlockDevice struct {
 	// image is being read as raw is a volume whose backing chain is invisible to it,
 	// which is worth being able to notice.
 	Format string
+	// NodeName is the block graph node holding the image, empty when QEMU generated an
+	// anonymous one. A VM launched with `-drive file=...,if=virtio` has an anonymous
+	// node — `#block126` — which QMP refuses as input, and a VM launched with
+	// `-blockdev node-name=...` has a real one and *no* Device. Neither field is
+	// reliably present, which is why Target picks.
+	NodeName string
+}
+
+// Target is how a command names the block node it acts on. Exactly one of the two is
+// set.
+//
+// It exists because there is no single way to name a disk that works for both kinds of
+// VM, and this Agent does not launch the VM (ADR-0021) so it does not get to choose.
+// A `-drive` disk has a generated drive id and an anonymous node; a `-blockdev` disk has
+// a named node and no drive id. Rotation broke on the second — `deviceFor` refused a
+// disk with no drive id — which is a VM shaped the way any libvirt-derived runner shapes
+// one.
+type Target struct {
+	Device   string
+	NodeName string
+}
+
+// Args renders the target as the arguments a block command names it with.
+func (t Target) Args() map[string]string {
+	if t.Device != "" {
+		return map[string]string{"device": t.Device}
+	}
+	return map[string]string{"node-name": t.NodeName}
+}
+
+// Named reports whether the target is addressable at all.
+func (t Target) Named() bool { return t.Device != "" || t.NodeName != "" }
+
+// String is what an error message says about it.
+func (t Target) String() string {
+	if t.Device != "" {
+		return "drive " + t.Device
+	}
+	return "node " + t.NodeName
 }
 
 // Dial connects to the QMP socket at path and completes the capabilities negotiation,
@@ -112,8 +152,9 @@ func (c *Client) BlockDevices() ([]BlockDevice, error) {
 		Device   string `json:"device"`
 		QDev     string `json:"qdev"`
 		Inserted *struct {
-			File   string `json:"file"`
-			Driver string `json:"drv"`
+			File     string `json:"file"`
+			Driver   string `json:"drv"`
+			NodeName string `json:"node-name"`
 		} `json:"inserted"`
 	}
 	if err := json.Unmarshal(raw, &devices); err != nil {
@@ -130,6 +171,7 @@ func (c *Client) BlockDevices() ([]BlockDevice, error) {
 		out = append(out, BlockDevice{
 			Device: d.Device, QDev: d.QDev,
 			File: d.Inserted.File, Format: d.Inserted.Driver,
+			NodeName: nameOrAnonymous(d.Inserted.NodeName),
 		})
 	}
 	return out, nil
@@ -162,14 +204,52 @@ type reply struct {
 // what makes this work, and it is also why the caller verifies the file it created before
 // getting here: a wrong backing path is invisible for the life of the VM and wrong on the
 // next boot.
-func (c *Client) Snapshot(device, file string) error {
-	_, err := c.executeWith("blockdev-snapshot-sync", map[string]string{
-		"device":        device,
-		"snapshot-file": file,
-		"format":        "qcow2",
-		"mode":          "existing",
-	})
+// The overlay is named only when the source is, and that is QEMU's rule rather than a
+// preference: addressed by node-name, blockdev-snapshot-sync answers "New overlay
+// node-name missing" without one. Measured against the pinned QEMU.
+func (c *Client) Snapshot(t Target, overlayNode, file string) error {
+	args := t.Args()
+	args["snapshot-file"] = file
+	args["format"] = "qcow2"
+	args["mode"] = "existing"
+	if t.Device == "" {
+		args["snapshot-node-name"] = overlayNode
+	}
+	_, err := c.executeWith("blockdev-snapshot-sync", args)
 	return err
+}
+
+// NamedNodes is every node in the block graph that has a name, which is what a fresh
+// overlay name has to avoid colliding with.
+//
+// It is a separate call from BlockDevices because the two answer different questions:
+// query-block lists what a *guest device* has open, and the graph underneath it —
+// backing files, filters, the file node under a qcow2 — is only in this one. A name
+// already taken by a backing node is as unusable as one taken by a tip.
+func (c *Client) NamedNodes() ([]string, error) {
+	raw, err := c.execute("query-named-block-nodes")
+	if err != nil {
+		return nil, err
+	}
+	var nodes []struct {
+		Inserted *struct {
+			NodeName string `json:"node-name"`
+		} `json:"inserted"`
+		NodeName string `json:"node-name"`
+	}
+	if err := json.Unmarshal(raw, &nodes); err != nil {
+		return nil, fmt.Errorf("qmp: decoding the query-named-block-nodes answer: %w", err)
+	}
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n.NodeName != "" {
+			out = append(out, n.NodeName)
+		}
+		if n.Inserted != nil && n.Inserted.NodeName != "" {
+			out = append(out, n.Inserted.NodeName)
+		}
+	}
+	return out, nil
 }
 
 // Stop pauses the guest. It is what fencing does to a VM that is still writing.
@@ -239,4 +319,16 @@ func (c *Client) executeWith(command string, args map[string]string) (json.RawMe
 			return nil, fmt.Errorf("qmp: %s got a line that is neither an answer, an error nor an event", command)
 		}
 	}
+}
+
+// nameOrAnonymous drops QEMU's generated node names.
+//
+// A node QEMU named for itself is called `#block126`, and QMP refuses a name beginning
+// with `#` as *input* — so carrying it would produce a Target that looks addressable and
+// is not. Empty is the honest answer: this node has no name anything can use.
+func nameOrAnonymous(name string) string {
+	if strings.HasPrefix(name, "#") {
+		return ""
+	}
+	return name
 }

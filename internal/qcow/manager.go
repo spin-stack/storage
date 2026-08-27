@@ -60,7 +60,9 @@ type Config struct {
 	// The tip is measured once per cycle, so a layer is sealed at roughly the threshold
 	// *plus whatever the guest wrote since the last look*. Measured by `task demo:stage2`
 	// with a 4 MiB threshold, a 300 ms cycle and a guest writing about a gigabyte a
-	// second: the sealed layers came out at 32 MiB, eight times the number configured.
+	// second: the sealed layers came out at 32 MiB, eight times the number configured —
+	// the same on QEMU 11.0.2 and 11.1.1, because what decides it is the cycle and the
+	// guest rather than anything QEMU does.
 	//
 	// That is not a defect to tune away here. With QEMU in the data path a guest's write
 	// cannot be refused (v6 §11), so nothing can hold a layer to a size — the only knobs
@@ -843,7 +845,7 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 	}
 	defer func() { _ = client.Close() }()
 
-	device, err := deviceFor(client, v.chain.Active)
+	target, overlayNode, err := targetFor(client, v.chain.Active)
 	if err != nil {
 		return err
 	}
@@ -853,7 +855,7 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 	sealed, err := v.chain.Rotate(ctx, m.run, m.paths, m.cfg.QemuImg, m.cfg.Root, v.id,
 		layerID, func(next string) error {
 			at := m.clk.Now()
-			if err := client.Snapshot(device, next); err != nil {
+			if err := client.Snapshot(target, overlayNode, next); err != nil {
 				return err
 			}
 			pause = time.Duration(m.clk.Now() - at)
@@ -864,7 +866,11 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 	}
 	slog.Info("rotated: the tip is sealed and the guest is writing to a new layer",
 		"volume_id", v.id, "epoch", v.epoch, "sealed", sealed, "sealed_bytes", tipBytes,
-		"tip", v.chain.Active, "pause_ms", float64(pause.Microseconds())/1000)
+		"tip", v.chain.Active, "pause_ms", float64(pause.Microseconds())/1000,
+		// How the disk was named, because there are two ways and which one applied is
+		// the first thing worth knowing when a rotation fails on the naming: a drive id
+		// means the VM was launched with -drive, a node means -blockdev.
+		"named_by", target.String())
 
 	// A host with no publisher still records what it sealed, and does not treat it as
 	// something to wait for. Those are two different facts and they were one: rotate
@@ -952,28 +958,69 @@ func (m *Manager) recordPending(v *volume) error {
 	return WriteState(m.paths, m.cfg.Root, v.id, st)
 }
 
-// deviceFor finds the drive id QEMU knows the tip by, which is what a snapshot names.
+// targetFor finds how QMP can name the node holding the tip, and picks a free name for
+// the overlay a rotation will put over it.
 //
-// The drive id and not the node name. Node names are what QMP documentation reaches for
-// first, but a drive QEMU created for itself — `-drive file=...,if=virtio`, which is how
-// a VM is launched here — has an anonymous one (`#block126`), and QMP refuses those as
-// input. Measured against the pinned QEMU; the drive id was `virtio0`.
-func deviceFor(c *qmp.Client, image string) (string, error) {
+// There is no single way to name a disk, because this Agent does not launch the VM
+// (ADR-0021) and so does not choose its shape. A `-drive file=...,if=virtio` disk has a
+// generated drive id (`virtio0`) and an *anonymous* node QMP refuses as input; a
+// `-blockdev node-name=vol` disk has a real node and no drive id at all. This used to
+// take the first and refuse the second, which is a VM shaped the way any libvirt-derived
+// runner shapes one — so rotation broke on exactly the launcher we expect to meet.
+//
+// The overlay name is only needed on the node path: addressed by node-name,
+// blockdev-snapshot-sync answers "New overlay node-name missing" without one. It cannot
+// be the layer's id — QEMU caps a node name at 31 characters and a v7 UUID is 36, which
+// is measured and is why the names are `spinN` rather than anything meaningful. What
+// matters about them is only that they are free, so they are checked against the whole
+// graph and not just the guest's devices: a name a *backing* node holds is as unusable
+// as one a tip holds.
+func targetFor(c *qmp.Client, image string) (qmp.Target, string, error) {
 	devices, err := c.BlockDevices()
 	if err != nil {
-		return "", err
+		return qmp.Target{}, "", err
 	}
 	want := filepath.Clean(image)
 	for _, d := range devices {
 		if filepath.Clean(d.File) != want {
 			continue
 		}
-		if d.Device == "" {
-			return "", fmt.Errorf("qcow: the VM has %s open under no drive id, so it cannot be named in a snapshot; launch it with -drive ...,if=virtio or an explicit id=", image)
+		t := qmp.Target{Device: d.Device, NodeName: d.NodeName}
+		if !t.Named() {
+			return qmp.Target{}, "", fmt.Errorf("qcow: the VM has %s open under neither a drive id nor a node name, so nothing can name it in a snapshot; launch it with `-drive ...,if=virtio` or `-blockdev node-name=<name>`", image)
 		}
-		return d.Device, nil
+		if t.Device != "" {
+			return t, "", nil
+		}
+		overlay, err := freeNodeName(c)
+		if err != nil {
+			return qmp.Target{}, "", err
+		}
+		return t, overlay, nil
 	}
-	return "", fmt.Errorf("qcow: the VM at this volume's socket no longer has %s open", image)
+	return qmp.Target{}, "", fmt.Errorf("qcow: the VM at this volume's socket no longer has %s open", image)
+}
+
+// freeNodeName returns a node name nothing in the block graph is using.
+func freeNodeName(c *qmp.Client) (string, error) {
+	taken, err := c.NamedNodes()
+	if err != nil {
+		return "", err
+	}
+	used := make(map[string]bool, len(taken))
+	for _, n := range taken {
+		used[n] = true
+	}
+	// Bounded rather than `for {}`: the loop's exit depends on what another process
+	// reports, and a QEMU answering with a graph this Agent cannot find a gap in is a
+	// bug to report, not a cycle to spin in.
+	for i := 1; i <= 1024; i++ {
+		name := fmt.Sprintf("spin%d", i)
+		if !used[name] {
+			return name, nil
+		}
+	}
+	return "", errors.New("qcow: this VM's block graph has a thousand nodes named spinN and no free one; something is not cleaning up after itself")
 }
 
 // refuse records why a volume is not being served and returns the error for the caller

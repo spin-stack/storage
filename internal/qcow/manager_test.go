@@ -74,6 +74,20 @@ func attachedTo(image string) []string {
 	}
 }
 
+// attachedByNode scripts a QEMU launched the modern way — `-blockdev node-name=vol` — so
+// the disk has a real node and no drive id at all. The fourth answer is
+// query-named-block-nodes, which a rotation asks in order to pick an overlay name nothing
+// is using.
+func attachedByNode(image string) []string {
+	return []string{
+		`{"QMP": {"version": {}, "capabilities": []}}`,
+		`{"return": {}}`,
+		`{"return": [{"device": "", "inserted": {"file": "` + image + `", "drv": "qcow2", "node-name": "vol"}}]}`,
+		`{"return": [{"node-name": "vol"}, {"node-name": "vol-file"}, {"node-name": "spin1"}]}`,
+		`{"return": {}}`,
+	}
+}
+
 // tip is the layer `active/current` names, which is the only way a test learns the path
 // the Manager chose: layer ids are v7 UUIDs minted per layer, so nothing outside can
 // predict one.
@@ -120,7 +134,7 @@ func newHarnessOn(t *testing.T, d *sim.Disk) *harness {
 func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64, pub qcow.Publisher) *harness {
 	t.Helper()
 	h := &harness{
-		runner: &fakeRunner{info: infoJSON("qcow2", size, false), version: "qemu-img version 11.0.2"},
+		runner: &fakeRunner{info: infoJSON("qcow2", size, false), version: "qemu-img version 11.1.1"},
 		paths:  newPaths(),
 		dialer: &fakeDialer{scripts: map[string][]string{}},
 		disk:   d,
@@ -471,7 +485,7 @@ func TestOneAgentPerHost(t *testing.T) {
 
 	_, err := qcow.New(t.Context(), qcow.Config{Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second}, qcow.Deps{
 		Clock: sim.NewClock(time.Unix(0, 0)), Disk: d,
-		Runner: &fakeRunner{version: "qemu-img version 11.0.2"}, Paths: newPaths(), Dialer: &fakeDialer{},
+		Runner: &fakeRunner{version: "qemu-img version 11.1.1"}, Paths: newPaths(), Dialer: &fakeDialer{},
 		Recovery: bornEmpty(),
 	})
 	if err == nil {
@@ -487,7 +501,7 @@ func TestNewRefusesIncompleteWiring(t *testing.T) {
 	full := func() (qcow.Config, qcow.Deps) {
 		return qcow.Config{Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second},
 			qcow.Deps{Clock: sim.NewClock(time.Unix(0, 0)), Disk: sim.NewDisk(),
-				Runner: &fakeRunner{version: "qemu-img version 11.0.2"}, Paths: newPaths(), Dialer: &fakeDialer{},
+				Runner: &fakeRunner{version: "qemu-img version 11.1.1"}, Paths: newPaths(), Dialer: &fakeDialer{},
 				Recovery: bornEmpty()}
 	}
 	tests := []struct {
@@ -1188,5 +1202,69 @@ func TestFencingAVolumeWithNoGuestIsNotAFailure(t *testing.T) {
 	}
 	if v := h.volumes(t)[vol]; v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED {
 		t.Errorf("the refusal is %v", v.Refusal)
+	}
+}
+
+// TestRotationNamesTheDiskTheWayThisVMAllowsIt asserts on the bytes that reach QEMU,
+// because that is the whole subject: a snapshot has to name the node it acts on, and the
+// two kinds of VM leave two different names to do it with.
+//
+// The `-blockdev` row is the one that was broken. A disk launched that way has no drive
+// id, rotation refused it outright, and that is the shape any libvirt-derived runner
+// produces — so the launcher we expect to meet was the launcher we could not rotate.
+func TestRotationNamesTheDiskTheWayThisVMAllowsIt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		script  func(string) []string
+		wants   []string
+		unwants []string
+	}{
+		{
+			name:    "launched with -drive: named by its generated drive id",
+			script:  attachedTo,
+			wants:   []string{`"device":"virtio0"`, `"mode":"existing"`},
+			unwants: []string{`"node-name"`, `"snapshot-node-name"`},
+		},
+		{
+			name:   "launched with -blockdev: named by its node, and the overlay named too",
+			script: attachedByNode,
+			// QEMU refuses the command without the second one — "New overlay node-name
+			// missing" — and spin2 rather than spin1 because the graph already holds a
+			// spin1 and a name in use is no name at all.
+			wants:   []string{`"node-name":"vol"`, `"snapshot-node-name":"spin2"`, `"mode":"existing"`},
+			unwants: []string{`"device"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarnessRotatingAt(t, 8<<20)
+			if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+				t.Fatalf("preparing: %v", err)
+			}
+			tip := h.tip(t)
+			h.dialer.scripts[qcow.QMPSocket(root, vol)] = tt.script(tip)
+			h.paths.sizes[tip] = 9 << 20
+			h.runner.info = overlayJSON(size, tip)
+
+			if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+				t.Fatalf("the cycle that should rotate: %v", err)
+			}
+			if h.tip(t) == tip {
+				t.Fatal("the tip did not rotate")
+			}
+			sent := h.dialer.sent()
+			for _, want := range tt.wants {
+				if !strings.Contains(sent, want) {
+					t.Errorf("the snapshot did not carry %s: %s", want, sent)
+				}
+			}
+			for _, unwant := range tt.unwants {
+				if strings.Contains(sent, unwant) {
+					t.Errorf("the snapshot carried %s, which this VM cannot be named by: %s", unwant, sent)
+				}
+			}
+		})
 	}
 }

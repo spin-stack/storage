@@ -14,24 +14,25 @@ recovery (`arquitectura_mvp_volumenes_remotos_v6.md`). The data path is not ours
 Three demonstrations, each with the real binaries and a real Linux guest. `demo:stage1`:
 a volume is provisioned, a guest boots off its qcow2, the Agent is SIGKILLed and restarted
 **under the running guest**, and a second boot reads the bytes back. `demo:stage2` adds
-rotation — the guest writes without stopping while the Agent seals the tip and starts a
-new layer under it, three times. `demo:stage3` adds the commit protocol, and reads the
-bucket back with `cat`: every structural object is a digest line and JSON, so the chain
-from `HEAD` is walked to the first commit, checking each layer is present, matches its
-recorded digest, and carries none of the guest's bytes in the clear.
+rotation — the guest writes without stopping while the Agent seals the tip and starts a new
+layer under it, three times. `demo:stage3` adds the commit protocol and reads the bucket
+back with `cat`: every structural object is a digest line and JSON, so the chain from
+`HEAD` is walked to the first commit, checking each layer is present, matches its digest,
+and carries none of the guest's bytes in the clear.
 
 `demo:stage4` closes v6 §26's cycle: it destroys the host — process killed, data directory
 deleted — and a rebuilt machine brings the volume back from the bucket alone, a guest
-reading bytes another guest wrote on a host that no longer exists. `integration/e2e`
-covers the same seams without a guest.
+reading bytes another guest wrote on a host that no longer exists.
 
-The two diagrams at the root are generated from the `.dot` beside each one, and
-`task diagrams:check` fails the gate when one is stale.
+`integration/e2e` covers the same seams without a guest. The two diagrams at the root are
+generated from the `.dot` beside each one; `task diagrams:check` fails on a stale one.
 
 **The Agent does not launch QEMU.** It prepares the chain and speaks QMP to whatever is at
 the socket; spin's runner runs the VMs (ADR-0021). The contract is `qcow.QMPSocket` and
-`qcow.ActivePointer` — a file holding the path of the layer to launch against, because
-rotation means the tip is a different file every time.
+`qcow.ActivePointer` — the path of the layer to launch against, because rotation makes the
+tip a different file every time. Either launcher shape works: `-drive ...,if=virtio` names
+the disk by a generated drive id, `-blockdev node-name=…` by its node, and `demo:stage2`
+boots the second so both are proven by something that runs.
 
 ## The open question: what a lapsed lease should do
 
@@ -75,8 +76,8 @@ no equivalent of vSphere's datastore lock to stop the successor's guest from sta
 ## What only a pilot can answer
 
 - **No commit has been published to real S3.** The lanes use the filesystem store or
-  RustFS; `task backend:conformance` is what stands between those and S3's own `If-Match`.
-- **An upgrade of a running fleet** has never been run; INV-19 becomes binding there.
+  RustFS; `task backend:conformance` stands between those and S3's own `If-Match`. And an
+  upgrade of a running fleet has never been run; INV-19 becomes binding there.
 
 ## Thin paths that shipped without being deepened
 
@@ -96,7 +97,6 @@ no equivalent of vSphere's datastore lock to stop the successor's guest from sta
   rotation leaves. A sweep needs a `List` on `qcow.Paths`, which does not exist.
 - **Nothing measures the chain or the commits.** No metric for depth, size, attachment,
   `unpublished_local_bytes` or `last_successful_commit_age` — which §11 calls the product.
-  The only observation outside the Agent is its log and the refusal column.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
   DEK). `DeleteVolume` returns which it did; even a real shred rests on the bucket's
   lifecycle policy expiring the descriptor's non-current versions.

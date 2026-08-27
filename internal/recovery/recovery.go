@@ -203,7 +203,7 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 	// The whole chain, once, offline. Every layer was checked against its own parent as
 	// it landed; this is the check that the result resolves end to end, and it is a
 	// different question — plain `qemu-img info` exits 0 on an image whose backing file
-	// is gone, and `--backing-chain` exits 1 (both measured against the pinned 11.0.2).
+	// is gone, and `--backing-chain` exits 1 (both measured against the pinned 11.1.1).
 	// It is safe here and only here: this runs on an offline image, and the walk opens
 	// every backing file, which would fail on the write lock of a live one.
 	chain, err := r.inspectChain(ctx, parent)
@@ -335,7 +335,7 @@ func (r *Recoverer) discard(part string) { _ = r.files.Remove(part) }
 // checks that it does.
 //
 // `-F qcow2` is mandatory, not decoration: without it qemu-img exits 1 with "backing file
-// format must be specified" (measured against the pinned 11.0.2). `-u` is what makes this
+// format must be specified" (measured against the pinned 11.1.1). `-u` is what makes this
 // O(1) — it rewrites the header and does not touch a cluster, which is correct because
 // the parent's *contents* are the same bytes wherever the file sits.
 //

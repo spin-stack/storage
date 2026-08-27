@@ -19,7 +19,7 @@ vars:
   BUILDKIT_CACHE_DIR: '{{.BUILDKIT_CACHE_DIR | default (printf "%s/.cache/buildkit" .ROOT_DIR)}}'
   BUILDKIT_CACHE_QEMU: '{{.BUILDKIT_CACHE_DIR}}/storage-qemu'
   # QEMU is pinned here and in CLAUDE.md; the same version runs in CI and prod.
-  QEMU_VERSION: 11.0.2
+  QEMU_VERSION: 11.1.1
   QEMU_JOBS: '{{.QEMU_JOBS | default 8}}'
   # BuildKit cache backends. Local by default (a laptop); CI overrides them with
   # `type=gha` so the build is not duplicated in a workflow file — the Dockerfile and

@@ -155,7 +155,7 @@ to the caller.
 ## Stack
 
 **Go 1.26**, module `github.com/spin-stack/storage`; conventions mirror `spin`/`spinbox`.
-Taskfile (go-task), golangci-lint v2, OpenTelemetry v1.38.x, QEMU pinned 11.0.2 (CI and
+Taskfile (go-task), golangci-lint v2, OpenTelemetry v1.38.x, QEMU pinned 11.1.1 (CI and
 prod). Layout: `internal/` (impl), `cmd/`, `api/` (proto), `integration/`, `hack/`,
 `deploy/`, `migrations/`, `internal/schema/`, `internal/db/` (generated).
 

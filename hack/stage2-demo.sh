@@ -4,6 +4,13 @@
 #
 # What it demonstrates, in order:
 #
+# This is also the lane that launches the guest the *modern* way — `-blockdev` with named
+# nodes and an explicit virtio-blk-pci — rather than `-drive ...,if=virtio`. The two shapes
+# leave the Agent different things to name the disk with: a generated drive id and an
+# anonymous node, or a real node and no drive id at all. Rotation refused the second until
+# it was taught to look, which is the shape any libvirt-derived runner produces. Stages 1,
+# 3 and 4 keep `-drive`, so both are proven by something that actually boots.
+#
 #   1. a volume is provisioned and a guest boots off its first layer;
 #   2. the guest writes continuously (spin.churn) while the Agent watches the tip grow;
 #   3. every time the tip crosses -rotate-at-bytes the Agent creates a new layer over
@@ -60,7 +67,9 @@ exec 9<>"$DIR/ctl"
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=$CHURN" \
-  -drive "file=$FIRST,format=qcow2,if=virtio,cache=writeback" \
+  -blockdev "driver=file,filename=$FIRST,node-name=vol-file,discard=unmap" \
+  -blockdev "driver=qcow2,node-name=vol,file=vol-file,discard=unmap" \
+  -device virtio-blk-pci,drive=vol,id=virtio-disk0,disable-legacy=on \
   -qmp "unix:$SOCK,server=on,wait=off" \
   -serial stdio <"$DIR/ctl" >"$DIR/logs/guest1.log" 2>&1 &
 PIDS+=($!)
@@ -97,7 +106,10 @@ def cmd(c):
         r = json.loads(f.readline())
         if "event" not in r: return r
 f.readline(); cmd("qmp_capabilities")
-got = cmd("query-block")["return"][0]["inserted"]["file"]
+# The entry with a medium in it: with no -nodefaults there is a CD-ROM tray first, and
+# it has no `inserted` at all.
+disks = [b for b in cmd("query-block")["return"] if b.get("inserted")]
+got = disks[0]["inserted"]["file"]
 print(f"    QEMU says it is writing to {got}")
 if got != tip:
     sys.exit(f"QEMU is writing to {got} and active/current names {tip}")

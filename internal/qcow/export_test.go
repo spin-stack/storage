@@ -20,5 +20,9 @@ func (m *Manager) DeviceForTest(ctx context.Context, volumeID, image string) (st
 		return "", err
 	}
 	defer func() { _ = client.Close() }()
-	return deviceFor(client, image)
+	t, _, err := targetFor(client, image)
+	if err != nil {
+		return "", err
+	}
+	return t.String(), nil
 }

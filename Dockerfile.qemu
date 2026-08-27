@@ -3,7 +3,7 @@
 # Modelled on spin-stack/spinbox's Dockerfile.qemu (same BuildKit cache-mount
 # strategy, same debloat flags) with three differences that matter here:
 #
-#   1. QEMU is pinned to 11.0.2 — the version CLAUDE.md pins for CI and prod —
+#   1. QEMU is pinned to 11.1.1 — the version CLAUDE.md pins for CI and prod —
 #      not spinbox's 11.0.1.
 #   2. --enable-vhost-user-blk-server builds QEMU's *own* vhost-user-blk backend
 #      (qemu-storage-daemon). That gives us a reference implementation to test our
@@ -16,7 +16,7 @@
 
 FROM ubuntu:26.04 AS builder
 
-ARG QEMU_VERSION=11.0.2
+ARG QEMU_VERSION=11.1.1
 ARG JOBS=8
 # Bump when the configure flags below change: the build directory lives in a cache
 # mount and configure only runs when there is no Makefile, so without this a flag
@@ -80,10 +80,11 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
 # Configure + build. vhost-user (our data path) and the storage daemon are the
 # reason this image exists; the display/audio stack is dead weight for a microVM.
 #
-# NOTE: do not re-add spinbox's `CONFIG_CXL=n` debloat here. On 11.0.2 it breaks the
+# NOTE: do not re-add spinbox's `CONFIG_CXL=n` debloat here. On 11.0.2 it broke the
 # link — the PCI expander bridge (pxb_cxl_realize, acpi_build) still references
 # cxl_component_register_block_init / cxl_fmws_get_all_sorted — and a few hundred KiB
-# of binary is not worth a build that fails only at the last step.
+# of binary is not worth a build that fails only at the last step. Not re-tested on
+# 11.1.1: the sed that removes it is still here, so nothing has had the chance to.
 RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/cache/qemu \
     --mount=type=cache,sharing=locked,id=qemu-build-${QEMU_VERSION}-${QEMU_CONFIG_REV},target=/build/qemu-build \
     sed -i '/^CONFIG_CXL=n$/d' \

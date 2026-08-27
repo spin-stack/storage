@@ -124,7 +124,7 @@ type Restored struct {
 // which is all the recovery this needs, since the socket is answering again by then.
 var ErrImageBusy = errors.New("qcow: a VM has this image open, so no offline tool may look at it")
 
-// writeLockRefusal is what the pinned qemu-img 11.0.2 prints when another process holds
+// writeLockRefusal is what the pinned qemu-img 11.1.1 prints when another process holds
 // the image. Matching on it is matching on another program's message, which is fragile in
 // exactly one direction: a wording change makes a busy image read as a broken one again,
 // which is the behaviour this replaced and not something worse.
@@ -386,7 +386,7 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 	// backing file is gone — format, virtual size and the corrupt flag all pass — so
 	// this Agent would log "volume ready" and the failure would land on whoever
 	// launches QEMU, as `Could not open backing file`. `--backing-chain` opens every
-	// layer and exits 1 (both measured against the pinned 11.0.2).
+	// layer and exits 1 (both measured against the pinned 11.1.1).
 	//
 	// Rotate keeps plain `inspect` and must: the overlay it checks is backed by a tip a
 	// live QEMU holds the write lock on, so a walk would fail on the lock and break
