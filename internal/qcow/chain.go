@@ -128,6 +128,15 @@ var ErrImageBusy = errors.New("qcow: a VM has this image open, so no offline too
 // the image. Matching on it is matching on another program's message, which is fragile in
 // exactly one direction: a wording change makes a busy image read as a broken one again,
 // which is the behaviour this replaced and not something worse.
+//
+// The lock itself is the launcher's to keep, and it can be given away silently. Measured
+// on the pinned 11.1.1, a guest holding the image makes `qemu-img info` refuse under both
+// launcher shapes — `-drive file=…,if=virtio` and `-blockdev driver=file,…` — because
+// locking defaults to on in both. `-blockdev …,locking=off` turns it off, and then
+// `qemu-img info` *succeeds against a running guest*: this package loses the only offline
+// evidence that a VM is attached, and reads a live volume as an idle one. Nothing here can
+// detect that, so it is stated where the assumption is: whoever launches the VM must leave
+// locking on.
 const writeLockRefusal = `Failed to get shared "write" lock`
 
 // ErrForeignImage means a QEMU is attached at this volume's QMP socket with a different

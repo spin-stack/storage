@@ -53,8 +53,8 @@ vars:
   # Pinned by content, the same rule as RUSTFS_IMAGE: "which kernel did the lane
   # certify" has to have an answer that is not "whatever was in _output that day".
   # Bump deliberately with `task guest:kernel:pin` and say in the commit why it moved.
-  GUEST_KERNEL_VERSION: 7.1.0
-  GUEST_KERNEL_SHA256: 76524fa7fd541f725265a1721e1a602be3bdb943e793950b76dec2f8e56848e2
+  GUEST_KERNEL_VERSION: 7.2.1
+  GUEST_KERNEL_SHA256: bd0ff2ed66f1837d1f7d26251c61b300d43810c8a320cfc02fd62179821a5c29
   # Source 1: a sibling spinbox checkout that has already built one (no network).
   SPINBOX_KERNEL: '{{.SPINBOX_KERNEL | default "../spinbox/_output/spinbox-kernel-x86_64"}}'
   # Source 2: the mirror. Unset by default — nothing is published yet — so the failure
