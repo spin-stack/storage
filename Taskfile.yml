@@ -32,6 +32,10 @@ vars:
   # Object-store backend under test (§6.1 conformance suite). Pinned by digest so a
   # re-tagged image cannot silently change what the suite certified.
   RUSTFS_IMAGE: "rustfs/rustfs:latest@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
+  # Graphviz, pinned by digest like every other image here. The diagrams at the repository
+  # root are generated from the .dot beside each one; the SVG is output and is committed so
+  # that reading the repository does not require rendering it.
+  DOT_IMAGE: "nshine/dot@sha256:17ba91db2197ae4154cdc4b397a263017ce15c7f2c0cb8bf29404d78bcb4bd6d"
   # --- pinned tool versions (the single place each is declared) ---
   SQLC_VERSION: v1.30.0
   PGSCHEMA_VERSION: v1.12.0
@@ -516,6 +520,26 @@ tasks:
     deps: [build:cmd, guest:verify]
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage4-demo.sh
+
+  diagrams:
+    desc: Render the architecture diagrams from their .dot sources into the SVGs at the root.
+    cmds:
+      - |
+        set -euo pipefail
+        for src in *.dot; do
+          out=${src%.dot}.svg
+          docker run --rm -i --entrypoint dot {{.DOT_IMAGE}} -Tsvg <"$src" >"$out"
+          echo "rendered $out"
+        done
+
+  diagrams:check:
+    desc: >-
+      Fail if a committed diagram is stale. This is the whole reason the .dot exists: the
+      v5 diagrams described a withdrawn engine for a month — vhost-user, an encrypted WAL,
+      CoW extents — because a picture is the one artefact nothing in a build ever reads.
+    cmds:
+      - task: diagrams
+      - git diff --exit-code -- '*.svg'
 
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
@@ -1081,6 +1105,7 @@ tasks:
     cmds:
       - task: ci
       - task: generate:check
+      - task: diagrams:check
       - task: db:verify
       - task: cover
       - task: test:integration

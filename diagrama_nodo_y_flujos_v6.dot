@@ -1,0 +1,38 @@
+// Un host, y por dónde pasan los bytes. Fuente de diagrama_nodo_y_flujos_v6.svg.
+//
+// Se genera con `task diagrams`; el SVG es salida, no se edita a mano. La versión v5 de
+// este diagrama describió durante un mes un motor que ya no existía —vhost-user, WAL
+// cifrado, extents CoW, batcher— porque nada podía notar que había dejado de ser cierto.
+// `task diagrams:check` es lo que ahora lo nota.
+digraph G {
+  rankdir=TB;
+  bgcolor="white";
+  labelloc="t";
+  label="Nodo y flujos — v6";
+  fontname="Arial"; fontsize=13;
+  node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#334155",
+        fontname="Arial", fontsize=12, margin="0.18,0.10"];
+  edge [color="#475569", fontname="Arial", fontsize=10];
+
+  guest  [label="Guest Linux\n/dev/vda"];
+  qemu   [label="QEMU  ·  virtio-blk\ndueño del formato CoW local (§7)"];
+  chain  [label="cadena qcow2 local\nlayers/<layer-id>.qcow2\nactive/current → el tip", fillcolor="#eef2f7"];
+  agent  [label="Volume Agent\nNO lanza la VM: prepara la cadena y habla QMP\nrota por tamaño · publica · reconstruye", fillcolor="#eef2f7"];
+  state  [label="state.json\ncommits que este host tiene · layer sellado sin publicar\nregistro de cerco"];
+  cp     [label="Control Plane\ncatálogo con guarda de term · desired state\nleases · GetVolumeKeys"];
+  kms    [label="KMS / Vault (KEK)\nDEK envuelta, atada al volumen"];
+  s3     [label="Object store\nlayers/sha256/… (inmutables, direccionadas por contenido)\nvolumes/<id>/commits/<commit>.json (create-only)\nvolumes/<id>/HEAD (único mutable, CAS)\nvolumes/<id>/epoch · descriptor.json", fillcolor="#eef2f7"];
+
+  guest -> qemu   [label="  READ · WRITE · FLUSH"];
+  qemu  -> chain  [label="  WRITE → qcow2 → ACK\l  FLUSH → fdatasync → ACK\l  (durabilidad LOCAL, §6)\l"];
+  agent -> qemu   [label="  QMP: query-block\l  blockdev-snapshot-sync (rotar)\l  stop (cercar)\l", style=dashed];
+  agent -> chain  [label="  qemu-img create / info / rebase\l  (no hay parser propio, §7)\l", style=dashed];
+  agent -> state  [label="  durable, se lee al abrir", style=dashed];
+  cp    -> agent  [label="  desired state · epoch\l  heartbeat / lease\l"];
+  kms   -> agent  [label="  desenvolver la DEK\l  (sólo mientras dura la operación)\l", style=dashed];
+  agent -> s3     [label="  COMMIT, siempre en este orden:\l  1. sellar el layer con la DEK (tramas de 64 KiB)\l  2. PUT layer\l  3. PUT manifest\l  4. CAS de HEAD  ← el commit existe recién acá\l"];
+  s3    -> agent  [label="  RECOVERY: leer HEAD, recorrer parent_commit_id,\l  bajar y verificar cada layer, re-apuntar backings,\l  tip nuevo encima\l", style=dashed, constraint=false];
+
+  { rank=same; state; agent; }
+  { rank=same; cp; kms; }
+}

@@ -20,11 +20,13 @@ bucket back with `cat`: every structural object is a digest line and JSON, so th
 from `HEAD` is walked to the first commit, checking each layer is present, matches its
 recorded digest, and carries none of the guest's bytes in the clear.
 
-`demo:stage4` closes v6 §26's cycle: it destroys the host — the process killed and the
-data directory deleted — and a rebuilt machine brings the volume back from the bucket
-alone, with a guest reading bytes another guest wrote on a host that no longer exists.
-`integration/e2e` covers the same seams without a guest; `task test:e2e` needs the pinned
-`qemu-img` (`task qemu:tools`).
+`demo:stage4` closes v6 §26's cycle: it destroys the host — process killed, data directory
+deleted — and a rebuilt machine brings the volume back from the bucket alone, a guest
+reading bytes another guest wrote on a host that no longer exists. `integration/e2e`
+covers the same seams without a guest.
+
+The two diagrams at the root are generated from the `.dot` beside each one, and
+`task diagrams:check` fails the gate when one is stale.
 
 **The Agent does not launch QEMU.** It prepares the chain and speaks QMP to whatever is at
 the socket; spin's runner runs the VMs (ADR-0021). The contract is `qcow.QMPSocket` and
@@ -42,10 +44,10 @@ it costs a tenant their VM for a partition nobody else acted on.
 Comparable systems enforce the fence *at the resource* rather than asking the writer to
 stop — Ceph blocklists the client at the OSDs, SCSI-3 reservations are enforced by the
 array — and that fence already exists here: the CAS on `HEAD` plus the epoch check mean
-nothing a fenced host writes can enter the published history. vSphere HA is the closest
-analogue and refuses to act on one signal: *isolated* when the network stops, *dead* only
-when the datastore heartbeat agrees. The object store is that second path, and
-`volumes/<id>/epoch` moves at the grant rather than at the first publish.
+nothing a fenced host writes can enter the published history. vSphere HA refuses to act on
+one signal: *isolated* when the network stops, *dead* only when the datastore heartbeat
+agrees. The object store is that second path, and `volumes/<id>/epoch` moves at the grant
+rather than at the first publish.
 
 It was implemented once and reverted, and the reason is the useful part: §12.2's "a lapsed
 lease gives the device up" has three tests protecting it, and each variant that satisfied
@@ -67,8 +69,8 @@ no equivalent of vSphere's datastore lock to stop the successor's guest from sta
 
 ## What the demolition left owed
 
-- **`hack/deadcode-pending.txt` is empty**, and `cpserver` still records a published
-  snapshot with no manifest key — the one piece recovery did not bring back.
+- **`cpserver` still records a published snapshot with no manifest key** — the one piece
+  recovery did not bring back. `hack/deadcode-pending.txt` is empty.
 
 ## What only a pilot can answer
 
@@ -87,8 +89,8 @@ no equivalent of vSphere's datastore lock to stop the successor's guest from sta
 - **A whole sealed layer is held in memory to publish it.** `objectstore.Store` takes a
   `[]byte`. At 32 MiB that is a buffer; an order of magnitude more and it is an OOM in a
   process holding somebody's disk. The fix is a streaming PUT on the store interface.
-- **A restart in the microseconds between sealing and publishing duplicates a commit id.**
-  The layer is derived from the chain and never lost; only the id is.
+- **A restart between sealing and publishing duplicates a commit id** — the layer is
+  derived from the chain and never lost; only the id is.
 - **Nothing reclaims local disk.** A released volume keeps its layers, a published layer
   keeps its file (§9 step 15), and nothing sweeps the orphan overlay an interrupted
   rotation leaves. A sweep needs a `List` on `qcow.Paths`, which does not exist.
@@ -99,14 +101,13 @@ no equivalent of vSphere's datastore lock to stop the successor's guest from sta
   DEK). `DeleteVolume` returns which it did; even a real shred rests on the bucket's
   lifecycle policy expiring the descriptor's non-current versions.
 - **No alerting artifact, no bucket lifecycle, no tracing, no PITR rehearsal, no `/healthz`
-  on the Control Plane** (whose term is a closure over a constant). The Connect API is
-  unauthenticated on `:8080`, with `GetVolumeKeys` on it.
+  on the CP** (whose term is a closure over a constant). The Connect API is unauthenticated
+  on `:8080`, with `GetVolumeKeys` on it.
 
 ## Divergences (DEV entries)
 
 The ratchet is `hack/dev-entries.sh` + `hack/dev-entries-open.txt`. **0 open.** Resolved
 ones keep a struck heading so the check cannot pass vacuously; the reasoning is in `git log`.
-
 ## ~~DEV-0007~~ — the spine's second half *(withdrawn 2026-08-03)*
 ## ~~DEV-0011~~ — a segment's space is charged as used, not reserved *(2026-08-08: accepted, not fixed)*
 ## ~~DEV-0012~~ — a self-fenced log still accepts WRITEs *(2026-08-02: not a divergence)*
