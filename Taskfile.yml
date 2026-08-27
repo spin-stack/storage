@@ -747,7 +747,17 @@ tasks:
         command -v docker >/dev/null || {
           echo "no qemu-img at {{.OUTPUT_DIR}}/bin and no docker to fetch one — run: task build:qemu" >&2; exit 1; }
         docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img" || {
-          echo "no $img locally and it could not be pulled — build it: task build:qemu" >&2; exit 1; }
+          # Which of the two causes this is matters, because the fixes are opposites.
+          # The tag is QEMU_VERSION, and the image is published by .github/workflows/qemu.yml
+          # — a separate workflow. So the first push of a version bump races: this gate
+          # starts while the image for the new tag is still being built, and no amount of
+          # rebuilding *here* helps. Waiting does. That happened on the 11.0.2 → 11.1.1 bump,
+          # where the advice below ("build it") was the wrong advice, confidently given.
+          echo "no $img locally and it could not be pulled." >&2
+          echo "  If QEMU_VERSION changed in this commit: .github/workflows/qemu.yml publishes" >&2
+          echo "  that tag and takes tens of minutes. Let it finish, then re-run this." >&2
+          echo "  Otherwise the tag should already exist — build it locally: task build:qemu" >&2
+          exit 1; }
         mkdir -p {{.OUTPUT_DIR}}/bin
         cid=$(docker create "$img")
         trap 'docker rm -f "$cid" >/dev/null' EXIT
