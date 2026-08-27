@@ -92,10 +92,15 @@ func TestProvisionCreatesTheRowTheKeyAndTheDescriptor(t *testing.T) {
 		t.Error("no wrapped DEK on the row: GetVolumeKeys would hand the Agent nothing")
 	}
 
-	// The wrapped key must open with this deployment's KEK and no other. Unwrapping
-	// binds the version as GCM AAD, so a key stored under the wrong version is a key
-	// the Agent cannot use — and it would only be discovered on the first WRITE.
-	dek, err := kms.UnwrapDEK(got.DEKWrapped, vol.KeyID)
+	// The wrapped key must open with this deployment's KEK, this volume's id, and no
+	// other pair. Unwrapping binds both the version and the volume as GCM AAD, so a key
+	// stored under the wrong version — or found under the wrong volume's prefix — is a
+	// key the Agent cannot use, and it would only be discovered on the first WRITE.
+	u, err := ids.Parse(vol.VolumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek, err := kms.UnwrapDEK(got.DEKWrapped, vol.KeyID, [16]byte(u))
 	if err != nil {
 		t.Fatalf("the stored DEK does not unwrap with the KEK that wrapped it: %v", err)
 	}
@@ -249,20 +254,25 @@ func TestTheKeyVersionSurvivesEveryBoundary(t *testing.T) {
 
 	// The KMS. This is the assertion that copying the wrong number around cannot
 	// satisfy: the version is AAD, so a wrong one fails to unwrap at all.
-	dek, err := kms.UnwrapDEK(row.DEKWrapped, row.DEKKeyID)
-	if err != nil {
-		t.Fatalf("the DEK the catalog describes does not unwrap: %v", err)
-	}
 	u, err := ids.Parse(vol.VolumeID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	dek, err := kms.UnwrapDEK(row.DEKWrapped, row.DEKKeyID, [16]byte(u))
+	if err != nil {
+		t.Fatalf("the DEK the catalog describes does not unwrap: %v", err)
 	}
 	if _, err := crypto.NewEncryption(dek, [16]byte(u)); err != nil {
 		t.Fatalf("the unwrapped DEK cannot encrypt this volume: %v", err)
 	}
 
-	// And the negative: one off, and nothing opens.
-	if _, err := kms.UnwrapDEK(row.DEKWrapped, row.DEKKeyID+1); !errors.Is(err, crypto.ErrUnwrap) {
+	// And the negatives: one off in either half of the AAD, and nothing opens.
+	if _, err := kms.UnwrapDEK(row.DEKWrapped, row.DEKKeyID+1, [16]byte(u)); !errors.Is(err, crypto.ErrUnwrap) {
 		t.Fatalf("a DEK unwrapped under the wrong version: %v", err)
+	}
+	other := [16]byte(u)
+	other[0]++
+	if _, err := kms.UnwrapDEK(row.DEKWrapped, row.DEKKeyID, other); !errors.Is(err, crypto.ErrUnwrap) {
+		t.Fatalf("a DEK unwrapped under another volume's id: %v", err)
 	}
 }

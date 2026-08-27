@@ -37,6 +37,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
@@ -50,10 +52,17 @@ var (
 	// commit was being assembled. **Nothing overwrites HEAD after this.** With a correct
 	// single writer it cannot happen, so it is a fencing failure, a concurrent recovery,
 	// or a bug (v6 §15) — and every one of those is made worse by taking the object.
-	ErrHeadMoved = errors.New("commit: HEAD moved while this commit was being published")
+	ErrHeadMoved = errors.New("commit: this host is not this volume's writer any more")
 	// ErrManifestConflict means a *different* manifest already occupies this commit id.
 	// A retry of our own is not this — that is byte-identical and reported as success.
-	ErrManifestConflict = errors.New("commit: another manifest already exists at this commit id")
+	//
+	// It wraps ErrHeadMoved, and that is not tidiness. With v7 ids two hosts cannot pick
+	// one commit id by chance, so the only way here is a host publishing under an id
+	// another host has already used for different content — which is the same statement
+	// as a HEAD that moved: this host is not the volume's writer any more. It was its own
+	// unrelated error until an adversary took a volume away from a host mid-commit and
+	// watched it be told something nothing fences on, and keep the guest's disk.
+	ErrManifestConflict = fmt.Errorf("%w: another manifest already exists at this commit id", ErrHeadMoved)
 	// ErrNoHead means the volume has never published a commit.
 	ErrNoHead = errors.New("commit: this volume has no HEAD")
 	// ErrCorrupt is what a stored object that disagrees with its own digest gives back.
@@ -134,6 +143,63 @@ func ManifestKey(volumeID, commitID string) string {
 // HeadKey is the volume's one mutable object.
 func HeadKey(volumeID string) string { return "volumes/" + volumeID + "/HEAD" }
 
+// ErrBadIdentifier means an object carries an id that is not a v7 UUID where one is
+// required.
+//
+// It is checked at both boundaries — on the way out and on the way in — because these
+// strings do not stay strings. A commit id becomes an object key, a layer id becomes a
+// *filesystem path* on whichever host rebuilds the volume, and a manifest is a document
+// somebody else may have written into the bucket. Adversarial tests found both ends of
+// that: a manifest whose layer_id was `../../<other volume>/layers/<id>` made a restore
+// create and delete a file outside the volume's directory, and a Publish called with an
+// empty commit id wrote `commits/.json` and pointed HEAD at "".
+//
+// The check is UUID-shaped rather than "no slashes" on purpose. INV-22 says every id in
+// this system is a v7 UUID, so anything else is already wrong, and a rule that lists the
+// characters an attacker may not use is a rule that is one encoding away from being
+// wrong.
+var ErrBadIdentifier = errors.New("commit: an identifier is not a UUID")
+
+// checkID refuses anything that is not a UUID. An empty string is refused too, except
+// where a caller has said it is allowed — a first commit has no parent.
+func checkID(what, id string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("%w: %s is %q", ErrBadIdentifier, what, id)
+	}
+	return nil
+}
+
+// validate checks every identifier in a manifest, at whichever boundary it is crossing.
+func (m Manifest) validate() error {
+	if err := checkID("volume_id", m.VolumeID); err != nil {
+		return err
+	}
+	if err := checkID("commit_id", m.CommitID); err != nil {
+		return err
+	}
+	if m.ParentCommitID != "" {
+		if err := checkID("parent_commit_id", m.ParentCommitID); err != nil {
+			return err
+		}
+	}
+	if m.ParentCommitID == m.CommitID {
+		// A commit that is its own parent is a chain a walk never leaves. It cannot be
+		// produced by Publish any more, and it was produced by Publish once.
+		return fmt.Errorf("%w: commit %s is its own parent", ErrBadIdentifier, m.CommitID)
+	}
+	if err := checkID("layer_id", m.Layer.LayerID); err != nil {
+		return err
+	}
+	// And the layer's key must be the one its own digest names. The key is what a reader
+	// GETs; a manifest that named some other object would send a recovery to bytes this
+	// system never wrote, and the digest check afterwards would blame the object store.
+	if want := LayerKey(m.Layer.SHA256); m.Layer.ObjectKey != want {
+		return fmt.Errorf("%w: commit %s names layer object %q, and its digest names %q",
+			ErrBadIdentifier, m.CommitID, m.Layer.ObjectKey, want)
+	}
+	return nil
+}
+
 // Digest is the SHA-256 of the bytes as stored, hex, which is what a layer's key and a
 // manifest's `sha256` are both built from.
 func Digest(body []byte) string {
@@ -159,6 +225,9 @@ func WriteManifest(ctx context.Context, store objectstore.Store, m Manifest) err
 	// written as one, and the whole point of the field is that it cannot be absent. `m`
 	// is this function's own copy, so the caller's value is untouched.
 	m.FormatVersion = framed.FormatVersion
+	if err := m.validate(); err != nil {
+		return err
+	}
 	body, err := marshal(m)
 	if err != nil {
 		return err
@@ -200,6 +269,12 @@ func ReadManifest(ctx context.Context, store objectstore.Store, volumeID, commit
 	if m.VolumeID != volumeID || m.CommitID != commitID {
 		return Manifest{}, fmt.Errorf("commit: %s describes volume %s commit %s", key, m.VolumeID, m.CommitID)
 	}
+	// And every identifier in it, before the caller turns one into a path. The two checks
+	// above say the object is the one that was asked for; this one says the object is
+	// one this system could have written.
+	if err := m.validate(); err != nil {
+		return Manifest{}, fmt.Errorf("%s: %w", key, err)
+	}
 	return m, nil
 }
 
@@ -226,6 +301,11 @@ func ReadHead(ctx context.Context, store objectstore.Store, volumeID string) (He
 	if h.VolumeID != volumeID {
 		return Head{}, "", fmt.Errorf("commit: %s names volume %s", key, h.VolumeID)
 	}
+	// The one field the whole chain walk is driven by, and the one nothing checked: a
+	// HEAD naming "" read back cleanly and then panicked whoever followed it.
+	if err := checkID("commit_id", h.CommitID); err != nil {
+		return Head{}, "", fmt.Errorf("%s: %w", key, err)
+	}
 	return h, info.ETag, nil
 }
 
@@ -243,6 +323,12 @@ func ReadHead(ctx context.Context, store objectstore.Store, volumeID string) (He
 // is reported as the success it was. Only a HEAD naming something else is ErrHeadMoved,
 // and nothing here overwrites that.
 func CASHead(ctx context.Context, store objectstore.Store, volumeID, commitID, etag string) error {
+	if err := checkID("volume_id", volumeID); err != nil {
+		return err
+	}
+	if err := checkID("commit_id", commitID); err != nil {
+		return err
+	}
 	h := Head{FormatVersion: framed.FormatVersion, VolumeID: volumeID, CommitID: commitID}
 	body, err := marshal(h)
 	if err != nil {
@@ -295,4 +381,10 @@ func unmarshal(key string, body []byte, v any, version *int) error {
 		return fmt.Errorf("commit %s: %w", key, err)
 	}
 	return nil
+}
+
+// ReadHeadCommit is ReadHead for a caller that wants the commit and not the ETag.
+func ReadHeadCommit(ctx context.Context, store objectstore.Store, volumeID string) (string, error) {
+	h, _, err := ReadHead(ctx, store, volumeID)
+	return h.CommitID, err
 }

@@ -2,9 +2,11 @@ package controlplane_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/controlplane"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -30,7 +32,8 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 	ctx := t.Context()
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
 
-	p := controlplane.NewProvisioner(md, store, testKMS(t), &ramp{})
+	kms := testKMS(t)
+	p := controlplane.NewProvisioner(md, store, kms, &ramp{})
 	v, err := p.Provision(ctx, term, controlplane.VolumeSpec{
 		SizeBytes: 1 << 30, BlockSize: 4096, HostID: cloneHostA,
 	})
@@ -46,7 +49,7 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 		t.Fatal(err)
 	}
 
-	c, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snap, ids.New().String())
+	c, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snap, ids.New().String())
 	if err != nil {
 		t.Fatalf("Clone: %v", err)
 	}
@@ -70,7 +73,7 @@ func TestRebuildMetadataFromTheBucket(t *testing.T) {
 	}
 
 	fresh, _, freshTerm := cpStore(t) // a database that has never seen this fleet
-	sum, err := controlplane.RebuildMetadata(ctx, fresh, store, freshTerm)
+	sum, err := controlplane.RebuildMetadata(ctx, fresh, store, testKMS(t), freshTerm)
 	if err != nil {
 		t.Fatalf("RebuildMetadata: %v", err)
 	}
@@ -139,11 +142,11 @@ func TestRebuildMetadataIsIdempotent(t *testing.T) {
 	vol, _, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
 
 	fresh, _, freshTerm := cpStore(t)
-	first, err := controlplane.RebuildMetadata(ctx, fresh, store, freshTerm)
+	first, err := controlplane.RebuildMetadata(ctx, fresh, store, testKMS(t), freshTerm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := controlplane.RebuildMetadata(ctx, fresh, store, freshTerm)
+	second, err := controlplane.RebuildMetadata(ctx, fresh, store, testKMS(t), freshTerm)
 	if err != nil {
 		t.Fatalf("the second rebuild failed: %v", err)
 	}
@@ -174,7 +177,7 @@ func TestRebuildMetadataRefusesAMisplacedDescriptor(t *testing.T) {
 	}
 
 	fresh, _, freshTerm := cpStore(t)
-	if _, err := controlplane.RebuildMetadata(ctx, fresh, store, freshTerm); err == nil {
+	if _, err := controlplane.RebuildMetadata(ctx, fresh, store, testKMS(t), freshTerm); err == nil {
 		t.Fatal("a descriptor under the wrong prefix was accepted")
 	}
 	if _, err := fresh.GetVolume(ctx, stranger); !errors.Is(err, metadata.ErrNotFound) {
@@ -191,4 +194,67 @@ func mustOneDescriptorKey(t *testing.T, store objectstore.Store) string {
 	}
 	id := objs[0].Key[len("volumes/") : len(objs[0].Key)-len("/descriptor.json")]
 	return id
+}
+
+// "You passed the wrong -kek-file" and "somebody forged this descriptor" are the same
+// failed unwrap and must not be the same message.
+//
+// A rebuild is run when the catalog is already gone, which is the worst moment to tell
+// an operator their bucket was tampered with because they typed the wrong path. The KEK
+// id is compared first for exactly that, the way publisher.encryption already does it.
+func TestRebuildSeparatesAWrongKEKFromAForgedDescriptor(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	vol, _, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
+
+	var other [crypto.DEKSize]byte
+	for i := range other {
+		other[i] = byte(255 - i)
+	}
+	fresh, _, freshTerm := cpStore(t)
+	_, err := controlplane.RebuildMetadata(ctx, fresh, store, crypto.NewDevKMS(other, "kek-other"), freshTerm)
+	if err == nil {
+		t.Fatal("a rebuild under a KEK that wrapped nothing in this bucket succeeded")
+	}
+	if errors.Is(err, crypto.ErrUnwrap) {
+		t.Fatalf("the wrong -kek-file was reported as a key that would not open, which reads as a forgery: %v", err)
+	}
+	if !strings.Contains(err.Error(), "-kek-file") {
+		t.Fatalf("the refusal does not name the flag an operator has to fix: %v", err)
+	}
+	if _, err := fresh.GetVolume(ctx, vol); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("the rebuild recorded a volume before refusing: %v", err)
+	}
+}
+
+// The forgery half: a descriptor naming the right KEK whose wrapped DEK was sealed for
+// another volume. Nothing structural can see it — the object's digest is its own, and it
+// names the volume it is filed under — so this is the assertion that the KEK is being
+// used as the witness.
+func TestRebuildRefusesAWrappedDEKSealedForAnotherVolume(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	kms := testKMS(t)
+	victim, other, _ := bucketWithAVolumeAndASnapshot(t, md, store, term)
+
+	d, err := descriptor.Read(ctx, store, victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	od, err := descriptor.Read(ctx, store, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.DEKWrapped, d.DEKKeyID = od.DEKWrapped, od.DEKKeyID
+	if err := descriptor.Write(ctx, store, d); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, _, freshTerm := cpStore(t)
+	if _, err := controlplane.RebuildMetadata(ctx, fresh, store, kms, freshTerm); !errors.Is(err, crypto.ErrUnwrap) {
+		t.Fatalf("a rebuild recorded a wrapped DEK sealed for another volume: %v", err)
+	}
+	if _, err := fresh.GetVolume(ctx, victim); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("the poisoned volume was recorded anyway: %v", err)
+	}
 }

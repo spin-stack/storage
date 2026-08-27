@@ -42,6 +42,7 @@ import (
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/publisher"
 	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
 )
@@ -192,21 +193,6 @@ func run() (err error) {
 	// here, in the wiring, by handing the publisher a holder that is filled in once the
 	// Loop exists — rather than by giving any of the three a reason to know about the
 	// other two.
-	keys := &loopKeys{}
-	var pub qcow.Publisher
-	switch {
-	case storeFlags.Bucket == "" && storeFlags.Dir == "":
-		slog.Warn("no object store configured: this Agent seals layers and publishes none of them, so nothing it holds survives losing this host")
-	case kms == nil:
-		return errors.New("an object store is configured but -kek-file is not: a layer is sealed with the volume's DEK on the way out (v6 §10), and this Agent could not unwrap one")
-	default:
-		store, serr := storeFlags.Open(ctx)
-		if serr != nil {
-			return serr
-		}
-		pub = publisher.New(store, kms, keys, real.NewPaths())
-	}
-
 	// The volume manager, and it is constructed here rather than after the Control Plane
 	// client because it is what claims --data-dir: v6 §10 is one Agent per host, and two
 	// incarnations preparing chains under the same paths would hand one qcow2 file to two
@@ -220,6 +206,29 @@ func run() (err error) {
 	if err != nil {
 		return fmt.Errorf("resolving %s: %w", *dataDir, err)
 	}
+	keys := &loopKeys{}
+	var (
+		pub qcow.Publisher
+		rec qcow.Recovery = recovery.Absent{}
+	)
+	switch {
+	case storeFlags.Bucket == "" && storeFlags.Dir == "":
+		// No object store: this host seals layers and publishes none of them, and it also
+		// cannot answer "does this volume have published commits". recovery.Absent is
+		// what makes that a refusal rather than a blank disk — see the type.
+		slog.Warn("no object store configured: this Agent seals layers and publishes none of them, so nothing it holds survives losing this host, and it cannot serve a volume that has published commits elsewhere")
+	case kms == nil:
+		return errors.New("an object store is configured but -kek-file is not: a layer is sealed with the volume's DEK on the way out (v6 §10), and this Agent could not unwrap one")
+	default:
+		store, serr := storeFlags.Open(ctx)
+		if serr != nil {
+			return serr
+		}
+		paths := real.NewPaths()
+		pub = publisher.New(store, kms, keys, paths)
+		rec = recovery.New(root, *qemuImg, store, kms, keys, paths, real.NewRunner())
+	}
+
 	volumes, err := qcow.New(ctx, qcow.Config{
 		Root:          root,
 		QemuImg:       *qemuImg,
@@ -232,6 +241,7 @@ func run() (err error) {
 		Paths:     real.NewPaths(),
 		Dialer:    real.NewUnixDialer(),
 		Publisher: pub,
+		Recovery:  rec,
 	})
 	if err != nil {
 		return err

@@ -93,6 +93,7 @@ type harness struct {
 	paths  *fakePaths
 	dialer *fakeDialer
 	disk   *sim.Disk
+	rec    *fakeRecovery
 }
 
 func newHarness(t *testing.T) *harness {
@@ -123,16 +124,25 @@ func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64, pub qcow.Publishe
 		paths:  newPaths(),
 		dialer: &fakeDialer{scripts: map[string][]string{}},
 		disk:   d,
+		rec:    bornEmpty(),
 	}
+	h.start(t, rotateAt, pub)
+	return h
+}
+
+// start builds the Manager over whatever this harness already holds.
+func (h *harness) start(t *testing.T, rotateAt int64, pub qcow.Publisher) {
+	t.Helper()
 	m, err := qcow.New(t.Context(), qcow.Config{
 		Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second, RotateAtBytes: rotateAt,
 	}, qcow.Deps{
 		Clock:     sim.NewClock(time.Unix(0, 0)),
-		Disk:      d,
+		Disk:      h.disk,
 		Runner:    h.runner,
 		Paths:     h.paths,
 		Dialer:    h.dialer,
 		Publisher: pub,
+		Recovery:  h.rec,
 	})
 	if err != nil {
 		t.Fatalf("building a manager: %v", err)
@@ -141,7 +151,20 @@ func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64, pub qcow.Publishe
 	// The start-up `--version` run is not part of what any test below is about.
 	h.runner.reset()
 	h.m = m
-	return h
+}
+
+// restart is a second Agent over the same filesystem: everything this process knew is
+// gone, and everything on disk is what it has. The data directory's lock is a fresh
+// simulated disk because the kernel drops an flock when a process dies, so a restarted
+// Agent meets an unlocked directory and not its own predecessor's claim.
+func (h *harness) restart(t *testing.T, rotateAt int64, pub qcow.Publisher) *harness {
+	t.Helper()
+	if err := h.m.Close(); err != nil {
+		t.Fatalf("closing the Agent that is being restarted: %v", err)
+	}
+	next := &harness{runner: h.runner, paths: h.paths, dialer: h.dialer, disk: sim.NewDisk(), rec: h.rec}
+	next.start(t, rotateAt, pub)
+	return next
 }
 
 func desired(id string, epoch int64, state storagev1.VolumeState) *storagev1.DesiredVolume {
@@ -449,6 +472,7 @@ func TestOneAgentPerHost(t *testing.T) {
 	_, err := qcow.New(t.Context(), qcow.Config{Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second}, qcow.Deps{
 		Clock: sim.NewClock(time.Unix(0, 0)), Disk: d,
 		Runner: &fakeRunner{version: "qemu-img version 11.0.2"}, Paths: newPaths(), Dialer: &fakeDialer{},
+		Recovery: bornEmpty(),
 	})
 	if err == nil {
 		t.Fatal("a second Agent took a data directory a live one is holding")
@@ -463,7 +487,8 @@ func TestNewRefusesIncompleteWiring(t *testing.T) {
 	full := func() (qcow.Config, qcow.Deps) {
 		return qcow.Config{Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second},
 			qcow.Deps{Clock: sim.NewClock(time.Unix(0, 0)), Disk: sim.NewDisk(),
-				Runner: &fakeRunner{version: "qemu-img version 11.0.2"}, Paths: newPaths(), Dialer: &fakeDialer{}}
+				Runner: &fakeRunner{version: "qemu-img version 11.0.2"}, Paths: newPaths(), Dialer: &fakeDialer{},
+				Recovery: bornEmpty()}
 	}
 	tests := []struct {
 		name string
@@ -479,6 +504,7 @@ func TestNewRefusesIncompleteWiring(t *testing.T) {
 		{"no runner", func(_ *qcow.Config, d *qcow.Deps) { d.Runner = nil }, "runner must be injected"},
 		{"no paths", func(_ *qcow.Config, d *qcow.Deps) { d.Paths = nil }, "path accessor must be injected"},
 		{"no dialer", func(_ *qcow.Config, d *qcow.Deps) { d.Dialer = nil }, "dialer must be injected"},
+		{"no recovery", func(_ *qcow.Config, d *qcow.Deps) { d.Recovery = nil }, "recovery must be injected"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -564,7 +590,7 @@ func TestAnAgentWhoseQemuImgDoesNotWorkRefusesToStart(t *testing.T) {
 			m, err := qcow.New(t.Context(),
 				qcow.Config{Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second},
 				qcow.Deps{Clock: sim.NewClock(time.Unix(0, 0)), Disk: d,
-					Runner: tt.runner, Paths: newPaths(), Dialer: &fakeDialer{}})
+					Runner: tt.runner, Paths: newPaths(), Dialer: &fakeDialer{}, Recovery: bornEmpty()})
 			if err == nil {
 				_ = m.Close()
 				t.Fatal("an Agent that cannot run qemu-img started anyway")
@@ -910,5 +936,257 @@ func TestAPublishThatFailsKeepsServingTheVolume(t *testing.T) {
 	v := h.volumes(t)[vol]
 	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
 		t.Errorf("the volume was refused over an upload: %v %q", v.Refusal, v.RefusalDetail)
+	}
+}
+
+// state is what this host has written down about the volume: which commits' layers it
+// holds, and which sealed layer it still owes the object store.
+func (h *harness) state(t *testing.T) qcow.State {
+	t.Helper()
+	body, err := h.paths.ReadFile(qcow.StateFile(root, vol))
+	if err != nil {
+		t.Fatalf("reading state.json: %v", err)
+	}
+	st, err := qcow.UnmarshalState(vol, body)
+	if err != nil {
+		t.Fatalf("state.json cannot be believed: %v", err)
+	}
+	return st
+}
+
+// TestAVolumeWithCommitsIsRecoveredRatherThanCreatedEmpty is the defect this stage
+// exists to close, seen from the Agent: a volume that has published commits, placed on a
+// host that holds none of them, used to be handed to its guest as an empty qcow2 with no
+// error anywhere. The bucket is asked, the chain is rebuilt, and the tip is an overlay
+// over it.
+func TestAVolumeWithCommitsIsRecoveredRatherThanCreatedEmpty(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	base := qcow.LayerImage(root, vol, baseID)
+	h.rec.err, h.rec.res = nil, qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}
+	h.runner.info = overlayJSON(size, base)
+	h.paths.present[base] = true
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 2)}); err != nil {
+		t.Fatalf("applying a volume whose chain is in the object store: %v", err)
+	}
+
+	tip := h.tip(t)
+	if tip == base || !strings.HasPrefix(tip, qcow.LayersDir(root, vol)+"/") {
+		t.Fatalf("the pointer names %q, want a new layer of this volume over %q", tip, base)
+	}
+	create := fmt.Sprintf("/qemu-img create -f qcow2 -b %s -F qcow2 -u %s %d", base, tip, size)
+	cmds := h.runner.commands()
+	if len(cmds) != 2 || cmds[0] != create {
+		t.Fatalf("qemu-img was run as %v, want %q first", cmds, create)
+	}
+	if v := h.volumes(t)[vol]; v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Errorf("a recovered volume reported a refusal: %v %q", v.Refusal, v.RefusalDetail)
+	}
+}
+
+// TestAnUnreachableObjectStoreRefusesTheVolumeInsteadOfHandingOutABlankDisk is the
+// assertion that matters most in this file. "I could not reach the bucket" and "this
+// volume is new" lead to opposite decisions about somebody's data, and the proof that
+// they are not collapsed is the *absence* of an image: an error value alone would be
+// satisfied by a build that refused and created the file anyway.
+func TestAnUnreachableObjectStoreRefusesTheVolumeInsteadOfHandingOutABlankDisk(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.rec.err = errors.New("dial tcp 10.0.0.7:443: connect: connection refused")
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 2)}); err == nil {
+		t.Fatal("a volume nobody could ask the bucket about was prepared without complaint")
+	}
+	if cmds := h.runner.commands(); len(cmds) != 0 {
+		t.Fatalf("an image was made for a volume whose history is unknown: %v", cmds)
+	}
+	if got := h.paths.pointer(); got != "" {
+		t.Fatalf("active/current names %q, so a VM would be launched against it", got)
+	}
+	v, ok := h.volumes(t)[vol]
+	if !ok {
+		t.Fatal("the volume is not reported at all, so the fleet cannot see why it stopped")
+	}
+	// IMAGE_MISSING and not the ATTACH_FAILED catch-all: its proto comment is "the
+	// object store holds none... Look at the bucket", which is the operator's next move.
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING {
+		t.Errorf("the refusal is %v, want IMAGE_MISSING", v.Refusal)
+	}
+	if !strings.Contains(v.RefusalDetail, "connection refused") {
+		t.Errorf("the refusal does not carry what went wrong: %q", v.RefusalDetail)
+	}
+}
+
+// TestAVolumeWithNoCommitsIsCreatedEmptyAndAskedOnce: the ordinary case must stay
+// cheap. One question per volume per host, in the branch that was about to fork a
+// process anyway; from the moment the pointer exists no cycle pays anything.
+func TestAVolumeWithNoCommitsIsCreatedEmptyAndAskedOnce(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	for i := range 3 {
+		if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+	}
+
+	tip := h.tip(t)
+	want := fmt.Sprintf("/qemu-img create -f qcow2 %s %d", tip, size)
+	if cmds := h.runner.commands(); len(cmds) != 1 || cmds[0] != want {
+		t.Fatalf("qemu-img was run as %v, want exactly [%q]", cmds, want)
+	}
+	if len(h.rec.calls) != 1 {
+		t.Errorf("the object store was asked %d times over three cycles: %v", len(h.rec.calls), h.rec.calls)
+	}
+}
+
+// TestAVolumeRefusedOverAnUnreachableBucketRecoversWhenItComesBack is why IMAGE_MISSING
+// is exempt from the refusal latch. Every other refusal is a statement about ownership
+// and must wait for a higher epoch; this one is "I could not look", which the bucket
+// coming back fixes with nobody in the fleet doing anything — and latching it would turn
+// a thirty-second S3 blip into a volume permanently dead on this host.
+func TestAVolumeRefusedOverAnUnreachableBucketRecoversWhenItComesBack(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.rec.err = errors.New("dial tcp 10.0.0.7:443: connect: connection refused")
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 3)}); err == nil {
+		t.Fatal("an unreachable bucket was not a refusal")
+	}
+
+	// The bucket is back, and the fleet has said nothing: the same epoch, on purpose.
+	h.rec.err = fmt.Errorf("recovery: volume %s: %w", vol, commit.ErrNoHead)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 3)}); err != nil {
+		t.Fatalf("the cycle after the bucket came back: %v", err)
+	}
+	v := h.volumes(t)[vol]
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("the volume is still refused after the bucket came back: %v %q", v.Refusal, v.RefusalDetail)
+	}
+	if h.paths.pointer() == "" {
+		t.Error("no chain was prepared, so nothing can be launched against this volume")
+	}
+}
+
+// TestARestartPublishesTheSealedLayerUnderTheCommitItWasSealedWith closes the gap
+// STATUS.md names: the commit id was minted in memory, so an Agent that restarted
+// between sealing and publishing published the same layer a second time under a second
+// id — a duplicate entry in a history that nothing could collapse afterwards. With the
+// sealed layer recorded on disk the restarted Agent re-publishes under the same id,
+// which commit.Publish recognises as its own retry.
+func TestARestartPublishesTheSealedLayerUnderTheCommitItWasSealedWith(t *testing.T) {
+	t.Parallel()
+	down := &recordingPublisher{err: errors.New("503 Service Unavailable")}
+	h := newHarnessFull(t, 8<<20, down)
+	sealed := h.rotating(t, 9<<20)
+	h.paths.sizes[sealed] = 9 << 20
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err == nil {
+		t.Fatal("a publish that failed was reported as a success")
+	}
+	if len(down.got) != 1 {
+		t.Fatalf("%d layers were offered before the restart, want 1", len(down.got))
+	}
+	minted := down.got[0].CommitID
+	st := h.state(t)
+	if st.Pending == nil {
+		t.Fatal("nothing on disk says this host owes the object store a layer; a restart would mint a second commit id for it")
+	}
+	switch {
+	case st.Pending.CommitID != minted:
+		t.Errorf("the record names commit %q and the layer was sealed under %q", st.Pending.CommitID, minted)
+	case st.Pending.LayerID != qcow.LayerIDOfImage(sealed):
+		t.Errorf("the record names layer %q, want the sealed file's own %q", st.Pending.LayerID, qcow.LayerIDOfImage(sealed))
+	}
+
+	// The Agent is killed and started again under the guest, which kept writing to the
+	// tip the rotation gave it.
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(h.tip(t))
+	up := &recordingPublisher{}
+	next := h.restart(t, 8<<20, up)
+
+	if err := next.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("the first cycle after the restart: %v", err)
+	}
+	if len(up.got) != 1 {
+		t.Fatalf("%d layers were offered after the restart, want the one this host owed", len(up.got))
+	}
+	l := up.got[0]
+	switch {
+	case l.CommitID != minted:
+		t.Errorf("the restarted Agent published under commit %q; the layer was sealed under %q, so the history now has two entries for one layer", l.CommitID, minted)
+	case l.Path != sealed:
+		t.Errorf("the layer published is %q, want the sealed one %q", l.Path, sealed)
+	case l.Epoch != 1:
+		t.Errorf("the epoch is %d, want the one this host held when it sealed the layer", l.Epoch)
+	}
+	// And the debt is discharged: nothing is owed, and the commit is recorded as one
+	// whose layer this host holds — which is what lets a later recovery skip its
+	// download, because a repointed layer no longer hashes to the object it came from.
+	after := next.state(t)
+	if after.Pending != nil {
+		t.Errorf("the layer is published and the record still owes it: %+v", after.Pending)
+	}
+	if len(after.Commits) != 1 || after.Commits[0].CommitID != minted ||
+		after.Commits[0].LayerID != qcow.LayerIDOfImage(sealed) {
+		t.Errorf("the commits this host holds are %+v, want the one it just published", after.Commits)
+	}
+}
+
+// TestFencingStopsTheGuest is the decision that made fencing mean something: a host told
+// it is not this volume's writer, with a VM still writing into the chain, was taking the
+// chain out of a map and leaving QEMU to it.
+//
+// Read-only would be better and was measured to be unavailable — a live guest's virtio-blk
+// holds the node read-write and nothing on the host can take that away (qmp.Stop carries
+// the two QEMU error messages). Pausing is the smallest true thing an Agent that does not
+// own the VM's lifetime can do.
+func TestFencingStopsTheGuest(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 0)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("preparing: %v", err)
+	}
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(h.tip(t))
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("with a guest attached: %v", err)
+	}
+
+	if err := h.m.Fence(t.Context(), []string{vol},
+		storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST, "the lease expired"); err != nil {
+		t.Fatalf("fencing: %v", err)
+	}
+	if !strings.Contains(h.dialer.sent(), `"execute":"stop"`) {
+		t.Errorf("the guest was left writing to a volume this host no longer owns: %s", h.dialer.sent())
+	}
+	// And the refusal is on disk, so a restart does not forget it. A host that came back
+	// and resumed would be the second writer this whole design is arranged against.
+	st, err := qcow.ReadState(h.paths, root, vol)
+	if err != nil {
+		t.Fatalf("reading state.json: %v", err)
+	}
+	if st.Fenced == nil {
+		t.Fatal("the fence was recorded only in memory, which a SIGKILL takes with it")
+	}
+	if st.Fenced.Epoch != 1 {
+		t.Errorf("the fence records epoch %d, want the one this host held", st.Fenced.Epoch)
+	}
+}
+
+// TestFencingAVolumeWithNoGuestIsNotAFailure: no socket means no guest, and a QEMU that
+// has already gone means the writing has already stopped. Neither is a reason for a fence
+// to fail — what must not happen is a fence that does not happen because a socket was slow.
+func TestFencingAVolumeWithNoGuestIsNotAFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 0)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("preparing: %v", err)
+	}
+	if err := h.m.Fence(t.Context(), []string{vol},
+		storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED, "HEAD moved"); err != nil {
+		t.Fatalf("fencing a volume nothing is attached to: %v", err)
+	}
+	if v := h.volumes(t)[vol]; v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED {
+		t.Errorf("the refusal is %v", v.Refusal)
 	}
 }

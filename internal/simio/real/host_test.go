@@ -1,6 +1,7 @@
 package real_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -264,5 +265,96 @@ func TestPathsWriteAtomicReportsADirectoryItCannotWriteIn(t *testing.T) {
 	p := real.NewPaths()
 	if err := p.WriteAtomic(filepath.Join(t.TempDir(), "no", "such", "dir", "current"), []byte("x")); err == nil {
 		t.Fatal("writing into a directory that does not exist succeeded")
+	}
+}
+
+// TestPathsCreateMakesTheBytesDurableOnClose pins what a downloaded layer needs: the file
+// AND its directory entry on the platter before Close returns.
+//
+// The fsync of the directory is the half that is easy to leave out and the half that
+// matters. A layer whose contents reached the platter but whose name did not is a chain
+// that opens today and is missing a link after a power cut — a guest booting a volume that
+// is short a commit, with nothing reporting an error. That cannot be observed from a test
+// without cutting power, so what is asserted is the observable part: the bytes are there,
+// exactly, and Close is idempotent, because a defer plus an explicit Close is how every
+// caller in this tree writes it.
+func TestPathsCreateMakesTheBytesDurableOnClose(t *testing.T) {
+	t.Parallel()
+	p := real.NewPaths()
+	file := filepath.Join(t.TempDir(), "layer.qcow2")
+
+	w, err := p.Create(file)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	want := bytes.Repeat([]byte("sealed layer bytes "), 1000)
+	if _, err := w.Write(want); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("a second Close reported %v; every caller here defers one and calls one", err)
+	}
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("reading it back: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("read back %d bytes, wrote %d", len(got), len(want))
+	}
+	// Truncating, not appending: a re-run of a restore writes the same layer again.
+	w2, err := p.Create(file)
+	if err != nil {
+		t.Fatalf("re-Create: %v", err)
+	}
+	if _, err := w2.Write([]byte("shorter")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got, _ := os.ReadFile(file); string(got) != "shorter" {
+		t.Errorf("re-creating left %q", got)
+	}
+}
+
+func TestPathsCreateReportsADirectoryThatIsNotThere(t *testing.T) {
+	t.Parallel()
+	if _, err := real.NewPaths().Create(filepath.Join(t.TempDir(), "no", "such", "dir", "x")); err == nil {
+		t.Fatal("creating a file under a directory that does not exist succeeded")
+	}
+}
+
+// TestPathsRenameAndRemove: a download lands under a temporary name and arrives under its
+// own, and a failed restore cleans up after itself. Remove tolerates a path that is
+// already gone, because the only caller is that cleanup and it must be safe to run twice.
+func TestPathsRenameAndRemove(t *testing.T) {
+	t.Parallel()
+	p := real.NewPaths()
+	dir := t.TempDir()
+	from, to := filepath.Join(dir, "layer.part"), filepath.Join(dir, "layer.qcow2")
+
+	if err := p.WriteAtomic(from, []byte("a layer")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	if err := p.Rename(from, to); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if ok, _ := p.Exists(from); ok {
+		t.Error("the temporary name survived the rename")
+	}
+	if got, err := p.ReadFile(to); err != nil || string(got) != "a layer" {
+		t.Errorf("after the rename: %q, %v", got, err)
+	}
+	if err := p.Remove(to); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := p.Remove(to); err != nil {
+		t.Errorf("removing a path that is already gone reported %v; a cleanup must be safe to run twice", err)
+	}
+	if err := p.Rename(from, to); err == nil {
+		t.Error("renaming a file that is not there succeeded")
 	}
 }

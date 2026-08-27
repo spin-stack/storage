@@ -46,7 +46,7 @@ type ProvisionedVolume struct {
 // no business unwrapping anything.
 type KeyWrapper interface {
 	KEKID() string
-	WrapDEK(r io.Reader, dek crypto.DEK) ([]byte, error)
+	WrapDEK(r io.Reader, dek crypto.DEK, volumeID [16]byte) ([]byte, error)
 }
 
 // Provisioner creates volumes: the act that has never existed in this tree, which is
@@ -92,8 +92,12 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 		return ProvisionedVolume{}, err
 	}
 
-	// A v7 id (INV-22), and its timestamp prefix means volumes sort by creation.
-	volumeID := ids.New().String()
+	// A v7 id (INV-22), and its timestamp prefix means volumes sort by creation. The
+	// uuid itself is kept, not just its string: the wrap below binds the volume's 16
+	// raw bytes, and re-parsing the string we just printed would be one more place the
+	// two representations could disagree.
+	u := ids.New()
+	volumeID := u.String()
 
 	// KeyID 1 is the first version. Zero is reserved: a WAL record header carrying
 	// KeyID 0 means "this payload is plaintext" (§15.2), so a volume provisioned with
@@ -102,7 +106,9 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 	if err != nil {
 		return ProvisionedVolume{}, fmt.Errorf("generating the volume DEK: %w", err)
 	}
-	wrapped, err := p.kms.WrapDEK(p.rand, dek)
+	// Bound to this volume, so that a wrapped DEK PUT into another volume's descriptor
+	// fails to unwrap instead of silently re-keying it (crypto.wrapAAD).
+	wrapped, err := p.kms.WrapDEK(p.rand, dek, [16]byte(u))
 	if err != nil {
 		return ProvisionedVolume{}, fmt.Errorf("wrapping the volume DEK: %w", err)
 	}
@@ -143,15 +149,28 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 }
 
 func (s VolumeSpec) validate() error {
-	switch {
-	case s.HostID == "":
+	if s.HostID == "" {
 		return errors.New("controlplane: a volume needs a host: GetDesiredState filters on primary_host_id, so an unplaced volume is one no Agent is ever told about")
-	case s.SizeBytes <= 0:
-		return fmt.Errorf("controlplane: size must be positive, got %d", s.SizeBytes)
-	case s.SizeBytes%sectorSize != 0:
-		return fmt.Errorf("controlplane: size %d is not a whole number of %d-byte sectors: no Agent can serve it", s.SizeBytes, sectorSize)
-	case s.BlockSize <= 0 || int64(s.BlockSize)%sectorSize != 0:
-		return fmt.Errorf("controlplane: block size %d is not a multiple of %d", s.BlockSize, sectorSize)
+	}
+	return geometry(s.SizeBytes, s.BlockSize)
+}
+
+// geometry is the rule about a volume's shape, split out of validate so that the other
+// path which invents catalog rows applies it too.
+//
+// `rebuild-metadata` reads descriptors out of a bucket, which is to say it takes this
+// geometry as *input*, and it recorded whatever it found. A volume of zero bytes or a
+// block size no device can address then exists in the catalog and cannot be served by
+// anything — created by the one command an operator runs when the catalog is already
+// gone, which is the worst moment to be handed a row nobody can act on.
+func geometry(sizeBytes int64, blockSize int32) error {
+	switch {
+	case sizeBytes <= 0:
+		return fmt.Errorf("controlplane: size must be positive, got %d", sizeBytes)
+	case sizeBytes%sectorSize != 0:
+		return fmt.Errorf("controlplane: size %d is not a whole number of %d-byte sectors: no Agent can serve it", sizeBytes, sectorSize)
+	case blockSize <= 0 || int64(blockSize)%sectorSize != 0:
+		return fmt.Errorf("controlplane: block size %d is not a multiple of %d", blockSize, sectorSize)
 	}
 	return nil
 }

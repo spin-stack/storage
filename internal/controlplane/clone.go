@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -101,7 +104,25 @@ var ErrChainTooDeep = errors.New("controlplane: the lineage is at its depth ceil
 // the same destination and both commit. policy.Bound hands the statement that places
 // the bytes the same two numbers Choose admitted against — §28.2 on what the host has
 // been promised, and ADR-0013's fill ceiling on what it measured itself using.
-func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, policy placement.Policy,
+// KeyRewrapper is what a clone needs from the KMS: open the parent's wrapped DEK and
+// seal the same key bytes again under the child's id.
+//
+// It is a second, narrow interface rather than a widening of KeyWrapper, whose comment
+// — "provisioning has no business unwrapping anything" — stays true. Clone is the one
+// verb that must do both, and it must, because a wrap is bound to the volume that
+// carries it (crypto.wrapAAD): copying the parent's ciphertext into the child's row
+// would produce a child nothing can open.
+//
+// No new secret reaches a new process: the Control Plane already handles a plaintext
+// DEK at provision. What it does mean is that `-clone-snapshot` now needs `-kek-file`.
+type KeyRewrapper interface {
+	KEKID() string
+	UnwrapDEK(wrapped []byte, keyID uint32, volumeID [16]byte) (crypto.DEK, error)
+	WrapDEK(r io.Reader, dek crypto.DEK, volumeID [16]byte) ([]byte, error)
+}
+
+func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, kms KeyRewrapper,
+	rand io.Reader, policy placement.Policy,
 	rec *obs.Recorder, term int64, parentSnapshotID, newVolumeID string,
 ) (metadata.Volume, error) {
 	snap, err := md.GetSnapshot(ctx, parentSnapshotID)
@@ -181,6 +202,56 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 		return metadata.Volume{}, fmt.Errorf("controlplane: placing a clone of snapshot %s: chose host %s, which is not in the fleet it was chosen from",
 			parentSnapshotID, newHostID)
 	}
+	// The shared DEK, re-wrapped under the child's id rather than copied.
+	//
+	// **The key bytes are the parent's and stay the parent's** (§10: a lineage shares one
+	// DEK, because the clone reads layers the parent sealed). What changes is the
+	// ciphertext: a wrap is bound to the volume that carries it, so the child's
+	// descriptor must carry a wrap that names the child. Copying `parent.DEKWrapped`
+	// verbatim — which is what this did until 2026-08-27 — would hand the child a blob
+	// that fails to unwrap under its own id.
+	//
+	// It costs one unwrap and one 12-byte nonce per clone, and it buys the property that
+	// makes the binding worth anything: *every* volume's wrap names that volume, root or
+	// clone, so a descriptor swap has nowhere to hide.
+	//
+	// **Crypto-shred stays lineage-scoped, and this is the line that makes it so.** The
+	// key *bytes* are shared, so deleting the parent destroys no secret the child does
+	// not still hold, and the parent's layers stay openable by anyone holding those bytes
+	// plus two public identifiers. A FLATTEN that re-uploads a clone's data must
+	// therefore mint a *fresh* DEK while it does it; if it keeps the shared key, deleting
+	// the flattened clone's parent shreds nothing and the delete verb's promise is false.
+	// There is no flatten in the tree yet — this is the constraint it has to be built
+	// under, written here because here is where the sharing happens.
+	parentID, err := ids.Parse(snap.VolumeID)
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("controlplane: parent volume id %q: %w", snap.VolumeID, err)
+	}
+	// A clone mints a fresh id, and the catalog's re-create path is not a way to get one.
+	// CreateVolume converges onto a row that already exists — deliberately, so that two
+	// operators running rebuild-metadata at once do not undo each other — so a clone
+	// pointed at a live volume's id was a *merge* into it: same size, same host, and a
+	// descriptor rewritten under that id. Key material and geometry are protected there
+	// now, and this is the other half: the id has to be free.
+	if _, err := md.GetVolume(ctx, newVolumeID); err == nil {
+		return metadata.Volume{}, fmt.Errorf("%w: volume %s already exists, and a clone mints a new id",
+			metadata.ErrAlreadyPlaced, newVolumeID)
+	} else if !errors.Is(err, metadata.ErrNotFound) {
+		return metadata.Volume{}, fmt.Errorf("controlplane: checking that %s is free: %w", newVolumeID, err)
+	}
+	childID, err := ids.Parse(newVolumeID)
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("controlplane: new volume id %q: %w", newVolumeID, err)
+	}
+	dek, err := kms.UnwrapDEK(parent.DEKWrapped, parent.DEKKeyID, [16]byte(parentID))
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("controlplane: opening the DEK of parent volume %s to clone it: %w", parent.VolumeID, err)
+	}
+	rewrapped, err := kms.WrapDEK(rand, dek, [16]byte(childID))
+	if err != nil {
+		return metadata.Volume{}, fmt.Errorf("controlplane: re-wrapping the lineage DEK for clone %s: %w", newVolumeID, err)
+	}
+
 	clone := metadata.Volume{
 		VolumeID:      newVolumeID,
 		SizeBytes:     parent.SizeBytes,
@@ -189,13 +260,13 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 		State:         lifecycle.VolumeActive,
 		PrimaryHostID: newHostID,
 		ChainDepth:    parent.ChainDepth + 1,
-		DEKWrapped:    parent.DEKWrapped,
-		KEKID:         parent.KEKID,
+		DEKWrapped:    rewrapped,
+		KEKID:         kms.KEKID(),
 		// A clone shares the parent's DEK (§19: the chain's objects are the parent's
 		// until the child writes), so it must share the *version* that names it —
 		// crypto.DevKMS binds it as GCM AAD, and a clone carrying the key without the
 		// version is a volume nobody can open.
-		DEKKeyID: parent.DEKKeyID,
+		DEKKeyID: dek.KeyID,
 		// And the link itself. ChainDepth above says a chain exists; these say what is
 		// on the other end of it, which is what the clone's Agent needs to find the
 		// objects it reads through. Without them the clone starts an empty WAL under

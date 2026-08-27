@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/spin-stack/storage/internal/framed"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
@@ -100,6 +101,19 @@ func VolumeOfKey(key string) (string, bool) {
 	}
 	id, ok := strings.CutSuffix(rest, "/descriptor.json")
 	if !ok || strings.Contains(id, "/") {
+		return "", false
+	}
+	// And it has to be a v7 UUID, not merely a path component. Every caller of this uses
+	// the answer to decide that an object is a volume's descriptor and then *reads* it,
+	// so a key anybody can create — `volumes/notes/descriptor.json` — becomes a volume
+	// that a rebuild, a sweep or a delete has to account for, and the honest thing each
+	// of them then does with an object it cannot parse is refuse the whole operation.
+	// One object under a shared prefix could stop every one of them.
+	//
+	// INV-22 says every id in this system is v7, so this is not a new rule, it is the
+	// existing rule applied where the string comes from outside.
+	u, err := ids.Parse(id)
+	if err != nil || !ids.IsV7(u) {
 		return "", false
 	}
 	return id, true

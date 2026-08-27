@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
@@ -269,13 +271,17 @@ func TestTheAgentCanOpenAVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrapped, err := kms.WrapDEK(&ramp{b: 100}, dek)
+	// A real v7 id, and not this file's usual "vol-mine": a wrap is bound to the volume
+	// that carries it now, so the id has to be one. Fixed rather than drawn, because the
+	// rest of this test asserts on exact strings.
+	const keyedVolume = "0198c0de-0000-7000-8000-00000000d0e5"
+	wrapped, err := kms.WrapDEK(&ramp{b: 100}, dek, uuid.MustParse(keyedVolume))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if err := md.CreateVolume(t.Context(), term, metadata.Volume{
-		VolumeID: "vol-mine", SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4,
+		VolumeID: keyedVolume, SizeBytes: 1 << 30, BlockSize: 4096, CurrentEpoch: 4,
 		PrimaryHostID: testHost, State: lifecycle.VolumeActive,
 		DEKWrapped: wrapped, KEKID: kms.KEKID(), DEKKeyID: 1,
 	}, nil); err != nil {
@@ -295,14 +301,14 @@ func TestTheAgentCanOpenAVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	keys, err := loop.VolumeKeys(t.Context(), "vol-mine")
+	keys, err := loop.VolumeKeys(t.Context(), keyedVolume)
 	if err != nil {
 		t.Fatalf("VolumeKeys: %v", err)
 	}
 	if keys.KEKID != kms.KEKID() {
 		t.Fatalf("kek_id = %q, want %q — the Agent cannot tell which KEK to use", keys.KEKID, kms.KEKID())
 	}
-	got, err := kms.UnwrapDEK(keys.DEKWrapped, dek.KeyID)
+	got, err := kms.UnwrapDEK(keys.DEKWrapped, dek.KeyID, uuid.MustParse(keyedVolume))
 	if err != nil {
 		t.Fatalf("the material the Control Plane served does not unwrap: %v", err)
 	}

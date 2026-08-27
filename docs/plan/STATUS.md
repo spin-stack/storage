@@ -6,102 +6,102 @@ decision is made. If something here is finished, delete it.
 ## The pivot, and what this tree is now
 
 **The custom block storage engine is withdrawn (2026-08-11).** QEMU manages the local
-copy-on-write format via qcow2, and this system manages only immutable commits,
-publication to object storage, and recovery (`arquitectura_mvp_volumenes_remotos_v6.md`,
-which replaced v5.1). The data path is not ours any more.
+copy-on-write format via qcow2; this system manages immutable commits, publication and
+recovery (`arquitectura_mvp_volumenes_remotos_v6.md`). The data path is not ours any more.
 
 ## What runs end to end
 
-`task demo:stage1`, with the real binaries and a real Linux guest: a Control Plane is
-elected, an Agent claims its data directory and registers, `-seed-volume` provisions a
-volume, the Agent prepares its qcow2 chain, a guest boots off that file and writes, the
-Agent is SIGKILLed and restarted **under the running guest**, the guest is told to stop
-and powers off, and a second boot reads the bytes back.
+Three demonstrations, each with the real binaries and a real Linux guest. `demo:stage1`:
+a volume is provisioned, a guest boots off its qcow2, the Agent is SIGKILLed and restarted
+**under the running guest**, and a second boot reads the bytes back. `demo:stage2` adds
+rotation — the guest writes without stopping while the Agent seals the tip and starts a
+new layer under it, three times. `demo:stage3` adds the commit protocol, and reads the
+bucket back with `cat`: every structural object is a digest line and JSON, so the chain
+from `HEAD` is walked to the first commit, checking each layer is present, matches its
+recorded digest, and carries none of the guest's bytes in the clear.
 
-`task demo:stage2` adds rotation: the guest writes without stopping while the Agent seals
-the tip and starts a new layer under it, three times, and a second boot reads every byte
-back through the four-layer chain.
-
-`task demo:stage3` adds the commit protocol: each sealed layer is uploaded, given an
-immutable manifest and named by a compare-and-set on `HEAD`. The bucket is then read back
-with `cat` — every structural object is a digest line and JSON — walking the chain from
-`HEAD` to the first commit and checking each layer is present, matches its recorded digest,
-and carries none of the guest's bytes in the clear. `integration/e2e` covers the same seams
-without a guest; `task test:e2e` needs the pinned `qemu-img` (`task qemu:tools`).
+`demo:stage4` is written and **has never been run**: it destroys the host — the process
+killed and the data directory deleted — and brings the volume back from the bucket alone.
+`integration/e2e` covers the same seams without a guest; `task test:e2e` needs the pinned
+`qemu-img` (`task qemu:tools`).
 
 **The Agent does not launch QEMU.** It prepares the chain and speaks QMP to whatever is at
 the socket; spin's runner runs the VMs (ADR-0021). The contract is `qcow.QMPSocket` and
 `qcow.ActivePointer` — a file holding the path of the layer to launch against, because
 rotation means the tip is a different file every time.
 
+## The open question: what a lapsed lease should do
+
+**Fencing stops the guest, and all three ways in are treated the same.** They are not the
+same fact. A Control Plane that refused this host's report, and a compare-and-set that
+lost, are somebody else having taken the volume. A lease that lapsed on this host's own
+monotonic clock says only that the Control Plane is unreachable, and stopping a guest over
+it costs a tenant their VM for a partition nobody else acted on.
+
+Comparable systems enforce the fence *at the resource* rather than asking the writer to
+stop — Ceph blocklists the client at the OSDs, SCSI-3 reservations are enforced by the
+array — and that fence already exists here: the CAS on `HEAD` plus the epoch check mean
+nothing a fenced host writes can enter the published history. vSphere HA is the closest
+analogue and refuses to act on one signal: *isolated* when the network stops, *dead* only
+when the datastore heartbeat agrees. The object store is that second path, and
+`volumes/<id>/epoch` moves at the grant rather than at the first publish.
+
+It was implemented once and reverted, and the reason is the useful part: §12.2's "a lapsed
+lease gives the device up" has three tests protecting it, and each variant that satisfied
+one broke another — they encode the rule being changed. It wants to be its own increment,
+with those tests as its subject. Genuinely unresolved: a host cut off from the Control
+Plane *and* the object store cannot tell isolation from supersession, and this design has
+no equivalent of vSphere's datastore lock to stop the successor's guest from starting.
+
 ## Do this next
 
-v6 §23's stages. The first has a thin path; everything below it is unbuilt.
-
-1. **Recovery** (v6 §14, §23.4): rebuild a volume on a host that has never seen it, from
-   PostgreSQL and the bucket alone — read `HEAD`, walk `parent_commit_id`, download and
-   verify each layer, rebuild the chain, create a new tip. `commit.Fetch` is the half that
-   exists and is allow-listed until this calls it. It is also what closes
-   `RebuildMetadata` and `cpserver`'s empty `manifest_key` below.
-2. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
+1. **What a lapsed lease should do** — the section above. It is first because it is the
+   only open question that decides whether a guest is stopped.
+2. **`task demo:stage4` has never been run.** It is written and registered; nothing has
+   executed it, so recovery is proven by unit and adversary tests and by no guest.
+3. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
    sealed layer is unpublished" are in; `rpo_target` on `DesiredVolume` and a commit fired
    by age are not, and the upload-throughput half of the measurement is now possible.
-3. **Depth for stages 1 and 2**: a DST scenario for the reconciler and for rotation, and
-   the two sentences nothing yet proves — that a *detach* stops the volume for a running
-   guest, and what happens to a chain whose directory is gone under it.
+4. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
+   reconciler nor the rebuild has one. Also unproven: that a *detach* stops a running
+   guest's volume, and what a chain whose directory vanished under it does.
 
 ## What the demolition left owed
 
-- **`hack/deadcode-pending.txt` is empty.** The three entries the demolition owed —
-  `agent.Loop.VolumeKeys`, its cache, and `crypto.NewEncryption` — are all reached by the
-  publish path.
-- **`internal/dst` has four scenarios and two checkers**, one of them
-  `effective-single-writer`, back with a behavioural planted bug: an object store whose
-  conditional writes are advisory.
-- **`RebuildMetadata` restores volumes only**, and **`cpserver` records a published
-  snapshot with no manifest key** — both because snapshots were read out of the chunked
-  image's manifests. Recovery is what restores them.
+- **`hack/deadcode-pending.txt` is empty**, and `cpserver` still records a published
+  snapshot with no manifest key — the one piece recovery did not bring back.
 
 ## What only a pilot can answer
 
-Named here so nobody mistakes them for things that were checked.
-
 - **No commit has been published to real S3.** The lanes use the filesystem store or
   RustFS; `task backend:conformance` is what stands between those and S3's own `If-Match`.
-- **An upgrade of a running fleet** has never been run; INV-19 becomes binding exactly there.
+- **An upgrade of a running fleet** has never been run; INV-19 becomes binding there.
 
 ## Thin paths that shipped without being deepened
 
-- **Stages 1 and 2 have no DST scenario**, by the gate's own rule for a first increment.
-  What exists is unit tests with the process and the socket injected, plus the demos.
 - **Rotation and publishing have no production default.** `-rotate-at-bytes` is 0 and no
   object store is required, so an Agent started without both seals nothing and publishes
-  nothing — loudly, in one WARN line. v6 §11 forbids choosing the threshold instead of
-  measuring it, and the measurement is not finished.
+  nothing — loudly, in one WARN line. §11 forbids choosing the threshold instead of
+  measuring it, and the measurement is not finished. A layer's size is a *floor* anyway,
+  not a bound: measured at 8x the threshold with a 300 ms cycle, and nothing can hold a
+  layer to a size while QEMU takes the guest's writes.
 - **A whole sealed layer is held in memory to publish it.** `objectstore.Store` takes a
-  `[]byte`. At the sizes rotation produces (32 MiB measured) that is a buffer; an order of
-  magnitude more and it is an OOM in a process holding somebody's disk. The fix is a
-  streaming PUT on the store interface.
-- **A restart between sealing and publishing duplicates a commit.** The commit id is minted
-  in memory and reused across retries, so retries are exact; a restart mints a new one and
-  publishes the same layer twice. It is a duplicate entry in a history, not a loss, and
-  closing it needs v6 §5's `state.json`, which arrives with recovery.
-- **Nothing deletes a published layer from local disk.** v6 §9's step 15 has no code.
-- **A layer's size is a floor, not a bound** — measured at 8x the threshold with a 300 ms
-  cycle. Nothing can hold a layer to a size while QEMU takes the guest's writes. Stated at
-  `qcow.Config.RotateAtBytes`.
-- **Nothing reclaims local disk.** A released volume keeps its layers; a published layer
-  keeps its file (v6 §9 step 15); nothing sweeps orphaned overlays from a rotation that
-  was interrupted. The device fills and nothing notices.
+  `[]byte`. At 32 MiB that is a buffer; an order of magnitude more and it is an OOM in a
+  process holding somebody's disk. The fix is a streaming PUT on the store interface.
+- **A restart in the microseconds between sealing and publishing duplicates a commit id.**
+  The layer is derived from the chain and never lost; only the id is.
+- **Nothing reclaims local disk.** A released volume keeps its layers, a published layer
+  keeps its file (§9 step 15), and nothing sweeps the orphan overlay an interrupted
+  rotation leaves. A sweep needs a `List` on `qcow.Paths`, which does not exist.
 - **Nothing measures the chain or the commits.** No metric for depth, size, attachment,
-  `unpublished_local_bytes` or `last_successful_commit_age` — which v6 §11 calls the
-  product. The only observation outside the Agent is its log and the refusal column.
-- **No alerting artifact, no bucket lifecycle, no distributed tracing, no PITR rehearsal**,
-  and no `/healthz` on the Control Plane (whose term is a closure over a constant, with no
-  renew loop).
-- **The Connect API is unauthenticated and binds `:8080`**, with `GetVolumeKeys` on it.
-- **Crypto-shred is partial**: deleting a volume drops both copies of the wrapped DEK, but a
-  lineage shares one DEK and `crypto.KMS` has no destroy verb.
+  `unpublished_local_bytes` or `last_successful_commit_age` — which §11 calls the product.
+  The only observation outside the Agent is its log and the refusal column.
+- **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
+  DEK). `DeleteVolume` returns which it did; even a real shred rests on the bucket's
+  lifecycle policy expiring the descriptor's non-current versions.
+- **No alerting artifact, no bucket lifecycle, no tracing, no PITR rehearsal, no `/healthz`
+  on the Control Plane** (whose term is a closure over a constant). The Connect API is
+  unauthenticated on `:8080`, with `GetVolumeKeys` on it.
 
 ## Divergences (DEV entries)
 

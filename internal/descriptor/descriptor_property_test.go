@@ -191,8 +191,9 @@ func TestADescriptorWithNoDigestIsRefused(t *testing.T) {
 // catalog row that never passed through this object.
 //
 // What this proves is that the two fields this increment cares about are
-// self-detecting: dek_wrapped is an AEAD ciphertext and dek_key_id is bound to it as
-// additional authenticated data (crypto.DevKMS.WrapDEK), so corrupting *either* makes
+// self-detecting: dek_wrapped is an AEAD ciphertext, and dek_key_id *and the volume the
+// object is filed under* are bound to it as additional authenticated data
+// (crypto.wrapAAD), so corrupting any of them makes
 // the unwrap fail rather than yielding a key that decrypts nothing recognisable. A
 // silently wrong DEK would decrypt every replayed record to garbage that still passes
 // as bytes; ErrUnwrap says which object is broken.
@@ -209,12 +210,16 @@ func TestCorruptedKeyMaterialCannotUnwrap(t *testing.T) {
 		if err != nil {
 			rt.Fatalf("dek: %v", err)
 		}
-		wrapped, err := kms.WrapDEK(rand.Reader, dek)
+		var vol [16]byte
+		if _, err := rand.Read(vol[:]); err != nil {
+			rt.Fatalf("volume id: %v", err)
+		}
+		wrapped, err := kms.WrapDEK(rand.Reader, dek, vol)
 		if err != nil {
 			rt.Fatalf("wrap: %v", err)
 		}
 		// The control: intact material unwraps to the same key.
-		back, err := kms.UnwrapDEK(wrapped, keyID)
+		back, err := kms.UnwrapDEK(wrapped, keyID, vol)
 		if err != nil {
 			rt.Fatalf("the intact DEK did not unwrap: %v", err)
 		}
@@ -222,13 +227,13 @@ func TestCorruptedKeyMaterialCannotUnwrap(t *testing.T) {
 			rt.Fatalf("unwrap returned a different key")
 		}
 
-		switch rapid.SampledFrom([]string{"ciphertext", "version"}).Draw(rt, "corrupt") {
+		switch rapid.SampledFrom([]string{"ciphertext", "version", "volume"}).Draw(rt, "corrupt") {
 		case "ciphertext":
 			i := rapid.IntRange(0, len(wrapped)-1).Draw(rt, "byte")
 			bit := rapid.IntRange(0, 7).Draw(rt, "bit")
 			corrupted := append([]byte(nil), wrapped...)
 			corrupted[i] ^= 1 << bit
-			if _, err := kms.UnwrapDEK(corrupted, keyID); !errors.Is(err, crypto.ErrUnwrap) {
+			if _, err := kms.UnwrapDEK(corrupted, keyID, vol); !errors.Is(err, crypto.ErrUnwrap) {
 				rt.Fatalf("a bit flipped in dek_wrapped[%d] unwrapped anyway: %v", i, err)
 			}
 		case "version":
@@ -239,8 +244,20 @@ func TestCorruptedKeyMaterialCannotUnwrap(t *testing.T) {
 			if other == keyID || other == 0 {
 				return
 			}
-			if _, err := kms.UnwrapDEK(wrapped, other); !errors.Is(err, crypto.ErrUnwrap) {
+			if _, err := kms.UnwrapDEK(wrapped, other, vol); !errors.Is(err, crypto.ErrUnwrap) {
 				rt.Fatalf("a DEK wrapped under version %d unwrapped as version %d: %v", keyID, other, err)
+			}
+		case "volume":
+			// The whole of the descriptor-swap defect, at the level where it is fixed.
+			// `dek_wrapped` moved into another volume's descriptor leaves every
+			// structural check on the object passing — the digest is the swapper's own
+			// and `volume_id` still names the victim — so the KEK is the only witness
+			// there is.
+			other := vol
+			i := rapid.IntRange(0, len(other)-1).Draw(rt, "volume_byte")
+			other[i] ^= 1 << rapid.IntRange(0, 7).Draw(rt, "volume_bit")
+			if _, err := kms.UnwrapDEK(wrapped, keyID, other); !errors.Is(err, crypto.ErrUnwrap) {
+				rt.Fatalf("a DEK wrapped for volume %x unwrapped for volume %x: %v", vol, other, err)
 			}
 		}
 	})

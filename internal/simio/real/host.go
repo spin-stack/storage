@@ -137,6 +137,59 @@ func (*Paths) WriteAtomic(path string, data []byte) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
+	return fsyncDirAt(dir)
+}
+
+// Create truncates or creates the file, and its Close makes the bytes durable — the file
+// and the directory entry both.
+//
+// The fsync of the *directory* is the half that is easy to leave out and is the half that
+// matters here: a downloaded layer whose contents reached the platter but whose name did
+// not is a chain that opens today and is missing a link after a power cut, which is a
+// guest booting a volume that is short a commit with nothing reporting an error.
+func (*Paths) Create(path string) (io.WriteCloser, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &syncOnClose{File: f, dir: filepath.Dir(path)}, nil
+}
+
+// Rename moves a file within the filesystem. It is atomic, which is why a download lands
+// under a temporary name and arrives under its own.
+func (*Paths) Rename(oldPath, newPath string) error { return os.Rename(oldPath, newPath) }
+
+// Remove deletes a file. A path that is already gone is not an error: the only caller is
+// a cleanup after a failed rebuild, and it must be safe to run twice.
+func (*Paths) Remove(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// syncOnClose is a file whose Close is the durability boundary.
+type syncOnClose struct {
+	*os.File
+	dir  string
+	once sync.Once
+}
+
+func (f *syncOnClose) Close() error {
+	var err error
+	f.once.Do(func() {
+		// f.File.Close, not f.Close: this *is* f.Close, and calling it re-enters the
+		// once that is already held. staticcheck asks for the embedded selector to go
+		// (QF1008) and it is right about Sync, which the wrapper does not define, and
+		// wrong about Close, which it does. Applying it to both deadlocked every caller
+		// that finished writing a downloaded layer.
+		err = errors.Join(f.Sync(), f.File.Close(), fsyncDirAt(f.dir))
+	})
+	return err
+}
+
+// fsyncDirAt makes a directory entry durable.
+func fsyncDirAt(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

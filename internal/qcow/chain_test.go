@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/qcow"
 )
 
@@ -20,11 +21,20 @@ type fakeRunner struct {
 	runs [][]string
 	// info is what `qemu-img info --output=json` answers.
 	info string
+	// chain is what `qemu-img info --output=json --backing-chain` answers: a JSON
+	// array, one element per layer, top first. Unset means "a chain of exactly this
+	// one image", which is what every test that is not about the walk wants.
+	chain string
 	// version is what `qemu-img --version` answers. The Manager runs it once at
 	// start-up; nothing else in the package does.
 	version string
 	// err, when set, is what every run fails with.
 	err error
+	// chainErr, when set, is what only `info --backing-chain` fails with. It models the
+	// one behaviour the walk exists for: a tip whose backing file is gone passes plain
+	// `info` with exit 0 and fails the walk with exit 1 (both measured against the
+	// pinned 11.0.2), so a fake that failed both would keep a plain-info build green.
+	chainErr error
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -36,6 +46,18 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 	}
 	switch {
 	case len(args) > 0 && args[0] == "info":
+		for _, a := range args {
+			if a != "--backing-chain" {
+				continue
+			}
+			if f.chainErr != nil {
+				return nil, f.chainErr
+			}
+			if f.chain != "" {
+				return []byte(f.chain), nil
+			}
+			return []byte("[" + f.info + "]"), nil
+		}
 		return []byte(f.info), nil
 	case len(args) > 0 && args[0] == "--version":
 		return []byte(f.version), nil
@@ -161,11 +183,56 @@ const (
 	size    = int64(268435456)
 	layerID = "0198c0de-0000-7000-8000-0000000f1r57"
 	nextID  = "0198c0de-0000-7000-8000-000000005ec0"
+	baseID  = "0198c0de-0000-7000-8000-000000000ba5"
+	// headCommit is what HEAD named when the chain was rebuilt.
+	headCommit = "0198c0de-0000-7000-8000-00000000c0m1"
 )
+
+// fakeRecovery is the object store's answer about a volume's published history — the
+// one question that separates "this volume is new" from "this volume's data is on
+// somebody else's disk". It records what it was asked, because a guard that is not
+// consulted is not a guard and the call is the only observable proof it was.
+type fakeRecovery struct {
+	res   qcow.Restored
+	err   error
+	calls []string
+	// head is what the object store says the volume's newest commit is. Empty means the
+	// volume has never published, which is what every test that is not about staleness
+	// wants and is the reason it is the zero value.
+	head    string
+	headErr error
+}
+
+func (f *fakeRecovery) Restore(_ context.Context, volumeID string, sizeBytes int64) (qcow.Restored, error) {
+	f.calls = append(f.calls, fmt.Sprintf("%s/%d", volumeID, sizeBytes))
+	return f.res, f.err
+}
+
+func (f *fakeRecovery) Current(_ context.Context, volumeID string) (string, error) {
+	f.calls = append(f.calls, "current/"+volumeID)
+	switch {
+	case f.headErr != nil:
+		return "", f.headErr
+	case f.head == "":
+		return "", fmt.Errorf("recovery: volume %s: %w", volumeID, commit.ErrNoHead)
+	}
+	return f.head, nil
+}
+
+// bornEmpty is the ordinary answer for a volume created a second ago: no HEAD, so an
+// empty chain is correct.
+func bornEmpty() *fakeRecovery {
+	return &fakeRecovery{err: fmt.Errorf("recovery: volume %s: %w", vol, commit.ErrNoHead)}
+}
+
+// recovered is a volume whose published chain has been rebuilt on this host.
+func recovered(base string) *fakeRecovery {
+	return &fakeRecovery{res: qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}}
+}
 
 // req is the ordinary Open for this volume, with one field varied per test.
 func req(mut func(*qcow.OpenRequest)) qcow.OpenRequest {
-	r := qcow.OpenRequest{Root: root, VolumeID: vol, SizeBytes: size, NewLayerID: layerID}
+	r := qcow.OpenRequest{Root: root, VolumeID: vol, SizeBytes: size, NewLayerID: layerID, Recovery: bornEmpty()}
 	if mut != nil {
 		mut(&r)
 	}
@@ -385,7 +452,9 @@ func TestOpenReportsTheFailuresOfTheThingsItDrives(t *testing.T) {
 			name:  "qemu-img could not open it",
 			runs:  &fakeRunner{err: errors.New(`Failed to get shared "write" lock`)},
 			paths: newPathsAt(image),
-			want:  "a lock failure here means a VM has it open",
+			// The wording moved with the behaviour: a write lock is now ErrImageBusy,
+			// which is retried next cycle rather than read as a broken image.
+			want: "a VM has this image open",
 		},
 	}
 	for _, tt := range tests {
@@ -531,5 +600,363 @@ func TestRotateRefusesToReuseALayerId(t *testing.T) {
 	}
 	if cmds := r.commands(); len(cmds) != 0 {
 		t.Errorf("a layer that already existed was overwritten by %v", cmds)
+	}
+}
+
+// TestOpenRefusesToDecideAnythingWithoutARecovery is why Recovery is a required
+// interface and not a bool the caller works out. A bool is a thing a caller forgets to
+// set, and the caller forgetting is the whole defect: this package used to run
+// `qemu-img create` for any volume whose pointer was absent, so a volume with published
+// commits placed on a host that has no local copy was handed a guest as a blank disk.
+func TestOpenRefusesToDecideAnythingWithoutARecovery(t *testing.T) {
+	t.Parallel()
+	r := &fakeRunner{}
+	p := newPaths()
+
+	_, err := qcow.Open(t.Context(), r, p, "/qemu-img", req(func(o *qcow.OpenRequest) { o.Recovery = nil }))
+	if !errors.Is(err, qcow.ErrChainMissing) {
+		t.Fatalf("want ErrChainMissing, got %v", err)
+	}
+	if cmds := r.commands(); len(cmds) != 0 {
+		t.Errorf("a volume nobody could ask about led to %v", cmds)
+	}
+	if p.pointer() != "" {
+		t.Errorf("active/current was written for a volume nobody could ask about: %q", p.pointer())
+	}
+}
+
+// TestOpenAsksAboutTheHistoryBeforeCreatingAVolumeEmpty: the ordinary case, and the one
+// that must stay cheap. A volume created a second ago has no HEAD, so exactly one
+// question is asked and the answer is the same `create` as before.
+func TestOpenAsksAboutTheHistoryBeforeCreatingAVolumeEmpty(t *testing.T) {
+	t.Parallel()
+	r := &fakeRunner{}
+	p := newPaths()
+	rec := bornEmpty()
+
+	chain, err := qcow.Open(t.Context(), r, p, "/qemu-img", req(func(o *qcow.OpenRequest) { o.Recovery = rec }))
+	if err != nil {
+		t.Fatalf("opening a volume that has never published: %v", err)
+	}
+	image := qcow.LayerImage(root, vol, layerID)
+	if chain.Active != image {
+		t.Errorf("the tip is %q, want %q", chain.Active, image)
+	}
+	want := fmt.Sprintf("/qemu-img create -f qcow2 %s %d", image, size)
+	if got := r.commands(); len(got) != 1 || got[0] != want {
+		t.Fatalf("qemu-img was run as %v, want exactly [%q]", got, want)
+	}
+	if got := fmt.Sprint(rec.calls); got != fmt.Sprintf("[%s/%d]", vol, size) {
+		t.Errorf("the object store was asked %v, want one question about this volume at its catalog size", rec.calls)
+	}
+	if got := p.pointer(); got != image {
+		t.Errorf("active/current names %q, want %q", got, image)
+	}
+}
+
+// TestOpenRefusesAVolumeWhoseHistoryCouldNotBeRebuilt is the defect this stage exists to
+// close, and the assertion that matters is the absence of a file: an unreachable bucket,
+// a missing layer or a digest that does not match all mean "this volume's data is
+// somewhere and it is not here", and creating an empty image for any of them hands a
+// guest a blank disk with nothing anywhere saying so.
+func TestOpenRefusesAVolumeWhoseHistoryCouldNotBeRebuilt(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, why string }{
+		{"the bucket cannot be reached", "dial tcp: connection refused"},
+		{"a layer named by a commit is gone", "recovery: layer 0198c0de is not in the object store"},
+		{"a layer came back corrupt", "recovery: the digest of layer 0198c0de does not match"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := &fakeRunner{}
+			p := newPaths()
+			rec := &fakeRecovery{err: errors.New(tt.why)}
+
+			_, err := qcow.Open(t.Context(), r, p, "/qemu-img", req(func(o *qcow.OpenRequest) { o.Recovery = rec }))
+			if !errors.Is(err, qcow.ErrChainMissing) {
+				t.Fatalf("want ErrChainMissing, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.why) {
+				t.Errorf("the refusal does not carry what went wrong: %v", err)
+			}
+			if cmds := r.commands(); len(cmds) != 0 {
+				t.Fatalf("a volume whose chain is elsewhere was given an image by %v", cmds)
+			}
+			if p.pointer() != "" {
+				t.Fatalf("active/current names %q, so a VM would be launched against it", p.pointer())
+			}
+		})
+	}
+}
+
+// TestOpenBuildsANewTipOverARecoveredChain: the rebuild put the published layers on this
+// disk, and this package's job is the one decision it owns — which file the VM writes to.
+// An overlay and never a flatten: an overlay is O(1) and a flatten is a second pass over
+// every byte the recovery just wrote (§19 owns flattening, as compaction).
+func TestOpenBuildsANewTipOverARecoveredChain(t *testing.T) {
+	t.Parallel()
+	base := qcow.LayerImage(root, vol, baseID)
+	tip := qcow.LayerImage(root, vol, layerID)
+	r := &fakeRunner{info: overlayJSON(size, base)}
+	p := newPaths(base)
+
+	chain, err := qcow.Open(t.Context(), r, p, "/qemu-img", req(func(o *qcow.OpenRequest) { o.Recovery = recovered(base) }))
+	if err != nil {
+		t.Fatalf("opening a recovered volume: %v", err)
+	}
+	if chain.Active != tip {
+		t.Errorf("the tip is %q, want a new layer %q over the recovered chain", chain.Active, tip)
+	}
+	if chain.SizeBytes != size {
+		t.Errorf("the chain is %d bytes, want the head commit's %d", chain.SizeBytes, size)
+	}
+	create := fmt.Sprintf("/qemu-img create -f qcow2 -b %s -F qcow2 -u %s %d", base, tip, size)
+	got := r.commands()
+	if len(got) != 2 || got[0] != create {
+		t.Fatalf("qemu-img was run as %v, want %q first", got, create)
+	}
+	if !strings.HasPrefix(got[1], "/qemu-img info --output=json "+tip) {
+		t.Errorf("the new tip was not read back before it was published: %v", got)
+	}
+	if p.pointer() != tip {
+		t.Errorf("active/current names %q, want the new tip %q", p.pointer(), tip)
+	}
+}
+
+// TestOpenRefusesATipThatIsNotOverTheRecoveredChain is the same check Rotate makes and
+// for the same reason: qemu-img accepts a wrong-but-existing backing in silence, and
+// nothing later would catch it — the guest runs perfectly on somebody else's history
+// until it stops.
+func TestOpenRefusesATipThatIsNotOverTheRecoveredChain(t *testing.T) {
+	t.Parallel()
+	base := qcow.LayerImage(root, vol, baseID)
+	tests := []struct{ name, info, want string }{
+		{"backed by another layer", overlayJSON(size, qcow.LayerImage(root, "other", nextID)), "not by the recovered chain"},
+		{"backed by nothing at all", infoJSON("qcow2", size, false), "not by the recovered chain"},
+		{"the wrong virtual size", overlayJSON(size/2, base), "the head commit says"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := newPaths(base)
+			_, err := qcow.Open(t.Context(), &fakeRunner{info: tt.info}, p, "/qemu-img",
+				req(func(o *qcow.OpenRequest) { o.Recovery = recovered(base) }))
+			if !errors.Is(err, qcow.ErrChainMismatch) {
+				t.Fatalf("want ErrChainMismatch, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("the refusal does not say why: %v", err)
+			}
+			if p.pointer() != "" {
+				t.Errorf("active/current names %q despite the refusal", p.pointer())
+			}
+		})
+	}
+}
+
+// TestAVolumeThatAlreadyHasAChainIsStillCheckedAgainstTheBucket.
+//
+// This asserted the opposite until an adversary showed what the opposite costs. A local
+// chain is not the same thing as the current one: this host keeps its layers when a
+// volume leaves its desired state, and in between another host may have served it and
+// published commits. Opening the local chain without asking hands the guest an older
+// disk, complete and sound and missing everything the other host wrote.
+//
+// The check is one HEAD read, on a path that was about to run qemu-img anyway.
+func TestAVolumeThatAlreadyHasAChainIsStillCheckedAgainstTheBucket(t *testing.T) {
+	t.Parallel()
+	image := qcow.LayerImage(root, vol, layerID)
+	rec := bornEmpty()
+	r := &fakeRunner{info: infoJSON("qcow2", size, false)}
+
+	if _, err := qcow.Open(t.Context(), r, newPathsAt(image), "/qemu-img",
+		req(func(o *qcow.OpenRequest) { o.Recovery = rec })); err != nil {
+		t.Fatalf("opening a volume whose chain is current: %v", err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0] != "current/"+vol {
+		t.Errorf("the object store was asked %v, want exactly one HEAD read", rec.calls)
+	}
+	// And it is a HEAD read and not a rebuild: a chain that is already here must not be
+	// downloaded again.
+	for _, c := range rec.calls {
+		if !strings.HasPrefix(c, "current/") {
+			t.Errorf("opening a chain that is already here did %q", c)
+		}
+	}
+}
+
+// TestOpenWalksTheWholeChainOfAnImageItAdopts. `qemu-img info` exits 0 on a tip whose
+// backing file is gone — format, virtual size and the corrupt flag all pass — so the
+// Agent would log "volume ready" and the failure would land on whoever launches QEMU
+// (`Could not open backing file`). `--backing-chain` opens every layer and exits 1.
+// It is safe here and only here: this branch is an image no VM has open.
+func TestOpenWalksTheWholeChainOfAnImageItAdopts(t *testing.T) {
+	t.Parallel()
+	image := qcow.LayerImage(root, vol, layerID)
+	base := qcow.LayerImage(root, vol, baseID)
+
+	t.Run("the walk is what is run", func(t *testing.T) {
+		t.Parallel()
+		r := &fakeRunner{info: infoJSON("qcow2", size, false)}
+		if _, err := qcow.Open(t.Context(), r, newPathsAt(image), "/qemu-img", req(nil)); err != nil {
+			t.Fatalf("opening: %v", err)
+		}
+		want := "/qemu-img info --output=json --backing-chain " + image
+		if got := r.commands(); len(got) != 1 || got[0] != want {
+			t.Fatalf("qemu-img was run as %v, want exactly [%q]", got, want)
+		}
+	})
+
+	t.Run("a chain that does not resolve", func(t *testing.T) {
+		t.Parallel()
+		r := &fakeRunner{
+			info:     infoJSON("qcow2", size, false),
+			chainErr: errors.New("Could not open backing file: No such file or directory"),
+		}
+		_, err := qcow.Open(t.Context(), r, newPathsAt(image), "/qemu-img", req(nil))
+		if err == nil {
+			t.Fatal("a tip whose backing file is gone was reported as a ready volume")
+		}
+	})
+
+	t.Run("a lower layer carries the corrupt flag", func(t *testing.T) {
+		t.Parallel()
+		r := &fakeRunner{chain: "[" + overlayJSON(size, base) + "," + infoJSON("qcow2", size, true) + "]"}
+		_, err := qcow.Open(t.Context(), r, newPathsAt(image), "/qemu-img", req(nil))
+		if !errors.Is(err, qcow.ErrChainMismatch) {
+			t.Fatalf("want ErrChainMismatch, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "corrupt flag") {
+			t.Errorf("the refusal does not say why: %v", err)
+		}
+	})
+}
+
+// TestDeviceForNamesTheDriveASnapshotCanUse. A snapshot is issued against the drive id,
+// not the node name: QEMU gives a drive it created for itself an anonymous node
+// (`#block126`) and QMP refuses those as input. Measured against the pinned 11.0.2, where
+// the drive id was `virtio0`.
+func TestDeviceForNamesTheDriveASnapshotCanUse(t *testing.T) {
+	t.Parallel()
+	image := qcow.LayerImage(root, vol, layerID)
+
+	tests := []struct {
+		name, want string
+		script     []string
+	}{
+		{
+			name:   "the drive holding our image",
+			script: attachedTo(image),
+			want:   "virtio0",
+		},
+		{
+			name: "a drive with no id at all",
+			script: []string{
+				`{"QMP": {"version": {}, "capabilities": []}}`,
+				`{"return": {}}`,
+				`{"return": [{"device": "", "inserted": {"file": "` + image + `", "drv": "qcow2"}}]}`,
+			},
+			want: "under no drive id",
+		},
+		{
+			name:   "a VM that has moved on to another image",
+			script: attachedTo("/somewhere/else.qcow2"),
+			want:   "no longer has",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.dialer.scripts[qcow.QMPSocket(root, vol)] = tt.script
+			got, err := h.m.DeviceForTest(t.Context(), vol, image)
+			if err != nil {
+				if !strings.Contains(err.Error(), tt.want) {
+					t.Errorf("the error does not say why: %v", err)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("the drive is %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWritePointerReportsADirectoryItCannotMake: the pointer is how a VM finds its disk,
+// and a write that failed silently would leave whoever launches it pointed at nothing.
+func TestWritePointerReportsADirectoryItCannotMake(t *testing.T) {
+	t.Parallel()
+	p := &failingMkdir{fakePaths: *newPaths()}
+	rec := bornEmpty()
+	_, err := qcow.Open(t.Context(), &fakeRunner{}, p, "/qemu-img",
+		req(func(o *qcow.OpenRequest) { o.Recovery = rec }))
+	if err == nil {
+		t.Fatal("a directory that could not be made was ignored")
+	}
+}
+
+// TestInspectSaysWhichKindOfFailureItMet. `qemu-img` meeting QEMU's write lock is not a
+// broken image: it is a VM having the file open, reached from the one angle that cannot
+// lie about it. The two are told apart because the operator's next move differs — one is
+// "check the socket path the VM was launched with", the other is "look at the image" —
+// and because a lock failure is retried next cycle while a corrupt image is not.
+func TestInspectSaysWhichKindOfFailureItMet(t *testing.T) {
+	t.Parallel()
+	image := qcow.LayerImage(root, vol, layerID)
+
+	tests := []struct {
+		name  string
+		run   error
+		busy  bool
+		wants string
+	}{
+		{
+			name:  "a VM has it open",
+			run:   errors.New(`qemu-img: Failed to get shared "write" lock`),
+			busy:  true,
+			wants: "a VM has this image open",
+		},
+		{
+			name:  "something else entirely",
+			run:   errors.New("qemu-img: No space left on device"),
+			wants: "No space left",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := qcow.Open(t.Context(), &fakeRunner{err: tt.run}, newPathsAt(image), "/qemu-img",
+				req(func(o *qcow.OpenRequest) { o.Recovery = bornEmpty() }))
+			if err == nil {
+				t.Fatal("the failure was swallowed")
+			}
+			if got := errors.Is(err, qcow.ErrImageBusy); got != tt.busy {
+				t.Errorf("ErrImageBusy = %v, want %v (%v)", got, tt.busy, err)
+			}
+			if !strings.Contains(err.Error(), tt.wants) {
+				t.Errorf("the error does not say what happened: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckNotStaleReportsAStoreThatWillNotAnswer: a local chain and an object store that
+// cannot say whether it is current is a refusal, not a shrug. Serving it would be a guess,
+// and the guess that is wrong hands a guest a fork of its own history.
+func TestCheckNotStaleReportsAStoreThatWillNotAnswer(t *testing.T) {
+	t.Parallel()
+	image := qcow.LayerImage(root, vol, layerID)
+	rec := bornEmpty()
+	rec.headErr = errors.New("dial tcp: connection refused")
+
+	_, err := qcow.Open(t.Context(), &fakeRunner{info: infoJSON("qcow2", size, false)},
+		newPathsAt(image), "/qemu-img", req(func(o *qcow.OpenRequest) { o.Recovery = rec }))
+	if !errors.Is(err, qcow.ErrChainMissing) {
+		t.Fatalf("want ErrChainMissing, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("the refusal does not carry what the store said: %v", err)
 	}
 }

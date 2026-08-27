@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/metadata"
 	"github.com/spin-stack/storage/internal/placement"
+	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
 // Placement is what an attach produced: where the volume went and under which epoch.
@@ -98,7 +100,7 @@ type Placement struct {
 // Provisioning does not bump either, and cannot: `Provision` writes epoch 1 into the row
 // and into descriptor.json in one act, and a fresh volume id has no WAL directory on any
 // host to collide with.
-func Place(ctx context.Context, md metadata.Store, policy placement.Policy, term int64, volumeID, hostID string) (Placement, error) {
+func Place(ctx context.Context, md metadata.Store, store objectstore.Store, policy placement.Policy, term int64, volumeID, hostID string) (Placement, error) {
 	// The volume first: it is where the size the policy admits against comes from, and
 	// reading it means a mistyped volume id is ErrNotFound here rather than a placement
 	// failure that names a host the operator never mentioned. Its epoch is also what the
@@ -162,6 +164,19 @@ func Place(ctx context.Context, md metadata.Store, policy placement.Policy, term
 	// carries a state that says nobody is writing rather than an epoch that says the
 	// wrong writer may.
 	if vol.PrimaryHostID == "" {
+		// Recorded in the bucket before the catalog moves. The catalog is the thing
+		// `rebuild-metadata` exists because you can lose, and until this the only trace
+		// of the epoch outside it was `descriptor.CurrentEpoch`, which is written at
+		// create and updated by nothing — so a rebuild handed every host that had ever
+		// held the volume a token the restored catalog would accept again.
+		//
+		// Before, not after: a crash in between leaves the bucket holding a number the
+		// catalog has not reached, and a rebuild that restores too high can only
+		// over-fence. The other order leaves the bucket behind and hands a predecessor a
+		// live token, which is the failure this whole ordering exists to prevent.
+		if err := descriptor.WriteEpoch(ctx, store, volumeID, vol.CurrentEpoch+1); err != nil {
+			return Placement{}, err
+		}
 		epoch, err = md.BumpVolumeEpoch(ctx, term, volumeID, hostID, vol.CurrentEpoch)
 		if err != nil {
 			return Placement{}, fmt.Errorf("controlplane: granting volume %s an epoch on %s: %w", volumeID, hostID, err)

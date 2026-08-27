@@ -122,11 +122,11 @@ func TestLoadKEKRoundTripsThroughTheKMS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrapped, err := crypto.NewDevKMS(kek, crypto.KEKID(kek)).WrapDEK(&ramp{n: 9}, dek)
+	wrapped, err := crypto.NewDevKMS(kek, crypto.KEKID(kek)).WrapDEK(&ramp{n: 9}, dek, volID(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	back, err := crypto.NewDevKMS(loaded, crypto.KEKID(loaded)).UnwrapDEK(wrapped, 3)
+	back, err := crypto.NewDevKMS(loaded, crypto.KEKID(loaded)).UnwrapDEK(wrapped, 3, volID(1))
 	if err != nil {
 		t.Fatalf("a DEK wrapped under the file's key did not unwrap under the loaded one: %v", err)
 	}

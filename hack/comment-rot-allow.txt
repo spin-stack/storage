@@ -37,7 +37,6 @@
 internal/agent/loop.go:Loop.giveUpOnExpiredLease:lease-gated # "This is not the lease-gated ACK that ADR-0026 withdrew and it is not being rebuilt", said where a reader would otherwise assume it
 internal/agent/loop.go:Loop.heartbeat:remote               # "The heartbeat used to carry the host's remote backlog" — past tense, and the next clause says what replaced it
 internal/agent/loop.go:Loop.heartbeat:uploader             # same sentence: "It went with the uploader (ADR-0026 increment 4.5)"
-internal/controlplane/clone.go:Clone:checkpoint            # "EROFS plus a checkpoint plus a cached WAL, which ADR-0026 deleted — the preference outlived the thing it was a preference for"
 internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:gc     # the trailing note listing §7's OperationKind (…|recovery|flatten|gc) as vocabulary that went with the operations table
 internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:remote # same note: "ADR-0026 withdrew the remote half, so the local ACK is the *only* contract and there is nothing left to select"
 internal/obs/metrics.go:Catalog:checkpoint                 # the Catalog's trim note, listing what three quarters of the old entries measured
@@ -68,3 +67,8 @@ internal/simio/real/s3.go:S3Store.Restore:gc               # quotes INV-14 ("a G
 # --- the lease is live; these say so about the right thing ----------------------------
 internal/agent/loop.go:Loop.giveUpOnExpiredLease:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use
 internal/metadata/metadata.go:Store.Now:lease-valid          # about the Control Plane granting an epoch "while the old writer's monotonic lease is still valid" — mutual exclusion, the one part of fencing V1 keeps
+
+# --- naming a withdrawn mechanism to say it is gone, and two forward references --------
+internal/controlplane/clone.go:KeyRewrapper:checkpoint # "was EROFS plus a checkpoint plus a cached WAL, which ADR-0026 deleted" — the sentence exists to say the mechanism is gone. Moved here from Clone when the re-wrap gave the comment a new home.
+internal/qcow/chain.go:overlay:compaction              # "§19 already owns flattening, as compaction, outside the recovery path" — compaction is v6 §23.7 and is ahead of this tree, not behind it. The comment is why a recovery does NOT flatten.
+internal/recovery/recovery.go:maxRestoreDepth:compaction # the depth ceiling exists because nothing compacts yet; the mention is the reason for the number, and it goes when §23.7 lands.

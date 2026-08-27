@@ -88,7 +88,17 @@ func (p *Publisher) encryption(ctx context.Context, volumeID string) (*crypto.En
 	if err != nil {
 		return nil, fmt.Errorf("publisher: volume %s: %w", volumeID, err)
 	}
-	dek, err := p.kms.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID)
+	// The catalog says which KEK wrapped this volume's DEK. Compared before unwrapping,
+	// because crypto/kek.go says at the line that defines KEKID that this is what the id
+	// is *for* — and nothing was comparing it. An Agent started with the wrong -kek-file
+	// got an AEAD failure instead, which reads as a corrupt key or a bad DEK version and
+	// sends an operator looking at the catalog and the KMS rather than at their own
+	// command line.
+	if keys.KEKID != "" && keys.KEKID != p.kms.KEKID() {
+		return nil, fmt.Errorf("publisher: volume %s was wrapped under KEK %s and this host holds %s: it is running with the wrong -kek-file",
+			volumeID, keys.KEKID, p.kms.KEKID())
+	}
+	dek, err := p.kms.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID, id)
 	if err != nil {
 		return nil, fmt.Errorf("publisher: unwrapping the DEK of volume %s: %w", volumeID, err)
 	}

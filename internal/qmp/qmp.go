@@ -172,6 +172,34 @@ func (c *Client) Snapshot(device, file string) error {
 	return err
 }
 
+// Stop pauses the guest. It is what fencing does to a VM that is still writing.
+//
+// # Why the disk is not made read-only instead
+//
+// Read-only is what you would want: a fenced volume the guest can still read, mounted
+// read-only, with the machine alive to say so. It was measured against the pinned QEMU
+// and it cannot be had from this side.
+//
+//   - With the drive QEMU creates for itself (`-drive file=...,if=virtio`, which is how a
+//     VM is launched here) the node is anonymous — `#block140` — and QMP refuses an
+//     anonymous node as input: "Cannot change the option 'node-name'". There is also no
+//     `read-only` property on virtio-blk-pci to set.
+//   - Launched with named nodes instead (`-blockdev node-name=vol0,...`), blockdev-reopen
+//     is reachable and still refuses: "Read-only block node 'vol0' cannot support
+//     read-write users". The guest's virtio driver holds it read-write, and nothing on
+//     the host can take that away from a running kernel.
+//
+// So the choice is between stopping the guest and leaving it writing to a volume this
+// host no longer owns. A fenced host whose guest goes on writing is a host that has been
+// told it is not the writer and is writing — every byte after that lands in a chain the
+// published history has no room for, and the guest is being told those writes succeeded.
+// Pausing is the smallest true thing this Agent can do: it does not kill the VM, whose
+// lifetime belongs to whoever launched it (ADR-0021), and it ends the lie.
+func (c *Client) Stop() error {
+	_, err := c.execute("stop")
+	return err
+}
+
 // execute sends one command and returns the raw `return` value.
 //
 // Events are skipped rather than delivered, and that is the one piece of protocol

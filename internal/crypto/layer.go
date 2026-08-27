@@ -67,16 +67,27 @@ const layerAADVersion = 1
 // the manifest, and a layer is read by a recovery that may be assembling one chain out of
 // several.
 //
-// The first two come from the *nonce*, which derives from (volume, layer, index): a frame
-// in the wrong position is opened under the wrong nonce and fails. The frame size is not
-// in the AAD either, because it decides where the boundaries are — read a layer with a
-// different frame size and every tag fails on the split alone.
+// The first two come from the *nonce*, which derives from (volume, layer, frame size,
+// index): a frame in the wrong position is opened under the wrong nonce and fails.
 //
-// So the AAD is two bytes: the framing generation, and the final flag. It was six times
-// that until each field's removal was planted and watched: only the final flag turned a
-// test red. A field no test can miss is a field that is not doing any work, and the
-// alternative — writing a test *for* the redundant field — would have been a test that
-// proves the implementation agrees with itself.
+// # The frame size is in the nonce, and leaving it out was a nonce reuse
+//
+// It was left out once, on the argument that the frame size "decides where the boundaries
+// are, so reading a layer with a different frame size fails every tag on the split alone".
+// That argument is about the *reader*. The catastrophic case is the writer: seal one layer
+// at 64 KiB and again at 1 MiB — which this design invites, since `frame_bytes` travels in
+// the manifest precisely so it can be changed — and frame 0 of each is a different
+// plaintext under the same nonce. AES-GCM under a repeated nonce leaks the XOR of the two
+// plaintexts and lets the authentication key be recovered; it is the one failure the whole
+// nonce-derivation argument in SealLayer exists to rule out, and the argument had a hole
+// in it exactly where it stopped talking about writers.
+//
+// It also disposes of a smaller thing: a layer of a single frame has no split, so nothing
+// about the reader's side was true for it either.
+//
+// The AAD is two bytes: the framing generation, and the final flag. It was six times that
+// until each field's removal was planted and watched, and only the final flag turned a
+// test red — the rest are bound by the nonce, which is where binding belongs.
 func (e *Encryption) SealLayer(layerID [16]byte, frameBytes int, r io.Reader, w io.Writer) error {
 	if frameBytes <= 0 {
 		return fmt.Errorf("crypto: a frame of %d bytes is not a frame", frameBytes)
@@ -99,7 +110,7 @@ func (e *Encryption) SealLayer(layerID [16]byte, frameBytes int, r io.Reader, w 
 			return err
 		}
 		final := m == 0
-		sealed := g.Seal(nil, layerNonce(e.VolumeID, layerID, idx),
+		sealed := g.Seal(nil, layerNonce(e.VolumeID, layerID, frameBytes, idx),
 			cur[:n], layerAAD(final))
 		if _, err := w.Write(sealed); err != nil {
 			return fmt.Errorf("crypto: writing sealed frame %d: %w", idx, err)
@@ -143,7 +154,7 @@ func (e *Encryption) OpenLayer(layerID [16]byte, frameBytes int, r io.Reader, w 
 		if !final && n != size {
 			return fmt.Errorf("%w: frame %d carries %d bytes, not %d", ErrShortLayer, idx, n, size)
 		}
-		pt, err := g.Open(nil, layerNonce(e.VolumeID, layerID, idx),
+		pt, err := g.Open(nil, layerNonce(e.VolumeID, layerID, frameBytes, idx),
 			cur[:n], layerAAD(final))
 		if err != nil {
 			// Deliberately not saying which of the reasons it was. A frame fails to
@@ -176,15 +187,20 @@ func readFull(r io.Reader, buf []byte) (int, error) {
 	}
 }
 
-// layerNonce is the deterministic nonce for one frame. Same construction as
-// deriveNonce, with the layer's identity in place of (epoch, sequence) and its own
-// domain-separation tag so the two can never collide.
-func layerNonce(volumeID, layerID [16]byte, idx uint64) []byte {
-	var buf [16 + 16 + 8 + 6]byte
+// layerNonce is the deterministic nonce for one frame. Same construction as deriveNonce,
+// with the layer's identity in place of (epoch, sequence) and its own domain-separation
+// tag so the two can never collide.
+//
+// The frame size is part of it, not decoration: without it, frame 0 of a layer sealed at
+// one frame size and frame 0 of the same layer sealed at another share a nonce and carry
+// different plaintexts. See SealLayer.
+func layerNonce(volumeID, layerID [16]byte, frameBytes int, idx uint64) []byte {
+	var buf [16 + 16 + 8 + 8 + 6]byte
 	copy(buf[0:16], volumeID[:])
 	copy(buf[16:32], layerID[:])
-	binary.LittleEndian.PutUint64(buf[32:40], idx)
-	copy(buf[40:], "layer1")
+	binary.LittleEndian.PutUint64(buf[32:40], uint64(frameBytes))
+	binary.LittleEndian.PutUint64(buf[40:48], idx)
+	copy(buf[48:], "layer1")
 	sum := sha256.Sum256(buf[:])
 	return sum[:NonceSize]
 }

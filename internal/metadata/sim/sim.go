@@ -341,7 +341,14 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, b
 // value; everything that is description comes from the new record.
 func converge(cur, next metadata.Volume) metadata.Volume {
 	next.CurrentEpoch = max(cur.CurrentEpoch, next.CurrentEpoch)
-	next.SizeBytes = max(cur.SizeBytes, next.SizeBytes) // §3: grow-only
+	// Geometry is authority, and it comes from the row that already exists rather than
+	// from the newcomer. It was grow-only, on a §3 resize rule whose only verb was
+	// withdrawn (DEV-0023), which left a rewrite of `size_bytes` in a bucket object able
+	// to grow a live volume's device — and `block_size`, which had no rule at all, able
+	// to change what a guest addresses under a running kernel.
+	if cur.SizeBytes != 0 {
+		next.SizeBytes, next.BlockSize = cur.SizeBytes, cur.BlockSize
+	}
 	next.LocalSequence = max(cur.LocalSequence, next.LocalSequence)
 	next.DurableSequence = max(cur.DurableSequence, next.DurableSequence)
 	next.PublishedSequence = max(cur.PublishedSequence, next.PublishedSequence)
@@ -353,6 +360,20 @@ func converge(cur, next metadata.Volume) metadata.Volume {
 	if cur.StandbyHostID != "" {
 		next.StandbyHostID = cur.StandbyHostID
 	}
+	// Key material is authority, not description, and it was on the wrong side of that
+	// line. A volume's wrapped DEK is the only thing standing between its layers and
+	// anybody who can read the bucket, so a re-create that carried a *newer* one would
+	// re-key a live volume — which is what a clone pointed at an existing id did, and what
+	// a rebuild reading a descriptor somebody else wrote would do. A volume's key is set
+	// once, when it is provisioned or cloned, and after that only the row that already
+	// exists knows it.
+	if cur.DEKKeyID != 0 {
+		next.DEKWrapped, next.DEKKeyID, next.KEKID = cur.DEKWrapped, cur.DEKKeyID, cur.KEKID
+	}
+	// Lineage is authority too: a re-create that moved a volume's parent would change
+	// which history its reads walk through, which is the same failure one level up.
+	next.ParentSnapshotID = cur.ParentSnapshotID
+	next.ChainDepth = max(cur.ChainDepth, next.ChainDepth)
 	return next
 }
 

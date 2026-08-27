@@ -122,6 +122,25 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 		return Manifest{}, err
 	}
 
+	// The epoch fence, and it is the second half of v6 §13: the epoch is a fencing token
+	// and not metadata. Recorded in every manifest and compared by nobody, it was the
+	// first — an Agent whose epoch the fleet had moved past could still read HEAD, seal
+	// its divergent layer and compare-and-set onto its successor's history, because the
+	// CAS only asks "is HEAD what I last read". It is, if this host read it a moment ago.
+	//
+	// So the parent is read and its epoch checked. One GET per commit, of a small object,
+	// against a host appending a divergent chain onto the volume it was fenced out of.
+	if parent != "" {
+		prev, err := ReadManifest(ctx, store, req.VolumeID, parent)
+		if err != nil {
+			return Manifest{}, fmt.Errorf("commit: reading the parent of %s: %w", req.CommitID, err)
+		}
+		if prev.Epoch > req.Epoch {
+			return Manifest{}, fmt.Errorf("%w: this host holds epoch %d and the commit it would build on was written at %d",
+				ErrHeadMoved, req.Epoch, prev.Epoch)
+		}
+	}
+
 	m := Manifest{
 		VolumeID: req.VolumeID, CommitID: req.CommitID, ParentCommitID: parent,
 		Epoch: req.Epoch, VirtualSize: req.VirtualSize,
@@ -142,10 +161,19 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 // putLayer stores the sealed bytes at their content-addressed key.
 //
 // Create-only, and a key that is already taken is the ordinary shape of a retry rather
-// than a failure: the key is the digest of the content, so an object already there is
-// this object. The size is checked anyway — it is one HEAD, and it is the difference
-// between "this layer was already uploaded" and "a manifest of ours names something
-// somebody else put in the bucket".
+// than a failure: the key is the digest of the content, so an object already there
+// should be this object.
+//
+// "Should be" is why what is there is read back and hashed rather than measured. Size was
+// the check until an adversary put an object of exactly the right length at the key — a
+// restore that put an old object back, a store that replayed a write, anything else with
+// access to a shared bucket — and watched Publish return SUCCESS for a commit that could
+// never be reconstructed. That is the commit contract broken by a `!=` on the wrong
+// field: what the sentence promises is that the bytes can be read back, and only reading
+// them back says so.
+//
+// It costs a GET of a whole layer, and only on the path where the key was already taken —
+// which is a retry, and which is exactly where a wrong answer is permanent.
 func putLayer(ctx context.Context, store objectstore.Store, key string, body []byte) error {
 	_, err := store.Put(ctx, key, body, objectstore.PutOptions{IfNoneMatch: true})
 	if err == nil {
@@ -154,12 +182,13 @@ func putLayer(ctx context.Context, store objectstore.Store, key string, body []b
 	if !errors.Is(err, objectstore.ErrPreconditionFailed) {
 		return fmt.Errorf("commit: uploading %s: %w", key, err)
 	}
-	info, err := store.Head(ctx, key)
+	existing, err := store.Get(ctx, key)
 	if err != nil {
-		return fmt.Errorf("commit: examining the object already at %s: %w", key, err)
+		return fmt.Errorf("commit: reading the object already at %s: %w", key, err)
 	}
-	if info.Size != int64(len(body)) {
-		return fmt.Errorf("%w: %s holds %d bytes, this layer is %d", ErrLayerKeyTaken, key, info.Size, len(body))
+	if got := Digest(existing); got != Digest(body) {
+		return fmt.Errorf("%w: %s holds an object that hashes to %s, this layer hashes to %s",
+			ErrLayerKeyTaken, key, got, Digest(body))
 	}
 	return nil
 }

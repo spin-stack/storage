@@ -124,7 +124,7 @@ func TestWrapUnwrapRoundTrip(t *testing.T) {
 	kms := crypto.NewDevKMS(kek, "kek-1")
 	dek := testDEK(t, 7)
 
-	wrapped, err := kms.WrapDEK(&fixedReader{b: 100}, dek)
+	wrapped, err := kms.WrapDEK(&fixedReader{b: 100}, dek, volID(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestWrapUnwrapRoundTrip(t *testing.T) {
 		t.Fatal("wrapped DEK must not contain the raw key")
 	}
 
-	got, err := kms.UnwrapDEK(wrapped, 7)
+	got, err := kms.UnwrapDEK(wrapped, 7, volID(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,8 +147,8 @@ func TestUnwrapWrongKEKFails(t *testing.T) {
 	a := crypto.NewDevKMS(kek1, "kek-1")
 	b := crypto.NewDevKMS(kek2, "kek-2")
 
-	wrapped, _ := a.WrapDEK(&fixedReader{b: 5}, testDEK(t, 1))
-	if _, err := b.UnwrapDEK(wrapped, 1); !errors.Is(err, crypto.ErrUnwrap) {
+	wrapped, _ := a.WrapDEK(&fixedReader{b: 5}, testDEK(t, 1), volID(1))
+	if _, err := b.UnwrapDEK(wrapped, 1, volID(1)); !errors.Is(err, crypto.ErrUnwrap) {
 		t.Fatalf("unwrap with wrong KEK: want ErrUnwrap, got %v", err)
 	}
 }
@@ -156,9 +156,9 @@ func TestUnwrapWrongKEKFails(t *testing.T) {
 func TestUnwrapWrongKeyIDFails(t *testing.T) {
 	var kek [crypto.DEKSize]byte
 	kms := crypto.NewDevKMS(kek, "kek-1")
-	wrapped, _ := kms.WrapDEK(&fixedReader{b: 9}, testDEK(t, 3))
+	wrapped, _ := kms.WrapDEK(&fixedReader{b: 9}, testDEK(t, 3), volID(1))
 	// keyID is bound as AAD; unwrapping under a different id must fail.
-	if _, err := kms.UnwrapDEK(wrapped, 4); !errors.Is(err, crypto.ErrUnwrap) {
+	if _, err := kms.UnwrapDEK(wrapped, 4, volID(1)); !errors.Is(err, crypto.ErrUnwrap) {
 		t.Fatalf("unwrap wrong keyID: want ErrUnwrap, got %v", err)
 	}
 }
@@ -191,7 +191,7 @@ func TestGenerateDEKShortReaderFails(t *testing.T) {
 func TestWrapShortNonceReaderFails(t *testing.T) {
 	var kek [crypto.DEKSize]byte
 	kms := crypto.NewDevKMS(kek, "kek-1")
-	if _, err := kms.WrapDEK(&shortReader{n: 0}, testDEK(t, 1)); err == nil {
+	if _, err := kms.WrapDEK(&shortReader{n: 0}, testDEK(t, 1), volID(1)); err == nil {
 		t.Fatal("WrapDEK with no wrap randomness must fail")
 	}
 }
@@ -199,7 +199,7 @@ func TestWrapShortNonceReaderFails(t *testing.T) {
 func TestUnwrapTooShortFails(t *testing.T) {
 	var kek [crypto.DEKSize]byte
 	kms := crypto.NewDevKMS(kek, "kek-1")
-	if _, err := kms.UnwrapDEK([]byte{1, 2, 3}, 1); !errors.Is(err, crypto.ErrUnwrap) {
+	if _, err := kms.UnwrapDEK([]byte{1, 2, 3}, 1, volID(1)); !errors.Is(err, crypto.ErrUnwrap) {
 		t.Fatalf("unwrap short blob: want ErrUnwrap, got %v", err)
 	}
 }

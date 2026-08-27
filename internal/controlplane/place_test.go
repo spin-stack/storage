@@ -90,7 +90,7 @@ func placedNowhere(t *testing.T, md metadata.Store) bool {
 // and the two hosts it must skip are skipped for two different reasons.
 func TestPlaceChoosesTheHostThePolicyAdmits(t *testing.T) {
 	md, term := placeWorld(t)
-	got, err := controlplane.Place(t.Context(), md, placement.Policy{}, term, placeVol, "")
+	got, err := controlplane.Place(t.Context(), md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, "")
 	if err != nil {
 		t.Fatalf("Place: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestPlaceChoosesTheHostThePolicyAdmits(t *testing.T) {
 // returned host carries the state the caller reports.
 func TestPlaceHonoursANamedHostThePolicyWouldNotChoose(t *testing.T) {
 	md, term := placeWorld(t)
-	got, err := controlplane.Place(t.Context(), md, placement.Policy{}, term, placeVol, quietHost)
+	got, err := controlplane.Place(t.Context(), md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, quietHost)
 	if err != nil {
 		t.Fatalf("Place on a named cordoned host: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestPlaceRefusesWhenNoHostAdmitsTheVolume(t *testing.T) {
 	if err := md.SetHostState(t.Context(), term, roomyHost, lifecycle.HostDraining, lifecycle.CordonOperator); err != nil {
 		t.Fatal(err)
 	}
-	_, err := controlplane.Place(t.Context(), md, placement.Policy{}, term, placeVol, "")
+	_, err := controlplane.Place(t.Context(), md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, "")
 	if !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("Place onto a fleet with no candidate: want ErrNoCapacity, got %v", err)
 	}
@@ -146,12 +146,12 @@ func TestPlaceRefusesWhenNoHostAdmitsTheVolume(t *testing.T) {
 func TestPlaceRefusesAHandOverAndAMissingHost(t *testing.T) {
 	md, term := placeWorld(t)
 	ctx := t.Context()
-	if _, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, roomyHost); err != nil {
+	if _, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, roomyHost); err != nil {
 		t.Fatal(err)
 	}
 
 	// A → B in one write would leave two Agents serving one volume for a poll interval.
-	if _, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, quietHost); !errors.Is(err, metadata.ErrAlreadyPlaced) {
+	if _, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, quietHost); !errors.Is(err, metadata.ErrAlreadyPlaced) {
 		t.Fatalf("a straight hand-over: want ErrAlreadyPlaced, got %v", err)
 	}
 	if serving(t, md, quietHost) || !serving(t, md, roomyHost) {
@@ -161,7 +161,7 @@ func TestPlaceRefusesAHandOverAndAMissingHost(t *testing.T) {
 	if err := md.SetVolumePrimaryHost(ctx, term, placeVol, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, absentHost); !errors.Is(err, metadata.ErrNotFound) {
+	if _, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, absentHost); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("a host nobody registered: want ErrNotFound, got %v", err)
 	}
 	if !placedNowhere(t, md) {
@@ -176,7 +176,7 @@ func TestPlaceUnderAStaleTermWritesNothing(t *testing.T) {
 	if _, err := md.AcquireLeadership(t.Context(), "cp-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Place(t.Context(), md, placement.Policy{}, term, placeVol, ""); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := controlplane.Place(t.Context(), md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, ""); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("Place under a stale term: want ErrStaleTerm, got %v", err)
 	}
 	if !placedNowhere(t, md) {
@@ -214,7 +214,7 @@ func TestPlaceGrantsAFreshEpochToEveryAttach(t *testing.T) {
 	md, term := placeWorld(t)
 	ctx := t.Context()
 
-	first, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, roomyHost)
+	first, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, roomyHost)
 	if err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestPlaceGrantsAFreshEpochToEveryAttach(t *testing.T) {
 		t.Fatalf("the detach moved the epoch from %d to %d", first.Epoch, vol.CurrentEpoch)
 	}
 
-	second, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, quietHost)
+	second, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, quietHost)
 	if err != nil {
 		t.Fatalf("attaching to the second host: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestPlaceGrantsAFreshEpochToEveryAttach(t *testing.T) {
 	if err := md.SetVolumePrimaryHost(ctx, term, placeVol, ""); err != nil {
 		t.Fatal(err)
 	}
-	third, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, roomyHost)
+	third, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, roomyHost)
 	if err != nil {
 		t.Fatalf("attaching back to the first host: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestPlaceBurnsNoEpochOnARefusalOrARepeat(t *testing.T) {
 	md, term := placeWorld(t)
 	ctx := t.Context()
 
-	placed, err := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, roomyHost)
+	placed, err := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, roomyHost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestPlaceBurnsNoEpochOnARefusalOrARepeat(t *testing.T) {
 		call func(t *testing.T)
 	}{
 		{"a repeat of the placement the volume already has", func(t *testing.T) {
-			again, aerr := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, roomyHost)
+			again, aerr := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, roomyHost)
 			if aerr != nil {
 				t.Fatalf("re-attaching to the host the volume is already on: %v", aerr)
 			}
@@ -313,13 +313,13 @@ func TestPlaceBurnsNoEpochOnARefusalOrARepeat(t *testing.T) {
 			}
 		}},
 		{"a straight hand-over", func(t *testing.T) {
-			_, aerr := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, quietHost)
+			_, aerr := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, quietHost)
 			if !errors.Is(aerr, metadata.ErrAlreadyPlaced) {
 				t.Fatalf("hand-over: want ErrAlreadyPlaced, got %v", aerr)
 			}
 		}},
 		{"a host nobody registered", func(t *testing.T) {
-			_, aerr := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, absentHost)
+			_, aerr := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, absentHost)
 			if !errors.Is(aerr, metadata.ErrNotFound) {
 				t.Fatalf("unregistered host: want ErrNotFound, got %v", aerr)
 			}
@@ -328,7 +328,7 @@ func TestPlaceBurnsNoEpochOnARefusalOrARepeat(t *testing.T) {
 			if _, aerr := md.AcquireLeadership(ctx, "cp-b"); aerr != nil {
 				t.Fatal(aerr)
 			}
-			_, aerr := controlplane.Place(ctx, md, placement.Policy{}, term, placeVol, roomyHost)
+			_, aerr := controlplane.Place(ctx, md, sim.NewObjectStore(), placement.Policy{}, term, placeVol, roomyHost)
 			if !errors.Is(aerr, metadata.ErrStaleTerm) {
 				t.Fatalf("stale term: want ErrStaleTerm, got %v", aerr)
 			}

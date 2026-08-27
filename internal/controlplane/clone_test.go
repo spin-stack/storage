@@ -1,12 +1,15 @@
 package controlplane_test
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/controlplane"
+	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
@@ -36,15 +39,53 @@ func cpStore(t *testing.T) (metadata.Store, objectstore.Store, int64) {
 	return md, sim.NewObjectStore(), term
 }
 
+// wrapFor seals a deterministic DEK under the test KEK, bound to volumeID.
+//
+// The fixtures below used to hand Clone a `DEKWrapped: []byte{7}` that no KMS could
+// open, which was fine while a clone only copied the bytes. It re-wraps now, so the
+// parent's key has to be a key: a stub would make every one of these tests a test of the
+// error path.
+func wrapFor(t *testing.T, kms *crypto.DevKMS, volumeID string, keyID uint32) []byte {
+	t.Helper()
+	dek, err := crypto.GenerateDEK(&ramp{}, keyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := ids.Parse(volumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := kms.WrapDEK(&ramp{}, dek, [16]byte(u))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// unwrapOf is what a reader does: open a volume's wrapped DEK under its own id.
+func unwrapOf(t *testing.T, kms *crypto.DevKMS, v metadata.Volume) crypto.DEK {
+	t.Helper()
+	u, err := ids.Parse(v.VolumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek, err := kms.UnwrapDEK(v.DEKWrapped, v.DEKKeyID, [16]byte(u))
+	if err != nil {
+		t.Fatalf("unwrapping the DEK of volume %s: %v", v.VolumeID, err)
+	}
+	return dek
+}
+
 func TestCloneIsIndependentOfParent(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
+	kms := testKMS(t)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536,
 		// Deliberately not 1. A parent at the first version would let an implementation
 		// that hardcodes "the first version" pass this test — which one did, until the
 		// assertion below was checked against a planted bug.
-		State: lifecycle.VolumeActive, ChainDepth: 0, DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 42,
+		State: lifecycle.VolumeActive, ChainDepth: 0, DEKWrapped: wrapFor(t, kms, parentVol, 42), KEKID: "kek-test", DEKKeyID: 42,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +97,7 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	}
 
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
-	clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol)
+	clone, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snapID, cloneVol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,17 +105,29 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 	if clone.VolumeID != cloneVol || clone.SizeBytes != 1<<30 || clone.ChainDepth != 1 || clone.CurrentEpoch != 1 {
 		t.Fatalf("clone shape wrong: %+v", clone)
 	}
-	if string(clone.DEKWrapped) != string([]byte{7}) || clone.KEKID != "kek" {
+	// The clone holds the same *key*, not the same ciphertext. A wrap is bound to the
+	// volume that carries it (crypto.wrapAAD), so Clone re-wraps under the child's id —
+	// and the assertion has to be about what the bytes open to, because the old
+	// byte-for-byte comparison would now be satisfied only by a clone nothing can unwrap.
+	parentVolRow, err := md.GetVolume(ctx, parentVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unwrapOf(t, kms, clone).Key != unwrapOf(t, kms, parentVolRow).Key {
 		t.Fatal("clone must inherit the parent DEK to read the shared base")
+	}
+	if bytes.Equal(clone.DEKWrapped, parentVolRow.DEKWrapped) {
+		t.Fatal("the clone carries the parent's wrapped bytes verbatim: a wrap bound to the parent " +
+			"is one the child cannot open, and copying it is what let a descriptor swap re-key a volume")
+	}
+	if clone.KEKID != kms.KEKID() {
+		t.Fatalf("clone names KEK %q, want %q", clone.KEKID, kms.KEKID())
 	}
 	// And the DEK's *version* with it. crypto.DevKMS binds the version as GCM
 	// additional authenticated data, so a clone carrying the wrapped key without the
 	// number that names it cannot unwrap at all — and the failure would surface on the
 	// clone's first WRITE, a long way from the code that dropped it.
-	parentRow, err := md.GetVolume(ctx, parentVol)
-	if err != nil {
-		t.Fatal(err)
-	}
+	parentRow := parentVolRow
 	if clone.DEKKeyID != parentRow.DEKKeyID {
 		t.Fatalf("clone carries DEK version %d, parent %d", clone.DEKKeyID, parentRow.DEKKeyID)
 	}
@@ -89,7 +142,8 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 func TestCloneWithStaleTermFails(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
-	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek"}, nil)
+	kms := testKMS(t)
+	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test"}, nil)
 	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID})
 
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
@@ -98,7 +152,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 	if _, err := md.AcquireLeadership(ctx, "cp-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, stale, snapID, cloneVol); !errors.Is(err, metadata.ErrStaleTerm) {
+	if _, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, stale, snapID, cloneVol); !errors.Is(err, metadata.ErrStaleTerm) {
 		t.Fatalf("want ErrStaleTerm, got %v", err)
 	}
 }
@@ -106,7 +160,8 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 func TestCloneFromMissingSnapshotFails(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, "no-such-snap", cloneVol); !errors.Is(err, metadata.ErrNotFound) {
+	kms := testKMS(t)
+	if _, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, "no-such-snap", cloneVol); !errors.Is(err, metadata.ErrNotFound) {
 		t.Fatalf("clone from a missing snapshot: want ErrNotFound, got %v", err)
 	}
 }
@@ -122,17 +177,18 @@ func TestCloneFromMissingSnapshotFails(t *testing.T) {
 func TestAFailedCloneChargesNothing(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
+	kms := testKMS(t)
 	// A host with no room for the clone: total is smaller than the volume.
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<20)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
-		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+		State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test",
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	createSnapshot(t, md, term, cloneHostA)
 
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol); !errors.Is(err, placement.ErrNoCapacity) {
+	if _, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snapID, cloneVol); !errors.Is(err, placement.ErrNoCapacity) {
 		t.Fatalf("want ErrNoCapacity, got %v", err)
 	}
 	if dst, _ := md.GetHost(ctx, cloneHostA); dst.NVMeCommittedBytes != 0 {
@@ -169,17 +225,18 @@ func TestACloneStartsWhereTheDataAlreadyIs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			md, store, term := cpStore(t)
+			kms := testKMS(t)
 			addHost(t, md, term, sourceHost, tc.sourceStat, tc.sourceCap)
 			addHost(t, md, term, otherHost, lifecycle.HostActive, 1<<41)
 			if err := md.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
-				State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+				State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test",
 			}, nil); err != nil {
 				t.Fatal(err)
 			}
 			createSnapshot(t, md, term, sourceHost)
 
-			clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol)
+			clone, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snapID, cloneVol)
 			if err != nil {
 				t.Fatalf("Clone: %v", err)
 			}
@@ -202,10 +259,11 @@ func TestACloneStartsWhereTheDataAlreadyIs(t *testing.T) {
 func TestCloneRefusesASnapshotThatWasNeverPublished(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
+	kms := testKMS(t)
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
-		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+		State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test",
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +273,7 @@ func TestCloneRefusesASnapshotThatWasNeverPublished(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controlplane.Clone(ctx, md, store, placement.Policy{}, nil, term, snapID, cloneVol); err == nil {
+	if _, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snapID, cloneVol); err == nil {
 		t.Fatal("a snapshot that was never published was accepted as a clone source")
 	}
 	if _, err := md.GetVolume(ctx, cloneVol); !errors.Is(err, metadata.ErrNotFound) {
@@ -240,12 +298,13 @@ func TestCloneRefusesASnapshotThatWasNeverPublished(t *testing.T) {
 func TestALineageStopsGrowingAtTheCeiling(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
+	kms := testKMS(t)
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
 
 	root := ids.New().String()
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: root, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
-		State: lifecycle.VolumeActive, DEKWrapped: []byte{7}, KEKID: "kek",
+		State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, root, 1), KEKID: "kek-test",
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +319,7 @@ func TestALineageStopsGrowingAtTheCeiling(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		clone, err := controlplane.Clone(ctx, md, store, placement.Policy{}, prov.Recorder(), term, snap, ids.New().String())
+		clone, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, prov.Recorder(), term, snap, ids.New().String())
 		if err != nil {
 			t.Fatalf("a clone at depth %d was refused below the ceiling of %d: %v", depth, controlplane.MaxChainDepth, err)
 		}
@@ -286,7 +345,7 @@ func TestALineageStopsGrowingAtTheCeiling(t *testing.T) {
 	// Errorf and not Fatalf, so that a build with no ceiling reports what it did rather
 	// than only that it did not refuse: the four assertions below are the ones that say
 	// a lineage grew past the limit, and they are the point of the test.
-	switch _, cerr := controlplane.Clone(ctx, md, store, placement.Policy{}, prov.Recorder(), term, snap, refused); {
+	switch _, cerr := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, prov.Recorder(), term, snap, refused); {
 	case !errors.Is(cerr, controlplane.ErrChainTooDeep):
 		t.Errorf("a clone of a volume at the ceiling: want ErrChainTooDeep, got %v", cerr)
 	// The message is the operator's whole interface to this refusal: it has to name the
@@ -361,5 +420,71 @@ func createSnapshot(t *testing.T, md metadata.Store, term int64, sourceHost stri
 		State: lifecycle.SnapshotPublished, RequestID: reqID,
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A clone opens its parent's already-published layers, through the real path: the
+// parent seals a layer, the Control Plane clones a snapshot of it, and the clone's
+// Agent unwraps *its own* wrapped DEK and reads the parent's object with it.
+//
+// This is the test that says binding the volume into the wrap broke no lineage. The two
+// things it keeps apart are easy to conflate: custody of the key is the wrap's AAD and
+// is now per-volume, while which volume's bytes a key may open is one step later and was
+// always per-volume — crypto.Encryption pairs a DEK with a volume id, the layer nonce
+// carries it, and commit.Fetch refuses a manifest naming another volume. A clone reading
+// its parent's layers builds an Encryption over the *parent's* id from the same key
+// bytes, and nothing about the wrap's AAD survives into that read.
+func TestACloneOpensItsParentsPublishedLayers(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	kms := testKMS(t)
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
+		State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	createSnapshot(t, md, term, cloneHostA)
+
+	// The parent publishes, sealed with its own DEK bound to its own id.
+	parentRow, err := md.GetVolume(ctx, parentVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentU, err := ids.Parse(parentVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentEnc, err := crypto.NewEncryption(unwrapOf(t, kms, parentRow), [16]byte(parentU))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := bytes.Repeat([]byte("what the parent wrote"), 4096)
+	m, err := commit.Publish(ctx, store, parentEnc, bytes.NewReader(plain), commit.Request{
+		VolumeID: parentVol, CommitID: ids.New().String(), LayerID: ids.New().String(),
+		Epoch: 1, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)),
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	clone, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snapID, cloneVol)
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+
+	// The clone's Agent: unwrap what the catalog holds for *the clone*, then bind it to
+	// the volume whose layer it is about to read — the parent's.
+	readView, err := crypto.NewEncryption(unwrapOf(t, kms, clone), [16]byte(parentU))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := commit.Fetch(ctx, store, readView, m, &out); err != nil {
+		t.Fatalf("the clone cannot open the layer it inherited: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), plain) {
+		t.Fatal("the inherited layer opened into the wrong bytes")
 	}
 }

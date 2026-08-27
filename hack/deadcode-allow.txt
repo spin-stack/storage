@@ -74,5 +74,3 @@ package hack/analyzers/simulable/cmd/simulable # its main; `go run` builds it, n
 # has its own transport in internal/vhost/hostio; and the Control Plane speaks Connect over
 # net/http. If a component ever needs a simulable network, this is where it plugs in.
 package internal/simio/network  # harness-only: the DST partition scenario drives it, no binary does
-internal/commit.Fetch  # the inverse a published commit is proved by: the round-trip and crash-point tests in internal/commit are what assert the contract "reconstructible without the host", and there is no way to assert it without reading a commit back. Its production caller is recovery (v6 §23.4).
-internal/crypto.Encryption.OpenLayer  # reached only through commit.Fetch, which is allowed above for the same reason: unsealing is how the round-trip and crash-point tests prove a published layer can be read back, and a sealer with no opener could not be proved at all. Its production caller arrives with recovery (v6 §23.4).

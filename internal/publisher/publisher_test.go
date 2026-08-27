@@ -77,11 +77,13 @@ func newWorld(t *testing.T) *world {
 	if err != nil {
 		t.Fatalf("generating a DEK: %v", err)
 	}
-	wrapped, err := kms.WrapDEK(rand.Reader, dek)
+	volumeID := ids.New().String()
+	// Wrapped under the volume that carries it: a DEK is custody-bound now, so a wrap
+	// minted for one volume does not unwrap for another.
+	wrapped, err := kms.WrapDEK(rand.Reader, dek, uuid.MustParse(volumeID))
 	if err != nil {
 		t.Fatalf("wrapping it: %v", err)
 	}
-	volumeID := ids.New().String()
 	plain := make([]byte, 200_000)
 	if _, err := rand.Read(plain); err != nil {
 		t.Fatalf("drawing a layer: %v", err)
@@ -136,7 +138,7 @@ func TestPublishPutsTheLayerWhereARecoveryWillLookForIt(t *testing.T) {
 	// And the bytes. Fetched with a key built the same way a recovery would build one,
 	// out of the wrapped material and nothing this test kept around.
 	keys, _ := w.keys.VolumeKeys(t.Context(), w.vol)
-	dek, err := w.kms.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID)
+	dek, err := w.kms.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID, uuid.MustParse(w.vol))
 	if err != nil {
 		t.Fatalf("unwrapping: %v", err)
 	}

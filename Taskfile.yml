@@ -506,6 +506,17 @@ tasks:
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/soak.sh
 
+  demo:stage4:
+    desc: >-
+      Stage 4 end to end: a guest writes and its Agent publishes, then the host is
+      destroyed — the process killed and its whole data directory deleted — and a rebuilt
+      machine with the same host id and an empty disk brings the volume back from the
+      object store alone. A guest then reads what a guest on a host that no longer exists
+      wrote. Needs `task db:dev:up`, KVM, and the pinned artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage4-demo.sh
+
   guest:kernel:pin:
     desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
     env: *guest_kernel_env

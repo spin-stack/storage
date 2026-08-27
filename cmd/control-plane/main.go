@@ -104,6 +104,7 @@ func run() error {
 		// point of that order is that an operator naming a host would override the one
 		// decision that makes a clone boot quickly.
 		cloneSnapshot = flag.String("clone-snapshot", "", "create a volume from this snapshot and exit, instead of serving")
+		deleteVolume  = flag.String("delete-volume", "", "crypto-shred this volume and exit: its wrapped DEK is deleted, which is what makes leaving its layers safe")
 
 		// rebuild-metadata: reconstruct the catalog from the bucket and exit (§22.5,
 		// INV-20). It is why descriptors are written at all — without it a lost
@@ -301,7 +302,20 @@ func run() error {
 		if lerr != nil {
 			return fmt.Errorf("-rebuild-metadata needs a Control Plane to be leading (start one first): %w", lerr)
 		}
-		sum, rerr := controlplane.RebuildMetadata(ctx, md, store, leader.Term)
+		// The KEK, and it is not optional here. A rebuild runs precisely when the catalog
+		// is gone, so whatever it copies out of the bucket becomes the *only* record of a
+		// volume's key material. A poisoned `dek_wrapped` recorded by a rebuild is
+		// permanent in a way the same object sitting in a bucket is not, which is why
+		// this path is the one that must unwrap every descriptor before believing it.
+		if *kekFile == "" {
+			return errors.New("-rebuild-metadata needs -kek-file: it verifies every descriptor's wrapped DEK before recording it, and cannot do that without the key that wraps them")
+		}
+		kek, kerr := readKEK(*kekFile)
+		if kerr != nil {
+			return kerr
+		}
+		sum, rerr := controlplane.RebuildMetadata(ctx, md, store,
+			crypto.NewDevKMS(kek, crypto.KEKID(kek)), leader.Term)
 		if rerr != nil {
 			return rerr
 		}
@@ -329,7 +343,7 @@ func run() error {
 			// against: whichever host it picks has to be one the fleet would have picked
 			// itself, or the two paths that add bytes to a device disagree about what a
 			// full device is.
-			placed, aerr := controlplane.Place(ctx, md,
+			placed, aerr := controlplane.Place(ctx, md, store,
 				placement.Policy{MaxOversubscription: *oversubscribe, MaxUsedRatio: *maxUsedRatio},
 				leader.Term, *attachVolume, *attachHost)
 			if aerr != nil {
@@ -379,12 +393,62 @@ func run() error {
 		return setCordon(ctx, md, leader.Term, host, state)
 	}
 
+	if *deleteVolume != "" {
+		leader, lerr := md.GetLeader(ctx)
+		if lerr != nil {
+			return fmt.Errorf("-delete-volume needs a Control Plane to be leading (start one first): %w", lerr)
+		}
+		// The KEK, because the descendant check unwraps before it believes a parent link:
+		// `parent_volume_id` is an unauthenticated field, and a forged descriptor claiming
+		// descent would otherwise block a real volume's shred for ever.
+		if *kekFile == "" {
+			return errors.New("-delete-volume needs -kek-file: it verifies which descriptors this fleet wrapped before deciding what descends from the volume")
+		}
+		dkek, kerr := readKEK(*kekFile)
+		if kerr != nil {
+			return kerr
+		}
+		shred, derr := controlplane.DeleteVolume(ctx, md, store,
+			crypto.NewDevKMS(dkek, crypto.KEKID(dkek)), leader.Term, *deleteVolume)
+		if derr != nil {
+			return derr
+		}
+		// Which of the two happened, said out loud. An operator who ran this to destroy
+		// data must not have to infer whether it was destroyed.
+		//
+		// Even the shred is qualified: objectstore.Delete is a reversible marker by design
+		// (INV-14), so the bytes stay until the bucket's lifecycle policy expires the
+		// non-current versions, and a deployment that has not configured one has not
+		// destroyed anything yet.
+		if shred.KeyDestroyed {
+			slog.Info("volume crypto-shredded: it held the last wrap of its key, which is now unreachable through this interface — its layers are noise once the bucket expires the descriptor's non-current versions",
+				"volume_id", *deleteVolume)
+			return nil
+		}
+		slog.Warn("volume removed, NOT shredded: it shares its key with a live relative, so every layer it published stays readable. Deleting the last member of the lineage is what destroys the key",
+			"volume_id", *deleteVolume, "key_shared_with", shred.SharedWith)
+		return nil
+	}
+
 	if *cloneSnapshot != "" {
 		leader, lerr := md.GetLeader(ctx)
 		if lerr != nil {
 			return fmt.Errorf("-clone-snapshot needs a Control Plane to be leading (start one first): %w", lerr)
 		}
+		// A clone re-wraps the shared DEK under its own volume id rather than copying its
+		// parent's ciphertext, so this path needs the KEK where it did not before. What a
+		// clone shares with its parent is the key *bytes* — which is what lets it read the
+		// parent's layers — and not the wrap: custody and access are two mechanisms, and
+		// only the first is what a swapped descriptor attacks.
+		if *kekFile == "" {
+			return errors.New("-clone-snapshot needs -kek-file: a clone re-wraps the volume's key under its own id")
+		}
+		ckek, kerr := readKEK(*kekFile)
+		if kerr != nil {
+			return kerr
+		}
 		vol, cerr := controlplane.Clone(ctx, md, store,
+			crypto.NewDevKMS(ckek, crypto.KEKID(ckek)), rand.Reader,
 			placement.Policy{MaxOversubscription: *oversubscribe, MaxUsedRatio: *maxUsedRatio},
 			telemetry.Recorder(), leader.Term, *cloneSnapshot, ids.New().String())
 		if cerr != nil {

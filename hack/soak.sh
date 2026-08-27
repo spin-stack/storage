@@ -31,7 +31,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 
-SOAK_DIR=${SOAK_DIR:-/tmp/soak-$(date -u +%Y%m%d-%H%M%S)}
+# Under _output and not /tmp. A soak runs for hours and its findings are the only thing it
+# produces; a /tmp cleaner took a run's worth of them once, which is a way of doing the
+# work and throwing the answer away. _output is gitignored and is where every other
+# artefact of this repository lives.
+SOAK_DIR=${SOAK_DIR:-$ROOT/_output/soak-$(date -u +%Y%m%d-%H%M%S)}
 SOAK_REF=${SOAK_REF:-HEAD}
 SOAK_SEEDS=${SOAK_SEEDS:-200}
 SOAK_ROUNDS=${SOAK_ROUNDS:-0} # 0 = until stopped
