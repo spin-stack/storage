@@ -108,12 +108,57 @@ func (r *fakeReconciler) Fence(_ context.Context, volumeIDs []string, why storag
 	return nil
 }
 
+// fakeWitness is the second signal: the epoch the object store records for a volume,
+// read over a path that does not run through the Control Plane.
+//
+// It records nothing and decides nothing. The two states worth setting are the two the
+// design turns on — an epoch that has moved (somebody else was granted the volume) and a
+// store that cannot be reached (this host cannot tell isolation from supersession).
+type fakeWitness struct {
+	mu     sync.Mutex
+	epochs map[string]int64
+	err    error
+}
+
+func newFakeWitness() *fakeWitness { return &fakeWitness{epochs: map[string]int64{}} }
+
+func (w *fakeWitness) GrantedEpoch(_ context.Context, volumeID string) (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return 0, w.err
+	}
+	e, ok := w.epochs[volumeID]
+	if !ok {
+		return 0, errNoEpochRecorded
+	}
+	return e, nil
+}
+
+func (w *fakeWitness) grant(volumeID string, epoch int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.epochs[volumeID] = epoch
+}
+
+func (w *fakeWitness) setErr(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.err = err
+}
+
+var (
+	errNoEpochRecorded  = errors.New("no epoch recorded for this volume")
+	errStoreUnreachable = errors.New("the object store is unreachable")
+)
+
 // leaseHarness is a real Loop on a simulated clock, against a Control Plane that can be
 // made to stop answering and a reconciler that records what it was told.
 type leaseHarness struct {
 	clk  *sim.Clock
 	cp   *fakeCP
 	rec  *fakeReconciler
+	wit  *fakeWitness
 	loop *agent.Loop
 }
 
@@ -122,17 +167,19 @@ func newLeaseHarness(t *testing.T) *leaseHarness {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	cp := newFakeCP(clk)
 	rec := newFakeReconciler()
+	wit := newFakeWitness()
 
 	loop, err := agent.New(testConfig(), agent.Deps{
 		Clock:        clk,
 		ControlPlane: cp,
 		Device:       fakeDevice{usage: disk.Usage{TotalBytes: 1 << 40, UsedBytes: 1 << 30}},
 		Volumes:      rec,
+		Witness:      wit,
 	})
 	if err != nil {
 		t.Fatalf("agent.New: %v", err)
 	}
-	return &leaseHarness{clk: clk, cp: cp, rec: rec, loop: loop}
+	return &leaseHarness{clk: clk, cp: cp, rec: rec, wit: wit, loop: loop}
 }
 
 // served is the set of volume ids this host would report as being served.
@@ -168,12 +215,29 @@ func (h *leaseHarness) desire(epoch int64) *storagev1.DesiredVolume {
 	return v
 }
 
-// TestAnExpiredLeaseStopsTheHostServing is the partitioned-Agent blocker.
+// A lapsed lease is one signal, and these three are the three things it can mean.
 //
-// The assertion is on what the host does and then on what the fleet is told, not on a
-// flag: a lease field that says "expired" next to a volume this host is still serving is
-// the bug this test exists to catch.
-func TestAnExpiredLeaseStopsTheHostServing(t *testing.T) {
+// # Why this stopped being "expiry stops the host"
+//
+// It used to. The argument was v5's and it was correct there: the Agent *was* the data
+// path, so a partitioned host kept ACKing flushes as durable while the fleet handed the
+// volume to somebody else, and two guests wrote one volume both believing their fsyncs
+// had landed. Nothing but the Agent itself could prevent that, so the Agent gave the
+// volume up the moment it could no longer confirm it owned it.
+//
+// v6 removed the premise. QEMU owns the local copy-on-write format; a FLUSH is its
+// fdatasync and claims local durability only, and what this system publishes is gated by
+// the compare-and-set on HEAD plus the epoch. **Nothing a superseded host writes can
+// enter the published history** — the fence is enforced at the resource, the way Ceph
+// blocklists a client at the OSDs rather than asking it to stop. What was left was the
+// cost with none of the benefit: a host that lost sight of the Control Plane for one TTL
+// stopped a tenant's VM over a partition nobody else had acted on.
+//
+// So a guest is stopped only on *confirmed* supersession, and a lapsed lease alone is not
+// that. The confirmation comes from the second path — `volumes/<id>/epoch`, written at
+// the grant — which is the same shape as vSphere HA refusing to declare a host dead on the
+// management network alone and requiring the datastore heartbeat to agree.
+func TestAConfirmedSupersessionStopsTheHostServing(t *testing.T) {
 	t.Parallel()
 	h := newLeaseHarness(t)
 	ctx := t.Context()
@@ -200,14 +264,15 @@ func TestAnExpiredLeaseStopsTheHostServing(t *testing.T) {
 		t.Fatalf("the volume was given up while the lease was still valid: served = %v", got)
 	}
 
-	// Past the TTL. The Control Plane's own fencing deadline is computed from the same
-	// TTL over a renewal it stamped at or after the instant this Agent anchored to, so
-	// from here on the volume may already have another writer.
+	// Past the TTL, and the second signal agrees: the bucket records a higher epoch than
+	// the one this host holds, which is the Control Plane having granted the volume to
+	// somebody else. That is the fact — not the silence — that stops the guest.
+	h.wit.grant(vol.GetVolumeId(), 2)
 	h.clk.Advance(2 * time.Second)
 	_ = h.loop.Reconcile(ctx)
 
 	if got := h.served(t); len(got) != 0 {
-		t.Fatalf("the host is still serving %v after its lease expired", got)
+		t.Fatalf("the host is still serving %v after the bucket said the volume was granted elsewhere", got)
 	}
 	if h.loop.LeaseValid() {
 		t.Fatal("the loop still reports a valid lease after its TTL passed")
@@ -225,8 +290,118 @@ func TestAnExpiredLeaseStopsTheHostServing(t *testing.T) {
 	if got.GetRefusal() != storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST {
 		t.Fatalf("the report for a volume this host gave up says refusal=%s, want LEASE_LOST", got.GetRefusal())
 	}
-	if !strings.Contains(got.GetRefusalDetail(), "lease") {
-		t.Fatalf("refusal detail = %q, and an operator has to be able to read why", got.GetRefusalDetail())
+	if !strings.Contains(got.GetRefusalDetail(), "epoch") {
+		t.Fatalf("refusal detail = %q, and an operator has to be able to read which signal stopped the guest", got.GetRefusalDetail())
+	}
+}
+
+// TestAnIsolatedHostKeepsServing is the tenant's side of the same partition.
+//
+// The lease has lapsed and the bucket says the volume is still this host's at the epoch
+// it holds. Nobody took it. Stopping the guest here costs a VM for a partition of the
+// management path alone, and buys nothing: this host is already unable to publish
+// anything the successor would have to reconcile with, because there is no successor.
+func TestAnIsolatedHostKeepsServing(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	vol := h.desire(1)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+	// The bucket agrees with what this host holds: epoch 1, granted to nobody since.
+	h.wit.grant(vol.GetVolumeId(), 1)
+
+	h.cp.setErr(errUnreachable)
+	h.clk.Advance(31 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+
+	if h.loop.LeaseValid() {
+		t.Fatal("the lease is reported valid past its TTL: the host must know it is degraded")
+	}
+	if got := h.served(t); len(got) != 1 {
+		t.Fatalf("an isolated host gave up %v; the bucket said nobody else was granted the volume", vol.GetVolumeId())
+	}
+
+	// And it keeps serving across cycles rather than surviving one and dying on the next.
+	for range 5 {
+		h.clk.Advance(time.Second)
+		_ = h.loop.Reconcile(ctx)
+	}
+	if got := h.served(t); len(got) != 1 {
+		t.Fatalf("the host gave the volume up after several cycles of isolation: served = %v", got)
+	}
+
+	// When the Control Plane comes back and the volume is still this host's, the lease
+	// re-arms and nothing had to be re-granted at a higher epoch to get there — which is
+	// the whole saving over giving up: a fence costs a promotion to undo.
+	h.cp.setErr(nil)
+	h.clk.Advance(time.Second)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the cycle after the partition healed failed: %v", err)
+	}
+	if !h.loop.LeaseValid() {
+		t.Fatal("the lease did not re-arm once the Control Plane answered again")
+	}
+	if got := h.served(t); len(got) != 1 {
+		t.Fatalf("served = %v after the partition healed, want the volume still being served", got)
+	}
+}
+
+// TestAHostThatCannotTellKeepsServing is the case the design does not resolve, asserted
+// so that it is a decision rather than an accident.
+//
+// Cut off from the Control Plane *and* the object store, this host cannot distinguish
+// isolation from supersession. It keeps the guest running, and the reason is that the
+// alternative is not safety: stopping is only correct in one of the two cases and is a
+// tenant's VM killed on a guess in the other, while the data in both is protected by the
+// compare-and-set this host cannot win if it has in fact been superseded.
+//
+// What is genuinely lost here is the successor's guest — nothing stops it from starting,
+// and this system has no equivalent of vSphere's datastore lock. That is the open half,
+// and it is not made better by stopping the wrong guest.
+func TestAHostThatCannotTellKeepsServing(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	h.desire(1)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+
+	h.cp.setErr(errUnreachable)
+	h.wit.setErr(errStoreUnreachable)
+	h.clk.Advance(31 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+
+	if got := h.served(t); len(got) != 1 {
+		t.Fatalf("a host that could reach neither the Control Plane nor the bucket gave up %v on a guess", got)
+	}
+}
+
+// TestAVolumeWithNoRecordedEpochIsNotGivenUp guards the reading of a *missing* answer.
+//
+// `volumes/<id>/epoch` is written at the grant, so a volume placed before that object
+// existed has none — and "no record" is not "granted to somebody else". Reading it as
+// supersession would stop every guest whose volume predates the object, on a partition.
+func TestAVolumeWithNoRecordedEpochIsNotGivenUp(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	h.desire(1) // and nothing is granted in the witness, so it answers "no record"
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+
+	h.cp.setErr(errUnreachable)
+	h.clk.Advance(31 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+
+	if got := h.served(t); len(got) != 1 {
+		t.Fatalf("a volume with no recorded epoch was read as granted elsewhere and given up: served = %v", got)
 	}
 }
 
@@ -305,6 +480,10 @@ func TestTheHostServesAgainOnceItsLeaseIsBack(t *testing.T) {
 		t.Fatalf("the first cycle failed: %v", err)
 	}
 	h.cp.setErr(errUnreachable)
+	// The precondition is a volume actually given up, which now takes both signals: the
+	// lease lapsing, and the bucket recording that the volume was granted to somebody
+	// else. The lapse alone leaves the host serving — that is TestAnIsolatedHostKeepsServing.
+	h.wit.grant(vol.GetVolumeId(), 2)
 	h.clk.Advance(31 * time.Second)
 	_ = h.loop.Reconcile(ctx)
 	if got := h.served(t); len(got) != 0 {

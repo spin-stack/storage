@@ -97,3 +97,21 @@ func ReadEpoch(ctx context.Context, store objectstore.Store, volumeID string) (i
 	}
 	return e.Epoch, nil
 }
+
+// EpochWitness answers what epoch the object store records for a volume.
+//
+// It exists so that the one caller that needs this over the object store — an Agent whose
+// lease has lapsed, deciding whether anybody actually took its volumes — depends on a
+// method and not on a package-level function it would have to be handed a store to call.
+// The interface it satisfies is declared where it is consumed (agent.Witness).
+//
+// A missing object answers ErrNoEpoch and not zero: "no record" and "granted at epoch 0"
+// are the same number and opposite facts, and the caller stops a guest on one of them.
+type EpochWitness struct {
+	Store objectstore.Store
+}
+
+// GrantedEpoch returns the epoch recorded for the volume.
+func (w EpochWitness) GrantedEpoch(ctx context.Context, volumeID string) (int64, error) {
+	return ReadEpoch(ctx, w.Store, volumeID)
+}

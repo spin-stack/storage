@@ -39,6 +39,7 @@ import (
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/publisher"
 	"github.com/spin-stack/storage/internal/qcow"
@@ -210,6 +211,11 @@ func run() (err error) {
 	var (
 		pub qcow.Publisher
 		rec qcow.Recovery = recovery.Absent{}
+		// wit is the second signal a lapsed lease is checked against, and it stays nil
+		// when there is no object store. That is the honest answer rather than a
+		// degraded one: with no second path an Agent cannot confirm that anybody took
+		// its volumes, and the loop keeps serving instead of stopping guests on silence.
+		wit agent.Witness
 	)
 	switch {
 	case storeFlags.Bucket == "" && storeFlags.Dir == "":
@@ -227,6 +233,7 @@ func run() (err error) {
 		paths := real.NewPaths()
 		pub = publisher.New(store, kms, keys, paths)
 		rec = recovery.New(root, *qemuImg, store, kms, keys, paths, real.NewRunner())
+		wit = descriptor.EpochWitness{Store: store}
 	}
 
 	volumes, err := qcow.New(ctx, qcow.Config{
@@ -261,6 +268,7 @@ func run() (err error) {
 		// disk's own answer and includes what other tenants of that filesystem occupy.
 		Device:   agent.NewDiskUsage(dataDisk),
 		Volumes:  volumes,
+		Witness:  wit,
 		Recorder: telemetry.Recorder(),
 	})
 	if err != nil {

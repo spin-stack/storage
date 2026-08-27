@@ -34,7 +34,6 @@
 # the virtio device, the interval map, the chunked image and the volume manager over them —
 # is withdrawn, so the comments that named a withdrawn mechanism inside it went with the
 # comments that named a live one.
-internal/agent/loop.go:Loop.giveUpOnExpiredLease:lease-gated # "This is not the lease-gated ACK that ADR-0026 withdrew and it is not being rebuilt", said where a reader would otherwise assume it
 internal/agent/loop.go:Loop.heartbeat:remote               # "The heartbeat used to carry the host's remote backlog" — past tense, and the next clause says what replaced it
 internal/agent/loop.go:Loop.heartbeat:uploader             # same sentence: "It went with the uploader (ADR-0026 increment 4.5)"
 internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:gc     # the trailing note listing §7's OperationKind (…|recovery|flatten|gc) as vocabulary that went with the operations table
@@ -65,7 +64,7 @@ internal/simio/real/s3.go:S3Store.Delete:gc                # "the object stays r
 internal/simio/real/s3.go:S3Store.Restore:gc               # quotes INV-14 ("a GC mistake costs a restore, not the data") as the argument this method's place on the production path rests on. The sweep that used to be named as the placer of the marker was corrected to Delete on 2026-08-11; what is left is the rule, and Restore is the half of it that runs
 
 # --- the lease is live; these say so about the right thing ----------------------------
-internal/agent/loop.go:Loop.giveUpOnExpiredLease:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use
+internal/agent/loop.go:Loop.giveUpWhatIsNoLongerOurs:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use
 internal/metadata/metadata.go:Store.Now:lease-valid          # about the Control Plane granting an epoch "while the old writer's monotonic lease is still valid" — mutual exclusion, the one part of fencing V1 keeps
 
 # --- naming a withdrawn mechanism to say it is gone, and two forward references --------

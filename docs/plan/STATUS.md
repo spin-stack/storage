@@ -34,37 +34,33 @@ tip a different file every time. Either launcher shape works: `-drive ...,if=vir
 the disk by a generated drive id, `-blockdev node-name=…` by its node, and `demo:stage2`
 boots the second so both are proven by something that runs.
 
-## The open question: what a lapsed lease should do
+## What a lapsed lease does
 
-**Fencing stops the guest, and all three ways in are treated the same.** They are not the
-same fact. A Control Plane that refused this host's report, and a compare-and-set that
-lost, are somebody else having taken the volume. A lease that lapsed on this host's own
-monotonic clock says only that the Control Plane is unreachable, and stopping a guest over
-it costs a tenant their VM for a partition nobody else acted on.
+**A guest is stopped only on confirmed supersession.** Three facts confirm it, and each is
+somebody who knows saying so: the Control Plane refusing this host's report, the
+compare-and-set on HEAD losing, and `volumes/<id>/epoch` recording a higher epoch than the
+one this host holds. The last is read over the object store — a path that does not run
+through the Control Plane, so it is still there when the Control Plane is not — and is the
+second signal vSphere HA gets from its datastore heartbeat.
 
-Comparable systems enforce the fence *at the resource* rather than asking the writer to
-stop — Ceph blocklists the client at the OSDs, SCSI-3 reservations are enforced by the
-array — and that fence already exists here: the CAS on `HEAD` plus the epoch check mean
-nothing a fenced host writes can enter the published history. vSphere HA refuses to act on
-one signal: *isolated* when the network stops, *dead* only when the datastore heartbeat
-agrees. The object store is that second path, and `volumes/<id>/epoch` moves at the grant
-rather than at the first publish.
+A lease that merely lapsed is *not* one of the three, and it used to be. That rule was
+v5's and was right there: the Agent was the data path, so a partitioned host ACKed flushes
+as durable while the fleet moved the volume. v6 removed the premise — QEMU owns the local
+format, a FLUSH claims local durability only, and nothing a superseded host writes can
+enter the history without winning a CAS it cannot win. What was left was the cost alone: a
+tenant's VM stopped for a partition nobody else had acted on.
 
-It was implemented once and reverted, and the reason is the useful part: §12.2's "a lapsed
-lease gives the device up" has three tests protecting it, and each variant that satisfied
-one broke another — they encode the rule being changed. It wants to be its own increment,
-with those tests as its subject. Genuinely unresolved: a host cut off from the Control
-Plane *and* the object store cannot tell isolation from supersession, and this design has
-no equivalent of vSphere's datastore lock to stop the successor's guest from starting.
+**Still unresolved, and now the whole of it:** a host that can reach neither the Control
+Plane nor the object store cannot tell isolation from supersession. It keeps serving. The
+data is safe either way, but nothing stops the successor's guest from starting, and this
+system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **What a lapsed lease should do** — the section above. It is first because it is the
-   only open question that decides whether a guest is stopped.
-2. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
+1. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
    sealed layer is unpublished" are in; `rpo_target` on `DesiredVolume` and a commit fired
    by age are not, and the upload-throughput half of the measurement is now possible.
-3. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
+2. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
    reconciler nor the rebuild has one. Also unproven: that a *detach* stops a running
    guest's volume, and what a chain whose directory vanished under it does.
 

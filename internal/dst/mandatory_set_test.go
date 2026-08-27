@@ -62,6 +62,8 @@ var pinnedMandatorySet = []string{
 	// core (scenarios.go)
 	"clock-drift-beyond-skew",
 	"network-partition",
+	// fencing (scenarios_fencing.go)
+	"an-isolated-host-keeps-its-guest",
 	// harness (scenarios_harness.go)
 	"restored-control-plane",
 }
