@@ -357,7 +357,7 @@ cmd_publish() {
 	fi
 
 	echo
-	echo "verifying, the way .github/workflows/ci.yml's guest-inputs job does:"
+	echo "verifying, the way .github/workflows/ci.yml's guest job does:"
 	local unpublished=0
 	if published "$kernel_image"; then
 		# Not just "the manifest resolves": pull the kernel back out of the registry into a
@@ -432,7 +432,7 @@ than into "not published".
 A pull request from a fork gets a token that cannot read a private package either; if
 forks must pass the gate, make both packages public.
 
-Then: any push runs .github/workflows/ci.yml, and its guest-inputs job stops failing.
+Then: any push runs .github/workflows/ci.yml, and its guest job stops failing.
 EOF
 }
 

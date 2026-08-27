@@ -1,5 +1,21 @@
 # ADR-0025 — the guest lane runs inside the published QEMU runtime image
 
+> **Amended 2026-08-27: the lane runs on an ordinary runner, and the principle survives
+> the mechanism.** The decision below is "a container job inside
+> `ghcr.io/<repo>/qemu:<version>`", and `.github/workflows/ci.yml`'s `guest` job is not
+> one. The reason is a constraint this ADR did not know about: the demos start the
+> development Postgres through Docker, and a container job gets no Docker daemon of its
+> own. Both cannot be had.
+>
+> What the ADR was actually protecting is **one definition of the dependency set**, and
+> that is intact. `task qemu:tools` computes the closure with `ldd` *inside the image* and
+> copies the loader with it, so the list is still `Dockerfile.qemu`'s and still moves when
+> the image does — the alternative this ADR refused, "install the runtime libraries on the
+> runner", is a second hand-written list and is still refused. The wrapper is a third
+> option the ADR did not consider, and it was not invented for this: it already carries
+> `qemu-img` to every lane, written after the first CI run this repository ever had died
+> on `liburing.so.2: cannot open shared object file`.
+>
 > **Amended 2026-08-05 (track B, `8c9d296`/`927f79d`): the decision stands, the skip is
 > reversed.** Running the lane *inside* `ghcr.io/<repo>/qemu:<version>` is unchanged and is
 > still right for the reason below — one definition of the dependency set, in

@@ -24,6 +24,8 @@ and carries none of the guest's bytes in the clear.
 deleted — and a rebuilt machine brings the volume back from the bucket alone, a guest
 reading bytes another guest wrote on a host that no longer exists.
 
+All four run in CI (`.github/workflows/ci.yml`'s `guest` job) and not only on a developer's
+machine — under TCG, from the mirrored kernel and the published QEMU.
 `integration/e2e` covers the same seams without a guest. The two diagrams at the root are
 generated from the `.dot` beside each one; `task diagrams:check` fails on a stale one.
 

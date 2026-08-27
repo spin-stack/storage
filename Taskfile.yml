@@ -608,12 +608,11 @@ tasks:
   # targets above, and a track log — and a procedure is what a human gets one step wrong
   # in. `guest:inputs:check` names every input; `guest:inputs:publish` does the whole thing
   # and proves it by resolving both refs the way `.github/workflows/ci.yml` resolves them.
-  # The name matches that workflow's `guest-inputs` job on purpose: the job that fails is
-  # the job this task exists to unblock.
-  # The two artefacts a guest needs: the pinned QEMU and the pinned kernel. No lane
-  # consumes them today — the lanes that booted a guest against this system's own
-  # vhost-user-blk backend went with that backend — and both are kept, pinned and
-  # publishable because Stage 1 boots QEMU against a qcow2 and needs exactly these.
+  # The two artefacts a guest needs: the pinned QEMU and the pinned kernel. `ci.yml`'s
+  # `guest` job consumes both, and it is the job these tasks exist to unblock — for a
+  # while nothing consumed them at all, because the lanes that booted a guest against this
+  # system's own vhost-user-blk backend went with that backend and the replacement lane
+  # took months to arrive.
   guest:inputs:check:
     desc: >-
       Name every input publishing the guest artefacts needs (gh, a token with
@@ -725,13 +724,16 @@ tasks:
 
   qemu:tools:
     desc: >-
-      Put the pinned qemu-img at _output/bin, extracting it from the published runtime
-      image when `task build:qemu` has not run here. Idempotent.
+      Put the pinned qemu-img, qemu-system-x86_64 and firmware under _output/, extracting
+      them from the published runtime image when `task build:qemu` has not run here.
+      Idempotent.
     status:
       # "it runs", not "the file is there". The two came apart once already: an extracted
       # binary whose libraries had not come with it is executable, and dies at exit 127 in
       # whatever lane first needs it — which was three e2e tests, not this task.
       - "{{.OUTPUT_DIR}}/bin/qemu-img --version"
+      - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64 --version"
+      - "test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin"
     cmds:
       # A second *source* for one artefact, not a second definition of the build —
       # the same shape hack/guest-kernel.sh already has for the kernel (a sibling
@@ -744,6 +746,7 @@ tasks:
       - |
         set -euo pipefail
         img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
+        BINARIES="qemu-img qemu-system-x86_64"
         command -v docker >/dev/null || {
           echo "no qemu-img at {{.OUTPUT_DIR}}/bin and no docker to fetch one — run: task build:qemu" >&2; exit 1; }
         docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img" || {
@@ -761,7 +764,17 @@ tasks:
         mkdir -p {{.OUTPUT_DIR}}/bin
         cid=$(docker create "$img")
         trap 'docker rm -f "$cid" >/dev/null' EXIT
-        docker cp -L "$cid":/usr/local/bin/qemu-img {{.OUTPUT_DIR}}/bin/qemu-img.real
+        # Two binaries and one firmware tree, because two different lanes need different
+        # halves and neither is worth a second task: an Agent needs qemu-img to create and
+        # inspect a chain, and the guest lane also needs a QEMU to boot and the firmware
+        # to boot *with* — pvh.bin above all, since a direct kernel boot has no entry
+        # point without it and fails as a rom-open error that reads like a backend bug.
+        for b in $BINARIES; do
+          docker cp -L "$cid":/usr/local/bin/"$b" {{.OUTPUT_DIR}}/bin/"$b".real
+        done
+        rm -rf {{.OUTPUT_DIR}}/share/spin-stack/qemu
+        mkdir -p {{.OUTPUT_DIR}}/share/spin-stack
+        docker cp "$cid":/usr/share/spin-stack/qemu {{.OUTPUT_DIR}}/share/spin-stack/qemu
 
         # And the libraries it links against, computed *inside the image* rather than
         # listed here. The binary is dynamically linked — liburing, libaio, glib — and
@@ -777,7 +790,8 @@ tasks:
         # no `=>`, and it is as much a part of what this binary needs as liburing is.
         rm -rf {{.OUTPUT_DIR}}/lib/qemu && mkdir -p {{.OUTPUT_DIR}}/lib/qemu
         for so in $(docker run --rm --entrypoint sh "$img" -c \
-              'ldd /usr/local/bin/qemu-img | sed -n -e "s|.*=> \(/[^ ]*\).*|\1|p" -e "s|^\t\(/[^ ]*\) (0x.*|\1|p"'); do
+              "for b in $BINARIES; do ldd /usr/local/bin/\$b; done" \
+              | sed -n -e "s|.*=> \(/[^ ]*\).*|\1|p" -e "s|^\t\(/[^ ]*\) (0x.*|\1|p" | sort -u); do
           # -L, because these are symlinks: /lib/x86_64-linux-gnu/liburing.so.2 points at
           # liburing.so.2.14 and /lib64/ld-linux-x86-64.so.2 points out of its own
           # directory. Copied as links they land dangling, and the failure that produces is
@@ -792,19 +806,21 @@ tasks:
         # binary's libc.so.6 loaded by whatever loader the host has, and those two are one
         # unit. Verified by running it on debian:12, whose glibc is older than the image's.
         ld=$(basename $(ls {{.OUTPUT_DIR}}/lib/qemu/ld-linux-*))
-        cat > {{.OUTPUT_DIR}}/bin/qemu-img <<WRAP
+        for b in $BINARIES; do
+          cat > {{.OUTPUT_DIR}}/bin/"$b" <<WRAP
         #!/bin/sh
-        # Generated by \`task qemu:tools\`. Runs the pinned qemu-img against the loader and
+        # Generated by \`task qemu:tools\`. Runs the pinned binary against the loader and
         # libraries extracted from the same image, so a host that has neither still works.
         here=\$(cd "\$(dirname "\$0")" && pwd)
         exec "\$here/../lib/qemu/$ld" --library-path "\$here/../lib/qemu" \\
-          "\$here/qemu-img.real" "\$@"
+          "\$here/$b.real" "\$@"
         WRAP
-        sed -i 's/^        //' {{.OUTPUT_DIR}}/bin/qemu-img
-        chmod +x {{.OUTPUT_DIR}}/bin/qemu-img
-        {{.OUTPUT_DIR}}/bin/qemu-img --version >/dev/null || {
-          echo "extracted qemu-img does not run on this host" >&2; exit 1; }
-        echo "extracted qemu-img, its loader and $(ls {{.OUTPUT_DIR}}/lib/qemu | wc -l) libraries from $img"
+          sed -i 's/^        //' {{.OUTPUT_DIR}}/bin/"$b"
+          chmod +x {{.OUTPUT_DIR}}/bin/"$b"
+          {{.OUTPUT_DIR}}/bin/"$b" --version >/dev/null || {
+            echo "extracted $b does not run on this host" >&2; exit 1; }
+        done
+        echo "extracted $BINARIES, their loader and $(ls {{.OUTPUT_DIR}}/lib/qemu | wc -l) libraries from $img"
 
   test:e2e:
     desc: >-
