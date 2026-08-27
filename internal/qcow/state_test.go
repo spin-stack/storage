@@ -249,6 +249,12 @@ func genState(rt *rapid.T, volumeID string) qcow.State {
 		// answer; JSON has only `null` for the second, so nil is what this asserts on.
 		commits = nil
 	}
+	// Zero is a distinct state — "this host has never committed this volume" — and it is
+	// the one the age trigger reads differently, so it is drawn rather than always set.
+	var lastCommitAt int64
+	if rapid.Bool().Draw(rt, "has_last_commit") {
+		lastCommitAt = int64(rapid.IntRange(1, 1<<42).Draw(rt, "last_commit_at"))
+	}
 	var pending *qcow.PendingCommit
 	if rapid.Bool().Draw(rt, "has_pending") {
 		pending = &qcow.PendingCommit{
@@ -284,6 +290,7 @@ func genState(rt *rapid.T, volumeID string) qcow.State {
 		FormatVersion: rapid.IntRange(0, 9).Draw(rt, "format_version"),
 		VolumeID:      volumeID,
 		Commits:       commits,
+		LastCommitAt:  lastCommitAt,
 		Pending:       pending,
 		Layers:        layers,
 		Fenced:        fenced,

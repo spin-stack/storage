@@ -268,14 +268,17 @@ type CapacityBound struct {
 
 // Volume is the durable-volume record (§8). Watermarks are informative (§5.8).
 type Volume struct {
-	VolumeID      string
-	SizeBytes     int64
-	BlockSize     int32
-	CurrentEpoch  int64
-	State         lifecycle.VolumeState
-	PrimaryHostID string
-	StandbyHostID string
-	ChainDepth    int32
+	VolumeID  string
+	SizeBytes int64
+	BlockSize int32
+	// RPOTargetSeconds is how far behind the object store this volume may fall before
+	// its host commits on age rather than on size (v6 §11). Zero is no age trigger.
+	RPOTargetSeconds int32
+	CurrentEpoch     int64
+	State            lifecycle.VolumeState
+	PrimaryHostID    string
+	StandbyHostID    string
+	ChainDepth       int32
 	// ParentSnapshotID is the snapshot this volume was cloned from (§20), empty for a
 	// volume that was created rather than cloned. ChainDepth says a chain exists; this
 	// says what is on the other end of it, which is what the clone's Agent needs to

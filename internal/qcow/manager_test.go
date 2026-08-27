@@ -108,6 +108,7 @@ type harness struct {
 	dialer *fakeDialer
 	disk   *sim.Disk
 	rec    *fakeRecovery
+	clk    *sim.Clock
 }
 
 func newHarness(t *testing.T) *harness {
@@ -147,10 +148,13 @@ func newHarnessWith(t *testing.T, d *sim.Disk, rotateAt int64, pub qcow.Publishe
 // start builds the Manager over whatever this harness already holds.
 func (h *harness) start(t *testing.T, rotateAt int64, pub qcow.Publisher) {
 	t.Helper()
+	if h.clk == nil {
+		h.clk = sim.NewClock(time.Unix(1_700_000_000, 0))
+	}
 	m, err := qcow.New(t.Context(), qcow.Config{
 		Root: root, QemuImg: "/qemu-img", ProbeTimeout: time.Second, RotateAtBytes: rotateAt,
 	}, qcow.Deps{
-		Clock:     sim.NewClock(time.Unix(0, 0)),
+		Clock:     h.clk,
 		Disk:      h.disk,
 		Runner:    h.runner,
 		Paths:     h.paths,
@@ -1266,5 +1270,85 @@ func TestRotationNamesTheDiskTheWayThisVMAllowsIt(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// withRPO is `active` plus v6 §11's age trigger.
+func withRPO(id string, epoch int64, rpo time.Duration) *storagev1.DesiredVolume {
+	d := active(id, epoch)
+	d.RpoTargetSeconds = int64(rpo.Seconds())
+	return d
+}
+
+// TestATipOlderThanItsRPOIsCommitted is the age trigger.
+//
+// The size trigger alone cannot keep an RPO: a volume whose guest writes a megabyte an
+// hour never reaches a threshold sized for upload cost, and everything it wrote sits on
+// one host until it does. Nothing reports that — the volume is healthy, the Agent is
+// doing what it was told — and the promise is broken silently, which is the only way this
+// class of promise ever breaks.
+func TestATipOlderThanItsRPOIsCommitted(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	// A tip well under the size threshold and over the "has been written to" floor.
+	tip := h.rotating(t, 2<<20)
+
+	// Inside the RPO: nothing happens, and that is as much of the rule as the trigger.
+	h.clk.Advance(4 * time.Minute)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withRPO(vol, 1, 5*time.Minute)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got != tip {
+		t.Fatalf("a tip inside its RPO was rotated to %q", got)
+	}
+
+	// Past it.
+	h.clk.Advance(2 * time.Minute)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withRPO(vol, 1, 5*time.Minute)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got == tip {
+		t.Fatalf("a tip older than its RPO was not rotated: still %q", got)
+	}
+}
+
+// TestAnIdleVolumeIsNotCommittedByAge is §11's first invariant against the new trigger.
+//
+// Time passes for a volume nobody writes to, so the age arm needs a condition the size
+// arm gets for free. Without it an idle volume seals an empty layer every RPO for ever,
+// and the number stops meaning what it says: a volume that wrote nothing is inside its
+// target, not behind it.
+func TestAnIdleVolumeIsNotCommittedByAge(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	// An untouched tip: a freshly created qcow2 is ~193 KiB of header and tables before a
+	// guest writes anything.
+	tip := h.rotating(t, 200<<10)
+
+	h.clk.Advance(2 * time.Hour)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withRPO(vol, 1, time.Minute)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got != tip {
+		t.Fatalf("an idle volume was rotated to %q after two hours of doing nothing", got)
+	}
+	if cmds := h.runner.commands(); len(cmds) != 0 {
+		t.Fatalf("an idle volume ran %v", cmds)
+	}
+}
+
+// TestAVolumeWithNoRPOIsNotCommittedByAge: the age trigger is a per-volume promise, and a
+// volume that carries none must behave exactly as it did before the trigger existed.
+func TestAVolumeWithNoRPOIsNotCommittedByAge(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 2<<20)
+
+	h.clk.Advance(24 * time.Hour)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got != tip {
+		t.Fatalf("a volume with no RPO was rotated by age to %q", got)
 	}
 }

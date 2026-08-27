@@ -86,6 +86,12 @@ func run() error {
 		seedHost   = flag.String("seed-host", "", "with -seed-volume: the host that will serve it (a UUIDv7)")
 		seedSize   = flag.Int64("seed-size", 1<<30, "with -seed-volume: capacity in bytes (a whole number of 512-byte sectors)")
 		seedBlock  = flag.Int("seed-block-size", 4096, "with -seed-volume: logical block size")
+		// Zero by default, and that is v6 §11 rather than an omission: the section
+		// forbids choosing an RPO instead of measuring one, and no measurement of upload
+		// throughput against a real object store has been made. Zero means the volume
+		// commits on the host's size threshold alone, which is what it did before this
+		// flag existed.
+		seedRPO = flag.Int("seed-rpo-seconds", 0, "with -seed-volume: commit the tip when it is this many seconds old even if it has not reached the size threshold (0 disables the age trigger)")
 		// One command needs it now. -flatten-volume and -delete-volume were the other
 		// two, and both were rewrites of a chunked image this system no longer produces
 		// — they went with it. Seeding still needs the key, because a volume's DEK is
@@ -271,9 +277,10 @@ func run() error {
 		// a no-op would be worse than removing it — an operator who passes it is told
 		// nothing, and believes they changed what a FLUSH means.
 		return seed(ctx, md, store, *kekFile, controlplane.VolumeSpec{
-			SizeBytes: *seedSize,
-			BlockSize: int32(*seedBlock),
-			HostID:    *seedHost,
+			SizeBytes:        *seedSize,
+			BlockSize:        int32(*seedBlock),
+			RPOTargetSeconds: int32(*seedRPO),
+			HostID:           *seedHost,
 		}, leader.Term)
 	}
 

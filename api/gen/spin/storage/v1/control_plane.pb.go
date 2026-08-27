@@ -661,8 +661,28 @@ type DesiredVolume struct {
 	// is that asymmetry.
 	PublishedSequence int64 `protobuf:"varint,10,opt,name=published_sequence,json=publishedSequence,proto3" json:"published_sequence,omitempty"`
 	DurableSequence   int64 `protobuf:"varint,11,opt,name=durable_sequence,json=durableSequence,proto3" json:"durable_sequence,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// rpo_target_seconds is how far behind the object store this volume is allowed to
+	// fall: the age at which the host seals its tip and commits it even though the tip
+	// has not reached the size threshold. Zero means the volume has no age trigger and
+	// commits on size alone.
+	//
+	// It is per volume and on the wire because it is a promise made to a tenant, and the
+	// Control Plane is the only party that knows what was promised — the size threshold
+	// next to it is the host's own affair (how much one layer costs to upload, how long a
+	// recovery takes) and is a process flag. Splitting them that way is v6 §11: an
+	// operator sizing a fleet and a tenant buying an RPO are setting different things.
+	//
+	// Seconds and not a Duration: the smallest RPO worth promising over an object store
+	// is measured in tens of seconds, and an integer that a human can read in a desired
+	// state dump is worth more here than a resolution nothing can deliver.
+	//
+	// It does not make an idle volume commit. §11's first invariant is that a volume
+	// nobody writes to does not produce layers, and the age trigger keeps it: the tip
+	// must also have grown past an empty image before age can fire it, so a volume that
+	// wrote nothing is *inside* its target rather than behind it.
+	RpoTargetSeconds int64 `protobuf:"varint,12,opt,name=rpo_target_seconds,json=rpoTargetSeconds,proto3" json:"rpo_target_seconds,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *DesiredVolume) Reset() {
@@ -761,6 +781,13 @@ func (x *DesiredVolume) GetPublishedSequence() int64 {
 func (x *DesiredVolume) GetDurableSequence() int64 {
 	if x != nil {
 		return x.DurableSequence
+	}
+	return 0
+}
+
+func (x *DesiredVolume) GetRpoTargetSeconds() int64 {
+	if x != nil {
+		return x.RpoTargetSeconds
 	}
 	return 0
 }
@@ -1282,7 +1309,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\x9c\x03\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xca\x03\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1296,7 +1323,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12-\n" +
 	"\x12published_sequence\x18\n" +
 	" \x01(\x03R\x11publishedSequence\x12)\n" +
-	"\x10durable_sequence\x18\v \x01(\x03R\x0fdurableSequenceJ\x04\b\x06\x10\a\"S\n" +
+	"\x10durable_sequence\x18\v \x01(\x03R\x0fdurableSequence\x12,\n" +
+	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\a\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +

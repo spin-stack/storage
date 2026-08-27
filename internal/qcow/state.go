@@ -108,6 +108,22 @@ type State struct {
 	// fleet corrects that — the refusal is a column nobody reconciles — so the fact has
 	// to outlive the process that learned it.
 	Fenced *Fencing `json:"fenced,omitempty"`
+	// LastCommitAt is when this host last published a commit for this volume, in
+	// milliseconds since the epoch on the injected clock. Zero means it never has, and
+	// the age trigger then measures from the moment the chain was opened.
+	//
+	// Durable, because the RPO is a promise about the volume and not about a process: a
+	// restart that reset the anchor would let a host that had not committed for an hour
+	// start a fresh hour, which is the failure the number exists to prevent — and it
+	// would be invisible, because every individual cycle after the restart is inside the
+	// target.
+	//
+	// Wall time and not monotonic, and that is the one thing here that can be wrong: a
+	// clock that steps backwards makes the tip look younger and delays a commit. It is
+	// the acceptable direction (the other is a commit storm on a clock that jumped
+	// forward), and nothing about writer safety reads this — §12.1's monotonic rule is
+	// about leases, not about when a layer is sealed.
+	LastCommitAt int64 `json:"last_commit_at,omitempty"`
 }
 
 // Fencing is the moment this host stopped being a volume's writer.

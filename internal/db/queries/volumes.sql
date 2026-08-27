@@ -12,11 +12,11 @@
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $14
 )
-INSERT INTO volumes (volume_id, size_bytes, block_size, current_epoch, state,
+INSERT INTO volumes (volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
                      chain_depth, parent_snapshot_id,
                      local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $4, $5, $6, $7, sqlc.arg(dek_key_id)::bigint, $8, $9, $10,
+SELECT $1, $2, $3, sqlc.arg(rpo_target_seconds)::int, $4, $5, $6, $7, sqlc.arg(dek_key_id)::bigint, $8, $9, $10,
        sqlc.narg(parent_snapshot_id)::uuid, $11, $12, $13
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The capacity bound, as a predicate of the write that places the volume
@@ -51,6 +51,10 @@ WHERE EXISTS (SELECT 1 FROM valid)
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       block_size = EXCLUDED.block_size,
+      -- Overwritten like block_size and not GREATEST-ed like the watermarks: an RPO is
+      -- a promise somebody set, and a lowered one is a promise being tightened. Keeping
+      -- the higher value would make a target impossible to reduce.
+      rpo_target_seconds = EXCLUDED.rpo_target_seconds,
       current_epoch = GREATEST(volumes.current_epoch, EXCLUDED.current_epoch),
       dek_wrapped = EXCLUDED.dek_wrapped,
       kek_id = EXCLUDED.kek_id,

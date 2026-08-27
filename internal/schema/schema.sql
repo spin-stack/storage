@@ -160,6 +160,22 @@ CREATE TABLE volumes (
     -- of what is addressed is part of the decision that spec puts to a human. Either
     -- way it is not this column.
     block_size         INTEGER NOT NULL,
+    -- rpo_target_seconds is how far behind the object store this volume may fall: the
+    -- age at which its host seals the tip and commits it even though the tip has not
+    -- reached the size threshold (v6 §11). Zero is no age trigger, and the volume then
+    -- commits on size alone.
+    --
+    -- It lives here and not in the Agent's configuration because it is a promise made
+    -- to one tenant, and the size threshold beside it is the host's own affair — how
+    -- much a single layer costs to upload, how long a recovery that downloads the chain
+    -- takes. An operator sizing a fleet and a tenant buying an RPO are setting different
+    -- things, and a fleet-wide flag cannot express the second.
+    --
+    -- DEFAULT 0 rather than a chosen number: §11 forbids picking a target instead of
+    -- measuring one, and no measurement of upload throughput against a real object store
+    -- has been made. Zero is the honest default — it says this volume was never sold an
+    -- RPO — and it is the one value that cannot silently under-deliver.
+    rpo_target_seconds INTEGER NOT NULL DEFAULT 0 CHECK (rpo_target_seconds >= 0),
     current_epoch      BIGINT NOT NULL DEFAULT 0,
     state              TEXT NOT NULL                                  -- §7 failover states
                          CHECK (state IN ('ACTIVE', 'PRIMARY_SUSPECTED', 'FENCING_WAIT',

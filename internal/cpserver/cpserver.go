@@ -171,6 +171,9 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			// authority that cannot distinguish the two cases, the bucket.
 			PublishedSequence: v.PublishedSequence,
 			DurableSequence:   v.DurableSequence,
+			// The age trigger (v6 §11). Zero is a volume that was never sold an RPO and
+			// commits on the host's size threshold alone; the Agent reads it that way.
+			RpoTargetSeconds: int64(v.RPOTargetSeconds),
 		}
 		// A clone reads through its parent's objects (§20), and the Agent cannot look
 		// the chain up itself (ADR-0021). The parent's *volume* id lives on the

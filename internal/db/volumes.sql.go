@@ -95,12 +95,12 @@ const createVolume = `-- name: CreateVolume :execrows
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $14
 )
-INSERT INTO volumes (volume_id, size_bytes, block_size, current_epoch, state,
+INSERT INTO volumes (volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
                      chain_depth, parent_snapshot_id,
                      local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $4, $5, $6, $7, $15::bigint, $8, $9, $10,
-       $16::uuid, $11, $12, $13
+SELECT $1, $2, $3, $15::int, $4, $5, $6, $7, $16::bigint, $8, $9, $10,
+       $17::uuid, $11, $12, $13
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The capacity bound, as a predicate of the write that places the volume
   -- (ADR-0017). A clone admitted by a pure placement.Choose against a fleet read
@@ -124,16 +124,20 @@ WHERE EXISTS (SELECT 1 FROM valid)
   -- A bound naming a host nobody registered admits nothing: the view has no row for
   -- it, the scalar subquery is NULL, and a NULL comparison admits no write. The
   -- EXISTS says so explicitly rather than leaving it to be re-derived by the reader.
-  AND ($17::uuid IS NULL
+  AND ($18::uuid IS NULL
        OR (EXISTS (SELECT 1 FROM hosts
-                    WHERE host_id = $17::uuid
-                      AND nvme_used_bytes <= $18::bigint)
+                    WHERE host_id = $18::uuid
+                      AND nvme_used_bytes <= $19::bigint)
            AND (SELECT c.committed_bytes FROM host_committed_bytes c
-                 WHERE c.host_id = $17::uuid)
-               + $19::bigint <= $20::bigint))
+                 WHERE c.host_id = $18::uuid)
+               + $20::bigint <= $21::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       block_size = EXCLUDED.block_size,
+      -- Overwritten like block_size and not GREATEST-ed like the watermarks: an RPO is
+      -- a promise somebody set, and a lowered one is a promise being tightened. Keeping
+      -- the higher value would make a target impossible to reduce.
+      rpo_target_seconds = EXCLUDED.rpo_target_seconds,
       current_epoch = GREATEST(volumes.current_epoch, EXCLUDED.current_epoch),
       dek_wrapped = EXCLUDED.dek_wrapped,
       kek_id = EXCLUDED.kek_id,
@@ -167,6 +171,7 @@ type CreateVolumeParams struct {
 	DurableSequence   int64       `json:"durable_sequence"`
 	PublishedSequence int64       `json:"published_sequence"`
 	Term              int64       `json:"term"`
+	RpoTargetSeconds  int32       `json:"rpo_target_seconds"`
 	DekKeyID          int64       `json:"dek_key_id"`
 	ParentSnapshotID  pgtype.UUID `json:"parent_snapshot_id"`
 	BoundHost         pgtype.UUID `json:"bound_host"`
@@ -201,6 +206,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.DurableSequence,
 		arg.PublishedSequence,
 		arg.Term,
+		arg.RpoTargetSeconds,
 		arg.DekKeyID,
 		arg.ParentSnapshotID,
 		arg.BoundHost,
@@ -275,7 +281,7 @@ func (q *Queries) DeleteVolume(ctx context.Context, arg DeleteVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -285,6 +291,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.VolumeID,
 		&i.SizeBytes,
 		&i.BlockSize,
+		&i.RpoTargetSeconds,
 		&i.CurrentEpoch,
 		&i.State,
 		&i.PrimaryHostID,
@@ -309,7 +316,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumes = `-- name: ListVolumes :many
-SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
 `
 
 // Every volume, placed or not, for a human reading the catalog. The volumes with a
@@ -333,6 +340,7 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 			&i.VolumeID,
 			&i.SizeBytes,
 			&i.BlockSize,
+			&i.RpoTargetSeconds,
 			&i.CurrentEpoch,
 			&i.State,
 			&i.PrimaryHostID,
@@ -364,7 +372,7 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, block_size, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -381,6 +389,7 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.VolumeID,
 			&i.SizeBytes,
 			&i.BlockSize,
+			&i.RpoTargetSeconds,
 			&i.CurrentEpoch,
 			&i.State,
 			&i.PrimaryHostID,

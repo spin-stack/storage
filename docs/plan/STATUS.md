@@ -57,10 +57,7 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **The age trigger and §11's defaults.** The size trigger and "nothing rotates while a
-   sealed layer is unpublished" are in; `rpo_target` on `DesiredVolume` and a commit fired
-   by age are not, and the upload-throughput half of the measurement is now possible.
-2. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
+1. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
    reconciler nor the rebuild has one. Also unproven: that a *detach* stops a running
    guest's volume, and what a chain whose directory vanished under it does.
 
@@ -77,6 +74,11 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Thin paths that shipped without being deepened
 
+- **No RPO is set anywhere.** The age trigger is in and per-volume
+  (`volumes.rpo_target_seconds` → `DesiredVolume`), and every volume carries zero: §11
+  forbids choosing a target instead of measuring one, and no upload-throughput measurement
+  against a real object store has been made. Until one is, every volume commits on size
+  alone and `-seed-rpo-seconds` is the only way to set one.
 - **Rotation and publishing have no production default.** `-rotate-at-bytes` is 0 and no
   object store is required, so an Agent started without both seals nothing and publishes
   nothing — loudly, in one WARN line. §11 forbids choosing the threshold instead of

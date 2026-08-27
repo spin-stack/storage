@@ -476,7 +476,8 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	rows, err := s.placing(ctx, bound, func(q *db.Queries) (int64, error) {
 		return q.CreateVolume(ctx, db.CreateVolumeParams{
 			VolumeID: id, SizeBytes: v.SizeBytes,
-			BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
+			BlockSize: v.BlockSize, RpoTargetSeconds: v.RPOTargetSeconds,
+			CurrentEpoch: v.CurrentEpoch, State: v.State.String(),
 			DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
 			ParentSnapshotID: parentSnap,
 			PrimaryHostID:    primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
@@ -510,7 +511,8 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 	}
 	return metadata.Volume{
 		VolumeID: v.VolumeID.String(), SizeBytes: v.SizeBytes,
-		BlockSize: v.BlockSize, CurrentEpoch: v.CurrentEpoch, State: state,
+		BlockSize: v.BlockSize, RPOTargetSeconds: v.RpoTargetSeconds,
+		CurrentEpoch: v.CurrentEpoch, State: state,
 		PrimaryHostID: fromNullUUID(v.PrimaryHostID), StandbyHostID: fromNullUUID(v.StandbyHostID),
 		ChainDepth: v.ChainDepth, ParentSnapshotID: fromNullUUID(v.ParentSnapshotID),
 		DEKWrapped: v.DekWrapped, KEKID: v.KekID,

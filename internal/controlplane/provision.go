@@ -25,6 +25,11 @@ type VolumeSpec struct {
 	SizeBytes int64
 	// BlockSize is the logical block size reported to the guest.
 	BlockSize int32
+	// RPOTargetSeconds is how far behind the object store this volume may fall before
+	// its host commits on age rather than size (v6 §11). Zero means no age trigger, and
+	// it is the default deliberately: §11 forbids choosing a target instead of measuring
+	// one, and zero is the only value that cannot silently under-deliver a promise.
+	RPOTargetSeconds int32
 	// HostID is the host that will serve it. Placement is deliberately explicit: the
 	// placement package chooses when there is a fleet to choose from, and a spec that
 	// names no host is one no Agent will ever see (GetDesiredState filters by
@@ -114,15 +119,16 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 	}
 
 	vol := metadata.Volume{
-		VolumeID:      volumeID,
-		SizeBytes:     spec.SizeBytes,
-		BlockSize:     spec.BlockSize,
-		CurrentEpoch:  1,
-		State:         lifecycle.VolumeActive,
-		PrimaryHostID: spec.HostID,
-		DEKWrapped:    wrapped,
-		KEKID:         p.kms.KEKID(),
-		DEKKeyID:      dek.KeyID,
+		VolumeID:         volumeID,
+		SizeBytes:        spec.SizeBytes,
+		BlockSize:        spec.BlockSize,
+		RPOTargetSeconds: spec.RPOTargetSeconds,
+		CurrentEpoch:     1,
+		State:            lifecycle.VolumeActive,
+		PrimaryHostID:    spec.HostID,
+		DEKWrapped:       wrapped,
+		KEKID:            p.kms.KEKID(),
+		DEKKeyID:         dek.KeyID,
 	}
 	if err := p.md.CreateVolume(ctx, term, vol, nil); err != nil {
 		return ProvisionedVolume{}, fmt.Errorf("creating the volume row: %w", err)
@@ -151,6 +157,13 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 func (s VolumeSpec) validate() error {
 	if s.HostID == "" {
 		return errors.New("controlplane: a volume needs a host: GetDesiredState filters on primary_host_id, so an unplaced volume is one no Agent is ever told about")
+	}
+	// A negative RPO is refused here rather than clamped. The column has the same CHECK,
+	// and the difference between the two is which caller learns: a clamp turns "minus one
+	// hour" into a volume with no age trigger at all, silently, and the operator who
+	// typed it goes on believing they bought one.
+	if s.RPOTargetSeconds < 0 {
+		return fmt.Errorf("controlplane: an RPO target of %ds is not a duration", s.RPOTargetSeconds)
 	}
 	return geometry(s.SizeBytes, s.BlockSize)
 }

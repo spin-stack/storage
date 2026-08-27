@@ -188,6 +188,14 @@ type volume struct {
 	// unpublished, so a host that cannot reach S3 grows one tip and holds one sealed
 	// layer rather than a chain of small ones that are each a commit that never landed.
 	pending *SealedLayer
+	// rpo is this volume's age trigger, from the desired state. Zero is a volume with
+	// no RPO promise, which commits on size alone.
+	rpo time.Duration
+	// openedAt is when this process opened the chain, in milliseconds on the injected
+	// clock. It is the age trigger's anchor for a volume that has never committed, and
+	// it is deliberately not durable: a volume with no commits has nothing to be late
+	// against, and the first commit replaces it with the durable one.
+	openedAt int64
 }
 
 // New validates the wiring, claims the data directory, and returns a Manager.
@@ -383,6 +391,10 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	// this host a token the fleet has already moved past, which is the whole failure the
 	// epoch exists to prevent. The higher number is kept and the volume goes on being
 	// served under it.
+	// The RPO is re-read every cycle rather than latched at attach: it is a promise the
+	// Control Plane can change under a running volume, and a host that only read it once
+	// would keep a tenant on the target they bought last month.
+	v.rpo = time.Duration(d.GetRpoTargetSeconds()) * time.Second
 	if e := d.GetEpoch(); e > v.epoch {
 		v.epoch = e
 	} else if e < v.epoch {
@@ -477,6 +489,9 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 			v.pending = nil
 		}
 		v.chain = chain
+		if v.openedAt == 0 {
+			v.openedAt = m.clk.Wall().UnixMilli()
+		}
 		v.refusal, v.detail = storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""
 		v.attached = attached
 		slog.Info("volume ready: the chain is prepared and this is where the VM attaches to it",
@@ -806,6 +821,7 @@ func (m *Manager) recordCommit(v *volume, layer SealedLayer) error {
 	}
 	st.Pending = nil
 	st.Commits = append(st.Commits, CommitLayer{CommitID: layer.CommitID, LayerID: layer.LayerID})
+	st.LastCommitAt = m.clk.Wall().UnixMilli()
 	// Everything under a published layer is published with it, so nothing older is ever
 	// a question again. Without this the list would grow by one entry per rotation for
 	// the life of the volume, for a fact that is only ever asked about the top of it.
@@ -813,19 +829,71 @@ func (m *Manager) recordCommit(v *volume, layer SealedLayer) error {
 	return WriteState(m.paths, m.cfg.Root, v.id, st)
 }
 
-// maybeRotate applies v6 §11's size trigger.
+// maybeRotate applies v6 §11's two triggers: size, which the host sets, and age, which
+// the volume carries from the Control Plane as its RPO.
+//
+// Either fires a rotation, and they answer different questions. Size bounds what a host
+// can lose control of on its own — how much one layer costs to upload, how long a
+// recovery that downloads this chain takes — and applies to every volume this Agent
+// serves. Age is a promise to one tenant about how far behind the bucket their volume may
+// fall, and a volume with no promise has no age trigger.
+//
+// § 11's first invariant survives both: an idle volume does not commit. The size arm gets
+// it for free — a tip nobody writes to does not grow. The age arm needs the extra
+// condition below, because time passes for an idle volume too, and without it a volume
+// that wrote nothing would seal an empty layer every RPO for ever and the number would
+// stop meaning what it says: a volume that wrote nothing is *inside* its target, not
+// behind it.
 func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
-	if m.cfg.RotateAtBytes <= 0 || v.pending != nil {
+	if v.pending != nil {
+		return nil
+	}
+	if m.cfg.RotateAtBytes <= 0 && v.rpo <= 0 {
 		return nil
 	}
 	size, err := m.paths.Size(v.chain.Active)
 	if err != nil {
 		return fmt.Errorf("qcow: measuring the tip %s: %w", v.chain.Active, err)
 	}
-	if size < m.cfg.RotateAtBytes {
+	if m.cfg.RotateAtBytes > 0 && size >= m.cfg.RotateAtBytes {
+		return m.rotate(ctx, v, size)
+	}
+	if v.rpo <= 0 {
 		return nil
 	}
+	// minRotateAtBytes is what "has been written to" means here, and it is the same
+	// constant the size trigger is floored by for the same reason: a freshly created
+	// qcow2 is already ~193 KiB of header, L1 table and refcount blocks before a guest
+	// writes a byte, so "larger than zero" is true of every tip that ever existed.
+	if size < minRotateAtBytes {
+		return nil
+	}
+	age, err := m.tipAge(v)
+	if err != nil || age < v.rpo {
+		return err
+	}
+	slog.Info("committing on age: this volume's tip has been unpublished for longer than its RPO",
+		"volume_id", v.id, "age_s", age.Seconds(), "rpo_s", v.rpo.Seconds(), "tip_bytes", size)
 	return m.rotate(ctx, v, size)
+}
+
+// tipAge is how long it has been since this host published a commit for the volume, or
+// since the chain was opened when it never has.
+//
+// Anchoring an uncommitted volume at the chain's opening rather than at zero is what
+// stops a volume that has never committed from being infinitely late: measured from the
+// epoch it would rotate on its first cycle, which is an empty-ish layer published for a
+// volume whose guest may not have booted yet.
+func (m *Manager) tipAge(v *volume) (time.Duration, error) {
+	st, err := ReadState(m.paths, m.cfg.Root, v.id)
+	if err != nil {
+		return 0, err
+	}
+	since := st.LastCommitAt
+	if since == 0 {
+		since = v.openedAt
+	}
+	return time.Duration(m.clk.Wall().UnixMilli()-since) * time.Millisecond, nil
 }
 
 // rotate seals the tip through the QEMU that is writing to it.

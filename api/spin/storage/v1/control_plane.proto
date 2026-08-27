@@ -207,6 +207,27 @@ message DesiredVolume {
   // is that asymmetry.
   int64 published_sequence = 10;
   int64 durable_sequence = 11;
+
+  // rpo_target_seconds is how far behind the object store this volume is allowed to
+  // fall: the age at which the host seals its tip and commits it even though the tip
+  // has not reached the size threshold. Zero means the volume has no age trigger and
+  // commits on size alone.
+  //
+  // It is per volume and on the wire because it is a promise made to a tenant, and the
+  // Control Plane is the only party that knows what was promised — the size threshold
+  // next to it is the host's own affair (how much one layer costs to upload, how long a
+  // recovery takes) and is a process flag. Splitting them that way is v6 §11: an
+  // operator sizing a fleet and a tenant buying an RPO are setting different things.
+  //
+  // Seconds and not a Duration: the smallest RPO worth promising over an object store
+  // is measured in tens of seconds, and an integer that a human can read in a desired
+  // state dump is worth more here than a resolution nothing can deliver.
+  //
+  // It does not make an idle volume commit. §11's first invariant is that a volume
+  // nobody writes to does not produce layers, and the age trigger keeps it: the tip
+  // must also have grown past an empty image before age can fire it, so a volume that
+  // wrote nothing is *inside* its target rather than behind it.
+  int64 rpo_target_seconds = 12;
 }
 
 message GetDesiredStateResponse {

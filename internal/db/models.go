@@ -59,6 +59,7 @@ type Volume struct {
 	VolumeID          uuid.UUID          `json:"volume_id"`
 	SizeBytes         int64              `json:"size_bytes"`
 	BlockSize         int32              `json:"block_size"`
+	RpoTargetSeconds  int32              `json:"rpo_target_seconds"`
 	CurrentEpoch      int64              `json:"current_epoch"`
 	State             string             `json:"state"`
 	PrimaryHostID     pgtype.UUID        `json:"primary_host_id"`
