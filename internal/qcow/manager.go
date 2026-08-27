@@ -335,6 +335,18 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 		if live[id] {
 			continue
 		}
+		// The guest goes first, and this half was missing. A volume leaving the desired
+		// state is this host being told it is not the writer any more — a detach, a
+		// promotion, a volume moved to FENCING_WAIT — and forgetting it in memory while
+		// QEMU stays attached is the same half-measure Fence had before it learned to
+		// stop the guest: every byte written from here lands in a chain nothing will ever
+		// publish, and the guest is told each one succeeded.
+		//
+		// It costs nothing in the ordinary case. A volume released because its VM was
+		// shut down has no QEMU at its socket, and stopGuest returns silently on
+		// ErrNoEndpoint; the only volume this acts on is one that still has a guest
+		// writing to it, which is precisely the one it must act on.
+		m.stopGuest(id)
 		// Released, not deleted. The files stay: local persistence is what Stage 1 is,
 		// a volume leaves the desired state for reasons that reverse (a promotion, a
 		// detach, a fleet decision made a second ago), and this Agent is not the
@@ -442,6 +454,28 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 		if filepath.Dir(filepath.Clean(open)) != filepath.Clean(LayersDir(m.cfg.Root, id)) {
 			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED,
 				fmt.Errorf("%w: it has %q open, which is not a layer of volume %s", ErrForeignImage, open, id))
+		}
+		// And it still has a name. QEMU reports the path it opened, not whether that path
+		// still resolves: unlink a running guest's layer directory — an operator
+		// reclaiming space, a stray cleanup, a filesystem that came back empty — and the
+		// guest keeps reading and writing the open inode while nothing on disk carries
+		// its bytes. Everything downstream reads `live` as "the tip exists and QEMU holds
+		// it", and the one that matters is Open's live branch, which returns that image
+		// without touching it (v6 §5) and hands back a chain of files that are not there.
+		//
+		// A stat is not "touching" in §5's sense — it takes no lock and opens nothing —
+		// and it is the whole difference between refusing this volume and preparing a
+		// second, empty chain under the same id while the first is still being written
+		// to. Whichever of the two were published would be missing the other's writes,
+		// with no error anywhere.
+		//
+		// The guest is deliberately *not* stopped. Nobody else owns this volume, so this
+		// is not supersession, and the same rule applies as to a lapsed lease: a guest is
+		// stopped only when somebody who knows says the volume is not ours. Its bytes are
+		// still in the open inode, which is where an operator can still reach them.
+		if _, err := m.paths.Size(open); err != nil {
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
+				fmt.Errorf("the VM has %s open and that path no longer exists, so this volume's layers were removed under a running guest; nothing here can name its bytes and no new chain will be prepared under it: %w", open, err))
 		}
 		live = open
 	}
@@ -853,7 +887,18 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	}
 	size, err := m.paths.Size(v.chain.Active)
 	if err != nil {
-		return fmt.Errorf("qcow: measuring the tip %s: %w", v.chain.Active, err)
+		// A tip that cannot be stat'd is not a measurement that failed, it is a layer
+		// that is not there: somebody unlinked this volume's layers while a guest was
+		// writing to them. QEMU keeps the open inode and the guest never notices, so
+		// until this refused, the only sign was one error per cycle from a function whose
+		// name says "rotate" — and the volume went on being reported as served.
+		//
+		// IMAGE_MISSING and not a bare error, because the two differ in what an operator
+		// does next: this refusal's own proto comment sends them to look at the bucket,
+		// which is where the volume's published history is and the only place its bytes
+		// can now come back from.
+		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
+			fmt.Errorf("this volume's tip %s cannot be stat'd, so its layers were removed under it; a guest holding the open file goes on writing bytes nothing here can name: %w", v.chain.Active, err))
 	}
 	if m.cfg.RotateAtBytes > 0 && size >= m.cfg.RotateAtBytes {
 		return m.rotate(ctx, v, size)

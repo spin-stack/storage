@@ -204,6 +204,14 @@ jobs:
       - name: The guest lane's inputs
         run: task guest:verify
 
+      # The demos run the real control-plane binary against a real Postgres, which is the
+      # point of them — the catalog is where placement, epochs and the term guard live, and
+      # a stage that stubbed it would be asserting on a stub. `task db:dev:up` starts the
+      # same pinned container a developer runs, so there is one definition of it rather
+      # than a `services:` block that would be a second.
+      - name: The pinned development Postgres
+        run: task db:dev:up
+
       - name: Stage 1 — a guest boots off a qcow2 this system made
         run: task demo:stage1
 

@@ -59,9 +59,9 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **DST for recovery and rotation.** Four scenarios and two checkers exist; neither the
-   reconciler nor the rebuild has one. Also unproven: that a *detach* stops a running
-   guest's volume, and what a chain whose directory vanished under it does.
+1. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
+   while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
+   implementation of it. They belong in `internal/qcow`'s adversary lane.
 
 ## What the demolition left owed
 

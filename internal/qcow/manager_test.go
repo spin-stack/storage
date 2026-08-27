@@ -51,6 +51,10 @@ func (d *fakeDialer) Dial(_ context.Context, path string) (io.ReadWriteCloser, e
 	return c, nil
 }
 
+// reset forgets the connections made so far, so an assertion can be about one cycle
+// rather than about every cycle since the harness was built.
+func (d *fakeDialer) reset() { d.conns, d.dialed = nil, nil }
+
 // sent is everything every connection carried to QEMU. Rotation is asserted on this and
 // not on the files: a Manager that moved the pointer and never told QEMU to switch would
 // satisfy every filesystem assertion and leave the guest writing to a sealed layer.
@@ -1350,5 +1354,104 @@ func TestAVolumeWithNoRPOIsNotCommittedByAge(t *testing.T) {
 	}
 	if got := h.tip(t); got != tip {
 		t.Fatalf("a volume with no RPO was rotated by age to %q", got)
+	}
+}
+
+// TestADetachStopsTheGuestStillWritingToTheVolume.
+//
+// A volume leaving the desired state is this host being told it is not the volume's
+// writer any more — a detach, a promotion, a fleet decision. Releasing it in memory and
+// leaving QEMU attached is the same half-measure fencing had before Fence learned to stop
+// the guest: every byte written from here lands in a chain nothing will ever publish, and
+// the guest is told each one succeeded.
+//
+// It is asserted on QMP and not on the map, because the map is the part that was already
+// right. The whole defect is a volume correctly forgotten by an Agent whose QEMU is still
+// writing to it.
+func TestADetachStopsTheGuestStillWritingToTheVolume(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	h.rotating(t, 1<<20) // served, with a VM attached at its socket
+	h.dialer.reset()
+
+	// The volume leaves the desired state entirely, which is what a detach looks like to
+	// an Agent: it is simply not listed any more.
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{}); err != nil {
+		t.Fatalf("applying an empty desired state: %v", err)
+	}
+
+	if _, held := h.volumes(t)[vol]; held {
+		t.Fatalf("the volume is still being served after it left the desired state")
+	}
+	if sent := h.dialer.sent(); !strings.Contains(sent, `"execute":"stop"`) {
+		t.Fatalf("the guest was left writing to a volume this host stopped serving; QMP saw: %s", sent)
+	}
+}
+
+// TestAChainWhoseDirectoryVanishedIsRefusedAndNotRebuiltUnderTheGuest.
+//
+// Somebody rm -rf'd the volume's layers while a guest was writing to them: an operator
+// reclaiming space, a stray cleanup, a filesystem that came back empty after a crash. The
+// files are gone and QEMU still holds open descriptors to them, so the guest goes on
+// reading and writing bytes that have no name any more.
+//
+// The wrong answer is to notice the absence and prepare a fresh chain, which is what
+// "make the desired state true" reads like from inside a reconciler. That hands the same
+// volume id a second, empty chain while the first one is still being written to through
+// the open descriptors, and whichever is published is missing the other's writes with no
+// error anywhere. The volume is refused instead, loudly, and the refusal names the bucket
+// rather than the code: it is IMAGE_MISSING, whose own proto comment tells an operator to
+// go and look there.
+func TestAChainWhoseDirectoryVanishedIsRefusedAndNotRebuiltUnderTheGuest(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 1<<20)
+
+	// The layers go, and so does the pointer that names the tip — that is what removing
+	// the directory does. The QMP script stays: QEMU is unaffected by a file being
+	// unlinked under it and answers exactly as before.
+	h.paths.remove(tip)
+	h.paths.remove(qcow.ActivePointer(root, vol))
+
+	// The Agent restarts, because that is what makes this the interesting case: an Agent
+	// that still holds the chain in memory is not being asked the question.
+	h2 := h.restart(t, 8<<20, nil)
+	_ = h2.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)})
+
+	got := h2.volumes(t)[vol]
+	if got.Refusal == storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("a volume whose layers vanished is being served as if nothing happened: %+v", got)
+	}
+	if got.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING {
+		t.Fatalf("refusal = %s, want IMAGE_MISSING — the operator's next move is to look in the bucket", got.Refusal)
+	}
+	if strings.Contains(strings.Join(h2.runner.commands(), " "), "create") {
+		t.Fatalf("a fresh chain was created under a guest still writing to the old one: %v", h2.runner.commands())
+	}
+}
+
+// TestAVanishedTipIsNoticedWithNoRotationConfigured is the same disappearance on an Agent
+// that rotates nothing — `-rotate-at-bytes 0` and no RPO, which is what `demo:stage1`
+// runs and what an Agent with no object store has.
+//
+// It is a separate case because the two checks that can notice sit on different paths:
+// one measures the tip when deciding whether to rotate, and never runs here, and the
+// other stats what QEMU reports having open. Without this, a configuration that is
+// nobody's edge case — the default one — kept serving a volume whose layers were gone,
+// and the test above passed the whole time.
+func TestAVanishedTipIsNoticedWithNoRotationConfigured(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t) // rotateAt 0: nothing here ever measures the tip
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("preparing: %v", err)
+	}
+	tip := h.tip(t)
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(tip)
+	h.paths.remove(tip)
+
+	_ = h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)})
+
+	if got := h.volumes(t)[vol]; got.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING {
+		t.Fatalf("refusal = %s, want IMAGE_MISSING: an Agent that rotates nothing never measures the tip, so nothing else here can notice its layers are gone", got.Refusal)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"sync"
 	"testing"
@@ -92,13 +93,15 @@ type fakePaths struct {
 	files    map[string]string
 	sizes    map[string]int64
 	statFail error
+	// removed is what a test has unlinked; see Size.
+	removed map[string]bool
 	// log records writes in order, so a test can assert that the pointer moved before
 	// QEMU was told to switch rather than only that both happened.
 	log *[]string
 }
 
 func newPaths(present ...string) *fakePaths {
-	p := &fakePaths{present: map[string]bool{}, files: map[string]string{}, sizes: map[string]int64{}}
+	p := &fakePaths{present: map[string]bool{}, files: map[string]string{}, sizes: map[string]int64{}, removed: map[string]bool{}}
 	for _, name := range present {
 		p.present[name] = true
 	}
@@ -129,13 +132,34 @@ func (p *fakePaths) Exists(path string) (bool, error) {
 	return p.present[path], nil
 }
 
+// Size fails for a path a test has removed. It used to answer (0, nil) for everything,
+// which made "this layer is gone" and "this layer is empty" the same answer here and
+// different answers in production — and a test whose subject is a vanished file cannot be
+// written against a fake with no way to say a file vanished.
+//
+// Removal is declared rather than derived from `present`, and that is the honest shape:
+// this fake never learns about the layers `qemu-img create` makes, because the runner is
+// a fake too, so absence from `present` means "nobody mentioned it" and not "it is not
+// there". Only `remove` means the second.
 func (p *fakePaths) Size(path string) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.statFail != nil {
 		return 0, p.statFail
 	}
+	if p.removed[path] {
+		return 0, fmt.Errorf("stat %s: %w", path, fs.ErrNotExist)
+	}
 	return p.sizes[path], nil
+}
+
+// remove is a file being unlinked out from under this Agent.
+func (p *fakePaths) remove(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.removed[path] = true
+	delete(p.present, path)
+	delete(p.files, path)
 }
 
 func (p *fakePaths) ReadFile(path string) ([]byte, error) {
