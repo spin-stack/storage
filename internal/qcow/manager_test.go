@@ -1591,3 +1591,90 @@ func TestASnapshotOnAHostWithNoObjectStoreIsRefusedRatherThanAwaited(t *testing.
 		t.Fatalf("the tip moved to %q: the request sealed a layer nothing can publish", h.tip(t))
 	}
 }
+
+// TestAForkedChainStopsTheGuestWritingIntoIt.
+//
+// The object store's history has moved to a commit this host never wrote, and a guest is
+// still writing into the local chain. Every byte from here lands in a history nobody will
+// publish, and the guest is told each one succeeded — the same statement fencing makes,
+// arrived at from the object store instead of from the Control Plane.
+//
+// Refusing the volume is not enough and asserting on the refusal does not see the
+// difference: the chain cannot be replaced while QEMU holds the file, so without the stop
+// the next cycle finds the same live image, refuses again, and the volume is stuck for as
+// long as the guest runs — the rebuild is only reachable once the guest is gone. A
+// mutation sweep deleted the stop call and nothing went red.
+func TestAForkedChainStopsTheGuestWritingIntoIt(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20)
+	tip := h.rotating(t, 1<<20)
+
+	// A fresh Agent over the same filesystem: this is the cycle that opens the chain, and
+	// the guest is still attached at the socket.
+	h2 := h.restart(t, 8<<20, nil)
+	// The bucket says the volume's newest commit is one this host has no record of.
+	h2.rec.head = ids.New().String()
+	h2.dialer.reset()
+
+	_ = h2.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)})
+
+	if sent := h2.dialer.sent(); !strings.Contains(sent, `"execute":"stop"`) {
+		t.Fatalf("the guest is still writing into a chain the published history has moved past; QMP saw: %s", sent)
+	}
+	if got := h2.volumes(t)[vol]; got.Refusal == storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("a volume on a forked chain is still being served: %+v", got)
+	}
+	if h2.tip(t) != tip {
+		t.Fatalf("the chain was replaced under a guest that still had it open: tip is now %q", h2.tip(t))
+	}
+}
+
+// TestASnapshotWaitsForItsOwnCommitToLand.
+//
+// The rotation this request asked for has happened and the publish has not. Answering now
+// would name the commit at the end of the history — the one that landed *before* this
+// request — and a restore of that snapshot silently yields a point missing everything the
+// guest wrote since it was asked for.
+//
+// This is the guard in settleSnapshot, and a mutation sweep found nothing asserted it: no
+// existing test reaches a cycle where a layer is sealed for the request and still
+// unpublished, because the recording publisher always succeeds.
+func TestASnapshotWaitsForItsOwnCommitToLand(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+	// One cycle with no request, so the volume has a history the wrong answer could name.
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("the first cycle: %v", err)
+	}
+	before := pub.got[0].CommitID
+
+	// The guest follows the rotation, and the object store goes down.
+	next := h.tip(t)
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(next)
+	h.paths.sizes[next] = 300 << 10
+	h.runner.info = overlayJSON(size, next)
+	pub.err = errors.New("dial tcp: connection refused")
+
+	snapID := ids.New().String()
+	_ = h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withSnapshot(vol, 1, snapID)})
+
+	got := h.volumes(t)[vol]
+	if got.SnapshotCommitID != "" {
+		t.Fatalf("the snapshot was answered with commit %q while the layer sealed for it was still unpublished (the history ended at %q)",
+			got.SnapshotCommitID, before)
+	}
+
+	// And once the store comes back it is answered, with the new commit and not the old.
+	pub.err = nil
+	_ = h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withSnapshot(vol, 1, snapID)})
+	got = h.volumes(t)[vol]
+	switch got.SnapshotCommitID {
+	case "":
+		t.Fatal("the snapshot was never answered once the object store came back")
+	case before:
+		t.Fatalf("the snapshot names %q, the commit that landed before it was asked for", before)
+	}
+}

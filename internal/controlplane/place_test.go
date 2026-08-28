@@ -1,11 +1,13 @@
 package controlplane_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/spin-stack/storage/internal/controlplane"
+	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -345,5 +347,62 @@ func TestPlaceBurnsNoEpochOnARefusalOrARepeat(t *testing.T) {
 				t.Fatalf("the epoch moved %d -> %d with no host granted the volume", placed.Epoch, vol.CurrentEpoch)
 			}
 		})
+	}
+}
+
+// catalogDownAtTheBump is the Control Plane crashing between the two writes that grant an
+// epoch: the bucket has been written and the catalog has not.
+type catalogDownAtTheBump struct {
+	metadata.Store
+	err error
+}
+
+func (s catalogDownAtTheBump) BumpVolumeEpoch(context.Context, int64, string, string, int64) (int64, error) {
+	return 0, s.err
+}
+
+// TestTheBucketHoldsTheEpochBeforeTheCatalogDoes pins the ordering in Place that grants an
+// epoch: `volumes/<id>/epoch` is written *before* the catalog moves.
+//
+// The order is stated at the call site as the thing that stops a rebuild handing a
+// predecessor a live token, and it had no test at all — a mutation sweep swapped the two
+// writes, and separately deleted the bucket write entirely, and the whole suite stayed
+// green both times.
+//
+// What is asserted is the consequence rather than the call order, because the consequence
+// is what survives a crash: after the catalog write fails, the bucket must already hold a
+// number the catalog never reached. A rebuild then restores an epoch at or above the
+// truth, which can over-fence a host that would have been allowed to write and can never
+// under-fence one that must not. The other order leaves the bucket *behind* the catalog,
+// which is the direction that hands a predecessor a token the restored catalog accepts.
+func TestTheBucketHoldsTheEpochBeforeTheCatalogDoes(t *testing.T) {
+	md, term := placeWorld(t)
+	ctx := t.Context()
+	store := sim.NewObjectStore()
+
+	before, err := md.GetVolume(ctx, placeVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	down := catalogDownAtTheBump{Store: md, err: errors.New("dial tcp 10.0.0.5:5432: connection refused")}
+	if _, err := controlplane.Place(ctx, down, store, placement.Policy{}, term, placeVol, roomyHost); err == nil {
+		t.Fatal("Place reported success while the catalog could not record the epoch")
+	}
+
+	got, err := descriptor.ReadEpoch(ctx, store, placeVol)
+	if err != nil {
+		t.Fatalf("the catalog write failed and the bucket holds no epoch, so a rebuild would restore %s at its old one: %v", placeVol, err)
+	}
+	after, err := md.GetVolume(ctx, placeVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.CurrentEpoch != before.CurrentEpoch {
+		t.Fatalf("the catalog moved to %d despite the bump failing", after.CurrentEpoch)
+	}
+	if got <= after.CurrentEpoch {
+		t.Fatalf("the bucket records epoch %d and the catalog holds %d: the bucket is not ahead, so a rebuild can hand this volume's predecessor a token the restored catalog accepts",
+			got, after.CurrentEpoch)
 	}
 }
