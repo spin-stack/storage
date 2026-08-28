@@ -14,39 +14,23 @@ import (
 )
 
 // fleetReport writes what the catalog says about the fleet, in the three answers an
-// operator wants at 3am: which hosts are out of service and why, which volumes nobody
-// is serving, and which snapshots nothing is going to finish.
+// operator wants at 3am: which hosts are out of service and why, which volumes nobody is
+// serving, and which snapshots nothing is going to finish. Until it existed the only
+// fleet-wide *read* of this system was psql — every read the Control Plane serves is
+// scoped to a host, and the rows an incident is about are the rows no host owns.
 //
-// It exists because until now the only fleet-wide *read* of this system was psql.
-// cmd/control-plane grew a one-shot for every write an operator needs — seed,
-// snapshot, clone, rebuild, detach, attach — and not one for looking. Every read the
-// Control Plane serves is scoped to a host, because every one of them answers an
-// Agent, and the rows an incident is about are precisely the rows no host owns.
+// ADR-0021 says this binary is a test harness whose operator surface is the sibling `spin`
+// project's. Hence a flag rather than a subcommand tree, no filtering, no paging and no
+// JSON: nothing but a human consumes this, and a second serialization of the catalog is a
+// format somebody would have to keep in step with the proto that already exists.
 //
-// ADR-0021 says this binary is a test harness and will not be deployed: storage
-// integrates into the sibling `spin` project, and the operator interface is that
-// project's. So the bar here is "someone running this repository's own lanes can see
-// the fleet", not "a CLI". That is why it is a flag on this binary rather than a
-// subcommand tree, why there is no filtering or paging, and why there is no JSON:
-// nothing consumes this output but a human, columnar text is what `grep` and `awk`
-// already work on, and a second serialization of the catalog is a format somebody
-// would then have to keep in step with the proto that already exists for machines.
+// It takes no term, unlike every other one-shot here: a read guards nothing, and the moment
+// an operator most needs the catalog is the moment nothing is leading.
 //
-// It takes no term and never asks for one, unlike every other one-shot in this file.
-// A read guards nothing — §7's term exists so a zombie Control Plane's *writes* are
-// refused — and the moment an operator most needs to see the catalog is the moment
-// nothing is leading. Failing here with "start a Control Plane first" would remove
-// the view exactly when it is the only thing left. The leader line below reports that
-// state instead of refusing over it.
-//
-// leaseTTL is the lease the Control Plane grants on a heartbeat, and it is the only
-// new input this report needed to stop lying about a fleet that has died. Every
-// "state" in the catalog is a column something has to write, so a host killed with
-// -9 keeps reading ACTIVE for ever and a Control Plane that was SIGTERMed keeps
-// reading LEADER: the process whose job it was to write the correction is the one
-// that is gone. Liveness is therefore not read from a column at all — it is derived
-// from how old the last write is, against the interval the fleet itself uses for
-// "how long a fact may be believed".
+// leaseTTL is what liveness is derived against. Every "state" in the catalog is a column
+// something has to write, so a host killed with -9 keeps reading ACTIVE and a SIGTERMed
+// Control Plane keeps reading LEADER — the process whose job it was to write the
+// correction is the one that is gone.
 func fleetReport(ctx context.Context, md metadata.Store, out io.Writer, leaseTTL time.Duration) error {
 	p := &printer{out: out}
 
@@ -98,28 +82,13 @@ func fleetReport(ctx context.Context, md metadata.Store, out io.Writer, leaseTTL
 	return p.err
 }
 
-// reportLeader prints who is leading and — the part that was missing — whether
-// anything has seen that process running.
+// reportLeader prints who is leading and whether anything has seen that process running.
 //
-// `renewed_at` was the word this line used, and it described a write nothing
-// performs: metadata.Store's only leadership write is AcquireLeadership, which
-// increments the term unconditionally, so the stamp is the election and never moves
-// again. A Control Plane dead for five minutes and one that started five minutes ago
-// printed the identical line.
-//
-// The renewal that would fix it properly is a term-guarded UPDATE of renewed_at that
-// does *not* increment — a metadata.Store method that does not exist. Renewing with
-// AcquireLeadership instead was rejected outright: it would move the term every few
-// seconds, and every admin one-shot in this binary reads GetLeader and then writes
-// under that term, so -flatten-volume and -delete-volume (both of which rewrite a
-// whole image between the two) would start failing with ErrStaleTerm at random.
-//
-// What the catalog can already prove is used instead. Every host heartbeat is a
-// term-guarded write performed by the serving Control Plane and by nothing else, so a
-// heartbeat stamped after this term was created is that process running at that
-// instant. The election is the same proof at time zero. It is a witness, not a lease:
-// a fleet with no hosts, or one whose Agents are all dead too, has nothing to witness
-// with and the line says exactly that rather than claiming the leader is gone.
+// Liveness is not read from the leader row: every host heartbeat is a term-guarded write
+// performed by the serving Control Plane and by nothing else, so a heartbeat stamped after
+// this term was created is that process running at that instant, and the election is the
+// same proof at time zero. It is a witness, not a lease: a fleet with no hosts, or one whose
+// Agents are all dead, has nothing to witness with and the line says exactly that.
 func reportLeader(p *printer, leader metadata.Leader, hosts []metadata.Host, herr error, now time.Time, leaseTTL time.Duration) {
 	head := fmt.Sprintf("LEADER  %s  term %d  elected %s ago",
 		leader.HolderID, leader.Term, age(now, leader.RenewedAt))
@@ -161,14 +130,10 @@ func reportHosts(p *printer, hosts []metadata.Host, now time.Time, leaseTTL time
 			stale++
 		}
 	}
-	// The stale count is in the header next to the cordon count because they are the
-	// same question — "how much of this fleet is not available?" — and the sentence
-	// after it is there because the two counts do *not* mean the same thing to
-	// placement. internal/placement admits any host whose State.AcceptsPlacement() is
-	// true and never looks at last_heartbeat, so a host that has been dead for an hour
-	// is still a candidate. Teaching it otherwise is a change to internal/placement,
-	// not to this report; until then the operator has to be told, because a report
-	// that marks a host dead reads as a report that took it out of the rotation.
+	// The stale count sits next to the cordon count because they answer the same question, and
+	// the sentence after it because they do not mean the same thing to placement:
+	// internal/placement admits any host whose State.AcceptsPlacement() is true and never looks
+	// at last_heartbeat, so a host dead for an hour is still a candidate.
 	p.printf("HOSTS (%d, %d not taking placements, %d with no heartbeat in the last %s — placement does not exclude them)\n",
 		len(hosts), cordoned, stale, leaseTTL)
 	s := p.section("HOST_ID", "STATE", "REASON", "USED", "TOTAL", "COMMITTED", "HEARTBEAT")
@@ -218,22 +183,13 @@ func reportVolumes(ctx context.Context, md metadata.Store, p *printer) ([]metada
 			atCeiling++
 		}
 	}
-	// The unplaced count is in the header because it is a question ("which volumes has
-	// nobody got?") rather than a detail: after -rebuild-metadata it is every volume in
-	// the catalog, and until an operator places them the fleet serves nothing.
-	//
-	// The ceiling count is the second question this report can answer and nothing else
-	// can. `controlplane.Clone` refuses a clone of a volume at MaxChainDepth, and the
-	// operator who hits that refusal — or who wants to not hit it — needs the list of
-	// volumes waiting on a FLATTEN. The `chain_depth` series does not answer it: it is
-	// recorded when the Control Plane changes a depth and then goes quiet, so it says what
-	// was created, while this says what the fleet is holding now.
-	//
-	// The refused count is the third, and it is the one that had no producer at all
-	// until the Agent started reporting a refusal: a volume whose host has fail-closed
-	// keeps the watermarks its last healthy report left behind, so every other number on
-	// its row reads normal. It goes last in the header so the two counts that were
-	// already asserted keep their position in the sentence.
+	// Three counts in the header because each is a question nothing else answers. Unplaced:
+	// after -rebuild-metadata it is every volume in the catalog, and until an operator places
+	// them the fleet serves nothing. At the ceiling: controlplane.Clone refuses a clone of a
+	// volume at MaxChainDepth, and the `chain_depth` series cannot say — it is recorded when
+	// the Control Plane changes a depth, so it says what was created, not what the fleet
+	// holds now. Refused: a volume whose host has fail-closed keeps the watermarks its last
+	// healthy report left, so every other number on its row reads normal.
 	p.printf("VOLUMES (%d, %d with no primary host, %d at the depth ceiling of %d — a clone of one is refused until it is flattened; %d not being served by the host that holds it)\n",
 		len(vols), unplaced, atCeiling, controlplane.MaxChainDepth, countRefused(vols))
 	s := p.section("VOLUME_ID", "PRIMARY_HOST", "STATE", "EPOCH", "SIZE", "DEPTH", "PARENT_SNAPSHOT")
@@ -246,16 +202,11 @@ func reportVolumes(ctx context.Context, md metadata.Store, p *printer) ([]metada
 	return vols, nil
 }
 
-// volumeState renders the STATE cell, the same move hostState makes one section above
-// and for the same reason: the catalog's word is still true about *ownership* — the
-// volume is ACTIVE, this host is its primary, placement and every §7 transition still
-// read it — and it is exactly the word that must not stand alone when the host holding
-// it is refusing to serve it.
-//
-// One token, so `awk '{print $3}'` and an eye both still work, and it greps and sorts as
-// NOT_SERVED. The reason itself is not in this cell: it belongs next to the sentence
-// that explains it, in the section below, and a fourth column here would push
-// PARENT_SNAPSHOT off an eighty-column terminal for every fleet, healthy or not.
+// volumeState renders the STATE cell, the same move hostState makes above: the catalog's word
+// is still true about *ownership* and is exactly the word that must not stand alone when the
+// host holding it refuses to serve. One token, so `awk` and an eye both still work. The reason
+// belongs in the section below, not in a fourth column that would push PARENT_SNAPSHOT off an
+// eighty-column terminal.
 func volumeState(v metadata.Volume) string {
 	if !v.Refusal.Refused() {
 		return string(v.State)
@@ -263,20 +214,11 @@ func volumeState(v metadata.Volume) string {
 	return fmt.Sprintf("NOT_SERVED(%s)", v.State)
 }
 
-// reportRefusals is the section that answers "why", and it is a section of its own
-// rather than a column because the two questions have different shapes. "Which volumes
-// are down" is a scan of the table above; "why is this one down" is one sentence with
-// numbers in it — the sequence that went missing, the KEK that is not on the host — and
-// a sentence does not fit a column-aligned table next to six other fields.
-//
-// It prints even when it is empty, like every other section here: "nothing is refusing
-// to serve" is an answer, and a section that vanishes when it has nothing to say is
-// indistinguishable from a report that stopped early.
-//
-// It is rendered from the volumes already read rather than from a filtered query. There
-// is no such query, and there should not be one until something needs it at a scale a
-// human is not reading: the rows are in hand, and a second read would be a second answer
-// that can disagree with the table above it.
+// reportRefusals answers "why", as a section rather than a column: "which volumes are down"
+// is a scan of the table above, while "why is this one down" is one sentence with numbers in
+// it. It prints when empty, like every section here — a section that vanishes is
+// indistinguishable from a report that stopped early — and it renders from the volumes
+// already read, because a second query would be a second answer that can disagree.
 func reportRefusals(p *printer, vols []metadata.Volume) {
 	p.printf("NOT SERVED (%d) — the fleet placed these volumes on a host that is refusing to serve them\n",
 		countRefused(vols))

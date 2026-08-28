@@ -1,14 +1,10 @@
 version: "3"
 
-# Build/test/lint/dst orchestration for github.com/spin-stack/storage.
-# Mirrors the sibling spin-stack projects (go-task). The `ci` target is the
-# aggregate gate wired into GitHub Actions (CLAUDE.md, "The gate").
+# Build/test/lint/dst orchestration for github.com/spin-stack/storage; `ci` is the
+# aggregate gate GitHub Actions runs.
 #
-# Reproducibility rule: every tool this project needs is pinned here and installed
-# into ./.tools/bin by `task tools`. Nothing depends on what happens to be on the
-# developer's PATH, and no task downloads an unpinned "latest". If you find yourself
-# typing `sqlc`, `pgschema`, `golangci-lint`, or `gofmt` by hand, that is a missing
-# task.
+# Reproducibility rule: every tool is pinned here and installed into ./.tools/bin by
+# `task tools`, so nothing depends on what is on the developer's PATH.
 
 vars:
   SIMULABLE: ./hack/analyzers/simulable/cmd/simulable
@@ -217,19 +213,13 @@ tasks:
 
   # --- schema (pgschema, ADR-0019) --------------------------------------------
   #
-  # internal/schema/schema.sql is the declared state; pgschema computes the DDL that
-  # takes a live database there. There is no history table and no checksum chain, so
-  # the reviewable record is the plan itself: `db:plan` writes one into migrations/,
-  # and `db:apply` executes *that file*. Reviewing plan A and applying a plan B
-  # recomputed at deploy time is the failure mode a state-based tool invites; the
-  # only apply path here reads a committed plan, and pgschema refuses it if the
-  # database has moved since it was made.
-  #
-  # So migrations/ is a **record, not a replay path**: nothing reads it in order, no test
-  # touches it, and `db:verify` proves the point by rebuilding from schema.sql alone and
-  # asserting the resulting plan is empty. Each change leaves a pair — `<ts>_<name>.sql`,
-  # the DDL a human reviews, and `<ts>_<name>.json`, the plan pgschema executes,
-  # fingerprinted against the database it was computed from.
+  # schema.sql is the declared state; pgschema computes the DDL that takes a live database
+  # there. There is no history table, so the reviewable record is the plan: `db:plan`
+  # writes one into migrations/ and `db:apply` executes *that file* — reviewing plan A and
+  # applying a recomputed plan B is the failure a state-based tool invites; pgschema
+  # refuses a saved plan if the database has moved since it was computed. migrations/ is a
+  # record, not a replay path: `db:verify` rebuilds from schema.sql alone. Each change
+  # leaves a pair — `<ts>_<name>.sql` for review, `<ts>_<name>.json` for apply.
 
   db:dev:up:
     desc: Start (or reuse) the local Postgres 18 development database that db:plan diffs against.
@@ -241,13 +231,9 @@ tasks:
     cmds:
       - DEVDB_CONTAINER={{.DEVDB_CONTAINER}} POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh down
 
-  # Standing a *new* database up is not a plan, and this is the only task that does it.
-  # db:plan/db:apply are for changes — they diff schema.sql against a database that
-  # already exists — so before this target the documented path from an empty Postgres to
-  # the declared state was "find a psql and redirect internal/schema/schema.sql into it",
-  # which is not a task, is not what CI runs, and needs a client the machine may not have.
-  # It refuses a non-empty database; see hack/db.sh for why that gate is what keeps this
-  # from becoming a way around db:plan's review.
+  # Standing a *new* database up is not a plan, and this is the only task that does it:
+  # db:plan/db:apply diff against a database that already exists. It refuses a non-empty
+  # database — see hack/db.sh for why that gate keeps this out of db:plan's review.
   db:init:
     desc: "Apply schema.sql to an EMPTY database — the supported way to stand a new one up. Usage: task db:init [DB_NAME=... DB_HOST=... DB_PORT=... DB_USER=...]"
     deps: [tools:pgschema, db:dev:up]
@@ -319,34 +305,17 @@ tasks:
   qemu:verify:
     desc: Verify the built QEMU is the pinned version and exposes the devices we depend on.
     cmds:
-      # Two halves, and they are separated because they need different things to be
-      # true. The files are checked where they were extracted; the *behaviour* is
-      # checked where the binary can actually run.
-      #
-      # It was one half until the first CI run this repository ever had, which failed
-      # here with `liburing.so.2: cannot open shared object file`. The extracted binary
-      # is dynamically linked against the build image's libraries, so executing it on
-      # the host works only where those happen to be installed — which is every
-      # developer machine that has ever run this, and not a bare GitHub runner.
-      # ADR-0025 already decided this for the lane ("the guest lane runs inside the
-      # published runtime image, rather than installing QEMU's dynamic dependencies on
-      # a bare runner"); the check that guards the lane was the one thing still
-      # assuming otherwise.
+      # Two halves: the files are checked where they were extracted, the behaviour where
+      # the binary can actually run. The extracted binary is dynamically linked against the
+      # build image's libraries, so it does not run on a bare runner (ADR-0025).
       - |
         set -euo pipefail
         bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
         test -x "$bin" || { echo "missing $bin — run: task build:qemu"; exit 1; }
         test -x {{.OUTPUT_DIR}}/bin/qemu-storage-daemon
-        # qemu-img is not a convenience here: the Volume Agent refuses to start without
+        # qemu-img is not a convenience: the Volume Agent refuses to start without
         # -qemu-img, because every qcow2 chain is created and inspected by running it
-        # (v6 §7 forbids a parser of our own). It was in the extract stage and in
-        # nothing that checked, so an _output/ built before this line could satisfy
-        # `task qemu:verify` and still not run an Agent.
-        # Present, not runnable — this task is the files-on-host half and the binary it
-        # is checking is one `build:qemu` just exported from a build image. On the runner
-        # that builds the artefact for everyone else, it cannot run at all
-        # (`liburing.so.2: cannot open shared object file`), which is the whole reason
-        # qemu:verify:behaviour exists and asks it there instead.
+        # (v6 §7 forbids a parser of our own). Presence only — see qemu:verify:behaviour.
         test -x {{.OUTPUT_DIR}}/bin/qemu-img || {
           echo "missing {{.OUTPUT_DIR}}/bin/qemu-img — the Agent cannot create a chain without it; run: task build:qemu"; exit 1; }
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
@@ -361,23 +330,13 @@ tasks:
   qemu:verify:behaviour:
     desc: Run the pinned QEMU and assert its version and devices, wherever that QEMU is actually runnable.
     cmds:
-      # The question is "is the QEMU this caller will execute the pinned one, with the
-      # device the data path needs" — and the answer has to come from whichever QEMU that
-      # is. There are three callers and they are not the same:
-      #
-      #   - a developer machine, where the extracted binary runs because the libraries it
-      #     was linked against happen to be installed;
-      #   - CI's guest jobs, which run *inside* the runtime image (ADR-0025) where the
-      #     binary is trivially runnable and there is no docker to ask about an image —
-      #     this is what broke when the check unconditionally built one: `"docker":
-      #     executable file not found in $PATH`, inside a container that had QEMU sitting
-      #     right there;
-      #   - a bare runner building the artefact for others, where the binary cannot run
-      #     at all: `liburing.so.2: cannot open shared object file`.
-      #
-      # So: run it if it runs, and fall back to the image if it does not. That is not the
-      # "detect and hope" this rejected in its first version — the branch taken is printed,
-      # so a reader always knows which QEMU answered.
+      # Ask whichever QEMU this caller will execute. The extracted binary runs on a
+      # developer machine and inside CI's guest jobs (ADR-0025's runtime image, where there
+      # is no docker to ask about an image — building one unconditionally failed there with
+      # `"docker": executable file not found in $PATH`), and not on a bare runner building
+      # the artefact for others: `liburing.so.2: cannot open shared object file`. So run it
+      # if it runs and fall back to the image if it does not, printing which branch
+      # answered.
       - |
         set -euo pipefail
         bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
@@ -401,11 +360,8 @@ tasks:
           printf '%s\n' "$out" | grep -i version; exit 1; }
         printf '%s' "$out" | grep -q '{{.QEMU_VERSION}}' || {
           echo "the QEMU in $where is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
-        # virtio-blk-pci, not vhost-user-blk-pci. The device the guest gets is now an
-        # ordinary virtio disk backed by a qcow2 file QEMU opens itself; the vhost-user
-        # backend this used to name was this repository's own, and it is withdrawn. The
-        # build still enables it (qemu-storage-daemon), which is exactly why the check
-        # had to move: it was passing on a capability nothing consumes.
+        # virtio-blk-pci, not vhost-user-blk-pci: the guest gets an ordinary virtio disk
+        # backed by a qcow2 QEMU opens itself. The build still enables the storage daemon.
         printf '%s' "$out" | grep -q 'virtio-blk-pci' || {
           echo "the QEMU in $where has no virtio-blk-pci device, so no guest can be given a qcow2"; exit 1; }
         echo "OK: $(printf '%s' "$out" | head -1), virtio-blk-pci present — verified in $where"
@@ -438,16 +394,10 @@ tasks:
     deps: [build:guest, fetch:kernel]
     env: *guest_kernel_env
     cmds:
-      # This half was one `test -f`, and `test -f` says OK for a zero-byte file, for a
-      # half-written one, and for an archive with no /init — three states whose whole
-      # symptom is a kernel panic minutes later inside QEMU, attributed to the lane. Worse,
-      # `build:guest` does not rebuild any of them: its `sources:`/`generates:` fingerprint
-      # compares the *sources*, so a truncated artefact is "up to date". Verified 2026-08-04
-      # by emptying the file: the old target printed OK and exited 0.
-      #
-      # So the artefact is opened, not stat'ed, and every failure names the task that makes
-      # a good one. cpio is required rather than optional for the same reason the kernel's
-      # readelf check is: a machine that cannot look must not report OK.
+      # The artefact is opened, not stat'ed: `test -f` says OK for a zero-byte file, a
+      # half-written one and an archive with no /init, and `build:guest` fingerprints its
+      # *sources*, so a truncated artefact is "up to date" (verified 2026-08-04 by emptying
+      # the file: the old target printed OK and exited 0). cpio is required, not optional.
       - |
         set -euo pipefail
         img={{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
@@ -583,17 +533,11 @@ tasks:
         # scratch, so its digest is a hash of the kernel and of nothing else.
         ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
         cp {{.GUEST_KERNEL}} "$ctx/vmlinux"
-        # org.opencontainers.image.source is what links a ghcr.io package to a repository,
-        # and the link is what lets that repository's Actions token read it — **but only
-        # when Actions is the pusher.** Pushed from a laptop with a personal token, ghcr
-        # creates the package owned by the pusher and unlinked, and this label does not
-        # link it afterwards: storage/qemu, pushed by the QEMU workflow, came out linked,
-        # and storage/guest-kernel, pushed from a developer machine with the same label,
-        # did not. So the label is necessary and not sufficient, `guest-inputs` fails with
-        # "not published" for a package that exists, and hack/publish-guest-inputs.sh's
-        # readable_by_ci is what names the real state and prints where to fix it. Derived from the target path rather than configured,
-        # because the only namespace CI resolves is ghcr.io/<owner>/<repo>/...; anything
-        # else gets no label rather than a wrong one. Same derivation in build:qemu:push.
+        # org.opencontainers.image.source links a ghcr.io package to a repository — and
+        # only when Actions is the pusher; see readable_by_ci in
+        # hack/publish-guest-inputs.sh. Derived from the target path rather than
+        # configured: the only namespace CI resolves is ghcr.io/<owner>/<repo>/...
+        # Same derivation in build:qemu:push.
         src=""
         case "{{.GUEST_KERNEL_IMAGE}}" in
           ghcr.io/*/*/*) slug={{.GUEST_KERNEL_IMAGE}}; slug=${slug#ghcr.io/}; slug=${slug%/*}
@@ -612,16 +556,9 @@ tasks:
         echo "pull it back with the digest, not the tag:"
         echo "  task fetch:kernel GUEST_KERNEL_IMAGE={{.GUEST_KERNEL_IMAGE}}@\$(docker buildx imagetools inspect --format '{{`{{.Manifest.Digest}}`}}' {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}})"
 
-  # The two artefacts CI's guest jobs need and this repository does not build. Publishing
-  # them was a procedure spread over four files — this workflow's failure summary, two push
-  # targets above, and a track log — and a procedure is what a human gets one step wrong
-  # in. `guest:inputs:check` names every input; `guest:inputs:publish` does the whole thing
-  # and proves it by resolving both refs the way `.github/workflows/ci.yml` resolves them.
-  # The two artefacts a guest needs: the pinned QEMU and the pinned kernel. `ci.yml`'s
-  # `guest` job consumes both, and it is the job these tasks exist to unblock — for a
-  # while nothing consumed them at all, because the lanes that booted a guest against this
-  # system's own vhost-user-blk backend went with that backend and the replacement lane
-  # took months to arrive.
+  # The two artefacts CI's guest job needs and this repository does not build: the pinned
+  # QEMU and the pinned kernel. `guest:inputs:check` names every input publishing them
+  # needs; `guest:inputs:publish` performs the procedure rather than documenting it.
   guest:inputs:check:
     desc: >-
       Name every input publishing the guest artefacts needs (gh, a token with
@@ -744,14 +681,10 @@ tasks:
       - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64 --version"
       - "test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin"
     cmds:
-      # A second *source* for one artefact, not a second definition of the build —
-      # the same shape hack/guest-kernel.sh already has for the kernel (a sibling
-      # checkout or the mirror). The reason is arithmetic: `task build:qemu` compiles
-      # QEMU from source, which is tens of minutes, and every lane that starts a
-      # Volume Agent now needs qemu-img, because the Agent refuses to start without it.
-      #
-      # The image is the one the QEMU workflow publishes, so what lands here is the
-      # same binary `--target extract` would produce from the same builder stage.
+      # A second *source* for one artefact, not a second definition of the build — the
+      # shape hack/guest-kernel.sh has for the kernel. `task build:qemu` compiles QEMU from
+      # source, tens of minutes, and every lane that starts an Agent needs qemu-img. The
+      # image is the one the QEMU workflow publishes, from the same builder stage.
       - |
         set -euo pipefail
         img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
@@ -785,18 +718,12 @@ tasks:
         mkdir -p {{.OUTPUT_DIR}}/share/spin-stack
         docker cp "$cid":/usr/share/spin-stack/qemu {{.OUTPUT_DIR}}/share/spin-stack/qemu
 
-        # And the libraries it links against, computed *inside the image* rather than
-        # listed here. The binary is dynamically linked — liburing, libaio, glib — and
-        # extracting it alone produced a file that ran on a developer's machine and died
-        # on a CI runner with "liburing.so.2: cannot open shared object file". That is
-        # the same class of break this repository already paid for once, when the runtime
-        # image needed libaio1t64 and the Dockerfile said libaio1.
-        #
-        # A hand-written apt-get list is what drifts: it is a second statement of what the
-        # image links against, kept in step by nobody. `ldd` inside the image is not a
-        # list, it is the answer, and it moves when the image does.
-        # The closure *and* the interpreter: `ldd` names the loader on its own line, with
-        # no `=>`, and it is as much a part of what this binary needs as liburing is.
+        # And the libraries it links against, computed *inside the image*: the binary is
+        # dynamically linked (liburing, libaio, glib), and extracting it alone produced a
+        # file that ran on a developer's machine and died on a CI runner with
+        # "liburing.so.2: cannot open shared object file". A hand-written apt-get list is a
+        # second statement of that, kept in step by nobody. The interpreter counts too —
+        # ldd names the loader on its own line, with no `=>`.
         rm -rf {{.OUTPUT_DIR}}/lib/qemu && mkdir -p {{.OUTPUT_DIR}}/lib/qemu
         for so in $(docker run --rm --entrypoint sh "$img" -c \
               "for b in $BINARIES; do ldd /usr/local/bin/\$b; done" \
@@ -854,31 +781,8 @@ tasks:
       Fail on a function no binary reaches that neither hack/deadcode-allow.txt nor
       hack/deadcode-pending.txt accounts for (CLAUDE.md: "a component with no caller is a
       liability, not progress"). In `ci`.
-    # It is in `ci` since 2026-08-06, and what it took to get there was a second list.
-    #
-    # It was deliberately out of every gate before that, with the reason written down: it
-    # exited 1 on findings nobody had decided about, and a step that is red the day it
-    # lands is a step someone deletes. Waiting for that count to reach zero was the plan,
-    # and it was the wrong plan — the count drifts on its own as other lanes delete code
-    # (it has already fallen once, with nobody deciding anything), so "wait until it is
-    # zero" is a gate that arrives by accident if it arrives at all, and until it does,
-    # every newly unreachable symbol lands unnoticed.
-    #
-    # The mechanism is a ratchet over a *set*, not a count: hack/deadcode-pending.txt pins
-    # the findings that are still owed a decision, each with its owner, and the script
-    # fails on a finding in neither list (the set cannot grow), on an entry that is no
-    # longer reported (it cannot outlive its code), and on a symbol claimed by both lists.
-    # A pinned integer was rejected for the reason this repository already knows: the one
-    # ratchet here that pins a bare number, `wantBehavioural`, is the one that causes merge
-    # conflicts, and a number can be satisfied by deleting one finding and adding another.
-    #
-    # Rejected alternative: move the ten into hack/deadcode-allow.txt with a reason each
-    # and have one list. That is green today and costs the allowlist its meaning — it is
-    # the file that says which unreachable symbols are *correct*, and half its entries
-    # would then be ones that are not.
-    #
-    # In `ci` rather than only `ci:full`, next to lint: it needs no Docker, it costs ~2s,
-    # and the person who creates an unreachable symbol is running `task ci`.
+    # A ratchet over the set of unreachable symbols, not a count; the two lists, the
+    # rejected alternatives and the blind spots are in hack/deadcode.sh.
     deps: [tools:deadcode]
     cmds:
       - DEADCODE={{.TOOLS_BIN}}/deadcode bash hack/deadcode.sh
@@ -888,43 +792,16 @@ tasks:
       List the open DEV entries in STATUS.md and who owes each decision, and fail on one
       that hack/dev-entries-open.txt does not pin (CLAUDE.md's gate: "No open DEV entry
       that this increment introduced"). In `ci`.
-    # The gate's fourth line had no mechanism at all: no target, no script and no CI job
-    # read a DEV entry, so `task ci:full` was green over an open one by construction.
-    # Wave 6 demonstrated it — DEV-0024 was opened and the increment shipped green — and
-    # the entry recording that in STATUS.md is what this target answers.
-    #
-    # Rejected: fail whenever any entry is open, which is the literal reading of the gate.
-    # Two of the three open entries wait on decisions a human has not made, so that
-    # version is red on the day it lands, and a step that is red on the day it lands is a
-    # step someone deletes — written down twelve lines above as the reason `deadcode`
-    # stayed out of every gate for two waves.
-    #
-    # Rejected: list and never fail. It cannot produce a false red and it is also easy to
-    # never run; `backend:conformance` was broken on main for a whole increment for
-    # exactly that reason.
-    #
-    # What it does instead is `deadcode`'s ratchet over a *set*: the open entries are
-    # pinned with a reason each, an entry appearing that nothing pinned is red, and a pin
-    # that outlives its entry is red. Opening a DEV entry stays possible and stops being
-    # free. The "a parser over Markdown fires on prose" objection is answered by parsing
-    # only heading lines that name a DEV-NNNN id — the one edit that can move this check
-    # is the one it exists to notice.
-    #
-    # In `ci` rather than only `ci:full`, beside deadcode: it reads two files, costs
-    # milliseconds, needs no toolchain, and the person opening a DEV entry is running
-    # `task ci`.
+    # A ratchet over the set of open DEV entries; the rejected alternatives and the
+    # heading-only parsing are in hack/dev-entries.sh.
     cmds:
       - bash hack/dev-entries.sh
 
   status:cap:
     desc: "Fail when docs/plan/STATUS.md is over its 120-line cap (CLAUDE.md)."
     cmds:
-      # CLAUDE.md says the cap is "enforced by a task" and, until this one, nothing
-      # computed it — which is the shape of every other check in this directory: a rule
-      # stated in a document and evaluated by whoever remembered. The cap is not
-      # arithmetic for its own sake. STATUS.md holds *what to do next* and *which thin
-      # paths are not deepened*; a file that outgrows a screen has started holding
-      # history, and history is `git log`.
+      # STATUS.md holds what to do next and which thin paths are not deepened; a file that
+      # outgrows a screen has started holding history, and history is `git log`.
       - |
         set -euo pipefail
         n=$(wc -l <docs/plan/STATUS.md)
@@ -939,42 +816,8 @@ tasks:
       upload chain, the checkpoint, the GC, the lease gate — as if it were still here,
       unless hack/comment-rot-allow.txt or hack/comment-rot-pending.txt accounts for it.
       In `ci`.
-    # The third ratchet, and it exists because the first two only cover the places a
-    # document used to be. This repository deleted ~10.000 lines of Markdown on the rule
-    # that "the decision lives in the code, at the line that makes it", and the drift
-    # moved with it: `wal.Log.Flush`'s doc comment still describes uploading and
-    # verifying every covering object and checking the lease before the ACK, three
-    # functions above a `durableStep` that does an fdatasync. Inside a comment that is
-    # worse than it was in a document — a comment has no banner, no date and no owner,
-    # and CLAUDE.md tells the reader to trust it.
-    #
-    # Same shape as deadcode and dev:entries, for the same reasons and with the same two
-    # rejected alternatives:
-    #
-    #   - list and never fail: cannot produce a false red and is easy to never run.
-    #     `backend:conformance` was broken on main for a whole increment for exactly that.
-    #   - fail on every mention: red on the day it lands, because sixty-two comments in
-    #     twenty-five files are wrong today and fixing them touches every lane. A step that is
-    #     red on the day it lands is a step someone deletes — written down twice above.
-    #
-    # So: a ratchet over a *set*. Every mention is accounted for by one of two lists —
-    # legitimate (a comment naming the mechanism to say it is gone, Go's own GC, INV-14's
-    # hazard) or a lie somebody owes a correction — and the script fails on a mention in
-    # neither, on an entry that no longer matches a finding, and on a key both lists
-    # claim. The debt is printed on green runs so it is read by whoever runs the gate.
-    #
-    # The objection this has to survive is "a word is not a mechanism": `remote` is in
-    # `nvme_remote_backlog_bytes`, a live column. It is answered twice — only comment text
-    # is matched, never code or a string literal, and matches are identifier-aware, so
-    # `nvme_remote_backlog_bytes` and `gcInterval` do not fire. And it is answered where
-    # it can be checked rather than in prose: every term carries a string it must match
-    # and a live identifier it must not, and the script re-proves all of them before it
-    # opens a file — a term whose pattern is mistyped fires on nothing and would otherwise
-    # report success for ever, which is `task dst`'s `-run` regex all over again.
-    #
-    # In `ci` rather than only `ci:full`, beside the other two: no toolchain, no Docker,
-    # one `go list` and one awk pass over the 79 files a binary links — 0.26s measured —
-    # and the person writing the comment is running `task ci`.
+    # A ratchet over the set of comments naming a withdrawn mechanism; the two lists, the
+    # rejected alternatives and the identifier-aware matching are in the script.
     cmds:
       - bash hack/comment-rot.sh
 
@@ -999,50 +842,23 @@ tasks:
   lint:simulable:
     desc: Run the authoritative simulable-interfaces analyzer over all packages.
     cmds:
-      # Same build tags as lint:golangci, for the same reason (DEV-0016) and one
-      # step later. Without them the analyzer's package loader never parses a file
-      # under `integration/` or `internal/testinfra` — so INV-01's *authoritative*
-      # layer was checking a smaller tree than its belt-and-suspenders layer, and
-      # the surface where a real clock, a real socket and a real process meet our
-      # code was governed only by golangci-lint's exclusion list.
-      #
-      # `-tags` on the analyzer binary is deprecated and does nothing; the flag that
-      # reaches go/packages' `go list` child is GOFLAGS, which is why the tags are
-      # set as environment and not as an argument.
+      # Same build tags as lint:golangci, one step later, so the authoritative INV-01 layer
+      # does not check a smaller tree than its belt-and-suspenders one.
+      # `-tags` on the analyzer binary is deprecated and does nothing; GOFLAGS is what
+      # reaches go/packages' `go list` child, which is why the tags are environment.
       - GOFLAGS=-tags=integration,e2e go run {{.SIMULABLE}} ./...
 
   dst:
     desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1, §25.2).
     cmds:
-      # No `-run` filter, deliberately. `go test -run <regex>` exits 0 and prints
-      # "[no tests to run]" when the regex matches nothing, so the test names this
-      # target used to list were a silent single point of failure: rename one, mistype
-      # one, and the mandatory gate reports success having proven nothing. That is the
-      # same class of defect as a checker that cannot fire, which this repository has
-      # already paid for twice.
-      #
-      # The obvious fix was a preflight asserting that each alternative selects at least
-      # one test (`go test -list`). Rejected: it writes the same test names down a second
-      # time, so it rots in exactly the situation it exists to catch — and in
-      # ./internal/dst it does not even work. That package's TestMain audits, after
-      # m.Run(), that every default checker was shown to catch a planted bug, and it
-      # skips that audit whenever `test.run` is non-empty; `-list` leaves `test.run`
-      # empty while running no tests, so `go test -list` there exits 1 on its own.
-      #
-      # Naming nothing beats naming things twice: with no filter there is no selection
-      # to go stale, and what the gate proves is the whole package. It also switches the
-      # TestMain audit back on here — for as long as this target filtered, the one check
-      # that proves the checkers can fire never executed in the gate that exists to run
-      # them. Measured cost of running both packages whole rather than filtered: 0.02s.
-      # `-count=1` stays: a cached "ok" is the other way a gate reports success without
-      # running.
-      #
-      # One package, and it used to be two: `./internal/wal/` was here for §25.2's
-      # serialize/replay property tests — truncate at every byte, flip a bit, and the
-      # recovered state is exactly the model's or a detected error. That package is
-      # withdrawn with the local block engine. The rule is not: the moment the commit
-      # protocol has an on-S3 format, its property test's package belongs on this list,
-      # beside the harness that will crash it at every point.
+      # No `-run` filter, deliberately: `go test -run <regex>` exits 0 printing "[no tests
+      # to run]" when the regex matches nothing, so a list of test names here is a gate
+      # that can report success having proven nothing. A `go test -list` preflight was
+      # rejected — it writes the same names down twice, and in ./internal/dst it exits 1
+      # anyway (TestMain's audit that every checker caught a planted bug skips when
+      # test.run is non-empty). Filtering also switched that audit off. `-count=1` stays.
+      # When the commit protocol's serialize/replay property test lands, its package
+      # belongs on this list too.
       - go test -race -count=1 ./internal/dst/
 
   fmt:
@@ -1074,53 +890,27 @@ tasks:
       # program, it costs about two seconds, and an unreachable symbol reported after
       # twenty seconds of tests is a report that arrives once nobody is watching.
       - task: deadcode
-      # Beside deadcode because it is the same kind of claim — a rule CLAUDE.md states as
-      # part of "done" that nothing computed — and because it is the cheapest step here:
-      # two files read, no toolchain, no build. Its list of open entries is printed on a
-      # green run on purpose, so the divergences this tree ships with are read by whoever
-      # runs the gate rather than by whoever remembers to open STATUS.md.
+      # Beside deadcode: two files read, no toolchain, and it prints the open entries on a
+      # green run so they are read by whoever runs the gate.
       - task: dev:entries
-      # And beside that one, because it is the same rule pointed at the place the docs
-      # went. STATUS.md is checked by the step above; the comments that replaced ten
-      # thousand lines of Markdown were checked by nobody, and the ACK contract in
-      # wal.Log.Flush's doc comment had described a withdrawn upload-and-verify chain for
-      # two waves. Cheap enough to sit in the fast gate: one `go list`, one awk pass.
+      # The same rule pointed at the comments that replaced the deleted Markdown. One `go
+      # list`, one awk pass.
       - task: comment:rot
       # Beside it, and the same kind of claim: a rule CLAUDE.md states as part of "done"
       # that nothing computed. One `wc`.
       - task: status:cap
       - task: test
       - task: dst
-      # Half a second, and it is in the *fast* gate rather than only in `ci:full`
-      # because renaming a Taskfile target is a local edit whose only victim is a
-      # workflow file — and the person renaming it runs `task ci`, not `task ci:full`.
-      # The alternative, leaving it to CI, means the report arrives from a runner that
-      # fails on a missing target long before it reaches the proof it exists for, with
-      # logs that read like an infrastructure fault.
+      # In the *fast* gate: renaming a Taskfile target is a local edit whose only victim is
+      # a workflow file, and the person renaming it runs `task ci`, not `ci:full`.
       - task: workflows:verify
 
   # --- the merge gate ----------------------------------------------------------
   #
-  # There is one, and there used to be two. `ci:noguest` was `ci:full` minus every proof
-  # that needed a real Linux kernel in the loop, and the pair existed because a skipped
-  # guest lane had been reported as a pass: `test:integration:qemu` printed "SKIP: no QEMU
-  # in _output" and exited 0, so the gate's exit code claimed a guest had booted on every
-  # machine except one laptop. The fix was to make the *caller* declare what it claimed
-  # (REQUIRE_PROOFS → SPIN_REQUIRE_PROOFS → a skip becomes a failure) and to give the
-  # weaker claim a second target *name*, because a name is visible in the sentence people
-  # exchange — "ci:full was green" — and an environment variable is not.
-  #
-  # Both are gone with the lanes they arbitrated. The guest-backed proofs drove a real
-  # kernel against this system's own vhost-user-blk backend, and that backend is
-  # withdrawn: QEMU manages the local copy-on-write format through qcow2 now. There is no
-  # lane that can skip, so there is nothing for a second target name to distinguish, and
-  # keeping `ci:noguest` would mean printing "NOT PROVEN: …" about proofs that do not
-  # exist — the same lie as the skip it was built to expose, told from the other side.
-  #
-  # It comes back with the qcow2 lane, and the mechanism above is what it comes back as:
-  # that lane needs a real QEMU (`task build:qemu`, still here and still pinned) and a
-  # real kernel (`task fetch:kernel`, likewise), and a machine without them must not be
-  # able to report a green merge gate.
+  # One gate. `ci:noguest` existed to name the weaker claim while a guest lane could skip
+  # itself and still report a pass; it went with the vhost-user-blk lanes it arbitrated.
+  # When the qcow2 lane lands, a machine without the pinned QEMU and kernel must again be
+  # unable to report a green merge gate — that is what it comes back as.
 
   ci:full:
     desc: >-

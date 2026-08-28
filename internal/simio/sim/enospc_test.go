@@ -7,12 +7,10 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// A full device is the one disk fault the simulation could not express. Every other
-// disk fault it models is transient and one-shot (a short append, a lost sync); ENOSPC
-// is neither: the first failure arrives as a partial append and every append after it
-// fails the same way until somebody reclaims space. Modelling it as a one-shot short
-// append is what let the WAL's out-of-space path go untested — the interesting part is
-// precisely what happens *after* the first failure.
+// ENOSPC is the one disk fault that is not one-shot: the first failure arrives as a
+// partial append and every append after it fails until somebody reclaims space. Modelling
+// it as a short append is what let the WAL's out-of-space path go untested — the
+// interesting part is what happens *after* the first failure.
 func TestInjectENOSPCFillsTheDeviceAndStaysFull(t *testing.T) {
 	tests := []struct {
 		name     string

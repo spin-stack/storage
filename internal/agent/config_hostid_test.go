@@ -9,16 +9,10 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 )
 
-// A host id is not free-form text: `hosts.host_id` is the `uuidv7` domain (INV-22) and
-// the pg adapter parses the string before it ever reaches SQL. An Agent started with
-// `-host-id host-1` therefore writes zero rows on every heartbeat — and because
-// Loop.Run feeds the error straight into its backoff, it retries that forever while
-// logging one line at startup. The operator sees a process that looks alive and a fleet
-// that never learns the host exists.
-//
-// Refusing it at construction is the difference between a five-second fix and an
-// afternoon. This is the boundary Parse belongs at: rejecting a bad value where it
-// enters, rather than letting it flow inward.
+// A host id is not free-form text: `hosts.host_id` is the `uuidv7` domain (INV-22) and the
+// pg adapter parses it before it reaches SQL, so `-host-id host-1` writes zero rows on
+// every heartbeat — forever, since Loop.Run feeds the error into its backoff. The operator
+// sees a process that looks alive and a fleet that never learns the host exists.
 func TestConfigRefusesAHostIDThatIsNotAUUIDv7(t *testing.T) {
 	base := func() agent.Config {
 		return agent.Config{
@@ -67,10 +61,8 @@ func TestConfigRefusesAHostIDThatIsNotAUUIDv7(t *testing.T) {
 }
 
 // TestConfigRefusesWiringThatWouldRunWrong walks the rest of Validate. Every field it
-// checks is a wiring mistake in `main` that produces a process which starts, looks
-// healthy and is wrong — the shape CLAUDE.md's table is entirely made of — so the
-// refusal has to land on the flag rather than behind whichever dependency happened to
-// be opened first.
+// checks is a wiring mistake in `main` that produces a process which starts, looks healthy
+// and is wrong, so the refusal has to land on the flag.
 func TestConfigRefusesWiringThatWouldRunWrong(t *testing.T) {
 	base := func() agent.Config {
 		return agent.Config{

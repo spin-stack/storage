@@ -12,16 +12,12 @@ import (
 // ErrNotExist is returned when opening or renaming a missing file.
 var ErrNotExist = errors.New("simio/disk: file does not exist")
 
-// ErrNoSpace means the device backing the file has no room left: the real disk's
-// ENOSPC and the simulator's injected equivalent, wrapped so callers can tell them
-// apart from any other I/O failure with errors.Is.
-//
-// It lives here because the WAL has to distinguish "the device is full" — a sticky
-// condition that clears only when somebody gives the filesystem room back, and never
-// on its own — from a transient error, and it may import neither syscall (denied
-// outside simio) nor the simulator. Without a sentinel
-// on this interface the only portable test is the error's message, which is a string
-// comparison in the durability path.
+// ErrNoSpace means the device backing the file has no room left: the real disk's ENOSPC
+// and the simulator's injected equivalent, wrapped so callers can tell them apart with
+// errors.Is. It lives here because the WAL must distinguish a full device — sticky until
+// somebody gives room back — from a transient error, and may import neither syscall
+// (denied outside simio) nor the simulator; without the sentinel the only portable test
+// is a comparison on the error's message, in the durability path.
 var ErrNoSpace = errors.New("simio/disk: no space left on device")
 
 // ErrLocked means another live process holds the lock. It is not a transient
@@ -49,21 +45,14 @@ type Usage struct {
 // Disk is a flat-ish namespace of append-only files (names may contain "/").
 type Disk interface {
 	// Create returns a new empty file, truncating any existing one, and makes the
-	// file's *name* durable before returning: on a real filesystem that means
-	// fsyncing the parent directory (and every directory Create had to make).
+	// file's *name* durable before returning: on a real filesystem that means fsyncing
+	// the parent directory (and every directory Create had to make).
 	//
-	// The guarantee belongs here rather than in a separate SyncDir the caller is
-	// trusted to remember. File.Sync makes a file's contents durable and says nothing
-	// about the directory entry pointing at them, so a crash can lose a freshly
-	// created file whole — with its fdatasync'd records inside it. The WAL, which
-	// creates a segment per 32 MiB and ACKs writes into it, is one Create away from
-	// that at all times, and so is every future caller. Making it a property of the
-	// interface removes the possibility of forgetting it; the cost is one fsync per
-	// file creation, and nothing in this tree creates files at a rate where that is
-	// visible.
-	//
-	// Unlink is deliberately *not* covered: a directory entry that outlives a crash
-	// costs a file a later sweep removes, never data.
+	// The guarantee belongs on the interface rather than a separate SyncDir the caller
+	// is trusted to remember: File.Sync says nothing about the directory entry, so a
+	// crash can lose a freshly created file whole, with its fdatasync'd records inside
+	// it. Unlink is deliberately not covered — a directory entry that outlives a crash
+	// costs a later sweep, never data.
 	Create(name string) (File, error)
 	// Open returns an existing file for read and append.
 	Open(name string) (File, error)
@@ -80,18 +69,13 @@ type Disk interface {
 	// cannot be cancelled halfway.
 	Usage() (Usage, error)
 	// Lock takes an exclusive, non-blocking lock on name, creating it if needed, and
-	// returns a handle whose Close releases it. ErrLocked means another *process*
-	// holds it (§10: "un proceso por host", DEV-0014).
+	// returns a handle whose Close releases it. ErrLocked means another *process* holds
+	// it (§10 "un proceso por host", DEV-0014).
 	//
-	// Non-blocking is the design, not a convenience: a caller that blocked would hang
-	// with no output instead of exiting with a message naming the directory, and
-	// "started but wedged" is harder to diagnose than "refused to start".
-	//
-	// The lock is owned by the open file description, so the kernel releases it when
-	// the process dies by any means. That is what makes it usable for a data
-	// directory at all: a `kill -9` leaves nothing to clean up, and the next
-	// incarnation starts (ADR-0024). A lock needing explicit release would trade one
-	// bug for a worse one — an Agent that will not come back after a crash.
+	// Non-blocking is the design: a caller that blocked would hang with no output
+	// instead of exiting with a message naming the directory. The lock is owned by the
+	// open file description, so the kernel releases it however the process dies and a
+	// `kill -9` leaves nothing to clean up (ADR-0024).
 	Lock(name string) (io.Closer, error)
 }
 

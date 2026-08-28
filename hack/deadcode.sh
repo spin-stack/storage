@@ -1,51 +1,24 @@
 #!/usr/bin/env bash
 # Which functions a shipped binary links but never calls — computed, not remembered.
+# It replaced a hand-written list in STATUS.md that went stale inside one increment.
 #
-# CLAUDE.md's rule is that "a component with no caller is a liability, not progress", and
-# `CloneCrossHost` was deleted for exactly it. Until now the enforcement was a hand-written
-# list in STATUS.md ("Components with no production caller"), and in two consecutive waves
-# it was wrong: it went stale inside one increment, and the wave after it added an OTLP
-# exporter and a provider that nobody added to the list. A list a human maintains about
-# code a human is changing is the same defect as a checker that cannot fire — it reports
-# success by not being updated.
+# Roots are the binaries and only the binaries: ./cmd/... plus integration/guestinit, PID 1
+# inside the guest. `deadcode -test` was rejected — it makes every test's own subject
+# reachable, answering "is this called by anything at all" rather than "does a binary
+# reach it".
 #
-# ROOTS ARE THE BINARIES, AND ONLY THE BINARIES: ./cmd/... plus integration/guestinit,
-# which is PID 1 inside the guest and as much a binary this repository builds and boots as
-# the other two. It left this list with the local block engine it used to boot against and
-# came back with Stage 1, which boots a guest against a qcow2. `deadcode -test` was
-# rejected outright: it makes every test's own
-# subject reachable, so it answers "is this called by anything at all", which is never the
-# question. CLAUDE.md's question is narrower and is the one that found CloneCrossHost —
-# does a *binary* reach it.
+# Two blind spots, which make this a floor and not a proof: RTA marks every method of a
+# type that reaches reflect as live, so absence from the report is not evidence of a
+# caller; and a package no binary imports is not in the program at all — the package pass
+# below closes that gap at package granularity.
 #
-# TWO BLIND SPOTS, both real, and they are why this is a floor rather than a proof:
+# Two lists — allow ("unreachable, and that is correct for ever") and pending
+# ("unreachable, and the deletion is unfinished") — one parser, reason mandatory. Exit
+# non-zero on a finding in neither list, an entry matching no finding, an entry with no
+# reason, or a symbol both lists claim: a ratchet that turns one way. A pinned count was
+# rejected — deleting one finding would buy the right to add another.
 #
-#   1. Reflection. RTA conservatively marks every method of a type that reaches `reflect`
-#      as live, so a symbol whose only caller is the DST harness can be absent from this
-#      report entirely — `deadcode -whylive` answers "reachable only through reflection".
-#      A symbol absent from this report is not evidence that something calls it.
-#   2. Packages no binary imports at all are not in the program, so no function in them can
-#      be reported. That is where STATUS.md's other entry (`metadata.BumpVolumeEpoch`, in
-#      metadata/sim and metadata/pg) lives. The package pass below closes exactly that gap,
-#      at package granularity: it names the packages, not the symbols.
-#
-# TWO LISTS, AND THE GATE. hack/deadcode-allow.txt says "unreachable, and that is correct
-# forever"; hack/deadcode-pending.txt says "unreachable, and nobody has finished deleting
-# it yet". Both are read the same way and both are enforced the same way — what differs is
-# what an entry claims, and keeping them apart is what let this become a blocking step in
-# `task ci` without turning the allowlist into the place findings go to be forgotten.
-#
-# EXIT POLICY. Non-zero when there is a finding neither list mentions, when an entry in
-# either list has gone stale (the symbol was deleted, or something now calls it), when an
-# entry carries no reason, and when the two lists claim the same symbol. Together those
-# make the pending list a ratchet that only turns one way: the set of unexplained findings
-# cannot grow, and an entry cannot outlive the code it names. A pinned *count* would have
-# neither property — deleting one finding would buy the right to add another, and the one
-# ratchet in this repository that pinned a bare integer (`wantBehavioural`) is the one
-# that causes merge conflicts.
-#
-# The result is valid for one GOOS/GOARCH/build-tag configuration — linux/amd64, no tags,
-# which is what CI runs and what the binaries ship as.
+# Valid for one GOOS/GOARCH/build-tag configuration — linux/amd64, no tags.
 set -euo pipefail
 
 # Byte ordering, not the developer's locale: `sort` in a UTF-8 locale folds punctuation

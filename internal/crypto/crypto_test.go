@@ -233,11 +233,9 @@ func TestNewEncryptionRefusesAnUnversionedDEK(t *testing.T) {
 	}
 }
 
-// SealRandom draws its nonce instead of deriving one, and the doc comment says why: an
-// object that has no monotonic sequence has nothing safe to derive from, and every
-// substitute considered leaks either a repeated nonce or the plaintext into it. What
-// that costs is that the nonce has to travel with the ciphertext, so the round trip and
-// the tamper case are both about the caller having stored it.
+// SealRandom's nonce is drawn, not derived, so it has to travel with the ciphertext —
+// which is why the round trip and the tamper case are both about the caller having
+// stored it.
 func TestSealRandomRoundTripsAndFailsClosed(t *testing.T) {
 	dek, err := crypto.GenerateDEK(&fixedReader{b: 7}, 1)
 	if err != nil {

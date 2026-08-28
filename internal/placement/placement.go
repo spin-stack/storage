@@ -1,12 +1,8 @@
-// Package placement decides which host a volume lands on. It is the §20 placement
-// order — source host with capacity, then a host that already holds the data, then
-// any host with capacity — bounded by the
-// declared NVMe oversubscription policy of §28.2, by the measured fill ceiling of
-// ADR-0013 §3, and by the fleet states of §28.1 (a CORDONED, DRAINING, or DEAD host
-// never receives new work).
-//
-// The policy is pure: no clock, no I/O, and no dependence on the order of its input,
-// so the DST harness replays a placement decision identically (INV-02).
+// Package placement decides which host a volume lands on: the §20 order (source host, then a
+// host that already holds the data, then any host with capacity), bounded by §28.2's
+// oversubscription policy, ADR-0013 §3's measured fill ceiling, and §28.1's fleet states — a
+// CORDONED, DRAINING or DEAD host never receives new work. The policy is pure (no clock, no
+// I/O, no dependence on input order), so DST replays a decision identically (INV-02).
 package placement
 
 import (
@@ -18,31 +14,21 @@ import (
 // ErrNoCapacity means no host can hold the request under the policy.
 var ErrNoCapacity = errors.New("placement: no host with capacity")
 
-// DefaultMaxUsedRatio is the fill ceiling a Policy uses when it names none: the
-// ≥85% row of ADR-0013 §3, the point at which a device stops taking new work. It is
-// the zero value's meaning rather than "no ceiling" on purpose — a Policy written
-// before this field existed is a Policy whose author never decided that a full
-// device may keep receiving volumes, and defaulting to "unbounded" would reinstate
-// exactly the gap this closes for every caller that did not edit its literal.
+// DefaultMaxUsedRatio is the fill ceiling a Policy uses when it names none: the ≥85% row of
+// ADR-0013 §3, at which a device stops taking new work. The zero value means this rather than
+// "no ceiling" — an unedited Policy literal must not be one that fills a device.
 const DefaultMaxUsedRatio = 0.85
 
-// Policy is the declared capacity rule, in two parts that answer two questions.
+// Policy is the declared capacity rule, in two ceilings.
 //
-// MaxOversubscription bounds what a host has been *promised*: committed/total may
-// not exceed it after the placement (§28.2). The zero value means no
-// oversubscription (committed <= total) — the safe default, never "unbounded".
+// MaxOversubscription bounds what a host has been *promised*: committed/total may not exceed
+// it after the placement (§28.2). Zero means no oversubscription, never unbounded.
+// MaxUsedRatio bounds what the host is *measured* to be using (ADR-0013 §3); zero means
+// DefaultMaxUsedRatio, and 1 or more has to be typed rather than inherited.
 //
-// MaxUsedRatio bounds what the host is *measured to be using*: the fraction of the
-// device that may already be occupied for it to take new work (ADR-0013 §3). Zero
-// means DefaultMaxUsedRatio; 1 or more means the operator has said a device may fill
-// completely, which has to be typed rather than inherited.
-//
-// The two are separate ceilings and not one number, because the whole point of
-// oversubscription is that promises exceed bytes: volumes are thin, so a fleet
-// deliberately promises 1.5× what its devices hold, while no device is ever 1.5×
-// full. Collapsing them (one ceiling over max(committed, used)) makes the lower —
-// physical — ceiling subsume the higher one and MaxOversubscription stops doing
-// anything at all.
+// Not one number: volumes are thin, so a fleet deliberately promises 1.5× what its devices
+// hold while no device is ever 1.5× full — collapsing them lets the lower, physical ceiling
+// subsume MaxOversubscription entirely.
 type Policy struct {
 	MaxOversubscription float64
 	MaxUsedRatio        float64
@@ -74,50 +60,26 @@ func (p Policy) maxUsedRatio() float64 {
 	return p.MaxUsedRatio
 }
 
-// Admits reports whether h can take sizeBytes more without breaking the policy,
-// evaluated against the host as it is *now*: the §28.2 bound on what it has been
-// promised, and the ADR-0013 fill ceiling on what it is measured to be using. Both
-// have to hold, because a host can be well inside its promises and out of device.
+// Admits reports whether h can take sizeBytes more: §28.2's bound on what it has been
+// promised, and ADR-0013's fill ceiling on what it is measured to be using. Both have
+// to hold — a host can be well inside its promises and out of device.
 //
-// The measurement arm charges the request nothing. It is a gate ("this device is
-// already filling, so it takes no new work"), not an accounting, and the two
-// alternatives are worse:
+// The measurement arm charges the request nothing. It is a gate, not an accounting:
+// `used + sizeBytes <= UsedLimit` would assume a volume occupies its declared size the
+// moment it is placed, which is the assumption oversubscription exists to deny, and a
+// single `max(committed, used)` ceiling would subsume MaxOversubscription. The catalog
+// cannot predict what a volume adds physically anyway — under ADR-0026 a session's whole
+// WAL stays on the device until the volume stops — so what is knowable is what is already
+// there, including other tenants of that filesystem (agent.DiskUsage), which no
+// truncation of ours frees.
 //
-//   - `used + sizeBytes <= UsedLimit` assumes a volume occupies its declared size
-//     the moment it is placed, which is the assumption oversubscription exists to
-//     deny. A 1 TiB volume would be unplaceable on a half-empty 2 TiB device
-//     although it will write a few GiB, so the arm that measures would kill thin
-//     provisioning outright.
-//   - a single occupancy number, `max(committed, used) + sizeBytes <= one ceiling`,
-//     puts the physical ceiling (below 1) above the promise ceiling (usually above
-//     1), so it subsumes it and MaxOversubscription stops meaning anything.
+// used == 0 is read as an empty device, not as "unmeasured": total and used come from one
+// statfs in one heartbeat, and a host that never measured is refused by the
+// NVMeTotalBytes guard.
 //
-// It also cannot be an accounting, because the catalog cannot predict what a volume
-// adds physically: under ADR-0026 a session's whole WAL stays on the device until
-// the volume stops, so what lands there is what the guest writes, not what it
-// declared. What is knowable is what is already there — including the bytes of
-// other tenants of that filesystem, which is deliberate (agent.DiskUsage): no
-// truncation of ours frees them, so a threshold that ignores them fires too late.
-//
-// A host that has never measured its device is refused by the NVMeTotalBytes guard
-// above, and that is the whole of the "no measurement yet" case: total and used come
-// from one statfs in one heartbeat, and agent.DiskUsage.Usage returns an error
-// rather than a zero when that statfs fails, so there is no state where the total is
-// known and the usage is not. Reading used == 0 as "unknown, refuse" instead would
-// refuse the empty host — the one we most want to place on.
-//
-// Choose is advisory. It is pure, so two operations that read the fleet before
-// either has reserved anything — a drain and a clone, or two drains — both get the
-// same destination and both commit, and the destination ends up past the declared
-// bound with neither caller having made a mistake. The bound therefore has to be
-// re-evaluated by whatever performs the reservation, and it has to be the same rule:
-// two copies of it is how a host ends up holding what placement believed it refused.
-//
-// This is the check; the enforcement is the same two numbers handed to the write
-// that adds the bytes (Bound below, ADR-0017), so the bound is a predicate of that
-// statement rather than a step before it. Re-checking here and committing afterwards
-// would leave the read and the write two steps apart, and the race would survive —
-// just narrower.
+// This check is advisory — it is pure, so two callers reading the same fleet both get the
+// same destination — which is why the same two numbers go to the write that adds the
+// bytes (Bound, ADR-0017) rather than being re-checked a step before it.
 func (p Policy) Admits(h metadata.Host, sizeBytes int64) bool {
 	if !h.State.AcceptsPlacement() || h.NVMeTotalBytes <= 0 {
 		return false
@@ -175,16 +137,13 @@ func (p Policy) Choose(hosts []metadata.Host, req Request) (string, error) {
 	return "", ErrNoCapacity
 }
 
-// best returns the fitting host with the lowest post-placement committed ratio,
-// breaking ties on host id so the choice is independent of input order. When only
-// is non-nil, candidates are restricted to those ids.
+// best returns the fitting host with the lowest post-placement committed ratio, ties broken on
+// host id so the choice is independent of input order. A non-nil `only` restricts candidates
+// to those ids.
 //
-// It ranks on the promise and not on the measurement, although Admits reads both.
-// The measurement lags placement by a heartbeat and by however long the guest takes
-// to write: a host handed ten volumes still measures empty, so ranking on used bytes
-// would keep choosing it until the first of them filled — the feedback loop arrives
-// after the damage. Committed moves with every placement, including the ones still
-// in flight, which is exactly what a ranking needs.
+// It ranks on the promise, not the measurement: used bytes lag placement by a heartbeat and by
+// however long the guest takes to write, so a host handed ten volumes still measures empty and
+// would keep being chosen.
 func (p Policy) best(hosts []metadata.Host, sizeBytes int64, only []string) (string, bool) {
 	var (
 		bestID    string

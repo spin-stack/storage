@@ -8,14 +8,10 @@
 // device, and the set of volumes this host is serving. cmd/volume-agent is the only
 // place the real implementations are constructed.
 //
-// **The volume manager behind the VolumeSource is internal/qcow.** The one before it
-// served each volume from a local write-ahead log through a vhost-user-blk socket, and
-// it went with that engine: QEMU owns the local copy-on-write format from here on, and
-// this system's job narrows to immutable commits, publication and recovery. What is left
-// here is exactly the half that talks to the Control Plane — heartbeat, lease, desired
-// state, the report — and it is deliberately unchanged, because it is the half the new
-// design keeps. VolumeReconciler is the seam, qcow.Manager is what plugs into it, and
-// VolumeSet is what the loop's own tests drive when the point is the loop.
+// The volume manager behind the VolumeSource is internal/qcow: QEMU owns the local
+// copy-on-write format, and what is left in this package is the half that talks to the
+// Control Plane. VolumeReconciler is the seam, qcow.Manager plugs into it, and VolumeSet
+// is what the loop's own tests drive.
 package agent
 
 import (
@@ -31,14 +27,12 @@ import (
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
-// Device reports the local NVMe device's usage (ADR-0013). It is an interface, and
-// it carries a context the disk's own statfs does not need, because the device an
-// Agent owns will not always be a filesystem under its feet: a future one is a block
-// device queried over a socket, and a caller that cannot cancel that is a caller
-// whose heartbeat can hang.
+// Device reports the local NVMe device's usage (ADR-0013). It carries a context the disk's
+// own statfs does not need, because the device an Agent owns will not always be a
+// filesystem: a future one is a block device over a socket, and a caller that cannot cancel
+// that is a caller whose heartbeat can hang.
 //
-// It reports disk.Usage unchanged rather than a shape of its own. The Agent used to
-// have one, and the translation was where the honest numbers were lost.
+// It reports disk.Usage unchanged; the Agent's own shape was where the honest numbers got lost.
 type Device interface {
 	Usage(ctx context.Context) (disk.Usage, error)
 }
@@ -69,19 +63,12 @@ type VolumeStatus struct {
 	// Refusal says this host is **not serving** this volume, and RefusalDetail is the
 	// sentence behind it. Unset is this host saying it is serving.
 	//
-	// It is the one field here that is not a measurement. Everything above is a number
-	// the volume's own storage holds; this is a decision the Agent made — the image the catalog promised
-	// is not in the bucket, the volume came back under the durability floor, the read
-	// view never resolved, there is no key for it, the lease lapsed. Every one of those
-	// was already correct and every one was invisible: a volume that fails closed keeps
-	// reporting the watermarks its last healthy session left behind, and one that never
-	// started reported nothing at all — it stopped appearing on the wire, and an absence
-	// is not a signal.
+	// It is the one field here that is not a measurement. Without it a volume that fails
+	// closed keeps reporting the watermarks its last healthy session left behind, and one
+	// that never started reports nothing at all — and an absence is not a signal.
 	//
-	// It is the proto's enum rather than a vocabulary of the Agent's own, for the reason
-	// VolumeReconciler.Apply takes proto types: this is the wire's word, the Agent is
-	// the only thing that produces it, and a third spelling between here and the message
-	// would be a mapping that can be wrong in one direction only.
+	// The proto's enum rather than a vocabulary of the Agent's own: the Agent is the only
+	// thing that produces it, and a third spelling would be a mapping that can be wrong.
 	Refusal storagev1.VolumeRefusal
 	// RefusalDetail is free text an operator reads and nothing branches on: which
 	// sequence, which KEK. Empty when there is no refusal.
@@ -111,29 +98,22 @@ type VolumeSource interface {
 }
 
 // VolumeReconciler is a VolumeSource that can also be told what this host *should* be
-// serving. The Loop uses it when its VolumeSource happens to be one; a plain source
-// leaves the desired state recorded and unacted-on, which is what a test driving
-// VolumeSet wants. qcow.Manager is the implementation a binary wires up.
+// serving; qcow.Manager is what a binary wires up, and a plain source leaves the desired
+// state recorded and unacted-on, which is what a test driving VolumeSet wants.
 //
-// It is deliberately the same object as the source. What is reported and what is served
-// must come from one place: two would drift, and the report is what the Control Plane
-// makes fencing decisions from.
+// Deliberately the same object as the source: what is reported and what is served must
+// come from one place, or they drift, and the report is what fencing decisions are made from.
 type VolumeReconciler interface {
 	VolumeSource
 	Apply(ctx context.Context, desired []*storagev1.DesiredVolume) error
-	// Fence stops serving the given volumes. This host is not their writer any more,
-	// and the data path is where that has to take effect (§16) — recording it was all
-	// the loop could ever do on its own.
+	// Fence stops serving the given volumes; recording it was all the loop could ever do on
+	// its own (§16).
 	//
-	// why and detail are what the *next* report says about them, and
-	// VOLUME_REFUSAL_UNSPECIFIED means "say nothing". The two callers want opposite
-	// things and the difference is whether the Control Plane already knows: a fence
-	// that follows a refused report is the Control Plane's own decision coming back,
-	// and reporting it would be telling it what it just told us — and the report would
-	// be refused again anyway, on the same host-and-epoch predicate. A lease that
-	// lapsed is the other case entirely: nothing outside this process knows the device
-	// is gone, the volume stays this host's at this epoch until somebody moves it, and
-	// silence there is a guest with no disk and a fleet that reads healthy.
+	// why and detail are what the *next* report says, and VOLUME_REFUSAL_UNSPECIFIED means
+	// "say nothing". A fence following a refused report is the Control Plane's own decision
+	// coming back, and reporting it would be refused again on the same predicate. A lapsed
+	// lease is the other case: nothing outside this process knows, and silence there is a
+	// guest with no disk and a fleet that reads healthy.
 	Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error
 }
 
@@ -177,15 +157,11 @@ func (s *VolumeSet) Volumes(context.Context) ([]VolumeStatus, error) {
 	return out, nil
 }
 
-// DiskUsage is the Device backed by this Agent's data disk: it asks the device itself
-// (a statfs in production), rather than estimating from the files it happens to know
-// about.
-//
-// The difference is what the Agent cannot reclaim. A sum of our own files says
-// nothing about the space another tenant of the same filesystem occupies, and nothing
-// this Agent can do will ever free it — so a threshold evaluated on the sum fires
-// after the device is already full, which is the one moment it needed to have fired
-// earlier (ADR-0013 §3).
+// DiskUsage is the Device backed by this Agent's data disk: it asks the device itself (a
+// statfs in production) rather than summing the files it knows about. A sum says nothing
+// about the space another tenant of the same filesystem occupies and this Agent can never
+// free it, so a threshold on the sum fires after the device is already full — the one
+// moment it needed to have fired earlier (ADR-0013 §3).
 type DiskUsage struct {
 	disk disk.Disk
 }

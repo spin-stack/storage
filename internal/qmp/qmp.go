@@ -1,18 +1,14 @@
 // Package qmp is a QEMU Machine Protocol client, cut down to the one question this
 // system asks today: which image file does the QEMU at this socket actually have open?
 //
-// # Why there is a client here at all, and why it is this small
+// # Why there is a client here at all
 //
-// The Agent does not run QEMU (see internal/qcow). It prepares a volume's chain and
-// then has no way of its own to know whether anything is using it — a file on disk is
-// the same file whether a VM booted from it, booted from something else, or never
-// started. QMP is the only channel that answers, and v6 §7 makes it the mandatory one:
-// flush the block devices, take the external snapshot, switch to the new tip, and
-// **confirm QEMU is using it**. The last of those is the whole of Stage 1's use, and
-// the first three are what the next stage builds on this transport.
+// The Agent does not run QEMU (see internal/qcow): it prepares a volume's chain and has no
+// other way to know whether anything is using it. QMP is the only channel that answers, and
+// v6 §7 makes it the mandatory one — flush, snapshot, switch to the new tip, and confirm QEMU
+// is using it.
 //
-// What it is not: a general QMP library. There is no event subscription, no command
-// registry, no reconnection. Those arrive when something asks for them.
+// Not a general QMP library: no event subscription, no command registry, no reconnection.
 package qmp
 
 import (
@@ -280,14 +276,10 @@ func (c *Client) Stop() error {
 	return err
 }
 
-// execute sends one command and returns the raw `return` value.
-//
-// Events are skipped rather than delivered, and that is the one piece of protocol
-// subtlety in this file. QEMU interleaves them with command answers on the same
-// stream — a `JOB_STATUS_CHANGE` can arrive between the request and its reply — so a
-// client that treated the next line as its answer would read an event as a result, or
-// as a malformed one, depending on the day. The loop reads until something that is an
-// answer or an error.
+// execute sends one command and returns the raw `return` value. Events are skipped rather
+// than delivered: QEMU interleaves them with command answers on the same stream — a
+// `JOB_STATUS_CHANGE` can arrive between the request and its reply — so the loop reads until
+// something is an answer or an error.
 func (c *Client) execute(command string) (json.RawMessage, error) {
 	return c.executeWith(command, nil)
 }

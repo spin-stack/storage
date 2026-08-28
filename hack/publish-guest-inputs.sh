@@ -2,37 +2,21 @@
 # The two artefacts CI's guest-backed jobs need and this repository does not build: the
 # pinned QEMU runtime image and the pinned guest kernel. One command publishes both.
 #
-# WHY THIS EXISTS. `.github/workflows/ci.yml`'s `guest-inputs` job fails until both are in
-# the registry, deliberately — the proofs a real Linux kernel carries are the ones it is
-# least safe to assume. Publishing them was documented rather than automated, and the
-# documentation was spread across four places: the workflow's failure summary, the Taskfile
-# targets `build:qemu:push` and `guest:kernel:push`, `hack/guest-kernel.sh`'s error text,
-# A human reconstructing a procedure from four files gets one step wrong;
-# the interesting part is that most of the wrong steps are *silent*. Pushing the kernel to
-# a path CI does not resolve, tagging it with the version instead of the content hash,
-# publishing a package the repository's own Actions token cannot read — each of those ends
-# as `guest-inputs` reporting "not published", which is the message it also prints when
-# nobody has published anything at all.
+# WHY THIS EXISTS. Publishing was documented rather than automated, across four files, and
+# most of the ways to get it wrong are silent: a path CI does not resolve, the version tag
+# instead of the content hash, a package the repository's Actions token cannot read. All
+# three end as "not published" — the message printed when nobody published anything.
 #
-# So this script does not describe the procedure, it performs it, and every input it needs
-# is checked and named first:
+#   check     the preconditions, each with its remedy. No side effects.
+#   publish   check, publish both, then prove it by resolving them the way ci.yml does.
+#             Idempotent: re-run after the QEMU build finishes and it verifies.
 #
-#   check     the preconditions, each with the remedy. No side effects, no publishing.
-#   publish   check, then bring both artefacts to published, then prove it by resolving
-#             them exactly the way ci.yml does. Idempotent: run it again after the QEMU
-#             build finishes and it verifies rather than republishes.
+# It does not build QEMU locally: qemu.yml builds the same artefact on a runner with the
+# shared BuildKit cache and has workflow_dispatch. The kernel is the opposite case —
+# storage never builds one (ADR-0021), so having it is a precondition, not a step.
 #
-# WHAT IT DELIBERATELY DOES NOT DO: build QEMU locally. `.github/workflows/qemu.yml` builds
-# and publishes it in tens of minutes on a runner with the shared BuildKit cache, and it
-# has `workflow_dispatch`; dispatching that is both faster and the same artefact CI would
-# have got anyway. The kernel is the opposite case — storage never builds one (ADR-0021),
-# so it can only come from a machine that already has spinbox's, which is why that is a
-# precondition here and not a step.
-#
-# UNVERIFIED, and said plainly because this repository has been bitten by checks that
-# claimed more than they established: nothing below has ever been run against a real
-# registry. What has been exercised is every precondition, in both states. The publish path
-# is reviewed code, not proven code, and the first person to run it is its first test.
+# Nothing below has been run against a real registry; every precondition has been
+# exercised in both states.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -406,12 +390,8 @@ EOF
 		return 1
 	fi
 
-	# The one thing this script cannot do, and it is the failure that looks exactly like
-	# "nothing was published": a ghcr.io package is private by default, and a package the
-	# repository is not linked to cannot be read by that repository's Actions token. The
-	# push carries org.opencontainers.image.source, which is what links it — but whether
-	# the link is enough depends on the package's "inherit access from repository" setting,
-	# and nothing here can read that.
+	# The one thing this script cannot do: confirm in the UI that each package is linked to
+	# the repository, which is what lets that repository's Actions token read it.
 	cat <<EOF
 Both inputs are published and resolve the way the workflow resolves them.
 

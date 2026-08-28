@@ -16,18 +16,6 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// Nothing in this tree creates a volume. Four RPCs exist and every one of them reads;
-// `crypto.GenerateDEK`, `WrapDEK` and `descriptor.Write` have no production caller at
-// all. The consequence is not subtle: `GetDesiredState` returns an empty list forever,
-// so an Agent — however complete its data path — has nothing to serve.
-//
-// Provisioning is one act with three durable effects that must agree: a row in
-// PostgreSQL, a wrapped DEK only this deployment's KEK can open, and a descriptor in
-// the object store. The descriptor is not bookkeeping — it is the anchor
-// `RebuildMetadata` reconstructs the catalog from (§22.5, INV-20) and the root
-// `gc.Reachable` walks from, so a volume whose row exists and whose descriptor does not
-// is a volume a metadata rebuild silently loses and the GC would mark.
-
 func testKMS(t *testing.T) *crypto.DevKMS {
 	t.Helper()
 	var kek [crypto.DEKSize]byte

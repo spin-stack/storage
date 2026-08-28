@@ -146,22 +146,16 @@ readonly REQUIRED_CONFIG=(
   CONFIG_SERIAL_8250_CONSOLE
 )
 
-# cmd_verify refuses every state that is not "checked and correct" — including the two
-# states that used to print OK: a check it was not asked to perform (an empty pin) and a
-# check it could not perform (no embedded config, no readelf). A preflight that reports
-# success for a kernel it did not read is worth less than no preflight, because the lane
-# it guards then fails later and somewhere else. Each refusal names the input and the task
-# that produces it: the reader is usually on a machine that has never run this lane.
+# cmd_verify refuses every state that is not "checked and correct", including a check it
+# was not asked to perform (an empty pin) and one it could not perform (no embedded config,
+# no readelf). Each refusal names the input and the task that produces it.
 cmd_verify() {
   local fail=0
 
   test -f "$KERNEL" || { echo "no kernel at $KERNEL — run: task fetch:kernel" >&2; return 1; }
 
-  # An empty pin used to mean "skip the hash comparison", which made `verify` pass for any
-  # file that happened to be at $KERNEL. `fetch` still honours an empty pin — acquiring an
-  # unpinned kernel is what bisecting a kernel change needs — but *verifying* against no
-  # pin is a contradiction, and it is how a lane certifies one kernel and reports on
-  # another.
+  # `fetch` honours an empty pin — bisecting a kernel change needs that — but verifying
+  # against no pin is how a lane certifies one kernel and reports on another.
   test -n "$KERNEL_SHA256" || {
     echo "GUEST_KERNEL_SHA256 is empty: there is no pin to verify $KERNEL against" >&2
     echo "print its hash with 'task guest:kernel:pin -- $KERNEL' and set GUEST_KERNEL_SHA256 in Taskfile.yml" >&2
@@ -193,11 +187,9 @@ cmd_verify() {
 
   local config
   config=$(ikconfig || true)
-  # A kernel carrying no config is legal in general and impossible here: the hash above
-  # already established this is the artefact we pinned, and that one embeds its config.
-  # So "unverifiable" means the pinned artefact changed shape, which is precisely when the
-  # four options below stop being checked — the warning this replaces let that pass with a
-  # line nobody reads in CI.
+  # A kernel with no embedded config is legal in general and impossible here: the hash
+  # above established this is the pinned artefact, and that one embeds its config. So
+  # "unverifiable" means the pinned artefact changed shape.
   [ -n "$config" ] || {
     echo "$KERNEL has no embedded config (CONFIG_IKCONFIG=n), so ${REQUIRED_CONFIG[*]} cannot be checked" >&2
     echo "it matches GUEST_KERNEL_SHA256, so the pinned artefact itself changed: re-pin a kernel built with" >&2

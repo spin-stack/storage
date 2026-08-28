@@ -30,15 +30,11 @@ func NewDisk(dir string) (*Disk, error) {
 
 func (d *Disk) path(name string) string { return filepath.Join(d.root, filepath.FromSlash(name)) }
 
-// Create makes the file and then makes its *name* durable, which is the contract
-// disk.Disk states and the one fdatasync does not give: a newly created file's
-// directory entry lives in the parent directory, and syncing the file's contents says
-// nothing about it. A crash between the two loses the whole file — records the WAL
-// already ACKed included.
-//
-// Every directory MkdirAll had to create is in the same position, so the sync walks
-// from the file's parent up to the shallowest directory that did not exist before. In
-// the steady state that is one fsync of an already-cached directory inode.
+// Create makes the file and then makes its *name* durable, which fdatasync does not: a
+// crash between the two loses the whole file, records the WAL already ACKed included.
+// Every directory MkdirAll had to create is in the same position, so the sync walks from
+// the file's parent up to the shallowest directory that did not exist before — in the
+// steady state, one fsync of a cached directory inode.
 func (d *Disk) Create(name string) (disk.File, error) {
 	p := d.path(name)
 	dir := filepath.Dir(p)
@@ -163,16 +159,12 @@ func (d *Disk) List(prefix string) ([]string, error) {
 	return names, nil
 }
 
-// Usage answers ADR-0013's question with the only thing that can answer it
-// honestly: a statfs of the filesystem holding this Disk's root. Summing our own
-// files — what the Agent did before this existed — misses every byte another tenant
-// of the same filesystem occupies, and those are the bytes nothing we do to our own
-// files will ever give back.
-//
-// syscall is denied everywhere but internal/simio (§25.1, depguard); this is one of
-// the two places in the tree that needs it, next to the ENOSPC translation below.
-// The uint64→int64 conversions are safe on any device this code will ever see: a
-// signed byte count overflows at 8 EiB, and Bfree is never above Blocks.
+// Usage answers ADR-0013's question with a statfs of the filesystem holding this Disk's
+// root. Summing our own files — what the Agent did before this existed — misses every
+// byte another tenant of the same filesystem occupies, and those are the bytes nothing we
+// do to our own files gives back. syscall is denied outside internal/simio; the
+// uint64→int64 conversions are safe, a signed byte count overflowing at 8 EiB and Bfree
+// never being above Blocks.
 func (d *Disk) Usage() (disk.Usage, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(d.root, &st); err != nil {
@@ -201,10 +193,7 @@ func (r *realFile) Append(p []byte) (int, error) {
 }
 
 // noSpace wraps ENOSPC in disk.ErrNoSpace so a caller can recognise a full device by
-// identity. The WAL has to tell "the device is full" — sticky, with its own remedy —
-// from a transient failure, and it may not import syscall (§25.1 denies it outside
-// this package). The original error is preserved in the chain, so an errors.As for
-// *os.PathError still works.
+// identity without importing syscall. The original error is preserved in the chain.
 func noSpace(err error) error {
 	if err == nil || !errors.Is(err, syscall.ENOSPC) {
 		return err
@@ -227,13 +216,10 @@ func (r *realFile) Size() (int64, error) {
 func (r *realFile) Close() error { return r.f.Close() }
 
 // Lock takes an exclusive, non-blocking flock on name inside this Disk's root
-// (DEV-0014, §10 "un proceso por host").
-//
-// The lock belongs to the open file description, which is why the returned Closer
-// keeps the *os.File alive: closing the file is what releases the lock, and letting
-// it be garbage-collected would release it while the caller still believed it held
-// the directory. It is also why nothing here has to clean up after a crash — the
-// kernel drops the lock when the process dies, so the next start is unblocked.
+// (DEV-0014). The lock belongs to the open file description, which is why the returned
+// Closer keeps the *os.File alive: closing it releases the lock, and letting it be
+// garbage-collected would release it while the caller still believed it held the
+// directory. The kernel drops it when the process dies, so a crash needs no cleanup.
 func (d *Disk) Lock(name string) (io.Closer, error) {
 	path := d.path(name)
 	// The parent, like Create makes: a lock is taken before anything else exists, so

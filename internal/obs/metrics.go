@@ -10,12 +10,8 @@ import (
 type MetricKind int
 
 // There is no KindHistogram. Every histogram in this catalogue measured the local block
-// engine — append and fdatasync latency, the duration of an image or snapshot publish —
-// and went with it, so the kind had no declaration, `Recorder.Observe` had no caller and
-// `Metrics.Histogram` had nothing to return. Keeping the machinery against the day a
-// duration is measured again is exactly the "reads as a plan" failure the catalogue
-// above was trimmed twice for; it comes back in the increment that declares the first
-// one, which is a Float64Histogram and eight lines.
+// engine and went with it, leaving Recorder.Observe with no caller. It comes back with the
+// increment that declares the first duration again: a Float64Histogram and eight lines.
 const (
 	// KindCounter is a monotonic Int64 counter (…_total).
 	KindCounter MetricKind = iota
@@ -36,56 +32,15 @@ type MetricDesc struct {
 }
 
 // Catalog returns the §26.2 metric taxonomy. Every entry is registered up front so a
-// later increment starts incrementing an existing series rather than inventing a name —
-// no cardinality drift, no typos discovered during an incident.
+// later increment increments an existing series rather than inventing a name — no
+// cardinality drift, no typos discovered during an incident.
 //
-// **Trimmed 2026-08-03 with §26.2 itself (DEV-0022).** It had grown to about forty
-// entries and three quarters of them named mechanisms ADR-0026 withdrew: the WAL-remote
-// block, checkpoints, objectization and compaction, GC, the fencing wait, mid-session
-// recovery, the warm standby and the io-class scheduler. Declaring a series for a
-// mechanism that does not exist is not free — it reads as a plan, which is exactly how
-// this file came to describe a system nobody had. Each goes back
-// in with the thing it measures.
-//
-// `wal_published_sequence` went for a smaller reason worth writing down: nothing
-// publishes in V1, so it would be a series permanently at 0.
-//
-// # The eleven that went on 2026-08-08, and the rule that took them
-//
-// A doc-vs-code audit found that thirteen series in this catalogue were declared and
-// recorded by nothing: instantiated by NewMetrics, exported on every scrape, and
-// permanently empty. That is worse than an absent series, because an empty series
-// reads as "the thing being measured is not happening" rather than "nothing is
-// measuring". A dashboard built on `s3_errors_total` shows a healthy object store.
-//
-// The rule applied, and it is CLAUDE.md's: a component with no caller is a liability.
-// So the ones whose *mechanism* does not exist went with it —
-// `inflight_recovered_total` and `vhost_reconnects_total` (increment 3.3 is not
-// started), `clone_cross_host_total` (ADR-0026 removed the cross-host path),
-// `agent_memory_bytes` (§10.1's memory budget was never built; `agent.Budget` is a
-// device budget), `clock_offset_seconds` (nothing reads chrony),
-// `host_nvme_committed_ratio` (derived at placement, never recorded),
-// `wal_oldest_unflushed_age_seconds` (the Log tracks *whether* there are unflushed
-// records, not the age of the oldest, and no Agent sets the age bound it belongs to),
-// and the four `s3_*` series (§24's subsystem does not exist; the client is one file
-// with no hedging, no circuit breaker and no classes).
-//
-// The ones whose mechanism *does* exist were wired instead of deleted, in the same
-// change, which is the other half of the rule.
-//
-// # The eleven that went on 2026-08-22, and it is the same rule again
-//
-// The local block engine was withdrawn — QEMU manages the local copy-on-write format
-// through qcow2 now, and this system keeps immutable commits, publication and recovery —
-// and every series that measured it went with it in the same commit: the five `wal_*`
-// series and `wal_out_of_space` (there is no write-ahead log), `volume_backpressure` (no
-// device refusing a guest), the three `read_view_*` series (no interval map),
-// `discarded_bytes_total` (no DISCARD reaching a backend), and the image and snapshot
-// publish durations (nothing publishes).
-//
-// Four are left, and that is the whole catalogue: two lease series the Agent's loop
-// records, and the two the clone path records. The commit protocol declares its own in
-// the increment that records them, which is this file's rule stated from the other end.
+// Trimmed three times (2026-08-03, -08-08, -08-22) down to these four. A series declared
+// for a mechanism that does not exist reads as a plan, and a declared series nothing
+// records is worse than an absent one: permanently empty reads as "the thing being
+// measured is not happening", so a dashboard on `s3_errors_total` showed a healthy object
+// store nobody was talking to. The commit protocol declares its own in the increment that
+// records them.
 func Catalog() []MetricDesc {
 	return []MetricDesc{
 		// --- Leases (liveness, no longer durability — §26.2) ---

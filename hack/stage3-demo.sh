@@ -11,10 +11,6 @@
 #      volume's DEK on the way out (v6 §10), so finding them would be the whole promise
 #      broken;
 #   5. the guest stops and a second boot reads back what it wrote, locally.
-#
-# What this does **not** show is recovery: rebuilding the volume on another host from the
-# bucket alone is v6 §23.4 and has no code yet. What it shows is that everything that
-# recovery would need is there and is internally consistent.
 set -euo pipefail
 
 DEMO_NAME=stage3

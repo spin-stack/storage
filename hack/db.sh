@@ -149,32 +149,14 @@ target_is_empty() {
 }
 
 # cmd_init — the only supported way to take an *empty* database to the declared state.
+# db:plan/db:apply are for changes: they diff schema.sql against an existing database and
+# the reviewable artefact is the plan.
 #
-# It exists because there was no such way. `db:plan`/`db:apply` are for changes: they diff
-# schema.sql against a database that already exists, and the reviewable artefact is the
-# plan. A newcomer with a fresh Postgres had to find a psql — the machine may not have one
-# — and redirect internal/schema/schema.sql into it by hand, which is neither a task nor
-# something CI has ever run.
-#
-# # Why this does not undermine "apply a saved plan, never a recomputed one"
-#
-# That rule is about *diffs*. Reviewing plan A and applying plan B recomputed at deploy
-# time is the failure a state-based tool invites, and it has teeth because a recomputed
-# diff can contain a DROP nobody read. Against an empty database there is no diff: the only
-# plan is "create everything in schema.sql", it is fully determined by the file already
-# under review, and it can destroy nothing because there is nothing there. That is exactly
-# the case `db:verify` recomputes on every CI run, and it is the only case this admits.
-#
-# So the emptiness gate is the load-bearing part, not a convenience. A non-empty database
-# is refused and sent to db:plan/db:apply — otherwise this task would be the back door
-# around review that the whole section exists to close.
-#
-# # Idempotent only where that is the truth
-#
-# Re-run against a database it already initialized, and it plans, finds nothing to do, and
-# says so — a task in CI has to survive being run twice. Re-run against a database that
-# has *drifted*, and it refuses and prints the diff: "make it match" is precisely the
-# unreviewed apply that is not on offer here.
+# The emptiness gate is the load-bearing part, not a convenience. "Apply a saved plan,
+# never a recomputed one" is about diffs — a recomputed diff can contain a DROP nobody
+# read. Against an empty database the only plan is "create everything in schema.sql", it is
+# determined by the file already under review, and it can destroy nothing. A non-empty
+# database is refused; re-running against one this already initialized finds nothing to do.
 cmd_init() {
   need_pgschema
   local flags

@@ -1,11 +1,9 @@
 // Package storecfg turns command-line flags into an object store, so both binaries
 // name the same knobs and resolve them the same way.
 //
-// It exists because they did not. cmd/control-plane grew its own four flags and its own
-// openObjectStore; the Agent had none at all, which is why it could heartbeat but never
-// upload. Two definitions of "how do I reach the object store" is one more than a
-// deployment can keep straight, and the divergence shows up as a host that talks to a
-// different bucket than the Control Plane it reports to.
+// It exists because they did not: the Control Plane grew its own flags and opener while the
+// Agent had none, and two definitions of "how do I reach the object store" show up as a host
+// talking to a different bucket than the Control Plane it reports to.
 package storecfg
 
 import (

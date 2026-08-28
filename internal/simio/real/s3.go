@@ -69,13 +69,10 @@ type bucketVersioningAPI interface {
 	GetBucketVersioning(context.Context, *s3.GetBucketVersioningInput, ...func(*s3.Options)) (*s3.GetBucketVersioningOutput, error)
 }
 
-// requireVersioning fails unless the bucket has versioning Enabled. It is the
-// precondition of INV-14: on any other bucket DeleteObject destroys the object
-// outright, and Delete is offered on this interface precisely because a mark is
-// reversible — a delete nobody can undo is the worst incident this system has. A
-// bucket whose versioning tooling forgot, or an operator Suspended, is
-// indistinguishable from a correct one at every other layer until the first delete,
-// which is why this is asked once, in the constructor.
+// requireVersioning fails unless the bucket has versioning Enabled — the precondition of
+// INV-14. A bucket whose versioning tooling forgot, or an operator Suspended, is
+// indistinguishable from a correct one at every other layer until the first delete, which
+// is why this is asked once, in the constructor.
 func requireVersioning(ctx context.Context, api bucketVersioningAPI, bucket string) error {
 	out, err := api.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
 	if err != nil {
@@ -94,14 +91,10 @@ func requireVersioning(ctx context.Context, api bucketVersioningAPI, bucket stri
 	return nil
 }
 
-// resolveCredentials answers what will sign this store's requests.
-//
-// Static credentials win when configured. Otherwise the SDK's default chain is loaded
-// explicitly — which is the part that was missing: s3.New takes an Options and resolves
-// nothing on its own, so an Options with no Credentials provider produces a client that
-// signs nothing and sends every request unsigned. Both realistic deployments go through
-// the chain (an instance role in AWS, AWS_* in the environment for a local backend), so
-// this makes S3Config's documented behaviour true rather than refusing the case.
+// resolveCredentials answers what will sign this store's requests. Static credentials
+// win when configured; otherwise the SDK's default chain is loaded explicitly, because
+// s3.New resolves nothing on its own and an Options with no Credentials provider sends
+// every request unsigned. Both realistic deployments go through the chain.
 func resolveCredentials(ctx context.Context, cfg S3Config) (aws.CredentialsProvider, error) {
 	if cfg.AccessKey != "" || cfg.SecretKey != "" {
 		return credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""), nil
@@ -188,12 +181,9 @@ func translate(err error) error {
 		}
 	}
 	// Everything else — SlowDown, ServiceUnavailable, RequestTimeout, InternalError,
-	// AccessDenied — stays opaque on purpose. A sentinel is for a condition a caller
-	// *branches* on, and the two above are the only ones anything branches on: a
-	// precondition failure is a decision (somebody else published; the chunk is
-	// already there) and a missing bucket is a misconfiguration. The rest all mean
-	// "this attempt failed", they are handled the same way wherever they surface,
-	// and naming them would invite a branch on a distinction nobody makes.
+	// AccessDenied — stays opaque on purpose: a sentinel is for a condition a caller
+	// *branches* on, and nothing branches on "this attempt failed". Naming them would
+	// invite a branch on a distinction nobody makes.
 	return err
 }
 
@@ -288,16 +278,12 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	return translate(err)
 }
 
-// Restore removes the delete marker a Delete placed, so the version underneath
-// becomes current again (§21.3). This is the operator action the whole INV-14
-// argument rests on — "a GC mistake costs a restore, not the data" — and it did not
-// exist on the production path at all.
+// Restore removes the delete marker a Delete placed, so the version underneath becomes
+// current again (§21.3) — the operator action INV-14 rests on.
 //
-// It refuses rather than guess in the one case that would be silently wrong: if the
-// latest version is not a delete marker, something wrote the key after the Delete
-// marked it, so the marked version is not what removing a marker would surface. An
-// operator who is told "restored" and gets different bytes rebuilds a volume from
-// content that was never what was marked.
+// It refuses in the one case that would be silently wrong: if the latest version is not a
+// delete marker, something wrote the key after the Delete, and the marked version is not
+// what removing a marker would surface.
 func (s *S3Store) Restore(ctx context.Context, key string) error {
 	var (
 		latestMarker *string

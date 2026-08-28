@@ -1,12 +1,11 @@
-// Package crypto implements per-volume encryption at rest (§15, §5.10). Every VM
-// data payload that leaves the host is AES-256-GCM sealed with the volume's DEK
-// before any WAL append or S3 PUT. The DEK is wrapped by a KEK held in a KMS.
+// Package crypto implements per-volume encryption at rest (§15, §5.10). Every payload
+// that leaves the host is AES-256-GCM sealed with the volume's DEK before it is PUT; the
+// DEK is wrapped by a KEK held in a KMS.
 //
-// The payload nonce is derived deterministically from (volume_id, epoch, sequence)
-// and never stored (§15.2); because sequence is strictly monotonic per
-// (volume, epoch), no nonce is reused within an epoch. This also keeps the data
-// path deterministic under DST — only DEK generation and DEK wrapping consume
-// randomness, and both take an injected io.Reader.
+// The payload nonce is derived deterministically from (volume_id, epoch, sequence) and
+// never stored (§15.2); sequence is strictly monotonic per (volume, epoch), so no nonce is
+// reused within an epoch. Only DEK generation and DEK wrapping consume randomness, and
+// both take an injected io.Reader.
 package crypto
 
 import (

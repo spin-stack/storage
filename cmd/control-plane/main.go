@@ -61,14 +61,10 @@ func run() error {
 		listen      = flag.String("listen", ":8080", "address to serve the Connect API on")
 		databaseDSN = flag.String("database-url", os.Getenv("DATABASE_URL"),
 			"PostgreSQL connection string (required; defaults to $DATABASE_URL)")
-		// No default, and that is the answer rather than an omission. This value is what
-		// the leadership row records as its holder, so two processes sharing one identity
-		// each read a leader row bearing their own name and each conclude they are still
-		// leading — the split-brain the Elector exists to make impossible, reintroduced by
-		// a convenience. Any default that could be computed here (a hostname, a constant)
-		// is exactly the kind two processes collide on. Saying "required" in the help is
-		// the whole fix: it costs one word and it makes -h the place an operator finds
-		// out, instead of a process that starts and dies.
+		// No default, deliberately: this value is what the leadership row records as its
+		// holder, so two processes sharing one identity each read a leader row bearing their
+		// own name and each conclude they are still leading. Any computable default (a
+		// hostname, a constant) is exactly what two processes collide on.
 		holderID = flag.String("holder-id", "",
 			"identity of this Control Plane process, distinct per process (required, except with -fleet-status)")
 		leaseTTL = flag.Duration("lease-ttl", 30*time.Second, "host lease TTL granted on heartbeat")
@@ -118,19 +114,12 @@ func run() error {
 		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
 		oversubscribe   = flag.Float64("max-oversubscription", 1.0,
 			"with -clone-snapshot / -attach-volume: committed/total ceiling a host may reach (§28.2)")
-		// The second ceiling is the measured one (ADR-0013 §3): what the host's last
-		// heartbeat said its device holds, which is what actually runs out. It is a
-		// separate flag rather than a share of the one above because the two are not
-		// the same quantity — promises are oversubscribed on purpose and bytes are
-		// not — and because the right value depends on the deployment: a dedicated
-		// NVMe per host tolerates a higher fill than a filesystem shared with logs
-		// and images, whose other tenants no truncation of ours can reclaim.
-		// The device-pressure cordon band (ADR-0013 §3). Flags rather than constants
-		// because the first CI run this repository ever had failed every placement in
-		// the e2e lane: a GitHub runner's disk is 87% full, the Agent measures the
-		// filesystem holding --data-dir including other tenants, so every host cordoned
-		// itself on its first heartbeat. The product was right and the lane had been
-		// relying on a developer's roomy /tmp; see cpserver.Band.
+		// The second ceiling is the measured one (ADR-0013 §3): a separate flag because promises
+		// are oversubscribed on purpose and bytes are not, and because a dedicated NVMe tolerates
+		// a higher fill than a filesystem shared with logs and images.
+		// The device-pressure band is flags rather than constants because a GitHub runner's disk
+		// is 87% full: the Agent measures the filesystem holding --data-dir including other
+		// tenants, so every host cordoned itself on its first heartbeat. See cpserver.Band.
 		cordonRatio = flag.Float64("cordon-used-ratio", cpserver.DefaultBand().Cordon,
 			"used ratio at which the Control Plane stops placing new volumes on a host (ADR-0013 §3)")
 		uncordonRatio = flag.Float64("uncordon-used-ratio", cpserver.DefaultBand().Uncordon,
@@ -143,24 +132,14 @@ func run() error {
 		// this repository has that is not psql. fleet.go carries the reasoning.
 		fleetStatus = flag.Bool("fleet-status", false, "print the fleet's hosts, volumes and unfinished snapshots, and exit")
 
-		// detach-volume / attach-volume: the two halves of a volume's placement, the
-		// same one-shot shape as the flags above. They exist because primary_host_id
-		// was write-once — CreateVolume set it and its converging upsert protected it —
-		// so an attach was permanent, and the volumes -rebuild-metadata restores with
-		// no host (it says so on the way out) could never be given one.
+		// detach-volume / attach-volume: the two halves of a volume's placement. They exist
+		// because primary_host_id was write-once, so an attach was permanent and the volumes
+		// -rebuild-metadata restores with no host could never be given one.
 		//
-		// They are two flags rather than one because the store refuses a straight
-		// hand-over (metadata.ErrAlreadyPlaced carries the reason: a host learns it has
-		// lost a volume only on its next poll, so a single write would have two Agents
-		// serving it). Detaching is what makes the release safe — the Agent's teardown
-		// publishes the session's image before it drops the socket — and an operator
-		// re-placing the volume has to wait for that to have happened.
-		//
-		// -attach-host is optional, and its absence is the case the rebuild leaves
-		// behind: a catalog restored from the bucket records no placement at all, so an
-		// operator with forty volumes has forty hosts to invent. Without it the
-		// placement order decides, exactly as -clone-snapshot's does, under the same two
-		// ceiling flags above. controlplane.Place carries the reasoning for both halves.
+		// Two flags rather than one because the store refuses a straight hand-over
+		// (metadata.ErrAlreadyPlaced: a host learns it lost a volume only on its next poll,
+		// so one write would have two Agents serving it). -attach-host is optional; without
+		// it the placement order decides. controlplane.Place carries the reasoning.
 		detachVolume = flag.String("detach-volume", "", "clear this volume's placement and exit, instead of serving")
 		attachVolume = flag.String("attach-volume", "", "place this volume and exit, instead of serving")
 		attachHost   = flag.String("attach-host", "",
@@ -203,17 +182,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Telemetry, before anything that records — the same wiring cmd/volume-agent has, for
-	// the same reason: a component that takes its Recorder before the exporter exists
-	// holds a no-op for the life of the process.
-	//
-	// This binary is mostly one-shots, and that decides what a series from it can mean
-	// rather than disqualifying it. `chain_depth` changes only when the Control Plane
-	// changes it (controlplane.Clone says why), so recording at the change and flushing at
-	// exit is a complete record of a value that is not allowed to move in between — where
-	// a poller would need a loop this process does not have. NewOTLPMetricExporter returns
-	// (nil, nil) for an empty endpoint and NewProvider takes that nil, so an operator who
-	// has no collector runs exactly the command they ran before.
+	// Telemetry, before anything that records: a component that takes its Recorder before the
+	// exporter exists holds a no-op for the life of the process. This binary is mostly
+	// one-shots, and `chain_depth` changes only when the Control Plane changes it, so recording
+	// at the change and flushing at exit is a complete record. NewOTLPMetricExporter returns
+	// (nil, nil) for an empty endpoint and NewProvider takes that nil.
 	exporter, err := real.NewOTLPMetricExporter(ctx, *otlpEndpoint)
 	if err != nil {
 		return err
@@ -272,10 +245,6 @@ func run() error {
 			return fmt.Errorf("-seed-volume needs a Control Plane to be leading (start one first): %w", lerr)
 		}
 		slog.Info("seeding under the current term", "holder_id", leader.HolderID, "term", leader.Term)
-		// No -seed-local-durability: ADR-0026 left one ACK contract, so the flag
-		// selected between a mode that exists and a mode that does not. Keeping it as
-		// a no-op would be worse than removing it — an operator who passes it is told
-		// nothing, and believes they changed what a FLUSH means.
 		return seed(ctx, md, store, *kekFile, controlplane.VolumeSpec{
 			SizeBytes:        *seedSize,
 			BlockSize:        int32(*seedBlock),
@@ -302,9 +271,7 @@ func run() error {
 	}
 
 	if *rebuildMetadata {
-		// Under the *current* term, like the other admin commands: a rebuild is not a
-		// leader taking over, and incrementing the term would leave the serving Control
-		// Plane's writes refused as stale.
+		// Under the current term, like every admin command here (-seed-volume says why).
 		leader, lerr := md.GetLeader(ctx)
 		if lerr != nil {
 			return fmt.Errorf("-rebuild-metadata needs a Control Plane to be leading (start one first): %w", lerr)
@@ -338,9 +305,7 @@ func run() error {
 		if *detachVolume != "" && *attachVolume != "" {
 			return errors.New("-detach-volume and -attach-volume are two separate runs: a volume moves host by being detached, observed to have stopped, and then placed")
 		}
-		// Under the current term, like every other admin command here: a placement
-		// change is not a leader taking over, and AcquireLeadership would leave the
-		// serving Control Plane's writes refused as stale.
+		// Under the current term, like every admin command here (-seed-volume says why).
 		leader, lerr := md.GetLeader(ctx)
 		if lerr != nil {
 			return fmt.Errorf("changing a volume's placement needs a Control Plane to be leading (start one first): %w", lerr)
@@ -356,15 +321,10 @@ func run() error {
 			if aerr != nil {
 				return aerr
 			}
-			// host_state is logged because a named host is honoured without an admission
-			// check (controlplane.Place says why): an operator who has just placed a
-			// volume onto a CORDONED or DRAINING host must be able to see that in the
-			// line that says it worked.
-			//
-			// epoch, because it is the WAL directory the host will open
-			// (<data-dir>/wal/<volume-id>/<epoch>) and the proof that this attach is not
-			// resuming a session from before the volume was somewhere else. An operator
-			// comparing it with the Agent's "serving volume" line can see the two agree.
+			// host_state, because a named host is honoured without an admission check
+			// (controlplane.Place says why) and an operator must see that in the line that
+			// says it worked. epoch, because it is the WAL directory the host will open and
+			// the proof this attach is not resuming a session from before the volume moved.
 			slog.Info("volume placed", "volume_id", *attachVolume,
 				"host_id", placed.Host.HostID, "host_state", placed.Host.State,
 				"epoch", placed.Epoch, "chosen_by", chooser(*attachHost))
@@ -386,9 +346,7 @@ func run() error {
 		if *cordonHost != "" && *uncordonHost != "" {
 			return errors.New("-cordon-host and -uncordon-host are two separate runs: pass the one you mean")
 		}
-		// Under the current term, like every other admin command here: taking a host out
-		// of the rotation is not a leader taking over, and AcquireLeadership would leave
-		// the serving Control Plane's writes refused as stale.
+		// Under the current term, like every admin command here (-seed-volume says why).
 		leader, lerr := md.GetLeader(ctx)
 		if lerr != nil {
 			return fmt.Errorf("changing a host's fleet state needs a Control Plane to be leading (start one first): %w", lerr)
@@ -420,13 +378,10 @@ func run() error {
 		if derr != nil {
 			return derr
 		}
-		// Which of the two happened, said out loud. An operator who ran this to destroy
-		// data must not have to infer whether it was destroyed.
-		//
-		// Even the shred is qualified: objectstore.Delete is a reversible marker by design
-		// (INV-14), so the bytes stay until the bucket's lifecycle policy expires the
-		// non-current versions, and a deployment that has not configured one has not
-		// destroyed anything yet.
+		// Which of the two happened, said out loud: an operator who ran this to destroy data must
+		// not have to infer whether it was destroyed. Even the shred is qualified — Delete is a
+		// reversible marker (INV-14), so the bytes stay until the bucket's lifecycle policy
+		// expires the non-current versions.
 		if shred.KeyDestroyed {
 			slog.Info("volume crypto-shredded: it held the last wrap of its key, which is now unreachable through this interface — its layers are noise once the bucket expires the descriptor's non-current versions",
 				"volume_id", *deleteVolume)
@@ -476,12 +431,8 @@ func run() error {
 	}
 	slog.Info("control-plane elected", "holder_id", *holderID, "term", term, "version", version)
 
-	// The term is fixed for the life of the process: it is never re-acquired, because
-	// AcquireLeadership increments unconditionally and a process that re-elected
-	// itself every few seconds would leave every admin one-shot in this file — each of
-	// which reads GetLeader and then writes under that term — failing at random.
-	// Losing the term ends the process instead; renewLeadership below is what notices,
-	// on the same write that keeps this process's liveness stamp fresh.
+	// The term is fixed for the life of the process; losing it ends the process instead
+	// (renewLeadership, which says why re-election is not an option).
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           cpserver.Handler(cpserver.New(md, func() int64 { return term }, *leaseTTL, band)),
@@ -535,15 +486,11 @@ func run() error {
 // so the exit is one identifiable thing in a log and not a string somebody greps.
 var errTermLost = errors.New("this Control Plane no longer holds its term")
 
-// leaderRenewInterval is how often a serving Control Plane renews its leadership. It is
-// derived from -lease-ttl rather than being a flag of its own: the lease is already this
-// system's unit of "how long a fact about the fleet may be believed", and it is what
-// -fleet-status compares the leader's stamp against. A third of it means a healthy
-// leader's renewed_at is never older than TTL/3 — three chances to renew before anything
-// reading the catalog is entitled to call this process gone — and it bounds a superseded
-// process's remaining life at a third of the same window. The one-second floor is a
-// busy-loop guard: the renewal is one indexed UPDATE, but a sub-second lease is a typo,
-// and hammering the catalog is not the way to find out.
+// leaderRenewInterval is how often a serving Control Plane renews its leadership, derived from
+// -lease-ttl rather than a flag of its own: a third of it means a healthy leader's renewed_at
+// is never older than TTL/3 — three chances to renew before anything reading the catalog may
+// call this process gone — and it bounds a superseded process's remaining life at the same
+// third. The one-second floor is a busy-loop guard.
 func leaderRenewInterval(leaseTTL time.Duration) time.Duration {
 	if d := leaseTTL / 3; d > time.Second {
 		return d
@@ -551,29 +498,22 @@ func leaderRenewInterval(leaseTTL time.Duration) time.Duration {
 	return time.Second
 }
 
-// renewLeadership keeps this Control Plane's leadership fresh, and ends the process when
-// it turns out no longer to hold it.
+// renewLeadership keeps this Control Plane's leadership fresh, and ends the process when it
+// turns out no longer to hold it.
 //
-// One term-guarded UPDATE does both jobs, which is why it is a write and not the read
-// this used to be. While it succeeds it is the only durable evidence that this process
-// is alive: control_plane_leader.renewed_at was stamped by the election and never touched
-// again, so a Control Plane dead for five minutes and one that started five minutes ago
-// printed the identical line in -fleet-status. When it fails with ErrStaleTerm it is §7's
-// "detects the condition and terminates itself" — the superseded process finds out on a
-// write it makes anyway, every few seconds, instead of on whichever Agent mutation
-// happens to arrive first.
+// One term-guarded UPDATE does both jobs. While it succeeds it is the only durable evidence
+// this process is alive: control_plane_leader.renewed_at was stamped by the election and
+// never touched again, so a Control Plane dead for five minutes and one that started five
+// minutes ago printed the identical line in -fleet-status. ErrStaleTerm is §7's "detects the
+// condition and terminates itself", found on a write it makes anyway rather than on whichever
+// Agent mutation arrives first.
 //
-// It is a renewal and not a re-election: AcquireLeadership increments the term
-// unconditionally, and every admin one-shot in this file reads GetLeader and then writes
-// under that term, so a self-renewing leader would fail them at random.
+// A renewal and not a re-election: AcquireLeadership increments unconditionally, and every
+// admin one-shot here reads GetLeader and then writes under that term.
 //
-// A catalog it cannot reach is not a term it has lost: those failures are logged and
-// retried, because a Control Plane cut off from PostgreSQL already writes nothing at all,
-// and killing it on a connection blip would turn a database hiccup into a fleet-wide
-// outage. Only ErrStaleTerm ends the process, because only ErrStaleTerm is the catalog
-// stating that somebody else is the leader.
-//
-// Returns nil when ctx ends — that is a normal shutdown, not a lost term.
+// Only ErrStaleTerm ends the process — other failures are logged and retried, because a
+// Control Plane cut off from PostgreSQL already writes nothing and killing it would turn a
+// database blip into a fleet-wide outage. Returns nil when ctx ends.
 func renewLeadership(ctx context.Context, md metadata.Store, clk clock.Clock, term int64, holderID string, every time.Duration) error {
 	for {
 		if err := clk.Sleep(ctx, every); err != nil {
@@ -643,13 +583,9 @@ func seed(ctx context.Context, md metadata.Store, store objectstore.Store, kekFi
 	return nil
 }
 
-// readKEK loads the 32-byte key-encryption key. It is a file rather than a flag
-// because a key on a command line is in `ps`, in shell history and in the unit file.
-//
-// It reads through simio/disk rather than os (INV-01): every file this tree opens goes
-// through the injected interface, and a key file is not an exception worth carving.
-// readKEK opens the directory holding the KEK and reads it through simio (INV-01).
-// The parsing rules live in internal/crypto so this binary and the Agent cannot
+// readKEK loads the 32-byte key-encryption key, through simio rather than os (INV-01). A file
+// rather than a flag because a key on a command line is in `ps`, in shell history and in the
+// unit file. The parsing rules live in internal/crypto so this binary and the Agent cannot
 // disagree about what a key file is.
 func readKEK(path string) ([crypto.DEKSize]byte, error) {
 	d, err := real.NewDisk(filepath.Dir(path))

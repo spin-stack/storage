@@ -7,12 +7,9 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// SetEventualList models a listing that never catches up until someone calls Settle.
-// That is one end of the spectrum, and it is the only one the sim could express: a
-// scenario cannot say "the listing lags by N operations and then catches up on its
-// own", which is what a real eventually consistent LIST does and what a seed-driven
-// scenario needs in order to explore *when* the catch-up lands relative to the
-// promotion, the boundary write, or the GC's second listing.
+// SetEventualList models a listing that never catches up until Settle; a scenario also
+// needs "the listing lags by N operations and then catches up on its own", which is what a
+// real eventually consistent LIST does and what a seed can drive.
 func TestSetListLagMakesAKeyVisibleAfterNOperations(t *testing.T) {
 	ctx := t.Context()
 

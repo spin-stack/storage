@@ -6,10 +6,6 @@
 # three helpers that make a shell script assert on another process: `say`, `die` and
 # `waitfor`. Each stage script sources this and then does only its own steps.
 #
-# It exists because the second one of those scripts would otherwise have copied a
-# hundred and thirty lines of set-up, and the copy that is not maintained is the one
-# that keeps passing after the thing it sets up has changed.
-#
 # A caller sets, before sourcing:
 #   DEMO_NAME    a short slug; names the database and the scratch directory
 #   DEMO_DONE    the closing line, printed only when the whole script succeeded

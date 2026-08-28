@@ -55,21 +55,16 @@ func ParseTermClaim(body []byte) (TermClaim, error) {
 
 // Elector hands out Control Plane terms that have never been issued before (ADR-0011).
 //
-// Every §7 mutation is guarded by the term, which makes a zombie affect 0 rows — but
-// only while the term moves forward, and the term lives in one row of one database
-// that operators restore. After a PITR, a failover to a lagging replica, or a
-// disaster-recovery drill, control_plane_leader.term reads below what a live leader
-// is using, and the next election hands that term out again: two processes then pass
-// every guard, and neither is a zombie by any check the system has. The epoch CAS
-// narrows the damage but does not restore single-writer — the two leaders take turns,
-// each reading the other's writes as its own resumed work.
+// Every §7 mutation is guarded by the term, which makes a zombie affect 0 rows — but only
+// while the term moves forward, and the term lives in one row of one database that
+// operators restore. After a PITR or a failover to a lagging replica the next election
+// hands that term out again: two processes then pass every guard, and the epoch CAS narrows
+// the damage without restoring single-writer.
 //
-// So the object store, which already outlives PostgreSQL for the epoch objects (§12.4)
-// and for rebuild-metadata (§22.5), is where a term becomes real: the elector claims
-// it create-only before returning it, and a claim that already exists means the
-// database was rewound. Terms are then unique for the life of the bucket rather than
-// for the life of the current database, and the failure mode is a stall — a CP that
-// cannot reach the object store does not become leader — which is the direction
+// So the object store, which already outlives PostgreSQL for rebuild-metadata (§22.5), is
+// where a term becomes real: the elector claims it create-only before returning it, and a
+// claim that already exists means the database was rewound. The failure mode is a stall — a
+// CP that cannot reach the object store does not become leader — which is the direction
 // everything else here fails in.
 type Elector struct {
 	md    metadata.Store

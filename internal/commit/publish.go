@@ -44,34 +44,21 @@ type Request struct {
 // Publish performs steps 9 to 13 of v6 §9 for one sealed layer: digest it, upload it,
 // publish an immutable manifest, and compare-and-set HEAD onto it.
 //
-// # The order, and what each reversal costs
-//
 //	PUT layer → PUT commit manifest → CAS HEAD
 //
-// Never the reverse, and the reason is what a crash between two steps leaves behind. Done
-// in this order, an interruption leaves an object nothing points at — a layer with no
-// manifest, or a manifest no HEAD names — which is garbage a sweep collects and which no
-// reader can reach. Done with the CAS anywhere but last, an interruption leaves HEAD
-// pointing at a manifest that is not there: a commit that was acknowledged and cannot be
-// reconstructed, which is the one thing `Commit() → SUCCESS` promises never happens.
+// Never the reverse. In this order an interruption leaves an object nothing points at,
+// which is garbage a sweep collects; with the CAS anywhere but last it leaves HEAD naming
+// a manifest that is not there — a commit that was acknowledged and cannot be
+// reconstructed, the one thing `Commit() → SUCCESS` rules out.
 //
-// Of the three steps, only "the CAS is last" is load-bearing, and that is worth stating
-// because the tests say so. Planting the other swap — the manifest published before its
-// layer — turned nothing red, and it should not have: HEAD does not move until both are
-// there, so no reader can reach the incomplete pair. The order is kept anyway, because a
-// manifest that exists and names an absent layer is an object every sweep and every
-// `rebuild-metadata` then has to reason about, and layer-first means an existing manifest
+// Only "the CAS is last" is load-bearing: planting the other swap, the manifest before
+// its layer, turned nothing red. Layer-first is kept anyway so that an existing manifest
 // is always complete.
 //
-// # The whole layer is held in memory
-//
-// objectstore.Store takes a []byte, so the sealed layer is assembled before it is sent.
-// At the sizes rotation actually produces — 32 MiB measured, and the threshold is a floor
-// rather than a bound (qcow.Config.RotateAtBytes) — that is a buffer, not a problem. It
-// stops being one at a threshold or a write rate an order of magnitude larger, and the
-// fix then is a streaming PUT on the store interface rather than anything here. Said out
-// loud because the alternative is finding it as an OOM in an Agent that was holding
-// somebody's disk.
+// The whole sealed layer is held in memory, objectstore.Store taking a []byte. At the
+// sizes rotation produces (32 MiB measured, and RotateAtBytes is a floor rather than a
+// bound) that is a buffer and not a problem; the fix at an order of magnitude more is a
+// streaming PUT on the store interface.
 func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryption, layer io.Reader, req Request) (Manifest, error) {
 	layerID, err := boundLayerID(enc, req.VolumeID, req.LayerID)
 	if err != nil {
@@ -82,18 +69,13 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 		frameBytes = crypto.LayerFrameBytes
 	}
 
-	// HEAD first, and it answers two questions at once: what this commit's parent is,
-	// and whether this commit has already happened.
+	// HEAD first: it says what this commit's parent is and whether this commit has already
+	// happened. The second question has to be asked here rather than at the CAS — asked
+	// late, a retry re-reads a HEAD that already names *this* commit and builds a manifest
+	// whose parent is itself, a cycle this code shipped once.
 	//
-	// The second is v6 §15's "CAS exitoso, respuesta perdida" and it has to be asked
-	// here rather than at the CAS. Asked late, the retry re-reads a HEAD that already
-	// names *this* commit and builds a manifest whose parent is itself — which is a
-	// cycle in the history, and it is what this code did until the idempotency test ran.
-	//
-	// Reading it before the upload widens the window in which another writer can move
-	// HEAD, and that is not a cost. With a correct single writer nobody else publishes;
-	// with a broken one, a CAS that fails is precisely the signal wanted, and a wider
-	// window makes it more likely to be seen rather than less correct.
+	// The wider window for another writer to move HEAD is not a cost: a CAS that fails is
+	// precisely the signal wanted.
 	parent, etag := "", ""
 	current, currentETag, err := ReadHead(ctx, store, req.VolumeID)
 	switch {
@@ -122,14 +104,10 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 		return Manifest{}, err
 	}
 
-	// The epoch fence, and it is the second half of v6 §13: the epoch is a fencing token
-	// and not metadata. Recorded in every manifest and compared by nobody, it was the
-	// first — an Agent whose epoch the fleet had moved past could still read HEAD, seal
-	// its divergent layer and compare-and-set onto its successor's history, because the
-	// CAS only asks "is HEAD what I last read". It is, if this host read it a moment ago.
-	//
-	// So the parent is read and its epoch checked. One GET per commit, of a small object,
-	// against a host appending a divergent chain onto the volume it was fenced out of.
+	// The epoch fence (v6 §13). The CAS only asks "is HEAD what I last read", which is true
+	// for a fenced Agent that read it a moment ago — so the parent's manifest is read and
+	// its epoch compared. One GET per commit against a host appending a divergent chain onto
+	// the volume it was fenced out of.
 	if parent != "" {
 		prev, err := ReadManifest(ctx, store, req.VolumeID, parent)
 		if err != nil {
@@ -160,20 +138,14 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 
 // putLayer stores the sealed bytes at their content-addressed key.
 //
-// Create-only, and a key that is already taken is the ordinary shape of a retry rather
-// than a failure: the key is the digest of the content, so an object already there
-// should be this object.
+// Create-only, and a key already taken is the ordinary shape of a retry: the key is the
+// digest of the content, so what is there should be this object. "Should be" is why it is
+// read back and hashed rather than measured — comparing the size alone let an object of
+// the right length planted at the key make Publish report SUCCESS for a commit that could
+// never be reconstructed.
 //
-// "Should be" is why what is there is read back and hashed rather than measured. Size was
-// the check until an adversary put an object of exactly the right length at the key — a
-// restore that put an old object back, a store that replayed a write, anything else with
-// access to a shared bucket — and watched Publish return SUCCESS for a commit that could
-// never be reconstructed. That is the commit contract broken by a `!=` on the wrong
-// field: what the sentence promises is that the bytes can be read back, and only reading
-// them back says so.
-//
-// It costs a GET of a whole layer, and only on the path where the key was already taken —
-// which is a retry, and which is exactly where a wrong answer is permanent.
+// It costs a GET of a whole layer, and only on the retry path, where a wrong answer is
+// permanent.
 func putLayer(ctx context.Context, store objectstore.Store, key string, body []byte) error {
 	_, err := store.Put(ctx, key, body, objectstore.PutOptions{IfNoneMatch: true})
 	if err == nil {
@@ -229,13 +201,9 @@ func Fetch(ctx context.Context, store objectstore.Store, enc *crypto.Encryption,
 }
 
 // boundLayerID parses a layer id and checks that the key being used belongs to the volume
-// the caller named.
-//
-// The mismatch it rules out is a wiring one, and the reason it is checked rather than
-// assumed is what it would otherwise cost: sealing with another volume's Encryption
-// produces an object that is perfectly valid, uploads without complaint, and is
-// discovered to be unopenable by whoever needs it — which is a recovery, on the day the
-// host is gone.
+// the caller named. Sealing with another volume's Encryption produces an object that is
+// perfectly valid, uploads without complaint, and is found to be unopenable by whoever
+// needs it — a recovery, on the day the host is gone.
 func boundLayerID(enc *crypto.Encryption, volumeID, layerID string) ([16]byte, error) {
 	var out [16]byte
 	if enc == nil {

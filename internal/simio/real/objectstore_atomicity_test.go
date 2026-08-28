@@ -14,21 +14,16 @@ import (
 	"github.com/spin-stack/storage/internal/simio/real"
 )
 
-// Finding 10. The filesystem store wrote objects with a bare os.WriteFile — which
-// opens with O_TRUNC and then writes — and cleared the delete marker *before*
-// writing. Two consequences, both silent:
+// Finding 10. The filesystem store wrote objects with a bare os.WriteFile (O_TRUNC then
+// write) and cleared the delete marker *before* writing. Two silent consequences:
 //
-//   - a reader concurrent with a rewrite can observe a truncated or half-written
-//     object. That object is a WAL object: recovery's integrity check reads a short
-//     body, declares the durable prefix ends there, and the writes past it are gone.
-//     A crash mid-write leaves the same thing permanently, at a create-only key that
-//     can never be repaired (the retry gets ErrPreconditionFailed);
-//   - an object an operator retired can come back and be served, because the marker
-//     is gone before the new bytes exist. ENOSPC, EIO or a crash in that window
-//     resurrects the old content.
+//   - a reader concurrent with a rewrite observes a truncated object; recovery reads a
+//     short WAL body and declares the durable prefix ends there. A crash mid-write leaves
+//     that permanently, at a create-only key the retry can never repair;
+//   - an object an operator retired can be served again, because the marker is gone
+//     before the new bytes exist.
 //
-// Neither is reachable through the contract's sequential assertions, so both need a
-// concurrent observer.
+// Neither is reachable through the contract's sequential assertions.
 
 func newFSStore(t *testing.T) (*real.ObjectStore, string) {
 	t.Helper()

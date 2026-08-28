@@ -332,12 +332,9 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 	})
 
-	// Finding 7. The un-GC runbook is "restore the version the sweep marked". If
-	// anything wrote the key again in the meantime — the Agent's idempotent retry, a
-	// rebuild, another operator — the marked version is no longer the one a restore
-	// would surface. Returning the *new* bytes there is the worst outcome available:
-	// the operator believes the data is back and the volume is reconstructed from
-	// content that was never what was marked. Refuse, distinctly.
+	// Finding 7. The un-GC runbook is "restore the version the sweep marked". If anything
+	// wrote the key since, returning the new bytes would have the operator rebuild a
+	// volume from content that was never marked. Refuse, distinctly.
 	t.Run("restore after the key was rewritten is refused, not silently wrong", func(t *testing.T) {
 		s := newStore(t)
 		if _, err := s.Put(ctx, "wal/v/1/x.wal", []byte("the-marked-bytes"), objectstore.PutOptions{}); err != nil {
@@ -360,18 +357,13 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 	})
 
-	// The two cases above spawn goroutines, and that is as far as they can see.
-	// Every in-process store holds an in-process mutex, and a mutex makes
-	// read-compare-publish look atomic to anything running in the same process —
-	// so a check-then-act conditional write passes both of them, every time, while
-	// admitting a second winner the moment the contenders are separate processes.
-	// The filesystem store shipped exactly that for If-Match (read the key, compare
-	// the ETag, rename) and the suite that names the property never noticed. These
-	// two cases re-exec the test binary, so the exclusion has to be real.
-	//
-	// The single-machine deployment (`-object-store-dir`) is where this bites: two
-	// Agents publishing one volume's manifest are two processes on one filesystem,
-	// and the CAS on that manifest is the only fencing V1 has.
+	// The two cases above spawn goroutines, and an in-process mutex makes
+	// read-compare-publish look atomic to anything in the same process — so a
+	// check-then-act conditional write passes both every time and admits a second winner
+	// the moment the contenders are separate processes. The filesystem store shipped
+	// exactly that for If-Match. These two cases re-exec the test binary, so the exclusion
+	// has to be real: on `-object-store-dir`, two Agents publishing one volume's manifest
+	// are two processes on one filesystem.
 	t.Run("create-only admits exactly one writer across processes", func(t *testing.T) {
 		dir := crossProcessDir(t, newStore(t))
 		s, err := real.NewObjectStore(dir)
@@ -410,23 +402,11 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 	})
 
-	// An exclusion an operator can switch off by deleting a file is not an exclusion.
-	// A POSIX lock lives on an *inode*, so anything that replaces the path it was
-	// taken on replaces the lock: while one writer holds it, the next writer opens the
-	// name, gets a brand-new inode, locks that instead, and both are inside the
-	// read-compare-publish at once — two CAS winners from one prevETag, both told they
-	// published, no error anywhere. When the exclusion was a `<key>.lock` sidecar, the
-	// action that did that was `find -name '*.lock' -delete`: a stale-lock sweep, an
-	// rsync or a backup restore that skips sidecars, a tidy-up script. Every one of
-	// them is something an operator has every reason to believe is harmless, and the
-	// state it leaves — two hosts overwriting each other's session — is one nothing
-	// reports and nobody can recover from after the fact.
-	//
-	// So the contract says it from the outside, in the only place that can see it:
-	// while `*.lock` files are being deleted underneath the writers, the CAS still
-	// admits exactly one of them. An implementation that keys its exclusion off a path
-	// an operator can unlink fails here; one that holds it somewhere a `find` sweep
-	// cannot reach does not notice the sweep at all.
+	// A POSIX lock lives on an *inode*, so an exclusion keyed off a path an operator can
+	// unlink is not an exclusion: the next writer opens the name, gets a new inode and is
+	// inside the read-compare-publish with the holder — two CAS winners from one prevETag,
+	// no error anywhere. So the contract says it from the outside: while `*.lock` files
+	// are being deleted underneath the writers, the CAS still admits exactly one of them.
 	t.Run("If-Match admits exactly one winner across processes while *.lock files are swept", func(t *testing.T) {
 		dir := crossProcessDir(t, newStore(t))
 		s, err := real.NewObjectStore(dir)
@@ -450,12 +430,10 @@ func RunContract(t *testing.T, newStore NewStore) {
 	})
 }
 
-// sweepLockFiles runs the operator's `find -name '*.lock' -delete` continuously over
-// the store until the test ends. It reports nothing: every error it can hit is one of
-// its own races with the writers (a name that vanished between the walk and the
-// unlink), and an operator's sweep would ignore those too. What it must never do is
-// touch anything else — `.tmp` staging files are a writer's in-flight body, and
-// deleting one turns this into a test about something else.
+// sweepLockFiles runs the operator's `find -name '*.lock' -delete` continuously until the
+// test ends. Errors are ignored — they are its own races with the writers, which `find`
+// would ignore too — and it must touch nothing else: a `.tmp` is a writer's in-flight
+// body.
 func sweepLockFiles(t *testing.T, dir string) {
 	t.Helper()
 	stop := make(chan struct{})
@@ -496,17 +474,11 @@ const (
 	crossProcessWriters = 4
 	crossProcessRounds  = 4
 	crossProcessBody    = 4096
-	// sweptBody is the object the swept round CASes over, and it is a megabyte for a
-	// reason: the read-compare half of a compare-and-swap is a read of the *current*
-	// object, so the window in which a second writer can slip in is as long as that
-	// read takes. A 4KB manifest reads in microseconds — shorter than the scheduling
-	// jitter between four processes — and a violation then needs the sweep and the two
-	// writers to line up inside that; measured against the sidecar implementation,
-	// 2 runs in 20 caught it. A real `image/<vol>/manifest.json` lists every chunk of
-	// the volume, so a megabyte is the ordinary size of the thing being fenced, not a
-	// weight added to make the test win: at that size the same implementation loses
-	// every run. A test whose bug reproduces one time in ten is a test that reports
-	// "fixed" nine times.
+	// sweptBody is a megabyte because the read-compare half of a CAS is a read of the
+	// *current* object, so the window a second writer can slip into is as long as that
+	// read takes: at 4KB, measured against the sidecar implementation, 2 runs in 20 caught
+	// the violation; at a megabyte — the ordinary size of a manifest listing every chunk —
+	// the same implementation loses every run.
 	sweptBody = 1 << 20
 )
 

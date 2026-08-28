@@ -19,14 +19,9 @@ import (
 // writes it — a provisioned volume, a snapshot of it, and a clone of that snapshot — and
 // returns the two volume ids.
 //
-// It writes through the real producers (`Provisioner`, `Clone`) rather than hand-rolling
-// objects, because a rebuild that only works against fixtures somebody wrote for it is
-// exactly the shape of test this project keeps finding.
-//
-// The snapshot is a catalog row and no object. It used to be both: `image.PublishSnapshot`
-// wrote a manifest under the volume's prefix and the rebuild read the snapshot back out of
-// it. That object layout went with the chunked image, so the row is all there is, and the
-// rebuild no longer sees a snapshot at all — which is what the assertions below say.
+// It writes through the real producers (Provisioner, Clone) rather than hand-rolled
+// objects. The snapshot is a catalog row and no object: the manifest a rebuild used to read
+// it out of went with the chunked image, which is what the assertions below say.
 func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store objectstore.Store, term int64) (vol, clone, snap string) {
 	t.Helper()
 	ctx := t.Context()

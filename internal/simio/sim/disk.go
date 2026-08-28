@@ -64,18 +64,14 @@ func NewDisk() *Disk {
 // InjectENOSPC caps the device backing target at capacity bytes. Appends are accepted
 // while they fit; the one that crosses the cap writes only what fits and returns
 // ErrNoSpace (the partial append a real ENOSPC delivers), and every append after it
-// writes nothing and returns ErrNoSpace. Growing a file with Truncate is refused the
-// same way. Space is reclaimed by truncating a file down, by removing one, or by
-// ClearENOSPC.
+// writes nothing. Growing a file with Truncate is refused the same way. Space comes back
+// by truncating down, removing a file, or ClearENOSPC.
 //
-// target is a file name or a directory prefix, and the cap is charged against the
-// *sum* of the files under it. A WAL is a directory of segments, so "how much room
-// this volume's log has" is not a property of any one file, and a per-file cap would
-// be lifted by the mere act of rotating to a new segment.
-//
-// Allocation is charged at append time, so Sync of bytes the device already took
-// always succeeds. A filesystem that defers allocation can instead fail at fsync;
-// that variant is not modelled.
+// target is a file name or a directory prefix, and the cap is charged against the *sum*
+// of the files under it: a WAL is a directory of segments, so a per-file cap would be
+// lifted by rotating to a new one. Allocation is charged at append time, so Sync of bytes
+// the device already took always succeeds; a filesystem that fails at fsync instead is
+// not modelled.
 func (d *Disk) InjectENOSPC(target string, capacity int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -121,30 +117,22 @@ func (d *Disk) chargedBytes(target string) int64 {
 	return used
 }
 
-// SetDeviceBudget declares how big this simulated device is: the total Usage
-// reports, and the ceiling every file on it is charged against together. It is the
-// simulated counterpart of the real disk's statfs, and the knob ADR-0013's device
-// budget, reserve and thresholds are exercised through — a scenario sets the size of
-// the NVMe it wants to fill, then fills it.
+// SetDeviceBudget declares how big this simulated device is: the total Usage reports and
+// the ceiling every file on it is charged against together — the simulated counterpart of
+// statfs, and the knob ADR-0013's thresholds are exercised through.
 //
-// It is deliberately not the same thing as InjectENOSPC, which caps one file: N
-// volumes each comfortably inside their own cap can still exhaust the device between
-// them, and that unsummed backlog is the failure ADR-0013 §1 exists for. Both
-// ceilings bind; the tighter one wins.
-//
-// Zero (the default) leaves the device unsized: appends are unbounded and Usage
-// refuses to answer.
+// It is not InjectENOSPC, which caps one file: N volumes each inside their own cap can
+// still exhaust the device between them, which is the failure ADR-0013 §1 exists for.
+// Both ceilings bind; the tighter one wins. Zero leaves the device unsized — appends are
+// unbounded and Usage refuses to answer.
 func (d *Disk) SetDeviceBudget(bytes int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.budget = bytes
 }
 
-// Usage reports the simulated device: the declared budget, and what the files on it
-// actually occupy. The used figure is derived from the files rather than tracked
-// alongside them, so it cannot drift from the disk it describes; it costs one pass
-// over the file table, which is a simulator's price to pay for not having a second
-// source of truth.
+// Usage reports the declared budget and what the files actually occupy. The used figure
+// is derived from the files rather than tracked alongside them, so it cannot drift.
 func (d *Disk) Usage() (disk.Usage, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -222,15 +210,11 @@ func (d *Disk) TornTail(name string, keep int) {
 	}
 }
 
-// Create adds the file with durable-but-empty content, which is the simulated form of
-// the interface's contract: the *name* survives a crash (the real disk fsyncs the
-// parent directory), the contents do not until they are Synced.
+// Create adds the file with durable-but-empty content: the *name* survives a crash (the
+// real disk fsyncs the parent directory), the contents do not until they are Synced.
 //
-// Unlink durability is deliberately not modelled the same way: a Remove here is
-// immediate and final, whereas a real one can be undone by a crash before the
-// directory is synced. Nothing depends on the difference — a resurrected file costs a
-// later sweep, never data — and modelling it would only add a fault no caller may
-// react to.
+// Unlink durability is deliberately not modelled: a Remove here is immediate, whereas a
+// real one can be undone by a crash — and a resurrected file costs a sweep, never data.
 func (d *Disk) Create(name string) (disk.File, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

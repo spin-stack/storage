@@ -177,17 +177,13 @@ func TestDeleteRefusesAVolumeAClonesDescriptorStillPointsAt(t *testing.T) {
 	}
 }
 
-// **What the shred does not do, stated where the decision is.**
+// A lineage shares one DEK's bytes — the re-wrap at Clone changes the ciphertext, not the
+// key — so deleting a volume a clone descends from destroys no secret the clone still holds.
 //
-// A lineage shares one DEK's bytes — the re-wrap at Clone changes the ciphertext, not
-// the key — so deleting a volume that a clone descends from destroys no secret the clone
-// does not still hold. That is why the delete refuses while a descendant exists, and it
-// is also the constraint on a future FLATTEN: a flatten that re-uploads a clone's data
-// under the *shared* key leaves this hole open, so it must mint a fresh DEK.
-//
-// This test drives the hole deliberately, so that a flatten written later cannot quietly
-// inherit it: the parent's link is cleared the way a flatten would clear it, the parent
-// is deleted, and the parent's layer is still opened with the clone's key.
+// This test drives the hole deliberately, so a flatten written later cannot quietly inherit
+// it: the parent's link is cleared the way a flatten would clear it, the parent is deleted,
+// and the parent's layer is still opened with the clone's key. A flatten must therefore mint
+// a fresh DEK.
 func TestAFlattenedClonesKeyStillOpensItsDeletedParentsLayers(t *testing.T) {
 	f := newFleet(t)
 	parent := f.provision(t)
@@ -266,14 +262,11 @@ func (f *fleet) dek(t *testing.T, v metadata.Volume) crypto.DEK {
 	return d
 }
 
-// TestDeleteRefusesACloneWhoseParentIsStillHere is the lineage contract, stated as a
-// refusal rather than as a comment.
-//
-// A clone is handed its parent's DEK bytes — only the wrap differs — because that is what
-// lets it read the layers its parent published (v6 §10). The consequence is that no member
-// of a live lineage can be crypto-shredded on its own: the secret stops existing when the
-// last wrap of it does. Deleting the clone anyway would return success over a secret that
-// is still there, and its layers stay readable with the parent's key.
+// TestDeleteRefusesACloneWhoseParentIsStillHere pins the lineage contract: no member of a
+// live lineage can be crypto-shredded on its own, because the secret stops existing only
+// when the last wrap of it does. Deleting the clone succeeds and *reports* that the parent
+// still publishes the key — claiming a shred would return success over a secret that is
+// still there. The name predates the report: refusing outright deadlocked deletion.
 func TestDeleteRefusesACloneWhoseParentIsStillHere(t *testing.T) {
 	f := newFleet(t)
 	parent := f.provision(t)

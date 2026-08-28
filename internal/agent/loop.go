@@ -63,12 +63,10 @@ type Loop struct {
 	state    storagev1.HostState
 	fenced   []string
 	failures int
-	// keys is the key material this Agent has been handed, by volume id. It is a
-	// cache with one eviction rule and no expiry: an entry lives exactly as long as
-	// its volume stays in the desired state (see readDesiredState). Key material
-	// does not change while the volume is this host's, and when it stops being this
-	// host's the entry must go — not because it would be stale, but because holding
-	// it means holding the means to open a volume the fleet has taken away.
+	// keys is key material by volume id, cached with one eviction rule and no expiry: an
+	// entry lives exactly as long as its volume stays in the desired state. When the volume
+	// stops being this host's the entry must go — not because it would be stale, but because
+	// it is the means to open a volume the fleet has taken away.
 	keys map[string]VolumeKeys
 }
 
@@ -120,15 +118,10 @@ func (l *Loop) Run(ctx context.Context) error {
 		}
 		delay = l.nextDelay(err)
 		if err != nil {
-			// The backoff above keeps the Agent trying, which is right; saying nothing
-			// is not. An Agent that can never succeed — wrong Control Plane URL, a host
-			// id the database refuses, expired credentials — otherwise behaves exactly
-			// like a healthy one from the outside: it logs a line at startup and then
-			// heartbeats into nothing forever. Every increment on top of this loop is
-			// debugged through it.
-			//
-			// One line per failed cycle, not per retry, and it carries the delay: "it
-			// failed" without "and I retry in 1s" reads as fatal to whoever is watching.
+			// An Agent that can never succeed — wrong Control Plane URL, a host id the
+			// database refuses, expired credentials — otherwise looks exactly like a healthy
+			// one from the outside. One line per failed cycle, not per retry, and it carries
+			// the delay: "it failed" without "and I retry in 1s" reads as fatal.
 			slog.Warn("reconciliation cycle failed",
 				"error", err,
 				"retry_in", delay,
@@ -160,28 +153,16 @@ func (l *Loop) nextDelay(err error) time.Duration {
 }
 
 // Reconcile runs one cycle: heartbeat, read the desired state, serve it, report what
-// this host observed. It stops at the first failure of the three calls to the Control
-// Plane — one that did not answer the heartbeat has nothing useful to say to the rest of
-// the cycle — and the lease is left to run down, which is what fences this host if the
-// condition lasts.
+// this host observed. It stops at the first failure of the three Control Plane calls — one
+// that did not answer the heartbeat has nothing useful to say to the rest of the cycle —
+// and the lease is left to run down, which is what fences this host if it lasts.
 //
-// **A failure to serve the desired state is the one exception, and it is the point.**
-// Applying it is local work, and the volumes it could not start are precisely the ones
-// this host has something to say about: they have no runtime, so the report is the only
-// thing that can tell the fleet they exist and are not being served. Returning at that
-// failure skipped the report that carries it — an Agent refusing a volume printed a WARN
-// every second and the catalog showed the volume healthy for ever, because the only cycle
-// with news never reached the sentence.
-//
-// It was found by starting the two real binaries: a volume-agent without -kek-file
-// against a Control Plane holding an encrypted volume. Nothing in the suite could see it.
-// Every test of a refusal builds the VolumeManager and asks it directly, which is the one
-// caller that does not go through this function, and the loop's own tests drive
-// agent.VolumeSet, whose Apply cannot fail.
-//
-// The error is still returned, at the end, unchanged: the backoff and the per-cycle WARN
-// are what retry it, and a fix that swallowed it to reach the report would trade one
-// silence for another.
+// A failure to *serve* the desired state is the exception, and it is the point: the
+// volumes that could not start have no runtime, so the report is the only thing that can
+// tell the fleet they exist and are not being served. Returning at that failure skipped
+// the report carrying it, and the catalog showed a refused volume healthy for ever. The
+// error is still returned at the end — the backoff and the per-cycle WARN are what retry
+// it, and swallowing it to reach the report would trade one silence for another.
 func (l *Loop) Reconcile(ctx context.Context) error {
 	usage, err := l.dev.Usage(ctx)
 	if err != nil {
@@ -233,72 +214,37 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 }
 
 // Witness answers whether a volume has been granted to somebody else, over a path that
-// does not run through the Control Plane. It is the second signal, and it is defined here
-// because this is the only place that consumes it.
+// does not run through the Control Plane. Defined here because this is its only consumer.
 //
-// The answer that matters is an epoch *higher* than the one this host holds. Every other
-// outcome — the same epoch, no record at all, a store that cannot be reached — is "this
-// host cannot confirm it was superseded", and they are deliberately not distinguished:
-// none of them is evidence that somebody else is writing.
+// Only an epoch *higher* than the one this host holds is an answer; the same epoch, no
+// record, and an unreachable store are deliberately not distinguished — none of them is
+// evidence that somebody else is writing.
 type Witness interface {
 	GrantedEpoch(ctx context.Context, volumeID string) (int64, error)
 }
 
 // giveUpWhatIsNoLongerOurs stops serving the volumes this host can confirm belong to
-// somebody else. A lease that merely lapsed is not that confirmation.
+// somebody else. A lease that merely lapsed is not that confirmation: v5 stopped every
+// volume at the lapse because the Agent *was* the data path, but under v6 nothing a
+// superseded host writes can enter the published history (the compare-and-set on HEAD
+// plus the epoch), so stopping on silence cost a tenant's VM for a partition nobody had
+// acted on.
 //
-// # What this used to do, and why it changed
+// Three things confirm supersession: the Control Plane refusing this host's report, the
+// compare-and-set on HEAD losing, and this function's signal — `volumes/<id>/epoch`,
+// written at the grant and read over the object store, a path that is still there when
+// the Control Plane is not. It is the shape of vSphere HA requiring the datastore
+// heartbeat to agree. A zero-TTL answer is the Control Plane speaking and is handled in
+// applyLease, not here.
 //
-// It stopped every volume the moment the lease lapsed. That was right in v5, where this
-// process *was* the data path: a partitioned Agent kept its socket bound, kept answering
-// the guest and kept ACKing flushes as durable, while the fleet declared the host dead
-// after one TTL and an operator moved the volume. Two guests wrote one volume, both were
-// told their fsyncs had landed, and one of them was wrong for the whole partition. The
-// Control Plane could not prevent it by construction — the Agent pulls (ADR-0018), so a
-// host that cannot hear it cannot be told anything — and the only actor left was this one.
+// A confirmed volume's guest is stopped rather than degraded: a volume this host does not
+// own cannot be served read-only either, because the bytes underneath it may already have
+// been overwritten, and a guest cannot be told that.
 //
-// v6 removed the premise rather than the risk. QEMU owns the local copy-on-write format;
-// a FLUSH is its fdatasync and claims local durability only. What this system publishes
-// is gated by the compare-and-set on HEAD and the epoch, so nothing a superseded host
-// writes can enter the published history. The fence is enforced at the resource — the
-// shape Ceph has when it blocklists a client at the OSDs, and SCSI-3 when the array
-// enforces the reservation — rather than by asking the writer to be honest about a
-// deadline it measured itself. What was left of the old rule was its whole cost and none
-// of its benefit: a tenant's VM stopped because this host lost sight of the Control Plane
-// for one TTL, over a promotion nobody had performed.
-//
-// # The two signals
-//
-// A guest is stopped only on confirmed supersession, and there are exactly three things
-// that confirm it. Two already existed: the Control Plane refusing this host's report, and
-// the compare-and-set on HEAD losing. Both are somebody else having taken the volume,
-// stated by a party that knows. The third is this function's: `volumes/<id>/epoch`, which
-// moves at the grant, read over the object store — a path that does not go through the
-// Control Plane and is therefore still there when the Control Plane is not. It is the same
-// structure as vSphere HA refusing to act on the management network alone and requiring
-// the datastore heartbeat to agree.
-//
-// A zero-TTL answer is not in this function at all and does not need to be: it nils the
-// lease (applyLease), and it is the Control Plane speaking — the first of the three.
-//
-// # What the guest sees
-//
-// Nothing, while this host is merely isolated. That is the change. When supersession *is*
-// confirmed the guest is stopped, and it is stopped rather than degraded because there is
-// no honest third option: a volume this host does not own cannot be served read-only
-// either — the bytes underneath it may already have been overwritten by the host that
-// does own it, and a guest cannot be told that. Stopping is visible; serving stale reads
-// is silent.
-//
-// # What is still unresolved
-//
-// A host that can reach neither the Control Plane nor the object store cannot tell
-// isolation from supersession, and it keeps serving. That is a choice between two bad
-// outcomes and not a safe one: the data is protected either way by a compare-and-set this
-// host cannot win if it has been superseded, but nothing stops the successor's guest from
-// starting, and this system has no equivalent of vSphere's datastore lock. Stopping the
-// guest here would trade a certain loss for a possible one in the case where nobody took
-// the volume, which is the more common partition.
+// Unresolved: a host that can reach neither the Control Plane nor the object store cannot
+// tell isolation from supersession and keeps serving. Nothing then stops the successor's
+// guest from starting — this system has no equivalent of vSphere's datastore lock — but
+// stopping here would trade a certain loss for a possible one in the more common case.
 func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus) error {
 	l.mu.Lock()
 	lm, reconcile, ttl, wit := l.lease, l.reconcile, l.leaseTTL, l.witness
@@ -321,11 +267,8 @@ func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus
 	}
 
 	if len(unconfirmed) > 0 {
-		// Warn and not Error: this is a degraded host, not a lost volume. It says the two
-		// things an operator needs and that nothing else in the process says — that this
-		// host has stopped being able to confirm its claim, and that it is still serving
-		// anyway, which is the decision above and the thing that looks like a bug from
-		// the outside if it is not written down.
+		// Warn, not Error: a degraded host, not a lost volume. It is the only line that says
+		// this host has stopped being able to confirm its claim and is serving anyway.
 		slog.Warn("this host's lease has expired and nothing confirms the volumes were granted elsewhere; it is still serving them",
 			"host_id", l.cfg.HostID, "volumes", unconfirmed, "lease_ttl", ttl)
 	}
@@ -342,15 +285,11 @@ func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus
 	slog.Error("these volumes have been granted to another host; this one is giving them up and stopping their guests",
 		"host_id", l.cfg.HostID, "volumes", volumeIDs, "lease_ttl", ttl)
 
-	// Revoked before the volumes go, so that from this instant the host makes no claim
-	// at all: Revoke bumps the generation, and a heartbeat answer that was already in
-	// flight when this ran cannot re-arm the lease behind the teardown (§12.2). Only a
-	// fresh grant can, which is what applyLease does when a renewal is refused.
-	//
-	// It is deliberately not done on the unconfirmed path above. A host that is still
-	// serving still holds its claim, and the lapsed lease has to be able to re-arm on the
-	// next answered heartbeat — otherwise an isolated host would need a promotion at a
-	// higher epoch to recover from a partition it was right to sit through.
+	// Revoked before the volumes go: Revoke bumps the generation, so a heartbeat answer
+	// already in flight cannot re-arm the lease behind the teardown (§12.2). Deliberately
+	// not done on the unconfirmed path — a host still serving must be able to re-arm on the
+	// next answered heartbeat, or an isolated host would need a promotion at a higher epoch
+	// to recover from a partition it was right to sit through.
 	if lm != nil {
 		lm.Revoke()
 	}
@@ -369,17 +308,13 @@ func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus
 }
 
 // Superseded splits the volumes into the ones the object store confirms were granted
-// elsewhere and the ones it does not.
+// elsewhere and the ones it does not. Every failure to answer — no witness, an unreachable
+// store, no epoch recorded, an epoch that has not moved — lands in the second group: none
+// of them is evidence that somebody else is writing, and reading them as supersession
+// would stop guests on silence.
 //
-// Exported because the DST scenario for this rule drives it directly. The alternative is
-// a scenario that re-states the rule in its own words, which is the one thing a simulation
-// of a rule must not do: it would then agree with itself while production disagreed.
-//
-// Every failure to answer lands in the second group, and that is the whole rule: with no
-// witness configured, an unreachable store, a volume with no epoch recorded, or an epoch
-// that has not moved, this host has learned nothing that says somebody else is writing.
-// Reading any of those as supersession would stop guests on silence, which is the
-// behaviour being replaced.
+// Exported because the DST scenario drives it directly; a scenario that re-stated the rule
+// in its own words would agree with itself while production disagreed.
 func Superseded(ctx context.Context, wit Witness, vols []VolumeStatus) (confirmed []VolumeStatus, unconfirmed []string) {
 	for _, v := range vols {
 		if wit == nil {
@@ -430,11 +365,8 @@ func (l *Loop) fence(ctx context.Context) error {
 }
 
 func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeStatus) error {
-	// The heartbeat used to carry the host's remote backlog — the bytes no verified
-	// object covered yet. It went with the uploader (ADR-0026 increment 4.5): with the
-	// ACK local and the volume published at stop there is no continuous distance to S3
-	// to measure. What a host would lose if it died mid-session is bounded by the session
-	// and, deliberately, nothing measures it — see STATUS.md.
+	// Nothing measures a host's remote backlog since the uploader went (ADR-0026 increment
+	// 4.5); the field stays on the wire and is always zero — see STATUS.md.
 	var backlog int64
 
 	// The lease is anchored to the instant the request leaves, never to the answer's
@@ -484,12 +416,10 @@ func (l *Loop) readDesiredState(ctx context.Context) ([]*storagev1.DesiredVolume
 	return desired, nil
 }
 
-// applyDesiredState hands the desired state to whatever serves volumes. This is where
-// the loop stops being a reporter.
-//
-// It is a call of its own and not part of readDesiredState's locked section, because
-// l.mu must not be held across starting a runtime: Apply opens a volume's local storage
-// and binds a socket, and a heartbeat blocked behind that is a lease not renewed.
+// applyDesiredState hands the desired state to whatever serves volumes. It is not part of
+// readDesiredState's locked section because l.mu must not be held across starting a
+// runtime: Apply opens a volume's local storage and binds a socket, and a heartbeat blocked
+// behind that is a lease not renewed.
 func (l *Loop) applyDesiredState(ctx context.Context, desired []*storagev1.DesiredVolume) error {
 	l.mu.Lock()
 	reconcile := l.reconcile
@@ -498,10 +428,7 @@ func (l *Loop) applyDesiredState(ctx context.Context, desired []*storagev1.Desir
 		return nil
 	}
 	if err := reconcile.Apply(ctx, desired); err != nil {
-		// Returned, not swallowed: a volume that could not be started is the whole
-		// reason this Agent exists, and the cycle's backoff is what retries it. Its
-		// caller carries it past the report rather than returning at it — Reconcile says
-		// why.
+		// Returned, not swallowed; Reconcile says why it is then carried past the report.
 		return fmt.Errorf("agent: applying the desired state: %w", err)
 	}
 	return nil
@@ -527,14 +454,10 @@ func (l *Loop) forgetKeysOutsideLocked(desired []*storagev1.DesiredVolume) {
 }
 
 // VolumeKeys returns the key material for one volume, fetching it the first time and
-// holding it afterwards (§15.1, ADR-0018). It is what the data path will call before
-// opening a volume: every payload it writes is sealed with this DEK.
-//
-// Fetched once, not per cycle. The material does not change while the volume is this
-// host's, and the desired state — which is re-read every few seconds, for every
-// volume — is deliberately not where it travels. The entry is dropped when the
-// volume leaves that desired state, which is the only invalidation this cache has
-// and the only one it needs.
+// holding it afterwards (§15.1, ADR-0018): every payload the data path writes is sealed
+// with this DEK. The material does not change while the volume is this host's, and the
+// entry is dropped when the volume leaves the desired state — the only invalidation this
+// cache has and the only one it needs.
 func (l *Loop) VolumeKeys(ctx context.Context, volumeID string) (VolumeKeys, error) {
 	if volumeID == "" {
 		return VolumeKeys{}, errors.New("agent: a volume id is required to ask for key material")
@@ -554,11 +477,9 @@ func (l *Loop) VolumeKeys(ctx context.Context, volumeID string) (VolumeKeys, err
 		return VolumeKeys{}, fmt.Errorf("agent: reading the keys of volume %q: %w", volumeID, err)
 	}
 
-	// Refused here rather than carried: KeyID 0 is the reserved marker for "these bytes
-	// are cleartext", so a 0 from the Control Plane is not a usable version — it is a
-	// volume whose key material this host cannot honestly use. Caching it would turn
-	// one bad answer into a permanently unopenable volume, since VolumeKeys never
-	// re-asks once it has an entry.
+	// KeyID 0 is the reserved marker for "these bytes are cleartext", so a 0 here is not a
+	// usable version. Caching it would turn one bad answer into a permanently unopenable
+	// volume, since VolumeKeys never re-asks once it has an entry.
 	if id := resp.Msg.GetDekKeyId(); id == 0 {
 		return VolumeKeys{}, fmt.Errorf("agent: volume %q was handed a DEK with no version (§15.1): %w",
 			volumeID, crypto.ErrUnversionedKey)
@@ -656,20 +577,15 @@ func (l *Loop) applyLease(gen uint64, sentAt clock.Instant, ttl time.Duration) {
 	if l.lease.RenewAt(gen, sentAt) {
 		return
 	}
-	// A refused renewal is not a lost heartbeat — the Control Plane just answered, with a
-	// TTL, which is it counting this host alive. RenewAt refuses a lease that has lapsed
-	// or been revoked, and neither can be renewed by construction: only a grant arms a
-	// lease. Without this line the first expiry would be permanent, because
-	// giveUpWhatIsNoLongerOurs revokes — LeaseValid would stay false for the life of the
-	// process and every volume granted afterwards would be given up on the next cycle.
+	// A refused renewal is not a lost heartbeat: the Control Plane just answered, with a
+	// TTL. RenewAt refuses a lapsed or revoked lease and only a grant arms one, so without
+	// this line the first expiry would be permanent — giveUpWhatIsNoLongerOurs revokes —
+	// and every volume granted afterwards would be given up on the next cycle.
 	//
-	// Re-arming is safe here and would not be earlier in this function: by the time a
-	// renewal is refused, the volumes that were held under the dead lease have already
-	// been given up (giveUpWhatIsNoLongerOurs runs at the top of the cycle, before the
-	// heartbeat), so this grants a claim over nothing until the desired state says
-	// otherwise. gen is passed unchanged, so an answer that a Revoke overtook *after it
-	// was sent* is still refused, and sentAt still anchors the window to the request
-	// rather than to the reply (§12.2).
+	// Safe here and not earlier: the volumes held under the dead lease were already given
+	// up at the top of the cycle. gen is passed unchanged, so an answer a Revoke overtook
+	// after it was sent is still refused, and sentAt anchors the window to the request
+	// (§12.2).
 	l.lease.GrantAt(gen, sentAt)
 }
 
@@ -689,13 +605,9 @@ func (l *Loop) setHostState(s storagev1.HostState) {
 }
 
 // LeaseValid reports whether this host's lease has not yet lapsed on the Agent's own
-// monotonic clock (§12.2).
-//
-// Nothing on the data path reads it. What acts on a lease running out is
-// giveUpWhatIsNoLongerOurs, in this file, which stops serving the volumes it can confirm
-// were granted elsewhere; this
-// is the observation point the loop's tests and the e2e guest lane assert against, so
-// they can read the decision rather than a flag the code set.
+// monotonic clock (§12.2). Nothing on the data path reads it — giveUpWhatIsNoLongerOurs is
+// what acts on a lease running out — and this is the observation point the loop's tests
+// and the e2e guest lane assert against.
 func (l *Loop) LeaseValid() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()

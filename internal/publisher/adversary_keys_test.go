@@ -9,19 +9,10 @@ import (
 	"github.com/spin-stack/storage/internal/publisher"
 )
 
-// `kek_id` is carried from the catalog to the Agent to the publisher, and nothing ever
-// compares it with the KEK this host actually holds.
-//
-// crypto/kek.go says the opposite where KEKID is defined: "`kek_id` is what a volume row
-// records and what the Agent compares its own key against before unwrapping", and the
-// paragraph goes on to explain that without it "the mismatch would then surface as an
-// AEAD failure with no hint that the files differ". There is no such comparison in
-// publisher.encryption or in recovery.encryption — the two callers — so the failure this
-// field exists to prevent is exactly the failure an operator gets.
-//
-// It is fail-closed, so this is not a data-loss finding. It is the one message an
-// operator sees at 3am when a host was handed the wrong `-kek-file`, and it points at
-// the DEK.
+// `kek_id` travels from the catalog to the Agent to the publisher, and until it was
+// compared with the KEK this host actually holds, the wrong `-kek-file` surfaced as an
+// AEAD failure that points an operator at the DEK. Fail-closed, so not a data-loss
+// finding: it is the one message an operator sees at 3am.
 func TestAdversaryWrongKEKBlamesTheDEK(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)

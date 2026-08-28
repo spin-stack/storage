@@ -12,14 +12,10 @@ import (
 // TestTheDesiredStateCarriesTheWatermarksTheCatalogHolds.
 //
 // The Agent decides at attach whether finding no image, or replaying short, means "this
-// volume is new" or "this volume's data is missing", and the only thing that can tell the
-// two apart is what the catalog already knows. It had no way to ask: ADR-0021 keeps it
-// from looking anything up, and these two columns were not on the wire — so an Agent
-// reasoning perfectly still came up blank, and the fleet's own record of what it had
-// promised sat in Postgres while a guest read zeros.
-//
-// Asserted against the *report the Agent would act on* rather than against the row,
-// because the row was never the part that was wrong.
+// volume is new" or "this volume's data is missing", and only the catalog can tell the two
+// apart. ADR-0021 keeps the Agent from looking anything up and these two columns were not
+// on the wire, so a guest read zeros while the fleet's own record sat in Postgres.
+// Asserted against the report the Agent would act on, because the row was never wrong.
 func TestTheDesiredStateCarriesTheWatermarksTheCatalogHolds(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{

@@ -36,34 +36,23 @@ func freshCatalog(t *testing.T) (*metasim.Store, int64) {
 	return md, term
 }
 
-// The epoch a rebuild restores is the epoch the volume had when it was *created*, and
-// the epoch is the fencing token.
+// The epoch a rebuild restores must not be the epoch the volume had when it was *created*,
+// and the epoch is the fencing token.
 //
-// descriptor.CurrentEpoch is written once, at Provision and at Clone, and the field's
-// own comment says why that used to be sound: "last known; the epoch object is
-// authoritative". ADR-0026 deleted the epoch object, and rebuild.go now says the
-// opposite at volumeFromDescriptor — "Authoritative now: the epoch object this used to
-// defer to went with the fencing chain". Nothing closed the gap between those two
-// sentences: controlplane.Place grants every attach a fresh epoch through
-// BumpVolumeEpoch, which writes the catalog and never comes back to the descriptor.
-//
-// So a volume that has been handed between hosts N times has epoch N+1 in the catalog
-// and epoch 1 in the bucket. Lose the catalog, rebuild from the bucket — the one path
-// this object exists to serve — and the volume comes back at epoch 1, which every host
-// that ever held it outranks. The comment at volumeFromDescriptor says the catalog's
-// GREATEST is what stops the epoch coming back lower than it was; against an empty
-// catalog GREATEST has nothing to compare with, and that is precisely the run.
+// descriptor.CurrentEpoch is written once, at Provision and at Clone; controlplane.Place
+// grants every attach a fresh epoch through BumpVolumeEpoch. So a volume handed between
+// hosts N times has epoch N+1 in the catalog and 1 in the bucket, and a rebuild from the
+// bucket alone — the one path this object exists to serve — brings it back at an epoch every
+// host that ever held it outranks. Against an empty catalog the converge path's GREATEST
+// has nothing to compare with, and that is precisely the run.
 func TestAdversaryRebuildRestoresAVolumeAtAFencedPredecessorsEpoch(t *testing.T) {
 	f := newFleet(t)
 	id := f.provision(t)
 
-	// Three hand-overs, each an ordinary attach, driven through controlplane.Place.
-	//
-	// It called f.md.BumpVolumeEpoch directly at first, on the argument that this is
-	// "exactly as Place calls it". It is not, and the difference is the subject: a grant
-	// writes the new epoch to the bucket *before* it moves the catalog, precisely so a
-	// rebuild can find it, and a fixture that bumps the catalog alone constructs a state
-	// no Control Plane can produce. The assertion below is unchanged.
+	// Three hand-overs, each an ordinary attach, driven through controlplane.Place rather
+	// than BumpVolumeEpoch: a grant writes the new epoch to the bucket *before* it moves the
+	// catalog, and a fixture that bumps the catalog alone constructs a state no Control Plane
+	// can produce.
 	epoch := int64(1)
 	for range 3 {
 		f.detach(t, id)
@@ -94,21 +83,15 @@ func TestAdversaryRebuildRestoresAVolumeAtAFencedPredecessorsEpoch(t *testing.T)
 	}
 }
 
-// Clone takes the new volume's id from its caller and writes it with CreateVolume,
-// whose conflict path is a *merge* built for rebuild idempotency. Point it at a volume
-// that already exists and the merge re-keys it.
+// Clone takes the new volume's id from its caller and writes it with CreateVolume, whose
+// conflict path is a *merge* built for rebuild idempotency. Point it at a volume that
+// already exists and the merge re-keys it: converge keeps the authority columns, while
+// dek_wrapped, dek_key_id, chain_depth and the parent link come from the new record
+// wholesale. Provision cannot be attacked this way — it mints its own id.
 //
-// Provision cannot be attacked this way — it mints its own id (ids.New) and nothing
-// else can name it. Clone is the one verb that accepts an id from outside and creates
-// under it, and it never asks whether that id is free. What converge then keeps is the
-// authority columns: the epoch, the state, the watermarks, the ownership. dek_wrapped,
-// dek_key_id, chain_depth and the parent link all come from the new record wholesale.
-//
-// This is the descriptor-swap outcome — a live volume holding a key that is not the one
-// its layers were sealed with — reached through the catalog instead of the bucket, and
-// it is worse in the one way that matters: the swapped-in wrap really is sealed for this
-// volume, so checkKey authenticates it, the descriptor Clone overwrites agrees with the
-// row, and there is no witness anywhere that says the volume was re-keyed.
+// It is the descriptor-swap outcome reached through the catalog, and worse in the one way
+// that matters: the swapped-in wrap really is sealed for this volume, so checkKey
+// authenticates it and no witness anywhere says the volume was re-keyed.
 func TestAdversaryCloneOntoAnExistingVolumeIDRekeysThatVolume(t *testing.T) {
 	f := newFleet(t)
 	victim := f.provision(t)
@@ -148,20 +131,14 @@ func TestAdversaryCloneOntoAnExistingVolumeIDRekeysThatVolume(t *testing.T) {
 	}
 }
 
-// One PUT of a descriptor nobody authenticated blocks the crypto-shred of any volume in
-// the fleet, permanently.
+// One PUT of a descriptor nobody authenticated blocks the crypto-shred of any volume in the
+// fleet, permanently.
 //
-// DeleteVolume's bucket-side descendant check reads every object under descriptor.Prefix
-// and refuses if any of them names the victim as its parent. `parent_volume_id` is a
-// field in a digest-framed object, and framed says out loud that the digest is not
-// authentication — so the refusal is driven by a string an adversary with write access
-// chooses, on an object they invent, under a volume id that has no catalog row and no
-// key this fleet ever wrapped.
-//
-// The operator cannot clear it: the error tells them to FLATTEN a volume that does not
-// exist. The rebuild was taught to hold every descriptor's dek_wrapped up to the KEK
-// before believing it; this check believes a descriptor whose wrapped DEK is not sealed
-// for it at all, which is the one thing an adversary cannot fake.
+// DeleteVolume's bucket-side descendant check refuses if any object under
+// descriptor.Prefix names the victim as its parent, and `parent_volume_id` is an
+// unauthenticated field an adversary chooses. The operator cannot clear it: the error tells
+// them to FLATTEN a volume that does not exist. The wrapped DEK is the one thing they
+// cannot fake, which is what the check now holds every descriptor up to.
 func TestAdversaryAForgedDescendantBlocksTheShredForever(t *testing.T) {
 	f := newFleet(t)
 	victim := f.provision(t)
@@ -192,17 +169,11 @@ func TestAdversaryAForgedDescendantBlocksTheShredForever(t *testing.T) {
 
 // Deleting a clone shreds nothing while its parent is alive.
 //
-// DeleteVolume states its lineage limit in one direction only — deleting a *parent*
-// destroys no secret its descendants still hold, which is why step 1 refuses it. The
-// other direction has no refusal, no warning, and is the one an operator actually
-// performs: keep the golden image, delete the ephemeral clone that was branched off it.
-//
-// The clone's layers are content-addressed under the global layers/ prefix and are
-// deliberately not deleted. Its key *bytes* are the parent's (§10), and the parent's
-// descriptor is still sitting in the bucket holding them, wrapped and openable. So
-// everything needed to read the deleted clone's guest data is still in the bucket, and
-// the "with the DEK gone the bytes are noise" argument — the entire justification for
-// leaving the layers — is false for every clone the fleet ever deletes.
+// The direction an operator actually performs — keep the golden image, delete the ephemeral
+// clone — has no refusal and no warning. The clone's layers stay under the global layers/
+// prefix and its key *bytes* are the parent's (§10), still wrapped and openable in the
+// parent's descriptor, so "with the DEK gone the bytes are noise" is false for every clone
+// the fleet deletes.
 func TestAdversaryDeletingACloneShredsNothingWhileItsParentLives(t *testing.T) {
 	f := newFleet(t)
 	parent := f.provision(t)
@@ -218,15 +189,9 @@ func TestAdversaryDeletingACloneShredsNothingWhileItsParentLives(t *testing.T) {
 	m := f.publishOne(t, clone.VolumeID, plain)
 
 	f.detach(t, clone.VolumeID)
-	// The delete is REFUSED, and that is the contract this test now pins.
-	//
-	// It asserted a successful delete and then showed the bytes coming back, which is the
-	// defect stated as a demand: a lineage shares one DEK (v6 §10), so no member of a live
-	// lineage can be crypto-shredded on its own, and no ordering of deletes inside this
-	// function could have made it true. What was wrong was the claim, not the mechanism —
-	// so the operation SAYS SO — refusing outright, which was the first fix, deadlocked
-	// deletion entirely, because a parent cannot go while a descendant exists either.
-	// Everything below still runs, and now proves the report is the truth.
+	// The delete succeeds and *reports* that it shredded nothing, which is the contract this
+	// test pins. Refusing outright was the first fix and it deadlocked deletion: a parent
+	// cannot go while a descendant exists either, so a cloned lineage became undeletable.
 	shred, err := controlplane.DeleteVolume(t.Context(), f.md, f.store, f.kms, f.term, clone.VolumeID)
 	if err != nil {
 		t.Fatalf("DeleteVolume: %v", err)
@@ -269,14 +234,9 @@ func TestAdversaryDeletingACloneShredsNothingWhileItsParentLives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// And here is *why* the refusal above is the only honest answer: the parent's wrap,
-	// which is still in the bucket, still opens every byte the clone's guest wrote. Had
-	// the delete returned success, this is what "shredded" would have meant.
-	//
-	// Asserted rather than merely observed, because the day it stops being true is the
-	// day the refusal can be lifted — a clone that holds a key of its own (the FLATTEN the
-	// refusal names) is a volume that can be shredded alone, and this test going red is
-	// how somebody finds out they have earned that.
+	// The parent's wrap, still in the bucket, still opens every byte the clone's guest wrote.
+	// Asserted rather than merely observed: the day it stops being true is the day a clone
+	// holds a key of its own and deleting one alone IS a shred.
 	var out bytes.Buffer
 	if err := commit.Fetch(t.Context(), f.store, enc, m, &out); err != nil {
 		t.Fatalf("the clone's layers no longer open under the lineage key (%v). If a clone now "+

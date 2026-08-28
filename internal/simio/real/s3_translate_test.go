@@ -12,24 +12,18 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// Finding 11. translate() is the whole boundary between S3's error vocabulary and
-// the two sentinels the protocol branches on, and it had no unit test at all: every
-// mapping was asserted only indirectly, against the one pinned backend, in the
-// Docker-gated lane. Two things fall out of that:
+// Finding 11. translate() had no unit test: every mapping was asserted only indirectly,
+// against the one pinned backend, in the Docker-gated lane. Two defects hid there:
 //
 //   - AWS answers a *concurrent* conditional write with 409 ConditionalRequestConflict,
-//     not 412. That is the §12.4 fencing race on real S3: the promoter that lost gets
-//     an unmapped, opaque error, epoch.CompareAndAdvance never returns ErrCASConflict,
-//     and the "I was fenced" branch is never taken. Fail-closed, so not data loss —
-//     but the fencing path behaves differently from every proof written about it and
-//     is undiagnosable during an incident;
-//   - NoSuchBucket was mapped to ErrNotFound, i.e. to "this object is not there".
-//     Recovery reads that as "nothing was written yet" and reports an empty durable
-//     prefix for a volume whose data is intact, on nothing worse than a typo'd bucket.
+//     not 412, so the promoter that lost got an opaque error and §12.4's "I was fenced"
+//     branch was never taken;
+//   - NoSuchBucket mapped to ErrNotFound, which recovery reads as "nothing was written
+//     yet" — an empty durable prefix for an intact volume, on a typo'd bucket.
 //
-// The retryable codes matter just as much in the negative: the uploader retries
-// anything that is not a precondition failure (§14.5), so a throttle must NOT come
-// back as a sentinel.
+// The retryable codes matter in the negative too: a throttle must NOT come back as a
+// sentinel, because the uploader retries anything that is not a precondition failure
+// (§14.5).
 
 func apiErr(code string) error {
 	return &smithy.GenericAPIError{Code: code, Message: code + " message"}

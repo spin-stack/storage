@@ -1,20 +1,10 @@
 // Package qcow owns a volume's local qcow2 chain: where it lives, how it is created,
 // how an existing one is opened and checked, and which file is the tip QEMU writes to.
 //
-// # This process does not launch QEMU, and that is the design
-//
-// QEMU is the data path (v6 §4): it reads and writes the active image directly, keeps
-// qcow2's semantics, and performs the guest's flushes. The Agent "prepares filesystems
-// and directories, creates and opens qcow2 chains, **controls QEMU over QMP**" — v6 §4
-// again, and §7 lists what that control is: flush the block devices, take the external
-// snapshot, switch to the new tip, confirm it is being used. Not one of them starts a
-// virtual machine. ADR-0021 says who does: spin's `cmd/runner`, "the long-lived per-host
-// daemon that runs the QEMU VMs", which this system integrates into.
-//
-// So the Agent would have to acquire a second responsibility — VM supervision, with the
-// process lifetime, the crash policy and the console that come with it — to launch QEMU
-// itself, and it would be the second daemon on the host doing it. The pivot to qcow2
-// exists to shed responsibilities, not to trade one for another.
+// This process does not launch QEMU. QEMU is the data path (v6 §4) and the Agent only
+// controls it over QMP; spin's `cmd/runner` runs the VMs (ADR-0021), and launching them
+// here would give this daemon a second responsibility — VM supervision, with the process
+// lifetime and crash policy that come with it — which the pivot to qcow2 exists to shed.
 //
 // # The contract with whoever does launch it
 //
@@ -23,18 +13,15 @@
 //   - the image at ActiveImage(root, volumeID) as the disk it writes to, and
 //   - a QMP socket at QMPSocket(root, volumeID), server side.
 //
-// Both are derived from the volume's directory, so the launcher needs to know the data
-// directory and the volume id and can compute the rest. That is the whole interface;
-// it is small on purpose, because it spans two repositories.
+// Both are derived from the volume's directory, so the launcher needs only the data
+// directory and the volume id. It is small on purpose: it spans two repositories.
 //
 // # The rule about offline tools
 //
-// v6 §5: the file QEMU is using is never processed with offline tools that could modify
-// it, and §7 allows `create`, `info`, `check`, `convert` and `rebase` on images that are
-// not in use. This package obeys something stricter and simpler to check: it runs
-// `qemu-img` against a volume's active image **only while opening the chain**, before
-// any VM of ours can be attached to it, and never again for as long as the volume is
-// held. After that, every question about the live image goes to QEMU over QMP.
+// v6 §5 forbids offline tools on the file QEMU is using. This package obeys something
+// stricter and simpler to check: `qemu-img` runs against a volume's active image **only
+// while opening the chain**, before any VM of ours can be attached, and never again.
+// After that, every question about the live image goes to QEMU over QMP.
 package qcow
 
 import (
@@ -57,12 +44,8 @@ var ErrChainMismatch = errors.New("qcow: the local image does not match the volu
 
 // ErrChainMissing means this volume has published commits and this host holds none of
 // them, and the rebuild that would have fetched them did not finish. It is a refusal and
-// never a create.
-//
-// Creating a fresh empty layer for a volume that already has one is how a guest is handed
-// a blank disk — the sentence readPointer already carries one branch below, where it was
-// not true of the branch above it: a volume with no pointer was assumed to be a volume
-// with no history, and nothing consulted the object store to find out.
+// never a create: creating a fresh empty layer for a volume that already has one is how a
+// guest is handed a blank disk.
 var ErrChainMissing = errors.New("qcow: this volume has published commits and this host has no copy of them")
 
 // ErrStaleChain means this host holds a chain the published history has moved past. It is
@@ -73,16 +56,13 @@ var ErrStaleChain = errors.New("qcow: this host's chain is behind the published 
 
 // Recovery rebuilds a volume's published chain on this host.
 //
-// It is an interface here and not a bool the caller computes, because the question — may
-// this volume be born empty? — must be impossible to skip. A bool is a thing a caller
-// forgets to set, and the caller forgetting is the whole defect this guard closes.
+// An interface and not a bool the caller computes, because the question — may this volume
+// be born empty? — must be impossible to skip, and a caller forgetting is the whole
+// defect this guard closes.
 //
-// The bucket is the authority and not the catalog. `published_sequence` and
-// `durable_sequence` on DesiredVolume are documented as exactly this fact and nothing in
-// this system can advance either: a commit manifest has no sequence, and the only writer
-// of those columns is the Agent's own report, which reports zero. A guard built on a
-// column that is structurally zero for every volume in the fleet always answers "born
-// empty" — the defect with a wire field in front of it.
+// The bucket is the authority and not the catalog: nothing in this system advances
+// `published_sequence` or `durable_sequence`, so a guard built on either always answers
+// "born empty".
 type Recovery interface {
 	// Restore rebuilds volumeID's published chain locally. A wrapped commit.ErrNoHead
 	// means the volume has never published and an empty chain is correct; every other
@@ -154,28 +134,19 @@ var ErrForeignImage = errors.New("qcow: the QEMU at this volume's QMP socket has
 //
 // # A layer file is never renamed, never reused, and never means a second thing
 //
-// This is the one rule the layout exists to keep, and it was not free: v6 §5 drew the
-// tree with a fixed `active/current.qcow2` and sealed layers moved to `sealed/<id>.qcow2`,
-// which is what a person would draw. Rotating that tree means a path — the one QEMU was
-// launched with — coming to mean a different file, and measuring it against a real QEMU
-// showed what that costs:
+// v6 §5 drew a fixed `active/current.qcow2` with sealed layers moved aside; measured
+// against a real QEMU, reusing a path costs two things:
 //
 //   - QEMU remembers the *string* it opened a node with, for ever. After a rotation that
-//     reuses `active/current.qcow2`, the node holding the sealed layer still calls itself
-//     `active/current.qcow2` — which now names the live tip. Anything that re-resolved it
-//     would open the tip as its own backing.
-//   - `query-block` stops answering with a path at all. It cannot render the graph as one
-//     filename any more, so `file` comes back as `json:{"backing": ...}` — and this
-//     Agent's one safety check on an attached VM is "is the file QEMU has open ours".
-//     Rotation would have broken it, silently, in the direction of refusing good volumes.
+//     reuses the path, the node holding the sealed layer still calls itself by it, and
+//     anything that re-resolved it would open the tip as its own backing.
+//   - `query-block` stops answering with a path at all — `file` comes back as
+//     `json:{"backing": ...}` — which silently breaks this Agent's one safety check on an
+//     attached VM: is the file QEMU has open ours.
 //
-// With id-named layers both problems are absent rather than handled: every path QEMU ever
-// sees is a real file that will still be that file tomorrow, and `query-block` answers
-// with it. §5's tree was corrected to this one.
-//
-// `active/current` is therefore not the image — it is a *pointer* to it, and it is the
-// contract with whoever launches the VM: read the line, hand that path to QEMU. It is
-// derived state, repaired from what QEMU says (Open), never trusted over it.
+// `active/current` is therefore not the image but a *pointer* to it, and it is the
+// contract with whoever launches the VM. It is derived state, repaired from what QEMU
+// says (Open), never trusted over it.
 const (
 	volumesDir  = "volumes"
 	layersDir   = "layers"
@@ -303,18 +274,14 @@ type OpenRequest struct {
 
 // Open returns the chain for one volume, creating the first layer the first time.
 //
-// # QEMU's answer outranks the pointer
+// QEMU's answer outranks the pointer. A live image is taken as the tip even when
+// `active/current` says otherwise, with the pointer repaired to match: a rotation writes
+// the pointer before it tells QEMU to switch, so a crash in between leaves the pointer
+// one layer ahead of the guest, and believing it would hand the next boot a file missing
+// every write since.
 //
-// A live image says a QEMU has that file open — the Agent restarted while the guest kept
-// running — and it is taken as the tip even when `active/current` says otherwise, with
-// the pointer repaired to match. The disagreement is a real state and not a corruption:
-// a rotation writes the pointer before it tells QEMU to switch, so a crash in between
-// leaves the pointer one layer ahead of the guest. Believing the pointer there would hand
-// the next boot a file that is missing every write the guest has made since.
-//
-// An image in use is checked by nobody: `qemu-img` takes a lock and would fail, and
-// forcing past that lock is the one thing v6 §5 forbids outright. QEMU opened the file,
-// which is a stronger statement about it than any check made from here.
+// An image in use is checked by nobody: `qemu-img` would fail on the lock, and forcing
+// past it is what v6 §5 forbids outright.
 func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest) (*Chain, error) {
 	if req.Recovery == nil {
 		// Before anything else, including the size check: a caller that did not wire a
@@ -327,16 +294,11 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 	}
 	pointer := ActivePointer(req.Root, req.VolumeID)
 	if req.LiveImage != "" {
-		// A guest being attached is not a reason to skip the question. This branch
-		// returned the live image straight away, on the argument that QEMU's answer
-		// outranks the pointer — which it does, about *which file* is the tip, and says
-		// nothing about whether that chain is still this volume's history. A host whose
-		// guest never stopped is exactly the shape a fence leaves behind, so the branch
-		// that skipped the check was the branch the check exists for.
-		//
-		// Nothing is rebuilt here and nothing is repaired: an image a guest holds cannot
-		// be replaced under it. What a stale chain gets is a refusal, which is what stops
-		// the layers being sealed and published into a history that has no room for them.
+		// A guest being attached is not a reason to skip the question: QEMU's answer outranks
+		// the pointer about *which file* is the tip, and says nothing about whether that
+		// chain is still this volume's history. A host whose guest never stopped is exactly
+		// the shape a fence leaves behind. Nothing is rebuilt or repaired here — an image a
+		// guest holds cannot be replaced under it — so a stale chain gets a refusal.
 		if err := checkNotStale(ctx, p, req, req.LiveImage); err != nil {
 			return nil, err
 		}
@@ -357,16 +319,11 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 	if err != nil {
 		return nil, fmt.Errorf("%w: volume %s: %w", ErrChainMissing, req.VolumeID, err)
 	}
-	// A chain this host gave up is not this volume's history any more, and the pointer
-	// cannot say so: it is one line of text that survived the host losing the volume.
-	// Between the loss and this grant another host held the volume, served it and
-	// published — that is what a lease lapsing or a HEAD moving under us means — so the
-	// bucket decides what the chain is, and the local layers are a fork of it.
-	//
-	// This is not the same question checkNotStale asks. That one compares HEAD with what
-	// this host published and can only refuse; this one applies when the object store has
-	// no opinion this host can be measured against, and it *repairs* — the volume has
-	// been granted back at a higher epoch and a guest is waiting for a disk.
+	// A chain this host gave up is not this volume's history any more, and the pointer is
+	// one line of text that survived the loss: another host may have held the volume and
+	// published in between. Not the question checkNotStale asks — that one compares HEAD
+	// with what this host published and can only refuse; this one *repairs*, because the
+	// volume has been granted back and a guest is waiting for a disk.
 	if image != "" && local.Fenced != nil {
 		chain, keepLocal, err := regrant(ctx, r, p, qemuImg, req, pointer, image, local)
 		if err != nil {
@@ -391,16 +348,12 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 		return nil, err
 	}
 
-	// The whole chain and not just the tip. `qemu-img info` exits 0 on an image whose
-	// backing file is gone — format, virtual size and the corrupt flag all pass — so
-	// this Agent would log "volume ready" and the failure would land on whoever
-	// launches QEMU, as `Could not open backing file`. `--backing-chain` opens every
-	// layer and exits 1 (both measured against the pinned 11.1.1).
-	//
-	// Rotate keeps plain `inspect` and must: the overlay it checks is backed by a tip a
-	// live QEMU holds the write lock on, so a walk would fail on the lock and break
-	// every rotation. This branch is the one place the image is known to be offline —
-	// LiveImage == "" returned above — which is exactly where the walk is safe.
+	// The whole chain and not just the tip: `qemu-img info` exits 0 on an image whose
+	// backing file is gone, so the failure would land on whoever launches QEMU as `Could
+	// not open backing file`; `--backing-chain` opens every layer and exits 1 (both
+	// measured against the pinned 11.1.1). Rotate must keep plain `inspect`: its overlay is
+	// backed by a tip a live QEMU locks, and a walk would break every rotation. This branch
+	// is the one place the image is known to be offline.
 	chain, err := inspectChain(ctx, r, qemuImg, image)
 	if err != nil {
 		return nil, err
@@ -466,35 +419,26 @@ func checkNotStale(ctx context.Context, p Paths, req OpenRequest, image string) 
 
 // born is the branch for a volume with no local chain, and the one that used to lose
 // data: it ran `qemu-img create` unconditionally, so a volume with published commits
-// placed on a host that has never seen it got an empty qcow2 and no error anywhere.
+// placed on a fresh host got an empty qcow2 and no error anywhere.
 //
-// The bucket is asked first, and there are exactly three answers. No HEAD is the
-// ordinary case — a volume created a second ago — and costs one request that never
-// happens again, in a branch that was about to fork a process anyway. A rebuild that
-// finished is a chain on this disk to overlay. Anything else is a refusal, including an
-// unreachable bucket: objectstore separates "the key is not there" from "I could not
-// look" precisely so that this line does not read the second as the first.
+// The bucket is asked first, and there are three answers: no HEAD is the ordinary case
+// and costs one request; a rebuild that finished is a chain to overlay; anything else is
+// a refusal, including an unreachable bucket, which objectstore reports separately from
+// "the key is not there" precisely so this line cannot confuse them.
 func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest, pointer string, local State) (*Chain, error) {
 	restored, err := req.Recovery.Restore(ctx, req.VolumeID, req.SizeBytes)
 	switch {
 	case errors.Is(err, commit.ErrNoHead):
-		// This host's own record outranks the bucket's answer, in exactly one direction
-		// and only here. An Agent that published commits for this volume and is now
-		// started against no object store — or against the wrong one, a typo, a staging
-		// value, a bucket restored without its HEADs — asks a Recovery that answers "this
-		// volume has never published", and would create a blank disk over a history it
-		// knows about, because it wrote the file that says so. The same goes for a host
-		// that was fenced: it held a chain a moment ago, so "never published" is an answer
-		// about the store this binary was pointed at and not about the volume.
+		// This host's own record outranks the bucket's answer, in exactly one direction and
+		// only here. An Agent that published commits for this volume and is pointed at no
+		// object store — or at the wrong one — is told "never published", and would create a
+		// blank disk over a history it wrote the file about. The same goes for a host that
+		// was fenced. The other direction is not symmetric: a host that has never seen the
+		// volume has no state file at all, so this refuses and never permits.
 		//
-		// The other direction is not symmetric: a state file that records nothing proves
-		// nothing, because a host that has never seen the volume has no state file at all.
-		// So this refuses and never permits.
-		//
-		// It is asked *after* Restore and not before, which is the order the earlier
-		// version had wrong: a host that holds commits and a store that can rebuild the
-		// chain is not a conflict at all, and refusing before the question was put made a
-		// re-granted host with a published history permanently unserveable.
+		// Asked *after* Restore, not before: a host that holds commits and a store that can
+		// rebuild the chain is no conflict, and refusing first made a re-granted host with a
+		// published history permanently unserveable.
 		if len(local.Commits) > 0 {
 			return nil, fmt.Errorf("%w: volume %s has %d commits recorded on this host and no local chain, and the object store does not know them",
 				ErrChainMissing, req.VolumeID, len(local.Commits))
@@ -520,19 +464,14 @@ func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 
 // regrant decides what a host that lost this volume and has been granted it back serves.
 //
-// The local pointer cannot answer it: it is one line of text that survived the host
-// losing the volume, and between the loss and this grant another host may have held the
-// volume, served it and published — which is what a lease lapsing or a HEAD moving under
-// us means. So the object store is asked, with the question that can also act on the
-// answer.
+// The local pointer cannot answer it: between the loss and this grant another host may
+// have held the volume, served it and published. So the object store is asked.
 //
-// Restore and not Current, and the difference is the whole decision. Current asks whether
-// the local chain is behind, which can only end in a refusal; Restore asks the store to
-// put the volume's history on this disk, and a host with a guest waiting needs the second.
-// Its ErrNoHead is the case that keeps the local chain: nothing was ever published, by
-// this host or by whoever had the volume in between, so the layers here are the only
-// history this volume has and replacing them with an empty image is the blank-disk defect
-// with a fence in front of it.
+// Restore and not Current, and the difference is the whole decision: Current asks whether
+// the local chain is behind and can only refuse, while a host with a guest waiting needs
+// the store to put the history on this disk. Its ErrNoHead is the case that keeps the
+// local chain — nothing was ever published by anyone, so replacing the local layers with
+// an empty image is the blank-disk defect with a fence in front of it.
 //
 // keepLocal true means the caller carries on with the chain that is already here.
 func regrant(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest, pointer, image string, local State) (chain *Chain, keepLocal bool, err error) {
@@ -613,21 +552,14 @@ func clearFence(p Paths, root, volumeID string) error {
 	return WriteState(p, root, volumeID, st)
 }
 
-// clearFork forgets what this host knew about the chain a re-derived volume replaced.
+// clearFork forgets what this host knew about the chain a re-derived volume replaced:
+// the fence, which would refuse the volume next cycle; the layer list, whose layers the
+// tip no longer sits on; and the pending commit, which would put a layer into the history
+// whose bytes the served chain does not contain — a sealed layer being dropped, which is
+// why it is logged with its ids.
 //
-// Three facts go, and each of them would be a lie about the new chain: the fence, because
-// the volume is this host's again and the record is what would refuse it next cycle; the
-// layer list, because those layers are a fork the tip no longer sits on; and the pending
-// commit, because publishing it now would put a layer into the history whose bytes the
-// chain being served does not contain. That last one is a sealed layer being dropped, and
-// it is logged with its ids for exactly that reason — the alternative is a commit that
-// reconstructs to something no guest ever saw.
-//
-// Commits is kept. Those are commits whose layers this host still holds, the restore just
-// added to them, and they are what lets the next rebuild skip a download.
-//
-// The state is read again rather than reused: the restore that ran a moment ago appended
-// to this same file.
+// Commits is kept: those layers this host still holds, and they let the next rebuild skip
+// a download. The state is read again because the restore just appended to this file.
 func clearFork(p Paths, root, volumeID string) error {
 	st, err := ReadState(p, root, volumeID)
 	if err != nil {
@@ -643,9 +575,8 @@ func clearFork(p Paths, root, volumeID string) error {
 }
 
 // Rotate seals the tip and puts a new empty layer on top of it, with the guest writing
-// throughout. It is v6 §23.2, and after it returns the previous tip is complete: nothing
-// will ever write to that file again, which is what makes it something a commit can
-// upload.
+// throughout (v6 §23.2). After it returns nothing will ever write to the previous tip
+// again, which is what makes it something a commit can upload.
 //
 // # The order is the design, and every other order loses data
 //
@@ -654,24 +585,19 @@ func clearFork(p Paths, root, volumeID string) error {
 //  3. Point `active/current` at it.
 //  4. Tell QEMU to switch (blockdev-snapshot-sync, mode=existing).
 //
-// Step 3 comes before step 4 and not after. Whichever way round they go there is a window
-// where a crash leaves the two disagreeing, and the question is only what a VM relaunched
-// in that window opens. Pointer first, it opens the new layer: an empty overlay over
-// everything the guest wrote, which is correct. Pointer last, it opens the layer that is
-// *already the backing of the live tip* and writes into it — a second writer under a file
-// QEMU is reading through, which corrupts the chain with no error anywhere. The Agent
-// converges out of the first window on its next cycle (Open); there is no converging out
-// of the second.
+// Step 3 before step 4: whichever way round, a crash leaves the two disagreeing, and the
+// question is what a VM relaunched in that window opens. Pointer first, it opens an empty
+// overlay over everything the guest wrote, and the Agent converges out of it next cycle.
+// Pointer last, it opens the layer that is *already the backing of the live tip* and
+// writes into it — a second writer under a file QEMU is reading through, with no error
+// anywhere and no converging out.
 //
-// Step 2 is not defensive. QEMU does not check that an overlay's recorded backing is the
-// node it attaches — that is exactly what lets step 1 name a file by a path QEMU never
-// used — so a wrong backing path is invisible for the entire life of the VM and wrong on
-// the next boot, when a guest gets somebody else's disk or a shorter one. The moment it
-// can still be caught is before step 4.
+// Step 2 is not defensive: QEMU does not check that an overlay's recorded backing is the
+// node it attaches, so a wrong backing path is invisible for the life of the VM and wrong
+// on the next boot. The moment it can still be caught is before step 4.
 //
-// The new layer is created with `-u`: qemu-img is told not to open the backing file. It
-// cannot, because QEMU holds its write lock, and this is the one place where "unsafe"
-// means "does not consult a file that is already known to be busy".
+// The new layer is created with `-u` because qemu-img cannot open the backing file: QEMU
+// holds its write lock.
 func (c *Chain) Rotate(ctx context.Context, r Runner, p Paths, qemuImg, root, volumeID, layerID string, switchTo func(newTip string) error) (sealed string, err error) {
 	next := LayerImage(root, volumeID, layerID)
 	exists, err := p.Exists(next)
@@ -724,17 +650,12 @@ func readPointer(p Paths, root, volumeID, pointer string) (string, error) {
 		return "", fmt.Errorf("qcow: reading %s: %w", pointer, err)
 	}
 	image := strings.TrimSpace(string(body))
-	// A layer of *this* volume, not any layer. `active/current` is the one local file
-	// with no identity of its own — a qcow2 carries its own header, a manifest names its
-	// volume, and this is one line of text that a data directory restored from a backup
-	// of another volume, or copied when a volume was re-placed, leaves pointing at
-	// somebody else's tip. Booting it is another tenant's disk served under this
-	// volume's name, and every layer this host then seals over it is theirs too.
-	// Cleaned before the prefix is compared, and that is the whole of it: a pointer
-	// naming `<this volume>/layers/../../<other volume>/layers/x.qcow2` starts with the
-	// right prefix as a *string* and resolves to somebody else's tip. Every path here is
-	// handed to another process, which resolves it, so the comparison has to resolve it
-	// too.
+	// A layer of *this* volume, not any layer: `active/current` is one line of text with no
+	// identity of its own, and a data directory restored from a backup leaves it pointing at
+	// somebody else's tip — another tenant's disk served under this volume's name.
+	// Cleaned before the prefix is compared, because `<vol>/layers/../../<other>/layers/x`
+	// has the right prefix as a string and resolves elsewhere, and every path here is handed
+	// to another process that resolves it.
 	image = filepath.Clean(image)
 	if !strings.HasPrefix(image, filepath.Clean(LayersDir(root, volumeID))+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: %s names %q, which is not a layer of volume %s",
@@ -750,19 +671,14 @@ func readPointer(p Paths, root, volumeID, pointer string) (string, error) {
 }
 
 // SyncPointer makes `active/current` name the layer a guest is actually writing to,
-// leaving the file alone when it already does.
+// leaving the file alone when it already does — writing means fsync of the file and its
+// directory, per volume per heartbeat, for a fact that changes once a rotation.
 //
-// It is called on every cycle a VM is attached, and reading before writing is not an
-// optimisation: writing is fsync of the file and of its directory, and doing that per
-// volume per heartbeat for a fact that changes once a rotation would be real I/O bought
-// for nothing.
-//
-// What it converges is the window Rotate opens deliberately. The pointer moves before
-// QEMU is told to switch, so a snapshot that fails — or one whose answer never came
-// back, which is the case nobody can tell apart from it — leaves the pointer one layer
-// ahead of the guest. It is left ahead rather than put back, because "the command
-// failed" and "the answer was lost after it took effect" look the same from here and
-// only one of those is safe to undo. QEMU is asked next cycle and it settles it.
+// What it converges is the window Rotate opens deliberately: the pointer moves before
+// QEMU is told to switch, so a snapshot that failed — or one whose answer was lost, which
+// looks the same from here — leaves the pointer one layer ahead. It is left ahead rather
+// than put back, because only one of those two is safe to undo, and QEMU settles it next
+// cycle.
 func SyncPointer(p Paths, root, volumeID, image string) error {
 	return syncPointer(p, ActivePointer(root, volumeID), image)
 }

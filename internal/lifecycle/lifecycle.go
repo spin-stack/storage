@@ -2,27 +2,15 @@
 // has a lifecycle: host fleet states (§28.1), volume ownership states (§7) and
 // snapshot states (§19).
 //
-// §16's Agent-side per-volume machine is deliberately not here. It was written
-// first, so that "Phases 02/03 implement the doc's machine rather than reinventing
-// one", and then the Agent was built and reinvented nothing: it imports exactly one
-// symbol from this package (lifecycle.VolumeActive) and tracks a volume's serving
-// state in internal/agent, per volume, next to the WAL and the lease it actually
-// depends on. Nine constants, a transition table and two tests spent three phases
-// describing a machine no process ran. It is deleted rather than kept as
-// documentation because a vocabulary in this package is a claim that some store or
-// boundary parses values into it, and this one made that claim falsely — which is
-// exactly how a reader concludes the Agent has states it does not have.
+// §16's Agent-side per-volume machine is deliberately not here: the Agent imports one symbol
+// (lifecycle.VolumeActive) and tracks serving state per volume in internal/agent. A
+// vocabulary in this package claims some store parses values into it; that one did not.
 //
-// Each vocabulary is a distinct named type with an explicit transition table taken
-// from the architecture document. That buys three things a bare string cannot:
-//
-//   - a state from the wrong vocabulary does not compile;
-//   - the zero value is not a valid state, so a field nobody set is caught rather
-//     than silently reading as ACTIVE;
-//   - an illegal lifecycle move (§7's "promotion always passes through FENCING_WAIT",
-//     §19's "a PUBLISHED snapshot never changes") is a returned error at the store
-//     boundary, and Predecessors feeds the SQL guard so Postgres enforces the same
-//     rule atomically.
+// Each vocabulary is a distinct named type with the architecture document's transition table:
+// a state from the wrong vocabulary does not compile, the zero value is not a valid state (an
+// unset field is caught rather than reading as ACTIVE), and an illegal move (§7's "promotion
+// always passes through FENCING_WAIT", §19's "a PUBLISHED snapshot never changes") is an error
+// at the store boundary — Predecessors feeds the SQL guard so Postgres enforces it atomically.
 //
 // The package is dependency-free on purpose: it is imported by metadata, the Control
 // Plane, placement, and the data path, and must never pull them back in.
@@ -194,20 +182,13 @@ func (s HostState) PredecessorNames() []string { return names(s.Predecessors()) 
 
 // --- Why a host is cordoned, and who may change it (ADR-0013 §3, §5) ---
 
-// CordonReason is why a host is CORDONED, and — because in this system the reason
-// and the actor are the same thing — the authority a write to hosts.state carries.
+// CordonReason is why a host is CORDONED and — because here the reason and the actor are the
+// same thing — the authority a write to hosts.state carries. Cordon is no longer only a
+// human's: ADR-0013 §3 cordons a host past 70% used, and the automatic loop must never clear
+// a cordon a human set for a reason it cannot see.
 //
-// It exists because cordon stopped being something only a human does. ADR-0013 §3
-// makes the Control Plane cordon a host whose device passes 70% used, so an operator
-// looking at a CORDONED host can no longer assume somebody meant it; and, in the
-// other direction, the automatic loop must never clear a cordon a human put there
-// for a reason it cannot see (a failing NIC, a kernel it is about to reboot).
-// A cordon with no recorded cause is a cordon nobody can safely undo.
-//
-// One value serves both questions on purpose. A second column — `cordoned_by`
-// alongside `cordon_reason` — was rejected: two columns that must agree are two
-// columns that can disagree, and nothing in this system would ever set them to
-// different things. There is exactly one automatic actor and exactly one human one.
+// Rejected: a second `cordoned_by` column — two columns that must agree are two columns that
+// can disagree, and there is exactly one automatic actor and one human one.
 type CordonReason string
 
 // Cordon reasons. The zero value means "not cordoned": it is a stored value, never
@@ -221,14 +202,10 @@ const (
 
 var cordonReasons = []CordonReason{CordonNone, CordonOperator, CordonPressure}
 
-// cordonOverwrite is the authority table: for a write made *for* the key reason,
-// the stored reasons it may replace.
-//
-// The asymmetry is the whole point. A human outranks the pressure loop, so an
-// operator write lands whatever the host currently says. The pressure loop does not
-// outrank a human, so it may only touch a host that is uncordoned or that it
-// cordoned itself — which is what stops the 70% rule from un-cordoning a host a
-// human took out of service deliberately.
+// cordonOverwrite is the authority table: for a write made *for* the key reason, the stored
+// reasons it may replace. The asymmetry is the point — an operator write lands on anything,
+// while the pressure loop may only touch a host that is uncordoned or that it cordoned itself,
+// so the 70% rule cannot un-cordon a host a human took out of service.
 var cordonOverwrite = map[CordonReason][]CordonReason{
 	CordonOperator: {CordonNone, CordonOperator, CordonPressure},
 	CordonPressure: {CordonNone, CordonPressure},
@@ -278,38 +255,26 @@ func (r CordonReason) MayOverwrite(current CordonReason) bool {
 	return false
 }
 
-// OverwritableNames is MayOverwrite as stored strings — the store's SQL predicate,
-// the same move PredecessorNames makes for the transition table. The rule has to be
-// *in* the statement that writes the state: a read-then-write in Go leaves a window
-// in which an operator's cordon lands between the two and the pressure loop clears
-// it anyway, which is the one outcome this whole type exists to prevent.
+// OverwritableNames is MayOverwrite as stored strings — the store's SQL predicate. The rule
+// has to be *in* the write: a read-then-write in Go leaves a window where an operator's cordon
+// lands between the two and the pressure loop clears it anyway.
 func (r CordonReason) OverwritableNames() []string { return names(cordonOverwrite[r]) }
 
 // --- Why a volume is not being served by the host that holds it ---
 
-// Refusal is why the Agent that holds a volume is not serving it. It is the fleet-side
-// name for the fail-closed decisions the data path makes at attach: the image the
-// catalog says exists is not in the bucket, the volume came back below the sequence a
-// guest was told was durable, the read view never resolved, the host has no key for an
-// encrypted volume, or the host's lease lapsed and it gave the device up.
+// Refusal is why the Agent that holds a volume is not serving it — the fleet-side name for
+// the data path's fail-closed decisions at attach.
 //
-// **It is a closed vocabulary and not a free string.** Both are defensible and the
-// choice is worth writing down. A string needs no schema change when a new refusal
-// appears and carries the Agent's own sentence — but the string that would actually be
-// stored is `err.Error()`, which embeds a volume id and a sequence number, so no two
-// rows ever compare equal, the `-fleet-status` column becomes a vocabulary nobody
-// controls, and the first alert anyone writes on it matches a substring. Every value
-// here is a decision made at a named line in internal/agent, so a new refusal is a new
-// code path in this repository and extending the vocabulary is the same commit: the
-// cost of the closed set falls on the person who is already editing both sides.
+// A closed vocabulary and not a free string: the string that would actually be stored is
+// `err.Error()`, which embeds a volume id and a sequence number, so no two rows compare
+// equal, the -fleet-status column becomes a vocabulary nobody controls, and the first alert
+// written on it matches a substring. Every value here is a decision at a named line in
+// internal/agent, so extending the vocabulary is the same commit. The sentence an operator
+// needs — which sequence, which key — rides alongside as free text nothing branches on
+// (metadata.Volume.RefusalDetail).
 //
-// The sentence an operator's next step needs — which sequence, which key — is carried
-// alongside as free text that nothing branches on (metadata.Volume.RefusalDetail). Same
-// split as a snapshot's id and its error message.
-//
-// RefusalNone is the zero value and it means "this host is serving the volume". That is
-// what makes the field self-clearing: every accepted report writes it, so a volume that
-// starts serving again overwrites the reason rather than needing anything to notice.
+// RefusalNone is the zero value and means "this host is serving the volume", which is what
+// makes the field self-clearing: every accepted report writes it.
 type Refusal string
 
 // Refusals. The empty value is stored, never argued: a report that names no refusal is
@@ -465,17 +430,10 @@ var snapshotMachine = newMachine("snapshot state",
 // SnapshotStates returns every snapshot state.
 func SnapshotStates() []SnapshotState { return snapshotMachine.all }
 
-// Unfinished reports whether something is still owed on a snapshot in this state.
-// CREATING is owed by the Agent serving the volume; DELETING is owed by a reclaim
-// ADR-0026 deleted, so nothing will ever move it and a snapshot that reaches it
-// stays there — which is why it belongs in the same answer rather than being read as
-// "on its way out".
-//
-// PUBLISHED and FAILED are finished: one is the result, the other is a request that
-// is over. Neither is a terminal state of the machine (both may still become
-// DELETING), so this is deliberately not `len(successors) == 0` — that predicate
-// would call a permanently stuck DELETING snapshot finished and a published one
-// outstanding, exactly backwards.
+// Unfinished reports whether something is still owed on a snapshot in this state. CREATING
+// is owed by the Agent; DELETING is owed by a reclaim ADR-0026 deleted, so a snapshot that
+// reaches it stays there. Deliberately not `len(successors) == 0`: that would call a stuck
+// DELETING snapshot finished and a PUBLISHED one outstanding, exactly backwards.
 func (s SnapshotState) Unfinished() bool {
 	return s == SnapshotCreating || s == SnapshotDeleting
 }
@@ -513,22 +471,10 @@ func (s SnapshotState) Predecessors() []SnapshotState { return snapshotMachine.p
 // PredecessorNames is Predecessors as stored strings — the store's SQL guard.
 func (s SnapshotState) PredecessorNames() []string { return names(s.Predecessors()) }
 
-// There are no reconciliation operations here any more. §7's OperationKind
-// (attach|detach|clone|resize|drain|recovery|flatten|gc) and OperationPhase
-// (PENDING…SUCCEEDED) were the vocabulary of the `operations` table, and both went
-// with it: ADR-0026 withdrew the drain, the promotion and the recovery those rows
-// converged, and nothing outside a test ever wrote one. The kinds that describe work
-// V1 still does — a snapshot, a clone — were never phases of an operation row; they
-// are one Control-Plane call each, and what they are waiting on is the snapshot's own
-// §19 state.
+// No OperationKind/OperationPhase: §7's operations table went with ADR-0026, and the work
+// V1 still does (a snapshot, a clone) is one Control-Plane call each, waiting on the
+// snapshot's own §19 state.
 //
-// There is no durability mode here any more. §14.8 once let a volume choose between
-// ACKing a FLUSH on the local fdatasync and ACKing it only once a verified object
-// existed; ADR-0026 withdrew the remote half, so the local ACK is the *only* contract
-// and there is nothing left to select. The enum outlived it by a whole increment —
-// stored in a column, carried on the wire, written into the descriptor, validated at
-// three boundaries — and no reader anywhere branched on it. A mode nobody can select
-// is not an option kept open, it is a second contract that has to be kept correct for
-// free, and the day someone re-reads it the code will silently promise durability the
-// data path stopped providing. Reintroducing a choice means reintroducing the
-// mechanism that honours it, and that is ADR-0026's decision to reopen, not a field's.
+// No durability mode: ADR-0026 withdrew the remote ACK, so the local ACK is the only
+// contract and nothing can select anything. Reintroducing a choice means reintroducing the
+// mechanism that honours it, which is ADR-0026's decision to reopen.

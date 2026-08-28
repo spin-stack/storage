@@ -167,15 +167,9 @@ func (s *Store) ListHosts(_ context.Context) ([]metadata.Host, error) {
 }
 
 // committedLocked is ADR-0017's derived §28.2 capacity, computed the same way the
-// host_committed_bytes view computes it in SQL: what the host holds. Nothing is
-// stored, so there is no delta to apply and nothing to apply twice — a resumed pass
-// computes the same answer as the pass that crashed.
-//
-// The second term — what an in-flight operation plan had reserved here and not yet
-// placed — went with the operations table (internal/schema/schema.sql carries the
-// reasoning). The sim summed it in Go and the view summed it in SQL; both are gone
-// together, which is the point of the shared contract: a term one implementation
-// keeps and the other does not is a proof about the wrong program.
+// host_committed_bytes view computes it in SQL: what the host holds. Nothing is stored, so
+// a resumed pass computes the same answer as the pass that crashed. ADR-0017's second term
+// went with the operations table (internal/schema/schema.sql).
 func (s *Store) committedLocked(hostID string) int64 {
 	var total int64
 	for _, v := range s.vols {
@@ -186,14 +180,11 @@ func (s *Store) committedLocked(hostID string) int64 {
 	return total
 }
 
-// boundLocked is the §28.2 ceiling and the ADR-0013 fill ceiling evaluated where
-// the write happens — against the derived committed value and the host's last
-// measurement as they stand immediately before it. Nil is not a placement decision.
-//
-// Both arms are here rather than one here and one in the caller: a host inside its
-// promises and out of device is admitted by the first and refused by the second, and
-// the two questions are answered from the same row at the same instant only if they
-// are asked in the same place.
+// boundLocked is the §28.2 ceiling and the ADR-0013 fill ceiling evaluated where the write
+// happens, against the derived committed value and the host's last measurement as they
+// stand immediately before it. Nil is not a placement decision. Both arms are here rather
+// than one here and one in the caller: they must be answered from the same row at the same
+// instant.
 func (s *Store) boundLocked(b *metadata.CapacityBound) error {
 	if b == nil {
 		return nil
@@ -360,13 +351,10 @@ func converge(cur, next metadata.Volume) metadata.Volume {
 	if cur.StandbyHostID != "" {
 		next.StandbyHostID = cur.StandbyHostID
 	}
-	// Key material is authority, not description, and it was on the wrong side of that
-	// line. A volume's wrapped DEK is the only thing standing between its layers and
-	// anybody who can read the bucket, so a re-create that carried a *newer* one would
-	// re-key a live volume — which is what a clone pointed at an existing id did, and what
-	// a rebuild reading a descriptor somebody else wrote would do. A volume's key is set
-	// once, when it is provisioned or cloned, and after that only the row that already
-	// exists knows it.
+	// Key material is authority, not description: a re-create carrying a *newer* wrapped DEK
+	// would re-key a live volume — which is what a clone pointed at an existing id did, and
+	// what a rebuild reading somebody else's descriptor would do. Set once, at provision or
+	// clone.
 	if cur.DEKKeyID != 0 {
 		next.DEKWrapped, next.DEKKeyID, next.KEKID = cur.DEKWrapped, cur.DEKKeyID, cur.KEKID
 	}

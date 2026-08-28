@@ -8,10 +8,8 @@ import (
 	"github.com/spin-stack/storage/internal/simio/disk"
 )
 
-// An Agent cannot open a volume without its key material, and the desired state —
-// which it polls every few seconds, for every volume on the host — is the wrong
-// place to carry it. These tests pin the alternative: one call, per volume, on
-// demand, and the answer held until the volume stops being this host's.
+// One call, per volume, on demand, with the answer held until the volume stops being this
+// host's — the alternative to carrying key material on the desired state the Agent polls.
 
 func setKeys(f *fakeCP, volumeID, kekID string, wrapped []byte) {
 	f.mu.Lock()
@@ -44,11 +42,9 @@ func TestVolumeKeysAreFetchedOnceAndHeld(t *testing.T) {
 	}
 }
 
-// TestVolumeKeysAreForgottenWhenTheVolumeLeaves: a volume that disappears from the
-// desired state is a volume this host must stop serving — promoted away, detached,
-// or fenced. Keeping its key material would mean the Agent holds the means to open a
-// volume the fleet has taken from it, and a stale entry is also what would let a
-// re-attached volume be opened with the key it had before.
+// TestVolumeKeysAreForgottenWhenTheVolumeLeaves: keeping the keys of a volume that left the
+// desired state means the Agent holds the means to open a volume the fleet took from it,
+// and a stale entry would let a re-attached volume be opened with the key it had before.
 func TestVolumeKeysAreForgottenWhenTheVolumeLeaves(t *testing.T) {
 	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	setKeys(h.cp, "vol-a", "kek-1", []byte("wrapped-a"))

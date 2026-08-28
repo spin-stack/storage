@@ -512,23 +512,14 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 	}
 }
 
-// volumeGeometry: a volume's size and block size are what CreateVolume was given, for
-// as long as the row exists. This is the standing half of "V1 does not resize" —
-// metadata.Store says why the verb is gone, and this says the property that replaced
-// it, in the one place both implementations are held to it.
+// volumeGeometry: a volume's size and block size are what CreateVolume was given, for as
+// long as the row exists — the standing half of "V1 does not resize" (metadata.Store says
+// why the verb is gone).
 //
-// It runs *everyMutation*, which is the point and is why it is not a list of the
-// methods that plausibly touch a volume. That list is the whole mutating surface and
-// carries the rule that a method added to the Store without a line in it is a method
-// whose term guard nobody checks; the same line now also asks whether the new method
-// moved a geometry it had no business moving. A resize brought back as a store method
-// and nothing else — the exact shape this deleted — fails here rather than passing a
-// suite that never looked.
-//
-// Each mutation gets its own world, so this proves something about each method rather
-// than about the order they happen to run in, and every one of them is required to
-// succeed: a case that silently errored would assert that a write which never happened
-// changed nothing.
+// It runs *everyMutation*, not a list of the methods that plausibly touch a volume, so a
+// resize brought back as a store method and nothing else fails here. Each mutation gets
+// its own world, and every one is required to succeed: a case that silently errored would
+// assert that a write which never happened changed nothing.
 func volumeGeometry(t *testing.T, s metadata.Store) {
 	for _, m := range everyMutation() {
 		t.Run(m.name, func(t *testing.T) {
@@ -672,15 +663,10 @@ func watermarks(t *testing.T, s metadata.Store) {
 	})
 }
 
-// refusals: the storage rule that makes a refusal different from a watermark, stated as
-// the four things a caller depends on.
-//
-// A watermark is the newest of a monotonic series, so GREATEST is right and a late report
-// is harmless. A refusal is a *state*, and the two ways a state column goes wrong are
-// both here: it fails to clear when the condition ends (the volume reads NOT SERVED for
-// ever), and it is written by somebody whose opinion no longer counts (a host the fleet
-// moved past marks a volume its successor is serving perfectly well). Neither is visible
-// from an assertion on the returned error — both writes "succeed".
+// refusals: the two ways a state column goes wrong, neither visible from an assertion on
+// the returned error because both writes "succeed" — it fails to clear when the condition
+// ends (the volume reads NOT SERVED for ever), and it is written by somebody whose opinion
+// no longer counts (a host the fleet moved past marking a volume its successor is serving).
 func refusals(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
@@ -777,16 +763,12 @@ func refusals(t *testing.T, s metadata.Store) {
 	})
 }
 
-// upsertHost: a host is cordoned and being drained; its next routine heartbeat
-// carries State ACTIVE and whatever committed bytes the agent believes. If the
-// heartbeat wins, AcceptsPlacement() starts handing the host new volumes while its
-// own are being evacuated.
-//
-// Committed capacity is derived (ADR-0017), so the second half of this is now
-// structural rather than a rule the write has to remember: whatever the agent puts
-// in the field, the host still reports the volumes it holds. The assertion stays
-// because "the heartbeat cannot rewrite the accounting" is the property, and which
-// mechanism enforces it is an implementation detail that may change again.
+// upsertHost: a host is cordoned and being drained; its next routine heartbeat carries
+// State ACTIVE and whatever committed bytes the agent believes. If the heartbeat wins,
+// AcceptsPlacement() starts handing the host new volumes while its own are being evacuated.
+// The committed half is structural now that capacity is derived (ADR-0017), but the
+// assertion stays: the property is "a heartbeat cannot rewrite the accounting", and which
+// mechanism enforces it may change again.
 func upsertHost(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s) // one ACTIVE host holding one 1 GiB volume
@@ -1132,20 +1114,13 @@ func fleetWideReads(t *testing.T, s metadata.Store) {
 	}
 }
 
-// concurrentBumps: an epoch is the fencing token, and a promotion decides which one
-// to grant by reading the volume first. So the bump has to be a compare-and-set on
-// what was read, not an increment: n promoters that all saw epoch e must produce one
-// winner at e+1, not n epochs burnt in a row.
-//
-// The damage the blind increment does is not the wasted numbers. Each promoter CASes
-// the S3 epoch object to the epoch *it* computed (e+1) and only one of those CASes
-// wins, while every one of them has already written its own host into
-// primary_host_id. The volume row then names a host that never won the object and
-// never got a lease, and the drain's listing, promotion's resume branch and
-// rebuild-metadata all read that row.
-//
-// This case replaces an earlier one that asserted the opposite — n bumps produce n
-// distinct epochs — which pinned the blind increment as if it were the contract.
+// concurrentBumps: an epoch is the fencing token, and a promotion decides which one to
+// grant by reading the volume first, so the bump is a compare-and-set on what was read.
+// The damage a blind increment does is not the wasted numbers: each promoter CASes the S3
+// epoch object to the epoch *it* computed and only one wins, while every one of them has
+// already written its own host into primary_host_id — leaving the row naming a host that
+// won no object and holds no lease. This case replaces an earlier one asserting the
+// opposite, which pinned the blind increment as if it were the contract.
 func concurrentBumps(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
@@ -1351,20 +1326,10 @@ func volumePlacement(t *testing.T, s metadata.Store) {
 	})
 }
 
-// hostLeases: the lease is what a host renews to say it is still there (§12.6). It
-// stopped being the Agent's authority to ACK a FLUSH when ADR-0026 withdrew the
-// durable ACK gate, so what is left to prove here is one rule and its observation.
-//
-// The rule: an assertion the Control Plane made about a host outranks the host's own
-// heartbeat. A host it has declared DEAD is a host it has said is gone — the same
-// assertion a promotion would accept as "the old writer is finished" — so a routine
-// renewal must not be able to put it back. CORDONED and DRAINING are deliberately
-// the other way: both are still serving the volumes they hold.
-//
-// The observation: GetHostLease. Every claim below is checked by reading the lease
-// back out of the store rather than by trusting what RenewHostLease returned, which
-// is the only way this contract can tell a store that answers correctly from one
-// that also writes correctly.
+// hostLeases (the function is at the bottom of this file): a Control Plane assertion about
+// a host outranks the host's own heartbeat. A host declared DEAD must not be put back by a
+// routine renewal; CORDONED and DRAINING are deliberately the other way, both still serving
+// the volumes they hold. Every claim is checked by reading GetHostLease back.
 // leadershipRenewal: a leader can say "I am still here" without becoming a new leader.
 //
 // The two halves are one property. A renewal that moved the term would be
@@ -1517,25 +1482,15 @@ func hostLeases(t *testing.T, s metadata.Store) {
 	})
 }
 
-// capacity is ADR-0017: committed capacity is derived from the rows that already
-// say who holds what, and the §28.2 oversubscription bound is a predicate of the
-// writes that place bytes on a host.
+// capacity is ADR-0017: committed capacity is derived from the rows that already say who
+// holds what, and the §28.2 bound is a predicate of the writes that place bytes:
 //
 //	committed(host) = Σ size_bytes of the volumes whose primary is host
 //
-// (ADR-0017's second term, what an in-flight operation plan had reserved on the host
-// but not yet placed, went with the operations table it was read from.)
-//
-// The bound has to live inside those writes and not before them, for the reason
-// wave 3 established: placement.Choose evaluates it correctly and is pure, so two
-// operations that read the fleet before either placed anything choose the same
-// destination, both proceed, and the host ends up past MaxOversubscription ×
-// NVMeTotalBytes with neither caller having made a mistake. Re-checking in Go
-// narrows the window and keeps the race.
-//
-// What is *not* here any more is everything a ledger needed: the non-negative
-// guard, the expected-value compare-and-set, the "did my own delta land?" proof. A
-// derived value has no delta to apply twice.
+// The bound lives inside those writes and not before them because placement.Choose is pure:
+// two operations that read the fleet before either placed anything choose the same
+// destination, both proceed, and the host lands past its ceiling with neither caller having
+// made a mistake. Re-checking in Go narrows the window and keeps the race.
 func capacity(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s) // one ACTIVE host, 1 TiB of NVMe, holding one 1 GiB volume
@@ -1663,24 +1618,15 @@ func capacity(t *testing.T, s metadata.Store) {
 	})
 
 	t.Run("placements racing for the last slot leave the host inside its ceiling", func(t *testing.T) {
-		// This is the case the bound exists for, and the only one that can tell a
-		// predicate of the write from a check in front of it. Every caller reads the
-		// fleet before any of them has placed anything — placement.Choose is pure and
-		// advisory, so they agree on the destination — and then they write at the same
-		// instant. A check the store performs in Go passes for all of them, because at
-		// the moment each one looks, nobody else's volume is there yet.
+		// The case the bound exists for, and the only one that can tell a predicate of the
+		// write from a check in front of it: every caller reads the fleet before any of them
+		// has placed anything, so a Go-side check passes for all of them. In PostgreSQL the
+		// predicate alone is not enough either — READ COMMITTED fixes each statement's
+		// snapshot and the derived capacity is an aggregate over unlocked rows — which is what
+		// the pg store's advisory lock is for.
 		//
-		// It is not a store-implementation detail either. In PostgreSQL the predicate
-		// alone is not enough: READ COMMITTED fixes each statement's snapshot before it
-		// runs and the derived capacity is an aggregate over rows the statement does not
-		// lock, so two overlapping INSERTs each affect one row and the host lands at
-		// twice its ceiling. That is what the pg store's advisory lock is for, and this
-		// case is what says so.
-		//
-		// Several rounds of many racers, because a scheduler is not an oracle: one round
-		// can serialize by luck and prove nothing, and the point of the case is that
-		// nothing is left to luck. Each round is a fresh host, so a round that fails
-		// says which one did.
+		// Several rounds of many racers, each on a fresh host: one round can serialize by
+		// luck, and a failing round says which one it was.
 		for round := range 5 {
 			racer := id()
 			if err := s.UpsertHost(ctx, w.term, metadata.Host{
@@ -1839,20 +1785,13 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 	}
 }
 
-// volumeDelete is the catalog half of the deletion decision: a volume leaves the
-// catalog with its snapshots, and only when nothing still descends from them.
-//
-// It asserts the refusal by what it lets an operator *do* rather than by reading a
-// column back. `ClearVolumeParent` — the write a FLATTEN needs and could not make —
-// is proven here by a delete that was refused before it and succeeds after it, which
-// is the whole reason that verb exists; asserting `parent_snapshot_id IS NULL` would
-// have passed just as well against a verb that cleared the column and left the
-// snapshot unreferenceable.
-//
-// The two descendant directions are separated on purpose, and the second is the one
-// an implementation forgets: everything else in this tree talks about
-// `volumes.parent_snapshot_id`, and a snapshot that descends from a snapshot — a
-// clone that took one of its own — leaves a row only the other query sees.
+// volumeDelete: a volume leaves the catalog with its snapshots, and only when nothing
+// still descends from them. It asserts the refusal by what it lets an operator *do* — a
+// delete refused before ClearVolumeParent and succeeding after it — rather than by reading
+// `parent_snapshot_id IS NULL`, which would pass against a verb that cleared the column and
+// left the snapshot unreferenceable. The two descendant directions are separated because
+// the second is the one an implementation forgets: a snapshot descending from a snapshot
+// leaves a row only the other query sees.
 func volumeDelete(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)

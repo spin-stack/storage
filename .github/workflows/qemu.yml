@@ -1,11 +1,9 @@
 name: QEMU
 
-# QEMU 11.0.2 is pinned for CI and production alike (CLAUDE.md), and building it from
-# source takes tens of minutes — far too slow for the per-push gate. So it is its own
-# workflow, triggered only when something that can change the artefact changes, and it
-# publishes the result so nobody has to rebuild it: a container image in GitHub
-# Packages for the integration lane, and the extracted binaries as an artefact for a
-# developer who wants to run them directly.
+# The pinned QEMU (CLAUDE.md, and QEMU_VERSION in Taskfile.yml) takes tens of minutes to
+# build from source, far too slow for the per-push gate. So it is its own workflow,
+# triggered only when something that can change the artefact changes, and it publishes a
+# runtime image for the lanes plus the extracted binaries as an artefact.
 on:
   push:
     branches: [main]
@@ -53,12 +51,9 @@ jobs:
         id: qemu
         run: echo "version=$(task qemu:version)" >> "$GITHUB_OUTPUT"
 
-      # `task build:qemu` runs the same buildx command a developer runs, with the
-      # cache backend swapped for the GitHub Actions one. It ends in `task
-      # qemu:verify`, which asserts the binary is the pinned version and really has
-      # vhost-user-blk-pci — the property the whole §3 data path depends on. A build
-      # that produces a QEMU without it fails here rather than in an integration test
-      # six weeks later.
+      # `task build:qemu` runs the same buildx command a developer runs, with the GitHub
+      # Actions cache backend. It ends in `task qemu:verify`, so a build that produced the
+      # wrong version or lost a device we depend on fails here, not in a lane weeks later.
       - name: Build QEMU and verify what came out
         run: task build:qemu QEMU_CACHE_FROM=type=gha QEMU_CACHE_TO=type=gha,mode=max QEMU_JOBS=4
 

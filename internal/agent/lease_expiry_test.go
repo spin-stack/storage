@@ -17,26 +17,14 @@ import (
 
 // What a host does when it stops being able to confirm that it owns its volumes.
 //
-// # Why these drive a stand-in and not the real thing
+// These used to drive a real VolumeManager and assert on the *socket*. That manager went
+// with the local block engine, so the loop's decisions are now asserted on the two places
+// it speaks: the reconciler it tells to stop serving, and the report the Control Plane
+// receives — the second being the only one observable from outside the process.
 //
-// They used to drive a real Loop against a real VolumeManager on one simulated clock,
-// and the assertion was the *socket*: an Agent that cannot reach the Control Plane keeps
-// running, and until the loop learned to give up it kept serving — the socket stayed
-// bound and the device stayed answering for as long as the process lived, while the fleet
-// declared the host dead after one lease TTL and an operator moved the volume elsewhere.
-// Two guests wrote one volume and both were told their flushes were durable.
-//
-// That manager is withdrawn with the local block engine, and with it the socket. The
-// decisions being asserted are the loop's and are unchanged, so what they are asserted
-// *on* moves to the two places the loop actually speaks: the reconciler it tells to stop
-// serving, and the report the Control Plane receives. The second is the one that matters
-// and is the one this lane can still observe from outside the process — everything else
-// about a host giving up its volumes is invisible until it reaches the wire.
-//
-// fakeReconciler is deliberately not a re-implementation of a volume manager: it records
-// what it was told, and reproduces exactly one rule, for the reason stated at that field.
-// A stand-in that decided anything more would be a second implementation of the rules
-// under test.
+// fakeReconciler records what it was told and reproduces exactly one rule, for the reason
+// stated at that field; a stand-in that decided more would be a second implementation of
+// the rules under test.
 type fakeReconciler struct {
 	mu sync.Mutex
 	// vols is what this host would report, refusals included. A fenced volume stays in
@@ -182,12 +170,9 @@ func newLeaseHarness(t *testing.T) *leaseHarness {
 	return &leaseHarness{clk: clk, cp: cp, rec: rec, wit: wit, loop: loop}
 }
 
-// served is the set of volume ids this host would report as being served.
-//
-// The refused ones are excluded, and the distinction is the point rather than a detail
-// of the helper: the report carries every volume this host was told to serve, including
-// the ones it has given up, because a volume that vanishes from the report is a volume
-// the fleet cannot see. "Serving" is the subset with no refusal on it.
+// served is the set of volume ids this host would report as being served — the refused
+// ones excluded. The report carries every volume this host was told to serve, including
+// the ones it gave up: a volume that vanishes from the report is one the fleet cannot see.
 func (h *leaseHarness) served(t *testing.T) []string {
 	t.Helper()
 	vols, err := h.rec.Volumes(t.Context())
@@ -215,28 +200,13 @@ func (h *leaseHarness) desire(epoch int64) *storagev1.DesiredVolume {
 	return v
 }
 
-// A lapsed lease is one signal, and these three are the three things it can mean.
+// A lapsed lease is one signal, and these three tests are the three things it can mean.
 //
-// # Why this stopped being "expiry stops the host"
-//
-// It used to. The argument was v5's and it was correct there: the Agent *was* the data
-// path, so a partitioned host kept ACKing flushes as durable while the fleet handed the
-// volume to somebody else, and two guests wrote one volume both believing their fsyncs
-// had landed. Nothing but the Agent itself could prevent that, so the Agent gave the
-// volume up the moment it could no longer confirm it owned it.
-//
-// v6 removed the premise. QEMU owns the local copy-on-write format; a FLUSH is its
-// fdatasync and claims local durability only, and what this system publishes is gated by
-// the compare-and-set on HEAD plus the epoch. **Nothing a superseded host writes can
-// enter the published history** — the fence is enforced at the resource, the way Ceph
-// blocklists a client at the OSDs rather than asking it to stop. What was left was the
-// cost with none of the benefit: a host that lost sight of the Control Plane for one TTL
-// stopped a tenant's VM over a partition nobody else had acted on.
-//
-// So a guest is stopped only on *confirmed* supersession, and a lapsed lease alone is not
-// that. The confirmation comes from the second path — `volumes/<id>/epoch`, written at
-// the grant — which is the same shape as vSphere HA refusing to declare a host dead on the
-// management network alone and requiring the datastore heartbeat to agree.
+// A guest is stopped only on *confirmed* supersession: giving up on the lapse alone
+// stopped a tenant's VM over a partition nobody else had acted on, and under v6 nothing a
+// superseded host writes can enter the published history anyway. The confirmation comes
+// from `volumes/<id>/epoch`, written at the grant and read over the object store — see
+// agent.Superseded.
 func TestAConfirmedSupersessionStopsTheHostServing(t *testing.T) {
 	t.Parallel()
 	h := newLeaseHarness(t)
@@ -278,11 +248,9 @@ func TestAConfirmedSupersessionStopsTheHostServing(t *testing.T) {
 		t.Fatal("the loop still reports a valid lease after its TTL passed")
 	}
 
-	// And the fleet is told. Everything above is invisible from outside this process:
-	// the Control Plane still names this host the volume's primary at this epoch, so
-	// nothing moves and nothing else will notice — the volume simply stopped being
-	// served, and an absence on the wire looks exactly like a volume that was never
-	// placed here.
+	// And the fleet is told. Everything above is invisible from outside this process — the
+	// Control Plane still names this host the volume's primary, so an absence on the wire
+	// looks exactly like a volume that was never placed here.
 	h.cp.setErr(nil)
 	h.clk.Advance(time.Second)
 	_ = h.loop.Reconcile(ctx)
@@ -350,17 +318,11 @@ func TestAnIsolatedHostKeepsServing(t *testing.T) {
 }
 
 // TestAHostThatCannotTellKeepsServing is the case the design does not resolve, asserted
-// so that it is a decision rather than an accident.
-//
-// Cut off from the Control Plane *and* the object store, this host cannot distinguish
-// isolation from supersession. It keeps the guest running, and the reason is that the
-// alternative is not safety: stopping is only correct in one of the two cases and is a
-// tenant's VM killed on a guess in the other, while the data in both is protected by the
-// compare-and-set this host cannot win if it has in fact been superseded.
-//
-// What is genuinely lost here is the successor's guest — nothing stops it from starting,
-// and this system has no equivalent of vSphere's datastore lock. That is the open half,
-// and it is not made better by stopping the wrong guest.
+// so that it is a decision rather than an accident. Cut off from the Control Plane *and*
+// the object store, this host cannot distinguish isolation from supersession; stopping is
+// correct in one of the two cases and a tenant's VM killed on a guess in the other, while
+// the data is protected in both by a compare-and-set it cannot win. What is genuinely lost
+// is the successor's guest, and that is not made better by stopping the wrong one.
 func TestAHostThatCannotTellKeepsServing(t *testing.T) {
 	t.Parallel()
 	h := newLeaseHarness(t)
@@ -406,18 +368,13 @@ func TestAVolumeWithNoRecordedEpochIsNotGivenUp(t *testing.T) {
 }
 
 // TestACycleThatCouldNotStartAVolumeStillReportsIt is the hole the two real binaries
-// found.
+// found: `Reconcile` returned at the first failure and the failure *is* `Apply`, so the
+// one cycle with something to say about a volume that could not start never got as far as
+// saying it — a WARN every second and a fleet showing the volume ACTIVE for ever.
 //
-// The refusal is recorded, the report message has a field for it, and the Control Plane
-// stores it — and none of that fired, because `Reconcile` returned at the first failure
-// and the failure *is* `Apply`. So the one cycle with something to say about a volume
-// that could not start was the one cycle that never got as far as saying it: an Agent
-// stuck refusing a volume printed a WARN every second and the fleet showed the volume
-// ACTIVE for ever.
-//
-// The assertion is on the report the Control Plane received, and on the cycle *still*
-// returning its error — the backoff and the WARN line are what retry it, and a fix that
-// swallowed the error to reach the report would trade one silence for another.
+// The assertion is on the report the Control Plane received and on the cycle still
+// returning its error: swallowing it to reach the report would trade one silence for
+// another.
 func TestACycleThatCouldNotStartAVolumeStillReportsIt(t *testing.T) {
 	t.Parallel()
 	h := newLeaseHarness(t)
@@ -463,13 +420,10 @@ func lastReportOf(t *testing.T, cp *fakeCP, volumeID string) *storagev1.VolumeRe
 }
 
 // TestTheHostServesAgainOnceItsLeaseIsBack pins the other half: giving up on an expired
-// lease must not wedge the host.
-//
-// Expiring revokes the lease, and a revoked lease cannot be renewed — only granted. An
-// Agent that only ever renews would come back from a partition with LeaseValid() false
-// for the life of the process, start whatever the Control Plane granted it next, and give
-// it up again on the following cycle, forever. That is a worse outage than the one being
-// fixed, and nothing about the assertion above can see it.
+// lease must not wedge the host. Expiring revokes the lease and a revoked lease can only
+// be granted, never renewed — an Agent that only renews comes back from a partition with
+// LeaseValid() false for the life of the process, starting each volume it is granted and
+// giving it up again on the next cycle, forever.
 func TestTheHostServesAgainOnceItsLeaseIsBack(t *testing.T) {
 	t.Parallel()
 	h := newLeaseHarness(t)

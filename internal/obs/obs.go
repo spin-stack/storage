@@ -2,28 +2,10 @@
 // from it, and the Recorder production code writes through without importing
 // OpenTelemetry.
 //
-// **It used to also carry tracing and correlation-keyed logging, and on 2026-08-03 that
-// half was deleted.** §26.1 describes a trace context propagating CP → Agent → object
-// store → KMS, and the code for it existed — a W3C propagator, InjectContext /
-// ExtractContext over a JSON header, five context keys (request_id, operation_id,
-// volume_id, epoch, host_id), NewLogger and LoggerFrom to stamp them onto a slog record.
-// None of it had a single caller outside this package's own tests. No RPC injected a
-// header, no handler extracted one, no binary built a Tracer, and no line anywhere in the
-// tree was logged through LoggerFrom. What the tests proved was that the OpenTelemetry
-// propagator propagates, which is OTel's test to write.
-//
-// The alternative was to wire it: one span around a Connect handler and one around
-// `Volume.publish`. That was rejected because it is not one line and it is not this
-// package's to make. The injection point is `api/`+`internal/cpserver`'s interceptor and
-// the extraction point is the Agent's loop; until those two exist, keeping the machinery
-// here means "registered and unused" — the exact shape this repository has spent three
-// passes removing (DEV-0010 was the same finding about the metric catalog). Git holds the
-// deleted code; when the CP grows an interceptor, that increment brings back the six
-// functions it actually calls, and not the five context keys nothing will carry.
-//
-// Metrics stayed because they have real callers: the Agent loop's lease series and the
-// two the clone path records. Everything the local block engine recorded went with it on
-// 2026-08-22 — see Catalog, which is now four entries long and says why.
+// Tracing and correlation-keyed logging were deleted on 2026-08-03: a W3C propagator,
+// Inject/ExtractContext and five context keys, with no caller outside this package's own
+// tests. They come back in the increment that wires a CP interceptor and an Agent
+// extraction point, carrying only the functions it calls.
 //
 // obs depends on the OTel SDK, whose internal timestamping is not our concern for
 // §25.1/INV-01: our own code never calls the time package (the simulable analyzer
@@ -53,41 +35,24 @@ type Provider struct {
 	mp *sdkmetric.MeterProvider
 	// reader is the collection point every Provider keeps, production or test: it is
 	// what Scrape reads, and therefore what makes the Agent's /metrics endpoint
-	// possible at all.
-	//
-	// It used to be nil outside NewTestProvider, and CollectedMetrics/GaugeValues
-	// answered a production Provider with "this one exports, collect from the
-	// collector". That was true and it was the blocker: a process whose samples can
-	// only be read by a collector nobody deploys has no observability, and the pilot
-	// found out by watching a guest take I/O errors while the Agent's log sat at its
-	// four start-up lines. A manual reader costs the SDK's cumulative state for a
-	// fixed catalogue over a bounded set of volumes; being unable to answer "what is
-	// this process doing" costs an incident.
+	// possible at all. It used to exist only in NewTestProvider, which left a
+	// production process whose samples only a collector nobody deploys could read.
 	reader *sdkmetric.ManualReader
 }
 
-// NewProvider builds the Provider a binary runs with: every §26.2 instrument, registered
-// on a meter named name, exported through exp. name is the service identity a collector
-// separates one process's series by (`service.name`), so pass the binary's name.
+// NewProvider builds the Provider a binary runs with: every §26.2 instrument on a meter named
+// name, exported through exp. name is the `service.name` a collector separates processes by.
 //
-// **A nil exp is a supported, working Provider that exports nothing**, and it is the
-// default deployment: no collector configured means no exporter, and the Agent must then
-// start and run exactly as it did before this existed. It is not a stub or a fallback —
-// the SDK simply has no reader attached, so a recorded sample is dropped at the
-// instrument. The alternative, refusing a nil exporter, would make every caller carry a
-// branch and would make telemetry a startup dependency of the data path; the alternative
-// of substituting NewTestProvider would export the metrics to memory and look like
-// observability from the outside, which is the trap `cmd/volume-agent` avoided by
-// passing `Recorder: nil` for as long as this constructor did not exist.
+// **A nil exp is a supported Provider that exports nothing**, and it is the default
+// deployment: the SDK simply has no reader attached, so a sample is dropped at the
+// instrument. Refusing nil would put a branch in every caller and make telemetry a startup
+// dependency of the data path; substituting NewTestProvider would export to memory and look
+// like observability from the outside.
 //
-// Construct exp with real.NewOTLPMetricExporter, which returns exactly this nil for an
-// unset endpoint — so a binary needs no conditional of its own. Nothing is exported
-// until the periodic reader's interval elapses (the SDK's default is 60s) or Shutdown
+// real.NewOTLPMetricExporter returns exactly this nil for an unset endpoint. Nothing is
+// exported until the periodic reader's interval elapses (SDK default 60s) or Shutdown
 // flushes, which is why Shutdown is not optional for a process that exits.
 func NewProvider(name string, exp sdkmetric.Exporter) (*Provider, error) {
-	// The manual reader is unconditional and the exporter is not. Scrape reads this
-	// one, so a Provider without it is a Provider a binary cannot serve /metrics from
-	// — which is the state this package was in.
 	reader := sdkmetric.NewManualReader()
 	opts := []sdkmetric.Option{
 		sdkmetric.WithResource(resource.NewWithAttributes(

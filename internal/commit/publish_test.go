@@ -286,17 +286,11 @@ func (f *failAfter) Put(ctx context.Context, key string, data []byte, opts objec
 }
 
 // TestAPublishedCommitIsAlwaysReconstructible is the commit contract, checked at every
-// point a commit can be cut in half.
-//
-// `Commit() → SUCCESS` promises that this state is reconstructible without the host. The
-// order `PUT layer → PUT manifest → CAS HEAD` is what keeps that true under an
-// interruption: whatever is left behind is an object nothing points at, which is garbage
-// a sweep collects. Any other order can leave HEAD naming a manifest that is not there,
-// or a manifest naming a layer that is not there — a commit that was acknowledged and
-// cannot be rebuilt, which is the one thing the sentence rules out.
-//
-// So: crash after every write, and assert the invariant rather than the steps. Whatever
-// HEAD names must be fully there.
+// point a commit can be cut in half: crash after every write and assert the invariant
+// rather than the steps — whatever HEAD names must be fully there, and so must every
+// ancestor. Any order but `PUT layer → PUT manifest → CAS HEAD` can leave HEAD naming a
+// manifest that is not there, which is a commit that was acknowledged and cannot be
+// rebuilt.
 func TestAPublishedCommitIsAlwaysReconstructible(t *testing.T) {
 	t.Parallel()
 	for writes := 0; writes < 6; writes++ {
@@ -345,10 +339,8 @@ func TestAPublishedCommitIsAlwaysReconstructible(t *testing.T) {
 	}
 }
 
-// TestPublishRefusesAKeyForAnotherVolume: the mismatch is a wiring one, and what it
-// would cost is why it is checked rather than assumed. Sealing with another volume's key
-// produces an object that is perfectly valid, uploads without complaint, and is found to
-// be unopenable by whoever needs it — which is a recovery, on the day the host is gone.
+// TestPublishRefusesAKeyForAnotherVolume: sealing with another volume's key produces a
+// perfectly valid object discovered to be unopenable by a recovery — see boundLayerID.
 func TestPublishRefusesAKeyForAnotherVolume(t *testing.T) {
 	t.Parallel()
 	mine, theirs := newID(), newID()

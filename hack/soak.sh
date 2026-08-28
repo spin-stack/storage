@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # Run everything this repository can run, over and over, until something breaks.
 #
-# It exists because of the table at the top of CLAUDE.md: every defect in it was at a
-# seam, and every one was found by *running* the real thing rather than by testing a part
-# of it more deeply. A gate answers "did this change break something a test already
-# knows about". This answers a different question — "does any of it break when it is run
-# a hundred times, with the parameters moved and the processes killed at moments nobody
-# chose" — and that question needs hours, not a merge.
+# A gate answers "did this change break something a test already knows about". This answers
+# "does any of it break when it is run a hundred times, with the parameters moved and the
+# processes killed at moments nobody chose" — hours, not a merge.
 #
 # What each round does:
 #
@@ -163,11 +160,6 @@ while :; do
   # the finding kept the scratch — the one layer ended at 11,337,728 bytes against a
   # threshold of 11,534,336: short by 192 KiB, for ever. The demos then wait for three
   # rotations that are physically impossible.
-  #
-  # An unattended runner that reports its own parameter choice as a finding is worse than
-  # one that reports nothing: it teaches whoever reads it to skip the findings directory,
-  # which is where the real ones will be. Same reason ADR-0025 refused to fail the gate
-  # for a missing artefact — a red that means "you held it wrong" trains people past red.
   export CHURN=$(( RANDOM % 48 + 8 ))
   export ROTATE_AT=$(( (RANDOM % (CHURN - 4) + 1) * 1048576 ))
   export HEARTBEAT="$(( RANDOM % 700 + 200 ))ms"

@@ -362,19 +362,14 @@ func (s catalogDownAtTheBump) BumpVolumeEpoch(context.Context, int64, string, st
 }
 
 // TestTheBucketHoldsTheEpochBeforeTheCatalogDoes pins the ordering in Place that grants an
-// epoch: `volumes/<id>/epoch` is written *before* the catalog moves.
+// epoch: `volumes/<id>/epoch` is written *before* the catalog moves. It had no test at all
+// — a mutation sweep swapped the two writes, and separately deleted the bucket write
+// entirely, and the suite stayed green both times.
 //
-// The order is stated at the call site as the thing that stops a rebuild handing a
-// predecessor a live token, and it had no test at all — a mutation sweep swapped the two
-// writes, and separately deleted the bucket write entirely, and the whole suite stayed
-// green both times.
-//
-// What is asserted is the consequence rather than the call order, because the consequence
-// is what survives a crash: after the catalog write fails, the bucket must already hold a
-// number the catalog never reached. A rebuild then restores an epoch at or above the
-// truth, which can over-fence a host that would have been allowed to write and can never
-// under-fence one that must not. The other order leaves the bucket *behind* the catalog,
-// which is the direction that hands a predecessor a token the restored catalog accepts.
+// The consequence is asserted rather than the call order, because the consequence survives
+// a crash: after the catalog write fails the bucket must already hold a number the catalog
+// never reached, so a rebuild over-fences rather than handing a predecessor a token the
+// restored catalog accepts.
 func TestTheBucketHoldsTheEpochBeforeTheCatalogDoes(t *testing.T) {
 	md, term := placeWorld(t)
 	ctx := t.Context()

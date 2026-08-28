@@ -89,13 +89,10 @@ func TestAReportedSnapshotStopsBeingAskedFor(t *testing.T) {
 	if snap.State != lifecycle.SnapshotPublished || snap.CommitID != snapCommit || snap.SourceHostID != hostA {
 		t.Fatalf("snapshot = %+v, want PUBLISHED at commit %s on %s", snap, snapCommit, hostA)
 	}
-	// There is no manifest key column any more, and its absence is the point. It was
-	// once *computed* from the two ids — never taken from the report — so the catalog
-	// could not point somewhere the reader does not look; then the layout it computed
-	// into went with the chunked image, and it became a string the Agent sent, which is
-	// exactly the property the computation existed to hold. A commit id restores it: the
-	// key is derived from the id (commit.ManifestKey), so there is one place a snapshot
-	// can live and nothing that can disagree about where.
+	// There is no manifest key column any more: it had become a string the Agent sent,
+	// which is exactly the property the original computation existed to hold. The key is
+	// derived from the commit id (commit.ManifestKey), so nothing can disagree about where
+	// a snapshot lives.
 	if vols := w.desired(t, hostA); vols[0].GetPendingSnapshotId() != "" {
 		t.Fatalf("a published snapshot is still being asked for: %q", vols[0].GetPendingSnapshotId())
 	}

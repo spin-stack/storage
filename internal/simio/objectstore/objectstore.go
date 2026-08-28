@@ -43,12 +43,8 @@ type PutResult struct {
 	ETag string
 }
 
-// ObjectInfo describes a stored object. LastModified is when the backend last wrote
-// the key; it is on the interface because every backend answers a listing with it and
-// dropping it would make the two implementations disagree about what a listing is.
-// Nothing in this tree reads it — a caller that wants to know whether an object is
-// too young to touch will find the number here, and will have to say what "too young"
-// means itself.
+// ObjectInfo describes a stored object. LastModified is on the interface because every
+// backend answers a listing with it; nothing in this tree reads it yet.
 type ObjectInfo struct {
 	Key          string
 	Size         int64
@@ -74,14 +70,10 @@ type Store interface {
 	// stops answering Get/Head/List, so callers see it as gone. Deleting a key that
 	// is already marked, or was never there, is ErrNotFound.
 	Delete(ctx context.Context, key string) error
-	// Restore removes the delete marker: the operator action the whole INV-14
-	// argument rests on ("a GC mistake costs a restore, not the data"). It is part
-	// of the interface, not an extra some implementations happen to offer, because
+	// Restore removes the delete marker (INV-14: "a GC mistake costs a restore, not the
+	// data"). It is on the interface, not an extra some implementations offer, because
 	// an implementation that cannot reverse a mark makes every reachability bug
-	// permanent — and nothing would catch that at compile time.
-	//
-	// ErrNotFound if the key carries no delete marker; ErrRestoreSuperseded if it
-	// was written again after being marked, so the marked version is no longer what
-	// a restore would surface.
+	// permanent. ErrNotFound if there is no marker; ErrRestoreSuperseded if the key was
+	// written again after being marked.
 	Restore(ctx context.Context, key string) error
 }

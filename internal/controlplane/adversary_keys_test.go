@@ -60,14 +60,9 @@ func (f *fleet) provision(t *testing.T) string {
 
 // A single PUT of one unauthenticated object re-keys a live volume.
 //
-// `volumes/<id>/descriptor.json` carries the wrapped DEK and is only digest-framed —
-// framed.go says out loud that the digest is not authentication, "anything that can
-// write the object can write a matching digest". RebuildMetadata reads it and calls
-// CreateVolume, whose conflict path is documented as converging *without regressing*:
-// the epoch, the size, the watermarks and the ownership columns all keep the higher or
-// existing value, `state` is not touched, `parent_snapshot_id` is never cleared.
-//
-// The three key columns are the only ones that are taken wholesale from the bucket.
+// `volumes/<id>/descriptor.json` carries the wrapped DEK and is only digest-framed.
+// RebuildMetadata reads it and calls CreateVolume, whose conflict path converges *without
+// regressing* — except for the three key columns, which are taken from the bucket wholesale.
 func TestAdversaryDescriptorSwapRekeysALiveVolume(t *testing.T) {
 	f := newFleet(t)
 	victim := f.provision(t)
@@ -197,13 +192,10 @@ func (f *fleet) encryption(t *testing.T, v metadata.Volume) *crypto.Encryption {
 	return enc
 }
 
-// Crypto-shred: the only delete verb this tree has leaves a usable key in the bucket.
-//
-// metadata.Store.DeleteVolume removes the row. Nothing removes
-// `volumes/<id>/descriptor.json`, which carries `dek_wrapped` and `dek_key_id` — and
-// nothing removes the layers either, which are content-addressed and global. So after a
-// "delete", the ciphertext and the key that opens it are both still in the bucket, and
-// anyone holding the deployment KEK reads the deleted volume back.
+// Crypto-shred: the row-only delete left a usable key in the bucket — the descriptor still
+// carried dek_wrapped, and the layers it opens are content-addressed and global, so anyone
+// holding the deployment KEK read the deleted volume back. This is the regression guard for
+// controlplane.DeleteVolume having taken that over.
 func TestAdversaryDeleteVolumeLeavesTheWrappedDEKInTheBucket(t *testing.T) {
 	f := newFleet(t)
 	id := f.provision(t)

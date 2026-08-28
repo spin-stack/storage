@@ -25,19 +25,11 @@ ON CONFLICT (host_id) DO UPDATE
       last_heartbeat = now();
 
 -- name: GetHost :one
--- Committed capacity comes with the host because every reader of a host is a
--- placement decision waiting to happen, and a §28.2 decision taken against a stale
--- copy of that number is exactly what ADR-0017 removed the copy to prevent.
---
--- The derivation itself is the host_committed_bytes view (schema.sql), which is
--- where its reasoning lives; two other queries read the same view (ListHosts below,
--- and the bound predicate in volumes.sql). It used to be copied into each of them,
--- for a tooling reason ADR-0019 removed.
---
--- It runs at placement time, not on the data path, over a fleet of hundreds of rows.
--- Joined rather than read as a scalar subquery: both plans push the host filter
--- into the derivation, but the join lets the planner visit `hosts` once for the
--- whole listing below instead of once per row.
+-- Committed capacity comes with the host because every reader of a host is a placement
+-- decision waiting to happen, and a §28.2 decision taken against a stale copy is what
+-- ADR-0017 removed the copy to prevent. The derivation is the host_committed_bytes view
+-- (schema.sql). Joined rather than read as a scalar subquery: both plans push the host
+-- filter down, but the join lets the planner visit `hosts` once for the listing below.
 SELECT sqlc.embed(h), COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
   FROM hosts h
   JOIN host_committed_bytes c ON c.host_id = h.host_id
@@ -58,16 +50,11 @@ SELECT sqlc.embed(h), COALESCE(c.committed_bytes, 0)::BIGINT AS committed_bytes
 -- the Go layer.
 --
 -- The third predicate is the same move for cordon authority (ADR-0013 §3, §5):
--- overwritable_reasons is what a write made for this reason may replace, so the
--- pressure loop's write simply does not match a host an operator cordoned. In Go it
--- would be a read, a comparison and then a write, and an operator's cordon landing
--- between the read and the write would be cleared anyway — which is the single
--- outcome the reason column exists to prevent.
---
--- cordon_reason is set from an argument the caller derives rather than from a CASE on
--- $2 here, because "the reason is empty unless the state is CORDONED" is the same
--- rule the table constraint states and the Go type states; a third copy in SQL is a
--- third place it can drift.
+-- overwritable_reasons is what a write made for this reason may replace, so the pressure
+-- loop's write does not match a host an operator cordoned — in Go it would be a read, a
+-- comparison and a write, with the operator's cordon landing between the read and the write
+-- and being cleared anyway. cordon_reason comes from a caller-derived argument rather than a
+-- CASE here, because the table constraint and the Go type already state that rule.
 UPDATE hosts
    SET state = $2, cordon_reason = sqlc.arg(cordon_reason)
  WHERE host_id = $1
@@ -76,17 +63,12 @@ UPDATE hosts
    AND cordon_reason = ANY(sqlc.arg(overwritable_reasons)::text[]);
 
 -- name: RenewHostLease :execrows
--- Grouped per-host lease renewal (§12.6), term-guarded. The host-exists predicate
--- turns "lease for an id nobody registered" into 0 rows (ErrNotFound) instead of a
--- foreign-key error: a lease is a fencing token, and granting one to an unknown
--- host invents authority over a volume nobody can find.
---
--- The state predicate is the second half of that rule. Marking a host DEAD is the
--- Control Plane asserting its writer is gone — the assertion promotion accepts as a
--- reason to skip the fencing wait — so a routine heartbeat must not be able to
--- re-arm the lease of a host that has just been fenced. CORDONED and DRAINING are
--- deliberately still allowed: both are still serving the volumes they hold, and
--- refusing their renewals would stop their ACKs in the middle of an evacuation.
+-- Grouped per-host lease renewal (§12.6), term-guarded. The host-exists predicate turns
+-- "lease for an id nobody registered" into 0 rows (ErrNotFound) instead of a foreign-key
+-- error: granting a fencing token to an unknown host invents authority. The state predicate
+-- is the other half — DEAD is the Control Plane asserting the writer is gone, so a routine
+-- heartbeat must not re-arm it, while CORDONED and DRAINING still renew because both are
+-- still serving the volumes they hold.
 WITH valid AS (
     SELECT 1 FROM control_plane_leader WHERE singleton AND term = $3
 )
@@ -106,29 +88,20 @@ SELECT * FROM host_leases WHERE host_id = $1;
 -- name: LockHostPlacement :exec
 -- Serialize the placements aimed at one host, for the duration of one transaction.
 --
--- The capacity bound is a predicate of the write that places the bytes (ADR-0017),
--- which is necessary and — in PostgreSQL — not sufficient. READ COMMITTED fixes a
--- statement's snapshot before the statement runs, and the derived committed value is
--- an aggregate over rows the statement does not lock, so two INSERTs that overlap in
--- time each evaluate the bound against a fleet that does not contain the other. Both
--- affect one row and the destination lands at twice its ceiling. Measured, not
--- feared: two psql sessions, one bound of 100 bytes, two 100-byte volumes, 200
--- committed afterwards.
+-- The capacity bound is a predicate of the write that places the bytes (ADR-0017), which
+-- is necessary and — in PostgreSQL — not sufficient. READ COMMITTED fixes a statement's
+-- snapshot before it runs, and the derived committed value is an aggregate over rows the
+-- statement does not lock, so two overlapping placements each evaluate the bound against
+-- a fleet without the other. Measured, not feared: two psql sessions, one bound of 100
+-- bytes, two 100-byte volumes, 200 committed afterwards.
 --
--- An advisory lock taken *inside* that statement would change nothing — the snapshot
--- is already taken. It has to be its own statement in the same transaction, because
--- READ COMMITTED gives the next statement a fresh snapshot: the loser blocks here,
--- and the INSERT it then runs sees the winner's row and refuses itself.
+-- It has to be its own statement in the same transaction — a lock taken inside the
+-- placing statement changes nothing, its snapshot already taken, while READ COMMITTED
+-- gives the next statement a fresh one, so the loser blocks here and then refuses itself.
+-- Chosen over SERIALIZABLE (a retry loop in every caller for a two-row hot spot) and over
+-- `SELECT ... FOR UPDATE` on the host row (every heartbeat writes it, and the rows being
+-- counted are in volumes). The key is a hash of the host id, so two hosts never wait.
 --
--- Chosen over SERIALIZABLE, which would push a retry loop into every caller of the
--- Store for a conflict that is a two-row hot spot, and over `SELECT ... FOR UPDATE`
--- on the host row, which locks the wrong thing: every heartbeat writes that row, and
--- the rows being counted are in volumes.
---
--- (Wording note, not a style rule: TestEveryMutatingQueryIsTermGuarded classifies a
--- query by matching INSERT/UPDATE/DELETE over the whole chunk, comments included, so
--- prose here that names one of those verbs makes this read look like a write.)
---
--- The key is a hash of the host id, so two hosts never wait for each other and a
--- collision costs one placement a wait and nothing else.
+-- (Wording note, not a style rule: TestEveryMutatingQueryIsTermGuarded matches
+-- INSERT/UPDATE/DELETE over the whole chunk, comments included.)
 SELECT pg_advisory_xact_lock(hashtextextended(sqlc.arg(host_id)::uuid::text, 0));

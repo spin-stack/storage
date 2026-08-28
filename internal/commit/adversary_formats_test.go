@@ -9,16 +9,12 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// TestAdversarySameSizeObjectAtALayerKey is the object-under-the-wrong-key attack aimed
-// at the one check that stands between "this layer was already uploaded" and "a manifest
-// of ours names something somebody else put in the bucket": putLayer compares the length
-// of the object that is already there and nothing else.
+// TestAdversarySameSizeObjectAtALayerKey is the object-under-the-wrong-key attack aimed at
+// putLayer's check that a taken key already holds this layer.
 //
-// The layer key is content-addressed, so an object of the same length that is not this
-// layer cannot come from this code — it comes from anything else with write access to a
-// shared bucket, or from a restore that put an old object back under a key. Publish then
-// reports SUCCESS for a commit whose layer bytes are not in the bucket at all, which is
-// exactly what `Commit() → SUCCESS` promises cannot happen.
+// The key is content-addressed, so an object of the same length that is not this layer
+// comes from something else with write access to the bucket, or from a restore that put
+// an old object back. Publish then reports SUCCESS for a commit whose layer is not there.
 func TestAdversarySameSizeObjectAtALayerKey(t *testing.T) {
 	t.Parallel()
 	volumeID := newID()

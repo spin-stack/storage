@@ -3,35 +3,23 @@
 -- NOT the authority for the durable point of data (that is S3, §5.8).
 -- Reconstructible from S3 via rebuild-metadata (§22.5).
 --
--- There is no `operations` table. §7's reconciliation operations — the
--- desired_state/current_state rows a drain, a promotion or a recovery converged
--- through — described the machinery ADR-0026 withdrew, and after it nothing wrote a
--- row: every write path (RecordOperation, UpdateOperationPhase) had a test for its
--- only caller. It is dropped rather than left empty because an empty table with
--- three indexes, a kind vocabulary and a term-guarded writer reads as a mechanism
--- somebody is about to use, and the next reader has no way to tell.
+-- There is no `operations` table: ADR-0026 withdrew the reconciliation machinery it served
+-- and nothing outside a test ever wrote a row. Dropped rather than left empty, so it does
+-- not read as a mechanism somebody is about to use.
 --
--- Identity columns are `uuidv7` (a domain over uuid, not text): volume_id in
--- particular is the same 16-byte
--- UUID the on-disk WAL format carries (RecordHeader.VolumeID [16]byte). IDs are
--- generated as UUIDv7 (time-ordered, better index locality) — app-side via
--- google/uuid.NewV7 for values that must match the durable format, and the DB runs
--- Postgres 18 (native uuidv7()). This file is the declared state and the single
--- source of truth: pgschema plans against it (ADR-0019), sqlc generates from it
--- (ADR-0006), and the integration lane builds its database from it. migrations/
--- holds the reviewed plans, not the apply path.
+-- Identity columns are the `uuidv7` domain (not text): volume_id is the same 16-byte id the
+-- on-disk format carries. This file is the declared state and the single source of truth —
+-- pgschema plans against it (ADR-0019), sqlc generates from it (ADR-0006), and the
+-- integration lane builds its database from it; migrations/ holds the reviewed plans, not
+-- the apply path.
 
--- UUIDv7 enforcement (INV-22, ADR-0007) as a type. The version nibble is the high
--- 4 bits of the 7th byte of the UUID; requiring it to equal 7 rejects any non-v7 id
--- at insert, whatever the client. It is a domain rather than a predicate copied onto
--- every identity column because a copied rule holds where somebody remembered to
--- copy it: active_root_id and published_root_id went without one from the start, and
--- nothing said so. A new table gets the rule by declaring the type — the same move
--- internal/lifecycle made in Go for the state vocabularies.
---
--- Foreign-key referencing columns stay plain `uuid`: they can only hold a value that
--- is already in a v7-checked primary key, so the rule reaches them transitively, and
--- TestPGIdentityColumnsUseTheUUIDv7Domain exempts exactly those.
+-- UUIDv7 enforcement (INV-22, ADR-0007) as a type: the version nibble is the high 4 bits
+-- of the UUID's 7th byte, so requiring it to equal 7 rejects a non-v7 id at insert whatever
+-- the client. A domain rather than a predicate copied onto every identity column, because a
+-- copied rule holds only where somebody remembered to copy it — active_root_id and
+-- published_root_id went without one and nothing said so. FK-referencing columns stay plain
+-- `uuid` (the rule reaches them transitively); TestPGIdentityColumnsUseTheUUIDv7Domain
+-- exempts exactly those.
 CREATE DOMAIN uuidv7 AS uuid CHECK ((get_byte(uuid_send(VALUE), 6) >> 4) = 7);
 
 -- Single-active Control Plane leadership with a verified term (§7). Every CP write
@@ -50,57 +38,34 @@ CREATE TABLE control_plane_leader (
 CREATE TABLE hosts (
     host_id              UUIDV7 PRIMARY KEY,
     state                TEXT NOT NULL CHECK (state IN ('ACTIVE', 'CORDONED', 'DRAINING', 'DEAD')),
-    -- Why the host is CORDONED, empty for every other state (ADR-0013 §3).
-    --
-    -- Cordon stopped being something only a human does: the Control Plane cordons a
-    -- host whose device passes 70% used, so an operator reading state = 'CORDONED'
-    -- can no longer assume somebody meant it. The column is what tells the two
-    -- apart, and it is also what stops the automatic loop from clearing a cordon a
-    -- human set for a cause the fleet cannot see — the pressure writer may only
-    -- replace '' or 'DEVICE_PRESSURE' (lifecycle.CordonReason.OverwritableNames,
-    -- applied in SetHostState's predicate).
-    --
-    -- It is emptied rather than left behind when the host leaves CORDONED, because a
-    -- reason that outlives its cordon is a reason the next reader will believe.
+    -- Why the host is CORDONED, empty for every other state (ADR-0013 §3). The Control
+    -- Plane cordons a host whose device passes 70% used, so the state alone no longer means
+    -- a human meant it; this column tells the two apart, and it is what stops the automatic
+    -- loop from clearing a human's cordon (the pressure writer may only replace '' or
+    -- 'DEVICE_PRESSURE' — lifecycle.CordonReason.OverwritableNames, in SetHostState's
+    -- predicate). Emptied when the host leaves CORDONED: a reason that outlives its cordon
+    -- is one the next reader will believe.
     cordon_reason        TEXT NOT NULL DEFAULT ''
                            CHECK (cordon_reason IN ('', 'OPERATOR', 'DEVICE_PRESSURE')),
     agent_version        TEXT NOT NULL DEFAULT '',
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
     nvme_used_bytes      BIGINT NOT NULL DEFAULT 0,
-    -- The part of nvme_used_bytes that no verified object covers yet, summed over
-    -- every volume this host holds (ADR-0013 §1). Reported by the Agent in each
-    -- heartbeat, like the two columns above it.
-    --
-    -- It is stored rather than derived, unlike committed capacity, because nothing
-    -- in this database can compute it: it is the distance between what the host has
-    -- written locally and what S3 has acknowledged, and the volumes table carries
-    -- watermarks in sequence numbers, not bytes. It is also the number that
-    -- distinguishes the two ways a device fills — a busy host, and a host whose
-    -- object store stopped answering, which is the one that will not stop growing
-    -- because no local truncation may reclaim those records (INV-13).
+    -- The part of nvme_used_bytes that no verified object covers yet, summed over every
+    -- volume this host holds (ADR-0013 §1), reported by the Agent in each heartbeat. Stored
+    -- rather than derived because nothing in this database can compute it: the volumes table
+    -- carries watermarks in sequence numbers, not bytes. It is also what distinguishes a busy
+    -- host from one whose object store stopped answering, which will not stop growing because
+    -- no local truncation may reclaim those records (INV-13).
     nvme_remote_backlog_bytes BIGINT NOT NULL DEFAULT 0,
     -- There is deliberately no nvme_committed_bytes column (ADR-0017). Committed
     -- capacity is derived from the rows that already say who holds what; see the
     -- note at the bottom of this file.
     last_heartbeat       TIMESTAMPTZ NOT NULL,
-    -- There is deliberately no renewals_blocked_until column either, and it is a
-    -- different deletion from the one above: this one held a mechanism that worked.
-    -- A withdrawn mechanism refused a host's lease renewals for the length of one
-    -- promotion, so that the lease the Control Plane revoked to fence a source could
-    -- not be re-armed by the source's next heartbeat. ADR-0026 then withdrew the
-    -- promotion, and the ADR's own amendment states the consequence: the window "is
-    -- currently empty, because a revocation stops nothing on the data path". Its
-    -- three writers (BlockHostRenewals, UnblockHostRenewals, RevokeHostLease) had no
-    -- caller, so the column could only ever be NULL and the renewal predicate that
-    -- read it could only ever be true.
-    --
-    -- Kept for stage 2 was the alternative, and it is worse than it looks: stage 2 is
-    -- a fence that follows the *volume*, so what it needs is not this column with a
-    -- caller added — it is a different granularity. A column no write ever sets is
-    -- indistinguishable, to the next reader, from one whose writer is broken.
-    -- A durability tier that gates an ACK on the lease brings back the requirement,
-    -- and it will bring back the schema with the code that exercises it.
+    -- There is deliberately no renewals_blocked_until column. It refused a host's lease
+    -- renewals for the length of one promotion; ADR-0026 withdrew the promotion, leaving it
+    -- with no writer and no reader. What stage 2 needs is a fence that follows the
+    -- *volume*, not this column with a caller added.
     -- A reason belongs to a cordon and dies with it. Stated as a table constraint
     -- because it spans two columns: a column-level CHECK reading another column is
     -- accepted by PostgreSQL and silently promoted to one anyway, which hides from
@@ -120,61 +85,35 @@ CREATE TABLE host_leases (
 
 CREATE TABLE volumes (
     volume_id          UUIDV7 PRIMARY KEY,              -- = on-disk VolumeID [16]byte
-    -- size_bytes is written once, at create, and no statement in queries/ updates it.
-    -- It said "mutable: resize grow" until 2026-08-06; the grow-only UPDATE that made
-    -- that true had no caller, and the rest of a resize (an Agent that acts on a new
-    -- size, a device whose capacity can change, a guest that can be told) does not
-    -- exist. Leaving the column documented as mutable would have been the expensive
-    -- half: descriptor.json carries this same number and is written only at create, so
-    -- a size that moved here and not there is a catalog and a bucket that disagree —
-    -- and -rebuild-metadata restores from the bucket.
+    -- Written once, at create; no statement in queries/ updates it. descriptor.json carries
+    -- the same number and is written only at create, so a size that moved here and not there
+    -- is a catalog and a bucket that disagree — and -rebuild-metadata restores from the
+    -- bucket.
     size_bytes         BIGINT NOT NULL,
-    -- There is no durability column. §14.8 once stored a per-volume FLUSH ACK
-    -- contract here ('remote' | 'local'); ADR-0026 withdrew the remote half, leaving
-    -- the local ACK as the only contract and the column as a value every write set,
-    -- every read parsed, and nothing ever branched on. Dropping it rather than
-    -- leaving it defaulted is deliberate: a column that still says 'remote' is a
-    -- catalog claiming a durability the data path no longer provides, and the next
-    -- reader has no way to tell it is decoration.
+    -- There is no durability column. §14.8's per-volume FLUSH ACK contract
+    -- ('remote' | 'local') lost its remote half to ADR-0026, and nothing ever branched on
+    -- what was left; a column still saying 'remote' would claim a durability the data path
+    -- no longer provides.
     -- The logical block size reported to the guest. It is carried to the Agent in the
     -- desired state and lands in the virtio-blk config as blk_size
     -- (vhost.Config.BlockSize, set by VolumeManager.supervise);
     -- controlplane.VolumeSpec.validate refuses one that is not a multiple of the
     -- 512-byte sector, and control-plane -seed-block-size defaults it to 4096.
     --
-    -- It said "CoW segment granularity (64 KiB)" until 2026-08-08, which is DEV-0024,
-    -- and it was wrong twice over. It is not what this column holds: nothing anywhere
-    -- reads block_size as an objectization unit. And the 64 KiB CoW segment §13.1 named
-    -- exists nowhere — cow.IntervalMap works on the guest's real extents with no grid
-    -- (its own package comment records that the second structure increment 4.4 promised
-    -- never arrived), and what leaves the host is a chunk of up to image.MaxChunkBytes
-    -- keyed by the digest of its plaintext.
-    --
-    -- Correcting the comment and not the column is the whole change, deliberately: the
-    -- value stored here has always been the guest's block size, so there is nothing to
-    -- migrate. The contract fixtures in internal/metadata/metadatatest pass 65536, which
-    -- is legal because 65536 is a sector multiple and not because anyone meant a
-    -- segment — that coincidence is presumably where the wrong comment kept its footing.
-    -- Whether the 64 KiB granularity is V2 or simply dead is the half of DEV-0024 that
-    -- stays open; it is downstream of the chain-depth decision, since the granularity
-    -- of what is addressed is part of the decision that spec puts to a human. Either
-    -- way it is not this column.
+    -- It is not a CoW segment granularity, whatever the older comment said (DEV-0024):
+    -- nothing reads block_size as an objectization unit, and the 64 KiB segment §13.1
+    -- named exists nowhere — cow.IntervalMap works on the guest's real extents with no
+    -- grid. Whether that granularity is V2 or simply dead is still open, and is not this
+    -- column either way.
     block_size         INTEGER NOT NULL,
-    -- rpo_target_seconds is how far behind the object store this volume may fall: the
-    -- age at which its host seals the tip and commits it even though the tip has not
-    -- reached the size threshold (v6 §11). Zero is no age trigger, and the volume then
-    -- commits on size alone.
+    -- rpo_target_seconds is how far behind the object store this volume may fall: the age
+    -- at which its host seals the tip and commits it even under the size threshold (v6 §11).
+    -- Zero is no age trigger, and the volume commits on size alone.
     --
-    -- It lives here and not in the Agent's configuration because it is a promise made
-    -- to one tenant, and the size threshold beside it is the host's own affair — how
-    -- much a single layer costs to upload, how long a recovery that downloads the chain
-    -- takes. An operator sizing a fleet and a tenant buying an RPO are setting different
-    -- things, and a fleet-wide flag cannot express the second.
-    --
-    -- DEFAULT 0 rather than a chosen number: §11 forbids picking a target instead of
-    -- measuring one, and no measurement of upload throughput against a real object store
-    -- has been made. Zero is the honest default — it says this volume was never sold an
-    -- RPO — and it is the one value that cannot silently under-deliver.
+    -- Per volume and not per Agent because it is a promise made to one tenant, while the
+    -- size threshold beside it is the host's own affair. DEFAULT 0 rather than a chosen
+    -- number: §11 forbids picking a target instead of measuring one, and no measurement of
+    -- upload throughput against a real object store has been made.
     rpo_target_seconds INTEGER NOT NULL DEFAULT 0 CHECK (rpo_target_seconds >= 0),
     current_epoch      BIGINT NOT NULL DEFAULT 0,
     state              TEXT NOT NULL                                  -- §7 failover states
@@ -185,17 +124,13 @@ CREATE TABLE volumes (
     active_root_id     UUIDV7,
     published_root_id  UUIDV7,
     chain_depth        INTEGER NOT NULL DEFAULT 0,
-    -- The snapshot this volume was cloned from (§20), or NULL for a volume that was
-    -- created rather than cloned. chain_depth says a chain exists; this says what is
-    -- on the other end of it, which is what a clone's Agent needs to find the objects
-    -- it reads through. Without it a clone starts an empty WAL under its own id, finds
-    -- nothing under that id in the object store, and serves zeros for everything its
-    -- parent ever wrote (DEV-0007).
+    -- The snapshot this volume was cloned from (§20), NULL for a volume that was created
+    -- rather than cloned. chain_depth says a chain exists; this says what is on the other end
+    -- of it, which is what a clone's Agent needs to find the objects it reads through —
+    -- without it a clone serves zeros for everything its parent ever wrote (DEV-0007).
     --
-    -- The constraint itself is added below, after snapshots exists: snapshots already
-    -- references volumes, so the pair is circular and one of the two directions has to
-    -- be an ALTER. This one, because volumes is the table that has to exist first for
-    -- anything else to reference it.
+    -- The constraint is added below, after snapshots exists: the pair is circular and one
+    -- direction has to be an ALTER.
     parent_snapshot_id UUID,
     dek_wrapped        BYTEA NOT NULL,                  -- DEK wrapped with the KEK
     kek_id             TEXT NOT NULL,
@@ -211,91 +146,59 @@ CREATE TABLE volumes (
     dek_key_id         BIGINT NOT NULL
                          CHECK (dek_key_id > 0 AND dek_key_id <= 4294967295),
     -- Watermarks are INFORMATIVE (lazy); authority is S3 (§5.8). Informative is not
-    -- unconstrained: INV-03 (§5.6) says published <= durable <= local at every
-    -- observation point, and this is that rule at the table rather than in the
-    -- queries that happen to write it. The triple is what an operator reads during
-    -- an incident to decide whether to accept data loss; a disordered one is not a
-    -- wrong number but three numbers that cannot all be true.
-    --
-    -- Nothing on the reporting path can trip it: UpdateVolumeWatermarks and
-    -- CreateVolume's conflict path both advance the three with GREATEST, and
-    -- component-wise max preserves the ordering of ordered inputs. What it does
-    -- catch is a row written out of order at birth — which no later report could
-    -- repair, since each watermark only ever moves forward.
+    -- unconstrained: INV-03 (§5.6) says published <= durable <= local, stated at the table
+    -- rather than in each query that writes it. Nothing on the reporting path can trip it —
+    -- the writers advance with GREATEST, and component-wise max preserves order. What it
+    -- catches is a row written out of order at birth, which no later report could repair.
     local_sequence     BIGINT NOT NULL DEFAULT 0,
     durable_sequence   BIGINT NOT NULL DEFAULT 0,
     published_sequence BIGINT NOT NULL DEFAULT 0,
     -- Why the host that holds this volume is not serving it, empty when it is
-    -- (internal/lifecycle.Refusal). The Agent fails closed in five places — a missing
-    -- image, a durability floor it came back under, a read view that never resolved, a
-    -- KEK it does not hold, a lease it lost — and until this column existed every one
-    -- of them was invisible to the fleet: the volume kept the watermarks its last
-    -- healthy report left behind, so `-fleet-status` rendered it as normal and the only
-    -- signal anywhere was one ERROR line in one host's log.
+    -- (internal/lifecycle.Refusal). The Agent fails closed in five places — a missing image,
+    -- a durability floor, a read view that never resolved, a KEK it does not hold, a lost
+    -- lease — and without this column every one of them was invisible to the fleet:
+    -- `-fleet-status` rendered the volume as normal off its last healthy watermarks.
     --
-    -- CHECK-constrained like every other vocabulary here, and for the third time for the
-    -- same reason: the Go type, the wire enum and the column each refuse a value the
-    -- other two do not know, so a new refusal is one commit that touches all three
-    -- rather than a string that arrives in a column and is never queried.
-    --
-    -- **It is not a watermark and is written by a different rule.** The three above are
-    -- monotonic and merged with GREATEST, so a late report cannot do harm. This is a
-    -- state that must clear the moment the volume serves again, so its write is
-    -- last-report-wins — and, because "last" would otherwise include a host the fleet
-    -- has moved past, SetVolumeRefusal qualifies the UPDATE with primary_host_id and
-    -- current_epoch. That predicate is the whole difference between the two, and it is
-    -- why this is not folded into UpdateVolumeWatermarks.
+    -- **It is not a watermark.** The three above are monotonic and merged with GREATEST.
+    -- This is a state that must clear the moment the volume serves again, so its write is
+    -- last-report-wins, qualified by primary_host_id and current_epoch so a host the fleet
+    -- has moved past cannot resurrect it. That predicate is why SetVolumeRefusal is not
+    -- folded into UpdateVolumeWatermarks.
     refusal            TEXT NOT NULL DEFAULT ''
                          CHECK (refusal IN ('', 'IMAGE_MISSING', 'DURABILITY_LOST',
                                             'NO_READ_VIEW', 'NO_KEY', 'LEASE_LOST',
                                             'ATTACH_FAILED', 'PUBLISH_FENCED')),
-    -- The sentence the Agent sent with the refusal — which sequence it came back at,
-    -- which KEK it is missing — printed verbatim by `-fleet-status` and branched on by
-    -- nothing. It is the free half of a deliberately split pair: the token above is what
-    -- a column, a grep and an alert key on, and this is what an operator's next step
-    -- needs. Emptied with the refusal, never left behind, for the reason
-    -- hosts.cordon_reason is: an explanation that outlives its cause is one the next
-    -- reader will believe.
+    -- The sentence the Agent sent with the refusal, printed verbatim by `-fleet-status` and
+    -- branched on by nothing: the token above is what a column, a grep and an alert key on.
+    -- Emptied with the refusal, for the reason hosts.cordon_reason is.
     refusal_detail     TEXT NOT NULL DEFAULT '',
     CONSTRAINT volumes_refusal_detail_needs_a_refusal
         CHECK (refusal <> '' OR refusal_detail = ''),
     CONSTRAINT volumes_watermarks_ordered
         CHECK (published_sequence <= durable_sequence AND durable_sequence <= local_sequence),
-    -- When the Control Plane observed the lease of the writer it is fencing
-    -- (ADR-0015). Stamped by this database's clock — the same clock that stamps
-    -- host_leases.last_renewal, and so the one every fencing deadline lives on —
-    -- when the volume enters FENCING_WAIT, and cleared when it leaves.
+    -- When the Control Plane observed the lease of the writer it is fencing (ADR-0015),
+    -- stamped by this database's clock — the one that also stamps host_leases.last_renewal,
+    -- and so the one every fencing deadline lives on — on entry to FENCING_WAIT, cleared on
+    -- exit.
     --
-    -- The promotion dwell is measured from here rather than from
-    -- host_leases.last_renewal, because last_renewal answers a question about the
-    -- *writer* and this answers a question about the *promoter*: a read served by a
-    -- lagging replica reports a last_renewal old enough that the wait already looks
-    -- over, and the epoch is granted while the old writer's monotonic lease is still
-    -- valid. This column is written by the promoter and read back by it, so a stale
-    -- read of it returns NULL — which starts a full dwell. Fail slow, never short.
-    --
-    -- It is what makes FENCING_WAIT load-bearing state rather than a marker: a
-    -- Control Plane that restarts mid-fence resumes the wait its predecessor started
-    -- instead of beginning a new one.
+    -- The dwell is measured from here and not from last_renewal because that answers a
+    -- question about the *writer*: a read served by a lagging replica reports one old enough
+    -- that the wait already looks over. This column is written and read back by the promoter,
+    -- so a stale read returns NULL and starts a full dwell. Fail slow, never short — and it
+    -- is what lets a Control Plane restarting mid-fence resume its predecessor's wait.
     fencing_started_at TIMESTAMPTZ,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- A snapshot is a *name for a commit* (§19 under v6). Not a copy, not a manifest the
--- host writes: the published history is already a chain of immutable commits, and a
--- snapshot is a row saying "this commit, under this name". Taking one costs a rotation
--- and a publish when the tip holds unpublished bytes, and nothing at all when it does
--- not.
+-- A snapshot is a *name for a commit* (§19 under v6), not a copy: the published history is
+-- already a chain of immutable commits. Taking one costs a rotation and a publish when the
+-- tip holds unpublished bytes, and nothing at all when it does not.
 --
--- Two v5 columns went with the engine that produced them. `target_sequence` was the
--- volume's local_sequence at the capture, and there are no sequences any more.
--- `root_digest` was the chunked image's root, and that object layout is withdrawn. What
--- is left identifying the point in history is `commit_id`, and it is enough on its own
--- — a commit id names a manifest whose key is derived (commit.ManifestKey), so a
--- catalog and a bucket cannot disagree about where a snapshot lives, which is the
--- property `manifest_key` was trying and failing to hold when it was a string the Agent
--- reported.
+-- `commit_id` is all that identifies the point in history: a commit id names a manifest
+-- whose key is derived (commit.ManifestKey), so a catalog and a bucket cannot disagree
+-- about where a snapshot lives — which is what `manifest_key`, a string the Agent reported,
+-- could not hold. (`target_sequence` and `root_digest` went with the v5 engine.)
 CREATE TABLE snapshots (
     snapshot_id        UUIDV7 PRIMARY KEY,
     volume_id          UUID NOT NULL REFERENCES volumes(volume_id),
@@ -312,15 +215,11 @@ CREATE TABLE snapshots (
     portable           BOOLEAN NOT NULL DEFAULT false,
     request_id         UUIDV7 UNIQUE NOT NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- A PUBLISHED snapshot names a commit. That direction only, and the difference
-    -- matters twice: a DELETING snapshot keeps the commit it was published at — it is
-    -- being removed, not un-published — and a biconditional would refuse the transition
-    -- outright. Written the other way round first, and the integration lane is what said
-    -- so; the sim does not enforce constraints, so the unit lane was green.
-    --
-    -- What it protects is the row a clone follows: PUBLISHED is the only state that says
-    -- a snapshot is usable, and one that says so while naming nothing sends a reader to
-    -- an object that is not there.
+    -- A PUBLISHED snapshot names a commit — that direction only: a DELETING snapshot keeps
+    -- the commit it was published at, and a biconditional would refuse the transition. What
+    -- it protects is the row a clone follows: PUBLISHED is the only state that says a
+    -- snapshot is usable, and one that says so while naming nothing sends a reader to an
+    -- object that is not there.
     CONSTRAINT snapshots_published_names_a_commit
         CHECK (state <> 'PUBLISHED' OR commit_id IS NOT NULL)
 );
@@ -363,9 +262,6 @@ ALTER TABLE volumes
     ADD CONSTRAINT volumes_parent_snapshot_id_fkey
     FOREIGN KEY (parent_snapshot_id) REFERENCES snapshots(snapshot_id);
 
--- Every FK *referencing* column carries an index: Postgres indexes only the referenced
--- side, so a clone lookup by parent would otherwise be a sequential scan, and deleting
--- a snapshot would take a full scan of volumes to check the constraint.
 CREATE INDEX volumes_parent_snapshot_id_idx ON volumes (parent_snapshot_id);
 CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 
@@ -373,49 +269,25 @@ CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 --
 --   committed(host) = Σ size_bytes of the volumes whose primary_host_id is the host
 --
--- It is a query over rows that already exist and are already term-guarded, so there
--- is no delta to apply and nothing to apply twice: a resumed pass computes the same
--- answer as the pass that crashed. The column this replaces was an incremental
--- ledger, and every safeguard the last two waves added to it — the non-negative
--- guard, the expected-value predicate, the per-volume release stage — existed only
--- because a delta is not an idempotency key.
+-- It is a query over rows that already exist and are already term-guarded, so a resumed
+-- pass computes the same answer as the pass that crashed. The column it replaces was an
+-- incremental ledger, and every safeguard added to it — the non-negative guard, the
+-- expected-value predicate, the per-volume release stage — existed only because a delta
+-- is not an idempotency key.
 --
--- It is a view because it is a rule, and a rule lives once. It was inlined in four
--- queries until now for a tooling reason that no longer exists (Atlas Community
--- refused to diff a schema containing a view; ADR-0019 replaced it), and four copies
--- of an accounting rule is four places for a placement decision to be taken against
--- a different definition of "full".
+-- A view because a rule lives once: it was inlined in four queries for a tooling reason
+-- ADR-0019 removed (Atlas Community refused to diff a schema containing a view), and four
+-- copies of an accounting rule is four places to decide "full" differently. Plain and not
+-- materialized: a materialized view is a ledger with a refresh job.
 --
--- **ADR-0017's second term is gone with the operations table.** It summed the
--- size_bytes an in-flight operation plan had reserved on a destination — "charged to
--- its destination *before* it becomes the primary there", which is what stops two
--- placements from both seeing room for one volume in flight. Removing it does not
--- change a single number this view has ever produced: nothing outside a test ever
--- wrote an operations row, so the lateral join ran over an empty relation for every
--- host in every state a V1 catalog can reach. What it removes is the *headroom* for
--- a move that spans two hosts — and V1 performs none, because ADR-0026 withdrew the
--- drain and the promotion that made one. ADR-0017's own "the tests that enforce it"
--- section already says so: the behavioural cases for that term went with the drain,
--- "V1 performs no moves, so the interleaving they quantified over is empty".
---
--- What this means for the one move a V1 catalog *can* make: detach-then-attach
--- (SetVolumePrimaryHost) makes the volume primary on the destination in the same
--- statement that places it, so there is no interval between "reserved" and "primary"
--- for a second term to cover. The gap that write does have is a different one and it
--- is still open — it carries no CapacityBound at all, so nothing evaluates a ceiling
--- inside it (recorded against D6 in docs/plan/tracks/TRACK-D.md). The reservation
--- term would not have closed it: a reservation is written by the operation that
--- plans a move, and an attach plans nothing.
---
--- The sum is a correlated subquery in the select list rather than an aggregate over
--- a join, so a reader asking about one host is charged for one host: the host_id
--- filter is applied to the scan of `hosts` and the subquery runs only for the rows
--- that survive it. That is the property a view puts at risk and the one
--- TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet measures.
---
--- It is a plain view and not a materialized one on purpose: staleness in an
--- accounting path is the exact failure ADR-0017 removed when it deleted the ledger,
--- and a materialized view is a ledger with a refresh job.
+-- ADR-0017's second term — bytes an in-flight operation plan had reserved on a
+-- destination — went with the operations table, and changes no number this view ever
+-- produced (nothing outside a test wrote an operations row). What it removes is headroom
+-- for a move spanning two hosts, and V1 performs none. The one move a V1 catalog can
+-- make, detach-then-attach, carries no CapacityBound at all — an open gap recorded
+-- against D6 in docs/plan/tracks/TRACK-D.md, which a reservation term would not have
+-- closed. The sum is a correlated subquery rather than an aggregate over a join, so a
+-- reader asking about one host is charged for one host (TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet).
 CREATE VIEW host_committed_bytes AS
 SELECT h.host_id,
        COALESCE((SELECT SUM(v.size_bytes) FROM volumes v

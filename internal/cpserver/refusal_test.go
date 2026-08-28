@@ -9,17 +9,12 @@ import (
 	"github.com/spin-stack/storage/internal/metadata"
 )
 
-// TestEveryWireRefusalHasAStoredOne is the other half of the closed-vocabulary bargain,
-// and the half a schema test cannot see: the enum on the wire and the vocabulary in the
-// catalog have to be the same set, in both directions.
-//
-// It is asserted through the handler rather than by reading the mapping function, because
-// the mapping function is exactly the thing that would be wrong. A value the handler
-// cannot translate fails the *whole* report RPC — the Agent's watermarks and its snapshot
-// outcome go with it — so a refusal added on the wire and forgotten here does not
-// degrade, it takes the reporting path down for that host. And a stored value with no
-// wire spelling is a refusal no Agent can ever express, which is the vocabulary quietly
-// shrinking back towards the silence this field was added to end.
+// TestEveryWireRefusalHasAStoredOne: the enum on the wire and the vocabulary in the
+// catalog must be the same set, in both directions. Asserted through the handler rather
+// than by reading the mapping function, because the mapping function is what would be
+// wrong — a value it cannot translate fails the *whole* report RPC, taking the host's
+// watermarks and snapshot outcome with it, and a stored value with no wire spelling is a
+// refusal no Agent can ever express.
 func TestEveryWireRefusalHasAStoredOne(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{
@@ -69,13 +64,10 @@ func TestEveryWireRefusalHasAStoredOne(t *testing.T) {
 }
 
 // TestARefusalIsNotResurrectedByAFencedWriter is the storage rule at the seam it matters
-// at, and it is deliberately not a store test: the guard has to survive the *handler's*
-// read-then-write, where the volume can move between the epoch check and the update.
-//
-// A watermark from a fenced writer is merged with GREATEST and is harmless. A refusal is
-// a state, so the same late report would mark a volume NOT SERVED while its successor is
-// serving it — with the term guard passing, because a promotion does not move the CP
-// term. It is the one thing that makes "last report wins" safe.
+// at, and deliberately not a store test: the guard has to survive the handler's
+// read-then-write, where the volume can move between the epoch check and the update. A
+// late watermark is merged with GREATEST and harmless; a late refusal would mark a volume
+// NOT SERVED while its successor serves it, with the term guard passing.
 func TestARefusalIsNotResurrectedByAFencedWriter(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{
@@ -137,15 +129,12 @@ func TestARefusalIsNotResurrectedByAFencedWriter(t *testing.T) {
 }
 
 // Two guards stand between a stale Agent and a volume it no longer holds, and this pins
-// the first one. The store's own qualification — the UPDATE is predicated on the host
-// and the epoch — is the second, and it lives in the shared contract because both
-// implementations must have it.
+// the first. The store's own host-and-epoch predicate is the second and lives in the
+// shared contract, because both implementations must have it.
 //
-// Written after a version of this test that asserted the second guard through this
-// handler and PASSED WITH THAT GUARD REMOVED: the report never reached the store,
-// because the epoch check here had already rejected it. A test that cannot fail for the
-// reason it names is the thing this repository keeps shipping, so what it pins now is
-// the guard it actually exercises.
+// An earlier version asserted the second guard through this handler and passed with that
+// guard removed: the report never reached the store, because the epoch check here had
+// already rejected it. What it pins now is the guard it actually exercises.
 func TestAReportFromAHostTheFleetMovedPastIsRefusedBeforeItCanSayAnything(t *testing.T) {
 	f := newFixture(t)
 	f.createVolume(t, metadata.Volume{

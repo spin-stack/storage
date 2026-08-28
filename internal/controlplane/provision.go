@@ -54,8 +54,7 @@ type KeyWrapper interface {
 	WrapDEK(r io.Reader, dek crypto.DEK, volumeID [16]byte) ([]byte, error)
 }
 
-// Provisioner creates volumes: the act that has never existed in this tree, which is
-// why GetDesiredState has always returned an empty list.
+// Provisioner creates volumes.
 type Provisioner struct {
 	md    metadata.Store
 	store objectstore.Store
@@ -74,33 +73,24 @@ func NewProvisioner(md metadata.Store, store objectstore.Store, kms KeyWrapper, 
 // term-guarded row naming the host that will serve it, and a descriptor in the object
 // store.
 //
-// Order is the row first, then the descriptor, and it matters. The row is the
-// term-guarded step (§7), so a stale Control Plane is refused before anything durable
-// is written anywhere. If the descriptor write then fails, what is left is a volume the
-// fleet knows about whose object-store anchor is missing — visible, repairable, and
-// refused by the Agent when it cannot read the descriptor. The reverse order leaves an
-// orphan descriptor under a volume id no row mentions: invisible to every query, and a
-// root a reachability sweep would walk from forever.
+// The row first, then the descriptor. The row is the term-guarded step (§7), so a stale
+// Control Plane is refused before anything durable is written anywhere; if the descriptor
+// write then fails, what is left is a volume the fleet knows about with no object-store
+// anchor — visible, repairable, refused by the Agent. The reverse order leaves an orphan
+// descriptor under a volume id no row mentions: invisible to every query, and a root a
+// reachability sweep would walk from forever.
 //
-// The volume starts at **epoch 1**, not 0. Epoch 0 is the absence of an epoch, and a
-// writer cannot address a WAL namespace under it.
-//
-// **Creating a volume does not grant a fresh epoch, and does not need to.** Every later
-// attach does (controlplane.Place), because a host that gets a volume back must not
-// reopen the WAL directory it wrote before the volume was somewhere else. A volume being
-// created has a v7 id nothing has ever seen, so no host holds a directory under it at
-// any epoch; and the 1 written here is the same 1 the descriptor below carries, which is
-// what -rebuild-metadata restores the row from. Bumping here would make those two
-// disagree at the one moment they are guaranteed to agree.
+// Epoch **1**, not 0: epoch 0 is the absence of an epoch and a writer cannot address a WAL
+// namespace under it. Creating a volume does not grant a fresh epoch and does not need to —
+// a fresh v7 id has no WAL directory on any host at any epoch — and the 1 written here is
+// the same 1 the descriptor carries, which is what -rebuild-metadata restores the row from.
 func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec) (ProvisionedVolume, error) {
 	if err := spec.validate(); err != nil {
 		return ProvisionedVolume{}, err
 	}
 
-	// A v7 id (INV-22), and its timestamp prefix means volumes sort by creation. The
-	// uuid itself is kept, not just its string: the wrap below binds the volume's 16
-	// raw bytes, and re-parsing the string we just printed would be one more place the
-	// two representations could disagree.
+	// A v7 id (INV-22). The uuid itself is kept, not just its string: the wrap below binds
+	// the volume's 16 raw bytes.
 	u := ids.New()
 	volumeID := u.String()
 
@@ -168,14 +158,11 @@ func (s VolumeSpec) validate() error {
 	return geometry(s.SizeBytes, s.BlockSize)
 }
 
-// geometry is the rule about a volume's shape, split out of validate so that the other
-// path which invents catalog rows applies it too.
-//
-// `rebuild-metadata` reads descriptors out of a bucket, which is to say it takes this
-// geometry as *input*, and it recorded whatever it found. A volume of zero bytes or a
-// block size no device can address then exists in the catalog and cannot be served by
-// anything — created by the one command an operator runs when the catalog is already
-// gone, which is the worst moment to be handed a row nobody can act on.
+// geometry is the rule about a volume's shape, split out of validate so that
+// rebuild-metadata — which reads descriptors out of a bucket and so takes this geometry as
+// *input* — applies it too. It used to record whatever it found: a zero-byte volume or an
+// unaddressable block size is a catalog row nothing can serve, created by the one command an
+// operator runs when the catalog is already gone.
 func geometry(sizeBytes int64, blockSize int32) error {
 	switch {
 	case sizeBytes <= 0:

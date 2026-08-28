@@ -39,20 +39,13 @@ type beginner interface {
 }
 
 // placing runs a write that carries a capacity bound: one transaction that takes the
-// destination's advisory lock first, so the bound's predicate cannot be evaluated by
-// two placements against a fleet neither of them is in yet.
+// destination's advisory lock first, so the bound's predicate cannot be evaluated by two
+// placements against a fleet neither of them is in yet. The predicate alone is necessary
+// and not sufficient under READ COMMITTED — measured against a real PostgreSQL, not
+// inferred — and the lock's own reasoning, including why it is a separate statement and
+// why not SERIALIZABLE or FOR UPDATE, is in hosts.sql next to the query.
 //
-// The bound being a predicate of the write (ADR-0017) is necessary and not
-// sufficient here. READ COMMITTED fixes a statement's snapshot before it runs, and
-// the derived committed value is an aggregate over rows the statement does not lock;
-// two INSERTs that overlap in time each see a fleet without the other, both affect
-// one row, and the host lands at twice its ceiling. That was measured against a real
-// PostgreSQL before this existed, not inferred. The lock's own reasoning — and why
-// it is a separate statement, and why not SERIALIZABLE or FOR UPDATE — is in
-// hosts.sql next to the query.
-//
-// An unbounded write is not a placement decision and pays nothing: no transaction,
-// no lock, the same single statement as before.
+// An unbounded write is not a placement decision and pays nothing: no transaction, no lock.
 func (s *Store) placing(ctx context.Context, b *metadata.CapacityBound, write func(*db.Queries) (int64, error)) (int64, error) {
 	if b == nil {
 		return write(s.q)
@@ -134,14 +127,11 @@ func fromNullUUID(u pgtype.UUID) string {
 
 func fromTS(t pgtype.Timestamptz) time.Time { return t.Time }
 
-// wrote reports whether a term-guarded write landed, having first answered the only
-// question a 0-row result always has a definite answer to: was the caller still the
-// leader? Every guarded query has more than one way to affect no rows (a stale term,
-// a missing row, a refused transition, a conflict), and the term must win — a zombie
-// CP told "shrink not allowed" concludes it is still the leader.
-//
-// The re-read is on the 0-row path only, and terms are monotonic: a write that
-// affected no rows cannot have had a term that becomes current afterwards.
+// wrote reports whether a term-guarded write landed, answering first the only question a
+// 0-row result always answers definitely: was the caller still the leader? Every guarded
+// query has several ways to affect no rows and the term must win — a zombie CP told
+// "transition refused" concludes it is still the leader. The re-read is on the 0-row path
+// only, and terms are monotonic.
 func (s *Store) wrote(ctx context.Context, term, rows int64, err error) (bool, error) {
 	if err != nil {
 		return false, err

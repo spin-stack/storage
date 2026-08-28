@@ -39,11 +39,6 @@ var (
 	// host already holds and what is already in flight to it, is more than the
 	// policy admits. Nothing was written, and the caller re-places the volume
 	// somewhere else.
-	//
-	// It is the only capacity sentinel left. The underflow and expected-value
-	// errors it used to sit beside were properties of an incremental ledger —
-	// "this delta was applied twice", "the books moved under my read" — and a
-	// derived value has neither (ADR-0017).
 	ErrCapacityExceeded = errors.New("metadata: committed capacity would exceed the placement bound")
 	// ErrWatermarkOrder means a watermark report violates
 	// published ≤ durable ≤ local (INV-03).
@@ -61,40 +56,26 @@ var (
 	// asserting that its writer is gone; handing it a fresh lease afterwards
 	// contradicts that assertion.
 	ErrHostNotServing = errors.New("metadata: host is not serving")
-	// ErrAlreadyPlaced means SetVolumePrimaryHost was asked to move a volume straight
-	// from one host to another. It is refused, and the reason is the only thing that
-	// keeps two writers off one volume today: a host serves exactly the volumes
-	// GetDesiredState lists for it, and it learns it has lost one on its *next* poll.
-	// A single write that named a new owner would therefore hand the volume to the
-	// destination while the source is still serving it, for a poll interval, with both
-	// guests writing and both Agents publishing an image over the same manifest — one
-	// of them silently losing its session to the CAS.
-	//
-	// The caller detaches first and places afterwards, which passes the volume through
-	// "no host" and gives the source the same teardown it gets on any other release
-	// (stop, publish, close). That is not exclusion either — an operator who places
-	// again within one poll interval has re-created the window by hand — and closing
-	// it properly is the §7 state machine's job, not this write's. What this refusal
-	// buys is that no *single* catalog write can open it.
+	// ErrAlreadyPlaced means SetVolumePrimaryHost was asked to move a volume straight from
+	// one host to another. It is refused because a host serves exactly the volumes
+	// GetDesiredState lists for it and learns it has lost one on its *next* poll: a single
+	// write naming a new owner hands the volume to the destination while the source still
+	// serves it, both guests writing and both Agents publishing over the same manifest.
+	// The caller detaches first and places afterwards. That is not exclusion either —
+	// closing the window is the §7 state machine's job; what this refusal buys is that no
+	// *single* catalog write can open it.
 	ErrAlreadyPlaced = errors.New("metadata: volume is already placed on another host")
 
 	// ErrUnversionedDEK is a volume written with DEKKeyID 0 — see CheckDEKKeyID.
 	ErrUnversionedDEK = errors.New("metadata: a volume's DEK must carry a version")
 
-	// ErrHasDescendants means a volume cannot be removed while another volume — or
-	// another volume's snapshot — still descends from one of its snapshots. It is the
-	// catalog half of deletion's first precondition, and it is a
-	// safety net rather than the check an operator meets: since publishing stopped
-	// flattening, `parent_snapshot_id` is write-once by construction, so the catalog
-	// keeps naming a parent a FLATTEN has already dissolved in the bucket. The command
-	// therefore asks the *bucket* who descends from what and flattens them first; this
-	// refuses the write that would leave a snapshot row referenced by nothing it can
-	// still be read through.
-	//
-	// Postgres would refuse it anyway — snapshots.snapshot_id is referenced by both
-	// volumes.parent_snapshot_id and snapshots.parent_snapshot_id — and that is
-	// precisely why the sentinel exists: an integrity violation surfacing as a driver
-	// error is one no caller can branch on, and the sim has no foreign keys at all.
+	// ErrHasDescendants means a volume cannot be removed while another volume — or another
+	// volume's snapshot — still descends from one of its snapshots. It is a safety net, not
+	// the check an operator meets: `parent_snapshot_id` is write-once, so the catalog keeps
+	// naming a parent a FLATTEN has dissolved in the bucket, and the command asks the
+	// *bucket* who descends from what. Postgres would refuse the write anyway; the sentinel
+	// exists because an integrity violation surfacing as a driver error is one no caller can
+	// branch on, and the sim has no foreign keys at all.
 	ErrHasDescendants = errors.New("metadata: a volume whose snapshots something still descends from")
 )
 
@@ -129,18 +110,12 @@ func CheckDEKKeyID(keyID uint32) error {
 	return nil
 }
 
-// PlacedState is the §7 volume state that belongs with an ownership write: a volume
-// with a writer is ACTIVE, a volume with none is DETACHED. It is here, next to
-// CheckWatermarkOrder and for the same reason, because both stores have to derive it
-// identically — and because it is the answer to "what does clearing the primary host
-// mean for the state".
-//
-// The two are one fact, so SetVolumePrimaryHost writes them together rather than
-// leaving the state to a second call. Two writes have a window, and the window is not
-// harmless in either order: a volume left ACTIVE with no host is one that
-// controlplane.RequestSnapshot accepts (it checks only the state) and that no Agent
-// can ever take, so the snapshot sits CREATING for ever; a volume left DETACHED while
-// a host still serves it is one the catalog says nobody is writing while a guest is.
+// PlacedState is the §7 volume state that belongs with an ownership write: a volume with a
+// writer is ACTIVE, a volume with none is DETACHED. Both stores must derive it identically,
+// and SetVolumePrimaryHost writes state and ownership together rather than in two calls — a
+// volume left ACTIVE with no host is one controlplane.RequestSnapshot accepts and no Agent
+// can ever take, and one left DETACHED while a host serves it is the catalog saying nobody
+// is writing while a guest is.
 func PlacedState(primaryHostID string) lifecycle.VolumeState {
 	if primaryHostID == "" {
 		return lifecycle.VolumeDetached
@@ -173,34 +148,20 @@ type Host struct {
 	MaxFormatVersion int32
 	NVMeTotalBytes   int64
 	NVMeUsedBytes    int64
-	// RemoteBacklogBytes is a byte count the host reports about itself, alongside the
-	// two NVMe fields above (ADR-0013 §1). Every Agent reports 0, and the column
-	// holds 0 for every host in the fleet: a FLUSH is ACKed on an fdatasync and a
-	// volume reaches the object store when it stops, so there is no running distance
-	// between a host and S3 for anything to measure (agent.Loop.heartbeat says the
-	// same at the line that sends the zero).
-	//
-	// It is stored rather than derived — the opposite call from NVMeCommittedBytes
-	// below — because nothing here could produce it: a measurement like this is made
-	// in bytes on the host, while the catalog holds watermarks in sequence numbers.
-	// No decision anywhere branches on it, and it costs a column, a proto field and
-	// this paragraph; deleting the three is a change to the wire and the schema,
-	// which is why it is written down here rather than left looking live.
+	// RemoteBacklogBytes is a byte count the host reports about itself (ADR-0013 §1). Every
+	// Agent reports 0 and the column holds 0 fleet-wide: a FLUSH is ACKed on an fdatasync and
+	// a volume reaches the object store when it stops, so there is no running distance to
+	// measure. Stored rather than derived — the opposite call from NVMeCommittedBytes — because
+	// the catalog holds watermarks in sequence numbers, not bytes. Nothing branches on it;
+	// removing it is a change to the wire and the schema, which is why it is written down.
 	RemoteBacklogBytes int64
-	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by
-	// the store on every read, and never stored anywhere (ADR-0017):
+	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by the store
+	// on every read and never stored anywhere (ADR-0017):
 	//
 	//	committed(host) = Σ size_bytes of the volumes whose primary is host
 	//
-	// ADR-0017's second term — what an in-flight operation plan had reserved on the
-	// host but not yet placed — went with the operations table it was read from
-	// (internal/schema/schema.sql carries the reasoning, including what it does and
-	// does not cost).
-	//
-	// It is therefore ignored on the way in: UpsertHost cannot set it, and neither
-	// can anything else. A number S3 or SQL can recompute is a cache, never an
-	// authority, and the cheapest cache to keep honest is the one that does not
-	// exist.
+	// It is therefore ignored on the way in: UpsertHost cannot set it, and neither can
+	// anything else. A number SQL can recompute is a cache, never an authority.
 	NVMeCommittedBytes int64
 	LastHeartbeat      time.Time
 }
@@ -213,34 +174,23 @@ type HostLease struct {
 	TTLSeconds  int32
 }
 
-// CapacityBound is the §28.2 oversubscription ceiling a write must respect, stated
-// by the caller that took the placement decision so there is one copy of the rule.
-//
-// placement.Choose is pure and advisory: two operations that read the fleet before
-// either reserved anything pick the same destination and both proceed, and the host
-// lands past the declared bound with neither caller having made a mistake.
-// Re-checking in Go only narrows that window; the bound is a bound only when the
-// statement that places the bytes evaluates it. So it travels *with* the write:
+// CapacityBound is the §28.2 oversubscription ceiling a write must respect, stated by the
+// caller that took the placement decision so there is one copy of the rule:
 //
 //	committed(HostID) + AddBytes <= Limit   and   used(HostID) <= UsedLimit
 //
-// where committed is the derived value (ADR-0017) as it stands immediately before
-// the write and used is the host's own last measurement of its device. The second
-// half is the ADR-0013 gap: the first bounds what the fleet has *promised* the host,
-// which is not what fills it — under ADR-0026 a session's WAL stays local until the
-// volume stops, and no reservation covers a byte of it. Both travel together because
-// both are the same decision, taken once by placement.Policy.Bound.
+// It travels *with* the write because placement.Choose is pure and advisory: two
+// operations that read the fleet before either reserved anything pick the same destination
+// and both proceed. A bound is a bound only when the statement that places the bytes
+// evaluates it. The second half is the ADR-0013 gap — promises are not what fills a
+// device, and under ADR-0026 a session's WAL stays local with no reservation covering it.
+// Both are the same decision, taken once by placement.Policy.Bound.
 //
-// A write that carries no bound is not a placement decision — rebuild-metadata
-// recreating volumes that already occupy their hosts — and a bound is never applied
-// to a write that gives capacity back: a host can be over its ceiling for reasons
-// that have nothing to do with the caller (a tightened policy, a device that came
-// back smaller), and refusing the write that brings it down would wedge every
-// release of that host.
-//
-// CreateVolume is the only write that takes one today. SetVolumePrimaryHost — the
-// other way a volume comes to occupy a host — takes none, which is an open gap and
-// not a decision.
+// A write with no bound is not a placement decision (rebuild-metadata recreating volumes
+// that already occupy their hosts), and no bound is applied to a write that gives capacity
+// back — refusing that would wedge every release of a host already over its ceiling.
+// CreateVolume is the only write that takes one; SetVolumePrimaryHost takes none, which is
+// an open gap and not a decision.
 type CapacityBound struct {
 	// HostID is the host being placed on.
 	HostID string
@@ -252,17 +202,11 @@ type CapacityBound struct {
 	// direction: a caller that cannot name a bound has not been told the host can
 	// hold anything.
 	Limit int64
-	// UsedLimit is the highest *measured* used value the host may already show and
-	// still take the write (placement.Policy.UsedLimit). It charges AddBytes
-	// nothing: a volume does not occupy its declared size the moment it is placed,
-	// and assuming it does is the assumption oversubscription exists to deny — the
-	// reasoning is at placement.Policy.Admits, which evaluates the same rule.
-	//
-	// Zero is fail-closed the same way Limit is, and here it bites in production
-	// rather than in a test: every real device measures something, so a bound built
-	// by hand without this field refuses every placement. That is the intended
-	// direction — Policy.Bound is what builds these, and a second builder is the
-	// second copy of the rule.
+	// UsedLimit is the highest *measured* used value the host may already show and still take
+	// the write (placement.Policy.UsedLimit). It charges AddBytes nothing: a volume does not
+	// occupy its declared size the moment it is placed (placement.Policy.Admits evaluates the
+	// same rule). Zero is fail-closed like Limit, and here it bites in production — every real
+	// device measures something, so a hand-built bound missing this field refuses everything.
 	UsedLimit int64
 }
 
@@ -302,16 +246,10 @@ type Volume struct {
 	LocalSequence     int64
 	DurableSequence   int64
 	PublishedSequence int64
-	// Refusal is why the host that holds this volume is not serving it, and
-	// RefusalDetail is the sentence the Agent sent with it. RefusalNone — the zero
-	// value — is the host saying it is serving.
-	//
-	// **It is not a watermark and is deliberately not stored like one.** A watermark is
-	// the newest of a monotonic series, so GREATEST is right for it and a late report is
-	// harmless. A refusal is a *state*: it has to clear the moment the volume serves
-	// again, so the write is last-report-wins, and it must not be resurrected by a
-	// report from a host the fleet has moved past — so SetVolumeRefusal is qualified by
-	// the reporting host and epoch, which UpdateWatermarks deliberately is not.
+	// Refusal is why the host that holds this volume is not serving it, and RefusalDetail is
+	// the sentence the Agent sent with it. RefusalNone — the zero value — is the host saying
+	// it is serving. It is a state and not a watermark; SetVolumeRefusal carries the storage
+	// rule that follows from that.
 	Refusal       lifecycle.Refusal
 	RefusalDetail string
 	// FencingStartedAt is the instant the Control Plane observed the lease of the
@@ -370,20 +308,14 @@ type Store interface {
 	// not the current leader — its term was superseded, or the row names somebody else
 	// — is ErrStaleTerm, and nothing is written.
 	//
-	// It exists because the term guard alone leaves two holes that meet in the middle.
-	// The stamp on the leader row was written by an election and never touched again,
-	// so a Control Plane that has been dead for an hour is indistinguishable from one
-	// that started an hour ago; and a Control Plane that has been superseded finds out
-	// only when it next tries to mutate something — §7 says it "detects the condition
-	// and terminates itself", and reading its own refusals off Agent traffic is not
-	// detecting it. One periodic guarded write closes both: it is the liveness stamp
-	// while it succeeds, and the notice to step down when it fails.
+	// It exists because the term guard alone leaves two holes: the leader row's stamp was
+	// written by an election and never touched, so a Control Plane dead for an hour looks
+	// like one that started an hour ago; and a superseded Control Plane finds out only when
+	// it next mutates something. One periodic guarded write closes both.
 	//
-	// Deliberately not AcquireLeadership on a timer. That increments the term every
-	// tick, and every admin one-shot in cmd/control-plane reads GetLeader and then
-	// writes under the term it read — -flatten-volume and -delete-volume rewrite a
-	// whole image between the two — so a self-renewing leader would fail them at
-	// random with ErrStaleTerm.
+	// Deliberately not AcquireLeadership on a timer: that increments the term every tick,
+	// and every admin one-shot in cmd/control-plane reads GetLeader and then writes under
+	// the term it read, so a self-renewing leader would fail them at random.
 	RenewLeadership(ctx context.Context, term int64, holderID string) error
 	// GetLeader returns the current leader record.
 	GetLeader(ctx context.Context) (Leader, error)
@@ -466,21 +398,14 @@ type Store interface {
 	// ListVolumesByHost returns the volumes whose primary is hostID, ordered by
 	// volume id — what a drain iterates over (§28.1).
 	ListVolumesByHost(ctx context.Context, hostID string) ([]Volume, error)
-	// ListVolumes returns every volume ordered by volume id, including the ones
-	// placed nowhere.
+	// ListVolumes returns every volume ordered by volume id, including the ones placed
+	// nowhere — which are the whole reason it exists and are unreachable through
+	// ListVolumesByHost: an unplaced volume's primary is NULL, which no host id matches (not
+	// even the empty one, ErrInvalidID at the boundary). rebuild-metadata restores every
+	// volume with no placement, so after the one event that most needs an answer *every*
+	// volume is in that set.
 	//
-	// Those are the whole reason it exists, and they are unreachable through
-	// ListVolumesByHost: an unplaced volume's primary is NULL, which no host id
-	// matches — not even the empty one, which is ErrInvalidID at the boundary. So a
-	// caller iterating the fleet's hosts and unioning their listings sees exactly the
-	// volumes that are already being served and none of the ones that are not, which
-	// inverts what the question is usually asked for. rebuild-metadata restores every
-	// volume with no placement (no object records one), so after the one event that
-	// most needs an answer, *every* volume is in the set the per-host read cannot
-	// return.
-	//
-	// It is a fleet-wide scan and it is not on any data path: cpserver answers Agents
-	// from the per-host listings, and this exists for a human reading the catalog.
+	// A fleet-wide scan and on no data path: this is for a human reading the catalog.
 	ListVolumes(ctx context.Context) ([]Volume, error)
 	// BumpVolumeEpoch advances the epoch to expectedEpoch+1 and sets the primary
 	// host, term-guarded, returning the new epoch (§12.3). It is a compare-and-set,
@@ -498,93 +423,53 @@ type Store interface {
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
 	// SetVolumePrimaryHost places a volume on a host, or clears its placement when
 	// primaryHostID is empty (term-guarded). It writes the §7 state that goes with the
-	// ownership in the same statement — PlacedState says which, and why they must not
-	// be two writes.
+	// ownership in the same statement — PlacedState says which, and why they must not be two
+	// writes. It is the only mutation of primary_host_id that is not a promotion: before it
+	// the column was write-once, so an attach was permanent.
 	//
-	// It is the only mutation of primary_host_id that is not a promotion. Until it
-	// existed the column was write-once: CreateVolume set it and its converging upsert
-	// protected it with COALESCE, so an attach was permanent — a volume could not be
-	// detached, could not be re-placed, and the volumes rebuild-metadata restores with
-	// no host could never be given one.
+	// **Moving straight from one host to another is refused with ErrAlreadyPlaced**; the
+	// caller clears first and places afterwards, and that sentinel carries the reason.
 	//
-	// **Moving straight from one host to another is refused with ErrAlreadyPlaced.**
-	// The caller clears first and places afterwards; that sentinel carries the reason.
+	// **The epoch is not touched by this write, in either direction.** controlplane.Place
+	// grants a fresh epoch before calling this; the two are separate writes because:
 	//
-	// **The epoch is not touched by this write, in either direction** — which is not the
-	// same as saying a placement does not move it. controlplane.Place grants the volume
-	// a fresh epoch before it calls this, and carries the reasoning for both halves; what
-	// belongs here is why the two are separate writes rather than one:
+	//   - detaching grants the token to nobody, so bumping inside a write that clears the
+	//     owner would burn an epoch no host holds;
+	//   - the release does not need it — cpserver.applyReport compares primary_host_id
+	//     against the reporting host *before* the epoch, so a cleared volume answers
+	//     NOT_PRIMARY, and "" can never be a reporting host (the RPC refuses it);
+	//   - an Agent restart must keep its epoch: it is not a placement, so the desired state
+	//     repeats the epoch and the Agent re-attaches to its own WAL (ADR-0024).
 	//
-	//   - An epoch is a fencing token, granted by BumpVolumeEpoch's compare-and-set to
-	//     the writer that won it (§12.3). Detaching grants it to nobody, so incrementing
-	//     inside a write that also clears the owner would burn a token no host holds.
-	//   - Nothing about the *release* needs it. What stops a released host's reports
-	//     being accepted is the ownership check, not the epoch: cpserver.applyReport
-	//     compares primary_host_id against the reporting host *before* it looks at the
-	//     epoch, so a cleared volume answers NOT_PRIMARY — which is exactly the outcome
-	//     that makes the Agent fence the volume and tear it down. That is sufficient
-	//     here, and it is sufficient because "" can never be a reporting host: the RPC
-	//     refuses an empty host_id at the boundary, so a cleared owner matches nobody
-	//     rather than matching everybody.
-	//   - An Agent restart must keep its epoch. It is not a placement — this row does
-	//     not change — so the desired state repeats the epoch, the Agent re-attaches to
-	//     its own WAL and republishes (ADR-0024). Bumping on any *read* of the placement
-	//     would break that; bumping at the attach does not reach it.
-	//
-	// A stale term is ErrStaleTerm, a missing volume ErrNotFound, a §7 move the table
-	// forbids lifecycle.ErrInvalidTransition. Re-writing the placement a volume already
-	// has is a no-op, not an error — the operator who re-runs the command after a
-	// timeout must not be told it failed.
+	// Re-writing the placement a volume already has is a no-op, not an error.
 	SetVolumePrimaryHost(ctx context.Context, term int64, volumeID, primaryHostID string) error
 	// ClearVolumeParent records that a volume descends from nothing any more:
 	// parent_snapshot_id back to NULL and chain_depth back to 0 (term-guarded).
 	//
-	// It is the one write `lineage.Flatten` cannot make and cannot do without.
-	// CreateVolume's conflict path is
-	// `parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED...)`, which
-	// makes the column write-once so that a converging rebuild can never drop a
-	// clone's link — correct, and it also means no write on this Store could say a
-	// lineage had ended. Nothing read wrong because of that: the Agent takes the link
-	// from `descriptor.json`, which the flatten rewrites. Everything that *counted*
-	// lineage did — `controlplane.Clone`'s ceiling kept refusing clones of a volume
-	// that is back at depth 0, and a delete of the old parent kept seeing a descendant
-	// whose snapshot rows it must not orphan (ErrHasDescendants). This is that write,
-	// and it is why a flatten now unblocks a delete instead of only appearing to.
+	// It is the one write `lineage.Flatten` cannot make and cannot do without. CreateVolume's
+	// conflict path COALESCEs the column so a converging rebuild can never drop a clone's
+	// link — which also means no write here could say a lineage had ended, while everything
+	// that *counted* lineage kept counting it: `controlplane.Clone`'s ceiling, and a delete of
+	// the old parent still seeing a descendant (ErrHasDescendants).
 	//
-	// Clearing a volume that already descends from nothing is a no-op, not an error:
-	// an operator re-running a flatten, and a delete flattening several descendants in
-	// one pass, must both be able to run twice.
-	//
-	// It does not touch the descriptor. The bucket is the authority a rebuild trusts
-	// (INV-20), the flatten rewrites it before this is called, and a second writer of
-	// that object here would be a second place the fact lives.
+	// Clearing a volume that already descends from nothing is a no-op: an operator re-running
+	// a flatten must be able to run it twice. It does not touch the descriptor — the flatten
+	// rewrites that first, and a second writer here is a second home for the fact.
 	ClearVolumeParent(ctx context.Context, term int64, volumeID string) error
-	// DeleteVolume removes a volume and its snapshots from the catalog
-	// (term-guarded). There is no DELETING state and no timer: the row goes, and the
-	// recovery window belongs entirely to the bucket's own versioning and lifecycle
-	// policy — the recovery window is the bucket's, not ours. Putting a retention
-	// window in a column as well as in a bucket policy makes two of them, and they
-	// drift; only one of the two controls the bytes.
+	// DeleteVolume removes a volume and its snapshots from the catalog (term-guarded).
+	// There is no DELETING state and no timer: the recovery window belongs to the bucket's
+	// own versioning and lifecycle policy, and a second window in a column would drift from
+	// the one that controls the bytes. The undo is `-rebuild-metadata`, built for losing the
+	// whole database.
 	//
-	// **The undo is `-rebuild-metadata`**, which reconstructs both rows from the
-	// descriptor and the snapshot manifests while the bucket still holds their
-	// non-current versions. That is not a mechanism this method needs to provide — it
-	// is the one built for losing the whole database.
+	// The snapshots go in the same write: a snapshot row whose volume is gone is unreadable
+	// (its manifest lives under the volume's prefix) and satisfies no foreign key.
 	//
-	// The volume's snapshots go with it, in the same write. A snapshot row whose
-	// volume is gone is a row nothing can read (its manifest lives under the volume's
-	// prefix) and a foreign key nothing can satisfy, so leaving the two to separate
-	// calls would leave a window in which the catalog states a snapshot of a volume
-	// that does not exist.
+	// ErrHasDescendants if anything still descends from those snapshots. ErrNotFound if the
+	// volume is not there, which a re-run of a completed delete reads as "already done".
 	//
-	// ErrHasDescendants if anything still descends from one of those snapshots.
-	// ErrNotFound if the volume is not there — which a re-run of a delete that already
-	// removed the row will get, and which its caller reads as "already done".
-	//
-	// It does not check placement. `primary_host_id` being NULL is the delete
-	// command's precondition and it belongs there: it is a statement about a host that
-	// is still serving a device, which this Store cannot see and could not enforce
-	// against an Agent that has not polled yet.
+	// It does not check placement: `primary_host_id IS NULL` is the delete command's
+	// precondition, a statement about a host this Store cannot see.
 	DeleteVolume(ctx context.Context, term int64, volumeID string) error
 	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
 	// A report violating published ≤ durable ≤ local is ErrWatermarkOrder (INV-03).
@@ -593,63 +478,29 @@ type Store interface {
 	// monotonic, because promotion does not change the CP term and this number is
 	// what an operator reads during an incident.
 	UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error
-	// SetVolumeRefusal records why the host holding a volume is not serving it, or
-	// clears the record when it is (lifecycle.RefusalNone). Term-guarded.
+	// SetVolumeRefusal records why the host holding a volume is not serving it, or clears the
+	// record when it is (lifecycle.RefusalNone). Term-guarded, and — unlike UpdateWatermarks —
+	// qualified by the reporting host and epoch: a watermark is monotonic and a late report is
+	// harmless under GREATEST, while a refusal is a state about right now, so the write is
+	// last-report-wins **within** (hostID, epoch) and a no-op outside it.
 	//
-	// **It is qualified by the reporting host and epoch, and UpdateWatermarks
-	// deliberately is not.** The two are different kinds of fact and want opposite
-	// storage. A watermark is the newest of a monotonic series, so a late report from a
-	// fenced writer is merged with GREATEST and cannot do harm. A refusal is a *state*
-	// about right now: taking the newest would leave a volume marked NOT SERVED after it
-	// came back, and taking any report at all would let a host the fleet moved past
-	// resurrect a refusal over a volume its successor is serving perfectly well. So the
-	// write is last-report-wins **within** (hostID, epoch) and no-op outside it.
-	//
-	// A report that names the wrong host or epoch is not an error: it is a writer that
-	// has been fenced, whose opinion about whether the volume is being served is void.
-	// It affects no row and returns nil, the same shape as a placement cleared twice.
-	// ErrNotFound only for a volume that is not in the catalog at all.
+	// A report naming the wrong host or epoch is not an error — it is a fenced writer whose
+	// opinion is void — and returns nil. ErrNotFound only for a volume not in the catalog.
 	SetVolumeRefusal(ctx context.Context, term int64, volumeID, hostID string, epoch int64,
 		refusal lifecycle.Refusal, detail string) error
-	// There is no ResizeVolume here any more, and **V1 does not resize a volume**.
-	// §3's objective 14 ("resize online (grow)") has no verb behind it; §9's promise
-	// that "el grow se propaga vía actualización del config space + notificación" has
-	// no mechanism behind it either.
+	// There is no ResizeVolume here, and **V1 does not resize a volume**. §3's objective 14
+	// and §9's config-space propagation have no mechanism behind them: blockdev.Device fixes
+	// its capacity at construction; the guest cannot be told at all, because announcing a new
+	// capacity needs VHOST_USER_BACKEND_CONFIG_CHANGE_MSG over the backend request channel
+	// and internal/vhost deliberately does not offer VHOST_USER_PROTOCOL_F_BACKEND_REQ (a
+	// test pins that it is not offered); and descriptor.json carries size_bytes and is
+	// written only at create, so a resized volume disagrees with the object
+	// -rebuild-metadata restores it from (INV-20).
 	//
-	// The method that was here grew size_bytes under the term guard and refused a
-	// shrink with ErrShrinkNotAllowed, and it was correct. What it was not was a
-	// resize: **a row that grows is not a volume that grows.** The rest of the path
-	// does not exist, and every step of it is missing, not merely untested —
-	//
-	//   - cpserver.GetDesiredState already sends size_bytes to the Agent on every
-	//     poll, and agent.VolumeManager.Apply returns at its epoch check before it
-	//     reads the field, so a grown row reaches the Agent every few seconds and
-	//     changes nothing;
-	//   - blockdev.New fixes a Device's capacity at construction and blockdev.Device
-	//     has no way to change it, so even a restart-driven resize means tearing the
-	//     volume down — which publishes the session and takes the guest's device away;
-	//   - the guest cannot be told in any case. Announcing a new capacity needs
-	//     VHOST_USER_BACKEND_CONFIG_CHANGE_MSG over the backend request channel, and
-	//     internal/vhost deliberately does not offer VHOST_USER_PROTOCOL_F_BACKEND_REQ
-	//     (a test pins that it is not offered). Without it QEMU raises no virtio
-	//     configuration-change interrupt and the guest never re-reads its capacity.
-	//   - descriptor.json carries size_bytes and is written only at create and clone,
-	//     so a resized volume's descriptor kept the old size — and -rebuild-metadata
-	//     reads exactly that object to reconstruct the row (INV-20). Keeping the method
-	//     was therefore not neutral: it was the one way to make the catalog and the
-	//     bucket disagree about a volume's size, with nothing to notice.
-	//
-	// **The rejected alternative was to keep it and wait.** Thirty correct lines cost
-	// nothing to hold, and a future resize would have to restate the §3 rule. But an
-	// uncallable verb reads to the next person as a feature that exists, and this one
-	// had a defect behind it rather than a gap. Bringing it back is one commit —
-	// the query, the two store methods, the contract cases — and it belongs in the
-	// same increment as the Agent, blockdev, vhost and guest-lane work above, which is
-	// what makes resize a verb instead of a column write.
-	//
-	// The immutability this leaves is asserted, not assumed: metadatatest's
-	// VolumeGeometryIsImmutable runs every mutation on the Store against a fresh
-	// volume and reads its size and block size back.
+	// Rejected: keep the correct grow-only method and wait — an uncallable verb reads as a
+	// feature that exists. Bringing it back belongs in the same increment as the Agent,
+	// blockdev, vhost and guest-lane work. metadatatest's VolumeGeometryIsImmutable asserts
+	// the immutability this leaves.
 
 	// SetVolumeState moves a volume through the §7 ownership machine (term-guarded).
 	// The move is guarded by the lifecycle table inside the write itself, so two
@@ -672,24 +523,16 @@ type Store interface {
 	// on completion by the host that actually took it, which is what §20's placement
 	// rule 1 reads later.
 	ListPendingSnapshots(ctx context.Context, hostID string) ([]Snapshot, error)
-	// ListUnfinishedSnapshots returns every snapshot that is waiting on something,
-	// fleet-wide and ordered by snapshot id: the CREATING ones, which are waiting on
-	// an Agent, and the DELETING ones, which are waiting on a reclaim that ADR-0026
-	// deleted and will therefore wait for ever. PUBLISHED and FAILED are finished —
-	// one of them succeeded, the other is a request that is over — so neither is
-	// anybody's outstanding work.
+	// ListUnfinishedSnapshots returns every snapshot waiting on something, fleet-wide and
+	// ordered by snapshot id: CREATING (waiting on an Agent) and DELETING (waiting on a
+	// reclaim ADR-0026 deleted, so waiting for ever). PUBLISHED and FAILED are finished.
 	//
-	// It is not ListPendingSnapshots without the host argument, and the difference is
-	// the point of it. That one joins through volumes.primary_host_id, so a CREATING
-	// snapshot of a volume that has since been detached — or of every volume, after a
-	// rebuild — belongs to no host and appears in no per-host listing at all. It is
-	// precisely the snapshot that is stuck, and it is precisely the one the read that
-	// drives the Agents cannot see.
+	// It is not ListPendingSnapshots without the host argument: that one joins through
+	// volumes.primary_host_id, so a CREATING snapshot of a detached volume — precisely the
+	// stuck one — belongs to no host and appears in no per-host listing.
 	//
-	// The two states are hard-coded rather than taken as a parameter: there is one
-	// caller and one question, and a state filter callers pass would let a future one
-	// ask for PUBLISHED — a fleet-wide unbounded scan of the largest table here, which
-	// is a listing API, not an incident read.
+	// The two states are hard-coded: one caller, one question, and a state filter would let
+	// a future caller ask for PUBLISHED — a fleet-wide scan of the largest table here.
 	ListUnfinishedSnapshots(ctx context.Context) ([]Snapshot, error)
 	// PublishSnapshot moves CREATING → PUBLISHED, recording the two facts only the host
 	// that took it knows: the commit its history is named by, and which host reported it
@@ -711,14 +554,8 @@ type Store interface {
 	SetSnapshotState(ctx context.Context, term int64, snapshotID string, state lifecycle.SnapshotState) error
 }
 
-// There are no operation methods. §7's reconciliation operations —
-// RecordOperation, UpdateOperation, GetOperation, ListLiveOperationsByHost, and the
-// `operations` table under them — were the interface of the drain, the promotion and
-// the recovery ADR-0026 withdrew, and after it nothing wrote a row: each of the four
-// had exactly one caller and it was the contract test. They are deleted rather than
-// kept for the mechanism's return, because a store method with a lifecycle, a
-// capacity bound and a duplicate-request rule reads as something the Control Plane
-// uses, and the next reader has no way to tell that it does not.
-//
-// What comes back with cross-host movement is ADR-0017's second capacity term (see
-// internal/schema/schema.sql), and it comes back with the writer that populates it.
+// There are no operation methods. §7's reconciliation operations — RecordOperation,
+// UpdateOperation, GetOperation, ListLiveOperationsByHost and the `operations` table under
+// them — were the interface of the drain, promotion and recovery ADR-0026 withdrew, and
+// each had exactly one caller: the contract test. They come back with the writer that
+// populates them, along with ADR-0017's second capacity term (internal/schema/schema.sql).

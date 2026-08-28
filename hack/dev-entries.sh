@@ -2,46 +2,17 @@
 # Which doc↔code divergences are open right now, and who owes the decision — computed
 # from STATUS.md, pinned as a set.
 #
-# CLAUDE.md's definition of done ends with "No open DEV entry that this increment
-# introduced", and until this script existed **no Taskfile target, no hack script and no
-# CI job read a DEV entry**. Wave 6 opened DEV-0024 and shipped green, because `task
-# ci:full` was always going to be green: the fourth line of the gate was enforced by
-# whoever happened to read STATUS.md, which is the "human-shaped control" PARALLEL-PLAN.md
-# says is not a control. It is the same shape as the two defects the waves before it found
-# in `task dst` (a `-run` regex that selected no tests) and `hack/coverage.sh`: a check
-# reporting success for something it never established.
+# CLAUDE.md's gate ends with "No open DEV entry that this increment introduced", and
+# nothing read a DEV entry until this script.
 #
-# THREE SHAPES WERE ON THE TABLE, and the two rejected ones are why this one looks like
-# hack/deadcode.sh:
+# Rejected: list and never fail (easy to never run); fail whenever any entry is open (red
+# on the day it lands, because entries wait on decisions a human has not made). What is
+# left is hack/deadcode.sh's ratchet over the open SET: an unpinned open entry is red, and
+# a pin that outlives its entry is red.
 #
-#   1. **List, never fail.** Honest, unable to produce a false red, and easy to never run.
-#      A target nobody runs is a target nobody notices going stale — `backend:conformance`
-#      was broken on main for a whole increment for exactly that reason. It also leaves
-#      the gate's fourth line still enforced by a human remembering.
-#   2. **Fail whenever any entry is open.** The letter of the gate, and the version that
-#      gets deleted. Two of the three open entries wait on decisions a human has not made
-#      (DEV-0020 on the chunk-addressing spec, DEV-0011 on ADR-0013); a step that is red
-#      on the day it lands is a step someone removes, which is written down in the
-#      Taskfile as the reason `deadcode` stayed out of every gate for two waves.
-#   3. **A ratchet over the open SET** — this file. The open entries are pinned in
-#      hack/dev-entries-open.txt with a reason each, so an entry appearing that nothing
-#      pinned is red, and an entry that stops being open while its line survives is red
-#      too. Opening a DEV entry stays possible and stops being free: it costs a deliberate
-#      edit to a second file, with the owner and the blocking decision written beside it.
-#      That is the precedent this repository has now landed twice — `deadcode`'s pending
-#      list and `internal/dst/mandatory_set_test.go` — and neither has produced a false
-#      red.
-#
-# The "parser over Markdown that fires on prose" objection is real and is answered by
-# narrowing what is parsed: **only heading lines, and only ones naming a `DEV-NNNN` id.**
-# A lane rewriting a paragraph, adding a section, or striking a sentence mid-entry cannot
-# move this check. The one edit that can is the one it exists to notice — adding, striking
-# or removing an entry's own heading.
-#
-# WHAT COUNTS AS RESOLVED is this file's convention, not an inference: the heading's id is
-# struck through (`## ~~DEV-0019~~ — …`). A heading that carries `~~` somewhere else while
-# leaving the id bare is reported as ambiguous rather than guessed at — guessing "open"
-# invents work, guessing "resolved" hides it, and the fix (strike the id) is one edit.
+# Only heading lines naming a DEV-NNNN id are parsed, so prose cannot move this check.
+# Resolved means the id itself is struck (## ~~DEV-0019~~ — …); a heading struck somewhere
+# else is reported as ambiguous rather than guessed at.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

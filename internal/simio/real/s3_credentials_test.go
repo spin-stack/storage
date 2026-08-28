@@ -8,16 +8,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// S3Config documents its credential fields as "empty means the SDK's default credential
-// chain (instance role, env, config file)". That was not true: NewS3Store builds the
-// client with s3.New(opts), and s3.New resolves nothing — an Options with no Credentials
-// provider signs nothing, so every request left the host **unsigned**. A backend with
-// auth answers 403 on the first call and the operator is told the bucket is not
-// versioned (see the other test in this file).
-//
-// The fix has to be the documented behaviour rather than an error, because the two ways
-// this will actually be deployed — an instance role in AWS, AWS_* in the environment for
-// a local RustFS — both go through that chain.
+// S3Config documents "empty means the SDK's default credential chain". That was not
+// true: s3.New resolves nothing, so an Options with no Credentials provider signed
+// nothing and every request left the host **unsigned** — a backend with auth answers 403
+// and the operator is told the bucket is not versioned. The fix has to be the documented
+// behaviour rather than an error, because both realistic deployments go through the
+// chain.
 func TestCredentialsFallBackToTheEnvironmentWhenNoneAreConfigured(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "from-the-environment")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "and-its-secret")
@@ -56,15 +52,11 @@ func TestConfiguredCredentialsWinOverTheEnvironment(t *testing.T) {
 	}
 }
 
-// requireVersioning is right to refuse a bucket it cannot verify — INV-14 rests on the
-// delete marker being reversible, and TestRequireVersioning pins that decision. This is
-// about the sentence it produces, which is the first thing a misconfigured deployment
-// sees, because NewS3Store runs the check in its constructor.
-//
-// Leading with "bucket versioning is not Enabled" when the truth is "your credentials
-// were refused" costs an operator the hour it takes to stop looking at the bucket
-// policy. The cause was already in the message, buried after the verdict; what is wrong
-// is which one the sentence asserts.
+// requireVersioning is right to refuse a bucket it cannot verify (TestRequireVersioning
+// pins that). This is about the sentence it produces, which is the first thing a
+// misconfigured deployment sees: leading with "bucket versioning is not Enabled" when the
+// truth is "your credentials were refused" costs an operator an hour of reading bucket
+// policies.
 func TestVersioningCheckLeadsWithWhatActuallyHappened(t *testing.T) {
 	tests := []struct {
 		name      string

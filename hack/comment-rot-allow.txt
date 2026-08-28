@@ -36,14 +36,7 @@
 # comments that named a live one.
 internal/agent/loop.go:Loop.heartbeat:remote               # "The heartbeat used to carry the host's remote backlog" — past tense, and the next clause says what replaced it
 internal/agent/loop.go:Loop.heartbeat:uploader             # same sentence: "It went with the uploader (ADR-0026 increment 4.5)"
-internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:gc     # the trailing note listing §7's OperationKind (…|recovery|flatten|gc) as vocabulary that went with the operations table
 internal/lifecycle/lifecycle.go:SnapshotState.PredecessorNames:remote # same note: "ADR-0026 withdrew the remote half, so the local ACK is the *only* contract and there is nothing left to select"
-internal/obs/metrics.go:Catalog:checkpoint                 # the Catalog's trim note, listing what three quarters of the old entries measured
-internal/obs/metrics.go:Catalog:compaction                 # same sentence
-internal/obs/metrics.go:Catalog:gc                         # same sentence
-internal/obs/metrics.go:Catalog:objectize                  # same sentence
-internal/obs/metrics.go:Catalog:remote                     # same sentence, naming "the WAL-remote block" as the first thing ADR-0026 withdrew
-internal/obs/metrics.go:Catalog:warm-standby               # same sentence. A metric declared for a mechanism nobody has "reads as a plan", which is this check's thesis in the tree already
 
 # --- somebody else's mechanism, spelled the same --------------------------------------
 # The reason this check matches whole words rather than substrings, and the reason it can
@@ -61,13 +54,11 @@ internal/simio/real/objectstore.go:ObjectStore.Restore:gc  # the operator step b
 internal/simio/real/s3.go:ErrBucketNotVersioned:gc         # quotes INV-14 to say what is false on an unversioned bucket. The sentinel is returned by a live check
 internal/simio/real/s3.go:NewS3Store:gc                    # "refuses a bucket the GC could not undo a delete on" — a property of the bucket, in the constructor that enforces it
 internal/simio/real/s3.go:S3Store.Delete:gc                # "the object stays recoverable and the GC cannot destroy data" — the guarantee this Delete provides, whoever ends up calling it
-internal/simio/real/s3.go:S3Store.Restore:gc               # quotes INV-14 ("a GC mistake costs a restore, not the data") as the argument this method's place on the production path rests on. The sweep that used to be named as the placer of the marker was corrected to Delete on 2026-08-11; what is left is the rule, and Restore is the half of it that runs
 
 # --- the lease is live; these say so about the right thing ----------------------------
 internal/agent/loop.go:Loop.giveUpWhatIsNoLongerOurs:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use
 internal/metadata/metadata.go:Store.Now:lease-valid          # about the Control Plane granting an epoch "while the old writer's monotonic lease is still valid" — mutual exclusion, the one part of fencing V1 keeps
 
 # --- naming a withdrawn mechanism to say it is gone, and two forward references --------
-internal/controlplane/clone.go:KeyRewrapper:checkpoint # "was EROFS plus a checkpoint plus a cached WAL, which ADR-0026 deleted" — the sentence exists to say the mechanism is gone. Moved here from Clone when the re-wrap gave the comment a new home.
 internal/qcow/chain.go:overlay:compaction              # "§19 already owns flattening, as compaction, outside the recovery path" — compaction is v6 §23.7 and is ahead of this tree, not behind it. The comment is why a recovery does NOT flatten.
 internal/recovery/recovery.go:maxRestoreDepth:compaction # the depth ceiling exists because nothing compacts yet; the mention is the reason for the number, and it goes when §23.7 lands.

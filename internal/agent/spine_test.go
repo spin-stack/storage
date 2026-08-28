@@ -120,22 +120,14 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	}
 }
 
-// TestARefusalCrossesTheSpineAndClears is the same seam for the fact the report could
-// not carry until now: this host is **not serving** a volume, and why.
+// TestARefusalCrossesTheSpineAndClears is the same seam for the fact the report could not
+// carry until now: this host is **not serving** a volume, and why. It is here rather than
+// in a cpserver unit test because every component was right on its own and the fleet still
+// could not see a volume that had stopped serving — nothing on the wire said so.
 //
-// It is here rather than in a cpserver unit test because the failure it closes is a seam
-// failure. Every component was right on its own — the Agent refused correctly, the
-// Control Plane recorded watermarks correctly, `-fleet-status` printed the row correctly
-// — and the fleet still could not see a volume that had stopped serving, because nothing
-// on the wire said so. The proof has to be a report leaving the Agent and a catalog row
-// coming back changed.
-//
-// Three properties, and the second and third are the ones a watermark does not need:
-//
-//   - it lands, with the sentence an operator reads;
-//   - it clears when the volume serves again, with nothing sweeping it;
-//   - a host the fleet has moved past cannot write it, so a slow report from a fenced
-//     writer cannot mark a volume its successor is serving perfectly well.
+// Three properties: it lands with the sentence an operator reads; it clears when the
+// volume serves again, with nothing sweeping it; and a host the fleet has moved past
+// cannot write it.
 func TestARefusalCrossesTheSpineAndClears(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())
 	md := metasim.New(clk.Wall)
@@ -242,15 +234,11 @@ func (r *ramp) Read(p []byte) (int, error) {
 }
 
 // TestTheAgentCanOpenAVolume closes the last of the three holes the spine left: the
-// desired state told the Agent a volume's geometry and epoch and nothing about how
-// to read a byte of it. Every payload on this path is sealed with the volume's DEK
-// (§15.1), so "attach this volume" without key material is an instruction the Agent
-// cannot carry out.
+// desired state told the Agent a volume's geometry and epoch and nothing about how to read
+// a byte of it, and every payload on this path is sealed with the volume's DEK (§15.1).
 //
-// It runs the whole way round — the Agent asks the real handler over HTTP, and what
-// comes back is unwrapped with the KEK a host's KMS holds — because the property is
-// not "a field arrived" but "the material is usable". A wrapped DEK that unwraps to
-// the wrong bytes, or that the Control Plane truncated on the way through, would
+// It runs the whole way round because the property is not "a field arrived" but "the
+// material is usable": a wrapped DEK the Control Plane truncated on the way through would
 // pass a field-by-field assertion and fail here.
 func TestTheAgentCanOpenAVolume(t *testing.T) {
 	clk := sim.NewClock(time.Unix(1_700_000_000, 0).UTC())

@@ -1,21 +1,11 @@
 // Package recovery rebuilds a volume's published chain on a host that has never seen it,
-// from the object store alone (v6 §14, §23.4).
-//
-// It is the mirror image of internal/publisher: the same collaborators, the opposite
-// direction. publisher turns a sealed layer on this disk into a commit in the bucket;
-// this turns a commit chain in the bucket into layers on this disk, repointed at each
-// other, ready for internal/qcow to mint a tip over. The split is the same one: qcow owns
-// a volume's local chain and decides *when* something happens to it; this is *what*
+// from the object store alone (v6 §14, §23.4). It is internal/publisher in reverse: qcow
+// owns a volume's local chain and decides *when* something happens to it; this is *what*
 // happens, and it is the half that needs a key and a bucket.
 //
-// # Why this exists at all
-//
-// Without it, a volume with published commits, placed on a host that holds no local copy,
-// gets `qemu-img create` and its guest gets a blank disk — silent data loss, and the same
-// shape as the clone that read zeros. So the refusal is the product here, not the
-// rebuild: every failure below returns ErrIncomplete and leaves nothing behind that could
-// be mistaken for a chain. Half a volume is worse than no volume, because a guest will
-// boot it.
+// The refusal is the product here, not the rebuild: without it a volume with published
+// commits, placed on a host holding no local copy, gets `qemu-img create` and its guest
+// gets a blank disk. Half a volume is worse than no volume, because a guest will boot it.
 package recovery
 
 import (
@@ -35,16 +25,14 @@ import (
 )
 
 // ErrIncomplete means this volume has published commits and this host could not assemble
-// all of them: a manifest that is not there, a layer that is not there, a digest that
-// does not match, a chain that does not resolve. It is a refusal and never a partial
-// chain — the caller's only correct response is to refuse the volume, because the one
-// thing it must not do is create a fresh empty layer for a volume that already has one.
+// all of them: a manifest or layer that is not there, a digest that does not match, a
+// chain that does not resolve. It is a refusal and never a partial chain — the one thing
+// the caller must not do is create a fresh empty layer for a volume that already has one.
 //
-// commit.ErrNoHead is the other answer and it is not this one: it means the volume has
-// never published anything, so an empty chain is *correct*. It is returned wrapped, and
-// the two are told apart with errors.Is. A single error type covering both would make
-// "the bucket is unreachable" and "this volume is new" the same sentence, which is the
-// defect this package was written to close.
+// commit.ErrNoHead is the other answer and means the volume has never published, so an
+// empty chain is *correct*; it is returned wrapped and the two are told apart with
+// errors.Is. One error type for both would make "the bucket is unreachable" and "this
+// volume is new" the same sentence.
 var ErrIncomplete = errors.New("recovery: this volume's published chain could not be rebuilt in full")
 
 // maxRestoreDepth bounds the walk.
@@ -63,19 +51,15 @@ const maxRestoreDepth = 256
 // may vouch for, and that a guest would boot.
 const partSuffix = ".part"
 
-// Keys hands over a volume's wrapped key material. It is agent.Loop in production — the
-// same object publisher.Keys names, declared again here because the two packages consume
-// it independently and neither is the other's client.
+// Keys hands over a volume's wrapped key material; agent.Loop in production.
 type Keys interface {
 	VolumeKeys(ctx context.Context, volumeID string) (agent.VolumeKeys, error)
 }
 
-// Files is the filesystem a rebuild needs, by absolute path.
-//
-// Deliberately not simio's disk.Disk: that namespace is relative names rooted at the data
-// directory, this one is absolute paths handed to another process, and a component
-// straddling the two is the `--data-dir applied twice` defect with a second process added
-// to it. real.Paths is the production implementation, the same one qcow.Paths takes.
+// Files is the filesystem a rebuild needs, by absolute path. Not simio's disk.Disk: that
+// namespace is relative names rooted at the data directory, and a component straddling the
+// two is the `--data-dir applied twice` defect with a second process added to it.
+// real.Paths is the production implementation.
 type Files interface {
 	// Paths is embedded whole because qcow.ReadState/WriteState take it: this package
 	// and qcow.Manager both write `state.json`, and two spellings of one format is how
@@ -89,10 +73,8 @@ type Files interface {
 	Remove(path string) error
 }
 
-// Runner runs qemu-img and returns its standard output. Structurally qcow.Runner —
-// real.Runner satisfies both — declared here because this is where it is consumed, and
-// because a qcow2 parser of our own is forbidden (v6 §7): every question about an offline
-// image is another process's answer.
+// Runner runs qemu-img and returns its standard output. A qcow2 parser of our own is
+// forbidden (v6 §7): every question about an offline image is another process's answer.
 type Runner interface {
 	Run(ctx context.Context, name string, args ...string) ([]byte, error)
 }
@@ -159,14 +141,11 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 	if err := r.files.MkdirAll(qcow.LayersDir(r.root, volumeID)); err != nil {
 		return qcow.Restored{}, fmt.Errorf("%w: making the layer directory for volume %s: %w", ErrIncomplete, volumeID, err)
 	}
-	// What this host already holds, from the record qcow.Manager writes on every
-	// successful publish. It is what makes a re-placement onto a host that has most of
-	// the chain skip most of the downloads, and it cannot be replaced by hashing the
-	// local files: `qemu-img rebase -u` rewrites a layer's header, so a repointed layer
-	// no longer hashes to the object it came from — measured, 40 bytes differ, same
-	// length. That is also its liability: a state file that is intact but wrong (hand
-	// edited, or restored from another host's backup) makes a restore skip a download it
-	// should have made. The framing catches corruption, not authorship.
+	// What this host already holds, so a re-placement skips most downloads. It cannot be
+	// replaced by hashing the local files: `qemu-img rebase -u` rewrites a layer's header,
+	// so a repointed layer no longer hashes to the object it came from (measured: 40 bytes
+	// differ, same length). Its liability is a state file that is intact but wrong — the
+	// framing catches corruption, not authorship.
 	st, err := qcow.ReadState(r.files, r.root, volumeID)
 	if err != nil {
 		return qcow.Restored{}, fmt.Errorf("%w: %w", ErrIncomplete, err)
@@ -217,15 +196,12 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 	return qcow.Restored{Base: parent, VirtualSize: headManifest.VirtualSize, HeadCommitID: head.CommitID}, nil
 }
 
-// walk follows parent_commit_id back from HEAD and returns the chain oldest-first, which
-// is the order it has to be rebuilt in: a layer is repointed at a parent that is already
-// on disk.
+// walk follows parent_commit_id back from HEAD and returns the chain oldest-first, the
+// order it must be rebuilt in: a layer is repointed at a parent already on disk.
 //
-// Both refusals here are about a history that cannot be walked rather than one that is
-// merely long. A repeated commit id is a cycle in the bucket — commit.Publish has already
-// shipped one self-parent bug, caught by a cycle test — and following it is an infinite
-// download. A repeated *layer* id is two commits claiming one file, which would rebase a
-// layer onto itself.
+// A repeated commit id is a cycle in the bucket — commit.Publish shipped one self-parent
+// bug — and following it is an infinite download. A repeated *layer* id is two commits
+// claiming one file, which would rebase a layer onto itself.
 func (r *Recoverer) walk(ctx context.Context, volumeID, headCommitID string) ([]commit.Manifest, error) {
 	var newestFirst []commit.Manifest
 	seenCommit := map[string]bool{}
@@ -261,13 +237,10 @@ func (r *Recoverer) walk(ctx context.Context, volumeID, headCommitID string) ([]
 	return oldestFirst, nil
 }
 
-// checkGeometry takes the volume's size from the commit and not from the catalog.
-//
-// A manifest whose virtual size differs from the head's would mean a resize, which this
-// system does not have; a caller whose size differs from the head's means the catalog row
-// and the bucket disagree about how big somebody's disk is. Neither is guessed at: the
-// number decides how big a device the guest is handed, and the commit is the thing that
-// describes the bytes.
+// checkGeometry takes the volume's size from the commit and not from the catalog. A
+// manifest differing from the head's would mean a resize, which this system does not have;
+// a caller differing from it means the catalog row and the bucket disagree about how big
+// somebody's disk is. The number decides the size of the device the guest is handed.
 func checkGeometry(volumeID string, sizeBytes int64, head commit.Manifest, manifests []commit.Manifest) error {
 	want := head.VirtualSize
 	for _, m := range manifests {
@@ -285,11 +258,8 @@ func checkGeometry(volumeID string, sizeBytes int64, head commit.Manifest, manif
 
 // materialize puts one layer's plaintext qcow2 at path.
 //
-// held is the durable record saying this host already has this commit's layer, and it is
-// only believed together with the file being there. That pair is the whole of "a
-// re-placement onto a host that has most of the chain does not download all of it": the
-// layer was either published by this host or fetched by an earlier restore, and in both
-// cases it is already backed by the local parent.
+// held — the durable record that this host already has this commit's layer — is believed
+// only together with the file being there.
 func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool) error {
 	if held {
 		there, err := r.files.Exists(path)
@@ -305,11 +275,9 @@ func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m c
 	if err != nil {
 		return fmt.Errorf("%w: creating %s: %w", ErrIncomplete, part, err)
 	}
-	// commit.Fetch checks the digest over the bytes as stored *before* unsealing one of
-	// them, then GCM-authenticates every frame with the volume and layer id as additional
-	// data — so a layer moved under another layer's manifest fails to open rather than
-	// decrypting into the wrong chain. Not reimplemented here; there must be one answer
-	// to "is this the object the manifest named".
+	// commit.Fetch checks the digest over the bytes as stored before unsealing and
+	// GCM-authenticates every frame; there must be one answer to "is this the object the
+	// manifest named".
 	if err := commit.Fetch(ctx, r.store, enc, m, w); err != nil {
 		_ = w.Close()
 		r.discard(part)
@@ -331,22 +299,16 @@ func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m c
 // garbage, not a chain — the next attempt truncates it.
 func (r *Recoverer) discard(part string) { _ = r.files.Remove(part) }
 
-// repoint makes a layer's header name the parent where it actually landed, and then
-// checks that it does.
+// repoint makes a layer's header name the parent where it actually landed, then checks it.
 //
-// `-F qcow2` is mandatory, not decoration: without it qemu-img exits 1 with "backing file
-// format must be specified" (measured against the pinned 11.1.1). `-u` is what makes this
-// O(1) — it rewrites the header and does not touch a cluster, which is correct because
-// the parent's *contents* are the same bytes wherever the file sits.
+// `-F qcow2` is mandatory: without it qemu-img exits 1 with "backing file format must be
+// specified" (measured against the pinned 11.1.1). `-u` rewrites the header and touches no
+// cluster. Run unconditionally, including on a layer already held: it is idempotent.
 //
-// It is run unconditionally, including on a layer that was skipped as already held: it is
-// one process, it is idempotent, and a conditional here is a branch that can be wrong.
-//
-// The check afterwards is not defensive. `rebase -u` onto a wrong-but-existing parent is
+// The check afterwards is not defensive: `rebase -u` onto a wrong-but-existing parent is
 // accepted in complete silence (measured: a later `convert -O raw` succeeded with no
-// warning), which is the same hazard qcow.Rotate guards with the same comparison. A chain
-// root that claims a backing file is a clone lineage, which the commit protocol does not
-// express yet, and it is refused rather than guessed at.
+// warning). A chain root that claims a backing file is a clone lineage, which the commit
+// protocol does not express yet.
 func (r *Recoverer) repoint(ctx context.Context, m commit.Manifest, path, parent string) error {
 	if parent != "" {
 		if _, err := r.run.Run(ctx, r.qemuImg,
@@ -441,33 +403,17 @@ func (r *Recoverer) Current(ctx context.Context, volumeID string) (string, error
 	return head.CommitID, nil
 }
 
-// Absent is the Recovery a host has when it was started with no object store.
-//
-// It exists so that "this Agent cannot publish" and "this Agent may hand a guest a blank
-// disk" stay different sentences. qcow.Deps.Recovery is not optional, and this is why: a
-// nil there, or a bool the caller computes, is a thing a wiring change forgets — and the
-// thing it forgets is the one that decides whether a volume with published commits
-// somewhere else is refused or served empty.
-//
-// Every question it is asked is answered "I could not look", which qcow turns into a
-// refusal. A volume that genuinely has no history is refused too, on a host configured
-// this way, and that is the right trade: the alternative is guessing, and the guess that
-// is wrong hands a guest somebody's data as zeros.
+// Absent is the Recovery a host has when it was started with no object store. It is a
+// type rather than a nil or a caller-computed bool in qcow.Deps.Recovery, because what a
+// wiring change forgets is the decision between refusing a volume with published commits
+// elsewhere and serving it empty.
 type Absent struct{}
 
-// Restore answers that the volume has never published.
-//
-// It is the honest answer and not a shrug: a deployment with no object store has never
-// published anything, so no volume in it has a history and every one of them is new. The
-// first version of this refused instead, on the argument that a host which cannot look
-// must not guess — and it broke every single-machine deployment, which is a configuration
-// this system supports and documents.
-//
-// What that argument was really about is a host that *did* publish and is now started
-// against no store. That case is caught where the evidence is: this host's own state.json
-// records the commits whose layers it holds, and qcow.Open refuses a volume whose record
-// names commits it cannot reach. Ignorance is distinguished from knowledge by the file
-// this host wrote, not by the flag it was started with.
+// Restore answers that the volume has never published: a deployment with no object store
+// has published nothing, so every volume in it is new. Refusing instead broke every
+// single-machine deployment. The case that refusal was for — a host that did publish and
+// is now started against no store — is caught by qcow.Open reading this host's own
+// state.json, which names the commits whose layers it holds.
 func (Absent) Restore(context.Context, string, int64) (qcow.Restored, error) {
 	return qcow.Restored{}, fmt.Errorf("%w: this Agent was started with no object store", commit.ErrNoHead)
 }

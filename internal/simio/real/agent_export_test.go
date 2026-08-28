@@ -1,38 +1,17 @@
 package real_test
 
-// A metric leaving a *process*, which is the one thing nothing here had ever observed.
+// A metric leaving a *process*: the exporter's own test proves it exports and obs's tests
+// prove the catalog aggregates, both in-process, and the chain between them was never run
+// — a volume-agent that built its Provider and dropped it satisfies all of them. So this
+// starts the real binary, with the flags an operator types, against a collector on a real
+// socket, and asserts on what the collector decoded.
 //
-// `TestOTLPExporterDeliversARecordedMetricToACollector` next door proves the exporter
-// exports and `obs`'s own tests prove the catalog aggregates, both in-process. The Agent
-// then builds the exporter from -otlp-endpoint and hands the Recorder down. Every link
-// is covered and **the chain was never run**: a `volume-agent` that
-// built its Provider and dropped it, or wired a Recorder nothing reached, or exited
-// without the flush, satisfies every one of those tests. That is exactly the seam
-// CLAUDE.md's "build it thin, end to end" table is made of — `HostID` never set, the WAL
-// under `<dir>/<dir>`, the queue loop that never restarted — each of them one field in a
-// `main` with a well-tested package underneath.
-//
-// So this starts the real binary, with the flags an operator types, against a collector
-// on a real socket, and asserts on what the collector decoded: a metric name, a value,
-// and the label carrying the host id that was passed on the command line.
-//
-// **Why the test lives here.** Its honest home is `integration/e2e`, which already runs
-// both binaries against a real Postgres and RustFS — and that file set belongs to another
-// track this wave, so putting it there would mean editing files this lane does not own.
-// Two consequences of landing it here instead, and both are arguments for it rather than
-// against:
-//
-//   - it runs in `task test`, on every push, with no Docker and no containers. The e2e
-//     lane is Docker-gated; this proof is not, because a fake Control Plane over httptest
-//     and a filesystem object store are all an Agent with no volume needs;
-//   - `internal/simio/real` is where the exporter's socket lives (INV-01), so the package
-//     whose code opens the connection is the package whose test watches the bytes land.
-//
-// `internal/testinfra` has process-driving machinery and was rejected for a mechanical
-// reason: it is behind `//go:build integration || e2e`, so importing it would tag this
-// test out of `task test` and into a lane that needs Docker — trading the proof's reach
-// for about forty lines of process handling. If this ever moves to `integration/e2e`, the
-// move is a package rename and a swap of `startAgent` for `testinfra.Start`.
+// Its honest home is integration/e2e; it lives here because that lane is Docker-gated and
+// this proof needs none (a fake Control Plane over httptest and a filesystem object store
+// are all an Agent with no volume needs), and because internal/simio/real is where the
+// exporter's socket lives (INV-01). internal/testinfra was rejected mechanically: it is
+// behind `//go:build integration || e2e`, so importing it would tag this test out of
+// `task test`.
 
 import (
 	"bufio"
@@ -112,10 +91,8 @@ func TestARunningAgentDeliversItsLeaseGaugeToACollector(t *testing.T) {
 	// race the very line under test.
 	waitFor(t, cp.reported, "the Agent never completed a reconciliation cycle", agent)
 
-	// SIGTERM, and then the process's own exit status: the flush that carries this
-	// sample happens in a deferred Shutdown after the volumes are settled, so a test
-	// that killed the Agent would be asserting on nothing, and one that never waited
-	// would race the POST.
+	// SIGTERM, then the process's own exit status: the flush that carries this sample
+	// happens in a deferred Shutdown, so a killed Agent would be asserting on nothing.
 	agent.stop(t)
 
 	dp := lastPoint(t, metrics.gauges(), leaseGauge, metrics)
@@ -275,19 +252,10 @@ func pointAttr(dp *metricspb.NumberDataPoint, key string) string {
 	return ""
 }
 
-// buildVolumeAgent compiles the binary under test. Built here rather than resolved out of
-// _output/bin, which is what the e2e lane does: that path exists only after `task
-// build:cmd`, so depending on it would make this proof skip on a developer's machine —
-// and a proof that skips is how this repository shipped three documents claiming a lane
-// no test performed.
-// stubQemuImg writes something that answers `qemu-img --version` and nothing else.
-//
-// The Agent runs qemu-img once at start-up, to refuse an unusable one before it
-// registers as a healthy host, and after that only when it has a volume's chain to
-// create or inspect. The Control Planes in this file hand out no volumes, so the stub is
-// never asked for anything real — and that is the reason this test can keep running in
-// `task test`, with no Docker and nothing extracted into _output, which is the property
-// the comment at the top of this file argues for.
+// stubQemuImg writes something that answers `qemu-img --version` and nothing else. The
+// Agent runs it once at start-up to refuse an unusable one before registering as healthy;
+// the Control Planes in this file hand out no volumes, so it is never asked for anything
+// real.
 func stubQemuImg(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "qemu-img")
@@ -297,6 +265,8 @@ func stubQemuImg(t *testing.T) string {
 	return path
 }
 
+// buildVolumeAgent compiles the binary under test rather than resolving _output/bin,
+// which exists only after `task build:cmd` and would make this proof skip locally.
 func buildVolumeAgent(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "volume-agent")
@@ -309,9 +279,7 @@ func buildVolumeAgent(t *testing.T) string {
 	return bin
 }
 
-// agentProcess is a started volume-agent and the lines it has printed. Forty lines of
-// process handling rather than internal/testinfra's, for the build-tag reason at the top
-// of this file.
+// agentProcess is a started volume-agent and the lines it has printed.
 type agentProcess struct {
 	cmd     *exec.Cmd
 	drained chan struct{}

@@ -71,15 +71,11 @@ type simObject struct {
 	// listable (listReady) or waiting for Settle (eventualList).
 	visibleAt uint64
 	// marked models a versioned bucket's delete marker (§21.3): the object stops
-	// answering reads and listings, and its bytes stay until the lifecycle sweeps
-	// them. Nothing in this package removes a marked object's data — that is the
-	// structural half of INV-14.
+	// answering reads and listings and its bytes stay — nothing here removes them, which
+	// is the structural half of INV-14.
 	marked bool
-	// superseded records that the object was written again *after* it was marked, so
-	// the marked version is no longer what a Restore would surface. Answering such a
-	// restore with the newer bytes is the one outcome an operator must never get:
-	// they believe the un-GC runbook worked and rebuild a volume from content that
-	// was never the content that was marked (§21.3).
+	// superseded records that the object was written again *after* it was marked, so the
+	// marked version is no longer what a Restore would surface (ErrRestoreSuperseded).
 	superseded bool
 	createdAt  time.Time
 	// prev is the version this one replaced, retained only so InjectStaleRead can
@@ -125,12 +121,9 @@ func (s *ObjectStore) SetEventualList(eventual bool) {
 // operations, modelling an eventually consistent listing that catches up by itself
 // (§6.1). n <= 0 restores a strongly consistent LIST.
 //
-// This is the seed-drivable form of SetEventualList: a scenario picks n from its PRNG
-// and the catch-up lands at a different point relative to the promotion, the boundary
-// write, or the GC's second listing on every seed, while the run stays reproducible —
-// the counter is operations, not time, so it advances only when the scenario acts.
-// SetEventualList(true) is the same thing with an unbounded lag, and takes precedence
-// while it is on.
+// The counter is operations, not time, so a scenario can draw n from its PRNG and stay
+// reproducible. SetEventualList(true) is the same thing with an unbounded lag, and takes
+// precedence while it is on.
 func (s *ObjectStore) SetListLag(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -228,25 +221,20 @@ func (s *ObjectStore) InjectStaleRead(key string) {
 }
 
 // InjectStaleListing makes the next n listings that would return something answer from
-// an index replica that is *behind the data*: each of them omits a non-empty set of
-// the most recently written keys it would otherwise report, r deciding how far behind
-// each one is.
+// an index replica that is *behind the data*: each omits a non-empty set of the most
+// recently written keys, r deciding how far behind it is.
 //
-// This is the fault SetEventualList and SetListLag cannot express, and the direction
-// that matters. Both of those withhold a key that no listing has served yet and then
-// let it catch up, so every number derived from a listing only ever grows. A real
-// eventually consistent LIST offers no monotonic-read guarantee at all: two listings a
-// moment apart can be served by different index replicas, and the second can be the
-// older one. Everything the system derives from a listing is a *number* —
-// recovery.DurablePrefix's contiguous prefix, the checkpointer's published point, the
-// boundary a promotion writes into a create-only object — and a listing that goes
-// backwards makes that number smaller with no error anywhere.
+// This is the direction SetEventualList and SetListLag cannot express — they withhold
+// keys nobody has seen yet, so every number derived from a listing only ever grows. A
+// real LIST offers no monotonic-read guarantee: the second of two listings can be served
+// by the older replica. Everything the system derives from a listing is a number
+// (recovery's contiguous prefix, the checkpointer's published point, a promotion's
+// boundary), and a listing that goes backwards shrinks it with no error.
 //
-// Determinism (INV-02): the draw is taken once per affected listing, after the keys
-// have been sorted, and orders them by write order with the key as a total tie-break,
-// so it never depends on map iteration. Listings that would return nothing do not
-// consume the budget — a fault nobody can observe should not be spent. n <= 0 or a nil
-// r is a no-op.
+// The draw is taken once per affected listing, after the keys are sorted, and orders them
+// by write order with the key as tie-break, so it never depends on map iteration
+// (INV-02). A listing that would return nothing does not spend the budget. n <= 0 or a
+// nil r is a no-op.
 func (s *ObjectStore) InjectStaleListing(r *rand.Rand, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -437,10 +425,8 @@ func (s *ObjectStore) List(_ context.Context, prefix string) ([]objectstore.Obje
 	return s.dropRecentWrites(out), nil
 }
 
-// Delete places a delete marker over the object (§21.3). It never destroys data: the
-// bytes remain and Restore brings them back, which is what makes a GC mistake
-// survivable (INV-14). Permanent removal belongs to the bucket lifecycle, which this
-// interface deliberately cannot reach.
+// Delete places a delete marker over the object (§21.3); the bytes remain and Restore
+// brings them back (INV-14).
 func (s *ObjectStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

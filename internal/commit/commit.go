@@ -2,8 +2,6 @@
 // describes one layer, and the single mutable object that says which manifest is
 // current.
 //
-// # What a commit promises, and what these three objects do about it
-//
 // `Commit() → SUCCESS` promises that this state is reconstructible without the host that
 // wrote it. Everything here serves that one sentence:
 //
@@ -19,14 +17,9 @@
 // The order is `PUT layer → PUT manifest → CAS HEAD`, never the reverse (v6 §9). What
 // each reversal costs is in Publish.
 //
-// # Why there is no `created_at`
-//
-// v6 §12 drew one. A commit id is a v7 UUID (INV-22), which *is* a timestamp — a
-// millisecond one, in the leading 48 bits, and the reason the ids are v7 at all is so
-// that ordering and time are properties of the identifier rather than fields beside it.
-// A second timestamp would have to come from a wall clock this Agent does not have
-// (INV-01 gives it a monotonic instant, which cannot be rendered as a date) and would be
-// a field that can disagree with the id it sits next to. §12 was corrected.
+// No `created_at`, against v6 §12: a commit id is a v7 UUID, so its leading 48 bits are
+// the millisecond timestamp. A second one would need a wall clock INV-01 does not give
+// this Agent, and could disagree with the id beside it.
 package commit
 
 import (
@@ -43,10 +36,7 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// The failures a caller branches on. Each is a different next move, and the two that
-// look alike are the ones worth separating: a HEAD that moved under us is a fencing
-// question for a human, while a manifest that is already there is the ordinary shape of
-// a retry.
+// The failures a caller branches on.
 var (
 	// ErrHeadMoved means the compare-and-set lost: something else published while this
 	// commit was being assembled. **Nothing overwrites HEAD after this.** With a correct
@@ -56,12 +46,10 @@ var (
 	// ErrManifestConflict means a *different* manifest already occupies this commit id.
 	// A retry of our own is not this — that is byte-identical and reported as success.
 	//
-	// It wraps ErrHeadMoved, and that is not tidiness. With v7 ids two hosts cannot pick
-	// one commit id by chance, so the only way here is a host publishing under an id
-	// another host has already used for different content — which is the same statement
-	// as a HEAD that moved: this host is not the volume's writer any more. It was its own
-	// unrelated error until an adversary took a volume away from a host mid-commit and
-	// watched it be told something nothing fences on, and keep the guest's disk.
+	// It wraps ErrHeadMoved because with v7 ids the only way here is a host publishing
+	// under an id another host has already used for different content, which is the same
+	// statement: this host is not the volume's writer any more. Anything callers do not
+	// fence on lets a fenced host keep the guest's disk.
 	ErrManifestConflict = fmt.Errorf("%w: another manifest already exists at this commit id", ErrHeadMoved)
 	// ErrNoHead means the volume has never published a commit.
 	ErrNoHead = errors.New("commit: this volume has no HEAD")
@@ -122,15 +110,12 @@ type Head struct {
 	CommitID      string `json:"commit_id"`
 }
 
-// LayerKey is where a sealed layer lives, addressed by the digest of the bytes as
-// stored.
+// LayerKey is where a sealed layer lives, addressed by the digest of the bytes as stored.
 //
-// Global, not under the volume's prefix, and that is deliberate against CLAUDE.md's
-// usual rule that a volume's id names everything under its prefix. A lineage shares one
-// DEK, so a clone's chain references layers its parent wrote; under the parent's prefix,
-// deleting the parent would delete its clones' data. Content addressing also makes a
-// re-upload a no-op instead of an orphan, which is what makes step 11 of v6 §9 safe to
-// retry.
+// Global rather than under the volume's prefix: a lineage shares one DEK, so a clone's
+// chain references layers its parent wrote, and under the parent's prefix deleting the
+// parent would delete its clones' data. Content addressing also makes a re-upload a no-op
+// instead of an orphan, which is what makes step 11 of v6 §9 safe to retry.
 func LayerKey(sha256hex string) string {
 	return "layers/sha256/" + sha256hex[0:2] + "/" + sha256hex[2:4] + "/" + sha256hex
 }
@@ -146,18 +131,14 @@ func HeadKey(volumeID string) string { return "volumes/" + volumeID + "/HEAD" }
 // ErrBadIdentifier means an object carries an id that is not a v7 UUID where one is
 // required.
 //
-// It is checked at both boundaries — on the way out and on the way in — because these
-// strings do not stay strings. A commit id becomes an object key, a layer id becomes a
-// *filesystem path* on whichever host rebuilds the volume, and a manifest is a document
-// somebody else may have written into the bucket. Adversarial tests found both ends of
-// that: a manifest whose layer_id was `../../<other volume>/layers/<id>` made a restore
-// create and delete a file outside the volume's directory, and a Publish called with an
-// empty commit id wrote `commits/.json` and pointed HEAD at "".
+// Checked at both boundaries, because these strings do not stay strings: a commit id
+// becomes an object key and a layer id becomes a *filesystem path* on whichever host
+// rebuilds the volume. A manifest whose layer_id was `../../<other volume>/layers/<id>`
+// made a restore create and delete a file outside the volume's directory; a Publish with
+// an empty commit id wrote `commits/.json` and pointed HEAD at "".
 //
-// The check is UUID-shaped rather than "no slashes" on purpose. INV-22 says every id in
-// this system is a v7 UUID, so anything else is already wrong, and a rule that lists the
-// characters an attacker may not use is a rule that is one encoding away from being
-// wrong.
+// UUID-shaped rather than "no slashes": a rule listing the characters an attacker may not
+// use is one encoding away from being wrong.
 var ErrBadIdentifier = errors.New("commit: an identifier is not a UUID")
 
 // checkID refuses anything that is not a UUID. An empty string is refused too, except
@@ -210,15 +191,11 @@ func Digest(body []byte) string {
 // WriteManifest publishes a commit manifest create-only, and treats a retry of the same
 // manifest as the success it is.
 //
-// The idempotency is not a convenience. Step 12 of v6 §9 can be interrupted by anything
-// — the process, the host, the network — and the recovery from that is to do the whole
-// commit again. An object store that refused the second attempt would turn every
-// interrupted commit into an operator's problem; one that overwrote would let a
-// second writer replace a manifest a reader may already have followed.
-//
-// So: create-only, and if the key is taken, read what is there. Byte-identical is our
-// own retry landing twice. Anything else is somebody having used this commit id for
-// different content, which with v7 ids cannot happen by chance.
+// The recovery from an interrupted commit is to do the whole commit again, so refusing the
+// second attempt would make every interruption an operator's problem, and overwriting
+// would let a second writer replace a manifest a reader may already have followed. So: if
+// the key is taken, read it. Byte-identical is our own retry; anything else is a host
+// using this commit id for different content, which with v7 ids is not chance.
 func WriteManifest(ctx context.Context, store objectstore.Store, m Manifest) error {
 	// Stamped over whatever the caller put here rather than trusted, for the reason
 	// descriptor.Write states: a struct built by hand with a zero version would be
@@ -269,9 +246,7 @@ func ReadManifest(ctx context.Context, store objectstore.Store, volumeID, commit
 	if m.VolumeID != volumeID || m.CommitID != commitID {
 		return Manifest{}, fmt.Errorf("commit: %s describes volume %s commit %s", key, m.VolumeID, m.CommitID)
 	}
-	// And every identifier in it, before the caller turns one into a path. The two checks
-	// above say the object is the one that was asked for; this one says the object is
-	// one this system could have written.
+	// And every identifier in it, before the caller turns one into a path.
 	if err := m.validate(); err != nil {
 		return Manifest{}, fmt.Errorf("%s: %w", key, err)
 	}
@@ -350,10 +325,8 @@ func CASHead(ctx context.Context, store objectstore.Store, volumeID, commitID, e
 }
 
 // marshal frames the JSON. Callers stamp the version into their own value first — see
-// WriteManifest — because a helper that took a pointer to the field stamped the caller's
-// struct and serialised the copy it had already been handed. The property test caught it
-// on its first run, which is the whole reason that test draws the version rather than
-// setting it correctly.
+// WriteManifest — because a helper taking a pointer to the field stamped the caller's
+// struct and serialised the copy it had already been handed.
 func marshal(v any) ([]byte, error) {
 	body, err := json.Marshal(v)
 	if err != nil {
@@ -362,13 +335,10 @@ func marshal(v any) ([]byte, error) {
 	return framed.Frame(body), nil
 }
 
-// unmarshal checks the digest, decodes, and checks the version *before* the caller reads
-// a field.
-//
-// The order is the whole of it. json.Unmarshal silently discards fields it does not
-// know, so an object from a newer format decodes without complaint into whatever subset
-// this binary understands — a commit whose layer has a field this build never heard of,
-// followed anyway. The version check is what turns that into a refusal.
+// unmarshal checks the digest, decodes, then checks the version *before* the caller reads
+// a field: json.Unmarshal discards fields it does not know, so an object from a newer
+// format would otherwise decode into whatever subset this binary understands and be
+// followed anyway.
 func unmarshal(key string, body []byte, v any, version *int) error {
 	payload, err := framed.Unframe(body)
 	if err != nil {

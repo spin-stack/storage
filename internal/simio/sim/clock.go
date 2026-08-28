@@ -52,16 +52,12 @@ func (c *Clock) SetSkew(d time.Duration) {
 	c.skew = d
 }
 
-// InjectMonotonicRegression steps monotonic time *backwards* by d. Nothing legitimate
-// does this: it models the clock source itself breaking — a VM resumed from a
-// snapshot, a live migration, a hypervisor serving a bad CLOCK_MONOTONIC — which is a
-// fault the design has no defence against and every lease in the system trusts (§12.1).
-//
-// It exists so a checker can be proven to catch it. A lease that had correctly expired
-// reports itself valid again after a regression, un-fencing a writer the Control Plane
-// has already replaced; without an injector that outcome cannot be produced from a
-// scenario, and the monotonic-clock checker can only be proven against a fabricated
-// event. Timers are left where they are: a deadline already passed does not un-fire.
+// InjectMonotonicRegression steps monotonic time *backwards* by d, modelling the clock
+// source itself breaking — a VM resumed from a snapshot, a live migration, a hypervisor
+// serving a bad CLOCK_MONOTONIC — which the design has no defence against and every lease
+// trusts (§12.1). It exists so the monotonic-clock checker can be proven against a real
+// scenario rather than a fabricated event: a lease that had expired reports itself valid
+// again. Timers are left where they are: a deadline already passed does not un-fire.
 func (c *Clock) InjectMonotonicRegression(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -149,13 +145,9 @@ type simTimer struct {
 
 func (t *simTimer) C() <-chan clock.Instant { return t.ch }
 
-// fire marks the timer fired and delivers the instant. The flag is set under the
-// clock's lock because Stop reads it there: without that, a Sleep whose context is
-// cancelled while another goroutine Advances is a data race, and the race is not
-// theoretical — it decides whether Stop reports that it removed a timer that had
-// already fired. The send happens outside the lock: the channel is buffered, and
-// holding the clock while delivering would let a receiver's next clock call deadlock
-// against the sender.
+// fire marks the timer fired and delivers the instant. The flag is set under the clock's
+// lock because Stop reads it there; the send is outside it because holding the clock
+// while delivering would let a receiver's next clock call deadlock against the sender.
 func (t *simTimer) fire(now clock.Instant) {
 	t.clk.mu.Lock()
 	t.fired = true

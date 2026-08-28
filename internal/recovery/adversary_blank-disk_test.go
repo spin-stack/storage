@@ -92,14 +92,9 @@ func TestAdversaryALayerIdFromTheBucketWritesOutsideTheVolumeDirectory(t *testin
 	}
 }
 
-// osFiles is real.Paths, which is the production filesystem and now has the three verbs
-// recovery.Files adds to qcow.Paths.
-//
-// It was a hand-rolled os.* wrapper in this file, on the finding that real.Paths had none
-// of them — which was true and is fixed. Using the real one is also the stronger test: a
-// path escape is a property of how the *production* implementation resolves names, and a
-// stand-in that happened to resolve them the same way would prove only that the stand-in
-// does.
+// osFiles is real.Paths — the production filesystem — plus the three verbs recovery.Files
+// adds to qcow.Paths. The real one and not a stand-in, because a path escape is a property
+// of how the production implementation resolves names.
 type osFiles struct {
 	realio.Paths
 	mu    sync.Mutex

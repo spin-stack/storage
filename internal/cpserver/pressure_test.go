@@ -254,17 +254,10 @@ func TestPressureIgnoresAHostThatHasNotMeasuredItsDevice(t *testing.T) {
 	}
 }
 
-// The band is a policy the caller states, and this is what makes the flags that state
-// it more than decoration: with a band moved out of the way, a device that would have
-// cordoned at the default stays ACTIVE, and the *new* line is where the cordon happens.
-//
-// It exists because of what the first CI run this repository ever had found. A GitHub
-// runner's disk is 87% full, the Agent measures the filesystem holding --data-dir
-// including other tenants, and every host in the e2e lane therefore cordoned itself on
-// its first heartbeat — so every placement failed with "no host with capacity". The
-// product was right; the lane had been relying on this developer's /tmp being a roomy
-// tmpfs. The lane now states a band, and a stated band that did not actually move the
-// line would put the lane back where it was without saying so.
+// The band is a policy the caller states, and this is what makes the flags stating it more
+// than decoration: a band moved out of the way leaves a device ACTIVE that would have
+// cordoned at the default, and the cordon happens at the *new* line. The e2e lane depends
+// on it — cpserver.Band has the CI run that turned the constants into a flag.
 func TestAStatedBandMovesTheLine(t *testing.T) {
 	f := newFixture(t)
 	f.srv = cpserver.New(f.md, func() int64 { return f.term }, leaseTTL, cpserver.Band{Cordon: 0.95, Uncordon: 0.90})

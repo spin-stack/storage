@@ -26,14 +26,10 @@ func volID(b byte) [16]byte {
 	return v
 }
 
-// A wrapped DEK opens for the volume it was wrapped for, and for nothing else.
-//
-// This is the whole of the descriptor-swap defect, at the level where it can be fixed.
-// `volumes/<id>/descriptor.json` is digest-framed and nothing more, and a digest is not
-// authentication, so a bucket writer can move `dek_wrapped` from one volume's descriptor
-// into another's and leave every structural check passing. Until the volume was in the
-// AAD, every wrap in a fleet was made under the same four bytes — KeyID 1 — and the
-// moved blob unwrapped perfectly under the victim's id.
+// A wrapped DEK opens for the volume it was wrapped for, and for nothing else — the
+// descriptor-swap defect at the level where it can be fixed. Until the volume was in the
+// AAD, every wrap in a fleet was made under the same four bytes (KeyID 1), so a blob moved
+// between two digest-framed descriptors unwrapped perfectly under the victim's id.
 func TestAWrappedDEKOpensOnlyForItsOwnVolume(t *testing.T) {
 	kms := testKEK(t)
 	mine, yours := volID(1), volID(200)

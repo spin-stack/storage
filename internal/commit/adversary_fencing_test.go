@@ -25,21 +25,12 @@ func advPublish(t *testing.T, store objectstore.Store, enc *crypto.Encryption, v
 // TestAdversaryAFencedHostAppendsOntoItsSuccessorsHead is the split brain the epoch is
 // supposed to stop, arranged so that the compare-and-set cannot see it.
 //
-// host-a writes the volume at epoch 5 and seals a layer. The fleet decides host-a is
-// gone, raises the epoch, and hands the volume to host-b, which rebuilds the chain and
-// publishes its own commit at epoch 6. host-a is not gone: it still has the sealed layer,
-// the DEK it cached, and a route to the bucket. It publishes.
-//
-// The CAS does not stop it. host-a reads HEAD *after* host-b moved it, so the etag it
-// compares against is the current one and the write lands: the published history now ends
-// in a commit written by a host that was fenced two commits ago, whose layer is an overlay
-// of a chain that ended at host-a's own commit and not at host-b's. A recovery that walks
-// this history stacks host-a's clusters over host-b's and hands the result to a guest,
-// and host-b — the volume's actual writer — is refused on its next publish and stops.
-//
-// The manifest records the epoch and nothing reads it. Publish has every fact it needs at
-// the moment it decides: the epoch it was handed and the epoch of the commit it is about
-// to name as parent.
+// host-a writes at epoch 5 and seals a layer; the fleet fences it and host-b publishes at
+// epoch 6. host-a is not gone — it still has the layer, the cached DEK and a route to the
+// bucket — and it reads HEAD *after* host-b moved it, so the etag it compares against is
+// current and the write lands. A recovery then stacks host-a's clusters over host-b's,
+// and host-b is refused on its next publish. Publish has every fact it needs at the
+// moment it decides: its own epoch and the epoch of the commit it would name as parent.
 func TestAdversaryAFencedHostAppendsOntoItsSuccessorsHead(t *testing.T) {
 	t.Parallel()
 	volumeID := newID()
@@ -104,19 +95,13 @@ func (s *advFailHead) Put(ctx context.Context, key string, data []byte, opts obj
 	return s.Store.Put(ctx, key, data, opts)
 }
 
-// TestAdversaryALostRaceReportedAsSomethingOtherThanAFence is the same split brain seen
-// from the losing side, and the point is which sentinel comes back.
-//
-// host-a uploads its layer and its manifest and is interrupted before the CAS. host-b
-// takes the volume and publishes. host-a retries the commit it owes — the same commit id,
-// which is what makes a retry a retry — and now builds a manifest whose parent is host-b's
-// commit, which collides with the manifest it already wrote against the older parent.
-//
-// It comes back as ErrManifestConflict, and ErrManifestConflict is not what anything
-// fences on: qcow.Manager.publish stops a volume on commit.ErrHeadMoved alone and treats
-// every other publishing failure as an upload that will succeed later, keeping the guest's
-// disk attached. So the one host in the fleet that has proof it lost the volume goes on
-// serving it, retrying for ever, and the fleet reads it as healthy.
+// TestAdversaryALostRaceReportedAsSomethingOtherThanAFence is the same split brain from
+// the losing side, and the point is which sentinel comes back. host-a is interrupted
+// before its CAS, host-b takes the volume and publishes, and host-a's retry — same commit
+// id — now builds a manifest whose parent is host-b's commit and collides with the one it
+// already wrote. qcow.Manager.publish stops a volume on commit.ErrHeadMoved alone, so a
+// conflict reported as anything else leaves the one host with proof it lost the volume
+// serving the guest for ever while the fleet reads it as healthy.
 func TestAdversaryALostRaceReportedAsSomethingOtherThanAFence(t *testing.T) {
 	t.Parallel()
 	volumeID := newID()

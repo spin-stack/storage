@@ -31,15 +31,11 @@ UPDATE snapshots
    AND state = ANY(sqlc.arg(allowed_states)::text[]);
 
 -- name: ListPendingSnapshots :many
--- The snapshots a host has been asked to take (§19), for the desired state it is
--- handed. Joined through volumes rather than filtered on snapshots.source_host_id,
--- because the request names a *volume*: whichever host serves it when the request is
--- picked up is the one that can freeze it, and source_host_id is stamped on
--- completion by the host that actually did — which is what §20's placement rule 1
--- later reads.
---
--- Ordered by snapshot_id so a host with several outstanding takes them oldest first
--- (UUIDv7 is time-ordered, INV-22) and two Control Planes answer identically (INV-02).
+-- The snapshots a host has been asked to take (§19). Joined through volumes rather than
+-- filtered on snapshots.source_host_id, because the request names a *volume* and whichever
+-- host serves it can freeze it; source_host_id is stamped on completion, which is what
+-- §20's placement rule 1 later reads. Ordered by snapshot_id: oldest first (UUIDv7 is
+-- time-ordered, INV-22) and identical between two Control Planes (INV-02).
 SELECT sqlc.embed(s) FROM snapshots s
   JOIN volumes v ON v.volume_id = s.volume_id
  WHERE v.primary_host_id = $1
@@ -50,16 +46,11 @@ SELECT sqlc.embed(s) FROM snapshots s
 -- The snapshots nothing has closed out, fleet-wide, for a human reading the catalog.
 --
 -- The states come in as an array rather than being written here, the same move
--- SetSnapshotState makes with allowed_states: the §19 vocabulary's authority is
--- internal/lifecycle (SnapshotState.Unfinished), and a literal IN-list in SQL is a
--- second copy of a rule that would silently stop matching the day a state is added.
---
--- No index, deliberately. This is unfiltered by host on purpose — the stuck snapshot
--- is exactly the one whose volume has no primary, so ListPendingSnapshots's join
--- through volumes cannot return it — and an index on `state` would be maintained by
--- every snapshot write for the benefit of a query an operator runs by hand during an
--- incident. Add one when something on the data path asks this question, which is a
--- change to what this query is for, not a tuning.
+-- SetSnapshotState makes: the §19 vocabulary's authority is internal/lifecycle
+-- (SnapshotState.Unfinished), and a literal IN-list would stop matching the day a state is
+-- added. No index, deliberately: this is unfiltered by host on purpose — the stuck snapshot
+-- is the one whose volume has no primary — and an index on `state` would be maintained by
+-- every snapshot write for a query an operator runs by hand during an incident.
 SELECT * FROM snapshots
  WHERE state = ANY(sqlc.arg(states)::text[])
  ORDER BY snapshot_id;

@@ -18,15 +18,10 @@
 #                          runs in the integration lane
 #   - cmd/                  main() entrypoints
 #   - internal/dst         the DST test harness itself
-#   - integration/         the lanes themselves, and integration/guestinit, which is
-#                          PID 1 *inside the guest VM* — the same code the INV-01
-#                          exemption calls "not host code" (DEV-0013). It is never
-#                          linked into any binary this repository ships and cannot be
-#                          exercised from the host at all: its coverage comes from a
-#                          kernel booting it (TestALinuxGuestIssuesFLUSH). Counting it
-#                          as production the 90% floor governs was a category error,
-#                          invisible while the file was small and static, and it
-#                          surfaced when DEV-0018 added three functions to it.
+#   - integration/         the lanes themselves, and integration/guestinit, which is PID 1
+#                          *inside the guest VM* (the INV-01 exemption's "not host code"):
+#                          never linked into a shipped binary, and its coverage comes from
+#                          a kernel booting it (TestALinuxGuestIssuesFLUSH).
 set -euo pipefail
 
 EXCLUDE='internal/db/|api/gen/|internal/metadata/pg/|internal/simio/real/s3.go|internal/simio/objectstore/storetest/|internal/metadata/metadatatest/|internal/testinfra/|/cmd/|internal/dst/|integration/'
@@ -56,27 +51,15 @@ echo "production (unit-covered code): ${prod}"
 
 # Enforce a floor on production code.
 #
-# Measured from the profile, not from `go tool cover`'s printed string. That string is
+# Measured from the profile, not from `go tool cover`'s printed string: that string is
 # rounded to one decimal, and on 2026-08-05 the gate reported "90.0%" and OK for a tree
-# whose real figure was 3929/4366 = 89.9908% — under the floor, passing on 0.0092pp of
-# rounding. A gate that reports success for something it did not establish is the exact
-# defect this repository keeps finding in its own checks; it should not have been in the
-# check that guards against it.
+# whose real figure was 3929/4366 = 89.9908%. The printed percentages stay rounded because
+# that is what a human reads; only the comparison changed.
 #
-# The printed percentages above stay rounded, because that is what a human reads. Only
-# the comparison changed.
-# 89, lowered from 90 on 2026-08-27 with the recovery increment.
-#
-# Not a slip: the tree gained about a thousand statements of production code — recovery,
-# state.json, the epoch object, the delete path — and what stayed uncovered afterwards was
-# dominated by `os`-error branches, which this repository's own rule says not to chase
-# ("that is what the sim models"). Sixty-two of them are in simio/real/objectstore.go and
-# simio/real/disk.go, whose sibling s3.go is already excluded from this floor on exactly
-# that argument.
-#
-# The alternative was writing tests for branches the rule says to ignore, which buys a
-# number and no confidence. A floor is worth having because it stops coverage sliding while
-# nobody looks; it is not worth having at a value that can only be met with filler.
+# 89, lowered from 90 on 2026-08-27 with the recovery increment: the tree gained about a
+# thousand statements and what stayed uncovered is dominated by `os`-error branches, which
+# this repository's rule says not to chase (sixty-two in simio/real, whose sibling s3.go is
+# already excluded on that same argument).
 floor=89
 read -r covered total < <(awk 'NR>1 {n=$2; c=$3; tot+=n; if (c+0 > 0) cov+=n} END {print cov, tot}' cover.prod.out)
 if [ "${total}" -eq 0 ]; then

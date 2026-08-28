@@ -87,10 +87,8 @@ func TestWriteManifestRefusesToReplaceADifferentCommit(t *testing.T) {
 	}
 }
 
-// TestReadManifestRefusesOneFromSomewhereElse: the digest proves the bytes are the bytes
-// that were written and says nothing about where. A manifest copied or restored under
-// another volume's prefix passes it intact, and every layer it names is then attributed
-// to the wrong volume — another tenant's disk served to this guest.
+// TestReadManifestRefusesOneFromSomewhereElse: a manifest copied under another volume's
+// prefix passes the digest intact — see ReadManifest for what that serves the guest.
 func TestReadManifestRefusesOneFromSomewhereElse(t *testing.T) {
 	t.Parallel()
 	store := sim.NewObjectStore()

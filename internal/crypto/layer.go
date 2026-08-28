@@ -17,11 +17,8 @@ import (
 // cache. The 28 bytes of nonce and tag per frame come to 0.043% at this size — 450 KiB
 // on a gigabyte layer.
 //
-// So the only axis on which the number matters is a read that wants part of a layer
-// without downloading all of it, which v6 §23.8 leaves for after measurement: the frame
-// is the smallest unit that can be fetched and authenticated, and one cluster is the
-// smallest unit anything would want. The size travels in the manifest rather than being
-// fixed by the format, so this is a default and not a decision nobody can revisit.
+// The number only matters for a read that wants part of a layer without downloading all
+// of it (v6 §23.8): the frame is the smallest unit that can be fetched and authenticated.
 const LayerFrameBytes = 64 << 10
 
 // ErrShortLayer means the sealed stream ended without a frame that says it is the last
@@ -37,57 +34,33 @@ const layerAADVersion = 1
 // plaintext each, to w. It is v6 §10: what leaves the host is sealed with the volume's
 // DEK, and the local qcow2 is not.
 //
-// It is a method on Encryption and not on DEK, which is the difference between a key and
-// a key that is allowed to open a particular volume's bytes. The volume's identity is in
-// every frame's nonce, so a caller holding the wrong pairing produces an object nothing
-// can open — and NewEncryption is where that pairing is checked.
+// It is a method on Encryption and not on DEK: the volume's identity is in every frame's
+// nonce, and NewEncryption is where that pairing is checked.
 //
 // # The nonce is derived, and here that is safe
 //
-// SealRandom exists in this package because an image chunk had no unique number to
-// derive a nonce from, and it says so at length: a generation counter is written before
-// the compare-and-set that decides which writer wins, so two hosts could seal different
-// plaintexts under one nonce, which is GCM's catastrophic case.
-//
-// A layer has one. It is a v7 UUID minted by the Agent at the rotation that created the
-// file, the file is complete and read-only from that moment, and Chain.Rotate refuses an
-// id that already exists. Two hosts that both believe they own the volume mint different
-// ids; there is no path by which one (volume, layer) names two plaintexts.
-//
-// Deriving it rather than drawing it buys the property the whole retry story rests on:
-// sealing the same layer twice produces the same bytes, so the same digest, so the same
-// content-addressed key — and step 11 of v6 §9 can be repeated after any interruption
-// without leaving an orphan behind.
+// Unlike the chunks SealRandom exists for, a layer has a unique number: a v7 UUID minted
+// at the rotation that created the file, which is complete and read-only from that
+// moment, and Chain.Rotate refuses an id that already exists. Deriving rather than
+// drawing buys the property the retry story rests on — sealing the same layer twice
+// produces the same bytes, so the same digest, so the same content-addressed key, and
+// step 11 of v6 §9 can be repeated after any interruption without leaving an orphan.
 //
 // # Every frame is bound to where it is, and says whether it is the last
 //
-// Three rearrangements of a valid layer fail to open instead of decrypting: frames
-// reordered, a frame duplicated, and the tail dropped. The last is the one that matters —
-// the manifest's SHA-256 also catches a truncated object, but only for a reader that has
-// the manifest, and a layer is read by a recovery that may be assembling one chain out of
-// several.
+// Frames reordered, a frame duplicated, or the tail dropped all fail to open. The first
+// two come from the nonce, which derives from (volume, layer, frame size, index). The
+// tail is the one that matters: the manifest's SHA-256 also catches a truncated object,
+// but only for a reader that has the manifest, and a layer is read by a recovery that
+// may be assembling one chain out of several.
 //
-// The first two come from the *nonce*, which derives from (volume, layer, frame size,
-// index): a frame in the wrong position is opened under the wrong nonce and fails.
+// The frame size is in the nonce because leaving it out is a nonce reuse on the *writer*
+// side: `frame_bytes` travels in the manifest so it can be changed, and one layer sealed
+// at 64 KiB and again at 1 MiB puts two plaintexts under frame 0's nonce, which leaks
+// their XOR and lets the authentication key be recovered.
 //
-// # The frame size is in the nonce, and leaving it out was a nonce reuse
-//
-// It was left out once, on the argument that the frame size "decides where the boundaries
-// are, so reading a layer with a different frame size fails every tag on the split alone".
-// That argument is about the *reader*. The catastrophic case is the writer: seal one layer
-// at 64 KiB and again at 1 MiB — which this design invites, since `frame_bytes` travels in
-// the manifest precisely so it can be changed — and frame 0 of each is a different
-// plaintext under the same nonce. AES-GCM under a repeated nonce leaks the XOR of the two
-// plaintexts and lets the authentication key be recovered; it is the one failure the whole
-// nonce-derivation argument in SealLayer exists to rule out, and the argument had a hole
-// in it exactly where it stopped talking about writers.
-//
-// It also disposes of a smaller thing: a layer of a single frame has no split, so nothing
-// about the reader's side was true for it either.
-//
-// The AAD is two bytes: the framing generation, and the final flag. It was six times that
-// until each field's removal was planted and watched, and only the final flag turned a
-// test red — the rest are bound by the nonce, which is where binding belongs.
+// The AAD is two bytes, the framing generation and the final flag. It was six times that
+// until each field's removal was planted and only the final flag turned a test red.
 func (e *Encryption) SealLayer(layerID [16]byte, frameBytes int, r io.Reader, w io.Writer) error {
 	if frameBytes <= 0 {
 		return fmt.Errorf("crypto: a frame of %d bytes is not a frame", frameBytes)
@@ -191,9 +164,7 @@ func readFull(r io.Reader, buf []byte) (int, error) {
 // with the layer's identity in place of (epoch, sequence) and its own domain-separation
 // tag so the two can never collide.
 //
-// The frame size is part of it, not decoration: without it, frame 0 of a layer sealed at
-// one frame size and frame 0 of the same layer sealed at another share a nonce and carry
-// different plaintexts. See SealLayer.
+// The frame size is part of it — see SealLayer.
 func layerNonce(volumeID, layerID [16]byte, frameBytes int, idx uint64) []byte {
 	var buf [16 + 16 + 8 + 8 + 6]byte
 	copy(buf[0:16], volumeID[:])

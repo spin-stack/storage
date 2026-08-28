@@ -19,19 +19,11 @@ var ErrUnversionedKey = errors.New("crypto: KeyID 0 is reserved for plaintext, i
 // and every AEAD call in this package takes the volume id as additional authenticated
 // data precisely so one volume's key cannot open another's object.
 //
-// It outlived the WAL it was written for. The local write path is QEMU's qcow2 now,
-// but the layers this system commits to the object store are still sealed with the
-// volume's DEK on the way out — that is what keeps encryption independent of QEMU and
-// keeps KMS wrapping, descriptor.DEKWrapped and crypto-shred working unchanged, which
-// is why this type was carried across rather than rebuilt on the far side.
-//
-// It lives in internal/crypto rather than in a package beside it. The alternative was
-// a package of its own — the shape it had inside internal/wal, where it was one
-// component's binding of somebody else's key. That reason is gone: what is left is a
-// DEK plus the identity every method on DEK already demands as AAD, which is this
-// package's subject and nothing else's. A package holding one struct, one constructor
-// and one sentinel would be a layer that cannot justify its existence, and a caller
-// would import both packages every time it imported either.
+// The local write path is QEMU's qcow2 now, but the layers this system commits to the
+// object store are still sealed with the volume's DEK on the way out, which is what keeps
+// KMS wrapping, descriptor.DEKWrapped and crypto-shred working unchanged. It lives here
+// rather than in a package of its own: a DEK plus the identity every DEK method already
+// demands as AAD is this package's subject.
 type Encryption struct {
 	DEK      DEK
 	VolumeID [16]byte

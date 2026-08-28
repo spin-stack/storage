@@ -824,15 +824,11 @@ func manifest(w *world, commitID string) commit.Manifest {
 	return m
 }
 
-// republish replaces a manifest in the bucket with a doctored one — a history that could
-// only have been written by something that is not this code, which is the point.
-//
-// It frames and PUTs the object itself rather than going through commit.WriteManifest,
-// and it has to: WriteManifest now validates every identifier it is handed, so a doctored
-// manifest cannot be planted through the writer at all. Planting through the reader's
-// front door is what makes the test about *this* package — a bucket is a place other
-// things write to, and what is being asserted is what a restore does when it finds
-// something no version of this code produced.
+// republish replaces a manifest in the bucket with a doctored one, framing and PUTting the
+// object itself rather than going through commit.WriteManifest — which validates every
+// identifier now, so a doctored manifest cannot be planted through the writer at all.
+// What is asserted is what a restore does when the bucket holds something no version of
+// this code produced.
 func republish(w *world, m commit.Manifest) {
 	w.t.Helper()
 	m.FormatVersion = framed.FormatVersion
@@ -897,14 +893,10 @@ func TestCurrentSaysWhenAVolumeHasNeverPublished(t *testing.T) {
 	}
 }
 
-// TestAbsentAnswersThatNothingIsPublished is the deployment with no object store, and the
-// answer is honest rather than a shrug: nothing was ever published there, so no volume has
-// a history and every one of them is new.
-//
-// The case it does NOT cover — a host that published and is now started against no store —
-// is caught by qcow.Open reading this host's own state.json, which records the commits
-// whose layers it holds. Ignorance is separated from knowledge by the file this host
-// wrote, not by the flag it was started with.
+// TestAbsentAnswersThatNothingIsPublished is the deployment with no object store: nothing
+// was ever published there, so every volume is new. The case it does NOT cover — a host
+// that published and is now started against no store — is caught by qcow.Open reading
+// this host's own state.json.
 func TestAbsentAnswersThatNothingIsPublished(t *testing.T) {
 	t.Parallel()
 	var a recovery.Absent

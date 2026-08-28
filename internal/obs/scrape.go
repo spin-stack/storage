@@ -19,31 +19,18 @@ import (
 // keeps the header honest if a different format is ever served from here.
 const ContentType = "text/plain; version=0.0.4; charset=utf-8"
 
-// Scrape renders everything this Provider has collected in the Prometheus text
-// exposition format — the thing `curl` prints readably and every scraper in a pilot's
-// toolbox already parses.
+// Scrape renders everything this Provider has collected in the Prometheus text exposition
+// format — what `curl` prints readably and every scraper already parses. Until it existed
+// every series left this process over OTLP or not at all, and nothing here stands a
+// collector up.
 //
-// It exists because until it did there was nothing an operator could look at. Every
-// series this process produced left it over OTLP or not at all, and no documented step
-// stood a collector up, so the honest description of the Agent's observability was
-// "none". A pilot needs an answer from the process itself, on demand, with no
-// infrastructure in front of it.
+// Rendered here rather than by otel's prometheus exporter: that brings prometheus/
+// client_golang and its global registry into a binary whose only use for either is one
+// read-only handler, in place of the sixty lines below.
 //
-// Rendered here rather than by go.opentelemetry.io/otel/exporters/prometheus, and that
-// is a dependency judgement rather than a preference: that exporter brings
-// prometheus/client_golang and its global registry into a binary whose only use for
-// either is one read-only handler, and what it would do for us is the sixty lines
-// below — `_bucket`/`_sum`/`_count` for a histogram, labels quoted and escaped, one
-// `# TYPE` per family. The dependency is the larger thing to review.
-//
-// Only series that carry data are emitted. The catalogue registers every instrument up
-// front so cardinality cannot drift, and exporting all of them would put a permanently
-// empty line under every name — which reads as "this is not happening" rather than
-// "nothing has recorded this yet", the exact confusion the catalogue was trimmed for.
-//
-// The output is deterministic: families sorted by name, samples sorted by label set. A
-// scrape is most often read by diffing it against the last one, and map iteration order
-// would make every diff claim everything moved.
+// Only series that carry data are emitted — a permanently empty line under every registered
+// name reads as "this is not happening". The output is deterministic (families by name,
+// samples by label set) because a scrape is most often read as a diff against the last one.
 func (p *Provider) Scrape(ctx context.Context) ([]byte, error) {
 	var rm metricdata.ResourceMetrics
 	if err := p.reader.Collect(ctx, &rm); err != nil {

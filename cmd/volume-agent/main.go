@@ -6,21 +6,11 @@
 //
 // # What it serves, and what serves it
 //
-// The data path is QEMU's. This process prepares each volume's local qcow2 chain,
-// hands the paths to whoever launches the VM, and speaks QMP to the QEMU that ends up
-// there — it does not start one. internal/qcow's package comment carries the reasoning
-// and the two-path contract; the short version is that spin's runner already runs the
-// VMs on this host, and a second daemon supervising them is the responsibility this
-// pivot exists to shed.
-//
-// So: this host claims its data directory (through the volume manager, which owns the
-// layout inside it), reads its key, registers, heartbeats, holds a lease, learns which
-// volumes it should be serving, prepares a chain for each, and reports what it saw.
-//
-// Nothing here talks to an object store, and there are no flags for one, because
-// nothing in this build writes an object: commits, publication and recovery are the
-// stages after this one, and a binary that accepted a bucket it never wrote to would be
-// claiming a capability it does not have.
+// The data path is QEMU's. This process prepares each volume's local qcow2 chain, hands the
+// paths to whoever launches the VM, and speaks QMP to the QEMU that ends up there — it does
+// not start one; internal/qcow carries the two-path contract. So: claim the data directory,
+// read the key, register, heartbeat, hold a lease, learn which volumes to serve, prepare a
+// chain for each, and report what it saw.
 package main
 
 import (
@@ -155,16 +145,11 @@ func run() (err error) {
 		return fmt.Errorf("opening the data directory: %w", err)
 	}
 
-	// §15: guest data is sealed with the volume's DEK, wrapped under this KEK. A KMS is
-	// built over it because there is now something that unwraps one: v6 §10 seals every
-	// layer on its way to the object store, so an Agent that publishes needs the volume's
-	// key in the clear for exactly as long as the transfer takes.
-	//
-	// Reading it is not ceremony even on a host that publishes nothing: the Control Plane
-	// wraps every volume's DEK under the KEK *it* read, an Agent that reaches a different
-	// key from the same file has volumes it can never open, and the two binaries
-	// disagreeing about how to parse the file is a defect this repository has already
-	// shipped once. The id on this line is what makes them comparable.
+	// §15: guest data is sealed with the volume's DEK, wrapped under this KEK; v6 §10 seals
+	// every layer on its way to the object store, so a publishing Agent needs the key in the
+	// clear for as long as the transfer takes. Reading it is not ceremony even on a host that
+	// publishes nothing: the Control Plane wraps every DEK under the KEK *it* read, and the two
+	// binaries disagreeing about how to parse the file is a defect already shipped once.
 	var kms crypto.KMS
 	if *kekFile != "" {
 		kekDisk, kerr := real.NewDisk(filepath.Dir(*kekFile))
@@ -181,28 +166,20 @@ func run() (err error) {
 		slog.Warn("no -kek-file: this Agent holds no key material (§15 requires encryption outside dev)")
 	}
 
-	// The publisher, if this host is configured to publish at all.
+	// The publisher, if this host is configured to publish at all. Optional: an Agent with no
+	// object store keeps every layer it seals on its own disk, and the line below says which it
+	// is, because "this Agent publishes nothing" must not have to be inferred from the absence
+	// of commits.
 	//
-	// Optional, and that is deliberate: an Agent with no object store keeps every layer
-	// it seals on its own disk, which is what every lane before v6 §23.3 does and what a
-	// single-machine trial does. It is not silent — the line below says which it is, and
-	// "this Agent publishes nothing" is the sort of thing an operator must not have to
-	// infer from the absence of commits.
+	// The knot — the publisher needs the volume's key, which only agent.Loop can fetch; the
+	// Loop needs the volume manager; the manager needs the publisher — is tied here in the
+	// wiring, with a holder filled in once the Loop exists (see loopKeys).
 	//
-	// The knot: the publisher needs the volume's key, which only agent.Loop can fetch,
-	// and the Loop needs the volume manager, which needs the publisher. It is resolved
-	// here, in the wiring, by handing the publisher a holder that is filled in once the
-	// Loop exists — rather than by giving any of the three a reason to know about the
-	// other two.
-	// The volume manager, and it is constructed here rather than after the Control Plane
-	// client because it is what claims --data-dir: v6 §10 is one Agent per host, and two
-	// incarnations preparing chains under the same paths would hand one qcow2 file to two
-	// QEMUs. The claim used to be taken in this function, with a note saying the qcow2
-	// manager should take it back the moment it owned the directory's layout. It does.
-	//
-	// The absolute path is resolved first. --data-dir is whatever an operator typed, and
-	// this string is handed to *other* processes — qemu-img on a command line, and
-	// whoever launches QEMU — whose working directory is not ours.
+	// The volume manager is constructed before the Control Plane client because it is what
+	// claims --data-dir: v6 §10 is one Agent per host, and two incarnations preparing chains
+	// under the same paths would hand one qcow2 file to two QEMUs. The absolute path is
+	// resolved first because this string is handed to other processes — qemu-img, and whoever
+	// launches QEMU — whose working directory is not ours.
 	root, err := filepath.Abs(*dataDir)
 	if err != nil {
 		return fmt.Errorf("resolving %s: %w", *dataDir, err)
@@ -291,17 +268,11 @@ func run() (err error) {
 	return nil
 }
 
-// backoffFor keeps the two flags in step so an operator does not have to.
-//
-// The Loop refuses a backoff longer than the interval — a retry that lands after the next
-// cycle would have started is not a backoff — and that check is right. What was wrong is
-// where it landed: the default backoff was a second, so `-heartbeat-interval 300ms`, which
-// is an ordinary thing to want, made the process refuse to start over a flag the operator
-// had never touched, naming that flag. A soak found it by moving the interval around.
-//
-// An explicitly given backoff is left alone and still validated. Silently shrinking a
-// number somebody typed would be worse than the refusal: they asked for something, and if
-// it cannot be had they should be told.
+// backoffFor keeps the two flags in step so an operator does not have to. The Loop refuses a
+// backoff longer than the interval, and that check is right; what was wrong is that the
+// default backoff was a second, so `-heartbeat-interval 300ms` made the process refuse to
+// start over a flag the operator never touched. An explicitly given backoff is left alone and
+// still validated: silently shrinking a number somebody typed would be worse than a refusal.
 func backoffFor(backoff, interval time.Duration) time.Duration {
 	explicit := false
 	flag.Visit(func(f *flag.Flag) {
@@ -315,15 +286,10 @@ func backoffFor(backoff, interval time.Duration) time.Duration {
 	return interval
 }
 
-// loopKeys is the knot between the publisher and the loop, tied in one place.
-//
-// The Control Plane is the only thing that knows a volume's DEK and agent.Loop is the
-// only thing that talks to it, so a publisher needs the Loop; the Loop needs the volume
-// manager; the volume manager needs the publisher. Nothing about that is circular in
-// *meaning* — it is three components each needing one verb from another — and this is
-// where a wiring cycle belongs: in the main that already knows all three.
-//
-// It is read only from the reconcile cycle, which starts after loop.Run, so the
+// loopKeys is the knot between the publisher and the loop, tied in the one place that already
+// knows all three: the Control Plane is the only thing that knows a volume's DEK, agent.Loop
+// is the only thing that talks to it, the Loop needs the volume manager, and the manager needs
+// the publisher. It is read only from the reconcile cycle, which starts after loop.Run, so the
 // assignment happens-before every read.
 type loopKeys struct{ loop *agent.Loop }
 
@@ -331,26 +297,15 @@ func (k *loopKeys) VolumeKeys(ctx context.Context, volumeID string) (agent.Volum
 	return k.loop.VolumeKeys(ctx, volumeID)
 }
 
-// serveOperatorEndpoint starts the Agent's only listening socket and returns the
-// function that stops it.
+// serveOperatorEndpoint starts the Agent's only listening socket and returns the function
+// that stops it. Before it there was no /metrics and no /healthz: every series the Agent
+// collected could reach a collector over OTLP or reach nobody, and nothing here stands a
+// collector up.
 //
-// **The Agent held no listening socket at all before this.** There was no /metrics, no
-// /healthz and no admin port: every series it collected could reach a collector over
-// OTLP or reach nobody, and nothing in this repository stood a collector up. So the
-// operational answer to "what is this Agent doing" was "read its log". One read-only
-// handler over what obs already collects is the whole fix, and it is deliberately not
-// more than that — a pilot needs an answer from the process, not a platform.
-//
-// INV-01 and the socket: `cmd/` is where real implementations are constructed, and this
-// is an http.Server bound in a main, the same shape cmd/control-plane already uses for
-// its RPC listener. Nothing simulable is involved — the handler is a pure function of
-// what the meter provider holds, it is on no data path, and no simulation drives it, so
-// there is nothing here for simio to model.
-//
-// A bind that fails is loud and not fatal, which is the one judgement call in this
-// function. The endpoint belongs to the operator: a port already in use must not end the
-// process. What makes the failure detectable is the Error line — the thing that must
-// never happen is a scrape that silently never worked.
+// INV-01: `cmd/` is where real implementations are constructed, and the handler is a pure
+// function of what the meter provider holds, on no data path, so there is nothing for simio
+// to model. A bind that fails is loud and not fatal — the endpoint belongs to the operator
+// and a port already in use must not end the process; the Error line makes it detectable.
 func serveOperatorEndpoint(addr string, telemetry *obs.Provider) func() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {

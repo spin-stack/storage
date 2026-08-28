@@ -48,28 +48,16 @@ type Config struct {
 	// RotateAtBytes is how large a tip may get before it is sealed and a new one is
 	// started on top of it (v6 §11's size trigger). Zero disables rotation.
 	//
-	// Size and not age, for the one trigger this stage has. Age is the RPO promise and
-	// belongs to the Control Plane, which sets it per volume; size is what bounds the
-	// two things a host can lose control of on its own — how much a single layer costs
-	// to upload, and how long a recovery that downloads this chain takes. It also gives
-	// §11's "an idle volume does not commit" for free: a tip nobody writes to does not
-	// grow, so it never crosses the threshold and no empty layer is ever produced.
+	// Size and not age, for the one trigger this stage has: age is the RPO promise and
+	// belongs to the Control Plane, which sets it per volume. Size also gives §11's "an
+	// idle volume does not commit" for free — a tip nobody writes to never crosses it.
 	//
-	// # It is a floor, not a bound, and the gap is the reconcile interval
-	//
-	// The tip is measured once per cycle, so a layer is sealed at roughly the threshold
-	// *plus whatever the guest wrote since the last look*. Measured by `task demo:stage2`
-	// with a 4 MiB threshold, a 300 ms cycle and a guest writing about a gigabyte a
-	// second: the sealed layers came out at 32 MiB, eight times the number configured —
-	// the same on QEMU 11.0.2 and 11.1.1, because what decides it is the cycle and the
-	// guest rather than anything QEMU does.
-	//
-	// That is not a defect to tune away here. With QEMU in the data path a guest's write
-	// cannot be refused (v6 §11), so nothing can hold a layer to a size — the only knobs
-	// are how often the tip is looked at and how fast the guest is, and the second is the
-	// tenant's. What the number is good for is the shape it gives: sealing happens *at
-	// least* this often by volume written, and an operator sizing uploads should plan for
-	// the threshold plus one cycle of the fastest guest they will host.
+	// It is a floor, not a bound, and the gap is the reconcile interval. Measured by
+	// `task demo:stage2` with a 4 MiB threshold, a 300 ms cycle and a guest writing about
+	// a gigabyte a second, the sealed layers came out at 32 MiB — eight times the number
+	// configured, the same on QEMU 11.0.2 and 11.1.1. With QEMU in the data path a guest's
+	// write cannot be refused (v6 §11), so nothing can hold a layer to a size; an operator
+	// sizing uploads should plan for the threshold plus one cycle of the fastest guest.
 	RotateAtBytes int64
 	// ProbeTimeout bounds one exchange with QEMU over QMP, and one run of `qemu-img`.
 	// Both are another process answering, and neither is allowed to park the Agent's
@@ -211,19 +199,10 @@ type volume struct {
 
 // New validates the wiring, claims the data directory, and returns a Manager.
 //
-// # It takes the lock, and cmd/volume-agent no longer does
-//
-// v6 §10 opens with one Agent per host, and two live Agents on one data directory is
-// not a hypothetical: both incarnations would prepare chains under the same paths and
-// hand the same qcow2 file to two different QEMUs, which is the one way this design
-// loses a guest's data locally. The lock was taken in `main` while nothing else owned
-// the directory's layout; this type does now, so it takes it here.
-//
-// The move is the point rather than a tidy-up. ADR-0021 promises spin's runner can take
-// this type without the loop around it, and a claim on the directory that lives in a
-// `main` is a step the runner would have to know to repeat — which is exactly the shape
-// of every defect in CLAUDE.md's table: one line in a `main`, invisible to every test
-// that builds the type itself.
+// The lock is taken here and not in cmd/volume-agent: two live Agents on one data
+// directory would hand the same qcow2 file to two QEMUs (v6 §10, one Agent per host),
+// and a claim that lives in a `main` is a step ADR-0021's other caller — spin's runner —
+// would have to know to repeat.
 func New(ctx context.Context, cfg Config, deps Deps) (*Manager, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -255,19 +234,12 @@ func New(ctx context.Context, cfg Config, deps Deps) (*Manager, error) {
 		vols: map[string]*volume{},
 	}
 
-	// qemu-img is run once, here, and the answer is logged.
+	// A start-up refusal rather than a per-volume one: the failure it catches is an
+	// operator's — a path that is not there, not executable, or not qemu-img — and an Agent
+	// that discovers it when the first volume arrives has already registered as healthy.
 	//
-	// It is a start-up refusal rather than a per-volume one because the failure it
-	// catches is an operator's — a path that is not there, not executable, or not
-	// qemu-img — and an Agent that discovers that when the first volume arrives has
-	// already registered as a healthy host and refuses a volume for a reason nobody was
-	// told about at start-up. This repository has taken the same decision once before,
-	// for a socket directory that could never be bound.
-	//
-	// The version is printed rather than compared. v6 pins one QEMU for CI and
-	// production, and asserting the pin here would put a version string in a binary that
-	// then has to be edited in lock-step with the Taskfile; what an operator needs is to
-	// be able to *see* which qemu-img this Agent will hand its chains to.
+	// The version is printed rather than compared: asserting the pin here would put a
+	// version string in a binary that has to be edited in lock-step with the Taskfile.
 	version, err := m.qemuImgVersion(ctx)
 	if err != nil {
 		return nil, errors.Join(err, unlock.Close())
@@ -293,11 +265,8 @@ func (m *Manager) qemuImgVersion(ctx context.Context) (string, error) {
 	return line, nil
 }
 
-// Close releases the data directory.
-//
-// The kernel drops an flock when the process dies, so this is for the paths that return
-// rather than for a crash — nothing has to clean up after one, which is what makes the
-// lock usable for a data directory at all.
+// Close releases the data directory. The kernel drops an flock when the process dies, so
+// this is for the paths that return rather than for a crash.
 func (m *Manager) Close() error { return m.unlock.Close() }
 
 // Apply converges this host on the desired state: every volume in it has a chain that
@@ -323,17 +292,12 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 			failures = append(failures, errors.New("qcow: the desired state carries a volume with no id"))
 			continue
 		}
-		// Only an ACTIVE volume is served, and a volume in any other state is left out
-		// of `live` so the loop below stops it by the one path that stops anything. The
-		// desired state lists every volume whose primary is this host, including the
-		// ones the fleet is in the middle of taking away — FENCING_WAIT is a volume
-		// being moved to somebody else — and preparing a chain for one of those is this
-		// host getting ready to write a volume it is losing.
-		//
-		// It also stops *reporting* them, which is the half that matters more: an
-		// unset refusal is this host saying "I am serving this", the report is accepted
-		// on a host-and-epoch predicate that a FENCING_WAIT volume still satisfies, and
-		// the fleet would read the outgoing writer as healthy for the whole wait.
+		// Only an ACTIVE volume is served; anything else is left out of `live` so the loop
+		// below stops it by the one path that stops anything. FENCING_WAIT is a volume being
+		// moved to somebody else, and preparing a chain for one is getting ready to write a
+		// volume this host is losing. It also stops *reporting* them: an unset refusal is
+		// this host saying "I am serving this", and the fleet would read the outgoing writer
+		// as healthy for the whole wait.
 		if d.GetState() != storagev1.VolumeState_VOLUME_STATE_ACTIVE {
 			continue
 		}
@@ -346,17 +310,11 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 		if live[id] {
 			continue
 		}
-		// The guest goes first, and this half was missing. A volume leaving the desired
-		// state is this host being told it is not the writer any more — a detach, a
-		// promotion, a volume moved to FENCING_WAIT — and forgetting it in memory while
-		// QEMU stays attached is the same half-measure Fence had before it learned to
-		// stop the guest: every byte written from here lands in a chain nothing will ever
-		// publish, and the guest is told each one succeeded.
-		//
-		// It costs nothing in the ordinary case. A volume released because its VM was
-		// shut down has no QEMU at its socket, and stopGuest returns silently on
-		// ErrNoEndpoint; the only volume this acts on is one that still has a guest
-		// writing to it, which is precisely the one it must act on.
+		// The guest goes first. A volume leaving the desired state is this host being told
+		// it is not the writer any more, and forgetting it in memory while QEMU stays
+		// attached means every byte written from here lands in a chain nothing will publish,
+		// with the guest told each one succeeded. A volume whose VM is already gone has no
+		// QEMU at its socket and stopGuest returns silently.
 		m.stopGuest(id)
 		// Released, not deleted. The files stay: local persistence is what Stage 1 is,
 		// a volume leaves the desired state for reasons that reverse (a promotion, a
@@ -374,17 +332,12 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 //
 // Exactly two are, and they are the two that are statements about *ownership*:
 // PUBLISH_FENCED (another host moved HEAD) and LEASE_LOST. Resuming on either without a
-// higher epoch is two hosts writing one volume, which is the failure the whole design is
-// arranged against.
+// higher epoch is two hosts writing one volume.
 //
-// Everything else is a statement about *reachability* — I could not reach the bucket, the
-// QMP socket did not answer just now, qemu-img met the write lock a running guest holds —
-// and none of those is about who owns the volume. Listing the retryable ones instead was
-// the same defect in the other direction: it named IMAGE_MISSING and stopped, so one
-// missed QMP dial refused a volume for the life of the process while its guest went on
-// writing to it, and the only thing that cleared it was the Control Plane raising an
-// epoch for reasons that had nothing to do with the socket. A retry costs one probe, and
-// one HEAD read for the volumes that need it, per refused volume per cycle.
+// Everything else is a statement about *reachability* — the bucket, the QMP socket, a
+// write lock a running guest holds — and is retried, at one probe per refused volume per
+// cycle. Listing the retryable ones instead was the same defect inverted: one missed QMP
+// dial refused a volume for the life of the process.
 func latched(why storagev1.VolumeRefusal) bool {
 	return why == storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED ||
 		why == storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST
@@ -427,21 +380,11 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	}
 
 	// The same guard, from disk, because the one above is only as durable as this
-	// process. A host that was fenced and then restarted — OOM, a deploy, the SIGKILL
-	// `task demo:stage1` performs under a running guest — reads the same desired state it
-	// read before, at the same epoch, with an empty map: it re-attached to the volume,
-	// found the layer it still owed in state.json, and published it, all of it while
-	// another host was the volume's writer. Nothing in the fleet corrects that; the
-	// refusal is a column no reconciler reads.
-	//
-	// Only while there is no chain, which is every cycle a refused volume has and no
-	// cycle a served one has: a volume this Agent is serving was already let past this
-	// point, and re-reading the file per heartbeat would buy nothing.
-	// The fence is checked whether or not this process already holds a chain, and whether
-	// or not a guest is attached. It was checked only for a volume with no chain, which
-	// left the case a fence is *for*: a host that was fenced with its guest still writing,
-	// coming back to find the guest still there. Open's live branch then returned that
-	// image before any guard ran, and the host resumed its fork.
+	// process: a host that was fenced and then restarted reads the same desired state at
+	// the same epoch with an empty map, and would re-attach and publish the layer it still
+	// owed while another host was the writer. Checked whether or not this process holds a
+	// chain and whether or not a guest is attached — Open's live branch returns the image
+	// before any guard runs, so the case a fence is *for* was the one it missed.
 	{
 		if err := m.checkFenced(v, d.GetEpoch()); err != nil {
 			return err
@@ -468,23 +411,15 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 				fmt.Errorf("%w: it has %q open, which is not a layer of volume %s", ErrForeignImage, open, id))
 		}
 		// And it still has a name. QEMU reports the path it opened, not whether that path
-		// still resolves: unlink a running guest's layer directory — an operator
-		// reclaiming space, a stray cleanup, a filesystem that came back empty — and the
-		// guest keeps reading and writing the open inode while nothing on disk carries
-		// its bytes. Everything downstream reads `live` as "the tip exists and QEMU holds
-		// it", and the one that matters is Open's live branch, which returns that image
-		// without touching it (v6 §5) and hands back a chain of files that are not there.
+		// still resolves: unlink a running guest's layer directory and the guest keeps
+		// reading and writing the open inode while nothing on disk carries its bytes.
+		// Everything downstream reads `live` as "the tip exists and QEMU holds it", and
+		// Open's live branch would hand back a chain of files that are not there.
 		//
-		// A stat is not "touching" in §5's sense — it takes no lock and opens nothing —
-		// and it is the whole difference between refusing this volume and preparing a
-		// second, empty chain under the same id while the first is still being written
-		// to. Whichever of the two were published would be missing the other's writes,
-		// with no error anywhere.
-		//
-		// The guest is deliberately *not* stopped. Nobody else owns this volume, so this
-		// is not supersession, and the same rule applies as to a lapsed lease: a guest is
-		// stopped only when somebody who knows says the volume is not ours. Its bytes are
-		// still in the open inode, which is where an operator can still reach them.
+		// A stat is not "touching" in §5's sense — it takes no lock and opens nothing — and
+		// without it a second, empty chain is prepared under the same id while the first is
+		// still being written to. The guest is deliberately *not* stopped: nobody else owns
+		// this volume, so this is not supersession.
 		if _, err := m.paths.Size(open); err != nil {
 			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
 				fmt.Errorf("the VM has %s open and that path no longer exists, so this volume's layers were removed under a running guest; nothing here can name its bytes and no new chain will be prepared under it: %w", open, err))
@@ -494,9 +429,6 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	attached := live != ""
 
 	if v.chain == nil {
-		// Bounded like the QMP exchange above, and for the same reason: `qemu-img` is
-		// another process, and a cycle that does not finish is a lease that does not get
-		// renewed.
 		openCtx, cancel := m.withTimeout(ctx)
 		defer cancel()
 		chain, err := Open(openCtx, m.run, m.paths, m.cfg.QemuImg, OpenRequest{
@@ -564,39 +496,28 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 		m.setAttached(v, attached)
 	}
 
-	// What this host holds and what it owes, against the record on disk. It runs on
-	// every cycle and for an unattached volume too, because both of the facts it
-	// maintains are about files and not about a guest.
-	//
-	// A failure here does not refuse the volume: it is a note about work already done,
-	// and taking a guest's disk away over an fsync would turn bookkeeping into an outage.
-	// It is returned, so the cycle reports it and the loop backs off.
+	// What this host holds and what it owes, against the record on disk — both facts are
+	// about files, so it runs for an unattached volume too. A failure here is a note about
+	// work already done and does not refuse the volume; it is returned so the loop backs off.
 	stateErr := m.reconcile(v)
 	if !attached {
 		return stateErr
 	}
-	// Publishing before rotating, and never a refusal for either. A tip that could not
-	// be sealed, or a layer that could not be published, is a volume that keeps working
-	// and keeps growing; taking it away from a guest that is using it would turn "we did
-	// not manage to bound this layer" into an outage. The one exception is a HEAD that
-	// moved, which is not this host's volume any more — see publish.
 	// Three steps, in this order, each a no-op when there is nothing to do: publish what
-	// this volume already owes, rotate if the tip has grown past the threshold, publish
-	// what that rotation just sealed. Rotation does not publish from inside itself —
-	// that nested a refusal (which clears the chain) underneath a caller still reading
-	// it, and the caller found out by dereferencing nil.
+	// this volume owes, rotate if the tip has grown past the threshold, publish what that
+	// rotation sealed. Neither failure refuses the volume — a layer that could not be
+	// sealed or published keeps serving and keeps growing — except a HEAD that moved (see
+	// publish). Rotation does not publish from inside itself: that nested a refusal, which
+	// clears the chain, under a caller still dereferencing it.
 	pubErr := m.publish(ctx, v)
 	if v.chain == nil {
 		// Refused — the only publishing failure that stops the volume is a HEAD that
 		// moved, and after it there is no chain left to rotate.
 		return errors.Join(stateErr, pubErr)
 	}
-	// A publish that merely failed does *not* return here, and that is deliberate. The
-	// layer stays pending, and it is maybeRotate's own guard that declines to rotate
-	// over it — v6 §11's second invariant, enforced where it can be read rather than as
-	// a side effect of this function giving up early. Planting the guard's removal
-	// turned nothing red while this returned, which is what a redundant guard looks
-	// like from the outside.
+	// A publish that merely failed does *not* return here: the layer stays pending and
+	// maybeRotate's own guard declines to rotate over it (v6 §11), enforced where it can be
+	// read rather than as a side effect of this function giving up early.
 	tip := v.chain.Active
 	if err := m.maybeRotate(ctx, v); err != nil {
 		slog.Error("could not rotate this volume's tip; it keeps serving and keeps growing",
@@ -617,17 +538,13 @@ func (v *volume) snapshotPending() bool {
 // settleSnapshot answers a snapshot request, once the published history contains
 // everything the volume held when the request arrived.
 //
-// A snapshot is a *name for a commit*, so answering it is naming one — there is nothing
-// to copy and nothing to write. That is the whole of what makes it durable: a commit id
-// exists only after `Commit() → SUCCESS`, which promises the state is reconstructible
-// without this host, so a snapshot that is reported at all is one that can be restored.
-// The v5 answer was the opposite — a manifest the host wrote, which could name data that
-// was not there.
+// A snapshot is a *name for a commit*, so answering it is naming one: nothing is copied
+// and nothing is written. A commit id exists only after `Commit() → SUCCESS`, so a
+// snapshot that is reported at all can be restored. (v5 wrote a manifest, which could
+// name data that was not there.)
 //
-// It runs at the end of the cycle, after the second publish, because that is the first
-// moment the layer this snapshot needs can be in the history. A pending layer means the
-// commit has not landed: nothing is reported, the request arrives again, and the next
-// cycle answers.
+// It runs after the second publish because that is the first moment the layer this
+// snapshot needs can be in the history; a pending layer means the next cycle answers.
 func (m *Manager) settleSnapshot(v *volume) error {
 	if !v.snapshotPending() || v.chain == nil {
 		return nil
@@ -657,13 +574,11 @@ func (m *Manager) settleSnapshot(v *volume) error {
 		// reachable through a publish that keeps failing, which is loud on its own.
 		return nil
 	}
-	// The newest commit, and it is the right one because maybeRotate has already sealed
-	// the tip for this request — unconditionally, with no size floor — and this runs after
-	// the publish that lands it. Take that floor away and the end of the history is
-	// whatever some other trigger sealed, which can be a rotation that began before the
-	// request arrived: a real point in the volume's history, missing everything the guest
-	// wrote since, reported as the snapshot. demo:stage5 caught exactly that, answering
-	// one second after the request.
+	// The newest commit, and it is the right one because maybeRotate has already sealed the
+	// tip for this request, unconditionally, and this runs after the publish that lands it.
+	// Without that floor the end of the history can be a rotation that began before the
+	// request — a real point, missing everything written since. demo:stage5 caught exactly
+	// that, one second after the request.
 	head := st.Commits[len(st.Commits)-1]
 	v.snapshotID, v.snapshotCommit, v.snapshotErr = v.wantSnapshot, head.CommitID, ""
 	slog.Info("snapshot taken: it names the commit carrying the layer sealed for it",
@@ -674,13 +589,11 @@ func (m *Manager) settleSnapshot(v *volume) error {
 
 // publish sends this volume's sealed layer to the object store, if it owes one.
 //
-// It runs before the rotation trigger is even looked at, which is v6 §11's second
-// invariant: nothing rotates while a sealed layer is unpublished. Without it, an object
-// store that is down turns into a chain of small layers, each one a commit that never
-// landed, and the local depth grows for the whole outage. With it, the tip grows instead
-// — one file, which the guest was going to fill anyway — and at most one sealed layer
-// waits. It is also what §15 wants at restart: if there is a sealed layer, publish *it*,
-// do not rotate again.
+// It runs before the rotation trigger is looked at (v6 §11: nothing rotates while a
+// sealed layer is unpublished). Without it, an object store that is down turns into a
+// chain of small layers each of which is a commit that never landed; with it the tip
+// grows instead and at most one sealed layer waits. §15 wants the same at restart:
+// publish the sealed layer, do not rotate again.
 func (m *Manager) publish(ctx context.Context, v *volume) error {
 	if v.pending == nil || m.pub == nil {
 		return nil
@@ -693,18 +606,13 @@ func (m *Manager) publish(ctx context.Context, v *volume) error {
 	layer := *v.pending
 	if err := m.pub.Publish(ctx, layer); err != nil {
 		if errors.Is(err, commit.ErrHeadMoved) {
-			// Another host published for this volume. This one is not its writer, and
-			// the worst thing it could do now is carry on holding the guest's disk: it
-			// would keep accepting writes that can never be published, and the fleet
-			// would have two hosts believing they own one volume. That is the failure
-			// the whole design is arranged against, so it is the one publishing failure
-			// that stops the volume.
+			// Another host published for this volume, so this one is not its writer: it
+			// would keep accepting writes that can never be published. That is the one
+			// publishing failure that stops the volume.
 			//
-			// Written down before it is refused, because this is the statement that must
-			// outlive the process: a refusal that lives only in a map is undone by the
-			// next SIGKILL, and the Agent that starts after it re-attaches to the guest's
-			// disk and publishes again. The write failing does not soften the refusal —
-			// both errors go back, and the volume stops either way.
+			// Written down before it is refused, because a refusal that lives only in a map
+			// is undone by the next SIGKILL and the Agent that starts after it publishes
+			// again. Both errors go back; the volume stops either way.
 			return errors.Join(
 				m.recordFenced(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED, err.Error()),
 				m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED, err))
@@ -728,13 +636,9 @@ func (m *Manager) publish(ctx context.Context, v *volume) error {
 	return nil
 }
 
-// checkFenced refuses a volume this host has recorded that it is not the writer of.
-//
-// The record is cleared by one thing and one thing only: a *higher* epoch, which is the
-// fleet granting the volume to this host again. Not a restart, not the object store
-// answering again, not the guest coming back — every one of those is this host deciding
-// on its own that it owns a volume it was told it does not, which is the two-writer
-// failure with a plausible story in front of it.
+// checkFenced refuses a volume this host has recorded that it is not the writer of. The
+// record is cleared by one thing only: a *higher* epoch, the fleet granting the volume
+// back. Not a restart, not the object store answering, not the guest coming back.
 func (m *Manager) checkFenced(v *volume, epoch int64) error {
 	st, err := ReadState(m.paths, m.cfg.Root, v.id)
 	if err != nil {
@@ -746,18 +650,12 @@ func (m *Manager) checkFenced(v *volume, epoch int64) error {
 		return nil
 	}
 	if epoch > st.Fenced.Epoch {
-		// A higher epoch is the fleet saying this host owns the volume again, so the
-		// refusal lifts. Whether the *record* is cleared here depends on whether there is
-		// a chain to re-grant, and the two cases are not the same:
-		//
-		//   - a host with a local chain leaves it: regrant needs the record to know this
-		//     is a re-grant rather than an ordinary open, and it clears the record, the
-		//     layer list and any pending commit together, once it has asked the object
-		//     store what the published history is. Clearing it here took that signal away
-		//     and left the host serving its stale fork.
-		//   - a host with no chain has nothing for regrant to run on, and nothing else
-		//     would ever clear the record — so it was refused at every later epoch for
-		//     ever, with the fleet granting it the volume again and again.
+		// A higher epoch is the fleet saying this host owns the volume again, so the refusal
+		// lifts. The record is cleared here only when there is no chain: with one, regrant
+		// needs the record to know this is a re-grant, and clears it together with the layer
+		// list and any pending commit once it has asked the object store what the published
+		// history is. Clearing it here left the host serving its stale fork; not clearing it
+		// for a host with no chain refused the volume at every later epoch for ever.
 		if has, err := m.paths.Exists(ActivePointer(m.cfg.Root, v.id)); err != nil {
 			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, err)
 		} else if !has {
@@ -776,13 +674,10 @@ func (m *Manager) checkFenced(v *volume, epoch int64) error {
 		st.Fenced.Epoch, why, st.Fenced.Detail, epoch))
 }
 
-// stopGuest pauses whatever VM is at this volume's QMP socket.
-//
-// Every failure is logged and none is returned. There is nothing a caller could do with
-// one — the volume is being fenced either way — and the two ordinary failures are not
-// failures at all: no socket means no guest, and a QEMU that has already gone means the
-// writing has already stopped. What must not happen is a fence that does not happen
-// because a socket was slow.
+// stopGuest pauses whatever VM is at this volume's QMP socket. Every failure is logged
+// and none returned: the volume is being fenced either way, no socket means no guest, and
+// a QEMU that has gone has already stopped writing. What must not happen is a fence that
+// does not happen because a socket was slow.
 func (m *Manager) stopGuest(volumeID string) {
 	ctx, cancel := m.withTimeout(context.Background())
 	defer cancel()
@@ -822,24 +717,16 @@ func (m *Manager) recordFenced(v *volume, why storagev1.VolumeRefusal, detail st
 // reconcile brings this host's record of a volume in line with what it can observe: which
 // layer is the tip, and which sealed layers are still owed to the object store.
 //
-// # The tip is written down, and the sealed layer is derived from it
+// A layer is sealed exactly when it stops being the tip, and the tip is *observed* — from
+// the QEMU that has it open, or failing that from `active/current` — so "sealed and not
+// published" is derived: (the layers this host has seen as tips) − (the tip) − (the
+// published ones). That closes the window rotate opens: a crash between the QMP switch
+// and the record used to leave a complete layer nothing would publish, and the next
+// commit chained past it, splicing a hole into the published history. Recording before
+// the switch is worse and is rejected where it is described.
 //
-// A layer is sealed exactly when it stops being the tip. That is a fact about files, and
-// the tip is *observed* — from the QEMU that has it open, or failing that from
-// `active/current` — so "sealed and not published" needs no record of its own to survive a
-// crash: it is (the layers this host has seen as tips) − (the tip) − (the published ones).
-//
-// This is what closes the window rotate opens. Rotate seals through QMP and records what
-// it owes afterwards, and a crash in between used to leave a complete layer, full of the
-// guest's writes, that nothing would ever publish — the next commit chained past it and
-// spliced a hole into the published history that no host could see. The alternative,
-// recording before the switch, is worse and was rejected where it is described: at that
-// moment the layer is still live, so the record would name a file QEMU is writing into.
-//
-// The Pending record stays, demoted to what it always was underneath: the commit id a
-// sealed layer was already promised under, so that a retry is the same commit and not a
-// second one. Losing it now costs a duplicate id, which commit.Publish would catch, and
-// never a layer.
+// Pending stays as what it always was: the commit id a sealed layer was promised under,
+// so a retry is the same commit. Losing it costs a duplicate id, never a layer.
 func (m *Manager) reconcile(v *volume) error {
 	st, err := ReadState(m.paths, m.cfg.Root, v.id)
 	if err != nil {
@@ -895,13 +782,10 @@ func (m *Manager) adopt(v *volume, st *State, tip string, dirty *bool) error {
 		return fmt.Errorf("qcow: measuring the sealed layer %s of volume %s: %w", path, v.id, err)
 	}
 	// A fresh commit id, because the one this layer was promised under died with the
-	// process that minted it. That is the cost of the lost record and it is the small
-	// half: a duplicate id in a history is something a human can read, and a layer nobody
-	// publishes is a hole nobody can see.
-	//
-	// The epoch is this host's current one and not the one the layer was sealed under,
-	// which is also lost. It is the honest value — an epoch is a claim this host makes
-	// now, and it holds this volume at this epoch or it would not be here.
+	// process that minted it: a duplicate id in a history is something a human can read,
+	// and a layer nobody publishes is a hole nobody can see. The epoch is this host's
+	// current one, which is the honest value — it holds this volume now or it would not be
+	// here.
 	v.pending = &SealedLayer{
 		VolumeID: v.id, LayerID: layerID, CommitID: ids.New().String(), Path: path,
 		Epoch: v.epoch, PlainBytes: bytes, VirtualSize: v.chain.SizeBytes,
@@ -917,15 +801,10 @@ func (m *Manager) adopt(v *volume, st *State, tip string, dirty *bool) error {
 	return nil
 }
 
-// recordCommit writes down that this host holds the layer of a commit that has landed.
-//
-// Two facts, one file, and both are things only this host knows: which commit a local
-// layer came from — after `qemu-img rebase -u` a layer no longer hashes to the object it
-// came from, so nothing else can vouch for the file — and which commit id a sealed layer
-// was promised under.
-//
-// state.json has two writers, this one and rotate, and both run under Manager.mu: Apply
-// holds it across ensure, which is what calls both. The file is read back the same way.
+// recordCommit writes down that this host holds the layer of a commit that has landed:
+// which commit a local layer came from — after `qemu-img rebase -u` the file no longer
+// hashes to the object it came from, so nothing else can vouch for it — and which commit
+// id a sealed layer was promised under.
 func (m *Manager) recordCommit(v *volume, layer SealedLayer) error {
 	st, err := ReadState(m.paths, m.cfg.Root, v.id)
 	if err != nil {
@@ -942,19 +821,11 @@ func (m *Manager) recordCommit(v *volume, layer SealedLayer) error {
 }
 
 // maybeRotate applies v6 §11's two triggers: size, which the host sets, and age, which
-// the volume carries from the Control Plane as its RPO.
+// the volume carries from the Control Plane as its RPO. Either fires a rotation.
 //
-// Either fires a rotation, and they answer different questions. Size bounds what a host
-// can lose control of on its own — how much one layer costs to upload, how long a
-// recovery that downloads this chain takes — and applies to every volume this Agent
-// serves. Age is a promise to one tenant about how far behind the bucket their volume may
-// fall, and a volume with no promise has no age trigger.
-//
-// § 11's first invariant survives both: an idle volume does not commit. The size arm gets
-// it for free — a tip nobody writes to does not grow. The age arm needs the extra
-// condition below, because time passes for an idle volume too, and without it a volume
-// that wrote nothing would seal an empty layer every RPO for ever and the number would
-// stop meaning what it says: a volume that wrote nothing is *inside* its target, not
+// §11's first invariant survives both: an idle volume does not commit. The size arm gets
+// it for free — a tip nobody writes to does not grow — and the age arm needs the extra
+// size condition below, because a volume that wrote nothing is *inside* its target, not
 // behind it.
 func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	if v.pending != nil {
@@ -969,34 +840,20 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	}
 	size, err := m.paths.Size(v.chain.Active)
 	if err != nil {
-		// A tip that cannot be stat'd is not a measurement that failed, it is a layer
-		// that is not there: somebody unlinked this volume's layers while a guest was
-		// writing to them. QEMU keeps the open inode and the guest never notices, so
-		// until this refused, the only sign was one error per cycle from a function whose
-		// name says "rotate" — and the volume went on being reported as served.
-		//
-		// IMAGE_MISSING and not a bare error, because the two differ in what an operator
-		// does next: this refusal's own proto comment sends them to look at the bucket,
-		// which is where the volume's published history is and the only place its bytes
-		// can now come back from.
+		// A tip that cannot be stat'd is not a measurement that failed, it is a layer that
+		// is not there: somebody unlinked this volume's layers while a guest was writing to
+		// them, and QEMU keeps the open inode. IMAGE_MISSING and not a bare error, because
+		// that refusal's proto comment sends an operator to the bucket, which is the only
+		// place the bytes can come back from.
 		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
 			fmt.Errorf("this volume's tip %s cannot be stat'd, so its layers were removed under it; a guest holding the open file goes on writing bytes nothing here can name: %w", v.chain.Active, err))
 	}
-	// The snapshot arm, first because it is the one a human asked for. The order is
-	// presentation and not correctness — every arm calls the same rotate on the same tip,
-	// and a plant that moved this below the size arm turned nothing red, which is what
-	// that looks like from the outside.
-	//
-	// What *is* load-bearing is that it has no size condition at all, which is the
-	// difference between the triggers
-	// that fire on their own and the one a human asks for. The other two decline to seal
-	// a tip under minRotateAtBytes, because a fresh qcow2 is already ~193 KiB of header
-	// and tables and "larger than zero" would commit an idle volume for ever. Applying
-	// that here would mean a snapshot taken after the guest wrote half a megabyte
-	// silently names the commit *before* those writes — a point in the history that is
-	// real, that is not the one that was asked for, and that nothing reports as
-	// different. §11's "an idle volume does not commit" is about the automatic triggers;
-	// an operator asking is not idleness, and being wrong the other way costs one small
+	// The snapshot arm has no size condition, and that is the difference between the
+	// triggers that fire on their own and the one a human asks for. The other two decline
+	// to seal a tip under minRotateAtBytes; applying that here would let a snapshot taken
+	// after half a megabyte of writes silently name the commit *before* them — a real
+	// point in the history, not the one that was asked for. §11's "an idle volume does not
+	// commit" is about the automatic triggers, and being wrong this way costs one small
 	// layer.
 	if v.snapshotPending() {
 		slog.Info("sealing the tip for a snapshot: everything written before the request has to be in the history it names",
@@ -1010,10 +867,7 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	if v.rpo <= 0 {
 		return nil
 	}
-	// minRotateAtBytes is what "has been written to" means here, and it is the same
-	// constant the size trigger is floored by for the same reason: a freshly created
-	// qcow2 is already ~193 KiB of header, L1 table and refcount blocks before a guest
-	// writes a byte, so "larger than zero" is true of every tip that ever existed.
+	// minRotateAtBytes is what "has been written to" means here (see the constant).
 	if size < minRotateAtBytes {
 		return nil
 	}
@@ -1027,12 +881,9 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 }
 
 // tipAge is how long it has been since this host published a commit for the volume, or
-// since the chain was opened when it never has.
-//
-// Anchoring an uncommitted volume at the chain's opening rather than at zero is what
-// stops a volume that has never committed from being infinitely late: measured from the
-// epoch it would rotate on its first cycle, which is an empty-ish layer published for a
-// volume whose guest may not have booted yet.
+// since the chain was opened when it never has. Anchoring at the opening rather than at
+// zero stops a volume that has never committed from being infinitely late and rotating an
+// empty-ish layer on its first cycle.
 func (m *Manager) tipAge(v *volume) (time.Duration, error) {
 	st, err := ReadState(m.paths, m.cfg.Root, v.id)
 	if err != nil {
@@ -1089,16 +940,11 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 		// means the VM was launched with -drive, a node means -blockdev.
 		"named_by", target.String())
 
-	// A host with no publisher still records what it sealed, and does not treat it as
-	// something to wait for. Those are two different facts and they were one: rotate
-	// returned here, so a layer sealed while no object store was configured left no
-	// trace at all, and an operator who added the store afterwards published everything
-	// from that point on and nothing from before it — the layers were on disk, complete,
-	// and invisible.
-	//
-	// It is not `pending` because pending is what stops the next rotation (v6 §11), and
-	// with no publisher there is nothing to wait for: a host configured this way would
-	// rotate once and then never again.
+	// A host with no publisher still records what it sealed but does not treat it as
+	// something to wait for: without the record, layers sealed before an object store was
+	// configured stay on disk, complete and invisible. It is not `pending` because pending
+	// is what stops the next rotation (v6 §11), so such a host would rotate once and never
+	// again.
 	sealedBytes, err := m.paths.Size(sealed)
 	if err != nil {
 		return fmt.Errorf("qcow: measuring the sealed layer %s: %w", sealed, err)
@@ -1107,40 +953,22 @@ func (m *Manager) rotate(ctx context.Context, v *volume, tipBytes int64) error {
 		return m.recordSealed(v, sealed, sealedBytes)
 	}
 	// The commit id is minted here, once, and every attempt to publish this layer reuses
-	// it. A fresh id per attempt would publish the same layer twice and read its own
-	// success as somebody else's conflict — commit.Request carries the whole reasoning.
+	// it; a fresh id per attempt would publish the same layer twice and read its own
+	// success as somebody else's conflict (commit.Request carries the reasoning).
 	//
-	// It lives in memory only. An Agent that restarts between sealing and publishing
-	// mints a new one and publishes the same layer under a second commit id, which is a
-	// duplicate entry in a history rather than a loss; closing it needs the sealed layer
-	// to be recorded on disk, which is v6 §5's state.json and arrives with recovery.
-	// LayerIDOfImage(sealed), not the id just minted: Rotate returns the layer it
-	// *sealed*, and layerID names the empty one the guest has moved on to. Publishing
-	// the sealed bytes under the new tip's id would seal every frame with the wrong
-	// nonce, and the layer would come back from the object store refusing to open —
-	// which is the sort of thing that is found on the day it is needed.
-	//
-	// Its size is measured again rather than reused from the trigger: the drain that
-	// the snapshot performs writes whatever QEMU still held, so the file is a little
-	// larger than it was when the threshold was crossed.
+	// LayerIDOfImage(sealed), not the id just minted: Rotate returns the layer it *sealed*
+	// and layerID names the empty one the guest moved on to, and sealing frames under the
+	// wrong nonce yields a layer that comes back from the object store refusing to open.
+	// The size is measured again rather than reused from the trigger — the snapshot's drain
+	// writes whatever QEMU still held.
 	v.pending = &SealedLayer{
 		VolumeID: v.id, LayerID: LayerIDOfImage(sealed), CommitID: ids.New().String(),
 		Path: sealed, Epoch: v.epoch, PlainBytes: sealedBytes, VirtualSize: v.chain.SizeBytes,
 	}
-	// Written after the layer is sealed and in memory, never before. There is a window
-	// here — between blockdev-snapshot-sync returning and this landing — in which a
-	// crash still mints a second commit id for the same layer. Writing the record
-	// *before* the QMP switch would close it and open a worse one: the layer is still
-	// live at that moment, so a restart in that window would publish a file QEMU is
-	// writing into, which is a corrupt commit rather than a duplicate entry. The window
-	// stays on purpose; it is microseconds, and its cost is the duplicate entry the gap
-	// already had.
-	//
-	// In memory first, then on disk, for the same asymmetry: a write that fails leaves
-	// the layer pending here, so it is still published and nothing rotates over it. The
-	// error is returned rather than swallowed — until it succeeds this volume is back to
-	// the restart gap — and the volume keeps serving, because ensure treats a rotation
-	// failure as a volume that goes on growing rather than an outage.
+	// Written after the layer is sealed and in memory, never before: writing the record
+	// before the QMP switch would publish a file QEMU is writing into (PendingCommit
+	// carries the window and why it stays). In memory first, then on disk, so a write that
+	// fails still leaves the layer pending here and nothing rotates over it.
 	return m.recordPending(v)
 }
 
@@ -1179,18 +1007,15 @@ func (m *Manager) recordPending(v *volume) error {
 // the overlay a rotation will put over it.
 //
 // There is no single way to name a disk, because this Agent does not launch the VM
-// (ADR-0021) and so does not choose its shape. A `-drive file=...,if=virtio` disk has a
-// generated drive id (`virtio0`) and an *anonymous* node QMP refuses as input; a
-// `-blockdev node-name=vol` disk has a real node and no drive id at all. This used to
-// take the first and refuse the second, which is a VM shaped the way any libvirt-derived
-// runner shapes one — so rotation broke on exactly the launcher we expect to meet.
+// (ADR-0021). A `-drive file=...,if=virtio` disk has a generated drive id (`virtio0`) and
+// an *anonymous* node QMP refuses as input; a `-blockdev node-name=vol` disk has a real
+// node and no drive id. Taking only the first broke rotation on exactly the shape any
+// libvirt-derived runner produces.
 //
-// The overlay name is only needed on the node path: addressed by node-name,
-// blockdev-snapshot-sync answers "New overlay node-name missing" without one. It cannot
-// be the layer's id — QEMU caps a node name at 31 characters and a v7 UUID is 36, which
-// is measured and is why the names are `spinN` rather than anything meaningful. What
-// matters about them is only that they are free, so they are checked against the whole
-// graph and not just the guest's devices: a name a *backing* node holds is as unusable
+// The overlay name is needed only on the node path — blockdev-snapshot-sync answers "New
+// overlay node-name missing" without one. It cannot be the layer's id: QEMU caps a node
+// name at 31 characters and a v7 UUID is 36, which is why the names are `spinN`. They are
+// checked against the whole graph, because a name a *backing* node holds is as unusable
 // as one a tip holds.
 func targetFor(c *qmp.Client, image string) (qmp.Target, string, error) {
 	devices, err := c.BlockDevices()
@@ -1328,20 +1153,11 @@ func (m *Manager) withTimeout(ctx context.Context) (context.Context, context.Can
 
 // Volumes reports what this host is holding, ordered by volume id (deterministic).
 //
-// # What the watermarks say, and what they do not
-//
-// LocalSequence, DurableSequence and PublishedSequence are reported as zero, and that
-// is the honest answer rather than a gap. They were the write-ahead log's counters —
-// what a guest had written, what an fdatasync had made durable, what an object covered
-// — and that log is withdrawn. In this design a guest's write is durable locally the
-// moment QEMU's own fdatasync returns, which is QEMU's business and has no sequence for
-// us to count; and durability past this host is what a published commit means, which
-// Stage 3 builds. The catalog's columns are still there and get their meaning back
-// then, from the commit protocol.
-//
-// Zero and saying so beats a number that looks like durability. A watermark is what the
-// Control Plane would compare across hosts to decide who has the newest state, and a
-// fabricated one is a fencing decision made on a fiction.
+// LocalSequence, DurableSequence and PublishedSequence are reported as zero: they were
+// the write-ahead log's counters and that log is withdrawn. Durability past this host is
+// what a published commit means, and the catalog's columns get their meaning back from
+// the commit protocol. A fabricated watermark would be a fencing decision made on a
+// fiction.
 func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1363,30 +1179,22 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 	return out, nil
 }
 
-// Fence stops serving the given volumes: this host is not their writer any more.
-//
-// The two callers want opposite things and the difference is whether the Control Plane
-// already knows. A fence that follows a refused report is the Control Plane's own
-// decision coming back — telling it would be telling it what it just told us, and the
-// report would be refused again on the same predicate — so the volume is dropped
-// outright and says nothing. A lease that lapsed is the other case: nothing outside
-// this process knows, so the volume is kept with the refusal on it, and the next report
-// is what carries the news off this host.
 // Fence stops serving what this host is no longer the writer of, and stops its guest.
 //
-// All three ways in are treated the same here — a lease that lapsed on this host's own
-// clock, a Control Plane that refused the report, a compare-and-set that lost — and
-// whether they *should* be is an open question recorded in docs/plan/STATUS.md. The short
-// version: only the last two prove somebody else has the volume, and stopping a guest
-// because a network was slow costs a tenant their VM for a partition nobody else acted on.
+// The two callers want opposite things and the difference is whether the Control Plane
+// already knows. A fence that follows a refused report is its own decision coming back,
+// so the volume is dropped outright and says nothing; a lease that lapsed is kept with
+// the refusal on it, and the next report is what carries the news off this host.
+//
+// All three ways in are treated the same — a lapsed lease, a refused report, a lost
+// compare-and-set — and whether they should be is an open question in docs/plan/STATUS.md.
 //
 // Read-only would be better than stopping and is not available. Measured against the
-// pinned QEMU: with the drive QEMU creates for itself the node is anonymous and QMP
-// refuses it as input, and with named nodes blockdev-reopen still refuses — "Read-only
-// block node cannot support read-write users" — because the guest's virtio driver holds
-// it read-write and nothing on the host can take that away. qmp.Stop carries both.
-//
-// Pausing does not kill the VM, whose lifetime belongs to whoever launched it (ADR-0021).
+// pinned QEMU: the drive QEMU creates for itself has an anonymous node QMP refuses as
+// input, and with named nodes blockdev-reopen still refuses — "Read-only block node
+// cannot support read-write users" — because the guest's virtio driver holds it
+// read-write. Pausing does not kill the VM, whose lifetime belongs to whoever launched
+// it (ADR-0021).
 func (m *Manager) Fence(_ context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1408,11 +1216,6 @@ func (m *Manager) Fence(_ context.Context, volumeIDs []string, why storagev1.Vol
 		// chain out of a map and left QEMU writing. A host that has been *shown* it is not
 		// this volume's writer, with a guest still writing to it, is accumulating bytes
 		// that no commit can ever carry.
-		//
-		// Read-only would be better and is not available: measured against the pinned
-		// QEMU, a live guest's virtio-blk holds the node read-write and nothing on the
-		// host can take that away. qmp.Stop carries the two error messages. Pausing does
-		// not kill the VM — its lifetime belongs to whoever launched it (ADR-0021).
 		m.stopGuest(v.id)
 		v.chain, v.attached = nil, false
 		v.refusal, v.detail = why, detail

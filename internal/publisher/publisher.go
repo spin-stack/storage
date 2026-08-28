@@ -1,11 +1,8 @@
 // Package publisher turns a sealed layer on this host's disk into a published commit.
 //
-// It exists as its own component because the two halves answer different questions and
-// fail for different reasons. internal/qcow owns a volume's local chain and decides
-// *when* a layer is ready — that is where v6 §11's triggers and invariants live, and it
-// is what spin's runner takes without a Control Plane anywhere near it. This is *what*
-// happens then: fetch the volume's key, read the file, and run v6 §9's publish protocol.
-// It needs a Control Plane (for the key) and an object store; the chain needs neither.
+// internal/qcow owns a volume's local chain and decides *when* a layer is ready; this is
+// *what* happens then — fetch the volume's key, read the file, and run v6 §9's publish
+// protocol. It needs a Control Plane and an object store; the chain needs neither.
 package publisher
 
 import (
@@ -30,8 +27,7 @@ type Keys interface {
 	VolumeKeys(ctx context.Context, volumeID string) (agent.VolumeKeys, error)
 }
 
-// Files opens a sealed layer for reading. It is the one filesystem verb this needs, and
-// it is injected for INV-01 like every other one.
+// Files opens a sealed layer for reading, the one filesystem verb this needs.
 type Files interface {
 	Open(path string) (io.ReadCloser, error)
 }
@@ -88,12 +84,10 @@ func (p *Publisher) encryption(ctx context.Context, volumeID string) (*crypto.En
 	if err != nil {
 		return nil, fmt.Errorf("publisher: volume %s: %w", volumeID, err)
 	}
-	// The catalog says which KEK wrapped this volume's DEK. Compared before unwrapping,
-	// because crypto/kek.go says at the line that defines KEKID that this is what the id
-	// is *for* — and nothing was comparing it. An Agent started with the wrong -kek-file
-	// got an AEAD failure instead, which reads as a corrupt key or a bad DEK version and
-	// sends an operator looking at the catalog and the KMS rather than at their own
-	// command line.
+	// The catalog says which KEK wrapped this volume's DEK. Without this comparison an
+	// Agent started with the wrong -kek-file gets an AEAD failure, which reads as a corrupt
+	// key and sends an operator to the catalog and the KMS rather than to their own command
+	// line.
 	if keys.KEKID != "" && keys.KEKID != p.kms.KEKID() {
 		return nil, fmt.Errorf("publisher: volume %s was wrapped under KEK %s and this host holds %s: it is running with the wrong -kek-file",
 			volumeID, keys.KEKID, p.kms.KEKID())

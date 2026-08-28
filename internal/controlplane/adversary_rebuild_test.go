@@ -191,26 +191,14 @@ func TestAdversaryRebuildRecordsGeometryProvisionWouldRefuse(t *testing.T) {
 
 // The forgery detector can be silenced into blaming the operator, by the forger.
 //
-// checkKey compares `kek_id` first and returns, in so many words, "this is a wrong
-// -kek-file, not a forged descriptor". The field it reads that from is cleartext,
-// unauthenticated and chosen by whoever wrote the object — so any descriptor carrying a
-// `kek_id` this Control Plane does not hold is reported as an operator error, whatever it
-// actually is. One PUT of a foreign object under a key that parses as a descriptor key is
-// enough, and it costs the adversary nothing to set the field.
-//
-// Two things go wrong at once, and the second is the expensive one:
-//
-//   - the whole rebuild aborts, so *no* volume is recovered. That abort is deliberate for
-//     a descriptor of a volume this fleet owns, where a silent skip would leave the
-//     operator unable to say which volumes are missing. Here it means one junk object
-//     denies disaster recovery for the entire fleet, with no override and nothing that
-//     names the healthy volumes it did not record.
-//   - the message sends the operator to look for a KEK file that does not exist, at the
-//     one moment — the catalog is gone — when the comment above checkKey says a
-//     misleading message costs the most.
-//
-// The object here is not even a plausible volume: its id is not a uuid, so the check two
-// lines further down would have caught it and said something true.
+// checkKey compares `kek_id` first and says "this is a wrong -kek-file, not a forged
+// descriptor". That field is cleartext, unauthenticated and chosen by whoever wrote the
+// object, so one PUT of a foreign object under a key that parses as a descriptor key aborts
+// the whole rebuild — no volume is recovered, with no override and nothing naming the
+// healthy volumes it skipped — and sends the operator after a KEK file that does not exist,
+// at the one moment the catalog is already gone. The object here is not even a plausible
+// volume: its id is not a uuid, so the check two lines further down would have said
+// something true.
 func TestAdversaryOneForeignObjectDeniesTheWholeRebuild(t *testing.T) {
 	ctx := t.Context()
 	f := newFleet(t)

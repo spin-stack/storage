@@ -10,41 +10,22 @@ import (
 )
 
 // NewOTLPMetricExporter builds the one thing in the telemetry path that touches the
-// network: an OTLP/HTTP metric exporter pointed at endpoint (e.g. "http://collector:4318").
-// An empty endpoint returns (nil, nil) — see below, it is a supported answer and not a
-// degenerate one. The result is handed to obs.NewProvider, which owns everything else.
+// network: an OTLP/HTTP metric exporter pointed at endpoint (e.g.
+// "http://collector:4318"). An empty endpoint returns (nil, nil). The result is handed
+// to obs.NewProvider, which owns everything else.
 //
-// **Why it lives here.** Opening a socket outside internal/simio is exactly what INV-01
-// (§25.1) forbids, and the rule is enforced twice — by the custom `simulable` analyzer
-// and by depguard. Constructing the exporter next to the metric catalog in internal/obs
-// would have meant adding an exemption to both, which is the widening the invariant
-// exists to prevent; internal/simio/real is where a real implementation belongs, and it
-// is where every other one already is (the clock, the disk, the S3 store). obs keeps no
-// knowledge of transports: it takes an sdkmetric.Exporter, so the DST harness and the
-// unit tests can pass anything, including nothing.
-//
-// **Why OTLP and not a /metrics scrape endpoint.** The project already pins the
-// OpenTelemetry SDK and §26.1 assumes OTLP, so this adds one exporter module rather than
-// a second protocol, a second port to open on every host, and a second thing to firewall.
-// The Agent is also short-lived by design under ADR-0026 — a session ends when the volume
-// stops — and a pull model loses whatever happened between the last scrape and the exit,
-// which is precisely the publish that a scrape would have been watching for.
-//
-// **Why HTTP and not gRPC.** They are the same protocol over different transports; HTTP
-// needs no gRPC dependency of our own, is the easier of the two to put a receiver in
-// front of in a test, and is what every collector accepts on 4318.
+// It lives here because opening a socket outside internal/simio is what INV-01 (§25.1)
+// forbids, and obs keeps no knowledge of transports. Rejected: a /metrics scrape
+// endpoint — the project already pins the OTel SDK, and a pull model loses whatever
+// happened between the last scrape and an Agent's exit, which is precisely the publish
+// it would be watching for. HTTP over gRPC: no gRPC dependency of our own, and every
+// collector accepts 4318.
 func NewOTLPMetricExporter(ctx context.Context, endpoint string) (sdkmetric.Exporter, error) {
-	// No endpoint configured is a working deployment, not a misconfiguration: an Agent
-	// with no collector in front of it must start and serve exactly as it does today.
-	// Returning an error here would make telemetry a startup dependency of the data
-	// path, and defaulting to OTLP's "localhost:4318" — which is what the SDK does if
-	// this function is called at all — would have every host in the fleet retrying
-	// against a collector nobody deployed, logging failures forever.
-	//
-	// Silence is right *only because the caller chose it*: the operator either passed
-	// the flag or did not. Being loud here would mean warning on every start of the
-	// normal case, which trains an operator to ignore the log that carries the real
-	// warnings (this Agent already prints one that matters — running without a KEK).
+	// No endpoint configured is a working deployment: returning an error would make
+	// telemetry a startup dependency of the data path, and the SDK's default
+	// ("localhost:4318") would have every host retrying against a collector nobody
+	// deployed. Silent, not a warning: the operator chose it, and warning on every start
+	// of the normal case trains them to ignore the log that carries the real ones.
 	if endpoint == "" {
 		return nil, nil
 	}

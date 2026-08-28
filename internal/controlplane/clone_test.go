@@ -39,12 +39,9 @@ func cpStore(t *testing.T) (metadata.Store, objectstore.Store, int64) {
 	return md, sim.NewObjectStore(), term
 }
 
-// wrapFor seals a deterministic DEK under the test KEK, bound to volumeID.
-//
-// The fixtures below used to hand Clone a `DEKWrapped: []byte{7}` that no KMS could
-// open, which was fine while a clone only copied the bytes. It re-wraps now, so the
-// parent's key has to be a key: a stub would make every one of these tests a test of the
-// error path.
+// wrapFor seals a deterministic DEK under the test KEK, bound to volumeID. The parent's key
+// has to be a real key now that Clone re-wraps it, or every test below would be a test of
+// the error path.
 func wrapFor(t *testing.T, kms *crypto.DevKMS, volumeID string, keyID uint32) []byte {
 	t.Helper()
 	dek, err := crypto.GenerateDEK(&ramp{}, keyID)
@@ -199,14 +196,11 @@ func TestAFailedCloneChargesNothing(t *testing.T) {
 	}
 }
 
-// §20's placement rule 1, and under ADR-0026 most of the boot-time story: a cross-host
-// clone pays a full download from the object store, a same-host clone reads local NVMe.
-// The host that took the snapshot is the one that still has the data, and it is a fact
-// rather than a guess because that host stamped it when it published (increment 3b).
-//
-// The second case is the half that must not be assumed away. Same-host is a preference:
-// the source can be cordoned, full or gone, and coupling scheduling to a host with no
-// obligation to be up would turn a fast path into an outage.
+// §20's placement rule 1: the host that took the snapshot is where the data was, and it is
+// a fact rather than a guess because that host stamped it when it published. The second and
+// third rows are the half that must not be assumed away — the source can be cordoned, full
+// or gone, and coupling scheduling to a host with no obligation to be up would turn a
+// preference into an outage.
 func TestACloneStartsWhereTheDataAlreadyIs(t *testing.T) {
 	const sourceHost, otherHost = cloneHostA, "00000000-0000-7000-8000-0000000000d2"
 	tests := []struct {
@@ -282,19 +276,13 @@ func TestCloneRefusesASnapshotThatWasNeverPublished(t *testing.T) {
 }
 
 // TestALineageStopsGrowingAtTheCeiling drives the production path five times and then a
-// sixth, which is the only way to see the ceiling as an operator does: a lineage that
-// grows until it does not.
+// sixth. Nothing here asserts on a field Clone set: the refusal is judged by what the fleet
+// holds afterwards — no row, no descriptor, not one byte charged, no volume past the
+// ceiling — because a gate that returns the right error and writes the row anyway satisfies
+// every assertion on `err`.
 //
-// Nothing here asserts on a field Clone set. The refusal is judged by what the fleet
-// holds afterwards — no row for the volume that was refused, no descriptor under its key,
-// not one byte charged to the host it would have landed on, and no volume anywhere in the
-// catalog past the ceiling — because a gate that returns the right error and writes the
-// row anyway satisfies every assertion on `err`.
-//
-// The per-step depth is read back from a collector rather than from the returned struct.
-// `chain_depth` is a series the §26.2 catalog has declared since before anything recorded
-// it, and "a name arrived" would pass on a producer wired to the wrong number, which is
-// the failure this repository has actually shipped.
+// The per-step depth is read back from a collector rather than from the returned struct: "a
+// name arrived" would pass on a producer wired to the wrong number.
 func TestALineageStopsGrowingAtTheCeiling(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
@@ -423,17 +411,14 @@ func createSnapshot(t *testing.T, md metadata.Store, term int64, sourceHost stri
 	}
 }
 
-// A clone opens its parent's already-published layers, through the real path: the
-// parent seals a layer, the Control Plane clones a snapshot of it, and the clone's
-// Agent unwraps *its own* wrapped DEK and reads the parent's object with it.
+// A clone opens its parent's already-published layers through the real path: the parent
+// seals a layer, the Control Plane clones a snapshot of it, and the clone's Agent unwraps
+// *its own* wrapped DEK and reads the parent's object with it — the test that says binding
+// the volume into the wrap broke no lineage.
 //
-// This is the test that says binding the volume into the wrap broke no lineage. The two
-// things it keeps apart are easy to conflate: custody of the key is the wrap's AAD and
-// is now per-volume, while which volume's bytes a key may open is one step later and was
-// always per-volume — crypto.Encryption pairs a DEK with a volume id, the layer nonce
-// carries it, and commit.Fetch refuses a manifest naming another volume. A clone reading
-// its parent's layers builds an Encryption over the *parent's* id from the same key
-// bytes, and nothing about the wrap's AAD survives into that read.
+// Custody of the key (the wrap's AAD) is per-volume; which bytes a key may open is one step
+// later, so a clone reading its parent's layers builds an Encryption over the *parent's* id
+// and nothing about the wrap's AAD survives into that read.
 func TestACloneOpensItsParentsPublishedLayers(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)

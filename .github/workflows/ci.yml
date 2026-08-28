@@ -4,14 +4,11 @@ on:
   push:
   pull_request:
 
-# One run per branch, not one per event. A push to a branch that already has an open
-# pull request fires both triggers and produces two identical runs; keying the group on
-# `head_ref || ref_name` gives both the same string ("my-branch"), so they collapse.
-# Keying on `github.ref` — the obvious choice — does not: a pull_request run is
-# `refs/pull/N/merge` and a push run is `refs/heads/my-branch`, two groups, nothing
-# de-duplicated. `cancel-in-progress` then makes a new push supersede its predecessor,
-# on main as well: the gate's answer is about the tip, and a run against a commit that
-# is already history is spending a runner to answer a question nobody asked.
+# One run per branch, not one per event. A push to a branch with an open pull request fires
+# both triggers; keying on `head_ref || ref_name` gives both the same string, while
+# `github.ref` — the obvious choice — does not (`refs/pull/N/merge` vs
+# `refs/heads/my-branch`, two groups, nothing de-duplicated). `cancel-in-progress` then
+# makes a new push supersede its predecessor, on main as well.
 concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
@@ -23,30 +20,11 @@ permissions:
   contents: read
 
 # ---------------------------------------------------------------------------------
-# The shape of this workflow, and why it is two jobs again.
-#
-# It was five. Three of them existed because `task ci:full` could not run on one hosted
-# runner: the lanes that booted a guest needed the pinned QEMU, which is only executable
-# inside the published runtime image (ADR-0025 — the binaries are dynamically linked
-# against what that image provides), and a container job gets no Docker daemon of its own,
-# which the TestContainers lanes need. So the gate was assembled from jobs that each had
-# one of the two, plus a job to fetch the artefacts they shared.
-#
-# That constraint is gone with the lanes it applied to. The guest-backed proofs drove a
-# real Linux kernel against this system's own vhost-user-blk backend, and that backend is
-# withdrawn — QEMU manages the local copy-on-write format through qcow2 now, and what this
-# system keeps is immutable commits, publication and recovery. Nothing left in the merge
-# gate needs QEMU, and everything left needs Docker, which one ordinary runner has. So
-# `ci:full` runs here as the single command it is.
-#
-# The pinned QEMU is still built and published by qemu.yml, and `task fetch:kernel` still
-# resolves the pinned kernel: both are inputs the qcow2 lane needs, and when that lane
-# lands this file grows a job for it and `ci:full` grows a preflight — the shape the three
-# deleted jobs had, which is why the reasoning above is kept rather than deleted with them.
-#
-# The `gate` job stays regardless, and its reason never depended on the split: `needs`
-# alone does not make a gate, because a needed job that is *skipped* leaves the dependent
-# job free to run and a workflow of green-or-grey jobs is reported as passing.
+# Two jobs. It was five, because `task ci:full` could not run on one hosted runner: the
+# guest lanes needed the pinned QEMU, only executable inside the published runtime image
+# (ADR-0025), and a container job gets no Docker daemon for the TestContainers lanes.
+# Nothing in the merge gate needs QEMU now. The `gate` job below stays regardless — its
+# reason never depended on the split.
 # ---------------------------------------------------------------------------------
 
 jobs:
@@ -65,11 +43,9 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Measured against nothing — these workflows have never executed (STATUS.md) — so
-    # this is a ceiling, not a budget: enough for the race suite, the coverage run and
-    # the Docker-backed lanes (e2e alone allows itself 15m) on a two-core runner, and far
-    # below the six-hour default that would let one wedged TestContainer hold a runner
-    # for a working day.
+    # A ceiling, not a budget — these workflows have never executed: enough for the race
+    # suite, the coverage run and the Docker lanes (e2e allows itself 15m) on a two-core
+    # runner, and far below the six-hour default a wedged TestContainer would hold.
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -129,12 +105,6 @@ jobs:
   # repository does not build — the pinned QEMU and the pinned kernel — and a lane that
   # silently skips when they are missing is the defect this whole file is shaped against.
   # Here their absence is a red job with a name that says which one.
-  #
-  # **Why this exists at all.** Until it did, `demo:stage1` through `demo:stage4` ran only
-  # on a developer's machine. Three documents described a guest lane and the gate performed
-  # none of it — the first entry in CLAUDE.md's table of defects, in the present tense. A
-  # kernel bump was certified by whoever happened to run the demos locally, which on
-  # 7.1.0 → 7.2.1 was one person once.
   #
   # No KVM is asked for. hack/demo-lib.sh takes `kvm:tcg`, so a runner without
   # /dev/kvm emulates instead — slower, and the same code path through everything this
@@ -227,20 +197,12 @@ jobs:
       - name: Stage 5 — a snapshot is a name for a commit
         run: task demo:stage5
 
-  # The gate. This is the check to require on the branch, and the only job here whose
-  # green means what a reader assumes it means.
+  # The gate. This is the check to require on the branch.
   #
-  # `needs` does not do this on its own: a needed job that is *skipped* leaves the
-  # dependent job free to run, and a workflow all of whose jobs are green-or-grey is
-  # reported as a passing run. That is the same defect as `task ci:full` exiting 0 after
-  # printing SKIP, one level up, and this job is the same fix — a lane that did not run
-  # is a lane that did not pass. It stays a job of its own with one `needs` entry because
-  # the qcow2 lane restores the second, and a gate assembled only when there is something
-  # to assemble is a gate nobody adds back — which is exactly what happened to the guest
-  # lane, and why this comment kept its shape while the job it described was gone.
-  #
-  # `if: always()` is required, not decorative: without it this job is itself skipped the
-  # moment anything it needs fails, and a skipped gate is a gate that never says no.
+  # `needs` does not do it alone: a needed job that is *skipped* leaves the dependent job
+  # free to run, and a workflow of green-or-grey jobs is reported as passing. `if:
+  # always()` is required for the same reason — without it this job is itself skipped the
+  # moment anything it needs fails, and a skipped gate never says no.
   gate:
     needs: [ci, guest]
     if: always()
@@ -249,18 +211,11 @@ jobs:
     steps:
       - name: Every lane ran, and every lane passed
         env:
-          # The whole `needs` context, serialized. This was one hand-written
-          # `job=${{ needs.<job>.result }}` line per needed job — a second list of lanes
-          # beside `needs:`, with nothing holding the two equal. That is the same defect
-          # this workflow exists to remove, one level in: a job added to `needs` and
-          # forgotten here is a lane the gate does not check and reports green for, and
-          # nothing about the run looks wrong. `toJSON(needs)` is the same object
-          # `needs.<job>.result` reads from, so there is exactly one list now — the
-          # `needs:` above.
-          #
-          # jq is preinstalled on hosted Ubuntu runners and this job is not a container
-          # job, so it is there; if it ever is not, `set -e` makes that a red gate rather
-          # than a green one, which is the direction every failure in this file leans.
+          # The whole `needs` context, serialized, so `needs:` above is the only list of
+          # lanes: a hand-written line per job is a second list, and a job missing from it
+          # is a lane the gate reports green without checking. jq is preinstalled on hosted
+          # Ubuntu runners and this is not a container job; if it ever is not, `set -e`
+          # makes that a red gate.
           NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail

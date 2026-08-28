@@ -7,14 +7,10 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// TestDiskUsageAsksTheDevice is ADR-0013 §3's first sentence, at the one place the
-// number enters this process.
-//
-// The Agent's device figure has to be the *device's* answer — a statfs in production —
-// and not a sum of the files this Agent knows about. A sum says nothing about the space
-// another tenant of the same filesystem occupies, and nothing this Agent can do will
-// ever free it, so a threshold evaluated on the sum fires after the device is already
-// full: the one moment it needed to have fired earlier.
+// TestDiskUsageAsksTheDevice is ADR-0013 §3's first sentence at the one place the number
+// enters this process: the figure has to be the *device's* answer, a statfs in production,
+// and not a sum of the files this Agent knows about — agent.DiskUsage says what the
+// difference costs.
 func TestDiskUsageAsksTheDevice(t *testing.T) {
 	d := sim.NewDisk()
 	const total = 1 << 30
@@ -40,13 +36,9 @@ func TestDiskUsageRefusesToSmoothAFailureIntoAZero(t *testing.T) {
 	}
 }
 
-// TestVolumeSetIsTheSetItWasTold. VolumeSet is what the Loop reports from while there
-// is no volume manager behind it, so what it holds is literally what the fleet is told
-// this host is serving.
-//
-// The ordering is not cosmetic: reports are compared across runs and the DST harness
-// requires the same seed to produce the same trace (INV-02), so a set that answered in
-// map order would make every such comparison a coin flip.
+// TestVolumeSetIsTheSetItWasTold. The ordering is not cosmetic: reports are compared
+// across runs and the DST harness requires the same seed to produce the same trace
+// (INV-02), so a set that answered in map order would make every comparison a coin flip.
 func TestVolumeSetIsTheSetItWasTold(t *testing.T) {
 	s := agent.NewVolumeSet()
 	for _, id := range []string{"vol-c", "vol-a", "vol-b"} {

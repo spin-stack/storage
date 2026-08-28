@@ -9,15 +9,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// Finding 1. INV-14 is stated as *structural*: "the interface deliberately cannot
-// reach permanent deletion", so a GC reachability bug costs a restore and not the
-// data. Every word of that rests on the bucket being versioned — on an unversioned
-// bucket, or one whose versioning an operator Suspended, DeleteObject destroys the
-// object outright and the GC becomes the incident the invariant promises it cannot
-// be. Nothing checked. A bucket created by tooling that forgets the versioning call
-// is indistinguishable, at every layer, from a correct one until the first sweep.
-//
-// The store therefore refuses to exist on a bucket it cannot delete reversibly on.
+// Finding 1. INV-14 ("a GC mistake costs a restore, not the data") rests entirely on the
+// bucket being versioned: on an unversioned or Suspended bucket DeleteObject destroys the
+// object, and a bucket whose tooling forgot the versioning call is indistinguishable from
+// a correct one until the first sweep. So the store refuses to exist on one.
 
 type versioningStub struct {
 	status types.BucketVersioningStatus

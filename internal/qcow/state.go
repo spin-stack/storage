@@ -10,11 +10,8 @@ import (
 )
 
 // stateName is the volume's durable record of what this host knows about its own
-// published history. It sits beside `active/` rather than under `layers/` because it is
-// about the volume and not about any one layer, and because everything else in this
-// volume's layout is already spelled by this package — a second package computing a
-// path under the data directory is the `--data-dir applied twice` defect waiting to
-// happen again.
+// published history. It sits beside `active/` because it is about the volume and not any
+// one layer, and its path is spelled here like the rest of this volume's layout.
 const stateName = "state.json"
 
 // StateFile is where one volume's state record lives.
@@ -22,22 +19,18 @@ func StateFile(root, volumeID string) string {
 	return filepath.Join(VolumeDir(root, volumeID), stateName)
 }
 
-// ErrBadState means the state file cannot be believed: it disagrees with its own
-// digest, it does not decode, it was written by a format this binary does not know, or
-// it describes another volume.
+// ErrBadState means the state file cannot be believed: it disagrees with its own digest,
+// it does not decode, it was written by a format this binary does not know, or it
+// describes another volume.
 //
-// It is one sentinel over four causes because the caller's move is the same for all of
-// them and must not be "carry on with the zero value". A State this host cannot read is
-// a host that does not know whether it owes the object store a sealed layer and does not
-// know which layers it already holds; acting on a blank one republishes a layer under a
-// second commit id and re-downloads a chain that is already on the disk. The specific
-// cause is wrapped alongside, so an operator still gets `framed.ErrCorrupt` or
-// `framed.ErrFormatTooNew` in the message and a test can branch on either.
+// One sentinel over four causes because the caller's move is the same and must not be
+// "carry on with the zero value": acting on a blank State republishes a layer under a
+// second commit id and re-downloads a chain that is already on disk. The specific cause
+// is wrapped alongside, so `framed.ErrCorrupt` and `framed.ErrFormatTooNew` still reach
+// an operator.
 //
-// Rejected: aliasing framed.ErrCorrupt the way descriptor.ErrCorruptDescriptor does.
-// That covers a flipped bit and not a state file restored under the wrong volume, whose
-// digest is intact and whose contents are somebody else's — and the second is the one
-// that makes this host skip a download it needed.
+// Rejected: aliasing framed.ErrCorrupt, which covers a flipped bit but not a state file
+// restored under the wrong volume.
 var ErrBadState = errors.New("qcow: this volume's state.json cannot be believed")
 
 // State is what this host durably knows about a volume's published history. It is
@@ -47,16 +40,10 @@ var ErrBadState = errors.New("qcow: this volume's state.json cannot be believed"
 //   - which commit a local layer file came from, and
 //   - which commit id a sealed-but-unpublished layer was already promised under.
 //
-// It holds no guest data, only structural metadata, so it stays in the clear (v6 §15.3,
-// the same call descriptor.json makes).
+// It holds no guest data, only structural metadata, so it stays in the clear (v6 §15.3).
 //
-// # Two writers, one file
-//
-// Manager.rotate records a pending commit and Manager.publish clears it; recovery
-// appends to Commits as it fetches. All of them run under Manager.mu — Apply holds it
-// across ensure, which is what opens a chain and what a restore runs inside — so this
-// type carries no lock of its own. A second process writing this file is not a case
-// this design has: one Agent owns a data directory, enforced by the lock New takes.
+// It carries no lock of its own: every writer — rotate, publish, recovery — runs under
+// Manager.mu, and one Agent owns a data directory, enforced by the lock New takes.
 type State struct {
 	// FormatVersion is framed.FormatVersion at the time the file was written. First, so
 	// that a human catting the file sees it before anything else.
@@ -81,22 +68,15 @@ type State struct {
 	Pending *PendingCommit `json:"pending,omitempty"`
 	// Layers is every layer this host has observed as this volume's tip, newest first.
 	//
-	// It exists so that "sealed and not published" can be *derived* rather than recorded
-	// at the moment of sealing. A layer is sealed exactly when it is no longer the tip,
-	// and the tip is observed — from the QEMU that has it open, or from `active/current`
-	// — so the sealed set is (this list) − (the tip) − (Commits), and no record has to
-	// survive the microseconds between blockdev-snapshot-sync returning and a write to
-	// this file.
+	// It exists so that "sealed and not published" is *derived* — (this list) − (the tip) −
+	// (Commits) — rather than recorded at the moment of sealing, so no record has to
+	// survive the microseconds between blockdev-snapshot-sync returning and a write here.
+	// The entry written is the *new* tip, after the switch, by the code that observes what
+	// QEMU has open: a crash that loses it loses nothing, while a record of what was sealed
+	// would name a file QEMU is still writing into.
 	//
-	// Recording the *new* tip is what makes that safe, and it is the opposite of
-	// recording the sealed one: the entry is written on an ordinary cycle, after the
-	// switch, by the code that observes which file QEMU actually has open. A crash that
-	// loses the entry loses nothing — the next cycle observes the same tip and writes it
-	// again — while a record of what was sealed, written before the switch, would name a
-	// file QEMU is still writing into.
-	//
-	// It is trimmed at the newest published layer (see trimLayers): everything under a
-	// published commit is published, so nothing older is ever a question.
+	// Trimmed at the newest published layer (trimLayers): everything under a published
+	// commit is published, so nothing older is ever a question.
 	Layers []string `json:"layers,omitempty"`
 	// Fenced, when set, is this host's own record that it stopped being this volume's
 	// writer while it believed it was one — HEAD moved under it, or its lease lapsed.
@@ -109,20 +89,15 @@ type State struct {
 	// to outlive the process that learned it.
 	Fenced *Fencing `json:"fenced,omitempty"`
 	// LastCommitAt is when this host last published a commit for this volume, in
-	// milliseconds since the epoch on the injected clock. Zero means it never has, and
-	// the age trigger then measures from the moment the chain was opened.
+	// milliseconds since the epoch on the injected clock. Zero means it never has, and the
+	// age trigger then measures from the moment the chain was opened.
 	//
-	// Durable, because the RPO is a promise about the volume and not about a process: a
-	// restart that reset the anchor would let a host that had not committed for an hour
-	// start a fresh hour, which is the failure the number exists to prevent — and it
-	// would be invisible, because every individual cycle after the restart is inside the
-	// target.
+	// Durable, because a restart that reset the anchor would let a host that had not
+	// committed for an hour start a fresh hour, invisibly — every cycle after the restart
+	// is inside the target.
 	//
-	// Wall time and not monotonic, and that is the one thing here that can be wrong: a
-	// clock that steps backwards makes the tip look younger and delays a commit. It is
-	// the acceptable direction (the other is a commit storm on a clock that jumped
-	// forward), and nothing about writer safety reads this — §12.1's monotonic rule is
-	// about leases, not about when a layer is sealed.
+	// Wall time and not monotonic: a clock that steps backwards delays a commit, which is
+	// the acceptable direction, and nothing about writer safety reads this.
 	LastCommitAt int64 `json:"last_commit_at,omitempty"`
 }
 
@@ -148,19 +123,15 @@ type CommitLayer struct {
 
 // PendingCommit is a layer that was sealed here and has not been published.
 //
-// Recording it is what stops a restart between sealing and publishing from minting a
-// second commit id for the same bytes: the restarted Agent republishes under the id
-// written here, commit.Publish recognises its own retry (a byte-identical manifest under
-// a create-only PUT), and the history gets one entry instead of two.
+// Recording it stops a restart between sealing and publishing from minting a second
+// commit id for the same bytes: the restarted Agent republishes under the id written
+// here and commit.Publish recognises its own retry.
 //
-// A window remains, between blockdev-snapshot-sync returning and this file landing.
-// Writing the record *before* the QMP switch was considered and rejected: the layer is
-// still the live tip at that moment, so a restart inside that window would publish a
-// file QEMU is writing into — a corrupt commit, where what is kept is a duplicate entry
-// in a history. The window stays on purpose, and it is microseconds wide.
+// A window remains, between blockdev-snapshot-sync returning and this file landing, and
+// it stays on purpose: writing the record *before* the QMP switch would publish a file
+// QEMU is still writing into — a corrupt commit, against a duplicate history entry.
 //
-// It carries no path. The file is LayerImage(root, volumeID, LayerID), and a stored path
-// is a second spelling of the layout that can disagree with the first.
+// It carries no path; the file is LayerImage(root, volumeID, LayerID).
 type PendingCommit struct {
 	CommitID string `json:"commit_id"`
 	LayerID  string `json:"layer_id"`
@@ -282,11 +253,8 @@ func WriteState(p Paths, root, volumeID string, s State) error {
 }
 
 // recordTip notes that `layerID` is the volume's tip, and reports whether that was news.
-//
-// The caller writes the file only when it was, because this runs once per volume per
-// reconciliation cycle and the fact changes once per rotation: an fsync of the file and
-// of its directory per heartbeat, for a line that is already there, is real I/O bought
-// for nothing. The same reasoning SyncPointer carries.
+// The caller writes the file only when it was: an fsync of the file and its directory per
+// heartbeat, for a line already there, is real I/O bought for nothing.
 func (s *State) recordTip(layerID string) bool {
 	for _, id := range s.Layers {
 		if id == layerID {
@@ -299,21 +267,16 @@ func (s *State) recordTip(layerID string) bool {
 
 // sealedBelow is every layer this host has sealed and not published, oldest first.
 //
-// It is derived and not looked up, which is the whole point: a layer is sealed exactly
-// when it stops being the tip, and `tip` is an observation — what QEMU has open, or what
-// `active/current` names — so a crash between the QMP switch and any write to this file
-// cannot hide a complete layer full of the guest's writes. It used to: the sealed layer
+// Derived and not looked up: a layer is sealed exactly when it stops being the tip, and
+// `tip` is an observation, so a crash between the QMP switch and any write to state.json
+// cannot hide a complete layer full of the guest's writes. It used to — the sealed layer
 // was known only from Pending, the next commit chained past it, and the published history
-// got a hole in it that nothing anywhere reported.
+// got a hole nothing reported.
 //
-// The walk stops at the first published layer because everything under one is published
-// too — a commit's manifest covers its whole backing chain — so the list is short (v6 §11
-// keeps it at one, except after a crash or a spell with no publisher).
-//
-// Layers above the tip are skipped rather than sealed. That is the other window Rotate
-// opens on purpose: the pointer moves before QEMU is told to switch, so a new layer can
-// be recorded that the guest never moved to. QEMU's answer decides which file is live,
-// and this never returns it.
+// The walk stops at the first published layer because a commit's manifest covers its
+// whole backing chain. Layers *above* the tip are skipped rather than sealed: the pointer
+// moves before QEMU is told to switch, so a layer can be recorded that the guest never
+// moved to.
 func (s State) sealedBelow(tip string) []string {
 	published := make(map[string]bool, len(s.Commits))
 	for _, c := range s.Commits {

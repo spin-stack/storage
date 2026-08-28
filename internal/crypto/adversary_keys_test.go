@@ -37,26 +37,12 @@ func advSeal(t *testing.T, enc *crypto.Encryption, id [16]byte, frameBytes int, 
 	return out.Bytes()
 }
 
-// The frame size is not in the nonce and not in the AAD, so two sealings of ONE layer
-// at two frame sizes are two ciphertexts under one (key, nonce).
-//
-// SealLayer's own comment argues the nonce may be derived because "there is no path by
-// which one (volume, layer) names two plaintexts": the layer id is minted at rotation
-// and the file is read-only from that moment. That is true of the *plaintext* and says
-// nothing about the *framing*, which is the other input to what gets sealed and is not
-// bound anywhere. crypto.LayerFrameBytes is documented as "a default and not a decision
-// nobody can revisit", and commit.Layer.FrameBytes is "recorded per layer rather than
-// fixed by the format so that changing it is not a migration" — so the two-frame-sizes
-// case is a supported change, not an abuse.
-//
-// It meets the one path that republishes a layer that was already sealed once: a
-// restart between sealing and publishing mints a fresh commit id and publishes the same
-// layer again (STATUS, "A restart between sealing and publishing duplicates a commit").
-// Across that restart the binary can carry a different frame size, and then frame 0 of
-// both objects is sealed under one nonce.
-//
-// Demonstrated the way the break is actually used: an observer with the two objects and
-// no key at all recovers the XOR of the two plaintexts.
+// Two sealings of ONE layer at two frame sizes must not be two ciphertexts under one
+// (key, nonce). `frame_bytes` travels in the manifest so it can be changed, and a restart
+// between sealing and publishing republishes a layer that was already sealed once — so
+// the two sizes meet on one layer id. Demonstrated the way the break is used: an observer
+// with the two objects and no key recovers the XOR of the two plaintexts. The binding is
+// now in crypto.layerNonce.
 func TestAdversaryFrameSizeIsNotBoundSoOneNonceSealsTwoPlaintexts(t *testing.T) {
 	enc, id := adversaryEncryption(t), adversaryLayerID()
 	const small = 32 << 10
@@ -103,13 +89,9 @@ func TestAdversaryControlSameFrameSizeDoesNotLeak(t *testing.T) {
 	}
 }
 
-// OpenLayer's frame size is not checked either: a single-frame layer opens under any
-// frame size at least as large as the one that sealed it.
-//
-// SealLayer claims the opposite — "The frame size is not in the AAD either, because it
-// decides where the boundaries are — read a layer with a different frame size and every
-// tag fails on the split alone". For a layer of one frame there is no split to fail on,
-// so the claimed binding is absent exactly where the reader would need it.
+// A single-frame layer has no split for a wrong frame size to fail on, so the reader's
+// half of the frame-size binding is absent exactly where it would be needed: it has to
+// come from the nonce, not from the framing.
 func TestAdversarySingleFrameLayerOpensUnderAnyFrameSize(t *testing.T) {
 	enc, id := adversaryEncryption(t), adversaryLayerID()
 	plain := []byte("one frame's worth")

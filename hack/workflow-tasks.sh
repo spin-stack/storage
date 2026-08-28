@@ -7,17 +7,11 @@
 # on the day the guest lane first matters — and the message is `task: Task "x" does not
 # exist`, forty seconds into a job that was supposed to be proving something else.
 #
-# It is a static check on purpose. Running the workflows locally (act, or a self-hosted
-# runner) was rejected: it needs Docker, a registry credential and the published QEMU
-# image, which is precisely the set of things that are missing and that make the guest
-# jobs unrunnable here. What *can* be settled without any of that is whether the names
-# line up, and that is the failure this check has actually seen — `guest:proofs` was a
-# target whose own description claimed CI ran it, and no workflow named it.
-#
-# `task --summary <name>` is the resolver rather than a parse of the Taskfile's YAML:
-# it is the Taskfile's own answer to "is this a target", it costs one process, and it
-# exits non-zero for a name that does not exist (200) *and* for an internal-only one
-# (202) — which a workflow must not call either.
+# A static check on purpose: running the workflows locally (act, a self-hosted runner)
+# needs Docker, a registry credential and the published QEMU image — the very things that
+# are missing here. `task --summary <name>` is the resolver rather than a YAML parse: it is
+# the Taskfile's own answer, and it exits non-zero for a name that does not exist (200) and
+# for an internal-only one (202), which a workflow must not call either.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

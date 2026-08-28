@@ -13,71 +13,43 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// RebuildSummary is what one rebuild found and recorded.
-//
-// There is no Snapshots count any more, and the absence is the report: the objects a
-// snapshot's existence was read out of were the chunked image's manifests, which went
-// with the local block engine. Keeping a field that is structurally zero would have a
-// rebuild print "0 snapshots" at an operator who has just lost their catalog, and that
-// sentence is indistinguishable from "your bucket holds no snapshots".
+// RebuildSummary is what one rebuild found and recorded. There is no Snapshots count: the
+// objects a snapshot's existence was read out of went with the chunked image, and printing
+// "0 snapshots" at an operator who has just lost their catalog is indistinguishable from
+// "your bucket holds no snapshots".
 type RebuildSummary struct {
 	Volumes int
 }
 
-// RebuildMetadata reconstructs the volume catalog from the object store alone
-// (§22.5, INV-20). It is the reader `descriptor.Write` had been feeding since
-// increment 4 deleted the previous one, and it is why those objects are written at all:
-// without it a lost PostgreSQL is unrecoverable even though every byte of every volume
-// is intact in the bucket.
+// RebuildMetadata reconstructs the volume catalog from the object store alone (§22.5,
+// INV-20). It is why descriptors are written at all: without it a lost PostgreSQL is
+// unrecoverable even though every byte of every volume is intact in the bucket.
 //
-// # What it restores, and what it cannot
+// It restores what the descriptor states: geometry, the wrapped DEK with the version that
+// names it, the epoch, and the chain depth. It does **not** restore placement — no object
+// records one — so a rebuilt catalog describes volumes nobody is serving, and an operator
+// re-places them.
 //
-// It restores what the descriptor states: geometry, the wrapped DEK with the version
-// that names it, the epoch, and the chain depth. It does **not** restore placement — no
-// volume comes back with a primary host — because no object records one. A rebuilt
-// catalog therefore describes volumes nobody is serving, which is the honest outcome:
-// after losing the database you know what exists, not who was running it, and an
-// operator re-places them.
+// A rebuilt volume also comes back with zeroed sequences and no parent link. The objects
+// those were read out of (the chunked image's manifests) are withdrawn, and inventing the
+// numbers is the one thing a rebuild must not do: `published_sequence` and
+// `durable_sequence` are the two floors an Agent checks at attach, so a rebuild that
+// guesses high refuses to serve a volume that is fine and one that guesses low hands a
+// guest a blank device for a volume it has written into. A clone's data is untouched — the
+// link is a catalog fact, and the descriptor still carries the parent id.
 //
-// # One pass, and what the other two used to do
-//
-// It used to be three, because it also recorded every snapshot (pass 2) and then linked
-// each clone to its parent snapshot (pass 3), and `volumes.parent_snapshot_id` and
-// `snapshots.volume_id` reference each other so neither could go first.
-//
-// Both of those read the chunked image's manifests — the per-volume `manifest.json` for
-// the published sequence, and `image/<vol>/snapshots/*.json` for the snapshots — and
-// that format is withdrawn with the local block engine. There is nothing left in the
-// bucket to read them out of, and inventing the numbers is the one thing a rebuild must
-// not do: `published_sequence` and `durable_sequence` are the two floors an Agent checks
-// at attach, so a rebuild that guesses high refuses to serve a volume that is fine, and
-// one that guesses low hands a guest a blank device for a volume it has written into.
-//
-// So a rebuilt volume comes back with zeroed sequences and no parent link, and the
-// commit protocol that replaces the manifest is what will restore both. A clone whose
-// parent link is not restored still has its data — the link is a catalog fact, and the
-// descriptor still carries the parent id for whoever re-establishes it.
-//
-// # It needs the KEK
-//
-// Every descriptor's wrapped DEK is unwrapped before the volume is recorded, and a
-// failure stops the whole rebuild — see checkKey for why anything softer turns one
-// poisoned PUT into permanent key loss. That makes `-rebuild-metadata` require
-// `-kek-file`, a new demand at the worst possible moment, and it is accepted
-// deliberately: the alternative is a repair tool that records key material nobody
-// verified.
+// Every descriptor's wrapped DEK is unwrapped before its volume is recorded, and a failure
+// stops the whole rebuild (see checkKey). That makes `-rebuild-metadata` require
+// `-kek-file` at the worst possible moment, accepted deliberately: the alternative is a
+// repair tool that records key material nobody verified.
 //
 // Running it twice, or from two operators at once, converges rather than aborting;
-// `CreateVolume` is idempotent by design, and this passes no capacity bound because it
-// is recording volumes that already occupy their hosts.
-// KeyChecker is the KMS operation a rebuild needs: prove that each descriptor's wrapped
-// DEK really is this volume's, before the catalog records it as such.
+// CreateVolume is idempotent, and no capacity bound is passed because these volumes already
+// occupy their hosts.
 //
-// Narrow, and read-only in effect — the DEK it recovers is discarded. What it buys is
-// the difference between a rebuild that repairs and one that launders: a rebuild runs
-// precisely when the catalog is gone, so a poisoned `dek_wrapped` copied out of the
-// bucket becomes the *only* record of that volume's key, and the loss is permanent and
-// silent.
+// KeyChecker is the KMS operation a rebuild needs: prove that each descriptor's wrapped DEK
+// really is this volume's before the catalog records it. Read-only in effect — the DEK it
+// recovers is discarded.
 type KeyChecker interface {
 	KEKID() string
 	UnwrapDEK(wrapped []byte, keyID uint32, volumeID [16]byte) (crypto.DEK, error)
@@ -91,11 +63,8 @@ func RebuildMetadata(ctx context.Context, md metadata.Store, store objectstore.S
 		return sum, err
 	}
 	for _, d := range descs {
-		// The same geometry rules provisioning applies, on the way in. A rebuild reads
-		// objects from a bucket, so a descriptor with a size of zero or a block size no
-		// device can address is an input, not a bug in this code — and recorded, it is a
-		// catalog row nothing can ever serve, created by the one command an operator runs
-		// when the catalog is already gone.
+		// The same geometry rules provisioning applies: a descriptor is an input read out
+		// of a bucket, and a bad one recorded is a row nothing can ever serve.
 		if err := geometry(d.SizeBytes, d.BlockSize); err != nil {
 			return sum, fmt.Errorf("controlplane: volume %s: %w", d.VolumeID, err)
 		}
@@ -117,20 +86,12 @@ func volumeFromDescriptor(ctx context.Context, store objectstore.Store, d descri
 		VolumeID:  d.VolumeID,
 		SizeBytes: d.SizeBytes,
 		BlockSize: d.BlockSize,
-		// The epoch is taken from the *published history* and raised past it, not from
-		// the descriptor.
-		//
-		// descriptor.json's current_epoch is written at create and at clone and updated
-		// by nothing — the comment at the field says so. A volume fenced up to epoch 4
-		// therefore has a descriptor that still reads 1, and a rebuild that believed it
-		// handed every host that ever held the volume a token this catalog would accept
-		// again. Every commit manifest records the epoch its writer held, and the
-		// manifest chain under HEAD is framed and digest-checked, so the newest commit
-		// is a lower bound on the truth that an adversary with the bucket cannot lower.
-		//
-		// Raised *past* it rather than restored to it: the point of a fencing token is
-		// that no predecessor holds a live one, and coming back at the same number leaves
-		// every one of them valid.
+		// The epoch is taken from the published history and raised past it, not from the
+		// descriptor: descriptor.json's current_epoch is written at create and at clone and
+		// updated by nothing, so a volume fenced up to epoch 4 has a descriptor that still
+		// reads 1, and a rebuild that believed it would hand every host that ever held the
+		// volume a token this catalog accepts. Raised *past* the floor rather than restored to
+		// it, because coming back at the same number leaves every predecessor's token live.
 		CurrentEpoch: epochFloor(ctx, store, d) + 1,
 		// ACTIVE with no primary: the volume exists and nobody is serving it. There is
 		// no object that records placement, and inventing one would make a rebuilt
@@ -179,21 +140,16 @@ func listDescriptors(ctx context.Context, store objectstore.Store, kms KeyChecke
 
 // checkKey refuses a descriptor whose wrapped DEK is not this volume's.
 //
-// The structural checks above cannot see the attack this closes. `descriptor.json` is
-// digest-framed and nothing more, the digest is not authentication, and a swap that
-// moves only `dek_wrapped`/`dek_key_id` leaves `volume_id` honest — so every check on
-// the object passes. The KEK is the only witness, because it is the one thing the
-// bucket-writing adversary does not hold.
+// The structural checks cannot see this: descriptor.json is digest-framed and a digest is
+// not authentication, and a swap that moves only dek_wrapped/dek_key_id leaves volume_id
+// honest. The KEK is the only witness the bucket-writing adversary does not hold.
 //
-// The whole rebuild fails, the same way a corrupt digest already fails it: a catalog
-// rebuilt from *some* of the bucket, silently, leaves the operator with no way to know
-// which volumes are missing — and here the alternative is worse than missing, it is
-// recording key material nobody verified.
+// The whole rebuild fails rather than skipping the volume: a catalog rebuilt from *some* of
+// the bucket leaves the operator unable to say which volumes are missing, and here the
+// alternative is worse than missing — recording key material nobody verified.
 //
-// The KEK-ID mismatch is reported separately and first. An operator who passed the
-// wrong -kek-file must not be told their bucket was forged; publisher.encryption already
-// draws that same line, and this is the moment — the catalog is already gone — when a
-// misleading message costs the most.
+// The KEK-ID mismatch is reported separately and first, because an operator who passed the
+// wrong -kek-file must not be told their bucket was forged.
 func checkKey(d descriptor.Descriptor, kms KeyChecker) error {
 	if d.KEKID != kms.KEKID() {
 		return fmt.Errorf("controlplane: %s was wrapped under KEK %q and this Control Plane holds %q: this is a wrong -kek-file, not a forged descriptor",
@@ -213,20 +169,12 @@ func checkKey(d descriptor.Descriptor, kms KeyChecker) error {
 
 // epochFloor is the highest epoch this volume can be shown to have used: the greater of
 // what its descriptor last recorded and what the newest published commit says.
-//
-// A volume that has published nothing falls back to the descriptor, which is all there is.
-// A bucket that will not answer is not a reason to guess low — the caller is rebuilding a
-// catalog, and an epoch that comes back too low is a fence that is not one — so the read
-// failing is reported through the descriptor's own number and the summary says the history
-// was not consulted.
 func epochFloor(ctx context.Context, store objectstore.Store, d descriptor.Descriptor) int64 {
-	// Three sources, and the highest wins because a fencing token may only ever go up.
-	//
-	// The recorded epoch is the one written on every grant and is the authority; the
-	// descriptor's is what a volume was created at and is a floor for one that has never
-	// been re-placed; the newest commit's is what a writer actually held, which covers a
-	// bucket restored without its epoch object. A source that will not answer contributes
-	// nothing rather than lowering the answer.
+	// Three sources and the highest wins, because a fencing token may only go up: the
+	// recorded epoch (the authority, written on every grant), the descriptor's create-time
+	// number, and the newest commit's, which covers a bucket restored without its epoch
+	// object. A source that will not answer contributes nothing rather than lowering the
+	// answer.
 	floor := d.CurrentEpoch
 	if recorded, err := descriptor.ReadEpoch(ctx, store, d.VolumeID); err == nil {
 		floor = max(floor, recorded)

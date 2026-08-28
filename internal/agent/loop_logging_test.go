@@ -29,18 +29,12 @@ func (s *syncBuffer) String() string {
 	return s.buf.String()
 }
 
-// TestAFailingCycleSaysWhy.
-//
-// Run feeds Reconcile's error straight into nextDelay and drops it. The backoff is
-// right — the loop must keep trying — but the silence is not: an Agent that can never
-// succeed (wrong Control Plane URL, a host id the database rejects, expired
-// credentials) logs one line at startup and then behaves exactly like a healthy one.
-// It heartbeats forever into nothing and nobody can tell from the outside.
-//
-// This is the first thing to fix in the whole build inventory, because every increment
-// after it is debugged through this loop. A cycle that fails has to say so, and it has
-// to say it once per failure rather than once per retry — a loop backing off from a
-// dead Control Plane must not become the thing that fills the disk.
+// TestAFailingCycleSaysWhy. Run feeds Reconcile's error into nextDelay and drops it. The
+// backoff is right; the silence is not — an Agent that can never succeed (wrong Control
+// Plane URL, a host id the database rejects, expired credentials) logged one line at
+// startup and then behaved exactly like a healthy one. Once per failure, not once per
+// retry: a loop backing off from a dead Control Plane must not become the thing that fills
+// the disk.
 func TestAFailingCycleSaysWhy(t *testing.T) {
 	var out syncBuffer
 	restore := slog.Default()

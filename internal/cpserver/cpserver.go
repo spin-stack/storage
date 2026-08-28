@@ -1,19 +1,11 @@
-// Package cpserver serves the Agent-facing RPC surface (api/spin/storage/v1) over
-// the Control Plane's existing libraries. It is a translation layer and deliberately
-// nothing more: every rule it appears to enforce — the term guard, the lifecycle
-// transitions, the watermark ordering — is enforced inside metadata.Store's writes,
-// which is where a second Control Plane cannot get between a read and a write.
+// Package cpserver serves the Agent-facing RPC surface (api/spin/storage/v1). It is a
+// translation layer: every rule it appears to enforce — the term guard, the lifecycle
+// transitions, the watermark ordering — is enforced inside metadata.Store's writes, where
+// a second Control Plane cannot get between a read and a write.
 //
-// Two things live here that live nowhere else, and both are reactions to what a host
-// reports rather than rules about a write:
-//
-//   - the *epoch qualification* of a volume report (§12.3): metadata.UpdateWatermarks
-//     is monotonic per column but has no notion of who is reporting, so refusing a
-//     fenced writer's report is done here, by comparing what the report claims
-//     against what the volume says;
-//   - the *device-pressure cordon* (ADR-0013 §3): the heartbeat carries the only
-//     measurement of the device there is, and the fleet's answer to it — cordon at
-//     70% used — is the Control Plane's alone (ADR-0013 §5). See pressure.go.
+// Two things live here and nowhere else, both reactions to what a host reports: the epoch
+// qualification of a volume report (§12.3), because UpdateWatermarks has no notion of who
+// is reporting; and the device-pressure cordon (ADR-0013 §3) — see pressure.go.
 package cpserver
 
 import (
@@ -37,9 +29,8 @@ type Server struct {
 	md       metadata.Store
 	term     func() int64
 	leaseTTL time.Duration
-	// band is the device-pressure cordon policy (ADR-0013 §3). It is stated by the
-	// caller rather than compiled in — see cpserver.Band for why the constants stopped
-	// being constants, which is a story about CI rather than about tuning.
+	// band is the device-pressure cordon policy (ADR-0013 §3); stated by the caller — see
+	// cpserver.Band.
 	band Band
 }
 
@@ -158,17 +149,11 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			Epoch:     v.CurrentEpoch,
 			State:     volumeState(v.State),
 			// The two watermarks the catalog holds, sent back to the host that will
-			// serve the volume. They are the only facts on this message the Agent does
-			// not otherwise have, and they are what lets it tell "this volume is new"
-			// from "this volume's data is missing": an attach that finds no image, or
-			// replays below the sequence a guest's fsync already returned on, is a
-			// volume that has lost data rather than one that never had any.
-			//
-			// Copied verbatim rather than derived. metadata.Volume calls them
-			// informative (§5.8) and that is still true of what the Control Plane does
-			// with them — it takes no decision on either — but "informative" was read as
-			// "not worth sending", and the Agent was then left deciding with the one
-			// authority that cannot distinguish the two cases, the bucket.
+			// serve the volume: they are what lets an Agent tell "this volume is new"
+			// from "this volume's data is missing". Copied verbatim — metadata.Volume
+			// calls them informative (§5.8), which was read as "not worth sending" and
+			// left the Agent deciding with the one authority that cannot distinguish
+			// the two cases, the bucket.
 			PublishedSequence: v.PublishedSequence,
 			DurableSequence:   v.DurableSequence,
 			// The age trigger (v6 §11). Zero is a volume that was never sold an RPO and
@@ -199,17 +184,13 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 
 // GetVolumeKeys hands one volume's wrapped DEK to the host that writes it.
 //
-// It is a call of its own rather than a field of the desired state (see the proto
-// for the full reasoning), and this handler is why: the answer is authorised per
-// request, against the volume's current primary. A host that has been fenced, or
-// that never held the volume, is refused here — a check with no equivalent inside a
-// list answer, whose only unit is the whole list.
+// A call of its own rather than a field of the desired state (the proto has the full
+// reasoning), and this handler is why: the answer is authorised per request against the
+// volume's current primary, a check with no equivalent inside a list answer.
 //
-// The refusal is PermissionDenied rather than NotFound. Hiding the volume's
-// existence buys nothing from a caller that already had to authenticate as a host in
-// this fleet, and it costs the operator the one message that explains what happened:
-// "you are not this volume's writer any more" is the fencing story, and it is what
-// an Agent's log should say at 3am.
+// PermissionDenied rather than NotFound: hiding the volume's existence buys nothing from a
+// caller already authenticated as a host in this fleet, and "you are not this volume's
+// writer any more" is what an Agent's log should say at 3am.
 func (s *Server) GetVolumeKeys(ctx context.Context, req *connect.Request[storagev1.GetVolumeKeysRequest]) (*connect.Response[storagev1.GetVolumeKeysResponse], error) {
 	hostID, volumeID := req.Msg.GetHostId(), req.Msg.GetVolumeId()
 	switch {
@@ -300,23 +281,17 @@ func (s *Server) applyReport(ctx context.Context, term int64, hostID string, r *
 
 // applyRefusal records whether the reporting host is serving this volume, and why it is
 // not. It runs on every accepted report, including the ones that say nothing is wrong —
-// that is what clears a refusal when the volume comes back, and it is why there is no
-// sweep and nothing that has to notice a recovery.
+// that is what clears a refusal when the volume comes back, with no sweep and nothing that
+// has to notice a recovery.
 //
-// It is a separate write from the watermarks above rather than three more columns on
-// that statement, because the two facts want opposite storage. A watermark is monotonic
-// and merged with GREATEST, so applying a late report is harmless. A refusal is a state,
-// so it is last-report-wins — and "last" has to exclude a writer the fleet has moved
-// past, which is what SetVolumeRefusal's host-and-epoch predicate does. Folding them
-// together would force one of the two rules onto the other: GREATEST over a refusal has
-// no meaning, and a host-and-epoch predicate on the watermarks would drop exactly the
-// late reports §12.3 wants merged.
+// A separate write from the watermarks because the two facts want opposite storage: a
+// watermark is monotonic and merged with GREATEST, while a refusal is a state and so is
+// last-report-wins, where "last" must exclude a writer the fleet has moved past.
 //
-// The epoch check above already refused a stale report, so the predicate looks redundant
-// from here. It is not: between that read and this write the volume can be promoted, and
-// the window is the whole failure — a fenced host marking a volume NOT SERVED while its
-// successor is serving it perfectly well, with the term guard passing because promotion
-// does not move the CP term.
+// The epoch check above makes SetVolumeRefusal's host-and-epoch predicate look redundant.
+// It is not: between that read and this write the volume can be promoted, and a fenced
+// host would then mark a volume NOT SERVED while its successor serves it — with the term
+// guard passing, because promotion does not move the CP term.
 func (s *Server) applyRefusal(ctx context.Context, term int64, hostID string, r *storagev1.VolumeReport) error {
 	refusal, err := refusalOf(r.GetRefusal())
 	if err != nil {
@@ -337,10 +312,8 @@ func (s *Server) applyRefusal(ctx context.Context, term int64, hostID string, r 
 		return fmt.Errorf("cpserver: recording that %q is not being served: %w", r.GetVolumeId(), err)
 	}
 	if refusal.Refused() {
-		// One line per refused report, not one per transition: this repeats every few
-		// seconds for as long as the condition lasts, which is what an operator who
-		// arrives an hour later needs — a line on the transition alone is a line they
-		// have to go looking for. The same reasoning as the Agent's own holding lines.
+		// One line per refused report, not one per transition: an operator arriving an hour
+		// later needs a line, not a transition they have to go looking for.
 		slog.WarnContext(ctx, "a host is refusing to serve a volume the fleet placed on it",
 			"volume_id", r.GetVolumeId(), "host_id", hostID, "epoch", r.GetEpoch(),
 			"refusal", refusal.String(), "detail", detail)
@@ -389,10 +362,8 @@ func (s *Server) applySnapshotReport(ctx context.Context, term int64, hostID str
 	}
 	if msg := r.GetSnapshotError(); msg != "" {
 		// FAILED is terminal, and it is what stops the request being re-sent. Leaving it
-		// CREATING so the Agent retries would loop forever on the failures that do not
-		// heal — a key that cannot open the parent, a store that refuses the write — and
-		// the ones that do heal are already covered, because the Agent retries within
-		// the session before it reports anything at all.
+		// CREATING would loop forever on failures that do not heal; the ones that do heal are
+		// already covered, because the Agent retries within the session before it reports.
 		if err := s.md.SetSnapshotState(ctx, term, snapID, lifecycle.SnapshotFailed); err != nil {
 			return fmt.Errorf("cpserver: recording snapshot %q as failed: %w", snapID, err)
 		}
@@ -400,15 +371,12 @@ func (s *Server) applySnapshotReport(ctx context.Context, term int64, hostID str
 			"snapshot_id", snapID, "volume_id", r.GetVolumeId(), "host_id", hostID, "error", msg)
 		return nil
 	}
-	// The commit the host reported, and nothing derived from a string it sent. A
-	// snapshot under v6 is a name for a commit that is already in the published history,
-	// so this id is the whole of what the row points at: the manifest's key is computed
-	// from it (commit.ManifestKey), which is the property the old computed key existed
-	// for and the reported `manifest_key` column gave up.
-	//
-	// It is refused when empty rather than recorded as a blank. A PUBLISHED snapshot
-	// with no commit is a row a clone would follow to an object that is not there, and
-	// the database says so too — snapshots_published_names_a_commit.
+	// The commit the host reported, and nothing derived from a string it sent: the
+	// manifest's key is computed from this id (commit.ManifestKey), which is the property
+	// the reported `manifest_key` column gave up. Refused when empty rather than recorded as
+	// a blank — a PUBLISHED snapshot with no commit is a row a clone would follow to an
+	// object that is not there, and the database says so too
+	// (snapshots_published_names_a_commit).
 	if r.GetSnapshotCommitId() == "" {
 		if err := s.md.SetSnapshotState(ctx, term, snapID, lifecycle.SnapshotFailed); err != nil {
 			return fmt.Errorf("cpserver: recording snapshot %q as failed: %w", snapID, err)

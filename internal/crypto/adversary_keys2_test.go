@@ -22,22 +22,13 @@ func advVol(n byte) [16]byte {
 	return v
 }
 
-// A DEK can be wrapped with no key version, and everything downstream refuses it.
-//
-// KeyID 0 is not a version: crypto.ErrUnversionedKey says it is the reserved marker for
-// "this payload is cleartext", NewEncryption refuses to bind a DEK carrying it, and
-// metadata.CheckDEKKeyID refuses to store one. WrapDEK is the one place key material is
-// minted and it is the only one of the three that accepts it — it seals the key, binds
-// the 0 as AAD, and hands back a blob that unwraps perfectly and can never be used.
-//
-// The failure is not an attacker's, it is the next caller's. Provision hardcodes 1 and
-// Clone inherits the parent's version, so no path reaches it today; the paths that are
-// coming do. A FLATTEN mints a fresh DEK (Clone's own comment says it must, or the
-// delete verb's promise is false), and a rotation mints one per version. A minting path
-// that forgets to set the version gets a wrap, a row, a descriptor and a green
-// provisioning run, and discovers at the guest's first read that NewEncryption will not
-// bind the key it has been storing. Refusing at the wrap costs one comparison and moves
-// that discovery to the line that made the mistake.
+// A DEK wrapped with no key version: KeyID 0 is the reserved "this payload is cleartext"
+// marker (crypto.ErrUnversionedKey), NewEncryption will not bind it and
+// metadata.CheckDEKKeyID will not store it — and WrapDEK was the one minting path that
+// accepted it, handing back a blob that unwraps perfectly and can never be used. No path
+// reaches it today (Provision hardcodes 1, Clone inherits), but a FLATTEN or a rotation
+// mints a fresh DEK, and a minting path that forgets the version would discover it at the
+// guest's first read instead of at the line that made the mistake.
 func TestAdversaryAWrapCanBeMintedWithNoKeyVersion(t *testing.T) {
 	kms := adversaryKMS(t, 1)
 	var dek crypto.DEK

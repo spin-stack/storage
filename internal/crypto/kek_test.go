@@ -13,11 +13,8 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// LoadKEK is the one place a host's key-encryption key enters either binary, and it is
-// shared precisely because it used to not be: `cmd/control-plane` and the Agent each
-// had their own reader with different rules, so a hex-encoded key file was a working
-// deployment for the one that wraps DEKs and a startup failure for the one that
-// unwraps them.
+// LoadKEK is the one place a host's key-encryption key enters either binary — see kek.go
+// for the two-readers defect that made it one place.
 
 func writeKEKFile(t *testing.T, d disk.Disk, name string, body []byte) {
 	t.Helper()

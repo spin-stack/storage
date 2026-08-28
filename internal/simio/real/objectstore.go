@@ -15,32 +15,21 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// ObjectStore is a filesystem-backed object store used for local/dev mode (§6.2). The
-// production S3-SDK-backed store is the §24 subsystem, and it lives next door in s3.go
-// behind this same objectstore.Store contract. This one satisfies that
-// contract without a network, which is what lets the DST harness and the whole contract
-// suite run in-process.
+// ObjectStore is a filesystem-backed object store used for local/dev mode (§6.2); s3.go
+// holds the production S3 implementation of the same objectstore.Store contract.
 //
-// Two properties are not incidental, because the protocol is built on them:
+// Two properties the protocol is built on:
 //
-//   - a conditional write is atomic. Create-only (§14.5, INV-21) and the If-Match
-//     CAS (§12.4, INV-10) decide which of several concurrent writers wins; a
-//     check-then-write implementation lets all of them win, silently, and two
-//     promoters believing they hold the fence is split brain. Create-only publishes
-//     with link(2), whose EEXIST *is* the exclusion; If-Match cannot be expressed as
-//     one syscall, so its read-compare-publish runs under an flock on the directory
-//     the key lives in (see lockKeysIn). Both hold between *processes*, which is the
-//     only thing that matters: this store is what `-object-store-dir` selects, i.e.
-//     the single-machine deployment, where two Agents publishing one volume's
-//     manifest are two processes on one filesystem. An in-process mutex here excluded
-//     nothing and hid everything — under it, four processes CASing from the same
-//     prevETag all won, and so did four processes after an operator deleted the lock
-//     file the exclusion used to live in;
-//   - an object is never partially visible. Bodies are staged in a temp file,
-//     fsynced, and then linked or renamed into place — both atomic — so a reader
-//     sees the old object or the new one, never a prefix of either. A torn WAL
-//     object is not a read error: recovery's integrity check reads it as the end of
-//     the durable prefix and everything past it is gone.
+//   - a conditional write is atomic *between processes* — `-object-store-dir` is the
+//     single-machine deployment, where two Agents publishing one volume's manifest are
+//     two processes on one filesystem. Create-only (§14.5, INV-21) publishes with
+//     link(2), whose EEXIST is the exclusion; If-Match's (§12.4, INV-10)
+//     read-compare-publish runs under an flock on the key's directory (see lockKeysIn).
+//     Rejected: an in-process mutex, under which four processes CASing from the same
+//     prevETag all won;
+//   - an object is never partially visible. Bodies are staged in a temp file, fsynced,
+//     then linked or renamed into place, so a reader sees the old object or the new one
+//     and never a prefix of either.
 type ObjectStore struct {
 	root string
 }
@@ -67,10 +56,8 @@ func etagOf(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Sidecars this store keeps next to an object. None of them is ever an object: they
-// are filtered out of List and are not reachable through any key, because a stray key
-// is a chunk no manifest names to anything that lists the bucket, and bytes that are
-// not a chunk to anything that reads it.
+// Sidecars this store keeps next to an object. None is ever an object: they are
+// filtered out of List and refused as keys.
 const (
 	// markerSuffix is this store's delete marker: an empty sidecar file next to the
 	// object. The bytes are never removed — permanent deletion is the lifecycle's job
@@ -82,12 +69,9 @@ const (
 	supersededSuffix = ".superseded"
 	// tmpSuffix is the staging name for an in-progress body.
 	tmpSuffix = ".tmp"
-	// lockSuffix is a reserved name, and the only one here that names no file this
-	// store writes. It used to: the per-key `<key>.lock` whose flock serialised the
-	// mutations of one key, until an operator deleting it turned out to dissolve the
-	// exclusion (see lockKeysIn). The name stays reserved because `*.lock` is what a
-	// stale-lock sweep deletes — an object stored under one would be swept away with
-	// no error and no way back.
+	// lockSuffix names no file this store writes; the name stays reserved because
+	// `*.lock` is what a stale-lock sweep deletes, and an object stored under one would
+	// be swept away with no error and no way back.
 	lockSuffix = ".lock"
 )
 
@@ -103,47 +87,27 @@ func isSidecar(key string) bool {
 }
 
 // lockKeysIn takes the exclusive lock that serialises mutations of every key in one
-// directory. It is held across processes, because the writers this store has to
-// exclude are processes: on a single-machine deployment two Agents share
-// `-object-store-dir`, and the CAS on a volume's manifest is the whole of V1's
+// directory. It is held across processes: on a single-machine deployment two Agents
+// share `-object-store-dir`, and the CAS on a volume's manifest is the whole of V1's
 // fencing.
 //
-// **The lock is the directory, not a `<key>.lock` sidecar** — which is what it was,
-// and what an operator could switch off. A POSIX lock lives on an *inode*, so it is
-// an exclusion only for as long as the path still resolves to the inode it was taken
-// on. Delete the sidecar under a holder and the next writer opens the same name, gets
-// a brand-new inode, locks that, and is inside the read-compare-publish alongside the
-// holder: two CAS winners from one prevETag, both told they published, no error
-// anywhere and nothing to recover from afterwards. Measured against the sidecar
-// version: with a holder in place, `rm <key>.lock` let a second CAS complete in 6ms
-// instead of blocking. The action that does it is a routine one — `find -name
-// '*.lock' -delete`, an rsync or a backup restore that skips sidecars, a tidy-up
-// script — which is the whole problem: nothing about it looks like it touches
-// fencing.
+// The lock is the directory, not a `<key>.lock` sidecar. A POSIX lock lives on an
+// *inode*, so deleting the sidecar under a holder lets the next writer lock a brand-new
+// inode and enter the read-compare-publish alongside it: two CAS winners from one
+// prevETag, no error anywhere. Measured against the sidecar version, with a holder in
+// place, `rm <key>.lock` let a second CAS complete in 6ms instead of blocking — and the
+// action that does it is routine (`find -name '*.lock' -delete`, an rsync, a backup
+// restore). Rejected: verifying the sidecar's inode before publishing, which keeps a
+// routine command as the trigger and leaves the check-to-rename window; rejected: one
+// store-wide lock file, a sidecar again and serialising the whole store.
 //
-// A directory closes that, because there is no file named for the lock to delete, and
-// the thing that would replace it holds the objects too: `rm -rf` on a volume's
-// directory is not a cleanup anybody performs by accident, and it takes the manifest
-// with it. Rejected: keeping the per-key sidecar and verifying its inode before
-// publishing, which keeps a *routine* command as the trigger and still leaves the
-// window between the check and the rename. Rejected: one store-wide lock file, which
-// is a sidecar again — same unlink, same hole — and serialises the whole store rather
-// than one directory.
+// The cost is granularity: two keys in one directory serialise across the publish only —
+// staging the body and its fsync happen outside the lock.
 //
-// The cost is granularity: two keys in one directory now serialise. Only the publish
-// does — staging the body and its fsync happen outside the lock — so what a second
-// writer waits for is a read-compare, a rename, and the directory fsync it was going
-// to queue behind anyway.
-//
-// flock(2), for the crash case. The kernel drops the lock when the fd is closed,
-// including when the holder is SIGKILLed or panics mid-publish, so a dead writer
-// cannot wedge a key — there is no lease, no timeout, and nothing to reap. Rejected:
-// an O_CREAT|O_EXCL lock file, which is the same atomic exclusion but leaves the key
-// locked forever when its holder dies, and the usual repair (break a lock older than
-// T) reintroduces precisely the race it was meant to remove — two writers both
-// deciding the lock is stale, both proceeding, both winning. A lock whose
-// correctness depends on a timeout is not an exclusion (§25.1 says the same thing
-// about sleeps).
+// flock(2), for the crash case: the kernel drops the lock when the fd is closed, so a
+// SIGKILLed writer cannot wedge a key. Rejected: an O_CREAT|O_EXCL lock file, which
+// leaves the key locked forever when its holder dies, and whose usual repair (break a
+// lock older than T) is two writers both deciding it is stale and both proceeding.
 func (s *ObjectStore) lockKeysIn(dir string) (*dirLock, error) {
 	for range lockAttempts {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -222,21 +186,16 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 		return objectstore.PutResult{}, err
 	}
 
-	// Stage the whole body first, so publishing it is a single atomic step and no
-	// reader can ever observe a prefix of it. Staging happens outside the lock: the
-	// temp name is unique, and an fsync of a multi-megabyte WAL object is the one
-	// part of a Put that must not serialise the whole key.
+	// Staged outside the lock: the temp name is unique, and an fsync of a multi-megabyte
+	// WAL object must not serialise the whole key.
 	tmp, err := stage(p, data)
 	if err != nil {
 		return objectstore.PutResult{}, err
 	}
 	defer func() { _ = os.Remove(tmp) }()
 
-	// From here to the publish is one critical section, and it has to be one across
-	// processes: reading the current ETag, comparing it, and renaming over the key
-	// is a check preceding an act, and every writer that reads before any of them
-	// renames sees the ETag it was told to expect. Under an in-process mutex, four
-	// processes CASing one manifest from the same prevETag all returned nil.
+	// Reading the current ETag, comparing it and renaming over the key is one critical
+	// section, and it has to be one across processes.
 	lock, err := s.lockKeysIn(filepath.Dir(p))
 	if err != nil {
 		return objectstore.PutResult{}, err
@@ -253,18 +212,14 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 		}
 	}
 
-	// Nothing is published under a lock that stopped being one: if the directory was
-	// replaced between taking it and here, this writer is not excluding the next one,
-	// and the caller hears about it instead of both of them succeeding.
 	if err := lock.stillExcludes(); err != nil {
 		return objectstore.PutResult{}, err
 	}
 
 	switch {
 	case opts.IfNoneMatch && !marked:
-		// Link *is* the exclusion, not a check preceding one: it fails with EEXIST
-		// if the key already exists, atomically, so two concurrent creators cannot
-		// both win — and neither can two processes sharing the directory.
+		// Link *is* the exclusion: EEXIST is atomic, so two concurrent creators cannot
+		// both win, processes included.
 		if err := os.Link(tmp, p); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return objectstore.PutResult{}, objectstore.ErrPreconditionFailed

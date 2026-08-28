@@ -2,75 +2,24 @@
 # Which production comments still describe a mechanism this tree withdrew — computed,
 # not remembered.
 #
-# This repository deleted ~10.000 lines of Markdown because documents drifted from the
-# code, and moved the reasoning into comments at the line that makes each decision. That
-# was right, and CLAUDE.md now tells every reader that "the decision lives in the code, at
-# the line that makes it". The rot moved with it, and inside a comment it is strictly
-# worse than it was in a document: a comment has no banner, no date and no owner, and the
-# project's own instructions say to trust it.
+# A finding is a (symbol, term) pair — internal/wal/log.go:Log.Flush:remote. Rejected
+# keys: file:line (moves on any edit above it), the whole file (collapses a file's eight
+# mentions into one decision), the line's text hashed (a reword fails the gate with a
+# message about a hash).
 #
-# The review that produced this check found, among others:
+# A word is not a mechanism. Only comment text is matched — never code, never a string
+# literal — and a match may not touch [A-Za-z0-9_] on either side, so
+# nvme_remote_backlog_bytes and gcInterval do not fire. Every term below carries a string
+# it MUST match and a live identifier it MUST NOT, re-proved before a file is opened: a
+# mistyped pattern matches nothing and would report success for ever.
 #
-#   - wal.Log.Flush's doc comment describes uploading and verifying every covering object
-#     and VERIFYING THE LEASE before the ACK. Three functions below, durableStep does an
-#     fdatasync and advances a watermark. Nothing uploads. Nothing consults a lease.
-#   - cmd/volume-agent says the object store "is what FLUSH makes a write durable in".
-#     It has not been since ADR-0026.
+# Two lists — allow (the mention is legitimate) and pending (a lie somebody owes a
+# correction) — in hack/deadcode-allow.txt's format and read by one parser. Exit policy is
+# that script's: a finding in neither list, an entry matching no finding, an entry with no
+# reason, or a key both lists claim. Rejected: an in-comment //commentrot:ok escape,
+# because the decision would then live in the file being defended, invisible to an audit.
 #
-# WHAT A FINDING IS. A **(symbol, term) pair**: one vocabulary term, inside the comments
-# attached to or contained by one declaration — `internal/wal/log.go:Log.Flush:remote`.
-# Three alternatives were rejected:
-#
-#   - **file:line**, the obvious key, is what hack/deadcode.sh refuses for its own list and
-#     for the same reason: a line number moves whenever anything above it does, so the list
-#     would go stale on edits that have nothing to do with it.
-#   - **the whole file** collapses log.go's eight mentions of `checkpoint` into one
-#     decision, so allow-listing the honest one silences the lying one beside it.
-#   - **the line's text**, hashed, is stable against edits above and against nothing else:
-#     rewording a legitimate comment would fail the gate with a message about a hash.
-#
-# The symbol is what a human acts on ("is what Log.Flush says about `remote` still true?"),
-# it survives edits above it, and it is the same unit CLAUDE.md uses when it says the
-# decision lives at the line that makes it. It moves when the symbol is renamed — which is
-# the one edit where re-reading the comment is worth the cost.
-#
-# A WORD IS NOT A MECHANISM, and a gate that cannot tell them apart is a gate that gets
-# turned off in a week. `remote` appears in `nvme_remote_backlog_bytes`, a live column;
-# `standby` in `standby_host_id`; `gc` in Go's own garbage collector. Two rules:
-#
-#   1. Comment text only — never code, never a string literal. A URL in `"http://…"` is
-#      not a comment and neither is an identifier.
-#   2. Identifier-aware word boundaries: a match must not touch `[A-Za-z0-9_]` on either
-#      side, so `nvme_remote_backlog_bytes`, `StandbyHostID` and `gcInterval` do not match
-#      while `remote`, `warm standby` and `GC` in prose do.
-#
-# Rule 2 is not asserted by reading it. **Every term in the table below ships with a string
-# it must match and a live identifier it must not**, and this script re-proves all of them
-# before it looks at a single file (see "the vocabulary" and `selftest`). A term whose
-# pattern is mistyped matches nothing and would otherwise report success for ever — the
-# same defect as `task dst`'s `-run` regex that selected no tests.
-#
-# TWO LISTS, AND THE GATE. hack/comment-rot-allow.txt says "this mention is legitimate";
-# hack/comment-rot-pending.txt says "this comment is a lie somebody still owes a
-# correction". Both are hack/deadcode-allow.txt's format and are read by one parser. The
-# split is the point: several comments name a withdrawn mechanism precisely to say it is
-# gone, and those are correct for ever; the ones that describe it in the present tense are
-# debt, and putting them in the allowlist would cost that file its meaning.
-#
-# EXIT POLICY, identical in shape to hack/deadcode.sh: non-zero when a finding is in
-# neither list, when an entry in either list no longer matches a finding (the comment was
-# fixed, the symbol renamed, the term dropped), when an entry carries no reason, and when
-# both lists claim the same key. That makes it a ratchet that turns one way and fails in
-# both directions: the set of unexplained mentions cannot grow, and a list entry cannot
-# outlive its finding.
-#
-# REJECTED: an in-comment escape (`//commentrot:ok`). It is cheaper for the author, which
-# is exactly the problem — the decision would live in the file being defended, invisible
-# to anyone auditing the set, and the count could grow without a second file ever being
-# edited. The cost of one line in a list, in a commit somebody reviews, is the mechanism.
-#
-# The result is valid for one GOOS/GOARCH/build-tag configuration — linux/amd64, no tags,
-# what CI runs and what the binaries ship as.
+# Valid for one GOOS/GOARCH/build-tag configuration — linux/amd64, no tags.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

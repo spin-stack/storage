@@ -14,26 +14,16 @@ import (
 var ErrNoEpoch = errors.New("descriptor: this volume has no recorded epoch")
 
 // Epoch is the fencing token a volume was last granted, recorded where it survives the
-// catalog.
+// catalog. A rebuild used to read `descriptor.CurrentEpoch`, which is written at create and
+// at clone and updated by nothing, so a volume fenced up to epoch 4 came back at 1 and every
+// host that had held it held a token the restored catalog would accept again.
 //
-// # Why this is its own object
+// Not folded into descriptor.json: that file carries the wrapped DEK, and rewriting it on
+// every attach would put key material on a path that runs whenever a volume moves, to record
+// an integer. Losing this object costs an over-fence, which is the safe side.
 //
-// The epoch lives in the catalog, and a catalog is the thing `rebuild-metadata` exists
-// because you can lose. Until this existed, a rebuild read `descriptor.CurrentEpoch` —
-// which is written at create and at clone and updated by nothing — so a volume fenced up
-// to epoch 4 came back at 1, and every host that had ever held it was holding a token the
-// restored catalog would accept again. A fencing token that can go backwards is not one.
-//
-// It is not folded into `descriptor.json`, which would have been one fewer object. That
-// file carries the wrapped DEK, and it is the one thing in this system whose loss cannot
-// be repaired by any amount of re-reading: rewriting it on every attach would put the
-// key material on a path that runs whenever a volume moves, to record an integer. This
-// object holds one number, and losing it costs an over-fence, which is the safe side.
-//
-// It is also not the epoch object ADR-0026 withdrew. That one was a *fence* — a
-// compare-and-set two writers raced at — and what replaced it is the compare-and-set on
-// HEAD. This is a record, read by exactly one caller, at the one moment the catalog is
-// already gone.
+// Not ADR-0026's withdrawn epoch object either: that one was a fence two writers raced at,
+// replaced by the compare-and-set on HEAD. This is a record, read by one caller.
 type Epoch struct {
 	FormatVersion int    `json:"format_version"`
 	VolumeID      string `json:"volume_id"`
@@ -98,15 +88,11 @@ func ReadEpoch(ctx context.Context, store objectstore.Store, volumeID string) (i
 	return e.Epoch, nil
 }
 
-// EpochWitness answers what epoch the object store records for a volume.
-//
-// It exists so that the one caller that needs this over the object store — an Agent whose
-// lease has lapsed, deciding whether anybody actually took its volumes — depends on a
-// method and not on a package-level function it would have to be handed a store to call.
-// The interface it satisfies is declared where it is consumed (agent.Witness).
-//
-// A missing object answers ErrNoEpoch and not zero: "no record" and "granted at epoch 0"
-// are the same number and opposite facts, and the caller stops a guest on one of them.
+// EpochWitness answers what epoch the object store records for a volume, as a method so its
+// one caller — an Agent whose lease has lapsed, deciding whether anybody took its volumes —
+// depends on an interface declared where it is consumed (agent.Witness). A missing object
+// answers ErrNoEpoch and not zero: "no record" and "granted at epoch 0" are opposite facts,
+// and the caller stops a guest on one of them.
 type EpochWitness struct {
 	Store objectstore.Store
 }

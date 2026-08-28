@@ -8,20 +8,16 @@ import (
 	"github.com/spin-stack/storage/internal/metadata"
 )
 
-// RequestSnapshot asks the host serving a volume to freeze a copy of it under a name
-// (§19). It writes one catalog row in CREATING and returns; the snapshot itself is
-// taken by the Agent, because the Agent is the only thing that holds the volume's
-// write path and can capture a sequence under its lock.
+// RequestSnapshot asks the host serving a volume to freeze a copy of it under a name (§19).
+// It writes one catalog row in CREATING and returns; the Agent takes the snapshot, because
+// it is the only thing holding the volume's write path.
 //
-// This is the whole request protocol. There is no call to a host and no operation row:
-// the Agent converges on desired state (ADR-0021), the Control Plane puts the id there,
-// and the row's own state is the record of how far it has got. A Control Plane that
-// dies between this write and the Agent noticing loses nothing — the row is still
-// CREATING, so the next desired state carries it again.
+// There is no call to a host and no operation row: the Agent converges on desired state
+// (ADR-0021) and the row's own state is the record of how far it has got, so a Control Plane
+// that dies between this write and the Agent noticing loses nothing.
 //
-// The volume must be ACTIVE. Snapshotting a volume that is being fenced or promoted
-// would freeze a view whose writer may be about to be taken away, and the sequence it
-// names would belong to an epoch the fleet has moved past.
+// The volume must be ACTIVE. Snapshotting one being fenced or promoted would freeze a view
+// whose writer may be taken away, at a sequence belonging to an epoch the fleet has left.
 func RequestSnapshot(ctx context.Context, md metadata.Store, term int64, volumeID, snapshotID, requestID string) (metadata.Snapshot, error) {
 	v, err := md.GetVolume(ctx, volumeID)
 	if err != nil {

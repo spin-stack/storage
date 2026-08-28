@@ -14,20 +14,12 @@ import (
 	"sync"
 )
 
-// The three real primitives a qcow2 chain needs, and why none of them is disk.Disk.
-//
-// disk.Disk is a rooted namespace of append-only files with a crash model. It was built
-// for a format this process writes itself, byte by byte, and it deliberately hides two
-// things: the absolute path of a file, and any way to hand that file to somebody else.
-// Both are exactly what qcow2 needs. QEMU writes the image, `qemu-img` creates and
-// inspects it, and each of them is a *different process* that takes a path on the
-// command line. There is nothing here for an append-only file interface to model, and
-// wrapping one around a subprocess would only move the real primitive one call deeper.
-//
-// So the primitives are named for what they are — run a program, make a directory,
-// open a stream — and they live here, where INV-01 puts every real implementation. The
-// interfaces they satisfy are declared where they are consumed (internal/qcow,
-// internal/qmp), so a test injects a fake without either package importing this one.
+// The three real primitives a qcow2 chain needs — run a program, make a directory, open
+// a stream — and not disk.Disk, which is a rooted namespace of append-only files that
+// deliberately hides absolute paths and any way to hand a file to somebody else. Both are
+// what qcow2 needs: QEMU and `qemu-img` are other processes taking a path on the command
+// line. The interfaces these satisfy are declared where they are consumed (internal/qcow,
+// internal/qmp), so a test fakes them without importing this package.
 
 // Runner runs external programs to completion. It is what `qemu-img` is reached
 // through: v6 §7 forbids a qcow2 parser of our own, so creating and inspecting an
@@ -39,16 +31,10 @@ func NewRunner() *Runner { return &Runner{} }
 
 // Run executes name with args and returns its standard output.
 //
-// Standard error is captured separately and folded into the returned error rather than
-// into the output, for two reasons that pull the same way: `qemu-img info
-// --output=json` must hand back parseable JSON and nothing else, and a failure whose
-// message is "exit status 1" is a failure an operator cannot act on. `qemu-img`'s
-// diagnostics are the whole explanation of what went wrong with an image, so they go
-// where an error is read.
-//
-// The context is the only deadline. There is no timeout of its own here — a caller that
-// wants one builds it from its injected clock, so the wait is simulable like every
-// other wait in this tree.
+// Standard error is captured separately and folded into the returned error: `qemu-img
+// info --output=json` must hand back parseable JSON and nothing else, and "exit status 1"
+// is a failure an operator cannot act on. The context is the only deadline — a caller
+// that wants one builds it from its injected clock, so the wait stays simulable.
 func (*Runner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -63,9 +49,7 @@ func (*Runner) Run(ctx context.Context, name string, args ...string) ([]byte, er
 	return stdout.Bytes(), nil
 }
 
-// Paths is the part of a real filesystem that is addressed by absolute path. Every verb
-// here is one a chain's owner performs on paths it then hands to another process, or on
-// the little pointer file that tells that process which path to take.
+// Paths is the part of a real filesystem addressed by absolute path.
 type Paths struct{}
 
 // NewPaths returns the production Paths.
@@ -108,13 +92,10 @@ func (*Paths) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
 // in the publish path that is worth counting.
 func (*Paths) Open(path string) (io.ReadCloser, error) { return os.Open(path) }
 
-// WriteAtomic replaces path's contents with data in one step.
-//
-// Temp file, fsync, rename, fsync the directory — all four, because the reader is
-// another process choosing its own moment and the thing being written is which qcow2 a
-// VM is about to be launched against. A half-written pointer is a VM that does not
-// start; a pointer that reached the directory entry but not the disk is a VM that starts
-// against the wrong layer after a power cut, which is worse and silent.
+// WriteAtomic replaces path's contents with data in one step: temp file, fsync, rename,
+// fsync the directory. The reader is another process choosing its own moment and the
+// thing written is which qcow2 a VM is launched against — a pointer that reached the
+// directory entry but not the disk starts a VM against the wrong layer, silently.
 func (*Paths) WriteAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
@@ -140,13 +121,9 @@ func (*Paths) WriteAtomic(path string, data []byte) error {
 	return fsyncDirAt(dir)
 }
 
-// Create truncates or creates the file, and its Close makes the bytes durable — the file
-// and the directory entry both.
-//
-// The fsync of the *directory* is the half that is easy to leave out and is the half that
-// matters here: a downloaded layer whose contents reached the platter but whose name did
-// not is a chain that opens today and is missing a link after a power cut, which is a
-// guest booting a volume that is short a commit with nothing reporting an error.
+// Create truncates or creates the file; its Close makes the file and its directory entry
+// both durable. A downloaded layer whose contents reached the platter but whose name did
+// not is a chain missing a link after a power cut, with nothing reporting it.
 func (*Paths) Create(path string) (io.WriteCloser, error) {
 	f, err := os.Create(path)
 	if err != nil {

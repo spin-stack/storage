@@ -16,18 +16,12 @@ import (
 	"github.com/spin-stack/storage/internal/simio/real"
 )
 
-// The If-Match CAS on a volume's manifest is the only fencing V1 has, and on a
-// single-machine deployment (`-object-store-dir`) the writers it must exclude are two
-// Agent *processes* on one filesystem. The exclusion is an flock; these tests are its
-// three halves — that it excludes another process at all, that a holder which dies
-// does not leave the key locked forever (which is why it is an flock and not an
-// O_CREAT|O_EXCL lock file), and that an operator deleting lock files does not
-// dissolve it.
-//
-// The conformance suite (storetest) proves the property from the outside, by racing
-// four processes. These prove the mechanism, including the two cases a race cannot
-// reach: a writer SIGKILLed between its ETag comparison and its rename, and a second
-// writer that arrives *after* a sweep and before the first writer publishes.
+// The If-Match CAS on a volume's manifest is the only fencing V1 has, and on
+// `-object-store-dir` the writers it must exclude are two Agent processes on one
+// filesystem. These prove the mechanism — that it excludes another process, that a holder
+// which dies does not wedge the key (why it is an flock and not an O_CREAT|O_EXCL file),
+// and that an operator deleting lock files does not dissolve it. storetest proves the
+// property from the outside by racing four processes.
 
 const holdLockEnv = "SPIN_REAL_HOLD_LOCK"
 
@@ -72,14 +66,11 @@ func TestAProcessHoldingTheKeyLockExcludesAnotherAndDyingUnwedgesIt(t *testing.T
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	// The operator now does the thing that reopened this: sweeps stale lock files.
-	// `find -name '*.lock' -delete`, an rsync that skips sidecars, a restore from a
-	// backup that never had them — all the same unlink. A lock lives on an inode, so
-	// if the exclusion is a path the sweep can remove, the *next* writer creates a
-	// fresh inode, locks that, and is inside the read-compare-publish alongside the
-	// holder: two winners from one prevETag, both told they published, nothing logged
-	// anywhere. Note that this second writer has to arrive after the sweep — the one
-	// already blocked in flock() is waiting on the inode it opened and never notices.
+	// The operator now sweeps stale lock files — `find -name '*.lock' -delete`, an rsync, a
+	// backup restore. A lock lives on an inode, so an exclusion the sweep can remove lets
+	// the *next* writer lock a fresh inode and join the holder inside the
+	// read-compare-publish. It has to arrive after the sweep: the one already blocked in
+	// flock() waits on the inode it opened.
 	swept := sweepLockFiles(t, dir)
 	casB := make(chan error, 1)
 	go func() {
@@ -298,11 +289,8 @@ func TestHelperHoldsTheLock(t *testing.T) {
 	select {} // held until the parent kills this process
 }
 
-// A key whose name ends in the lock suffix is refused, like every other sidecar. This
-// store no longer writes a `<key>.lock` — the exclusion moved off a path an operator
-// can unlink — but that is exactly why the name stays reserved: `*.lock` is what a
-// stale-lock sweep deletes, and an object stored under one would be swept away with no
-// error and no way back.
+// A key ending in the lock suffix is refused like every other sidecar: `*.lock` is what a
+// stale-lock sweep deletes, so an object stored under one would vanish with no error.
 func TestALockFileIsNotAnObject(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()

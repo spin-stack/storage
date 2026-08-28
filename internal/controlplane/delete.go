@@ -15,57 +15,44 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// ErrVolumeAttached refuses the delete of a volume a host is still serving.
-//
-// A sentinel because it is the one refusal here an operator can act on with a single
-// command — detach it — where ErrHasDescendants asks for a FLATTEN and everything else
-// says the bucket or the catalog is wrong.
+// ErrVolumeAttached refuses the delete of a volume a host is still serving. A sentinel
+// because it is the one refusal here an operator fixes with a single command: detach it.
 var ErrVolumeAttached = errors.New("controlplane: the volume is still placed on a host")
 
-// DeleteVolume destroys a volume: its key material first, then the map from the volume
-// to its layers, then the catalog row.
+// DeleteVolume destroys a volume: its key material first, then the map from the volume to
+// its layers, then the catalog row.
 //
-// # What "deleted" means, exactly
+// # What "deleted" means
 //
-// Crypto-shred. The layers themselves are **not** touched: `commit.LayerKey` puts them
-// under a global content-addressed prefix precisely so a clone's chain can reference
-// layers its parent wrote, and deleting them under a volume's name would delete its
-// clones' data. With the DEK gone the bytes are noise, and that is the entire argument
-// for why leaving them is safe — which is also why the shred has to be complete.
+// Crypto-shred. The layers themselves are **not** touched: commit.LayerKey puts them under
+// a global content-addressed prefix so a clone's chain can reference layers its parent
+// wrote, and deleting them under a volume's name would delete its clones' data. With the
+// DEK gone the bytes are noise — which is why the shred has to be complete. Two limits:
 //
-// Two limits, said out loud rather than implied:
-//
-//   - `objectstore.Store.Delete` is a *reversible marker* by design (INV-14): the bytes
-//     stay, `Restore` brings them back, and permanent removal belongs to the bucket's
-//     lifecycle policy — the same argument `metadata.Store.DeleteVolume` already makes
-//     about there being no retention column. So this makes the wrapped DEK unreachable
-//     through this interface and hands the actual destruction to that policy. A
-//     deployment that has not configured it has not shredded anything, and any claim
-//     otherwise is false until the descriptor's non-current versions expire.
-//   - The shred is **lineage-scoped, not volume-scoped**. A clone shares the parent's
-//     DEK bytes (only the wrap differs), so deleting a parent whose descendants exist
-//     would destroy no secret at all — which is one more reason step 1 refuses it. See
-//     the re-wrap in Clone for the constraint this puts on a future FLATTEN.
+//   - objectstore.Store.Delete is a *reversible marker* by design (INV-14); permanent
+//     removal belongs to the bucket's lifecycle policy. A deployment that has not
+//     configured one has shredded nothing until the descriptor's non-current versions
+//     expire, and any claim otherwise is false.
+//   - The shred is **lineage-scoped, not volume-scoped**. A clone shares the parent's DEK
+//     bytes (only the wrap differs), so deleting a parent whose descendants exist would
+//     destroy no secret at all — one more reason step 1 refuses it. See the re-wrap in
+//     Clone for the constraint this puts on a future FLATTEN.
 //
 // # Order, decided by what a crash in the middle leaves behind
 //
 //  1. Preconditions. Nothing is written before a refusal.
-//  2. `volumes/<id>/descriptor.json` — the key material — before anything else. It is
-//     also what `-rebuild-metadata` lists volumes from, so killing it first means a
-//     crash anywhere later leaves an unopenable, unlistable orphan. The reverse order
-//     (row first) leaves the wrapped DEK in the bucket with no row to drive a retry, and
-//     the next `-rebuild-metadata` would resurrect the deleted volume from its
-//     descriptor: the shred defeated by the repair tool.
-//  3. `HEAD` and the commit manifests. Not key material — they are the map from a volume
-//     to its layers, and leaving a map to bytes you have just claimed to destroy is what
-//     makes an operator's "it's gone" wrong.
-//  4. The catalog row last, term-guarded. It is the only durable record of what is still
-//     to be finished, and `volumes.dek_wrapped` is the second copy of the key.
+//  2. `volumes/<id>/descriptor.json` — the key material — first. It is also what
+//     -rebuild-metadata lists volumes from, so a crash later leaves an unopenable,
+//     unlistable orphan. Row-first instead would let the next -rebuild-metadata resurrect
+//     the deleted volume from its descriptor: the shred defeated by the repair tool.
+//  3. `HEAD` and the commit manifests — the map from a volume to bytes you have just
+//     claimed to destroy.
+//  4. The catalog row last, term-guarded: `volumes.dek_wrapped` is the second copy of the
+//     key.
 //
-// A crash between 2 and 4 leaves a row whose descriptor is gone. Re-running is
-// idempotent — this is driven by the id, not by a listing — but `-rebuild-metadata` will
-// not see the volume any more, so the row is only removable through this verb. The
-// runbook is: run the delete again.
+// A crash between 2 and 4 leaves a row whose descriptor is gone — invisible to
+// -rebuild-metadata and removable only through this verb. The runbook: run the delete
+// again.
 func DeleteVolume(ctx context.Context, md metadata.Store, store objectstore.Store,
 	kms KeyChecker, term int64, volumeID string,
 ) (Shred, error) {
@@ -79,40 +66,26 @@ func DeleteVolume(ctx context.Context, md metadata.Store, store objectstore.Stor
 		return Shred{}, fmt.Errorf("%w: volume %s is placed on host %s. Detach it first — deleting its key while a guest is writing "+
 			"turns the next commit into unopenable bytes", ErrVolumeAttached, volumeID, vol.PrimaryHostID)
 	}
-	// The bucket's half of the descendant refusal. The catalog has its own
-	// (ErrHasDescendants, at step 4, enforced in both directions and by two foreign keys
-	// in Postgres), and it is not enough on its own here: a rebuild that lost the clone's
-	// parent link, or a clone whose row has not been recorded yet, is invisible to it,
-	// and the bucket is the authority a rebuild trusts (INV-20). This is what
-	// descriptor.Prefix and VolumeOfKey were given for.
+	// The bucket's half of the descendant refusal. The catalog's own (ErrHasDescendants, at
+	// step 4) is not enough alone: a rebuild that lost the clone's parent link, or a clone
+	// whose row is not recorded yet, is invisible to it, and the bucket is the authority a
+	// rebuild trusts (INV-20).
 	if err := refuseIfAnythingDescends(ctx, store, kms, volumeID); err != nil {
 		return Shred{}, err
 	}
-	// Whether this delete is a shred at all, decided before anything is removed.
-	//
-	// A clone is handed its parent's DEK *bytes* — only the wrap differs — because that
-	// is what lets it read the layers its parent published (v6 §10). So deleting one
-	// member of a live lineage destroys no secret: its layers stay readable with the
-	// wrap its relative still publishes, which an adversary demonstrated by reading every
-	// byte back out.
-	//
-	// It is reported and not refused, and that was a real choice. Refusing was the first
-	// answer and it deadlocked deletion outright: a parent cannot go while a descendant
-	// exists (the check above, which is right), so a clone that could not go while its
-	// parent existed made a cloned lineage undeletable for ever. What was wrong was never
-	// the removal — it was the *claim*. Deleting a clone is a removal; deleting the last
-	// holder of the key is the shred; and this says which one happened rather than
-	// letting an operator assume.
+	// Whether this delete is a shred at all, decided before anything is removed. Reported
+	// and not refused: refusing was the first answer and it deadlocked deletion — a parent
+	// cannot go while a descendant exists (the check above), so a clone that could not go
+	// while its parent existed made a cloned lineage undeletable for ever. What was wrong was
+	// the claim, not the removal.
 	shred, err := lineageShred(ctx, store, volumeID)
 	if err != nil {
 		return Shred{}, err
 	}
 
-	// Step 2: the key material, before anything else.
-	// ErrNotFound is tolerated here and at every Delete below: it is what a re-run of a
-	// delete that crashed after step 2 sees, and the runbook for that crash is to run the
-	// delete again. Treating "already gone" as a failure would make the only path that
-	// can finish the job the one path that refuses to.
+	// Step 2: the key material. ErrNotFound is tolerated here and at every Delete below — it
+	// is what a re-run after a crash sees, and treating "already gone" as a failure would make
+	// the only path that can finish the job the one path that refuses to.
 	if err := store.Delete(ctx, descriptor.Key(volumeID)); err != nil && !errors.Is(err, objectstore.ErrNotFound) {
 		return Shred{}, fmt.Errorf("controlplane: deleting the key material at %s: %w", descriptor.Key(volumeID), err)
 	}
@@ -159,23 +132,17 @@ type Shred struct {
 	SharedWith string
 }
 
-// lineageShred reports whether deleting this volume destroys its key.
-//
-// A clone is handed its parent's DEK *bytes* — only the wrap differs (see Clone's
-// re-wrap) — because that is what lets it read the layers its parent published. The
-// consequence is that no single member of a lineage can be crypto-shredded: the secret
-// only stops existing when the last wrap of it does.
+// lineageShred reports whether deleting this volume destroys its key: a lineage shares one
+// DEK's bytes (see Clone's re-wrap), so the secret only stops existing when the last wrap of
+// it does.
 //
 // The parent is looked for in the bucket rather than in the catalog, for the reason the
-// descendant check gives one direction up: a rebuild that lost the link, or a row that
-// was never recorded, is invisible to the catalog, and the bucket is the authority a
-// rebuild trusts.
+// descendant check gives one direction up: a rebuild that lost the link, or a row never
+// recorded, is invisible to the catalog.
 func lineageShred(ctx context.Context, store objectstore.Store, volumeID string) (Shred, error) {
 	d, err := descriptor.Read(ctx, store, volumeID)
 	if errors.Is(err, objectstore.ErrNotFound) {
-		// Already gone, which is what a re-run of a delete that crashed after step 2
-		// sees. There is no key left here to share, and the runbook for that crash is to
-		// run the delete again.
+		// Already gone: no key left here to share.
 		return Shred{KeyDestroyed: true}, nil
 	}
 	if err != nil {
@@ -223,18 +190,14 @@ func refuseIfAnythingDescends(ctx context.Context, store objectstore.Store, kms 
 			// descendant" is the one thing this check exists to prevent.
 			return fmt.Errorf("controlplane: reading %s while checking what descends from %s: %w", o.Key, volumeID, err)
 		}
-		// Only a descriptor this fleet wrapped counts as a descendant. `parent_volume_id`
-		// is an unauthenticated field in an object anyone with the bucket can create, so
-		// a forged descriptor claiming descent blocked the crypto-shred of a real volume
-		// for ever — and the instruction the operator was handed was to FLATTEN a volume
-		// that does not exist. The wrap is the one thing a forger cannot produce: it is
-		// sealed under this fleet's KEK, bound to the volume that carries it.
+		// Only a descriptor this fleet wrapped counts as a descendant. `parent_volume_id` is
+		// unauthenticated, so a forged descriptor claiming descent blocked a real volume's
+		// crypto-shred for ever, with the operator told to FLATTEN a volume that does not
+		// exist. The wrap is the one thing a forger cannot produce.
 		//
-		// A descriptor that does not verify is skipped rather than refused. Skipping is
-		// safe in the direction that matters: it cannot be one of ours, so it cannot be
-		// reading through the volume being deleted, so it is not a descendant. It is
-		// logged, because an object under this prefix that is not ours is worth an
-		// operator's attention even when it changes nothing.
+		// A descriptor that does not verify is skipped rather than refused: it cannot be ours,
+		// so it cannot be reading through the volume being deleted. Logged, because an object
+		// under this prefix that is not ours is worth an operator's attention.
 		if _, kerr := kms.UnwrapDEK(d.DEKWrapped, d.DEKKeyID, uuid.UUID(id)); kerr != nil {
 			slog.Warn("an object under the volumes prefix carries key material this fleet did not wrap; it is not a descendant and is being ignored",
 				"key", o.Key, "checking", volumeID, "error", kerr)

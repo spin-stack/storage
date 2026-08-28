@@ -8,12 +8,9 @@ import (
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
 
-// The device budget is the simulated counterpart of statfs (ADR-0013 §1): a
-// declared device size, against which everything written to this disk is charged.
-// It is what the Agent's thresholds will be evaluated on under DST, and it is
-// per *device*, not per file — the per-file InjectENOSPC cap models one file's
-// filesystem quota, and N volumes each inside their own cap can still fill the
-// device between them, which is exactly the case ADR-0013 §1 exists for.
+// The device budget is the simulated counterpart of statfs (ADR-0013 §1) and is per
+// *device*, not per file: N volumes each inside their own InjectENOSPC cap can still fill
+// the device between them, which is the case ADR-0013 §1 exists for.
 
 func write(t *testing.T, d *sim.Disk, name string, n int) disk.File {
 	t.Helper()

@@ -41,25 +41,15 @@ type Descriptor struct {
 	// rebuild-metadata reconstructs volumes from these objects: a clone rebuilt
 	// without its parent link is a clone that reads zeros, with nothing to say why.
 	ParentSnapshotID string `json:"parent_snapshot_id,omitempty"`
-	// ParentVolumeID is the volume that snapshot belongs to, and without it the link
-	// above is only half a link. A snapshot is not addressable on its own — it lives at
-	// image/<volume>/snapshots/<id>.json (image.SnapshotKey) — so "which snapshot"
-	// without "whose" names nothing a reader can open. Until this field existed the
-	// other half lived only in the catalog (snapshots.volume_id), which meant a reader
-	// holding the database could resolve a lineage and a reader holding only the bucket
-	// could not, while every claim about these objects says the bucket is the authority
-	// a rebuild trusts (§22.5, INV-20).
+	// ParentVolumeID is the volume that snapshot belongs to; without it the link above is
+	// half a link, since a snapshot lives at image/<volume>/snapshots/<id>.json and is not
+	// addressable on its own. It was only in the catalog until agent.parentView started
+	// walking a clone's ancestry one descriptor at a time — a reader holding the bucket
+	// could not resolve a lineage the bucket is supposed to be the authority for (§22.5,
+	// INV-20).
 	//
-	// The reader that made it necessary is agent.parentView, which walks a clone's
-	// ancestry one descriptor at a time: the desired state names the first link (ADR-0021
-	// — the Agent is told, it does not look things up), and every link above it comes
-	// from here.
-	//
-	// Rejected: putting the whole ancestry in DesiredVolume. It would save this field and
-	// one GET per link, and it makes the Control Plane responsible for bounding the
-	// length of a list in a message, and it moves the authority for a volume's lineage
-	// out of the object store — into the one component whose loss -rebuild-metadata
-	// exists to survive.
+	// Rejected: the whole ancestry in DesiredVolume — it moves the authority for a volume's
+	// lineage into the one component -rebuild-metadata exists to survive losing.
 	ParentVolumeID string `json:"parent_volume_id,omitempty"`
 }
 
@@ -67,14 +57,6 @@ type Descriptor struct {
 // not repaired and not guessed at: a descriptor nobody can state the true contents of
 // is exactly what the recovery path must refuse to act on.
 var ErrCorruptDescriptor = framed.ErrCorrupt
-
-// Digest is SHA-256 over the descriptor's JSON with the digest field itself empty.
-//
-// Hashing the encoding rather than a hand-written list of fields is deliberate: a field
-// added to this struct later is covered automatically, where a hand-written list would
-// silently stop covering the struct the moment someone added to it — which is the exact
-// failure this closes. encoding/json writes struct fields in declaration order and every
-// field here is a scalar or a []byte, so the encoding is deterministic.
 
 // Key is the deterministic descriptor key for a volume.
 func Key(volumeID string) string { return "volumes/" + volumeID + "/descriptor.json" }
@@ -119,17 +101,9 @@ func VolumeOfKey(key string) (string, bool) {
 	return id, true
 }
 
-// Write persists (or overwrites) a volume descriptor.
-//
-// It is written at create (controlplane.Provision) and at clone (controlplane.Clone),
-// and nothing else writes one. It said "updated on resize, epoch change, and
-// snapshot-lineage changes" until 2026-08-06, which was true of none of the three: the
-// only resize verb was a catalog UPDATE nothing called (now deleted, see metadata.Store),
-// the epoch is bumped in the catalog by BumpVolumeEpoch without coming back here, and
-// CurrentEpoch below already says the epoch object is the authority. The staleness that
-// matters is therefore the epoch's, and it is stated where the field is; a sentence
-// promising updates nobody makes is worse than no sentence, because -rebuild-metadata
-// reads this object as the truth about a volume the database no longer describes.
+// Write persists (or overwrites) a volume descriptor. Only create (controlplane.Provision)
+// and clone (controlplane.Clone) write one; the epoch is bumped in the catalog and does not
+// come back here, which is why the epoch object is the authority (see CurrentEpoch).
 func Write(ctx context.Context, store objectstore.Store, d Descriptor) error {
 	// Stamped here rather than trusted from the caller: a Descriptor built by hand with a
 	// zero version would be written as one, and the whole point of the field is that it
@@ -165,17 +139,11 @@ func Read(ctx context.Context, store objectstore.Store, volumeID string) (Descri
 	if err := framed.CheckVersion(d.FormatVersion); err != nil {
 		return Descriptor{}, fmt.Errorf("descriptor %s: %w", Key(volumeID), err)
 	}
-	// The object must describe the volume it was asked for. The digest above proves the
-	// bytes are the bytes that were written; it says nothing about *where*, so a
-	// descriptor copied or restored under another volume's prefix passes it intact — and
-	// it is a whole volume's identity, geometry, wrapped key and parent link, every one
-	// of which a reader then attributes to the wrong volume.
-	//
-	// The same check, for the same reason, is in image.readManifest ("what catches a
-	// bucket copied under the wrong prefix, and every reader needs it"). It matters more
-	// here since agent.parentChain started following these objects: a descriptor under
-	// the wrong key sends the walk up a lineage that is not this volume's, and every
-	// range it then layers is another volume's data served to this guest.
+	// The object must describe the volume it was asked for. The digest proves the bytes are
+	// the bytes that were written and says nothing about *where*, so a descriptor copied under
+	// another volume's prefix passes it intact — and agent.parentChain follows these objects,
+	// so a misplaced one sends the lineage walk up another volume's history and every range it
+	// layers is another volume's data served to this guest.
 	if d.VolumeID != volumeID {
 		return Descriptor{}, fmt.Errorf("descriptor: %s describes volume %s", Key(volumeID), d.VolumeID)
 	}
