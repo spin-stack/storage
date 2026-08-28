@@ -17,6 +17,10 @@ layer under it, three times. `demo:stage3` adds the commit protocol and reads th
 back with `cat`: the chain from `HEAD` is walked to the first commit, checking each layer is
 present, matches its digest, and carries none of the guest's bytes in the clear.
 
+`demo:stage6` is §20: a snapshot is cloned, and a second guest boots the clone and reads
+back the bytes the parent's guest wrote — the parent's layers fetched from the bucket and
+opened with the parent's key binding, a fresh tip on top.
+
 `demo:stage5` is §19 under v6: a snapshot is a *name for a commit*. An operator asks with
 the real binary while a guest writes, the Agent seals the tip because it was asked, and the
 catalog names a commit the bucket holds and that is on the chain from HEAD.
@@ -58,14 +62,9 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **A clone still reads zeros.** §20 has a Control Plane half and no Agent half: `-clone-snapshot`
-   creates the row and the descriptor with `parent_snapshot_id`, and nothing in
-   `internal/qcow` reads a parent, so the Agent prepares a fresh empty chain for a volume
-   advertised as a copy. Snapshots are commits now, so a clone is "restore from another
-   volume's commit" — which is what `internal/recovery` already does; what is new is the
-   lineage's shared DEK (§10). `internal/controlplane/clone.go` also still reasons about
-   the withdrawn engine: `MaxChainDepth` is justified by a measurement of `cow.IntervalMap`,
-   `agent.awaitBase` and `agent.maxChainWalk`, none of which exist.
+1. **`clone.go` still reasons about the withdrawn engine.** `MaxChainDepth` is justified by
+   a measurement of `cow.IntervalMap`, `agent.awaitBase` and `agent.maxChainWalk`, none of
+   which exist. The number wants re-measuring against the chain a clone actually builds.
 2. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
    while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
    implementation of it. They belong in `internal/qcow`'s adversary lane.

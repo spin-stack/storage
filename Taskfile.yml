@@ -458,6 +458,14 @@ tasks:
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage5-demo.sh
 
+  demo:stage6:
+    desc: >-
+      Stage 6 end to end: a snapshot is cloned and a second guest boots the clone and reads
+      back the bytes the parent's guest wrote.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage6-demo.sh
+
   soak:
     desc: >-
       Run everything, over and over, until something breaks — the DST set across hundreds

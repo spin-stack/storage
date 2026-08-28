@@ -432,7 +432,16 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 		openCtx, cancel := m.withTimeout(ctx)
 		defer cancel()
 		chain, err := Open(openCtx, m.run, m.paths, m.cfg.QemuImg, OpenRequest{
-			Root: m.cfg.Root, VolumeID: id, SizeBytes: d.GetSizeBytes(),
+			Root: m.cfg.Root,
+			// The lineage comes from the desired state every cycle, because the Agent
+			// cannot look a parent up (ADR-0021) and the Control Plane is the only party
+			// that can read the snapshot row this points at.
+			Lineage: Lineage{
+				VolumeID:       id,
+				ParentVolumeID: d.GetParentVolumeId(),
+				ParentCommitID: d.GetParentCommitId(),
+			},
+			SizeBytes: d.GetSizeBytes(),
 			LiveImage: live, NewLayerID: ids.New().String(), Recovery: m.rec,
 		})
 		if err != nil {

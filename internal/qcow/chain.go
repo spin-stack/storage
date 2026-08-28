@@ -64,11 +64,12 @@ var ErrStaleChain = errors.New("qcow: this host's chain is behind the published 
 // `published_sequence` or `durable_sequence`, so a guard built on either always answers
 // "born empty".
 type Recovery interface {
-	// Restore rebuilds volumeID's published chain locally. A wrapped commit.ErrNoHead
-	// means the volume has never published and an empty chain is correct; every other
-	// error means refuse. commit.ErrNoHead is reused rather than a sentinel of our own
-	// because the condition *is* "this volume has no HEAD".
-	Restore(ctx context.Context, volumeID string, sizeBytes int64) (Restored, error)
+	// RestoreFrom rebuilds this volume's published chain locally, including its parent's
+	// up to the named commit when it is a clone. A wrapped commit.ErrNoHead means the
+	// volume has never published and an empty chain is correct; every other error means
+	// refuse. commit.ErrNoHead is reused rather than a sentinel of our own because the
+	// condition *is* "this volume has no HEAD".
+	RestoreFrom(ctx context.Context, l Lineage, sizeBytes int64) (Restored, error)
 	// Current is the commit the object store says is this volume's newest, wrapping
 	// commit.ErrNoHead when it has never published. It is Restore's question without
 	// Restore's work, and it is asked on every open of a chain that is already here:
@@ -257,8 +258,9 @@ type imageInfo struct {
 
 // OpenRequest is what Open needs to know about one volume.
 type OpenRequest struct {
-	Root     string
-	VolumeID string
+	Root string
+	// Lineage is this volume's id and, for a clone, the parent commit it starts from.
+	Lineage
 	// SizeBytes is the virtual size the catalog says this volume has.
 	SizeBytes int64
 	// LiveImage is the layer a running QEMU already has open, empty when none does.
@@ -426,7 +428,7 @@ func checkNotStale(ctx context.Context, p Paths, req OpenRequest, image string) 
 // a refusal, including an unreachable bucket, which objectstore reports separately from
 // "the key is not there" precisely so this line cannot confuse them.
 func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest, pointer string, local State) (*Chain, error) {
-	restored, err := req.Recovery.Restore(ctx, req.VolumeID, req.SizeBytes)
+	restored, err := req.Recovery.RestoreFrom(ctx, req.Lineage, req.SizeBytes)
 	switch {
 	case errors.Is(err, commit.ErrNoHead):
 		// This host's own record outranks the bucket's answer, in exactly one direction and
@@ -475,7 +477,7 @@ func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 //
 // keepLocal true means the caller carries on with the chain that is already here.
 func regrant(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest, pointer, image string, local State) (chain *Chain, keepLocal bool, err error) {
-	restored, err := req.Recovery.Restore(ctx, req.VolumeID, req.SizeBytes)
+	restored, err := req.Recovery.RestoreFrom(ctx, req.Lineage, req.SizeBytes)
 	switch {
 	case errors.Is(err, commit.ErrNoHead):
 		slog.Info("this volume was granted back to this host and the object store holds no history for it, so the local chain is the only one there is",
@@ -752,3 +754,19 @@ func inspect(ctx context.Context, r Runner, qemuImg, image string) (imageInfo, e
 	}
 	return info, nil
 }
+
+// Lineage is which volume a chain belongs to and, for a clone, where it starts.
+//
+// ParentCommitID is a *named* commit and not the parent's HEAD: a clone is the volume as
+// it was at the snapshot, and the parent's HEAD is whatever it has published since.
+type Lineage struct {
+	VolumeID string
+	// ParentVolumeID and ParentCommitID are empty for a volume that was created rather
+	// than cloned. They travel together: a parent id with no commit names no point in a
+	// history, and a commit with no volume names no prefix to read it from.
+	ParentVolumeID string
+	ParentCommitID string
+}
+
+// Cloned reports whether this volume descends from another one.
+func (l Lineage) Cloned() bool { return l.ParentVolumeID != "" && l.ParentCommitID != "" }

@@ -615,6 +615,16 @@ type DesiredVolume struct {
 	// the snapshot row, which is one lookup the Agent cannot perform.
 	ParentSnapshotId string `protobuf:"bytes,7,opt,name=parent_snapshot_id,json=parentSnapshotId,proto3" json:"parent_snapshot_id,omitempty"`
 	ParentVolumeId   string `protobuf:"bytes,8,opt,name=parent_volume_id,json=parentVolumeId,proto3" json:"parent_volume_id,omitempty"`
+	// parent_commit_id is the commit that snapshot names — the exact point in the parent's
+	// published history this clone starts from. Empty for a volume that was created rather
+	// than cloned.
+	//
+	// It is on the wire for the reason the two ids above are: the Agent is a thing that is
+	// told (ADR-0021), and this one lives on the snapshot row, which is a lookup it cannot
+	// perform. Without it a clone would have to read the parent's HEAD, which is whatever
+	// the parent has published *since* — a clone of "the volume as it was on Tuesday" that
+	// silently delivers Thursday.
+	ParentCommitId string `protobuf:"bytes,13,opt,name=parent_commit_id,json=parentCommitId,proto3" json:"parent_commit_id,omitempty"`
 	// pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
 	// empty when there is nothing to take. It is the whole trigger: an Agent is never
 	// *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —
@@ -760,6 +770,13 @@ func (x *DesiredVolume) GetParentSnapshotId() string {
 func (x *DesiredVolume) GetParentVolumeId() string {
 	if x != nil {
 		return x.ParentVolumeId
+	}
+	return ""
+}
+
+func (x *DesiredVolume) GetParentCommitId() string {
+	if x != nil {
+		return x.ParentCommitId
 	}
 	return ""
 }
@@ -1316,7 +1333,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xca\x03\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xf4\x03\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1326,7 +1343,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05epoch\x18\x04 \x01(\x03R\x05epoch\x122\n" +
 	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x12,\n" +
 	"\x12parent_snapshot_id\x18\a \x01(\tR\x10parentSnapshotId\x12(\n" +
-	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\x12.\n" +
+	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\x12(\n" +
+	"\x10parent_commit_id\x18\r \x01(\tR\x0eparentCommitId\x12.\n" +
 	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12-\n" +
 	"\x12published_sequence\x18\n" +
 	" \x01(\x03R\x11publishedSequence\x12)\n" +

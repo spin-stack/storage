@@ -45,7 +45,18 @@ SIZE=${SIZE:-268435456}
 # hosted CI runner. What Stage 1 demonstrates is a Linux guest reaching a qcow2 through
 # virtio, and that is true at either speed; refusing to run without KVM would make the one
 # command a human runs unrunnable on most of the machines that would run it.
-ACCEL=${ACCEL:-kvm:tcg}
+# Chosen here rather than left to QEMU's `kvm:tcg` fallback list, which picks the same
+# thing and says nothing. The silence is the problem: a machine that should have KVM and
+# does not — a developer outside the `kvm` group, a runner that lost nested virt — runs
+# emulated at a tenth of the speed, and every timing the run prints is a measurement of
+# something else. Several numbers in this repository's comments came out of these demos.
+if [ -z "${ACCEL:-}" ]; then
+  if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    ACCEL=kvm
+  else
+    ACCEL=tcg
+  fi
+fi
 
 say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
@@ -173,4 +184,10 @@ grep -m1 "qemu-img is usable" "$DIR/logs/agent1.log"
 until docker exec "$PGC" psql -U cp -d "$DB" -tAc \
   "SELECT count(*) FROM hosts WHERE host_id='$HOST_ID'" | grep -q '^1$'; do sleep 0.2; done
 echo "the host registered itself"
+if [ "$ACCEL" = tcg ]; then
+  echo "    NOTE: emulated (no writable /dev/kvm, or ACCEL=tcg was asked for). Every duration"
+  echo "    this run prints is emulation, not a measurement of anything a tenant would see."
+else
+  echo "    accelerator: $ACCEL"
+fi
 

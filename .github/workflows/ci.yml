@@ -197,6 +197,9 @@ jobs:
       - name: Stage 5 — a snapshot is a name for a commit
         run: task demo:stage5
 
+      - name: Stage 6 — a clone reads what its parent wrote
+        run: task demo:stage6
+
   # The gate. This is the check to require on the branch.
   #
   # `needs` does not do it alone: a needed job that is *skipped* leaves the dependent job

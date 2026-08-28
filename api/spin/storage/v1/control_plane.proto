@@ -160,6 +160,16 @@ message DesiredVolume {
   // the snapshot row, which is one lookup the Agent cannot perform.
   string parent_snapshot_id = 7;
   string parent_volume_id = 8;
+  // parent_commit_id is the commit that snapshot names — the exact point in the parent's
+  // published history this clone starts from. Empty for a volume that was created rather
+  // than cloned.
+  //
+  // It is on the wire for the reason the two ids above are: the Agent is a thing that is
+  // told (ADR-0021), and this one lives on the snapshot row, which is a lookup it cannot
+  // perform. Without it a clone would have to read the parent's HEAD, which is whatever
+  // the parent has published *since* — a clone of "the volume as it was on Tuesday" that
+  // silently delivers Thursday.
+  string parent_commit_id = 13;
   // pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
   // empty when there is nothing to take. It is the whole trigger: an Agent is never
   // *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —

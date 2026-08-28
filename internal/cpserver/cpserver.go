@@ -173,8 +173,18 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 				return nil, rpcError(fmt.Errorf("cpserver: volume %s names parent snapshot %s: %w",
 					v.VolumeID, v.ParentSnapshotID, serr))
 			}
+			// A clone of a snapshot that names no commit is a clone of nothing. The
+			// column's CHECK says a PUBLISHED snapshot has one, so this is the CREATING
+			// case: the host that owns the parent has not finished taking it. Refused
+			// rather than served, for the reason above — a clone with no chain reads
+			// zeros, and zeros look exactly like a volume nobody wrote to.
+			if snap.CommitID == "" {
+				return nil, rpcError(fmt.Errorf("cpserver: volume %s clones snapshot %s, which is %s and names no commit",
+					v.VolumeID, v.ParentSnapshotID, snap.State))
+			}
 			d.ParentSnapshotId = v.ParentSnapshotID
 			d.ParentVolumeId = snap.VolumeID
+			d.ParentCommitId = snap.CommitID
 		}
 		d.PendingSnapshotId = oldestPending[v.VolumeID]
 		out = append(out, d)

@@ -108,62 +108,89 @@ func New(root, qemuImg string, store objectstore.Store, kms crypto.KMS,
 // a VM is launched against is one decision and it stays in the one package that owns the
 // layout of the thing being launched.
 func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int64) (qcow.Restored, error) {
-	// HEAD first, and nothing before it. This is the hot path for every volume that was
-	// created a second ago, it is asked once per volume per host, and it must cost
-	// exactly one request — not a key fetch, not a MkdirAll.
-	head, _, err := commit.ReadHead(ctx, r.store, volumeID)
-	switch {
-	case errors.Is(err, commit.ErrNoHead):
-		return qcow.Restored{}, fmt.Errorf("recovery: volume %s: %w", volumeID, err)
-	case err != nil:
-		// Including a bucket that is not there. objectstore separates that from a key
-		// that is not there precisely so this line can refuse instead of reading an
-		// unreachable bucket as "nothing was ever written".
-		return qcow.Restored{}, fmt.Errorf("%w: reading the HEAD of volume %s: %w", ErrIncomplete, volumeID, err)
-	}
+	return r.RestoreFrom(ctx, qcow.Lineage{VolumeID: volumeID}, sizeBytes)
+}
 
-	manifests, err := r.walk(ctx, volumeID, head.CommitID)
+// RestoreFrom rebuilds a volume that may descend from another one.
+//
+// With no parent it is Restore. With one it rebuilds the parent's chain up to the commit
+// the snapshot names, and then this volume's own published chain on top of it — in that
+// order, because a layer is repointed at a parent already on disk.
+//
+// The parent's commit is *named*, not read from the parent's HEAD, and the difference is
+// the whole promise of §20: a clone is the volume as it was at that snapshot, and the
+// parent's HEAD is whatever it has published since. Reading HEAD would deliver Thursday
+// for a clone of Tuesday, with nothing anywhere reporting the difference.
+func (r *Recoverer) RestoreFrom(ctx context.Context, l qcow.Lineage, sizeBytes int64) (qcow.Restored, error) {
+	base, parentTip, beneath := "", "", 0
+	if l.ParentVolumeID != "" {
+		got, n, err := r.rebuild(ctx, l.VolumeID, l.ParentVolumeID, l.ParentCommitID, sizeBytes, "", 0)
+		if err != nil {
+			return qcow.Restored{}, err
+		}
+		base, parentTip, beneath = got.Base, got.Base, n
+	}
+	head, _, err := commit.ReadHead(ctx, r.store, l.VolumeID)
+	switch {
+	case errors.Is(err, commit.ErrNoHead) && parentTip != "":
+		// A clone that has published nothing of its own: its parent's chain is the whole
+		// of what it holds, and the new tip goes straight on top.
+		return qcow.Restored{Base: base, VirtualSize: sizeBytes, HeadCommitID: l.ParentCommitID}, nil
+	case errors.Is(err, commit.ErrNoHead):
+		return qcow.Restored{}, fmt.Errorf("recovery: volume %s: %w", l.VolumeID, err)
+	case err != nil:
+		return qcow.Restored{}, fmt.Errorf("%w: reading the HEAD of volume %s: %w", ErrIncomplete, l.VolumeID, err)
+	}
+	got, _, err := r.rebuild(ctx, l.VolumeID, l.VolumeID, head.CommitID, sizeBytes, parentTip, beneath)
+	return got, err
+}
+
+// rebuild materialises one chain: `source` is the volume whose published objects are read
+// and whose id the layers were sealed under, `local` is the volume whose directory they
+// land in. They differ exactly for a clone reading its parent.
+func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string, sizeBytes int64, onTopOf string, beneath int) (qcow.Restored, int, error) {
+	manifests, err := r.walk(ctx, source, commitID)
 	if err != nil {
-		return qcow.Restored{}, err
+		return qcow.Restored{}, 0, err
 	}
 	// The head commit is the last element, the walk being oldest-first. The size comes
 	// from its manifest and not from the Head object, which names a commit and holds
 	// nothing else: the manifest is where a recovery running without a catalog can still
 	// read how big the guest's disk is.
 	headManifest := manifests[len(manifests)-1]
-	if err := checkGeometry(volumeID, sizeBytes, headManifest, manifests); err != nil {
-		return qcow.Restored{}, err
+	if err := checkGeometry(source, sizeBytes, headManifest, manifests); err != nil {
+		return qcow.Restored{}, 0, err
 	}
-	enc, err := r.encryption(ctx, volumeID)
+	enc, err := r.encryption(ctx, local, source)
 	if err != nil {
-		return qcow.Restored{}, err
+		return qcow.Restored{}, 0, err
 	}
-	if err := r.files.MkdirAll(qcow.LayersDir(r.root, volumeID)); err != nil {
-		return qcow.Restored{}, fmt.Errorf("%w: making the layer directory for volume %s: %w", ErrIncomplete, volumeID, err)
+	if err := r.files.MkdirAll(qcow.LayersDir(r.root, local)); err != nil {
+		return qcow.Restored{}, 0, fmt.Errorf("%w: making the layer directory for volume %s: %w", ErrIncomplete, local, err)
 	}
 	// What this host already holds, so a re-placement skips most downloads. It cannot be
 	// replaced by hashing the local files: `qemu-img rebase -u` rewrites a layer's header,
 	// so a repointed layer no longer hashes to the object it came from (measured: 40 bytes
 	// differ, same length). Its liability is a state file that is intact but wrong — the
 	// framing catches corruption, not authorship.
-	st, err := qcow.ReadState(r.files, r.root, volumeID)
+	st, err := qcow.ReadState(r.files, r.root, local)
 	if err != nil {
-		return qcow.Restored{}, fmt.Errorf("%w: %w", ErrIncomplete, err)
+		return qcow.Restored{}, 0, fmt.Errorf("%w: %w", ErrIncomplete, err)
 	}
 	held := make(map[string]string, len(st.Commits))
 	for _, c := range st.Commits {
 		held[c.CommitID] = c.LayerID
 	}
 
-	parent := ""
+	parent := onTopOf
 	for _, m := range manifests {
-		path := qcow.LayerImage(r.root, volumeID, m.Layer.LayerID)
+		path := qcow.LayerImage(r.root, local, m.Layer.LayerID)
 		known := held[m.CommitID] == m.Layer.LayerID
 		if err := r.materialize(ctx, enc, m, path, known); err != nil {
-			return qcow.Restored{}, err
+			return qcow.Restored{}, 0, err
 		}
 		if err := r.repoint(ctx, m, path, parent); err != nil {
-			return qcow.Restored{}, err
+			return qcow.Restored{}, 0, err
 		}
 		if !known {
 			// One write per layer that is new to this host, rather than one at the end:
@@ -171,8 +198,8 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 			// already on disk. A layer that was already recorded is not appended again —
 			// the list would grow by the whole chain on every re-placement.
 			st.Commits = append(st.Commits, qcow.CommitLayer{CommitID: m.CommitID, LayerID: m.Layer.LayerID})
-			if err := qcow.WriteState(r.files, r.root, volumeID, st); err != nil {
-				return qcow.Restored{}, fmt.Errorf("%w: recording commit %s: %w", ErrIncomplete, m.CommitID, err)
+			if err := qcow.WriteState(r.files, r.root, local, st); err != nil {
+				return qcow.Restored{}, 0, fmt.Errorf("%w: recording commit %s: %w", ErrIncomplete, m.CommitID, err)
 			}
 			held[m.CommitID] = m.Layer.LayerID
 		}
@@ -187,13 +214,13 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 	// every backing file, which would fail on the write lock of a live one.
 	chain, err := r.inspectChain(ctx, parent)
 	if err != nil {
-		return qcow.Restored{}, err
+		return qcow.Restored{}, 0, err
 	}
-	if len(chain) != len(manifests) {
-		return qcow.Restored{}, fmt.Errorf("%w: volume %s rebuilt to %d commits and %s walks %d layers",
-			ErrIncomplete, volumeID, len(manifests), parent, len(chain))
+	if len(chain) != len(manifests)+beneath {
+		return qcow.Restored{}, 0, fmt.Errorf("%w: volume %s rebuilt to %d commits and %s walks %d layers",
+			ErrIncomplete, local, len(manifests), parent, len(chain))
 	}
-	return qcow.Restored{Base: parent, VirtualSize: headManifest.VirtualSize, HeadCommitID: head.CommitID}, nil
+	return qcow.Restored{Base: parent, VirtualSize: headManifest.VirtualSize, HeadCommitID: commitID}, len(manifests), nil
 }
 
 // walk follows parent_commit_id back from HEAD and returns the chain oldest-first, the
@@ -371,22 +398,33 @@ func (r *Recoverer) inspectChain(ctx context.Context, path string) ([]imageInfo,
 // encryption fetches the volume's key, unwraps it, and binds it to the volume — once for
 // the whole walk, which is publisher.encryption in reverse service. The unwrapped key is
 // not kept beyond the restore that needed it.
-func (r *Recoverer) encryption(ctx context.Context, volumeID string) (*crypto.Encryption, error) {
-	id, err := uuid.Parse(volumeID)
+// The two ids are the same volume except for a clone, and that is the whole of §10's
+// shared-lineage key. `holder` is whose wrapped DEK this host was handed; `sealedBy` is
+// the volume whose id the layers' nonces were derived from (crypto.layerNonce binds it).
+//
+// A clone can open its parent's layers because controlplane.Clone rewraps the *same* DEK
+// bytes under the child's id: unwrapping with the clone's id yields the parent's key. The
+// nonce is the part that does not follow, so it is passed separately rather than assumed.
+func (r *Recoverer) encryption(ctx context.Context, holder, sealedBy string) (*crypto.Encryption, error) {
+	holderID, err := uuid.Parse(holder)
 	if err != nil {
-		return nil, fmt.Errorf("%w: volume id %q: %w", ErrIncomplete, volumeID, err)
+		return nil, fmt.Errorf("%w: volume id %q: %w", ErrIncomplete, holder, err)
 	}
-	keys, err := r.keys.VolumeKeys(ctx, volumeID)
+	bindTo, err := uuid.Parse(sealedBy)
 	if err != nil {
-		return nil, fmt.Errorf("%w: volume %s: %w", ErrIncomplete, volumeID, err)
+		return nil, fmt.Errorf("%w: volume id %q: %w", ErrIncomplete, sealedBy, err)
 	}
-	dek, err := r.kms.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID, id)
+	keys, err := r.keys.VolumeKeys(ctx, holder)
 	if err != nil {
-		return nil, fmt.Errorf("%w: unwrapping the DEK of volume %s: %w", ErrIncomplete, volumeID, err)
+		return nil, fmt.Errorf("%w: volume %s: %w", ErrIncomplete, holder, err)
 	}
-	enc, err := crypto.NewEncryption(dek, id)
+	dek, err := r.kms.UnwrapDEK(keys.DEKWrapped, keys.DEKKeyID, holderID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: volume %s: %w", ErrIncomplete, volumeID, err)
+		return nil, fmt.Errorf("%w: unwrapping the DEK of volume %s: %w", ErrIncomplete, holder, err)
+	}
+	enc, err := crypto.NewEncryption(dek, bindTo)
+	if err != nil {
+		return nil, fmt.Errorf("%w: volume %s: %w", ErrIncomplete, holder, err)
 	}
 	return enc, nil
 }
@@ -414,7 +452,15 @@ type Absent struct{}
 // single-machine deployment. The case that refusal was for — a host that did publish and
 // is now started against no store — is caught by qcow.Open reading this host's own
 // state.json, which names the commits whose layers it holds.
-func (Absent) Restore(context.Context, string, int64) (qcow.Restored, error) {
+func (Absent) RestoreFrom(_ context.Context, l qcow.Lineage, _ int64) (qcow.Restored, error) {
+	// Except for a clone, which cannot be born empty however loudly this host has no
+	// object store: a volume advertised as a copy of another one, served blank, is the
+	// oldest defect in this repository (DEV-0007). ErrNoHead would mean "new, start
+	// empty"; this must refuse instead.
+	if l.Cloned() {
+		return qcow.Restored{}, fmt.Errorf("%w: volume %s clones %s at commit %s and this Agent was started with no object store to read it from",
+			ErrIncomplete, l.VolumeID, l.ParentVolumeID, l.ParentCommitID)
+	}
 	return qcow.Restored{}, fmt.Errorf("%w: this Agent was started with no object store", commit.ErrNoHead)
 }
 

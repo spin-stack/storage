@@ -225,10 +225,15 @@ type fakeRecovery struct {
 	// wants and is the reason it is the zero value.
 	head    string
 	headErr error
+	// lineage is what the last RestoreFrom was asked for. A clone is served by passing a
+	// parent down; a test that only checked the returned chain could not tell a clone
+	// from a volume born empty.
+	lineage qcow.Lineage
 }
 
-func (f *fakeRecovery) Restore(_ context.Context, volumeID string, sizeBytes int64) (qcow.Restored, error) {
-	f.calls = append(f.calls, fmt.Sprintf("%s/%d", volumeID, sizeBytes))
+func (f *fakeRecovery) RestoreFrom(_ context.Context, l qcow.Lineage, sizeBytes int64) (qcow.Restored, error) {
+	f.lineage = l
+	f.calls = append(f.calls, fmt.Sprintf("%s/%d", l.VolumeID, sizeBytes))
 	return f.res, f.err
 }
 
@@ -256,7 +261,7 @@ func recovered(base string) *fakeRecovery {
 
 // req is the ordinary Open for this volume, with one field varied per test.
 func req(mut func(*qcow.OpenRequest)) qcow.OpenRequest {
-	r := qcow.OpenRequest{Root: root, VolumeID: vol, SizeBytes: size, NewLayerID: layerID, Recovery: bornEmpty()}
+	r := qcow.OpenRequest{Root: root, Lineage: qcow.Lineage{VolumeID: vol}, SizeBytes: size, NewLayerID: layerID, Recovery: bornEmpty()}
 	if mut != nil {
 		mut(&r)
 	}

@@ -904,8 +904,14 @@ func TestAbsentAnswersThatNothingIsPublished(t *testing.T) {
 	if _, err := a.Current(t.Context(), "any"); !errors.Is(err, commit.ErrNoHead) {
 		t.Errorf("Current = %v, want a wrapped ErrNoHead", err)
 	}
-	if _, err := a.Restore(t.Context(), "any", 1<<30); !errors.Is(err, commit.ErrNoHead) {
-		t.Errorf("Restore = %v, want a wrapped ErrNoHead", err)
+	if _, err := a.RestoreFrom(t.Context(), qcow.Lineage{VolumeID: "any"}, 1<<30); !errors.Is(err, commit.ErrNoHead) {
+		t.Errorf("RestoreFrom = %v, want a wrapped ErrNoHead", err)
+	}
+	// A clone is the one thing it must not answer that way: "born empty" for a volume
+	// advertised as a copy is DEV-0007, served blank with no error anywhere.
+	cloned := qcow.Lineage{VolumeID: "any", ParentVolumeID: "parent", ParentCommitID: "commit"}
+	if _, err := a.RestoreFrom(t.Context(), cloned, 1<<30); err == nil || errors.Is(err, commit.ErrNoHead) {
+		t.Errorf("RestoreFrom for a clone = %v, want a refusal and not ErrNoHead", err)
 	}
 }
 
