@@ -1,23 +1,7 @@
 # ADR-0017 — Committed capacity is derived from state, not carried as a ledger
 
-- **Status:** Accepted 2026-07-26
-- **Date:** 2026-07-26
-- **Deciders:** human (decided), implementer agent (proposed the options)
+- **Status:** Accepted 2026-07-26. Second term withdrawn 2026-08-05 (see below).
 - **Implements/Extends:** §28.2 (capacity accounting), §7 (term-guarded mutations).
-- **Closes:** TEST-GAPS "capacity accounting has no idempotency key".
-
-## Context
-
-`hosts.nvme_committed_bytes` is an incremental ledger: the drain adds on reserve and
-subtracts on release. Every safeguard the last two waves added exists because a ledger
-can be applied twice — the non-negative guard, the oversubscription bound, the
-expected-value predicate, and the per-volume stages in the operation's progress.
-
-The residual wave 3 named honestly is unfixable in that shape: across a crash, a
-stranger's change that nets to exactly one volume size is indistinguishable from this
-operation's own delta. Closing it with an idempotency key means a reservation row keyed
-by `(operation_id, volume_id)`, or a transaction boundary `metadata.Store` does not
-have.
 
 ## Decision
 
@@ -25,80 +9,41 @@ have.
 
 ```
 committed(host) = Σ size_bytes of volumes whose primary_host_id = host
-                + Σ size_bytes reserved by in-flight operation plans targeting host
 ```
 
-Both terms are queries over rows that already exist and are already term-guarded. There
-is no delta to apply, so there is nothing to apply twice: the accounting is a function
-of state, and a resumed pass computes the same answer as the pass that crashed.
+It is a query over rows that already exist and are already term-guarded, so there is no
+delta to apply and nothing to apply twice: a resumed pass computes the same answer as the
+pass that crashed. The oversubscription bound stays a predicate of the write that assigns
+a volume or records a plan, evaluated against the derived value.
 
-The second term is what makes it correct rather than merely simple: a volume being moved
-must be charged to its destination *before* it becomes the primary there, or two
-placements would both see room. The operation's recorded plan is what says so — and
-after wave 3 it already carries a per-volume stage, so "reserved but not yet primary" is
-readable, not inferred.
-
-The oversubscription bound (wave 3) stays exactly where it is — a predicate of the write
-that assigns a volume or records a plan — evaluated against the derived value.
+The original decision had a second term — bytes an in-flight operation plan had reserved
+on a destination — so a volume being moved was charged to its destination before it became
+primary there. It went with the operations table (ADR-0026). It changed no number the
+derivation ever produced, because nothing outside a test wrote an operations row; what it
+removed is headroom for a move spanning two hosts, and V1 performs none. It comes back
+with cross-host movement.
 
 ## Alternatives considered
 
 - **A reservation table keyed by `(operation_id, volume_id)`.** Exact, and it adds a
-  table, a lifecycle for its rows, and a cleanup policy for terminal operations. It
-  blinds the ledger's failure mode instead of removing it.
-- **Use the progress stages as the key, without a new table.** Cheaper, but the progress
-  write and the capacity write remain two writes: making them one needs a transaction
-  boundary on `metadata.Store`, which would be the first in the interface and would have
-  to be honoured by both implementations.
-- **Keep the ledger and accept the residual.** The residual is silent over-commit or a
-  wedged drain, in the operational case (a crash mid-evacuation) the ledger exists for.
+  table, a row lifecycle and a cleanup policy — it blinds the ledger's failure mode
+  instead of removing it.
+- **The progress stages as the key, no new table.** Cheaper, but the progress write and
+  the capacity write stay two writes; making them one needs a transaction boundary on
+  `metadata.Store`, the first in that interface, honoured by both implementations.
+- **Keep the ledger and accept the residual.** Across a crash, a stranger's change that
+  nets to exactly one volume size is indistinguishable from this operation's own delta.
+  The residual is silent over-commit or a wedged drain, in the exact operational case the
+  ledger exists for.
 
-## What this costs
+## What it costs, and what holds it
 
-- **A query where there was a column.** Placement and the drain read a sum over the
-  volumes of a host instead of one field. It is indexed (`volumes(primary_host_id)`
-  exists, and every FK referencing column carries an index by the schema rule), and it
-  runs at placement time, not on the data path.
-- **`nvme_committed_bytes` becomes derived**, so the column goes or becomes an explicit
-  cache with a test that recomputation agrees with it — the same rule ADR-0014 applies
-  to `charged_bytes` and §5.8 applies to watermarks: a stored number that S3 or SQL can
-  recompute is a cache, never an authority.
-- `CommitHostCapacity` disappears as a mutation. The wave-3 sentinels it carried
-  (`ErrCapacityExceeded`, `ErrCapacityConflict`) fold into the write that assigns the
-  volume.
+Placement and the drain read a sum instead of a field; it is indexed
+(`volumes (primary_host_id, volume_id)`) and runs at placement time, not on the data path.
+`CommitHostCapacity` disappears as a mutation, and its sentinels fold into the write that
+assigns the volume.
 
-## The tests that enforce it
-
-All landed, and the prediction they were written to test came out as predicted: the
-crash tests *did* become uninteresting, because a derived number has nothing to be
-half-updated. There is no `nvme_committed_bytes` column — `internal/schema/schema.sql`
-says so at the point where it would have been — and the derivation is the
-`host_committed_bytes` view (`schema.sql:346`), which landed with increment 5.
-
-- `TestCommittedBytesIsDerivedInOnePlace` (`internal/db/queries_guard_test.go`): the
-  derivation has exactly one home, so a second query cannot quietly reintroduce the
-  ledger. This is the structural guarantee and it is the one that survives.
-
-**The behavioural tests went with the drain on 2026-08-02 (ADR-0026).**
-`TestCommittedCapacityIsDerivedFromState`,
-`TestVolumeInFlightIsChargedToItsDestinationOnce` and
-`TestCommittedCapacityHoldsUnderAnyInterleaving` asserted the identity across drain
-passes, faults and crashes — "for any interleaving of moves and crashes,
-`committed(host)` equals the sum over the host's volumes and in-flight plans". V1
-performs no moves, so the interleaving they quantified over is empty. The decision is
-unchanged and still right; what is gone is the *scenario* that made it interesting, and
-it comes back with cross-host movement.
-
-An unresolved prediction in an ADR is how a decision record stops matching the code
-without anyone noticing, so this section is written in the past tense on purpose.
-- A contract case pinning that the oversubscription bound is still evaluated inside the
-  write, against the derived value.
-
-## Consequences
-
-- Removes an entire class of bug rather than guarding it — the same move wave 3 made
-  when it put the oversubscription bound inside the write instead of the reader.
-- The plan becomes load-bearing for accounting: an operation whose plan is lost or
-  malformed no longer just fails its own move, it makes the destination look emptier
-  than it is. The plan is already recorded term-guarded and is already what
-  `finishMovedVolume` trusts, so this concentrates trust rather than spreading it.
+The rule is that the derivation has exactly one home — the `host_committed_bytes` view —
+so a second query cannot quietly reintroduce the ledger. Enforced by
+`TestCommittedBytesIsDerivedInOnePlace` (`internal/db/queries_guard_test.go`). A stored
+number that SQL can recompute is a cache, never an authority.

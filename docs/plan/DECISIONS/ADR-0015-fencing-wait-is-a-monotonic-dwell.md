@@ -1,97 +1,46 @@
 # ADR-0015 — The fencing wait is a monotonic dwell, not a timestamp comparison
 
-> **Amended by ADR-0026 (2026-08-03): the dwell has no consumer.** V1 does not promote —
-> `controlplane.Promoter` went with the fencing half in increment 4.6 — so nothing waits
-> out `last_renewal + lease_ttl + max_clock_skew`, and INV-11 is `withdrawn`.
->
-> **The durable half survives, deliberately.** `volumes.fencing_started_at` is still a
-> column, `metadata.Volume.FencingStartedAt` still carries it, and the state machine still
-> has FENCING_WAIT. Keeping them costs nothing and they are the part that is expensive to
-> get right: the reason the instant is *stored* is that a Control Plane which restarts
-> mid-fence has no memory of having observed anything, and a dwell restarted from scratch
-> is the failure mode this ADR exists to prevent. The reasoning below is what a future
+Accepted 2026-07-26. Extends §12.1 (clocks), §12.3 (promotion, FENCING_WAIT), §7.
+
+> **No consumer today (ADR-0026).** V1 does not promote — `controlplane.Promoter` went with
+> the fencing half in increment 4.6 — so nothing waits out `lease_ttl + max_clock_skew`, and
+> INV-11 is withdrawn. **The durable half is kept deliberately:** `volumes.fencing_started_at`,
+> `metadata.Volume.FencingStartedAt` and the FENCING_WAIT state still exist. They cost
+> nothing and they are the part that is expensive to get right; what follows is what a future
 > promotion must be rebuilt on.
 
-- **Status:** Accepted 2026-07-26
-- **Date:** 2026-07-26
-- **Deciders:** human (decided), implementer agent (proposed the options)
-- **Implements/Extends:** §12.1 (clocks), §12.3 (promotion, FENCING_WAIT), §7 (volume
-  states), INV-11.
-- **Closes:** TEST-GAPS "a lagging replica read makes the fencing wait elapse early".
+## The problem
 
-## Context
-
-`Promote` derives the fencing deadline from `host_leases.last_renewal` and waits until
-that instant plus `lease_ttl + max_clock_skew`. Wave 2 removed the CP's own wall clock
-from the comparison (`metadata.Store.Now`, `ErrClockOffsetTooLarge`), which closed the
-case where the container's clock jumped.
-
-It does not close the case where the **data** is old. A read served by a replica lagging
-by more than `lease_ttl + max_clock_skew` reports a `last_renewal` old enough that the
-wait already looks over, and the epoch is granted while the old writer's monotonic lease
-is still valid. Both clocks agree, so nothing in the current design notices: the offset
-check compares clocks, and the clocks are fine.
+`Promote` derived the fencing deadline from `host_leases.last_renewal`. Wave 2 removed the
+CP's own wall clock from that comparison, which closed the case of a clock that jumped. It
+does not close the case where the **data** is old: a read served by a replica lagging more
+than `lease_ttl + max_clock_skew` reports a `last_renewal` old enough that the wait already
+looks over, and the epoch is granted while the old writer's monotonic lease is still valid.
+Both clocks agree, so nothing in the design notices.
 
 ## Decision
 
-**The wait is measured as elapsed time on the promoter's monotonic clock since the
-promoter itself observed the lease** — not as a comparison against the timestamp the
-lease carries.
+**The wait is elapsed time on the promoter's own monotonic clock since the promoter observed
+the lease**, not a comparison against the timestamp the lease carries. A stale read then
+costs nothing: whatever `last_renewal` says, the promoter still sits through the full dwell
+of its own time. The timestamp keeps its second job — refusing to promote when the lease was
+renewed *after* the observation — and stops being what makes the wait long enough.
 
-A stale read then costs nothing: whatever `last_renewal` says, the promoter still has to
-sit through `lease_ttl + max_clock_skew` of its own monotonic time before granting. The
-timestamp keeps its second job (refusing to promote when the lease was renewed *after*
-the observation), but it is no longer what makes the wait long enough.
+**The observation is durable**, written with the FENCING_WAIT state and term-guarded like
+every other CP mutation. Without it a CP that restarts mid-fence has no memory of having
+observed anything and must start the dwell again — which is why it is part of the decision
+rather than an optimisation. A *missing* record starts a fresh full dwell: fail slow, never
+short.
 
-The observation is **durable**, recorded with the §7 `FENCING_WAIT` state the promoter
-already writes: the state row gains the instant the fence started. Without it, a CP that
-restarts mid-fence has no memory of having observed anything and must start the dwell
-again.
+**The cost, stated:** a promotion issued by a CP that has just restarted waits a full dwell
+from the moment *it* first looks. Failover is slower after a Control-Plane restart, and that
+is the intended direction — the alternative is a fence whose length depends on how the
+database happens to be deployed.
 
-### The cost, stated
+## Alternatives rejected
 
-A promotion issued by a CP that has just restarted waits a full
-`lease_ttl + max_clock_skew` from the moment *it* first looks, even if the previous CP
-had already waited most of it — unless the durable record above is present, which is why
-it is part of the decision rather than an optimisation. **Failover is slower after a
-Control-Plane restart, and that is the intended direction:** the alternative is a fence
-whose length depends on how the database happens to be deployed.
-
-## Alternatives considered
-
-- **Route lease reads to the primary.** One line of pool configuration, and a guarantee
-  that lives outside the code: the day somebody points the pool at a replica the fence
-  degrades silently and no test can see it. Worth doing anyway as defence in depth, but
-  not as the mechanism.
-- **Bound replica lag and check it.** Requires a lag signal the CP can trust, which is
-  the same problem one level down.
-
-## The tests that enforce it
-
-All three landed, and the durable fence-start instant they need is a column on
-`volumes` (`internal/schema/schema.sql`), term-guarded like every other CP mutation.
-
-- `TestAStaleLeaseReadDoesNotShortenTheFence`
-  (`internal/controlplane/promotion_dwell_test.go`): a `metadata.Store` whose
-  `GetHostLease` returns a `last_renewal` from before the process started — a maximally
-  stale read — and the grant still waits the full dwell on the injected clock, with
-  `PromotionWaitChecker` quiet throughout.
-- `TestACrashMidFenceResumesTheDwellFromTheRecordedInstant` and
-  `TestAMissingFenceRecordStartsAFullDwell` (same file): a restart mid-fence resumes
-  from the recorded instant rather than restarting it, and a *missing* record starts a
-  fresh full dwell — fail slow, never short.
-- The DST scenario `stale-lease-read-does-not-shorten-the-fence`
-  (`internal/dst/scenarios_drain.go`), on the existing INV-11 checker, with its planted
-  bug reverting the dwell to a timestamp comparison.
-
-## Consequences
-
-- `FENCING_WAIT` stops being a marker and becomes load-bearing state: the promoter must
-  write it before the wait and read it on resume. That is the durable record §7 was
-  described as providing and, until now, was not.
-- A new column on `volumes` (the fence-start instant), term-guarded like every other CP
-  mutation, and stamped by the store's clock — the same clock the deadline already
-  trusts.
-- The promoter needs a monotonic clock of its own (it has one: `simio/clock`), and the
-  DST harness can now drive this path with time it controls, which it could not when the
-  answer came from a timestamp in a row.
+- **Route lease reads to the primary.** One line of pool configuration, and a guarantee that
+  lives outside the code: the day somebody points the pool at a replica the fence degrades
+  silently and no test can see it. Worth doing as defence in depth, not as the mechanism.
+- **Bound replica lag and check it.** Needs a lag signal the CP can trust, which is the same
+  problem one level down.

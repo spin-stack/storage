@@ -9,7 +9,7 @@
 --
 -- Identity columns are the `uuidv7` domain (not text): volume_id is the same 16-byte id the
 -- on-disk format carries. This file is the declared state and the single source of truth —
--- pgschema plans against it (ADR-0019), sqlc generates from it (ADR-0006), and the
+-- pgschema plans against it (ADR-0019), sqlc generates from it, and the
 -- integration lane builds its database from it; migrations/ holds the reviewed plans, not
 -- the apply path.
 

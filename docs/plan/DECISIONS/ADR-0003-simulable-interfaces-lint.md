@@ -1,61 +1,34 @@
 # ADR-0003 — Enforcement of simulable interfaces (the day-1 lint)
 
-- **Status:** Accepted (Phase 0)
-- **Date:** 2026-07-24
-- **Deciders:** human owner + tech-lead agent
-- **Implements:** §25.1, INV-01
-
-## Context
-
-§25.1 mandates, from the first commit, that there be **no direct `time.Now()`, sockets,
-or disk/network/S3 syscalls outside** the clock/net/disk/objectstore interfaces, and
-that this be verified by an automated check in CI — "not by good intentions." §29.7
-stresses this is impossible to retrofit. This ADR fixes *how* the check is built, since
-the mechanism is an architectural commitment the whole codebase must live under.
+Accepted 2026-07-24. Implements §25.1, INV-01. §25.1 requires this be verified by CI, "not
+by good intentions"; §29.7 records that it is impossible to retrofit. This ADR fixes *how*.
 
 ## Decision
 
-Enforcement is **layered**, so a gap in one layer is caught by another:
+No `time.Now()`, socket, or disk/network/S3 syscall outside `internal/simio` (the
+interfaces) and `internal/simio/real` (thin passthroughs); everything else takes them by
+injection. Enforcement is **layered**, so a gap in one layer is caught by another:
 
-1. **Package boundary.** Only `internal/simio` (interface definitions) and
-   `internal/simio/real` (thin passthrough implementations) may import the forbidden
-   real primitives. Everything else depends on the `simio` interfaces via dependency
-   injection.
-2. **`depguard` (golangci-lint).** A `depguard` ruleset forbids importing `time` (except
-   for types), `net`, `os` (file ops), `syscall`, and the concrete S3 SDK packages from
-   any package outside the allow-listed `simio`/`simio/real` paths.
-3. **`forbidigo` (golangci-lint).** Forbids specific call expressions that slip past
-   import rules: `time.Now`, `time.Since`, `time.Sleep`, `time.After`, `time.Tick`,
-   `net.Dial*`, `os.Open`, `os.Create`, `os.OpenFile`, and raw disk/net `syscall.*`.
-4. **Custom `simulable` analyzer** (`hack/analyzers/simulable`, a `go/analysis` pass,
-   runnable standalone and as a golangci-lint plugin). It catches what config-based
-   linters cannot express cleanly: e.g. constructing a real clock/dialer/objectstore
-   outside the allowed packages, or method-value escapes. Ships with `analysistest`
-   golden fixtures (a violating package and a compliant one).
-5. **CI gate.** `task lint` (which runs all of the above) is a required GitHub Actions
-   job. A planted violation must turn CI red; this is demonstrated in the Phase 01 / 1.1
-   PR and is the checker for **INV-01**.
+1. **Package boundary.** Only `simio` and `simio/real` may import the real primitives.
+2. **`depguard`.** Forbids importing `time` (except for types), `net`, `os` file
+   operations, `syscall` and the concrete S3 SDK packages from anywhere outside those two.
+3. **`forbidigo`.** Forbids the call expressions that slip past import rules:
+   `time.Now/Since/Sleep/After/Tick`, `net.Dial*`, `os.Open/Create/OpenFile`, and raw disk
+   and net `syscall.*`.
+4. **The custom `simulable` analyzer** (`hack/analyzers/simulable`, a `go/analysis` pass,
+   runnable standalone and as a golangci-lint plugin). It catches what config-based linters
+   cannot express cleanly — constructing a real clock, dialer or objectstore outside the
+   allowed packages, method-value escapes — and ships `analysistest` fixtures, one violating
+   package and one compliant.
 
-## Consequences
+`task lint` runs all four and is a required CI job. A planted violation must turn it red;
+that demonstration is the checker for INV-01.
 
-- Test code and the sim implementations get the deterministic clock/net/disk/objectstore
-  by injection; there is no ambient global time or I/O anywhere in production packages.
-- The real implementations are a small, audited surface (`simio/real`) — the only place
-  the forbidden primitives live.
-- Adding a new real primitive (e.g. a KMS client) means extending `simio` with an
-  interface and its real/sim pair, never calling the SDK inline. The lint enforces this.
+Adding a new real primitive (a KMS client, say) means extending `simio` with an interface
+and its real/sim pair, never an inline SDK call. That is the rule the lint exists to keep.
 
-## Assumptions (decided; revisit via ADR if false)
+## Alternatives rejected
 
-- golangci-lint's `depguard` + `forbidigo` are expressive enough for layers 2–3; the
-  custom analyzer covers the rest. *Verified* incrementally in Phase 01 / 1.1 against
-  the golden fixtures. If `forbidigo` proves too coarse, the custom analyzer absorbs its
-  rules.
-
-## Alternatives considered
-
-- **Convention + code review only:** rejected outright by §25.1 ("not by good
-  intentions").
-- **Custom analyzer only (no golangci rules):** more code to maintain and slower to
-  author; the layered approach gets 80% from config and reserves the analyzer for the
-  hard cases.
+- **Convention plus code review.** Refused by §25.1 in as many words.
+- **The custom analyzer alone.** More code to maintain and slower to author; config buys
+  most of it, and the analyzer is reserved for what config cannot state.
