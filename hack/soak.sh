@@ -154,8 +154,22 @@ while :; do
   # Parameters moved every round. Rotation threshold and churn decide how often the
   # publish path runs at all; the reconcile interval decides how much a guest writes
   # between two looks, which is the one number §11 says nothing can bound.
-  export ROTATE_AT=$(( (RANDOM % 12 + 1) * 1048576 ))
+  #
+  # The threshold is drawn *below* the churn, and the two were drawn independently until
+  # a round picked ROTATE_AT=11 MiB against CHURN=10 MiB and both rotation demos timed out
+  # after 300 s. That is not a defect and the run reported it as one: `spin.churn=<MiB>`
+  # rewrites one region in a loop, so within a layer each of its clusters is allocated
+  # once and the tip stops growing at roughly the churn size. Measured on that very run —
+  # the finding kept the scratch — the one layer ended at 11,337,728 bytes against a
+  # threshold of 11,534,336: short by 192 KiB, for ever. The demos then wait for three
+  # rotations that are physically impossible.
+  #
+  # An unattended runner that reports its own parameter choice as a finding is worse than
+  # one that reports nothing: it teaches whoever reads it to skip the findings directory,
+  # which is where the real ones will be. Same reason ADR-0025 refused to fail the gate
+  # for a missing artefact — a red that means "you held it wrong" trains people past red.
   export CHURN=$(( RANDOM % 48 + 8 ))
+  export ROTATE_AT=$(( (RANDOM % (CHURN - 4) + 1) * 1048576 ))
   export HEARTBEAT="$(( RANDOM % 700 + 200 ))ms"
   say "round $round parameters: ROTATE_AT=$ROTATE_AT CHURN=$CHURN HEARTBEAT=$HEARTBEAT"
 
