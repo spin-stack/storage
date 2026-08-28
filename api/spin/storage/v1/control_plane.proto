@@ -351,18 +351,32 @@ message VolumeReport {
 
   // snapshot_id is the pending snapshot this host has finished acting on, empty when
   // it has nothing to say. The three fields below are one answer and are read
-  // together: an id plus a sequence is "published at N", an id plus an error is
-  // "FAILED, and here is what an operator needs to read".
+  // together: an id plus a commit is "published, and this commit is it", an id plus an
+  // error is "FAILED, and here is what an operator needs to read".
   //
   // It is reported on the volume's own report rather than through a call of its own
   // because the report is already the Agent's one channel for "what is true here",
   // and a second channel would need its own retry, its own ordering against the
   // watermarks, and its own way of being refused when the host has been fenced.
   string snapshot_id = 7;
-  // snapshot_sequence is the §19 sequence the copy was frozen at — the volume's
-  // local_sequence at the instant of the capture, and what makes the snapshot a
-  // point rather than an interval.
-  int64 snapshot_sequence = 8;
+  // 8 was `int64 snapshot_sequence`, the §19 sequence the copy was frozen at. There
+  // are no sequences under v6 — the local data path that produced them is withdrawn —
+  // and what identifies a point in a volume's history now is the commit that carries
+  // it. Reserved rather than reused, for the reason field 6 is: a peer built before
+  // this change decodes 8 as a varint, and a new field of another type at the same
+  // number is the one way a wire format lies to a reader doing everything right.
+  reserved 8;
+  // snapshot_commit_id is the commit this snapshot names. A snapshot under v6 is not a
+  // copy of anything: it is a *name for a commit* that is already in the published
+  // history, so taking one costs a rotation and a publish when the tip has unpublished
+  // bytes, and nothing at all when it does not.
+  //
+  // That is the whole of what makes it durable, and it is worth saying because the
+  // v5 answer was the opposite: a snapshot was a manifest the host wrote, and it could
+  // exist while the data it named did not. A commit id can only be reported after
+  // `Commit() → SUCCESS`, which promises the state is reconstructible without this
+  // host — so a snapshot that is reported at all is a snapshot that can be restored.
+  string snapshot_commit_id = 12;
   // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
   // that fails silently stays CREATING forever and nothing ever collects it.
   string snapshot_error = 9;

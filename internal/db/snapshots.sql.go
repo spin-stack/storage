@@ -14,13 +14,13 @@ import (
 
 const createSnapshot = `-- name: CreateSnapshot :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $11
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
 )
 INSERT INTO snapshots (
-    snapshot_id, volume_id, parent_snapshot_id, epoch, target_sequence,
-    root_digest, source_host_id, state, manifest_key, request_id
+    snapshot_id, volume_id, parent_snapshot_id, epoch,
+    commit_id, source_host_id, state, request_id
 )
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+SELECT $1, $2, $3, $4, $9::uuid, $5, $6, $7
 WHERE EXISTS (SELECT 1 FROM valid)
 ON CONFLICT DO NOTHING
 `
@@ -30,13 +30,11 @@ type CreateSnapshotParams struct {
 	VolumeID         uuid.UUID   `json:"volume_id"`
 	ParentSnapshotID pgtype.UUID `json:"parent_snapshot_id"`
 	Epoch            int64       `json:"epoch"`
-	TargetSequence   int64       `json:"target_sequence"`
-	RootDigest       string      `json:"root_digest"`
 	SourceHostID     pgtype.UUID `json:"source_host_id"`
 	State            string      `json:"state"`
-	ManifestKey      pgtype.Text `json:"manifest_key"`
 	RequestID        uuid.UUID   `json:"request_id"`
 	Term             int64       `json:"term"`
+	CommitID         pgtype.UUID `json:"commit_id"`
 }
 
 // Term-guarded snapshot record (§19).
@@ -51,13 +49,11 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		arg.VolumeID,
 		arg.ParentSnapshotID,
 		arg.Epoch,
-		arg.TargetSequence,
-		arg.RootDigest,
 		arg.SourceHostID,
 		arg.State,
-		arg.ManifestKey,
 		arg.RequestID,
 		arg.Term,
+		arg.CommitID,
 	)
 	if err != nil {
 		return 0, err
@@ -66,7 +62,7 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 }
 
 const getSnapshot = `-- name: GetSnapshot :one
-SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, target_sequence, root_digest, source_host_id, state, portable, manifest_key, request_id, created_at FROM snapshots WHERE snapshot_id = $1
+SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, commit_id, source_host_id, state, portable, request_id, created_at FROM snapshots WHERE snapshot_id = $1
 `
 
 func (q *Queries) GetSnapshot(ctx context.Context, snapshotID uuid.UUID) (*Snapshot, error) {
@@ -77,12 +73,10 @@ func (q *Queries) GetSnapshot(ctx context.Context, snapshotID uuid.UUID) (*Snaps
 		&i.VolumeID,
 		&i.ParentSnapshotID,
 		&i.Epoch,
-		&i.TargetSequence,
-		&i.RootDigest,
+		&i.CommitID,
 		&i.SourceHostID,
 		&i.State,
 		&i.Portable,
-		&i.ManifestKey,
 		&i.RequestID,
 		&i.CreatedAt,
 	)
@@ -90,7 +84,7 @@ func (q *Queries) GetSnapshot(ctx context.Context, snapshotID uuid.UUID) (*Snaps
 }
 
 const listPendingSnapshots = `-- name: ListPendingSnapshots :many
-SELECT s.snapshot_id, s.volume_id, s.parent_snapshot_id, s.epoch, s.target_sequence, s.root_digest, s.source_host_id, s.state, s.portable, s.manifest_key, s.request_id, s.created_at FROM snapshots s
+SELECT s.snapshot_id, s.volume_id, s.parent_snapshot_id, s.epoch, s.commit_id, s.source_host_id, s.state, s.portable, s.request_id, s.created_at FROM snapshots s
   JOIN volumes v ON v.volume_id = s.volume_id
  WHERE v.primary_host_id = $1
    AND s.state = 'CREATING'
@@ -124,12 +118,10 @@ func (q *Queries) ListPendingSnapshots(ctx context.Context, primaryHostID pgtype
 			&i.Snapshot.VolumeID,
 			&i.Snapshot.ParentSnapshotID,
 			&i.Snapshot.Epoch,
-			&i.Snapshot.TargetSequence,
-			&i.Snapshot.RootDigest,
+			&i.Snapshot.CommitID,
 			&i.Snapshot.SourceHostID,
 			&i.Snapshot.State,
 			&i.Snapshot.Portable,
-			&i.Snapshot.ManifestKey,
 			&i.Snapshot.RequestID,
 			&i.Snapshot.CreatedAt,
 		); err != nil {
@@ -144,7 +136,7 @@ func (q *Queries) ListPendingSnapshots(ctx context.Context, primaryHostID pgtype
 }
 
 const listUnfinishedSnapshots = `-- name: ListUnfinishedSnapshots :many
-SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, target_sequence, root_digest, source_host_id, state, portable, manifest_key, request_id, created_at FROM snapshots
+SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, commit_id, source_host_id, state, portable, request_id, created_at FROM snapshots
  WHERE state = ANY($1::text[])
  ORDER BY snapshot_id
 `
@@ -176,12 +168,10 @@ func (q *Queries) ListUnfinishedSnapshots(ctx context.Context, states []string) 
 			&i.VolumeID,
 			&i.ParentSnapshotID,
 			&i.Epoch,
-			&i.TargetSequence,
-			&i.RootDigest,
+			&i.CommitID,
 			&i.SourceHostID,
 			&i.State,
 			&i.Portable,
-			&i.ManifestKey,
 			&i.RequestID,
 			&i.CreatedAt,
 		); err != nil {
@@ -198,32 +188,32 @@ func (q *Queries) ListUnfinishedSnapshots(ctx context.Context, states []string) 
 const publishSnapshot = `-- name: PublishSnapshot :execrows
 UPDATE snapshots
    SET state = 'PUBLISHED',
-       target_sequence = $2,
-       source_host_id = $3,
-       manifest_key = $4
+       commit_id = $2,
+       source_host_id = $3
  WHERE snapshot_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $5
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $4
    AND state = 'CREATING'
 `
 
 type PublishSnapshotParams struct {
-	SnapshotID     uuid.UUID   `json:"snapshot_id"`
-	TargetSequence int64       `json:"target_sequence"`
-	SourceHostID   pgtype.UUID `json:"source_host_id"`
-	ManifestKey    pgtype.Text `json:"manifest_key"`
-	Term           int64       `json:"term"`
+	SnapshotID   uuid.UUID   `json:"snapshot_id"`
+	CommitID     pgtype.UUID `json:"commit_id"`
+	SourceHostID pgtype.UUID `json:"source_host_id"`
+	Term         int64       `json:"term"`
 }
 
-// CREATING → PUBLISHED, stamping the three facts only the host that took it knows:
-// the sequence the copy was frozen at, the manifest it wrote, and which host did it.
+// CREATING → PUBLISHED, stamping the two facts only the host that took it knows: the
+// commit its history is named by, and which host reported it. The manifest key is not
+// among them and must not be: it is derived from the commit id (commit.ManifestKey), so
+// believing a string the Agent sent is how a catalog and a bucket come to disagree about
+// where a snapshot lives.
 // Term-guarded, and guarded on CREATING so a report replayed after the snapshot has
 // moved on cannot resurrect it (INV-16: PUBLISHED never changes).
 func (q *Queries) PublishSnapshot(ctx context.Context, arg PublishSnapshotParams) (int64, error) {
 	result, err := q.db.Exec(ctx, publishSnapshot,
 		arg.SnapshotID,
-		arg.TargetSequence,
+		arg.CommitID,
 		arg.SourceHostID,
-		arg.ManifestKey,
 		arg.Term,
 	)
 	if err != nil {

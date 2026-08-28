@@ -3,31 +3,31 @@
 State only. What shipped is `git log`; why a decision was made is a comment where the
 decision is made. If something here is finished, delete it.
 
-## The pivot, and what this tree is now
-
-**The custom block storage engine is withdrawn (2026-08-11).** QEMU manages the local
-copy-on-write format via qcow2; this system manages immutable commits, publication and
-recovery (`arquitectura_mvp_volumenes_remotos_v6.md`). The data path is not ours any more.
+**The custom block engine is withdrawn (2026-08-11).** QEMU manages the local copy-on-write
+format via qcow2; this system manages immutable commits, publication and recovery
+(v6). The data path is not ours any more.
 
 ## What runs end to end
 
-Three demonstrations, each with the real binaries and a real Linux guest. `demo:stage1`:
-a volume is provisioned, a guest boots off its qcow2, the Agent is SIGKILLed and restarted
+Five demonstrations, each with the real binaries and a real Linux guest. `demo:stage1`: a
+volume is provisioned, a guest boots off its qcow2, the Agent is SIGKILLed and restarted
 **under the running guest**, and a second boot reads the bytes back. `demo:stage2` adds
 rotation — the guest writes without stopping while the Agent seals the tip and starts a new
 layer under it, three times. `demo:stage3` adds the commit protocol and reads the bucket
-back with `cat`: every structural object is a digest line and JSON, so the chain from
-`HEAD` is walked to the first commit, checking each layer is present, matches its digest,
-and carries none of the guest's bytes in the clear.
+back with `cat`: the chain from `HEAD` is walked to the first commit, checking each layer is
+present, matches its digest, and carries none of the guest's bytes in the clear.
+
+`demo:stage5` is §19 under v6: a snapshot is a *name for a commit*. An operator asks with
+the real binary while a guest writes, the Agent seals the tip because it was asked, and the
+catalog names a commit the bucket holds and that is on the chain from HEAD.
 
 `demo:stage4` closes v6 §26's cycle: it destroys the host — process killed, data directory
 deleted — and a rebuilt machine brings the volume back from the bucket alone, a guest
 reading bytes another guest wrote on a host that no longer exists.
 
-All four run in CI (`.github/workflows/ci.yml`'s `guest` job) and not only on a developer's
-machine — under TCG, from the mirrored kernel and the published QEMU.
-`integration/e2e` covers the same seams without a guest. The two diagrams at the root are
-generated from the `.dot` beside each one; `task diagrams:check` fails on a stale one.
+All five run in CI (`ci.yml`'s `guest` job), under TCG, from the mirrored kernel and the
+published QEMU. `integration/e2e` covers the same seams without a guest; the root diagrams
+are generated from the `.dot` beside each one and `task diagrams:check` fails on a stale one.
 
 **The Agent does not launch QEMU.** It prepares the chain and speaks QMP to whatever is at
 the socket; spin's runner runs the VMs (ADR-0021). The contract is `qcow.QMPSocket` and
@@ -45,12 +45,11 @@ one this host holds. The last is read over the object store — a path that does
 through the Control Plane, so it is still there when the Control Plane is not — and is the
 second signal vSphere HA gets from its datastore heartbeat.
 
-A lease that merely lapsed is *not* one of the three, and it used to be. That rule was
-v5's and was right there: the Agent was the data path, so a partitioned host ACKed flushes
-as durable while the fleet moved the volume. v6 removed the premise — QEMU owns the local
-format, a FLUSH claims local durability only, and nothing a superseded host writes can
-enter the history without winning a CAS it cannot win. What was left was the cost alone: a
-tenant's VM stopped for a partition nobody else had acted on.
+A lease that merely lapsed is *not* one of the three, and it used to be — v5's rule, right
+there, where the Agent was the data path. v6 removed the premise: a FLUSH claims local
+durability only, and nothing a superseded host writes enters the history without winning a
+CAS it cannot win. What was left was the cost alone, a tenant's VM stopped for a partition
+nobody else had acted on.
 
 **Still unresolved, and now the whole of it:** a host that can reach neither the Control
 Plane nor the object store cannot tell isolation from supersession. It keeps serving. The
@@ -59,14 +58,17 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
+1. **A clone still reads zeros.** §20 has a Control Plane half and no Agent half: `-clone-snapshot`
+   creates the row and the descriptor with `parent_snapshot_id`, and nothing in
+   `internal/qcow` reads a parent, so the Agent prepares a fresh empty chain for a volume
+   advertised as a copy. Snapshots are commits now, so a clone is "restore from another
+   volume's commit" — which is what `internal/recovery` already does; what is new is the
+   lineage's shared DEK (§10). `internal/controlplane/clone.go` also still reasons about
+   the withdrawn engine: `MaxChainDepth` is justified by a measurement of `cow.IntervalMap`,
+   `agent.awaitBase` and `agent.maxChainWalk`, none of which exist.
+2. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
    while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
    implementation of it. They belong in `internal/qcow`'s adversary lane.
-
-## What the demolition left owed
-
-- **`cpserver` still records a published snapshot with no manifest key** — the one piece
-  recovery did not bring back. `hack/deadcode-pending.txt` is empty.
 
 ## What only a pilot can answer
 
@@ -77,32 +79,30 @@ system has no equivalent of vSphere's datastore lock.
 ## Thin paths that shipped without being deepened
 
 - **No RPO is set anywhere.** The age trigger is in and per-volume
-  (`volumes.rpo_target_seconds` → `DesiredVolume`), and every volume carries zero: §11
-  forbids choosing a target instead of measuring one, and no upload-throughput measurement
-  against a real object store has been made. Until one is, every volume commits on size
-  alone and `-seed-rpo-seconds` is the only way to set one.
+  (`volumes.rpo_target_seconds` → `DesiredVolume`); every volume carries zero, because §11
+  forbids choosing a target instead of measuring one and the upload-throughput measurement
+  has not been made. `-seed-rpo-seconds` is the only way to set one.
 - **Rotation and publishing have no production default.** `-rotate-at-bytes` is 0 and no
-  object store is required, so an Agent started without both seals nothing and publishes
-  nothing — loudly, in one WARN line. §11 forbids choosing the threshold instead of
-  measuring it, and the measurement is not finished. A layer's size is a *floor* anyway,
-  not a bound: measured at 8x the threshold with a 300 ms cycle, and nothing can hold a
-  layer to a size while QEMU takes the guest's writes.
+  object store is required, so an Agent started without both seals and publishes nothing —
+  loudly, in one WARN line. A layer's size is a *floor*, not a bound: measured at 8x the
+  threshold with a 300 ms cycle, and nothing holds a layer to a size while QEMU takes the
+  guest's writes.
 - **A whole sealed layer is held in memory to publish it.** `objectstore.Store` takes a
   `[]byte`. At 32 MiB that is a buffer; an order of magnitude more and it is an OOM in a
   process holding somebody's disk. The fix is a streaming PUT on the store interface.
 - **A restart between sealing and publishing duplicates a commit id** — the layer is
   derived from the chain and never lost; only the id is.
-- **Nothing reclaims local disk.** A released volume keeps its layers, a published layer
-  keeps its file (§9 step 15), and nothing sweeps the orphan overlay an interrupted
-  rotation leaves. A sweep needs a `List` on `qcow.Paths`, which does not exist.
+- **Nothing reclaims local disk.** Released volumes keep their layers, published layers
+  keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
+  never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.
 - **Nothing measures the chain or the commits.** No metric for depth, size, attachment,
   `unpublished_local_bytes` or `last_successful_commit_age` — which §11 calls the product.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
-  DEK). `DeleteVolume` returns which it did; even a real shred rests on the bucket's
-  lifecycle policy expiring the descriptor's non-current versions.
-- **No alerting artifact, no bucket lifecycle, no tracing, no PITR rehearsal, no `/healthz`
-  on the CP** (whose term is a closure over a constant). The Connect API is unauthenticated
-  on `:8080`, with `GetVolumeKeys` on it.
+  DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
+  expiring the descriptor's non-current versions.
+- **No alerting, bucket lifecycle, tracing, PITR rehearsal, or `/healthz` on the CP** (whose
+  term is a closure over a constant). The Connect API is unauthenticated on `:8080`, with
+  `GetVolumeKeys` on it.
 
 ## Divergences (DEV entries)
 

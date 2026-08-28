@@ -132,13 +132,6 @@ func fromNullUUID(u pgtype.UUID) string {
 	return ""
 }
 
-func text(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
-func fromText(t pgtype.Text) string {
-	if t.Valid {
-		return t.String
-	}
-	return ""
-}
 func fromTS(t pgtype.Timestamptz) time.Time { return t.Time }
 
 // wrote reports whether a term-guarded write landed, having first answered the only
@@ -806,11 +799,19 @@ func (s *Store) CreateSnapshot(ctx context.Context, term int64, snap metadata.Sn
 	if !snap.State.Valid() {
 		return fmt.Errorf("%w: snapshot state %q", lifecycle.ErrUnknownState, snap.State)
 	}
+	// A snapshot is created CREATING and with no commit — the commit is what the host
+	// reports back — so a create that carried one would be a caller inventing a point in
+	// a history it does not write. -rebuild-metadata is the exception and states it: it
+	// recreates rows that were already PUBLISHED, and those carry theirs.
+	commit, err := nullUUID("commit", snap.CommitID)
+	if err != nil {
+		return err
+	}
 	rows, err := s.q.CreateSnapshot(ctx, db.CreateSnapshotParams{
 		SnapshotID: sid, VolumeID: vid, ParentSnapshotID: parent,
-		Epoch: snap.Epoch, TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
+		Epoch: snap.Epoch, CommitID: commit,
 		SourceHostID: source, State: snap.State.String(),
-		ManifestKey: text(snap.ManifestKey), RequestID: rid, Term: term,
+		RequestID: rid, Term: term,
 	})
 	// 0 rows with a current term is the ON CONFLICT DO NOTHING path: the snapshot is
 	// already in the catalog and is immutable (INV-16), so this is a no-op, not an
@@ -872,18 +873,27 @@ func (s *Store) ListUnfinishedSnapshots(ctx context.Context) ([]metadata.Snapsho
 }
 
 // PublishSnapshot records what the host that took the snapshot observed.
-func (s *Store) PublishSnapshot(ctx context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error {
+func (s *Store) PublishSnapshot(ctx context.Context, term int64, snapshotID, commitID, sourceHostID string) error {
 	id, err := requireUUID("snapshot", snapshotID)
 	if err != nil {
 		return err
+	}
+	// Required, not optional: the column's CHECK says a PUBLISHED snapshot names a
+	// commit, so a publish with no commit id would be refused by the database with a
+	// constraint name instead of by this function with a sentence.
+	commit, err := nullUUID("commit", commitID)
+	if err != nil {
+		return err
+	}
+	if !commit.Valid {
+		return fmt.Errorf("%w: a published snapshot names a commit, and none was reported for %s", metadata.ErrInvalidID, snapshotID)
 	}
 	source, err := nullUUID("source host", sourceHostID)
 	if err != nil {
 		return err
 	}
 	rows, err := s.q.PublishSnapshot(ctx, db.PublishSnapshotParams{
-		SnapshotID: id, TargetSequence: targetSequence, SourceHostID: source,
-		ManifestKey: text(manifestKey), Term: term,
+		SnapshotID: id, CommitID: commit, SourceHostID: source, Term: term,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
@@ -896,7 +906,7 @@ func (s *Store) PublishSnapshot(ctx context.Context, term int64, snapshotID stri
 	if gerr != nil {
 		return gerr
 	}
-	if snap.State == lifecycle.SnapshotPublished && snap.TargetSequence == targetSequence {
+	if snap.State == lifecycle.SnapshotPublished && snap.CommitID == commitID {
 		return nil
 	}
 	return fmt.Errorf("%w: snapshot %s is %s, not CREATING", lifecycle.ErrInvalidTransition, snapshotID, snap.State)
@@ -910,9 +920,9 @@ func snapshotFromRow(snap *db.Snapshot) (metadata.Snapshot, error) {
 	return metadata.Snapshot{
 		SnapshotID: snap.SnapshotID.String(), VolumeID: snap.VolumeID.String(),
 		ParentSnapshotID: fromNullUUID(snap.ParentSnapshotID), Epoch: snap.Epoch,
-		TargetSequence: snap.TargetSequence, RootDigest: snap.RootDigest,
+		CommitID:     fromNullUUID(snap.CommitID),
 		SourceHostID: fromNullUUID(snap.SourceHostID), State: state,
-		ManifestKey: fromText(snap.ManifestKey), RequestID: snap.RequestID.String(),
+		RequestID: snap.RequestID.String(),
 	}, nil
 }
 

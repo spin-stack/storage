@@ -90,8 +90,8 @@ func TestCloneIsIndependentOfParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10,
-		RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID,
+		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, CommitID: ids.New().String(),
+		State: lifecycle.SnapshotPublished, RequestID: reqID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestCloneWithStaleTermFails(t *testing.T) {
 	md, store, term := cpStore(t)
 	kms := testKMS(t)
 	_ = md.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test"}, nil)
-	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10, RootDigest: "abc", State: lifecycle.SnapshotPublished, RequestID: reqID})
+	_ = md.CreateSnapshot(ctx, term, metadata.Snapshot{SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, CommitID: ids.New().String(), State: lifecycle.SnapshotPublished, RequestID: reqID})
 
 	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
 
@@ -394,9 +394,9 @@ func publishSnapshotOf(t *testing.T, md metadata.Store, term int64, volumeID str
 	t.Helper()
 	id := ids.New().String()
 	if err := md.CreateSnapshot(t.Context(), term, metadata.Snapshot{
-		SnapshotID: id, VolumeID: volumeID, Epoch: 1, TargetSequence: 10,
-		RootDigest: "abc", SourceHostID: cloneHostA,
-		State: lifecycle.SnapshotPublished, RequestID: ids.New().String(),
+		SnapshotID: id, VolumeID: volumeID, Epoch: 1, CommitID: ids.New().String(),
+		SourceHostID: cloneHostA,
+		State:        lifecycle.SnapshotPublished, RequestID: ids.New().String(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -415,9 +415,9 @@ func addHost(t *testing.T, md metadata.Store, term int64, id string, state lifec
 func createSnapshot(t *testing.T, md metadata.Store, term int64, sourceHost string) {
 	t.Helper()
 	if err := md.CreateSnapshot(t.Context(), term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, TargetSequence: 10,
-		RootDigest: "abc", SourceHostID: sourceHost,
-		State: lifecycle.SnapshotPublished, RequestID: reqID,
+		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, CommitID: ids.New().String(),
+		SourceHostID: sourceHost,
+		State:        lifecycle.SnapshotPublished, RequestID: reqID,
 	}); err != nil {
 		t.Fatal(err)
 	}

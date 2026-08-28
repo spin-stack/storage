@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spin-stack/storage/internal/controlplane"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/lifecycle"
 	"github.com/spin-stack/storage/internal/metadata"
 	metasim "github.com/spin-stack/storage/internal/metadata/sim"
@@ -111,15 +112,14 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 	}
 
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: stuckSnap, VolumeID: strandedVol, Epoch: 9, TargetSequence: 0,
-		RootDigest: "d", State: lifecycle.SnapshotCreating, RequestID: requestID,
+		SnapshotID: stuckSnap, VolumeID: strandedVol, Epoch: 9,
+		State: lifecycle.SnapshotCreating, RequestID: requestID,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: doneSnap, VolumeID: servedVol, Epoch: 3, TargetSequence: 77,
-		RootDigest: "d", State: lifecycle.SnapshotPublished, SourceHostID: activeHost,
-		ManifestKey: "image/v/snapshots/s.json", RequestID: requestID,
+		SnapshotID: doneSnap, VolumeID: servedVol, Epoch: 3, CommitID: ids.New().String(),
+		State: lifecycle.SnapshotPublished, SourceHostID: activeHost, RequestID: requestID,
 	}); err != nil {
 		t.Fatal(err)
 	}

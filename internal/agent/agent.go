@@ -58,8 +58,10 @@ type VolumeStatus struct {
 	// flight, because a half-taken snapshot is not a fact the catalog can hold. The
 	// two fields below are its outcome: a sequence, or an error.
 	SnapshotID string
-	// SnapshotSequence is the §19 sequence the copy was frozen at.
-	SnapshotSequence int64
+	// SnapshotCommitID is the commit this snapshot names. A snapshot is a name for a
+	// point in the published history, so this can only be set after a commit succeeded —
+	// which is what makes a reported snapshot one that can actually be restored.
+	SnapshotCommitID string
 	// SnapshotError is why it could not be taken. A snapshot that fails silently stays
 	// CREATING in the catalog forever.
 	SnapshotError string

@@ -196,8 +196,7 @@ func newWorld(t *testing.T, s metadata.Store) world {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	if err := s.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: w.snap, VolumeID: w.vol, Epoch: 1, TargetSequence: 10,
-		RootDigest: "digest", State: lifecycle.SnapshotCreating, RequestID: id(),
+		SnapshotID: w.snap, VolumeID: w.vol, Epoch: 1, CommitID: "", State: lifecycle.SnapshotCreating, RequestID: id(),
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
@@ -250,15 +249,14 @@ func everyMutation() []mutation {
 		}},
 		{"CreateSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{
-				SnapshotID: id(), VolumeID: w.vol, Epoch: 1, TargetSequence: 1,
-				RootDigest: "d", State: lifecycle.SnapshotCreating, RequestID: id(),
+				SnapshotID: id(), VolumeID: w.vol, Epoch: 1, CommitID: "", State: lifecycle.SnapshotCreating, RequestID: id(),
 			})
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return setSnapshotState(ctx, s, term, w.snap, lifecycle.SnapshotPublished)
+			return setSnapshotState(ctx, s, term, w.snap, lifecycle.SnapshotFailed)
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.PublishSnapshot(ctx, term, w.snap, 7, w.host, "image/k/snapshots/s.json")
+			return s.PublishSnapshot(ctx, term, w.snap, id(), w.host)
 		}},
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.ClearVolumeParent(ctx, term, w.vol)
@@ -363,10 +361,10 @@ func missingRows(t *testing.T, s metadata.Store) {
 			return s.DeleteVolume(ctx, term, ghostVol)
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return setSnapshotState(ctx, s, term, ghostSnap, lifecycle.SnapshotPublished)
+			return setSnapshotState(ctx, s, term, ghostSnap, lifecycle.SnapshotFailed)
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.PublishSnapshot(ctx, term, ghostSnap, 7, "", "k")
+			return s.PublishSnapshot(ctx, term, ghostSnap, id(), "")
 		}},
 	}
 	for _, tc := range tests {
@@ -562,17 +560,16 @@ func snapshotRecreate(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
 	snapID, reqID := id(), id()
+	commitID := id()
 	first := metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: w.vol, Epoch: 3, TargetSequence: 42,
-		RootDigest: "original", State: lifecycle.SnapshotPublished,
-		ManifestKey: "snapshots/x/manifest.json", RequestID: reqID,
+		SnapshotID: snapID, VolumeID: w.vol, Epoch: 3, CommitID: commitID,
+		State: lifecycle.SnapshotPublished, RequestID: reqID,
 	}
 	if err := s.CreateSnapshot(ctx, w.term, first); err != nil {
 		t.Fatal(err)
 	}
 	second := first
-	second.RootDigest = "rewritten"
-	second.TargetSequence = 1
+	second.CommitID = ""
 	second.State = lifecycle.SnapshotCreating
 	second.RequestID = id()
 	if err := s.CreateSnapshot(ctx, w.term, second); err != nil {
@@ -582,7 +579,7 @@ func snapshotRecreate(t *testing.T, s metadata.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RootDigest != "original" || got.TargetSequence != 42 || got.State != lifecycle.SnapshotPublished {
+	if got.CommitID != commitID || got.State != lifecycle.SnapshotPublished {
 		t.Fatalf("a published snapshot was mutated by a duplicate create: %+v", got)
 	}
 }
@@ -969,7 +966,7 @@ func snapshotLifecycle(t *testing.T, s metadata.Store) {
 	// INV-16: a published snapshot never goes back to being built.
 	other := id()
 	if err := s.CreateSnapshot(ctx, w.term, metadata.Snapshot{
-		SnapshotID: other, VolumeID: w.vol, Epoch: 1, TargetSequence: 1, RootDigest: "d",
+		SnapshotID: other, VolumeID: w.vol, Epoch: 1, CommitID: id(),
 		State: lifecycle.SnapshotPublished, RequestID: id(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1006,17 +1003,16 @@ func pendingSnapshots(t *testing.T, s metadata.Store) {
 		t.Fatalf("a host that serves nothing was asked for %d snapshots (err %v)", len(other), err)
 	}
 
-	const seq = 41
-	key := "image/vol/snapshots/snap.json"
-	if err := s.PublishSnapshot(ctx, w.term, w.snap, seq, w.host, key); err != nil {
+	commitID := id()
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, commitID, w.host); err != nil {
 		t.Fatalf("PublishSnapshot: %v", err)
 	}
 	got, err := s.GetSnapshot(ctx, w.snap)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != lifecycle.SnapshotPublished || got.TargetSequence != seq ||
-		got.SourceHostID != w.host || got.ManifestKey != key {
+	if got.State != lifecycle.SnapshotPublished || got.CommitID != commitID ||
+		got.SourceHostID != w.host {
 		t.Fatalf("published snapshot = %+v", got)
 	}
 	// Published means no longer asked for: an Agent that kept being asked would keep
@@ -1025,14 +1021,16 @@ func pendingSnapshots(t *testing.T, s metadata.Store) {
 		t.Fatalf("a published snapshot is still pending: %+v (err %v)", pending, err)
 	}
 
-	if err := s.PublishSnapshot(ctx, w.term, w.snap, seq, w.host, key); err != nil {
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, commitID, w.host); err != nil {
 		t.Fatalf("re-reporting the same publication: %v", err)
 	}
-	if err := s.PublishSnapshot(ctx, w.term, w.snap, seq+1, w.host, key); !errors.Is(err, lifecycle.ErrInvalidTransition) {
-		t.Fatalf("re-reporting at a different sequence: want ErrInvalidTransition, got %v", err)
+	// A different commit at a published id is INV-16: a snapshot names one point in the
+	// history and a second answer would silently move what every clone of it reads.
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, id(), w.host); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+		t.Fatalf("re-reporting at a different commit: want ErrInvalidTransition, got %v", err)
 	}
-	if got, _ := s.GetSnapshot(ctx, w.snap); got.TargetSequence != seq {
-		t.Fatalf("a refused report moved the sequence to %d", got.TargetSequence)
+	if got, _ := s.GetSnapshot(ctx, w.snap); got.CommitID != commitID {
+		t.Fatalf("a refused report moved the snapshot to commit %s", got.CommitID)
 	}
 }
 
@@ -1119,7 +1117,7 @@ func fleetWideReads(t *testing.T, s metadata.Store) {
 
 	// A published snapshot is finished and drops out; a DELETING one does not, because
 	// under ADR-0026 nothing reclaims it and it stays there for ever.
-	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotPublished); err != nil {
+	if err := s.PublishSnapshot(ctx, w.term, w.snap, id(), w.host); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	if got, err := s.ListUnfinishedSnapshots(ctx); err != nil || len(got) != 0 {
@@ -1812,15 +1810,15 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		}},
 		{"CreateSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{
-				SnapshotID: "", VolumeID: w.vol, Epoch: 1, TargetSequence: 1, RootDigest: "d",
+				SnapshotID: "", VolumeID: w.vol, Epoch: 1, CommitID: "",
 				State: lifecycle.SnapshotCreating, RequestID: id(),
 			})
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return setSnapshotState(ctx, s, term, "", lifecycle.SnapshotPublished)
+			return setSnapshotState(ctx, s, term, "", lifecycle.SnapshotFailed)
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.PublishSnapshot(ctx, term, "", 7, "", "k")
+			return s.PublishSnapshot(ctx, term, "", id(), "")
 		}},
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.ClearVolumeParent(ctx, term, "")
@@ -1872,7 +1870,7 @@ func volumeDelete(t *testing.T, s metadata.Store) {
 	}
 	if err := s.CreateSnapshot(ctx, w.term, metadata.Snapshot{
 		SnapshotID: snapB, VolumeID: cloneB, ParentSnapshotID: w.snap, Epoch: 1,
-		TargetSequence: 20, RootDigest: "d", State: lifecycle.SnapshotCreating, RequestID: id(),
+		CommitID: "", State: lifecycle.SnapshotCreating, RequestID: id(),
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}

@@ -1,13 +1,13 @@
 -- name: CreateSnapshot :execrows
 -- Term-guarded snapshot record (§19).
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $11
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
 )
 INSERT INTO snapshots (
-    snapshot_id, volume_id, parent_snapshot_id, epoch, target_sequence,
-    root_digest, source_host_id, state, manifest_key, request_id
+    snapshot_id, volume_id, parent_snapshot_id, epoch,
+    commit_id, source_host_id, state, request_id
 )
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+SELECT $1, $2, $3, $4, sqlc.narg(commit_id)::uuid, $5, $6, $7
 WHERE EXISTS (SELECT 1 FROM valid)
 -- INV-16: a snapshot is immutable once it is in the catalog, so a duplicate record
 -- — a retried request, or two operators rebuilding at once — is a no-op rather than
@@ -65,15 +65,17 @@ SELECT * FROM snapshots
  ORDER BY snapshot_id;
 
 -- name: PublishSnapshot :execrows
--- CREATING → PUBLISHED, stamping the three facts only the host that took it knows:
--- the sequence the copy was frozen at, the manifest it wrote, and which host did it.
+-- CREATING → PUBLISHED, stamping the two facts only the host that took it knows: the
+-- commit its history is named by, and which host reported it. The manifest key is not
+-- among them and must not be: it is derived from the commit id (commit.ManifestKey), so
+-- believing a string the Agent sent is how a catalog and a bucket come to disagree about
+-- where a snapshot lives.
 -- Term-guarded, and guarded on CREATING so a report replayed after the snapshot has
 -- moved on cannot resurrect it (INV-16: PUBLISHED never changes).
 UPDATE snapshots
    SET state = 'PUBLISHED',
-       target_sequence = $2,
-       source_host_id = $3,
-       manifest_key = $4
+       commit_id = $2,
+       source_host_id = $3
  WHERE snapshot_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
    AND state = 'CREATING';

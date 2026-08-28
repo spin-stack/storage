@@ -714,7 +714,7 @@ func (s *Store) ListUnfinishedSnapshots(_ context.Context) ([]metadata.Snapshot,
 }
 
 // PublishSnapshot records what the host that took the snapshot observed.
-func (s *Store) PublishSnapshot(_ context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error {
+func (s *Store) PublishSnapshot(_ context.Context, term int64, snapshotID, commitID, sourceHostID string) error {
 	if err := requireID("snapshot", snapshotID); err != nil {
 		return err
 	}
@@ -731,19 +731,18 @@ func (s *Store) PublishSnapshot(_ context.Context, term int64, snapshotID string
 	// keeps reporting until the request stops arriving — so it is a no-op. A different
 	// sequence at the same id is not: INV-16 says PUBLISHED never changes.
 	if snap.State == lifecycle.SnapshotPublished {
-		if snap.TargetSequence == targetSequence {
+		if snap.CommitID == commitID {
 			return nil
 		}
-		return fmt.Errorf("%w: snapshot %s is PUBLISHED at sequence %d, reported at %d",
-			lifecycle.ErrInvalidTransition, snapshotID, snap.TargetSequence, targetSequence)
+		return fmt.Errorf("%w: snapshot %s is PUBLISHED at commit %s, reported at %s",
+			lifecycle.ErrInvalidTransition, snapshotID, snap.CommitID, commitID)
 	}
 	if err := snap.State.Transition(lifecycle.SnapshotPublished); err != nil {
 		return err
 	}
 	snap.State = lifecycle.SnapshotPublished
-	snap.TargetSequence = targetSequence
+	snap.CommitID = commitID
 	snap.SourceHostID = sourceHostID
-	snap.ManifestKey = manifestKey
 	s.snaps[snapshotID] = snap
 	return nil
 }

@@ -53,7 +53,7 @@ func TestRequestSnapshotRecordsWhatOnlyTheControlPlaneKnows(t *testing.T) {
 	}
 	// Empty on purpose: these are facts only the host that takes it can know, and a
 	// number here would name a point no copy corresponds to.
-	if got.TargetSequence != 0 || got.SourceHostID != "" || got.ManifestKey != "" {
+	if got.CommitID != "" || got.SourceHostID != "" {
 		t.Errorf("the Control Plane guessed at the host's facts: %+v", got)
 	}
 

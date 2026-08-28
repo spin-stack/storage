@@ -995,18 +995,25 @@ type VolumeReport struct {
 	RemoteGapBytes int64 `protobuf:"varint,6,opt,name=remote_gap_bytes,json=remoteGapBytes,proto3" json:"remote_gap_bytes,omitempty"`
 	// snapshot_id is the pending snapshot this host has finished acting on, empty when
 	// it has nothing to say. The three fields below are one answer and are read
-	// together: an id plus a sequence is "published at N", an id plus an error is
-	// "FAILED, and here is what an operator needs to read".
+	// together: an id plus a commit is "published, and this commit is it", an id plus an
+	// error is "FAILED, and here is what an operator needs to read".
 	//
 	// It is reported on the volume's own report rather than through a call of its own
 	// because the report is already the Agent's one channel for "what is true here",
 	// and a second channel would need its own retry, its own ordering against the
 	// watermarks, and its own way of being refused when the host has been fenced.
 	SnapshotId string `protobuf:"bytes,7,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
-	// snapshot_sequence is the §19 sequence the copy was frozen at — the volume's
-	// local_sequence at the instant of the capture, and what makes the snapshot a
-	// point rather than an interval.
-	SnapshotSequence int64 `protobuf:"varint,8,opt,name=snapshot_sequence,json=snapshotSequence,proto3" json:"snapshot_sequence,omitempty"`
+	// snapshot_commit_id is the commit this snapshot names. A snapshot under v6 is not a
+	// copy of anything: it is a *name for a commit* that is already in the published
+	// history, so taking one costs a rotation and a publish when the tip has unpublished
+	// bytes, and nothing at all when it does not.
+	//
+	// That is the whole of what makes it durable, and it is worth saying because the
+	// v5 answer was the opposite: a snapshot was a manifest the host wrote, and it could
+	// exist while the data it named did not. A commit id can only be reported after
+	// `Commit() → SUCCESS`, which promises the state is reconstructible without this
+	// host — so a snapshot that is reported at all is a snapshot that can be restored.
+	SnapshotCommitId string `protobuf:"bytes,12,opt,name=snapshot_commit_id,json=snapshotCommitId,proto3" json:"snapshot_commit_id,omitempty"`
 	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
 	// that fails silently stays CREATING forever and nothing ever collects it.
 	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
@@ -1111,11 +1118,11 @@ func (x *VolumeReport) GetSnapshotId() string {
 	return ""
 }
 
-func (x *VolumeReport) GetSnapshotSequence() int64 {
+func (x *VolumeReport) GetSnapshotCommitId() string {
 	if x != nil {
-		return x.SnapshotSequence
+		return x.SnapshotCommitId
 	}
-	return 0
+	return ""
 }
 
 func (x *VolumeReport) GetSnapshotError() string {
@@ -1336,7 +1343,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xc2\x03\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xc9\x03\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +
@@ -1345,12 +1352,12 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x12published_sequence\x18\x05 \x01(\x03R\x11publishedSequence\x12(\n" +
 	"\x10remote_gap_bytes\x18\x06 \x01(\x03R\x0eremoteGapBytes\x12\x1f\n" +
 	"\vsnapshot_id\x18\a \x01(\tR\n" +
-	"snapshotId\x12+\n" +
-	"\x11snapshot_sequence\x18\b \x01(\x03R\x10snapshotSequence\x12%\n" +
+	"snapshotId\x12,\n" +
+	"\x12snapshot_commit_id\x18\f \x01(\tR\x10snapshotCommitId\x12%\n" +
 	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
 	"\arefusal\x18\n" +
 	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +
-	"\x0erefusal_detail\x18\v \x01(\tR\rrefusalDetail\"l\n" +
+	"\x0erefusal_detail\x18\v \x01(\tR\rrefusalDetailJ\x04\b\b\x10\t\"l\n" +
 	"\x18ReportVolumeStateRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x127\n" +
 	"\avolumes\x18\x02 \x03(\v2\x1d.spin.storage.v1.VolumeReportR\avolumes\"k\n" +

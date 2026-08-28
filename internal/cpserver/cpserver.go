@@ -400,20 +400,24 @@ func (s *Server) applySnapshotReport(ctx context.Context, term int64, hostID str
 			"snapshot_id", snapID, "volume_id", r.GetVolumeId(), "host_id", hostID, "error", msg)
 		return nil
 	}
-	// The manifest key is left empty, and it is not a placeholder for the Agent's
-	// reported one. It used to be *computed* here — a function of the two ids — rather
-	// than believed, so the catalog and the writer could not disagree about where a
-	// snapshot lives. What it computed was a key into the chunked image's object layout
-	// (`image/<vol>/snapshots/<snap>.json`), and that layout is withdrawn along with the
-	// local block engine. Recording the Agent's string instead would give up the one
-	// property the computation existed for; recording a key in a layout nothing writes
-	// would point an operator at an object that is not there. So: no key, and the commit
-	// protocol that replaces the manifest brings the computation back with a prefix that
-	// exists. Nothing reaches this branch today — no host can freeze a snapshot without
-	// a data path — and the row is still worth writing, because the sequence and the
-	// host are facts the catalog holds and the empty column says the object is not
-	// locatable yet.
-	if err := s.md.PublishSnapshot(ctx, term, snapID, r.GetSnapshotSequence(), hostID, ""); err != nil {
+	// The commit the host reported, and nothing derived from a string it sent. A
+	// snapshot under v6 is a name for a commit that is already in the published history,
+	// so this id is the whole of what the row points at: the manifest's key is computed
+	// from it (commit.ManifestKey), which is the property the old computed key existed
+	// for and the reported `manifest_key` column gave up.
+	//
+	// It is refused when empty rather than recorded as a blank. A PUBLISHED snapshot
+	// with no commit is a row a clone would follow to an object that is not there, and
+	// the database says so too — snapshots_published_names_a_commit.
+	if r.GetSnapshotCommitId() == "" {
+		if err := s.md.SetSnapshotState(ctx, term, snapID, lifecycle.SnapshotFailed); err != nil {
+			return fmt.Errorf("cpserver: recording snapshot %q as failed: %w", snapID, err)
+		}
+		slog.WarnContext(ctx, "a host reported a snapshot as taken and named no commit; it cannot be restored, so it is FAILED",
+			"snapshot_id", snapID, "volume_id", r.GetVolumeId(), "host_id", hostID)
+		return nil
+	}
+	if err := s.md.PublishSnapshot(ctx, term, snapID, r.GetSnapshotCommitId(), hostID); err != nil {
 		return fmt.Errorf("cpserver: publishing snapshot %q: %w", snapID, err)
 	}
 	return nil

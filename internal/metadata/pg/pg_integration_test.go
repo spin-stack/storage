@@ -225,14 +225,14 @@ func TestPGRejectsNonV7OnEveryIdentityColumn(t *testing.T) {
 		},
 		{
 			name: "snapshots.snapshot_id",
-			insert: `INSERT INTO snapshots (snapshot_id, volume_id, epoch, target_sequence, root_digest, state, request_id)
-			         VALUES ($1, $2, 1, 1, 'd', 'CREATING', $3)`,
+			insert: `INSERT INTO snapshots (snapshot_id, volume_id, epoch, state, request_id)
+			         VALUES ($1, $2, 1, 'CREATING', $3)`,
 			row: func(id string) []any { return []any{id, seedVolume, ids.New().String()} },
 		},
 		{
 			name: "snapshots.request_id",
-			insert: `INSERT INTO snapshots (snapshot_id, volume_id, epoch, target_sequence, root_digest, state, request_id)
-			         VALUES ($2, $3, 1, 1, 'd', 'CREATING', $1)`,
+			insert: `INSERT INTO snapshots (snapshot_id, volume_id, epoch, state, request_id)
+			         VALUES ($2, $3, 1, 'CREATING', $1)`,
 			row: func(id string) []any { return []any{id, ids.New().String(), seedVolume} },
 		},
 	}
@@ -426,8 +426,8 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 	}
 	snapID, reqID := ids.New().String(), ids.New().String()
 	if err := store.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: volID, Epoch: 1, TargetSequence: 1,
-		RootDigest: "d", State: lifecycle.SnapshotCreating, RequestID: reqID,
+		SnapshotID: snapID, VolumeID: volID, Epoch: 1,
+		State: lifecycle.SnapshotCreating, RequestID: reqID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -454,6 +454,14 @@ func TestPGAcceptsEveryDeclaredLifecycleValue(t *testing.T) {
 		if _, err := pool.Exec(ctx, `UPDATE volumes SET state=$1 WHERE volume_id=$2`, s.String(), volID); err != nil {
 			t.Fatalf("volume state %q rejected by the DB: %v", s, err)
 		}
+	}
+	// The row carries a commit throughout, because the subject here is the state
+	// vocabulary and PUBLISHED additionally requires one — snapshots_published_names_a_commit.
+	// Without it this loop would fail on one value for a reason that has nothing to do
+	// with what it is checking.
+	if _, err := pool.Exec(ctx, `UPDATE snapshots SET commit_id=$1 WHERE snapshot_id=$2`,
+		ids.New().String(), snapID); err != nil {
+		t.Fatal(err)
 	}
 	for _, s := range lifecycle.SnapshotStates() {
 		if _, err := pool.Exec(ctx, `UPDATE snapshots SET state=$1 WHERE snapshot_id=$2`, s.String(), snapID); err != nil {

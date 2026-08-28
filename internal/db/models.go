@@ -45,12 +45,10 @@ type Snapshot struct {
 	VolumeID         uuid.UUID          `json:"volume_id"`
 	ParentSnapshotID pgtype.UUID        `json:"parent_snapshot_id"`
 	Epoch            int64              `json:"epoch"`
-	TargetSequence   int64              `json:"target_sequence"`
-	RootDigest       string             `json:"root_digest"`
+	CommitID         pgtype.UUID        `json:"commit_id"`
 	SourceHostID     pgtype.UUID        `json:"source_host_id"`
 	State            string             `json:"state"`
 	Portable         bool               `json:"portable"`
-	ManifestKey      pgtype.Text        `json:"manifest_key"`
 	RequestID        uuid.UUID          `json:"request_id"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }

@@ -282,20 +282,47 @@ CREATE TABLE volumes (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- A snapshot is a *name for a commit* (§19 under v6). Not a copy, not a manifest the
+-- host writes: the published history is already a chain of immutable commits, and a
+-- snapshot is a row saying "this commit, under this name". Taking one costs a rotation
+-- and a publish when the tip holds unpublished bytes, and nothing at all when it does
+-- not.
+--
+-- Two v5 columns went with the engine that produced them. `target_sequence` was the
+-- volume's local_sequence at the capture, and there are no sequences any more.
+-- `root_digest` was the chunked image's root, and that object layout is withdrawn. What
+-- is left identifying the point in history is `commit_id`, and it is enough on its own
+-- — a commit id names a manifest whose key is derived (commit.ManifestKey), so a
+-- catalog and a bucket cannot disagree about where a snapshot lives, which is the
+-- property `manifest_key` was trying and failing to hold when it was a string the Agent
+-- reported.
 CREATE TABLE snapshots (
     snapshot_id        UUIDV7 PRIMARY KEY,
     volume_id          UUID NOT NULL REFERENCES volumes(volume_id),
     parent_snapshot_id UUID REFERENCES snapshots(snapshot_id),
     epoch              BIGINT NOT NULL,
-    target_sequence    BIGINT NOT NULL,
-    root_digest        TEXT NOT NULL,
+    -- The commit this snapshot names, empty until the host reports one. It is not a
+    -- foreign key to anything: commits live in the object store, which is the authority
+    -- on them, and a catalog row that could only exist alongside a bucket object would
+    -- make -rebuild-metadata impossible by construction.
+    commit_id          UUIDV7,
     source_host_id     UUID REFERENCES hosts(host_id),
     state              TEXT NOT NULL                                  -- §19
                          CHECK (state IN ('CREATING', 'PUBLISHED', 'FAILED', 'DELETING')),
     portable           BOOLEAN NOT NULL DEFAULT false,
-    manifest_key       TEXT,
     request_id         UUIDV7 UNIQUE NOT NULL,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- A PUBLISHED snapshot names a commit. That direction only, and the difference
+    -- matters twice: a DELETING snapshot keeps the commit it was published at — it is
+    -- being removed, not un-published — and a biconditional would refuse the transition
+    -- outright. Written the other way round first, and the integration lane is what said
+    -- so; the sim does not enforce constraints, so the unit lane was green.
+    --
+    -- What it protects is the row a clone follows: PUBLISHED is the only state that says
+    -- a snapshot is usable, and one that says so while naming nothing sends a reader to
+    -- an object that is not there.
+    CONSTRAINT snapshots_published_names_a_commit
+        CHECK (state <> 'PUBLISHED' OR commit_id IS NOT NULL)
 );
 
 -- Indexes.

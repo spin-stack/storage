@@ -12,6 +12,7 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/commit"
+	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
 )
@@ -1453,5 +1454,140 @@ func TestAVanishedTipIsNoticedWithNoRotationConfigured(t *testing.T) {
 
 	if got := h.volumes(t)[vol]; got.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING {
 		t.Fatalf("refusal = %s, want IMAGE_MISSING: an Agent that rotates nothing never measures the tip, so nothing else here can notice its layers are gone", got.Refusal)
+	}
+}
+
+// withSnapshot is `active` plus a §19 request.
+func withSnapshot(id string, epoch int64, snapshotID string) *storagev1.DesiredVolume {
+	d := active(id, epoch)
+	d.PendingSnapshotId = snapshotID
+	return d
+}
+
+// TestASnapshotNamesTheCommitCarryingTheLayerSealedForIt.
+//
+// A snapshot under v6 is a name for a commit, and the only commit that may answer a
+// request is the one carrying the layer sealed *because of* it. The obvious
+// implementation — name the newest commit — passes every test that does not have another
+// trigger running, and is wrong exactly when one is: a size-triggered rotation that began
+// before the request arrived produces a commit that is missing everything written since,
+// and reporting it says nothing about the difference.
+//
+// `demo:stage5` is where that showed up, one second after the request, against a guest
+// writing hard enough to cross the size threshold every cycle.
+func TestASnapshotNamesTheCommitCarryingTheLayerSealedForIt(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{}
+	h := newHarnessFull(t, 8<<20, pub)
+	// A tip well under the size threshold: nothing but the request can seal this.
+	tip := h.rotating(t, 2<<20)
+	h.paths.sizes[tip] = 2 << 20
+
+	snapID := ids.New().String()
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withSnapshot(vol, 1, snapID)}); err != nil {
+		t.Fatalf("the cycle that should seal and publish for the snapshot: %v", err)
+	}
+
+	if len(pub.got) != 1 {
+		t.Fatalf("%d layers were published, want the one sealed for the snapshot", len(pub.got))
+	}
+	sealed := pub.got[0]
+	if sealed.LayerID != qcow.LayerIDOfImage(tip) {
+		t.Fatalf("the layer published is %q, want the tip that was current when the request arrived, %q",
+			sealed.LayerID, qcow.LayerIDOfImage(tip))
+	}
+	got := h.volumes(t)[vol]
+	if got.SnapshotID != snapID {
+		t.Fatalf("the report answers snapshot %q, want %q", got.SnapshotID, snapID)
+	}
+	if got.SnapshotError != "" {
+		t.Fatalf("the snapshot failed: %s", got.SnapshotError)
+	}
+	if got.SnapshotCommitID != sealed.CommitID {
+		t.Fatalf("the snapshot names commit %q; the layer sealed for it went into %q",
+			got.SnapshotCommitID, sealed.CommitID)
+	}
+}
+
+// TestASnapshotIsNotAnsweredByACommitThatPredatesIt is the same rule seen from the side
+// that a "name the newest commit" implementation gets wrong.
+//
+// The volume already has a published history when the request arrives. Answering with the
+// commit at the end of it would be instant, would look right, and would name a point
+// before everything the guest wrote since — which is the whole of what a snapshot is for.
+func TestASnapshotIsNotAnsweredByACommitThatPredatesIt(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+	// One cycle with no request: the size trigger seals and publishes, so the volume now
+	// has a history and the newest commit predates anything below.
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("the first cycle: %v", err)
+	}
+	if len(pub.got) != 1 {
+		t.Fatalf("precondition: %d commits, want one before the request", len(pub.got))
+	}
+	before := pub.got[0].CommitID
+
+	// The guest follows the rotation, and the fake has to be told: the QMP script is what
+	// the Manager reads the live tip from, and left pointing at the sealed layer it
+	// re-adopts that file every cycle — so the tip looks 9 MiB for ever, the size trigger
+	// fires for ever, and a test about *not* rotating is exercising a volume that rotates
+	// on its own. Both of this file's snapshot tests were written that way and neither
+	// could fail; the plants said so.
+	next := h.tip(t)
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(next)
+	// A few hundred kilobytes: more than the ~193 KiB an empty qcow2 already occupies, so
+	// the guest really did write; less than minRotateAtBytes, which is what the automatic
+	// triggers call "has been written to". This is the size that discriminates — 2 MiB
+	// sits above that floor and would let a floored snapshot arm pass this test.
+	h.paths.sizes[next] = 300 << 10
+	// And what `qemu-img info` says about the overlay the next rotation creates, which
+	// is checked against the tip it was supposed to be built on.
+	h.runner.info = overlayJSON(size, next)
+
+	snapID := ids.New().String()
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withSnapshot(vol, 1, snapID)}); err != nil {
+		t.Fatalf("the cycle carrying the request: %v", err)
+	}
+	got := h.volumes(t)[vol]
+	if got.SnapshotCommitID == before {
+		t.Fatalf("the snapshot was answered by commit %s, which was published before the request arrived", before)
+	}
+	if got.SnapshotCommitID == "" {
+		t.Fatal("the snapshot was not answered at all")
+	}
+}
+
+// TestASnapshotOnAHostWithNoObjectStoreIsRefusedRatherThanAwaited.
+//
+// Nothing can be published, so no commit can ever exist for the request to name. Waiting
+// is not a neutral choice here: the request keeps arriving, the rotation arm fires on the
+// request alone, and the volume is ground into one layer per cycle for as long as the
+// Control Plane keeps asking.
+func TestASnapshotOnAHostWithNoObjectStoreIsRefusedRatherThanAwaited(t *testing.T) {
+	t.Parallel()
+	h := newHarnessRotatingAt(t, 8<<20) // no publisher
+	tip := h.rotating(t, 2<<20)
+	h.paths.sizes[tip] = 2 << 20
+
+	snapID := ids.New().String()
+	for range 3 {
+		if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{withSnapshot(vol, 1, snapID)}); err != nil {
+			t.Fatalf("applying: %v", err)
+		}
+	}
+	got := h.volumes(t)[vol]
+	if got.SnapshotID != snapID || got.SnapshotError == "" {
+		t.Fatalf("a snapshot with nowhere to publish was not refused: %+v", got)
+	}
+	if got.SnapshotCommitID != "" {
+		t.Fatalf("a refused snapshot names commit %q", got.SnapshotCommitID)
+	}
+	// And the tip was left alone. Three cycles of sealing would be three layers.
+	if h.tip(t) != tip {
+		t.Fatalf("the tip moved to %q: the request sealed a layer nothing can publish", h.tip(t))
 	}
 }

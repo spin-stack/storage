@@ -74,9 +74,10 @@ func TestDesiredStateCarriesAPendingSnapshot(t *testing.T) {
 // Without this the Agent is asked forever and the catalog never learns the sequence.
 func TestAReportedSnapshotStopsBeingAskedFor(t *testing.T) {
 	w := newSnapshotWorld(t)
+	snapCommit := ids.New().String()
 
 	if got := w.report(t, hostA, &storagev1.VolumeReport{
-		VolumeId: w.vol, Epoch: 1, SnapshotId: w.snap, SnapshotSequence: 12,
+		VolumeId: w.vol, Epoch: 1, SnapshotId: w.snap, SnapshotCommitId: snapCommit,
 	}); got != storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED {
 		t.Fatalf("outcome = %v", got)
 	}
@@ -85,18 +86,16 @@ func TestAReportedSnapshotStopsBeingAskedFor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.State != lifecycle.SnapshotPublished || snap.TargetSequence != 12 || snap.SourceHostID != hostA {
-		t.Fatalf("snapshot = %+v, want PUBLISHED at 12 on %s", snap, hostA)
+	if snap.State != lifecycle.SnapshotPublished || snap.CommitID != snapCommit || snap.SourceHostID != hostA {
+		t.Fatalf("snapshot = %+v, want PUBLISHED at commit %s on %s", snap, snapCommit, hostA)
 	}
-	// No manifest key, and the empty column is the assertion. It used to be *computed*
-	// from the two ids — never taken from the report — so the catalog could not point
-	// somewhere the reader does not look. What it computed was a key into the chunked
-	// image's object layout, which is withdrawn; recording the Agent's string instead
-	// would give up the property the computation existed for, and recording a key in a
-	// layout nothing writes would point an operator at an object that is not there.
-	if snap.ManifestKey != "" {
-		t.Fatalf("manifest key = %q, want empty until the commit protocol supplies a layout", snap.ManifestKey)
-	}
+	// There is no manifest key column any more, and its absence is the point. It was
+	// once *computed* from the two ids — never taken from the report — so the catalog
+	// could not point somewhere the reader does not look; then the layout it computed
+	// into went with the chunked image, and it became a string the Agent sent, which is
+	// exactly the property the computation existed to hold. A commit id restores it: the
+	// key is derived from the id (commit.ManifestKey), so there is one place a snapshot
+	// can live and nothing that can disagree about where.
 	if vols := w.desired(t, hostA); vols[0].GetPendingSnapshotId() != "" {
 		t.Fatalf("a published snapshot is still being asked for: %q", vols[0].GetPendingSnapshotId())
 	}
@@ -119,7 +118,7 @@ func TestAStaleWritersSnapshotReportIsNotRecorded(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newSnapshotWorld(t)
 			if got := w.report(t, tc.host, &storagev1.VolumeReport{
-				VolumeId: w.vol, Epoch: tc.epoch, SnapshotId: w.snap, SnapshotSequence: 99,
+				VolumeId: w.vol, Epoch: tc.epoch, SnapshotId: w.snap, SnapshotCommitId: ids.New().String(),
 			}); got != tc.outcome {
 				t.Fatalf("outcome = %v, want %v", got, tc.outcome)
 			}
@@ -127,7 +126,7 @@ func TestAStaleWritersSnapshotReportIsNotRecorded(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if snap.State != lifecycle.SnapshotCreating || snap.TargetSequence != 0 {
+			if snap.State != lifecycle.SnapshotCreating || snap.CommitID != "" {
 				t.Fatalf("a refused report was recorded: %+v", snap)
 			}
 		})

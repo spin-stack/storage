@@ -191,6 +191,17 @@ type volume struct {
 	// rpo is this volume's age trigger, from the desired state. Zero is a volume with
 	// no RPO promise, which commits on size alone.
 	rpo time.Duration
+	// wantSnapshot is the snapshot id the Control Plane is asking this host to take, from
+	// the desired state; empty when it is asking for nothing. It is a *request* and the
+	// three fields below are the answer to it — kept apart because the request keeps
+	// arriving until the Control Plane sees the answer, so the two must not be one field
+	// that clearing would re-arm.
+	wantSnapshot string
+	// snapshotID is the request this host has finished acting on, with snapshotCommit or
+	// snapshotErr saying how. Reported until the request stops arriving.
+	snapshotID     string
+	snapshotCommit string
+	snapshotErr    string
 	// openedAt is when this process opened the chain, in milliseconds on the injected
 	// clock. It is the age trigger's anchor for a volume that has never committed, and
 	// it is deliberately not durable: a volume with no commits has nothing to be late
@@ -407,6 +418,7 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	// Control Plane can change under a running volume, and a host that only read it once
 	// would keep a tenant on the target they bought last month.
 	v.rpo = time.Duration(d.GetRpoTargetSeconds()) * time.Second
+	v.wantSnapshot = d.GetPendingSnapshotId()
 	if e := d.GetEpoch(); e > v.epoch {
 		v.epoch = e
 	} else if e < v.epoch {
@@ -591,7 +603,73 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 			"volume_id", id, "image", tip, "error", err)
 		return errors.Join(stateErr, pubErr, fmt.Errorf("volume %s: %w", id, err))
 	}
-	return errors.Join(stateErr, pubErr, m.publish(ctx, v))
+	pubErr = errors.Join(pubErr, m.publish(ctx, v))
+	return errors.Join(stateErr, pubErr, m.settleSnapshot(v))
+}
+
+// snapshotPending says a snapshot has been asked for and not yet answered. The request
+// keeps arriving until the Control Plane has seen the answer, so "asked for" alone would
+// re-seal the tip every cycle for as long as the report took to land.
+func (v *volume) snapshotPending() bool {
+	return v.wantSnapshot != "" && v.wantSnapshot != v.snapshotID
+}
+
+// settleSnapshot answers a snapshot request, once the published history contains
+// everything the volume held when the request arrived.
+//
+// A snapshot is a *name for a commit*, so answering it is naming one — there is nothing
+// to copy and nothing to write. That is the whole of what makes it durable: a commit id
+// exists only after `Commit() → SUCCESS`, which promises the state is reconstructible
+// without this host, so a snapshot that is reported at all is one that can be restored.
+// The v5 answer was the opposite — a manifest the host wrote, which could name data that
+// was not there.
+//
+// It runs at the end of the cycle, after the second publish, because that is the first
+// moment the layer this snapshot needs can be in the history. A pending layer means the
+// commit has not landed: nothing is reported, the request arrives again, and the next
+// cycle answers.
+func (m *Manager) settleSnapshot(v *volume) error {
+	if !v.snapshotPending() || v.chain == nil {
+		return nil
+	}
+	// Answered, not waited on, when this host has nowhere to publish. Without this the
+	// request is a loop with no exit: nothing can ever land, so the answer never comes,
+	// so the Control Plane keeps asking — and the rotation arm, which fires on the
+	// request alone, seals the tip *every cycle*. An Agent with no object store would
+	// grind a volume into one layer per cycle for as long as the snapshot was wanted.
+	if m.pub == nil {
+		v.snapshotID, v.snapshotCommit = v.wantSnapshot, ""
+		v.snapshotErr = "this host has no object store, so it cannot publish a commit for a snapshot to name"
+		slog.Warn("cannot take a snapshot: this host has no object store",
+			"volume_id", v.id, "snapshot_id", v.wantSnapshot)
+		return nil
+	}
+	if v.pending != nil {
+		return nil
+	}
+	st, err := ReadState(m.paths, m.cfg.Root, v.id)
+	if err != nil {
+		return fmt.Errorf("volume %s: %w", v.id, err)
+	}
+	if len(st.Commits) == 0 {
+		// Sealed and not published yet. Saying nothing is what lets a later cycle answer;
+		// the failure §19 has is a snapshot left CREATING for ever, and that is now only
+		// reachable through a publish that keeps failing, which is loud on its own.
+		return nil
+	}
+	// The newest commit, and it is the right one because maybeRotate has already sealed
+	// the tip for this request — unconditionally, with no size floor — and this runs after
+	// the publish that lands it. Take that floor away and the end of the history is
+	// whatever some other trigger sealed, which can be a rotation that began before the
+	// request arrived: a real point in the volume's history, missing everything the guest
+	// wrote since, reported as the snapshot. demo:stage5 caught exactly that, answering
+	// one second after the request.
+	head := st.Commits[len(st.Commits)-1]
+	v.snapshotID, v.snapshotCommit, v.snapshotErr = v.wantSnapshot, head.CommitID, ""
+	slog.Info("snapshot taken: it names the commit carrying the layer sealed for it",
+		"volume_id", v.id, "snapshot_id", v.wantSnapshot,
+		"commit_id", head.CommitID, "layer", head.LayerID)
+	return nil
 }
 
 // publish sends this volume's sealed layer to the object store, if it owes one.
@@ -882,7 +960,11 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	if v.pending != nil {
 		return nil
 	}
-	if m.cfg.RotateAtBytes <= 0 && v.rpo <= 0 {
+	// A snapshot request is a third trigger and the only one that is *asked* for. It
+	// fires whatever the thresholds are, including on a host that rotates nothing —
+	// which is the ordinary configuration, so leaving it out would make a snapshot a
+	// thing that only works when something else is already configured.
+	if m.cfg.RotateAtBytes <= 0 && v.rpo <= 0 && !v.snapshotPending() {
 		return nil
 	}
 	size, err := m.paths.Size(v.chain.Active)
@@ -899,6 +981,28 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 		// can now come back from.
 		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
 			fmt.Errorf("this volume's tip %s cannot be stat'd, so its layers were removed under it; a guest holding the open file goes on writing bytes nothing here can name: %w", v.chain.Active, err))
+	}
+	// The snapshot arm, first because it is the one a human asked for. The order is
+	// presentation and not correctness — every arm calls the same rotate on the same tip,
+	// and a plant that moved this below the size arm turned nothing red, which is what
+	// that looks like from the outside.
+	//
+	// What *is* load-bearing is that it has no size condition at all, which is the
+	// difference between the triggers
+	// that fire on their own and the one a human asks for. The other two decline to seal
+	// a tip under minRotateAtBytes, because a fresh qcow2 is already ~193 KiB of header
+	// and tables and "larger than zero" would commit an idle volume for ever. Applying
+	// that here would mean a snapshot taken after the guest wrote half a megabyte
+	// silently names the commit *before* those writes — a point in the history that is
+	// real, that is not the one that was asked for, and that nothing reports as
+	// different. §11's "an idle volume does not commit" is about the automatic triggers;
+	// an operator asking is not idleness, and being wrong the other way costs one small
+	// layer.
+	if v.snapshotPending() {
+		slog.Info("sealing the tip for a snapshot: everything written before the request has to be in the history it names",
+			"volume_id", v.id, "snapshot_id", v.wantSnapshot,
+			"layer", LayerIDOfImage(v.chain.Active), "tip_bytes", size)
+		return m.rotate(ctx, v, size)
 	}
 	if m.cfg.RotateAtBytes > 0 && size >= m.cfg.RotateAtBytes {
 		return m.rotate(ctx, v, size)
@@ -1245,9 +1349,12 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 	out := make([]agent.VolumeStatus, 0, len(m.vols))
 	for _, v := range m.vols {
 		out = append(out, agent.VolumeStatus{
-			VolumeID: v.id,
-			Epoch:    v.epoch,
-			Refusal:  v.refusal,
+			VolumeID:         v.id,
+			Epoch:            v.epoch,
+			SnapshotID:       v.snapshotID,
+			SnapshotCommitID: v.snapshotCommit,
+			SnapshotError:    v.snapshotErr,
+			Refusal:          v.refusal,
 			// Empty when there is no refusal, which is what the wire's healthy value is.
 			RefusalDetail: v.detail,
 		})

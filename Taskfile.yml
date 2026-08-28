@@ -499,6 +499,15 @@ tasks:
     cmds:
       - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage3-demo.sh
 
+  demo:stage5:
+    desc: >-
+      Stage 5 end to end: an operator asks for a snapshot while a guest is writing, the
+      Agent seals the tip because it was asked, and the catalog names a commit the bucket
+      holds.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage5-demo.sh
+
   soak:
     desc: >-
       Run everything, over and over, until something breaks — the DST set across hundreds

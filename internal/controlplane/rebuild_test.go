@@ -43,7 +43,7 @@ func bucketWithAVolumeAndASnapshot(t *testing.T, md metadata.Store, store object
 
 	snap = ids.New().String()
 	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snap, VolumeID: v.VolumeID, Epoch: 1, TargetSequence: 9,
+		SnapshotID: snap, VolumeID: v.VolumeID, Epoch: 1,
 		State: lifecycle.SnapshotPublished, RequestID: ids.New().String(),
 	}); err != nil {
 		t.Fatal(err)

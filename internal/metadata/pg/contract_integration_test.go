@@ -84,15 +84,15 @@ func TestPGMalformedIDsAreRejected(t *testing.T) {
 		}},
 		{"CreateSnapshot source host", func() error {
 			return store.CreateSnapshot(ctx, term, metadata.Snapshot{
-				SnapshotID: ids.New().String(), VolumeID: volID, Epoch: 1, TargetSequence: 1,
-				RootDigest: "d", SourceHostID: truncated, State: lifecycle.SnapshotCreating,
+				SnapshotID: ids.New().String(), VolumeID: volID, Epoch: 1,
+				SourceHostID: truncated, State: lifecycle.SnapshotCreating,
 				RequestID: ids.New().String(),
 			})
 		}},
 		{"CreateSnapshot parent snapshot", func() error {
 			return store.CreateSnapshot(ctx, term, metadata.Snapshot{
 				SnapshotID: ids.New().String(), VolumeID: volID, ParentSnapshotID: truncated,
-				Epoch: 1, TargetSequence: 1, RootDigest: "d", State: lifecycle.SnapshotCreating,
+				Epoch: 1, State: lifecycle.SnapshotCreating,
 				RequestID: ids.New().String(),
 			})
 		}},
@@ -197,7 +197,7 @@ func TestPGSnapshotStateGuardIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: volID, Epoch: 1, TargetSequence: 1, RootDigest: "d",
+		SnapshotID: snapID, VolumeID: volID, Epoch: 1,
 		State: lifecycle.SnapshotCreating, RequestID: ids.New().String(),
 	}); err != nil {
 		t.Fatal(err)
@@ -205,7 +205,8 @@ func TestPGSnapshotStateGuardIsAtomic(t *testing.T) {
 
 	// The publication lands under the caller, between its read and its write.
 	if _, err := pool.Exec(ctx,
-		`UPDATE snapshots SET state='PUBLISHED' WHERE snapshot_id=$1`, snapID); err != nil {
+		`UPDATE snapshots SET state='PUBLISHED', commit_id=$2 WHERE snapshot_id=$1`,
+		snapID, ids.New().String()); err != nil {
 		t.Fatal(err)
 	}
 	if err := setter.SetSnapshotState(ctx, term, snapID, lifecycle.SnapshotFailed); !errors.Is(err, lifecycle.ErrInvalidTransition) {

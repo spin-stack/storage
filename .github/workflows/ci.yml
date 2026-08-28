@@ -224,6 +224,9 @@ jobs:
       - name: Stage 4 — the host is destroyed and the volume comes back
         run: task demo:stage4
 
+      - name: Stage 5 — a snapshot is a name for a commit
+        run: task demo:stage5
+
   # The gate. This is the check to require on the branch, and the only job here whose
   # green means what a reader assumes it means.
   #

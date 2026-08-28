@@ -46,7 +46,7 @@ func RequestSnapshot(ctx context.Context, md metadata.Store, term int64, volumeI
 		ParentSnapshotID: v.ParentSnapshotID,
 		State:            lifecycle.SnapshotCreating,
 		RequestID:        requestID,
-		// TargetSequence, SourceHostID and ManifestKey are deliberately empty: they are
+		// CommitID and SourceHostID are deliberately empty: they are
 		// facts only the host that takes the snapshot can know, and guessing them here
 		// would put a number in the catalog that no copy corresponds to. PublishSnapshot
 		// stamps them from the Agent's report.

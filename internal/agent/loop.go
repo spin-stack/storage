@@ -592,7 +592,7 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			DurableSequence:   v.DurableSequence,
 			PublishedSequence: v.PublishedSequence,
 			SnapshotId:        v.SnapshotID,
-			SnapshotSequence:  v.SnapshotSequence,
+			SnapshotCommitId:  v.SnapshotCommitID,
 			SnapshotError:     v.SnapshotError,
 			// The one field here that is not a measurement: this host saying it is not
 			// serving the volume, and why. Unset is it saying it is, so a healthy cycle

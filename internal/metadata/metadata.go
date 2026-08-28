@@ -331,12 +331,15 @@ type Snapshot struct {
 	VolumeID         string
 	ParentSnapshotID string
 	Epoch            int64
-	TargetSequence   int64
-	RootDigest       string
-	SourceHostID     string
-	State            lifecycle.SnapshotState
-	ManifestKey      string
-	RequestID        string
+	// CommitID is the commit this snapshot names, empty until a host has reported one.
+	// A snapshot under v6 is a name for a point in the published history and not a copy
+	// of anything, so this is the whole of what it points at: the manifest's key is
+	// derived from it (commit.ManifestKey), which is why there is no key column to
+	// disagree with the bucket.
+	CommitID     string
+	SourceHostID string
+	State        lifecycle.SnapshotState
+	RequestID    string
 }
 
 // Store is the Control Plane metadata authority. Every implementation answers the
@@ -688,14 +691,18 @@ type Store interface {
 	// ask for PUBLISHED — a fleet-wide unbounded scan of the largest table here, which
 	// is a listing API, not an incident read.
 	ListUnfinishedSnapshots(ctx context.Context) ([]Snapshot, error)
-	// PublishSnapshot moves CREATING → PUBLISHED, recording the three facts only the
-	// host that took it knows: the §19 sequence the copy was frozen at, the manifest
-	// it wrote, and which host did it (term-guarded).
+	// PublishSnapshot moves CREATING → PUBLISHED, recording the two facts only the host
+	// that took it knows: the commit its history is named by, and which host reported it
+	// (term-guarded).
 	//
-	// Reporting the same publication twice is a no-op, because the Agent keeps
-	// reporting until the request stops arriving. Reporting a *different* sequence at
-	// a published id is refused: INV-16.
-	PublishSnapshot(ctx context.Context, term int64, snapshotID string, targetSequence int64, sourceHostID, manifestKey string) error
+	// The manifest key is not among them and must not be. It is derived from the commit
+	// id, so a catalog and a bucket cannot disagree about where a snapshot lives — which
+	// is exactly what a key believed from the Agent allowed, and why the column is gone.
+	//
+	// Reporting the same publication twice is a no-op, because the Agent keeps reporting
+	// until the request stops arriving. Reporting a *different* commit at a published id
+	// is refused: INV-16.
+	PublishSnapshot(ctx context.Context, term int64, snapshotID, commitID, sourceHostID string) error
 	// SetSnapshotState moves a snapshot through the §19 lifecycle (term-guarded,
 	// transition-guarded in the write). Without it a snapshot whose publication
 	// crashed stays CREATING for ever: PublishSnapshot is the only other way out of
