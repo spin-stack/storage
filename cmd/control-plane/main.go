@@ -370,7 +370,7 @@ func run() error {
 			}
 			// host_state, because a named host is honoured without an admission check
 			// (controlplane.Place says why) and an operator must see that in the line that
-			// says it worked. epoch, because it is the WAL directory the host will open and
+			// says it worked. epoch, because it is the fencing token the host will hold and
 			// the proof this attach is not resuming a session from before the volume moved.
 			slog.Info("volume placed", "volume_id", *attachVolume,
 				"host_id", placed.Host.HostID, "host_state", placed.Host.State,

@@ -30,13 +30,12 @@ type RebuildSummary struct {
 // records one — so a rebuilt catalog describes volumes nobody is serving, and an operator
 // re-places them.
 //
-// A rebuilt volume also comes back with zeroed sequences and no parent link. The objects
-// those were read out of (the chunked image's manifests) are withdrawn, and inventing the
-// numbers is the one thing a rebuild must not do: `published_sequence` and
-// `durable_sequence` are the two floors an Agent checks at attach, so a rebuild that
-// guesses high refuses to serve a volume that is fine and one that guesses low hands a
-// guest a blank device for a volume it has written into. A clone's data is untouched — the
-// link is a catalog fact, and the descriptor still carries the parent id.
+// A rebuilt volume comes back with nothing said about how far behind the object store it
+// is: that is an observation a host makes, no object in the bucket holds it, and a zero
+// would render as a volume perfectly up to date on a fleet that has just lost its catalog.
+// What the rebuild *can* take from the bucket it does — `head_commit_id` comes from HEAD,
+// so the blank-disk refusal is armed the moment the catalog returns. A clone's data is
+// untouched: the link is a catalog fact and the descriptor still carries the parent id.
 //
 // Every descriptor's wrapped DEK is unwrapped before its volume is recorded, and a failure
 // stops the whole rebuild (see checkKey). That makes `-rebuild-metadata` require

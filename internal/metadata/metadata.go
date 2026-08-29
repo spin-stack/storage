@@ -135,10 +135,11 @@ type VolumeReport struct {
 // the same sentinel, rather than one of them surfacing an integrity error no caller can
 // branch on.
 //
-// Zero is the whole rule. It is not "unset" — on the WAL path KeyID 0 means *this
-// record is plaintext* (§14.1), so a volume row carrying 0 describes a key the Agent
-// must refuse at attach (wal.ErrUnversionedKey), after the KMS call, with the DEK
-// already in memory. Refusing it at the write refuses it while it can still be fixed.
+// Zero is the whole rule, and it is not "unset": a key with no version is a key rotation
+// cannot work with, because re-keying new data without re-encrypting history needs every
+// sealed object to say which key sealed it. crypto.NewEncryption refuses it
+// (crypto.ErrUnversionedKey) at the binding, after the KMS call, with the DEK already in
+// memory. Refusing it at the write refuses it while it can still be fixed.
 func CheckDEKKeyID(keyID uint32) error {
 	if keyID == 0 {
 		return fmt.Errorf("%w: 0 is the plaintext marker, not a DEK version (§15.1)", ErrUnversionedDEK)
@@ -186,9 +187,9 @@ type Host struct {
 	NVMeUsedBytes    int64
 	// RemoteBacklogBytes is a byte count the host reports about itself (ADR-0013 §1). Every
 	// Agent reports 0 and the column holds 0 fleet-wide, and what replaced it is per volume:
-	// Volume.Progress.UnpublishedLocalBytes, which a host measures against a chain that
-	// exists rather than against a WAL that does not. Nothing branches on it; removing it is
-	// a change to the wire and the schema, which is why it is written down.
+	// Volume.Progress.UnpublishedLocalBytes, which a host measures against the chain it
+	// holds. Nothing branches on it; removing it is a change to the wire and the schema,
+	// which is why it is written down rather than done in passing.
 	RemoteBacklogBytes int64
 	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by the store
 	// on every read and never stored anywhere (ADR-0017):
@@ -218,7 +219,7 @@ type HostLease struct {
 // operations that read the fleet before either reserved anything pick the same destination
 // and both proceed. A bound is a bound only when the statement that places the bytes
 // evaluates it. The second half is the ADR-0013 gap — promises are not what fills a
-// device, and under ADR-0026 a session's WAL stays local with no reservation covering it.
+// device, and under ADR-0026 what a session writes stays local with no reservation for it.
 // Both are the same decision, taken once by placement.Policy.Bound.
 //
 // A write with no bound is not a placement decision (rebuild-metadata recreating volumes
@@ -245,7 +246,7 @@ type CapacityBound struct {
 	UsedLimit int64
 }
 
-// Volume is the durable-volume record (§8). Watermarks are informative (§5.8).
+// Volume is the durable-volume record (§8).
 type Volume struct {
 	VolumeID  string
 	SizeBytes int64
@@ -272,11 +273,10 @@ type Volume struct {
 	ParentVolumeID string
 	DEKWrapped     []byte
 	KEKID          string
-	// DEKKeyID is the DEK's own version — RecordHeader.KeyID (§15.1), the field that
-	// lets rotation re-key new data without re-encrypting history. It travels with
-	// DEKWrapped because a wrapped key and another key's version describe a volume
-	// nothing can open. Zero is not a version: it is the WAL's plaintext marker, and
-	// wal.NewEncryption refuses it.
+	// DEKKeyID is the DEK's own version (§10): the field that lets rotation re-key new
+	// data without re-encrypting history. It travels with DEKWrapped because a wrapped key
+	// and another key's version describe a volume nothing can open. Zero is refused, and
+	// CheckDEKKeyID says why.
 	DEKKeyID uint32
 	// HeadCommitID is the newest commit a host has reported publishing for this volume,
 	// empty for one that has never published.
@@ -454,10 +454,10 @@ type Store interface {
 	// primary_host_id, naming an owner that never won the S3 epoch object and never
 	// got a lease.
 	//
-	// controlplane.Place is what calls it: every attach grants an epoch the volume has
-	// never been served under, so a host that gets the volume back cannot resume the WAL
-	// directory its previous session left behind. It does not write the §7 state, which
-	// is why Place follows it with SetVolumePrimaryHost rather than using it alone.
+	// controlplane.Place is what calls it, and says why: every attach grants an epoch the
+	// volume has never been served under, so a host that gets the volume back cannot mistake
+	// the chain its previous session left behind for one it still owns. It does not write
+	// the §7 state, which is why Place follows it with SetVolumePrimaryHost.
 	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
 	// SetVolumePrimaryHost places a volume on a host, or clears its placement when
 	// primaryHostID is empty (term-guarded). It writes the §7 state that goes with the
@@ -477,7 +477,8 @@ type Store interface {
 	//     against the reporting host *before* the epoch, so a cleared volume answers
 	//     NOT_PRIMARY, and "" can never be a reporting host (the RPC refuses it);
 	//   - an Agent restart must keep its epoch: it is not a placement, so the desired state
-	//     repeats the epoch and the Agent re-attaches to its own WAL (ADR-0024).
+	//     repeats the epoch and the Agent re-attaches to the chain it already holds
+	//     (ADR-0024).
 	//
 	// Re-writing the placement a volume already has is a no-op, not an error.
 	SetVolumePrimaryHost(ctx context.Context, term int64, volumeID, primaryHostID string) error

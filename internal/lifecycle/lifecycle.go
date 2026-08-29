@@ -277,12 +277,12 @@ func (r CordonReason) OverwritableNames() []string { return names(cordonOverwrit
 // the data path's fail-closed decisions at attach.
 //
 // A closed vocabulary and not a free string: the string that would actually be stored is
-// `err.Error()`, which embeds a volume id and a sequence number, so no two rows compare
-// equal, the -fleet-status column becomes a vocabulary nobody controls, and the first alert
-// written on it matches a substring. Every value here is a decision at a named line in
-// internal/agent, so extending the vocabulary is the same commit. The sentence an operator
-// needs — which sequence, which key — rides alongside as free text nothing branches on
-// (metadata.Volume.RefusalDetail).
+// `err.Error()`, which embeds a volume id and a path, so no two rows compare equal, the
+// -fleet-status column becomes a vocabulary nobody controls, and the first alert written on
+// it matches a substring. Every value here is a decision at a named line in internal/agent
+// or internal/qcow, so extending the vocabulary is the same commit. The sentence an operator
+// needs — which layer, which key — rides alongside as free text nothing branches on
+// (metadata.VolumeProgress.RefusalDetail).
 //
 // RefusalNone is the zero value and means "this host is serving the volume", which is what
 // makes the field self-clearing: every accepted report writes it.
@@ -292,14 +292,15 @@ type Refusal string
 // a host saying it is serving the volume.
 const (
 	RefusalNone Refusal = ""
-	// RefusalImageMissing: the catalog says the volume published an image and the
-	// object store holds none (agent.ErrImageMissing).
+	// RefusalImageMissing: the volume's layers are not where this host must find them —
+	// unlinked under a running guest, or a chain the object store cannot rebuild.
 	RefusalImageMissing Refusal = "IMAGE_MISSING"
-	// RefusalDurabilityLost: replay came back below the sequence the catalog last
-	// recorded as ACKed to a guest (agent.ErrDurabilityLost).
+	// RefusalDurabilityLost: the QEMU writing this volume reports the qcow2 corrupt flag,
+	// so nothing sealed from the chain can be published and the newest restorable point is
+	// the last commit.
 	RefusalDurabilityLost Refusal = "DURABILITY_LOST"
-	// RefusalNoReadView: the read view never resolved, so every read fails and the
-	// session will not be published (agent.ErrNoReadView, wal.ErrBaseUnavailable).
+	// RefusalNoReadView: the chain never resolved end to end, so the volume cannot be
+	// opened and nothing sealed from it will be published.
 	RefusalNoReadView Refusal = "NO_READ_VIEW"
 	// RefusalNoKey: the catalog says the volume is encrypted and this Agent holds no
 	// KEK, or holds the wrong one (agent.ErrNoKEK).
@@ -308,9 +309,9 @@ const (
 	// it gave the device up rather than keep answering for a volume it can no longer
 	// confirm it owns.
 	RefusalLeaseLost Refusal = "LEASE_LOST"
-	// RefusalAttachFailed: everything else that stopped the runtime from starting — a
-	// socket that could not be bound, a WAL that would not resume, the host's own
-	// -max-volumes ceiling. It is a catch-all on purpose: without one, a refusal with
+	// RefusalAttachFailed: everything else that stopped the volume from being served — a
+	// QMP socket that would not answer, a qemu-img run that failed, an image QEMU has open
+	// that nothing here accounts for. It is a catch-all on purpose: without one, a refusal with
 	// no enum value of its own would be invisible again, which is the whole failure
 	// this vocabulary exists to close.
 	RefusalAttachFailed Refusal = "ATTACH_FAILED"

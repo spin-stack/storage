@@ -34,32 +34,16 @@
 # Format is the allowlist's: `<symbol>  # who owns the decision, and what the decision is`.
 # The reason is mandatory here too — an entry with none fails the check that reads it.
 
-# --- internal/simio/real's network: a transport nothing transports over -------------------
-# A complete TCP implementation of the simio network interface — listen, dial, framed
-# send/recv — reachable from no binary, because the wire between the Agent and the Control
-# Plane is Connect over HTTP (ADR-0018) and neither binary opens a socket through simio.
-# Its only callers are internal/simio/network's contract test and the DST harness's
-# simulated counterpart. This is the CloneCrossHost shape — well-tested code doing real
-# work that nothing asks for — and the decision (delete it, or give the contract test a
-# home that does not ship a transport) belongs to whoever owns internal/simio/real.
-
-# --- the lease verb nothing performs -----------------------------------------------------
-# Revoke drops the lease and bumps the generation so an in-flight grant response cannot
-# revive it (§12.2). Nothing performs it: ADR-0026 removed the fence and the lease-gated
-# ACK, so the two events that revoked a lease no longer exist. It is not in the allowlist
-# because it is not a test affordance — it is a production verb waiting for the one caller
-# V1 still lacks. The decision travels with detach.
-
-# --- the two the demolition of the local block engine left standing (2026-08-22) ---------
+# THE LIST IS EMPTY, and every entry it used to carry was settled rather than forgotten:
 #
-# These are not the CloneCrossHost shape and it matters that the difference is written
-# down, because the entries above them are. Nothing here was written for a caller that
-# never arrived: each had a production caller last week, in code this commit deleted, and
-# each was kept deliberately by the owner of the pivot rather than by whoever was passing.
-# They are here rather than in the allowlist because the allowlist means "unreachable, and
-# that is correct **forever**", and neither of these is: both are owed a caller by the next
-# two increments, and if that caller does not arrive they are owed a deletion instead.
+#   - the simio TCP transport nothing dialled was deleted (2026-08-09), and what is left is
+#     the interface and its contract test, which the allowlist covers with that reason;
+#   - lease.Manager.Revoke found its caller — agent.Loop.giveUpWhatIsNoLongerOurs revokes
+#     before it gives volumes up, so an in-flight heartbeat answer cannot re-arm the lease
+#     behind the teardown (§12.2);
+#   - the two symbols the local block engine's demolition left standing were taken up by
+#     the qcow2 manager and the commit protocol.
 #
-# Owner for both: whoever builds the qcow2 volume manager (Stage 1) and the commit
-# protocol (Stage 2).
-
+# An entry here is a symbol with no caller that is owed one, with an owner and a deadline —
+# as opposed to the allowlist, which means "unreachable, and that is correct forever".
+# Nothing is owed today.

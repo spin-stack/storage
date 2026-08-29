@@ -80,10 +80,11 @@ func NewProvisioner(md metadata.Store, store objectstore.Store, kms KeyWrapper, 
 // descriptor under a volume id no row mentions: invisible to every query, and a root a
 // reachability sweep would walk from forever.
 //
-// Epoch **1**, not 0: epoch 0 is the absence of an epoch and a writer cannot address a WAL
-// namespace under it. Creating a volume does not grant a fresh epoch and does not need to —
-// a fresh v7 id has no WAL directory on any host at any epoch — and the 1 written here is
-// the same 1 the descriptor carries, which is what -rebuild-metadata restores the row from.
+// Epoch **1**, not 0: epoch 0 is the absence of an epoch, and every comparison a host makes
+// about a volume is against the epoch it holds — a zero would read as "no grant" wherever it
+// travelled. Creating a volume does not grant a fresh epoch and does not need to (a fresh v7
+// id has no chain on any host), and the 1 written here is the same 1 the descriptor carries,
+// which is what -rebuild-metadata restores the row from.
 func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec) (ProvisionedVolume, error) {
 	if err := spec.validate(); err != nil {
 		return ProvisionedVolume{}, err
@@ -94,9 +95,9 @@ func (p *Provisioner) Provision(ctx context.Context, term int64, spec VolumeSpec
 	u := ids.New()
 	volumeID := u.String()
 
-	// KeyID 1 is the first version. Zero is reserved: a WAL record header carrying
-	// KeyID 0 means "this payload is plaintext" (§15.2), so a volume provisioned with
-	// it would announce ciphertext as clear text.
+	// KeyID 1 is the first version. Zero is not a version at all — metadata.CheckDEKKeyID
+	// says why, and crypto.NewEncryption refuses it at the binding — so a volume
+	// provisioned with it could never be re-keyed.
 	dek, err := crypto.GenerateDEK(p.rand, 1)
 	if err != nil {
 		return ProvisionedVolume{}, fmt.Errorf("generating the volume DEK: %w", err)

@@ -39,7 +39,7 @@ const layerAADVersion = 1
 //
 // # The nonce is derived, and here that is safe
 //
-// Unlike the chunks SealRandom exists for, a layer has a unique number: a v7 UUID minted
+// A layer has a unique number to derive from: a v7 UUID minted
 // at the rotation that created the file, which is complete and read-only from that
 // moment, and Chain.Rotate refuses an id that already exists. Deriving rather than
 // drawing buys the property the retry story rests on — sealing the same layer twice
@@ -160,9 +160,8 @@ func readFull(r io.Reader, buf []byte) (int, error) {
 	}
 }
 
-// layerNonce is the deterministic nonce for one frame. Same construction as deriveNonce,
-// with the layer's identity in place of (epoch, sequence) and its own domain-separation
-// tag so the two can never collide.
+// layerNonce is the deterministic nonce for one frame: the layer's identity, the frame
+// index, and its own domain-separation tag so it can never collide with deriveNonce's.
 //
 // The frame size is part of it — see SealLayer.
 func layerNonce(volumeID, layerID [16]byte, frameBytes int, idx uint64) []byte {

@@ -296,8 +296,8 @@ func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus
 	// Reported, not only logged. This is the one teardown nothing outside the process
 	// knows about: the Control Plane still names this host the volume's primary at this
 	// epoch, so nothing has moved and nothing will until somebody looks. The report is
-	// refused on the same host-and-epoch predicate the watermarks are, so if the fleet
-	// *has* moved on, this says nothing rather than something wrong.
+	// refused on the same host-and-epoch predicate every report is, so if the fleet *has*
+	// moved on, this says nothing rather than something wrong.
 	if err := reconcile.Fence(ctx, volumeIDs,
 		storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST,
 		fmt.Sprintf("agent: this host's lease (%s) expired and the object store records a higher epoch for these volumes, so another host has been granted them; it will not serve them again until the control plane grants a higher epoch here", ttl),

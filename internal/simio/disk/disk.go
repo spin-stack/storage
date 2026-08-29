@@ -1,7 +1,10 @@
-// Package disk is the simulable durable-storage interface (§25.1, INV-01). It
-// models the properties the WAL depends on: append, read, durable sync
-// (fdatasync-level), truncate, and a crash model where data written but not
-// synced may be lost. Production code depends on Disk/File, never on os directly.
+// Package disk is the simulable durable-storage interface (§25.1, INV-01). It models the
+// properties this Agent's own records depend on: append, read, durable sync
+// (fdatasync-level), truncate, and a crash model where data written but not synced may be
+// lost. Production code depends on Disk/File, never on os directly.
+//
+// The guest's data path is not here: QEMU writes the qcow2 chain itself (v6), and what this
+// models is the state.json, the pointer and the lock that say what that chain is.
 package disk
 
 import (
@@ -14,10 +17,10 @@ var ErrNotExist = errors.New("simio/disk: file does not exist")
 
 // ErrNoSpace means the device backing the file has no room left: the real disk's ENOSPC
 // and the simulator's injected equivalent, wrapped so callers can tell them apart with
-// errors.Is. It lives here because the WAL must distinguish a full device — sticky until
+// errors.Is. It lives here because a caller must distinguish a full device — sticky until
 // somebody gives room back — from a transient error, and may import neither syscall
-// (denied outside simio) nor the simulator; without the sentinel the only portable test
-// is a comparison on the error's message, in the durability path.
+// (denied outside simio) nor the simulator; without the sentinel the only portable test is
+// a comparison on the error's message, in the path that records what a host holds.
 var ErrNoSpace = errors.New("simio/disk: no space left on device")
 
 // ErrLocked means another live process holds the lock. It is not a transient

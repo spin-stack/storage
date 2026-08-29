@@ -68,8 +68,8 @@ func (p Policy) maxUsedRatio() float64 {
 // `used + sizeBytes <= UsedLimit` would assume a volume occupies its declared size the
 // moment it is placed, which is the assumption oversubscription exists to deny, and a
 // single `max(committed, used)` ceiling would subsume MaxOversubscription. The catalog
-// cannot predict what a volume adds physically anyway — under ADR-0026 a session's whole
-// WAL stays on the device until the volume stops — so what is knowable is what is already
+// cannot predict what a volume adds physically anyway — a guest's writes stay on the
+// device until a commit takes them — so what is knowable is what is already
 // there, including other tenants of that filesystem (agent.DiskUsage), which no
 // truncation of ours frees.
 //

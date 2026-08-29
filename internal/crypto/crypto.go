@@ -2,10 +2,10 @@
 // that leaves the host is AES-256-GCM sealed with the volume's DEK before it is PUT; the
 // DEK is wrapped by a KEK held in a KMS.
 //
-// The payload nonce is derived deterministically from (volume_id, epoch, sequence) and
-// never stored (§15.2); sequence is strictly monotonic per (volume, epoch), so no nonce is
-// reused within an epoch. Only DEK generation and DEK wrapping consume randomness, and
-// both take an injected io.Reader.
+// A layer's frame nonces are derived deterministically from the layer's own identity and
+// the frame index (§10, layerNonce) and never stored — a layer id is minted once, so no
+// nonce is reused. Only DEK generation and DEK wrapping consume randomness, and both take
+// an injected io.Reader.
 package crypto
 
 import (
@@ -106,46 +106,6 @@ func (d DEK) Open(volumeID [16]byte, epoch, seq uint64, ciphertext []byte, tag [
 	sealed = append(sealed, ciphertext...)
 	sealed = append(sealed, tag[:]...)
 	pt, err := g.Open(nil, nonce[:], sealed, aad(volumeID, epoch, seq))
-	if err != nil {
-		return nil, ErrOpen
-	}
-	return pt, nil
-}
-
-// SealRandom encrypts plaintext under a freshly drawn nonce and returns the nonce with
-// it. It is for payloads that have no monotonic sequence to derive one from.
-//
-// The WAL derives its nonce from (volume, epoch, sequence) and never stores it, which is
-// sound because sequence is strictly monotonic per (volume, epoch) — there is no way for
-// two different records to share one. An image chunk has no such number. The obvious
-// substitutes are all unsafe: a generation counter is written *before* the compare-and-set
-// that decides which writer wins, so two hosts at the same generation with different
-// content would seal different plaintexts under one nonce, which is the catastrophic case
-// for GCM. Deriving it from the plaintext would be unique per content but makes the nonce
-// a function of the secret.
-//
-// So the nonce is drawn, and it travels with the ciphertext. The caller must store it —
-// there is nothing to re-derive it from, and that is the point.
-func (d DEK) SealRandom(r io.Reader, aad, plaintext []byte) (nonce [NonceSize]byte, sealed []byte, err error) {
-	if _, err := io.ReadFull(r, nonce[:]); err != nil {
-		return nonce, nil, fmt.Errorf("crypto: drawing a nonce: %w", err)
-	}
-	g, err := d.gcm()
-	if err != nil {
-		return nonce, nil, err
-	}
-	return nonce, g.Seal(nil, nonce[:], plaintext, aad), nil
-}
-
-// OpenRandom is SealRandom's inverse: it opens a payload whose nonce was stored beside
-// it. It fails closed on any tamper (ErrOpen) and never returns partially-authenticated
-// plaintext.
-func (d DEK) OpenRandom(nonce [NonceSize]byte, aad, sealed []byte) ([]byte, error) {
-	g, err := d.gcm()
-	if err != nil {
-		return nil, err
-	}
-	pt, err := g.Open(nil, nonce[:], sealed, aad)
 	if err != nil {
 		return nil, ErrOpen
 	}

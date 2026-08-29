@@ -51,8 +51,8 @@ var ErrCorrupt = errors.New("framed: contents do not match the stored digest")
 // first deployment, because adding a required field to objects already in a bucket is not
 // a change you can make. Concretely: `json.Unmarshal` silently discards fields it does not
 // know, so without a version an Agent meeting a newer manifest would drop them and serve
-// the volume anyway. The binary WAL formats already had this; the S3 objects, the only
-// ones that cross hosts, did not.
+// the volume anyway. The S3 objects are the ones that cross hosts, so they are the ones
+// that need it.
 const FormatVersion = 1
 
 // ErrFormatTooNew and ErrFormatTooOld are what a reader gets for an object of the wrong

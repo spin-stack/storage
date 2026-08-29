@@ -17,7 +17,7 @@ import (
 // that dies between this write and the Agent noticing loses nothing.
 //
 // The volume must be ACTIVE. Snapshotting one being fenced or promoted would freeze a view
-// whose writer may be taken away, at a sequence belonging to an epoch the fleet has left.
+// whose writer may be taken away, under an epoch the fleet has left.
 func RequestSnapshot(ctx context.Context, md metadata.Store, term int64, volumeID, snapshotID, requestID string) (metadata.Snapshot, error) {
 	v, err := md.GetVolume(ctx, volumeID)
 	if err != nil {
@@ -34,8 +34,8 @@ func RequestSnapshot(ctx context.Context, md metadata.Store, term int64, volumeI
 	snap := metadata.Snapshot{
 		SnapshotID: snapshotID,
 		VolumeID:   volumeID,
-		// The epoch the request is made under. The Agent reports the sequence it froze
-		// at, and a sequence means nothing without the epoch that numbered it (§12.3).
+		// The epoch the request is made under. The Agent reports the commit it named, and
+		// a commit from a writer the fleet moved past is not this volume's (§12.3).
 		Epoch: v.CurrentEpoch,
 		// The parent link: a snapshot of a clone descends from the clone's own parent
 		// snapshot, so a chain read from the catalog is the chain the objects form.

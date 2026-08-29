@@ -21,30 +21,10 @@
 # A pinned COUNT was rejected for the reason this repository has paid for twice: a number
 # can be satisfied by fixing one comment and writing another, with nobody seeing the swap.
 #
-# WHY THIS LIST LANDS FULL RATHER THAN EMPTY. Fixing these means editing twenty-five files
-# across every lane in the tree, and a gate that is red on the day it lands is a gate
-# somebody deletes — which is written down in the Taskfile as the reason `deadcode` stayed
-# out of every gate for two waves. So the debt is measured, pinned and printed on every
-# green run, and it can only shrink.
+# THE LIST IS EMPTY, and that is the state to keep it in. It landed full — twenty-five
+# files across every lane — and the last of them were corrected on 2026-08-29 in the same
+# commit that gave the vocabulary a term for `wal`, which is the mechanism it had no term
+# for and the one 34 production comments were still describing.
 #
-# Format: `<file>:<symbol>:<term>  # what the comment claims, and what the code does`.
-
-# --- the FLUSH/FUA ACK contract, which is a human-review zone -------------------------
-# Owner: whoever next touches the ACK path (integration/guestinit).
-# CLAUDE.md calls the ACK rule "the sentence a
-# guest's fsync rests on" and makes widening it a review-zone change; these comments have
-# already widened it in prose. They are the most expensive lines in this file and the ones
-# to fix first.
-
-# --- the operator's remedy for a full device, WHERE THIS CHECK CANNOT SEE IT -----------
-# No entry, and that is the point of leaving the note: blockdev.go's ENOSPC refusal
-# builds the withdrawn remedy into the latched reason and into the error a guest's
-# refusal is logged with — "truncate after a checkpoint, grow the device, or restore the
-# object store" — so an operator reads it outside the tree. Comments only match comment
-# text (hack/comment-rot.sh, rule 1), so those two literals are invisible here. The
-# comments around them, in internal/wal and internal/agent, were corrected on 2026-08-11
-# to the remedy that exists (grow the device, or stop volumes on it — each publishes its
-# image and gives that WAL back at its next start); correcting the literals is a
-# behaviour change with an assertion of its own to write, and it is still owed.
-
-# --- one straggler ----------------------------------------------------------------------
+# An entry here is a debt with an owner, written in the commit that incurs it. Nothing is
+# owed today.

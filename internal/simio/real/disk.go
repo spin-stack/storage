@@ -31,7 +31,7 @@ func NewDisk(dir string) (*Disk, error) {
 func (d *Disk) path(name string) string { return filepath.Join(d.root, filepath.FromSlash(name)) }
 
 // Create makes the file and then makes its *name* durable, which fdatasync does not: a
-// crash between the two loses the whole file, records the WAL already ACKed included.
+// crash between the two loses the whole file, everything already written to it included.
 // Every directory MkdirAll had to create is in the same position, so the sync walks from
 // the file's parent up to the shallowest directory that did not exist before — in the
 // steady state, one fsync of a cached directory inode.

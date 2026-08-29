@@ -2,7 +2,7 @@
 # Which production comments still describe a mechanism this tree withdrew — computed,
 # not remembered.
 #
-# A finding is a (symbol, term) pair — internal/wal/log.go:Log.Flush:remote. Rejected
+# A finding is a (symbol, term) pair — internal/qcow/chain.go:Open:checkpoint. Rejected
 # keys: file:line (moves on any edit above it), the whole file (collapses a file's eight
 # mentions into one decision), the line's text hashed (a reword fails the gate with a
 # message about a hash).
@@ -59,13 +59,18 @@ ROOTS=(./cmd/... ./integration/guestinit)
 #   - `lease`   — the lease is live; it is the ACK *gate* that went, so the term is
 #                 `lease-gated` and the sentences that are left are found through `remote`.
 #   - `materialize` — the package went; the verb did not. A clone still assembles its
-#                 ancestry, and blockdev's "materialized base image" is that, not the
-#                 deleted cross-host mover.
+#                 ancestry from layers this host already holds, which is that verb, not
+#                 the deleted cross-host mover.
 #   - `recovery`, `fencing wait`, `epoch`, `self-fence` — all still implemented. Only
 #                 §16's `SELF_FENCED` state itself is gone.
-#   - `INV-06`/`INV-07`/`INV-08`/`INV-13` — an invariant id is a different axis. INV-13's
-#                 truncation floor is still enforced by wal.StrictOrder, so the id is not
-#                 evidence of anything either way.
+#   - `INV-06`/`INV-07`/`INV-08`/`INV-13` — an invariant id is a different axis: an id says
+#                 nothing about whether the mechanism behind it is still implemented, so it
+#                 is not evidence either way.
+#   - `blockdev` — QEMU's own vocabulary and central to the live design: `-blockdev
+#                 node-name=` is one of the two launcher shapes this Agent supports and
+#                 `blockdev-snapshot-sync` is how every rotation happens. Only
+#                 internal/blockdev, the withdrawn package, is a mechanism, and a term that
+#                 fires on 23 live sentences is how a gate gets deleted.
 vocabulary() {
 	cat <<-'TERMS'
 		remote	remote	a FLUSH in remote mode	nvme_remote_backlog_bytes	the `remote` durability mode and the WAL→S3 chain behind it (ADR-0026 §1); V1 has one ACK contract and it is fdatasync
@@ -80,6 +85,9 @@ vocabulary() {
 		lease-valid	(in)?valid lease|lease is (still )?(in)?valid	the lease is still valid	the lease is validated on arrival	the same rule written the other way round — "a FLUSH is ACKed only while the lease is valid". The lease itself is live and decides who serves, so this term finds sentences, not the mechanism, and the live ones are in the allowlist.
 		self-fenced	self_fenced	§16 SELF_FENCED	self_fenced_at	the §16 state a log entered when a durable step found the lease invalid. Losing the lease still stops the device — that is live — but there is no such state to transition to.
 		14.4	§14\.4	the §14.4 ACK	§14.42	the six-step remote ACK chain (close the batch, fdatasync, upload, verify, advance, ACK). ADR-0026 keeps it in the design document as the V2 path and removed the code.
+		wal	wal	the WAL's counters	walkCommits	the write-ahead log itself. There is no internal/wal package and nothing appends records anywhere; QEMU owns the local format via qcow2 (v6). It is the largest mechanism this tree withdrew and the vocabulary had no term for it, so 34 production comments reasoned about it while this gate printed green.
+		watermark	watermarks?	the watermarks it advances	high_water_mark_bytes	the local/durable/published sequence triple the WAL produced. The three columns were deleted from volumes on 2026-08-29; nothing computes or stores one.
+		sequence	sequences?	up to sequence 512	sequenceDiagram	the WAL's per-record counter, which numbered writes and was what a FLUSH ACKed against. Every Agent reported zero for a year before the columns went; a commit id is what names a point in the history now.
 	TERMS
 }
 

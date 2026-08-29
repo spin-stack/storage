@@ -48,25 +48,26 @@ type Placement struct {
 // serving one volume.
 //
 // **An attach grants a fresh epoch, and that is what makes a returning host safe.** The
-// Agent's WAL lives at <data-dir>/wal/<volume-id>/<epoch>, so a volume that goes A -> B and
-// comes back to A at the epoch A already used opens A's *previous* session's directory and
-// lays those records over the image B published — older bytes on top of newer ones, no
-// error anywhere. What it costs, said out loud: a session whose teardown publish failed is
-// abandoned, its records left in the old epoch's directory for an operator to recover by
-// hand. Keeping the epoch is only correct when nobody else has served the volume since,
-// which is exactly what this code cannot know.
+// epoch is a fencing token (§13) and every local decision about a volume is taken against
+// the one this host holds: a fenced record is cleared only by a *higher* number, a
+// superseded host is recognised by the object store recording a higher one, and the local
+// chain a returning host still has is judged the same way. So a volume that goes A -> B and
+// comes back to A at the epoch A already used gives A no way to tell "granted again" from
+// "never lost it" — it resumes a chain that is now a fork of the published history, with
+// nothing in that comparison able to say so.
 //
 // Three placements deliberately do **not** move it:
 //
 //   - a re-run of the same attach, which has to stay the no-op the store made it or it
 //     tears down a running guest's device;
 //   - a detach, which grants the volume to nobody: burning a fencing token no host holds
-//     names the next attach's WAL root after a writer that never existed;
+//     raises the number every later comparison is made against for a writer that never
+//     existed;
 //   - an Agent restart, which is not a placement at all (ADR-0024): the row is untouched
-//     and the Agent re-attaches to its own WAL and republishes.
+//     and the Agent re-attaches at the epoch it already holds.
 //
-// Provisioning does not bump either: a fresh v7 id has no WAL directory on any host to
-// collide with.
+// Provisioning does not bump either: a fresh v7 id has no chain on any host to collide
+// with.
 func Place(ctx context.Context, md metadata.Store, store objectstore.Store, policy placement.Policy, term int64, volumeID, hostID string) (Placement, error) {
 	// The volume first: it is where the size the policy admits against comes from, and
 	// reading it means a mistyped volume id is ErrNotFound here rather than a placement
@@ -115,7 +116,7 @@ func Place(ctx context.Context, md metadata.Store, store objectstore.Store, poli
 
 	// Order: the epoch first, the §7 state second, and it is not interchangeable. The other
 	// order puts the volume in the host's desired state at the epoch it used before — the
-	// stale WAL root this grant exists to make unreachable — for as long as the second write
+	// stale local chain this grant exists to make unusable — for as long as the second write
 	// takes, and for ever if the process dies between them. This order's interruption leaves
 	// the volume placed at a fresh epoch and still DETACHED, which the operator fixes by
 	// re-running the attach.

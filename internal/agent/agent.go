@@ -47,7 +47,7 @@ type VolumeStatus struct {
 	// SnapshotID is the snapshot this host was asked to take and has finished acting
 	// on, empty while there is nothing to say — including while an upload is still in
 	// flight, because a half-taken snapshot is not a fact the catalog can hold. The
-	// two fields below are its outcome: a sequence, or an error.
+	// two fields below are its outcome: a commit, or an error.
 	SnapshotID string
 	// PublishStalled says this host tried to get this volume's sealed layer into the
 	// object store and could not. The volume is still being served; see the proto field.
@@ -79,14 +79,14 @@ type VolumeStatus struct {
 	// sentence behind it. Unset is this host saying it is serving.
 	//
 	// It is the one field here that is not a measurement. Without it a volume that fails
-	// closed keeps reporting the watermarks its last healthy session left behind, and one
-	// that never started reports nothing at all — and an absence is not a signal.
+	// closed reports the numbers its last healthy cycle left behind, and one that never
+	// started reports nothing at all — and an absence is not a signal.
 	//
 	// The proto's enum rather than a vocabulary of the Agent's own: the Agent is the only
 	// thing that produces it, and a third spelling would be a mapping that can be wrong.
 	Refusal storagev1.VolumeRefusal
-	// RefusalDetail is free text an operator reads and nothing branches on: which
-	// sequence, which KEK. Empty when there is no refusal.
+	// RefusalDetail is free text an operator reads and nothing branches on: which layer,
+	// which KEK. Empty when there is no refusal.
 	RefusalDetail string
 }
 

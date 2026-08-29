@@ -1,11 +1,11 @@
 // Package cpserver serves the Agent-facing RPC surface (api/spin/storage/v1). It is a
 // translation layer: every rule it appears to enforce — the term guard, the lifecycle
-// transitions, the watermark ordering — is enforced inside metadata.Store's writes, where
-// a second Control Plane cannot get between a read and a write.
+// transitions — is enforced inside metadata.Store's writes, where a second Control Plane
+// cannot get between a read and a write.
 //
-// Two things live here and nowhere else, both reactions to what a host reports: the epoch
-// qualification of a volume report (§12.3), because UpdateWatermarks has no notion of who
-// is reporting; and the device-pressure cordon (ADR-0013 §3) — see pressure.go.
+// Three things live here and nowhere else, all reactions to what a host reports: the epoch
+// qualification of a volume report (§12.3); the device-pressure cordon (ADR-0013 §3); and
+// §11's stalled-publish cordon — both in pressure.go.
 package cpserver
 
 import (
@@ -264,7 +264,8 @@ func (s *Server) GetVolumeKeys(ctx context.Context, req *connect.Request[storage
 	}), nil
 }
 
-// ReportVolumeState applies epoch-qualified watermarks, one answer per report.
+// ReportVolumeState records what a host observes about the volumes it holds, epoch
+// qualified, one answer per report.
 func (s *Server) ReportVolumeState(ctx context.Context, req *connect.Request[storagev1.ReportVolumeStateRequest]) (*connect.Response[storagev1.ReportVolumeStateResponse], error) {
 	hostID := req.Msg.GetHostId()
 	if hostID == "" {
@@ -301,11 +302,11 @@ func (s *Server) applyReport(ctx context.Context, term int64, hostID string, r *
 	if v.PrimaryHostID != hostID {
 		return storagev1.ReportOutcome_REPORT_OUTCOME_NOT_PRIMARY, nil
 	}
-	// The epoch is the qualification the watermarks never had: a report from a
-	// writer the fleet has moved past names an epoch that is no longer current, and
-	// applying it would let a fenced host's numbers stand as the volume's own
-	// (§12.3). An epoch *ahead* of the volume's is equally refused — nothing has
-	// granted it, so it names a volume this Control Plane does not know about.
+	// The epoch is the qualification: a report from a writer the fleet has moved past
+	// names an epoch that is no longer current, and applying it would let a fenced host's
+	// numbers stand as the volume's own (§12.3). An epoch *ahead* of the volume's is
+	// equally refused — nothing has granted it, so it names a volume this Control Plane
+	// does not know about.
 	if v.CurrentEpoch != r.GetEpoch() {
 		return storagev1.ReportOutcome_REPORT_OUTCOME_STALE_EPOCH, nil
 	}
@@ -396,7 +397,7 @@ func refusalOf(r storagev1.VolumeRefusal) (lifecycle.Refusal, error) {
 // applySnapshotReport records the outcome of a snapshot this host was asked to take.
 //
 // It runs after the epoch check, and that is the point: a host the fleet has moved past
-// froze a view of a volume it no longer writes, and stamping its sequence into the
+// froze a view of a volume it no longer writes, and stamping the commit it named into the
 // catalog would publish a snapshot of a state that was superseded. A stale report leaves
 // the row CREATING, which is the right answer — the volume's current writer still has
 // the request in its desired state.
