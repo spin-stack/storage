@@ -225,7 +225,19 @@ func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, siz
 	// rewind, so a connection lost mid-upload fails the publish. The commit protocol
 	// retries the whole thing next cycle from the same SealedLayer under the same commit
 	// id, so that costs a cycle rather than a commit.
-	out, err := s.client.PutObject(ctx, in, s3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware))
+	// One attempt, and it has to be said rather than left to the default. The SDK cannot
+	// replay a body it cannot rewind, so its retry does not retry: it fails with "failed
+	// to rewind transport stream for retry", and that error arrives *instead of* the one
+	// the server actually sent. A loser of the create-only race then reports a transport
+	// problem where it should report ErrPreconditionFailed — measured here as roughly one
+	// conformance run in three.
+	//
+	// Nothing is lost by saying so. The retry could never have worked, and the commit
+	// protocol retries the whole publish next cycle from the same SealedLayer under the
+	// same commit id.
+	out, err := s.client.PutObject(ctx, in,
+		s3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware),
+		func(o *s3.Options) { o.RetryMaxAttempts = 1 })
 	if err != nil {
 		return objectstore.PutResult{}, translate(err)
 	}
