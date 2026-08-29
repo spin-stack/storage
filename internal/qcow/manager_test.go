@@ -114,6 +114,9 @@ type harness struct {
 	disk   *sim.Disk
 	rec    *fakeRecovery
 	clk    *sim.Clock
+	// witness is the object store's answer to "who holds this volume now". Nil is an
+	// Agent with no object store, which reclaims nothing.
+	witness qcow.Witness
 }
 
 func newHarness(t *testing.T) *harness {
@@ -130,6 +133,22 @@ func newHarnessRotatingAt(t *testing.T, at int64) *harness {
 func newHarnessFull(t *testing.T, at int64, pub qcow.Publisher) *harness {
 	t.Helper()
 	return newHarnessWith(t, sim.NewDisk(), at, pub)
+}
+
+// newHarnessWitnessing is a Manager that can ask the object store who holds a volume now,
+// which is the whole of what makes a released volume's disk reclaimable.
+func newHarnessWitnessing(t *testing.T, wit qcow.Witness) *harness {
+	t.Helper()
+	h := &harness{
+		runner:  &fakeRunner{info: infoJSON("qcow2", size, false), version: "qemu-img version 11.1.1"},
+		paths:   newPaths(),
+		dialer:  &fakeDialer{scripts: map[string][]string{}},
+		disk:    sim.NewDisk(),
+		rec:     bornEmpty(),
+		witness: wit,
+	}
+	h.start(t, 0, nil)
+	return h
 }
 
 func newHarnessOn(t *testing.T, d *sim.Disk) *harness {
@@ -166,6 +185,7 @@ func (h *harness) start(t *testing.T, rotateAt int64, pub qcow.Publisher) {
 		Dialer:    h.dialer,
 		Publisher: pub,
 		Recovery:  h.rec,
+		Witness:   h.witness,
 	})
 	if err != nil {
 		t.Fatalf("building a manager: %v", err)
@@ -185,7 +205,7 @@ func (h *harness) restart(t *testing.T, rotateAt int64, pub qcow.Publisher) *har
 	if err := h.m.Close(); err != nil {
 		t.Fatalf("closing the Agent that is being restarted: %v", err)
 	}
-	next := &harness{runner: h.runner, paths: h.paths, dialer: h.dialer, disk: sim.NewDisk(), rec: h.rec}
+	next := &harness{runner: h.runner, paths: h.paths, dialer: h.dialer, disk: sim.NewDisk(), rec: h.rec, witness: h.witness}
 	next.start(t, rotateAt, pub)
 	return next
 }

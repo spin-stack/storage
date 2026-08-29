@@ -49,6 +49,16 @@ type State struct {
 	// that a human catting the file sees it before anything else.
 	FormatVersion int    `json:"format_version"`
 	VolumeID      string `json:"volume_id"`
+	// Epoch is the epoch this host last held the volume under, and it is durable for one
+	// reason: everything else here is about *files*, and a released volume's files can
+	// only be judged against the epoch they were written at. Without it, a host that let
+	// a volume go has no record of what it held, so it can never tell "the fleet moved
+	// this somewhere else" from "nobody has said anything" — which is the difference
+	// between reclaiming a disk and deleting a tenant's data (see reclaim.go).
+	//
+	// Zero is a record written before this field existed, and it reclaims nothing, which
+	// is the safe direction on both counts.
+	Epoch int64 `json:"epoch,omitempty"`
 	// Commits is every published commit whose layer this host holds, oldest first in
 	// the order it was learned. It is what lets a same-host recovery skip a download,
 	// and it has to be durable to do that: `qemu-img rebase -u` rewrites a layer's

@@ -195,6 +195,10 @@ func run() (err error) {
 		// degraded one: with no second path an Agent cannot confirm that anybody took
 		// its volumes, and the loop keeps serving instead of stopping guests on silence.
 		wit agent.Witness
+		// reclaimer is the same object as wit, typed for the Manager. Nil without an
+		// object store, and nothing is then reclaimed — a host that cannot confirm
+		// anything must not delete anything.
+		reclaimer qcow.Witness
 	)
 	switch {
 	case storeFlags.Bucket == "" && storeFlags.Dir == "":
@@ -231,6 +235,10 @@ func run() (err error) {
 		rec = recovery.New(root, *qemuImg, store, kms, keys, paths, real.NewRunner()).
 			WithTelemetry(real.NewClock(), telemetry.Recorder())
 		wit = descriptor.EpochWitness{Store: store}
+		// The same witness reaches the Manager, and on purpose: the loop stops a running
+		// guest on this fact, so the disk of a volume that is *not* being served can go on
+		// it too. One signal, one meaning (qcow.Witness).
+		reclaimer = wit
 	}
 
 	volumes, err := qcow.New(ctx, qcow.Config{
@@ -247,6 +255,7 @@ func run() (err error) {
 		Dialer:    real.NewUnixDialer(),
 		Publisher: pub,
 		Recovery:  rec,
+		Witness:   reclaimer,
 	})
 	if err != nil {
 		return err

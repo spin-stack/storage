@@ -148,6 +148,20 @@ h = b.hex()
 print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
 PY
 )
+# uuidv7 mints another id, for a stage that needs a second host in the fleet. Same rule
+# as HOST_ID above: INV-22, and the binaries refuse anything else on the flag.
+uuidv7() {
+  python3 -c "
+import os, time
+ms = int(time.time() * 1000)
+b = bytearray(os.urandom(16))
+b[0:6] = ms.to_bytes(6, 'big')
+b[6] = (b[6] & 0x0F) | 0x70
+b[8] = (b[8] & 0x3F) | 0x80
+h = b.hex()
+print(f'{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}')
+"
+}
 echo "database=$DB  host_id=$HOST_ID  data_dir=$DIR/agent"
 
 say "1. the two binaries, as processes"

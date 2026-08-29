@@ -97,13 +97,18 @@ type fakePaths struct {
 	statFail error
 	// removed is what a test has unlinked; see Size.
 	removed map[string]bool
+	// dirs is every directory MkdirAll has made, so List can answer with them.
+	dirs map[string]bool
 	// log records writes in order, so a test can assert that the pointer moved before
 	// QEMU was told to switch rather than only that both happened.
 	log *[]string
 }
 
 func newPaths(present ...string) *fakePaths {
-	p := &fakePaths{present: map[string]bool{}, files: map[string]string{}, sizes: map[string]int64{}, removed: map[string]bool{}}
+	p := &fakePaths{
+		present: map[string]bool{}, files: map[string]string{},
+		sizes: map[string]int64{}, removed: map[string]bool{}, dirs: map[string]bool{},
+	}
 	for _, name := range present {
 		p.present[name] = true
 	}
@@ -122,6 +127,17 @@ func (p *fakePaths) MkdirAll(dir string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.made = append(p.made, dir)
+	if p.dirs == nil {
+		// Some tests build this fake by hand rather than through newPaths.
+		p.dirs = map[string]bool{}
+	}
+	// Every ancestor too, and they are listable: os.ReadDir returns directories
+	// alongside files, and a fake that returned only files made a whole directory tree
+	// invisible to anything walking it — reclaim walks `<root>/volumes` looking for the
+	// per-volume directories, and against the old fake it always found an empty fleet.
+	for d := dir; len(d) > 1; d = filepath.Dir(d) {
+		p.dirs[d] = true
+	}
 	return nil
 }
 
@@ -172,8 +188,13 @@ func (p *fakePaths) List(dir string) ([]string, error) {
 			names = append(names, filepath.Base(path))
 		}
 	}
+	for d := range p.dirs {
+		if filepath.Dir(d) == dir {
+			names = append(names, filepath.Base(d))
+		}
+	}
 	slices.Sort(names)
-	return names, nil
+	return slices.Compact(names), nil
 }
 
 // Rename moves the name and everything this fake knows about the file: its presence, its

@@ -148,3 +148,47 @@ grep -q "GUESTINIT-PASS" "$DIR/logs/guest2.log" ||
   { tail -20 "$DIR/logs/guest2.log" >&2; die "the recovered volume does not hold what the first guest wrote"; }
 grep -m1 "GUESTINIT-PASS" "$DIR/logs/guest2.log"
 echo "    the bytes came from an object store, through a machine that had never seen them"
+
+say "10. the disk comes back when the fleet moves the volume somewhere else"
+# A released volume keeps its layers on purpose: it leaves the desired state for reasons
+# that reverse, and getting it back should be free. What makes them reclaimable is not
+# time passing but a fact — `volumes/<id>/epoch` naming a grant this host does not hold.
+# From that moment this chain is a fork that can never be published, so the files are
+# holding a disk for a history nothing will accept.
+LAYERS="$DIR/agent/volumes/$VOLUME/layers"
+BEFORE=$(ls "$LAYERS" | wc -l)
+[ "$BEFORE" -gt 0 ] || die "there are no layers to reclaim"
+
+# A second host, so there is somewhere to move the volume to. It registers itself by
+# heartbeating — the fleet learns a host exists by being told — and is then stopped: this
+# step is about the *first* host's disk, and nothing has to run for the epoch to move.
+OTHER=$(uuidv7)
+mkdir -p "$DIR/agent-b"
+"$AGENT" -host-id "$OTHER" -control-plane "http://127.0.0.1:$PORT" \
+  -data-dir "$DIR/agent-b" -kek-file "$DIR/kek" -qemu-img "$QEMU_IMG" \
+  -heartbeat-interval "$HEARTBEAT" >"$DIR/logs/agent-b.log" 2>&1 &
+OTHER_PID=$!
+# Registered when the fleet says so, asked with the same command an operator would use:
+# a host row exists because a host heartbeated it into the catalog, and nothing can be
+# placed on a host the catalog does not know (volumes.primary_host_id is a foreign key).
+for i in $(seq 1 100); do
+  "$CP" -database-url "$DSN" -fleet-status >"$DIR/logs/fleet-b.txt" 2>&1 || true
+  grep -qF "$OTHER" "$DIR/logs/fleet-b.txt" && break
+  [ "$i" = 100 ] && die "the second host never registered: $(tail -8 "$DIR/logs/fleet-b.txt")"
+  sleep 0.2
+done
+"$CP" -database-url "$DSN" -object-store-dir "$DIR/store" -holder-id cp-move \
+  -detach-volume "$VOLUME" >"$DIR/logs/move.log" 2>&1 ||
+  die "detach failed: $(tail -3 "$DIR/logs/move.log")"
+"$CP" -database-url "$DSN" -object-store-dir "$DIR/store" -holder-id cp-move \
+  -max-used-ratio 0.99 -attach-volume "$VOLUME" -attach-host "$OTHER" >>"$DIR/logs/move.log" 2>&1 ||
+  die "attach to the second host failed: $(tail -3 "$DIR/logs/move.log")"
+kill -9 "$OTHER_PID" 2>/dev/null || true
+wait "$OTHER_PID" 2>/dev/null || true
+echo "    volume $VOLUME now belongs to host $OTHER"
+
+waitfor "$DIR/logs/agent2.log" "reclaimed the local disk" 120
+grep -m1 "reclaimed the local disk" "$DIR/logs/agent2.log" | sed 's/^/    /'
+AFTER=$(ls "$LAYERS" 2>/dev/null | wc -l)
+[ "$AFTER" -eq 0 ] || die "$AFTER layers are still on the first host after the volume moved"
+echo "    $BEFORE layers freed on the host that no longer holds it"

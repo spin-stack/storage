@@ -169,6 +169,11 @@ type Deps struct {
 	Dialer qmp.Dialer
 	// Publisher is optional; without one, nothing this host seals ever leaves it.
 	Publisher Publisher
+	// Witness is optional; without one, nothing this host released is ever reclaimed.
+	// It answers the one question a released volume's files can be judged against, and
+	// the answer has to come from the object store because the volume is gone from the
+	// desired state by then (reclaim.go).
+	Witness Witness
 	// Recovery is not optional. A host that cannot ask whether a volume has published
 	// commits cannot tell "this volume is new" from "this volume's data is elsewhere",
 	// and the only answer it can give in that state is a blank disk.
@@ -190,6 +195,7 @@ type Manager struct {
 	dialer qmp.Dialer
 	pub    Publisher
 	rec    Recovery
+	wit    Witness
 	unlock io.Closer
 
 	mu   sync.Mutex
@@ -277,7 +283,7 @@ func New(ctx context.Context, cfg Config, deps Deps) (*Manager, error) {
 	}
 	m := &Manager{
 		cfg: cfg, clk: deps.Clock, run: deps.Runner,
-		paths: deps.Paths, dialer: deps.Dialer, pub: deps.Publisher, rec: deps.Recovery, unlock: unlock,
+		paths: deps.Paths, dialer: deps.Dialer, pub: deps.Publisher, rec: deps.Recovery, wit: deps.Witness, unlock: unlock,
 		vols: map[string]*volume{},
 	}
 
@@ -372,6 +378,11 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 		slog.Info("released a volume: this host is no longer serving it, and its local layers are kept",
 			"volume_id", id, "epoch", v.epoch, "layers", LayersDir(m.cfg.Root, id))
 	}
+	// And the disk of anything the fleet can be shown to have moved elsewhere — which is
+	// the volumes released above, and the ones a previous process released before this one
+	// started. It never touches a volume in `m.vols`, so it runs after the loop above and
+	// not inside it.
+	m.reclaim(ctx)
 	return errors.Join(failures...)
 }
 
@@ -843,6 +854,12 @@ func (m *Manager) reconcile(ctx context.Context, v *volume) error {
 	}
 	tip := LayerIDOfImage(v.chain.Active)
 	dirty := st.ObserveTip(tip)
+	// The epoch these files were written under, on disk. It is the only thing a host that
+	// has *released* the volume can judge them against — see reclaim.go — and by then
+	// there is no desired state to read it from.
+	if st.Epoch != v.epoch {
+		st.Epoch, dirty = v.epoch, true
+	}
 	// Only with a publisher, and only when nothing is already in hand. A host with no
 	// object store configured has nothing to owe: giving it a pending layer would stop it
 	// rotating for ever (v6 §11), which is the one thing rotate's own no-publisher branch
@@ -857,9 +874,10 @@ func (m *Manager) reconcile(ctx context.Context, v *volume) error {
 			return fmt.Errorf("volume %s: %w", v.id, err)
 		}
 	}
-	// Nothing else reclaims local disk, so this runs every cycle over a directory only
-	// this host writes to. A failure is reported and never refuses the volume: what it
-	// costs is space, and the guest is being served.
+	// The orphan overlay an interrupted rotation leaves; reclaim.go is the other half,
+	// for volumes this host no longer serves. Runs every cycle over a directory only this
+	// host writes to. A failure is reported and never refuses the volume: what it costs is
+	// space, and the guest is being served.
 	removed, err := sweep(m.paths, m.cfg.Root, v.id, v.chain.Active, st, v.pending)
 	for _, path := range removed {
 		slog.Warn("swept a layer file no chain reads through: it sits above the tip QEMU has open and no record names it, which is what a rotation interrupted between creating the overlay and switching to it leaves behind",

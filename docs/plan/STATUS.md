@@ -86,10 +86,11 @@ Nothing on the §24 list. What is left is in the two sections below.
 - **A collapse waits for the guest to detach.** The rebase onto the new root needs the
   files, and QEMU holds every one of a live chain, so the last step is owed until the
   volume reads as unattached. Until then the chain does not shrink and one line says so.
-- **Nothing reclaims local disk.** Released volumes keep their layers and published layers
-  keep their files (§9 step 15) — the chain reads through them, so only a collapse can
-  free them, and a collapse waits for the guest. What the sweep does remove is the orphan
-  overlay an interrupted rotation leaves. The *bucket* side is done: `-gc-delete`.
+- **A volume detached and left detached keeps its layers.** Local disk comes back when the
+  object store confirms the fleet granted the volume elsewhere (`demo:stage4` step 10) and
+  never on silence, so a volume nobody has moved is never reclaimed — and neither is one
+  that was deleted, because absence is not a fact. Published layers under a live chain are
+  a separate matter: the guest reads through them, so only a collapse frees those.
 - **§21's numbers reach a human, not an alert.** Eleven are recorded and scrapeable; the
   RPO and the unpublished backlog reach the catalog and `-fleet-status` per volume. §11's
   other half is built — a host holding a layer it failed to publish is cordoned — but
