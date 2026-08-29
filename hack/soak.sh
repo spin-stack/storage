@@ -138,7 +138,7 @@ kill_mid_publish() {
 }
 
 round=0
-trap 'say "stopping after $round rounds, $fail_count findings"; exit 0' INT TERM
+trap 'say "stopping during round $round, $fail_count findings"; exit 0' INT TERM
 while :; do
   round=$((round + 1))
   [ "$SOAK_ROUNDS" -gt 0 ] && [ "$round" -gt "$SOAK_ROUNDS" ] && break
@@ -165,7 +165,13 @@ while :; do
   export HEARTBEAT="$(( RANDOM % 700 + 200 ))ms"
   say "round $round parameters: ROTATE_AT=$ROTATE_AT CHURN=$CHURN HEARTBEAT=$HEARTBEAT"
 
-  for stage in stage1 stage2 stage3; do
+  # stage4 is in the loop and stages 5 and 6 are not, deliberately. It is v6 §26's whole
+  # priority — RUN, COMMIT, DESTROY HOST, RECOVER, RUN — so it is the one demonstration
+  # whose failure means a volume did not come back, and it is the only one that exercises
+  # a *second* machine reading what the first wrote. The other two cost a second guest
+  # each and answer questions about snapshots and clones, which a round would buy at the
+  # price of running half as many rounds.
+  for stage in stage1 stage2 stage3 stage4; do
     scratch=$(mktemp -d "/tmp/soak-$stage-XXXXXX")
     log=$(mktemp)
     say "demo $stage"
@@ -179,4 +185,5 @@ while :; do
 
   kill_mid_publish
 done
-say "done: $round rounds, $fail_count findings in $FINDINGS"
+# round was incremented before the break, so the loop leaves it one past what ran.
+say "done: $((round - 1)) rounds, $fail_count findings in $FINDINGS"
