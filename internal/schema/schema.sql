@@ -51,13 +51,11 @@ CREATE TABLE hosts (
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
     nvme_used_bytes      BIGINT NOT NULL DEFAULT 0,
-    -- The part of nvme_used_bytes that no verified object covers yet, summed over every
-    -- volume this host holds (ADR-0013 §1), reported by the Agent in each heartbeat. Stored
-    -- rather than derived because nothing in this database can compute it: the volumes table
-    -- carries watermarks in sequence numbers, not bytes. It is also what distinguishes a busy
-    -- host from one whose object store stopped answering, which will not stop growing because
-    -- no local truncation may reclaim those records (INV-13).
-    nvme_remote_backlog_bytes BIGINT NOT NULL DEFAULT 0,
+    -- There is no host-level backlog column. It was ADR-0013 §1's, the WAL bytes no
+    -- verified object covered, and every Agent reported zero into it for a year. What
+    -- distinguishes a busy host from one whose object store stopped answering is per volume
+    -- and measured against a chain that exists: volumes.unpublished_local_bytes, with
+    -- volumes.publish_stalled saying which of the two it is.
     -- There is deliberately no nvme_committed_bytes column (ADR-0017). Committed
     -- capacity is derived from the rows that already say who holds what; see the
     -- note at the bottom of this file.

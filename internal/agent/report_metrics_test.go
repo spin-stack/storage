@@ -40,18 +40,9 @@ func TestTheReportRecordsWhatItCarries(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	// On the wire: chain_depth and local_disk_bytes were computed on the host and never
-	// left it, so the Control Plane could not see a chain getting deep at all.
-	for _, v := range h.cp.lastReport(t).GetVolumes() {
-		want := map[string][2]int64{
-			"vol-a": {5, 11 << 20},
-			"vol-b": {2, 3 << 20},
-		}[v.GetVolumeId()]
-		if int64(v.GetChainDepth()) != want[0] || v.GetLocalDiskBytes() != want[1] {
-			t.Errorf("%s reports chain_depth=%d local_disk_bytes=%d, want %d and %d",
-				v.GetVolumeId(), v.GetChainDepth(), v.GetLocalDiskBytes(), want[0], want[1])
-		}
-	}
+	// The chain's depth and its disk are the host's own numbers and stay here: they went
+	// over the wire for a while and nothing in the Control Plane ever read them, so what
+	// they need is a scrape, not a field. Which is what the rest of this asserts.
 
 	// And in the scrape, one series per volume. `local_chain_depth` and not `chain_depth`:
 	// that name is the Control Plane's, for the catalog's lineage depth under the same

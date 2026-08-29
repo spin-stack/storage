@@ -192,7 +192,6 @@ func (h *leaseHarness) desire(epoch int64) *storagev1.DesiredVolume {
 	v := &storagev1.DesiredVolume{
 		VolumeId:  ids.New().String(),
 		SizeBytes: 1 << 30,
-		BlockSize: 4096,
 		Epoch:     epoch,
 		State:     storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}
@@ -450,7 +449,6 @@ func TestTheHostServesAgainOnceItsLeaseIsBack(t *testing.T) {
 	h.cp.setDesired([]*storagev1.DesiredVolume{{
 		VolumeId:  vol.GetVolumeId(),
 		SizeBytes: vol.GetSizeBytes(),
-		BlockSize: vol.GetBlockSize(),
 		Epoch:     2,
 		State:     storagev1.VolumeState_VOLUME_STATE_ACTIVE,
 	}})

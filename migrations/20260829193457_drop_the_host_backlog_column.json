@@ -1,0 +1,20 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-08-29T16:34:57-03:00",
+  "source_fingerprint": {
+    "hash": "50d722d1d724e7e25138204c64d396be46bbd14d78f0d5b10d397402d0b52ecf"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE hosts DROP COLUMN nvme_remote_backlog_bytes;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.hosts.nvme_remote_backlog_bytes"
+        }
+      ]
+    }
+  ]
+}

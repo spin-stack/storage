@@ -74,9 +74,8 @@ func TestHeartbeatWritesTheDevicePicture(t *testing.T) {
 		AgentVersion:     "0.1.0",
 		MaxFormatVersion: 2,
 		Device: &storagev1.DeviceStatus{
-			TotalBytes:         1 << 40,
-			UsedBytes:          700 << 30,
-			RemoteBacklogBytes: 4 << 30,
+			TotalBytes: 1 << 40,
+			UsedBytes:  700 << 30,
 		},
 	})
 	if err != nil {
@@ -98,14 +97,6 @@ func TestHeartbeatWritesTheDevicePicture(t *testing.T) {
 	}
 	if h.NVMeTotalBytes != 1<<40 || h.NVMeUsedBytes != 700<<30 {
 		t.Fatalf("device numbers not stored: %+v", h)
-	}
-	// The backlog is the one number of the three that no other reader can recompute:
-	// it is the part of `used` that no verified object covers yet (INV-13), so no
-	// amount of local truncation reclaims it, and per-volume MaxRemoteGapBytes never
-	// sums to it. Dropping it left the fleet unable to tell a host that is merely
-	// full from one whose object store has stopped answering.
-	if h.RemoteBacklogBytes != 4<<30 {
-		t.Fatalf("remote backlog not stored: %+v", h)
 	}
 	if h.AgentVersion != "0.1.0" || h.MaxFormatVersion != 2 {
 		t.Fatalf("identity not stored: %+v", h)
@@ -200,7 +191,7 @@ func TestGetDesiredStateListsThisHostsVolumes(t *testing.T) {
 	if vols[0].GetVolumeId() != "vol-a" || vols[1].GetVolumeId() != "vol-b" {
 		t.Fatalf("not ordered by volume id: %v, %v", vols[0].GetVolumeId(), vols[1].GetVolumeId())
 	}
-	if vols[0].GetBlockSize() != 512 || vols[0].GetSizeBytes() != 1<<30 || vols[0].GetEpoch() != 1 {
+	if vols[0].GetSizeBytes() != 1<<30 || vols[0].GetEpoch() != 1 {
 		t.Fatalf("volume geometry not carried: %+v", vols[0])
 	}
 	if vols[1].GetState() != storagev1.VolumeState_VOLUME_STATE_ACTIVE {

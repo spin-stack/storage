@@ -73,10 +73,6 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[storagev1.H
 		MaxFormatVersion: msg.GetMaxFormatVersion(),
 		NVMeTotalBytes:   dev.GetTotalBytes(),
 		NVMeUsedBytes:    dev.GetUsedBytes(),
-		// RemoteBacklogBytes is carried through from the wire without being read.
-		// Every Agent sends 0 and no decision here branches on it; metadata.Host
-		// says what the field is and what deleting it would cost.
-		RemoteBacklogBytes: dev.GetRemoteBacklogBytes(),
 	})
 	if err != nil {
 		return nil, rpcError(fmt.Errorf("cpserver: upserting host %q: %w", msg.GetHostId(), err))
@@ -154,7 +150,6 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 		d := &storagev1.DesiredVolume{
 			VolumeId:  v.VolumeID,
 			SizeBytes: v.SizeBytes,
-			BlockSize: v.BlockSize,
 			Epoch:     v.CurrentEpoch,
 			State:     volumeState(v.State),
 			// The age trigger (v6 §11). Zero is a volume that was never sold an RPO and

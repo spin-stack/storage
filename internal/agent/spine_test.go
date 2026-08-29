@@ -79,12 +79,6 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	if host.NVMeTotalBytes != 1<<40 || host.NVMeUsedBytes != 512<<30 {
 		t.Fatalf("device numbers did not cross the wire: %+v", host)
 	}
-	// The field still crosses the wire and is always zero: nothing measures a backlog
-	// since the uploader went (ADR-0026 increment 4.5). Asserted rather than dropped,
-	// because a field that silently starts carrying something again is worth catching.
-	if host.RemoteBacklogBytes != 0 {
-		t.Fatalf("the aggregate remote backlog did not cross the wire: %+v", host)
-	}
 	if host.AgentVersion != testVersion || host.MaxFormatVersion != 3 {
 		t.Fatalf("identity did not cross the wire: %+v", host)
 	}

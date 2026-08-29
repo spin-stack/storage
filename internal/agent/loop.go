@@ -63,6 +63,8 @@ type Loop struct {
 	state    storagev1.HostState
 	fenced   []string
 	failures int
+	// term is the Control Plane term that last answered a heartbeat; see noteTerm.
+	term int64
 	// keys is key material by volume id, cached with one eviction rule and no expiry: an
 	// entry lives exactly as long as its volume stays in the desired state. When the volume
 	// stops being this host's the entry must go — not because it would be stale, but because
@@ -365,10 +367,6 @@ func (l *Loop) fence(ctx context.Context) error {
 }
 
 func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeStatus) error {
-	// Nothing measures a host's remote backlog since the uploader went (ADR-0026 increment
-	// 4.5); the field stays on the wire and is always zero — see STATUS.md.
-	var backlog int64
-
 	// The lease is anchored to the instant the request leaves, never to the answer's
 	// (§12.2): the Control Plane stamps last_renewal at or after this instant, so the
 	// Agent's window can only ever be a subset of the one it is fenced against.
@@ -380,9 +378,8 @@ func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeSta
 		AgentVersion:     l.cfg.AgentVersion,
 		MaxFormatVersion: l.cfg.MaxFormatVersion,
 		Device: &storagev1.DeviceStatus{
-			TotalBytes:         usage.TotalBytes,
-			UsedBytes:          usage.UsedBytes,
-			RemoteBacklogBytes: backlog,
+			TotalBytes: usage.TotalBytes,
+			UsedBytes:  usage.UsedBytes,
 		},
 	}))
 	if err != nil {
@@ -392,6 +389,7 @@ func (l *Loop) heartbeat(ctx context.Context, usage disk.Usage, vols []VolumeSta
 
 	l.applyLease(gen, sentAt, time.Duration(resp.Msg.GetLeaseTtlSeconds())*time.Second)
 	l.setHostState(resp.Msg.GetState())
+	l.noteTerm(resp.Msg.GetTerm())
 	l.rec.Gauge(ctx, "lease_remaining_seconds", l.leaseRemaining().Seconds(), obs.String("host", l.cfg.HostID))
 	return nil
 }
@@ -515,8 +513,6 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			PublishStalled:            v.PublishStalled,
 			LastSuccessfulCommitAgeMs: v.LastCommitAge.Milliseconds(),
 			UnpublishedLocalBytes:     v.UnpublishedLocalBytes,
-			ChainDepth:                int32(v.ChainDepth),
-			LocalDiskBytes:            v.LocalDiskBytes,
 			SnapshotError:             v.SnapshotError,
 			// The one field here that is not a measurement: this host saying it is not
 			// serving the volume, and why. Unset is it saying it is, so a healthy cycle
@@ -563,6 +559,31 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 	defer l.mu.Unlock()
 	l.fenced = fenced
 	return nil
+}
+
+// noteTerm logs the Control Plane's term when it changes, which is the only thing this
+// host does with it: a term is the Control Plane's own fencing and no decision here is
+// taken against it. A failover is otherwise invisible from a host's journal, and it is
+// exactly what an operator correlates against everything that went strange at that minute.
+//
+// On change and not per heartbeat: at one line every few seconds it is noise, and the fact
+// is a transition rather than a level. The first answer of a process is a change from
+// nothing and says so, because "which leader has been answering me since I started" is the
+// same question.
+func (l *Loop) noteTerm(term int64) {
+	l.mu.Lock()
+	was, first := l.term, l.term == 0
+	l.term = term
+	l.mu.Unlock()
+	if term == was {
+		return
+	}
+	if first {
+		slog.Info("the Control Plane answering this host", "host_id", l.cfg.HostID, "term", term)
+		return
+	}
+	slog.Warn("the Control Plane answering this host changed term; a leader election happened",
+		"host_id", l.cfg.HostID, "was", was, "now", term)
 }
 
 // applyLease arms (or re-arms) the host lease from a heartbeat that was *requested*

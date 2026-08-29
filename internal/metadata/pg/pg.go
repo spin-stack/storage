@@ -282,8 +282,7 @@ func (s *Store) UpsertHost(ctx context.Context, term int64, h metadata.Host) err
 		NvmeUsedBytes:    h.NVMeUsedBytes,
 		// The backlog is the host's own report, so it travels with the rest of what
 		// the host knows about itself (ADR-0013 §1).
-		NvmeRemoteBacklogBytes: h.RemoteBacklogBytes,
-		Term:                   term,
+		Term: term,
 	})
 	return s.staleIfZero(ctx, term, rows, err)
 }
@@ -315,7 +314,7 @@ func hostFromRow(h *db.Host, committed int64) (metadata.Host, error) {
 	return metadata.Host{
 		HostID: h.HostID.String(), State: state, CordonReason: reason, AgentVersion: h.AgentVersion,
 		MaxFormatVersion: h.MaxFormatVersion, NVMeTotalBytes: h.NvmeTotalBytes,
-		NVMeUsedBytes: h.NvmeUsedBytes, RemoteBacklogBytes: h.NvmeRemoteBacklogBytes,
+		NVMeUsedBytes:      h.NvmeUsedBytes,
 		NVMeCommittedBytes: committed,
 		LastHeartbeat:      fromTS(h.LastHeartbeat),
 	}, nil

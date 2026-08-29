@@ -92,12 +92,6 @@ message DeviceStatus {
   int64 total_bytes = 1;
   // used_bytes is what is occupied on it right now, by everything.
   int64 used_bytes = 2;
-  // remote_backlog_bytes was the sum, over every volume, of bytes no verified object
-  // covered — a WAL number. Every Agent sends 0 and nothing reads it; what replaced it is
-  // per volume and measured against a chain that exists
-  // (VolumeReport.unpublished_local_bytes). Kept because deleting it is a wire change,
-  // and written down so that it is a decision and not an oversight.
-  int64 remote_backlog_bytes = 3;
 }
 
 message HeartbeatRequest {
@@ -121,9 +115,14 @@ message HeartbeatResponse {
   int32 lease_ttl_seconds = 1;
   // state is the fleet state the Control Plane holds for this host (§28.1).
   HostState state = 2;
-  // term is the Control Plane term that served this heartbeat. It is
-  // informative — the Agent does not guard on it — and exists so an operator
-  // reading an Agent's logs during an incident can see which leader answered.
+  // term is the Control Plane term that served this heartbeat. The Agent does not guard
+  // on it — a term is the Control Plane's own fencing and no decision here is taken
+  // against it — and it logs a line when the number changes, which is the point: a
+  // failover is invisible from a host's journal otherwise, and it is exactly what an
+  // operator needs to correlate against everything that went strange at that minute.
+  //
+  // On change and not per heartbeat: at one line every few seconds it would be noise,
+  // and the fact is a transition rather than a level.
   int64 term = 3;
 }
 
@@ -147,24 +146,10 @@ message Ancestor {
 message DesiredVolume {
   string volume_id = 1;
   int64 size_bytes = 2;
-  int32 block_size = 3;
   // epoch is the volume's current epoch (§12.3). Everything the Agent later
   // reports about this volume is qualified by it.
-  int64 epoch = 4;
-  VolumeState state = 5;
-  // 6 was `Durability durability`, the per-volume §14.8 FLUSH/FUA ACK contract.
-  // ADR-0026 withdrew the remote mode, so the local ACK is the only contract and
-  // there is nothing for the Agent to be told; it never read the field. Reserved
-  // rather than reused because a peer built before this change decodes field 6 as
-  // an enum, and a new field with a different type at the same number is the one
-  // way a wire format lies to a reader that is otherwise doing everything right.
-  reserved 6;
-  // 7, 8 and 13 were `parent_snapshot_id`, `parent_volume_id` and
-  // `parent_commit_id`: one generation of lineage, which is all a rebuild could walk.
-  // `ancestry` carries every generation instead. Reserved rather than reused because a
-  // peer built before this change reads field 8 as the volume it must restore under,
-  // and one ancestor out of three is a chain missing everything the older ones wrote.
-  reserved 7, 8, 13;
+  int64 epoch = 3;
+  VolumeState state = 4;
   // ancestry is every generation this volume descends from, oldest first and empty for
   // a volume that was created rather than cloned. The last entry is its own parent.
   //
@@ -174,7 +159,7 @@ message DesiredVolume {
   // a clone finds nothing under its own id in the object store and serves zeros for
   // everything its ancestors wrote, which is a volume advertised as a copy and
   // delivered blank (DEV-0007).
-  repeated Ancestor ancestry = 14;
+  repeated Ancestor ancestry = 5;
   // pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
   // empty when there is nothing to take. It is the whole trigger: an Agent is never
   // *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —
@@ -188,21 +173,7 @@ message DesiredVolume {
   // leaves CREATING, so a host that missed the report, restarted, or came back after
   // a partition converges by doing the same thing again — and doing it again is free,
   // because the manifest is written create-only (INV-16).
-  string pending_snapshot_id = 9;
-
-  // 10 and 11 were `published_sequence` and `durable_sequence`, floors an attach
-  // checked itself against so that a missing image read as "the manifest is gone"
-  // rather than "this volume is new". They were the write-ahead log's counters; under
-  // v6 every Agent reports zero, so both floors have been permanently zero and have
-  // checked nothing. Reserved rather than reused: a peer built before this change
-  // reads them as floors and would compare against whatever took their number.
-  //
-  // The failure they were written for is real and is not gone with them: a volume
-  // whose HEAD object is lost is indistinguishable, to a host, from a volume that has
-  // never published, and a host that guesses wrong boots the tenant a blank disk. What
-  // v6 has to answer it with is the commit the catalog last saw published, which is a
-  // fact and not a counter — and which nothing carries yet.
-  reserved 10, 11;
+  string pending_snapshot_id = 6;
 
   // head_commit_id is the newest commit any host has told the catalog it published for
   // this volume, empty for a volume that has never published.
@@ -224,7 +195,7 @@ message DesiredVolume {
   // has published and whose catalog row does not say so is served exactly as it is
   // served today. Over-claiming would refuse a volume that is fine, which is why this is
   // written from what a host reported publishing rather than derived from anything.
-  string head_commit_id = 15;
+  string head_commit_id = 7;
 
   // rpo_target_seconds is how far behind the object store this volume is allowed to
   // fall: the age at which the host seals its tip and commits it even though the tip
@@ -245,7 +216,7 @@ message DesiredVolume {
   // nobody writes to does not produce layers, and the age trigger keeps it: the tip
   // must also have grown past an empty image before age can fire it, so a volume that
   // wrote nothing is *inside* its target rather than behind it.
-  int64 rpo_target_seconds = 12;
+  int64 rpo_target_seconds = 8;
 }
 
 message GetDesiredStateResponse {
@@ -362,42 +333,6 @@ message VolumeReport {
   // whose epoch is not the volume's current one is refused: it comes from a
   // writer that has been fenced.
   int64 epoch = 2;
-  // 3, 4, 5 and 6 were `local_sequence`, `durable_sequence`, `published_sequence` and
-  // `remote_gap_bytes` — the write-ahead log's counters and its backlog. That log is
-  // withdrawn (v6), so every Agent reported the four as zero and the catalog stored
-  // zeros in three columns for a year. What v6 measures instead is below:
-  // last_successful_commit_age_ms, which §11 calls the product, and
-  // unpublished_local_bytes, which is the backlog stated in the unit that exists.
-  reserved 3, 4, 5, 6;
-
-  // snapshot_id is the pending snapshot this host has finished acting on, empty when
-  // it has nothing to say. The three fields below are one answer and are read
-  // together: an id plus a commit is "published, and this commit is it", an id plus an
-  // error is "FAILED, and here is what an operator needs to read".
-  //
-  // It is reported on the volume's own report rather than through a call of its own
-  // because the report is already the Agent's one channel for "what is true here",
-  // and a second channel would need its own retry, its own ordering against the
-  // watermarks, and its own way of being refused when the host has been fenced.
-  string snapshot_id = 7;
-  // 8 was `int64 snapshot_sequence`, the §19 sequence the copy was frozen at. There
-  // are no sequences under v6 — the local data path that produced them is withdrawn —
-  // and what identifies a point in a volume's history now is the commit that carries
-  // it. Reserved rather than reused, for the reason field 6 is: a peer built before
-  // this change decodes 8 as a varint, and a new field of another type at the same
-  // number is the one way a wire format lies to a reader doing everything right.
-  reserved 8;
-  // snapshot_commit_id is the commit this snapshot names. A snapshot under v6 is not a
-  // copy of anything: it is a *name for a commit* that is already in the published
-  // history, so taking one costs a rotation and a publish when the tip has unpublished
-  // bytes, and nothing at all when it does not.
-  //
-  // That is the whole of what makes it durable, and it is worth saying because the
-  // v5 answer was the opposite: a snapshot was a manifest the host wrote, and it could
-  // exist while the data it named did not. A commit id can only be reported after
-  // `Commit() → SUCCESS`, which promises the state is reconstructible without this
-  // host — so a snapshot that is reported at all is a snapshot that can be restored.
-  string snapshot_commit_id = 12;
 
   // The two numbers §28 asks for by name, and the only ones on this message that describe
   // the *gap* between what a guest has written and what the bucket holds.
@@ -415,22 +350,16 @@ message VolumeReport {
   //
   // Both are zero for a volume that has never committed on this host, which is a state
   // and not a measurement; the report's own refusal is what says why.
-  int64 last_successful_commit_age_ms = 13;
-  int64 unpublished_local_bytes = 14;
-  // The other two numbers §28 asks for per volume. They were computed on the host and
-  // written to a log line, which is a place nobody alerts on: an operator learns about a
-  // chain forty layers deep, or a host whose disk is being eaten by one volume, by
-  // reading the host's journal after the incident.
+  int64 last_successful_commit_age_ms = 3;
+  int64 unpublished_local_bytes = 4;
+  // published_commit_id is the newest commit this host has published for the volume,
+  // empty while it has published none. It is what the catalog remembers so that a *later*
+  // host can be told the volume has a history — see DesiredVolume.head_commit_id.
   //
-  // chain_depth is how many layers a guest reads through — read amplification, and
-  // §19's compaction trigger. local_disk_bytes is every layer file this volume occupies
-  // here, the tip included and orphans included: it is about the disk, not the chain, so
-  // it is measured by listing the directory rather than walking the record.
-  //
-  // Both are zero for a volume this host is not serving, which is the same shape the two
-  // above take: the report's refusal is what says why.
-  int32 chain_depth = 15;
-  int64 local_disk_bytes = 16;
+  // Not a durability claim and not an authority: the bucket is the authority on what a
+  // commit holds (§5.8), and the only thing this number is ever compared against is the
+  // absence of a HEAD.
+  string published_commit_id = 5;
   // publish_stalled says this host is holding a sealed layer it has tried and failed to
   // get into the object store. It is not a refusal: the guest goes on writing and the
   // volume goes on being served (§15 — "S3 no disponible: la VM sigue"), which is exactly
@@ -441,18 +370,7 @@ message VolumeReport {
   // v6 §11 names the reaction: alarm on the backlog long before that, and stop placing
   // new volumes on the host. This is the fact that reaction is taken on, and it is a
   // fact rather than a threshold — the host tried, and it did not work.
-  bool publish_stalled = 18;
-  // published_commit_id is the newest commit this host has published for the volume,
-  // empty while it has published none. It is what the catalog remembers so that a *later*
-  // host can be told the volume has a history — see DesiredVolume.head_commit_id.
-  //
-  // Not a durability claim and not an authority: the bucket is the authority on what a
-  // commit holds (§5.8), and the only thing this number is ever compared against is the
-  // absence of a HEAD.
-  string published_commit_id = 17;
-  // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
-  // that fails silently stays CREATING forever and nothing ever collects it.
-  string snapshot_error = 9;
+  bool publish_stalled = 6;
 
   // refusal says this host is **not serving** the volume, and why; unset is it saying
   // it is. It is reported for a volume the Agent started and then failed closed on
@@ -466,12 +384,37 @@ message VolumeReport {
   // recorded last-report-wins and qualified by this host and this epoch — see
   // RecordVolumeReport — so a writer the fleet has moved past cannot mark a volume its
   // successor is serving, nor stamp its RPO over the successor's.
-  VolumeRefusal refusal = 10;
+  VolumeRefusal refusal = 7;
   // refusal_detail is the sentence behind it, verbatim from the Agent, empty when
   // there is no refusal. `-fleet-status` prints it and nothing branches on it: it
   // carries the numbers the enum cannot — which sequence was ACKed, which KEK is
   // missing — and those are what an operator's next step is chosen from.
-  string refusal_detail = 11;
+  string refusal_detail = 8;
+
+  // snapshot_id is the pending snapshot this host has finished acting on, empty when
+  // it has nothing to say. The three fields below are one answer and are read
+  // together: an id plus a commit is "published, and this commit is it", an id plus an
+  // error is "FAILED, and here is what an operator needs to read".
+  //
+  // It is reported on the volume's own report rather than through a call of its own
+  // because the report is already the Agent's one channel for "what is true here",
+  // and a second channel would need its own retry, its own ordering against the
+  // watermarks, and its own way of being refused when the host has been fenced.
+  string snapshot_id = 9;
+  // snapshot_commit_id is the commit this snapshot names. A snapshot under v6 is not a
+  // copy of anything: it is a *name for a commit* that is already in the published
+  // history, so taking one costs a rotation and a publish when the tip has unpublished
+  // bytes, and nothing at all when it does not.
+  //
+  // That is the whole of what makes it durable, and it is worth saying because the
+  // v5 answer was the opposite: a snapshot was a manifest the host wrote, and it could
+  // exist while the data it named did not. A commit id can only be reported after
+  // `Commit() → SUCCESS`, which promises the state is reconstructible without this
+  // host — so a snapshot that is reported at all is a snapshot that can be restored.
+  string snapshot_commit_id = 10;
+  // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
+  // that fails silently stays CREATING forever and nothing ever collects it.
+  string snapshot_error = 11;
 }
 
 message ReportVolumeStateRequest {
@@ -492,11 +435,6 @@ enum ReportOutcome {
   REPORT_OUTCOME_NOT_PRIMARY = 3;
   // UNKNOWN_VOLUME: the Control Plane has no such volume.
   REPORT_OUTCOME_UNKNOWN_VOLUME = 4;
-  // 5 was OUT_OF_ORDER, the one refusal a report could earn on its own contents:
-  // published <= durable <= local. It went with the watermarks. Reserved rather than
-  // reused because an Agent built before this change reads an unknown outcome as
-  // "something is wrong with what I sent" and stops reporting.
-  reserved 5;
 }
 
 message VolumeReportResult {

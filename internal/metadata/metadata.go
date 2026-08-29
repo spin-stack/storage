@@ -185,12 +185,6 @@ type Host struct {
 	MaxFormatVersion int32
 	NVMeTotalBytes   int64
 	NVMeUsedBytes    int64
-	// RemoteBacklogBytes is a byte count the host reports about itself (ADR-0013 §1). Every
-	// Agent reports 0 and the column holds 0 fleet-wide, and what replaced it is per volume:
-	// Volume.Progress.UnpublishedLocalBytes, which a host measures against the chain it
-	// holds. Nothing branches on it; removing it is a change to the wire and the schema,
-	// which is why it is written down rather than done in passing.
-	RemoteBacklogBytes int64
 	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by the store
 	// on every read and never stored anywhere (ADR-0017):
 	//
@@ -366,7 +360,7 @@ type Store interface {
 	Now(ctx context.Context) (time.Time, error)
 
 	// UpsertHost registers a host or refreshes what the host itself reports:
-	// agent version, format version, NVMe totals, RemoteBacklogBytes, heartbeat. It
+	// agent version, format version, NVMe totals, heartbeat. It
 	// deliberately does NOT carry the fleet state — that belongs to the Control
 	// Plane (SetHostState),
 	// and a routine heartbeat that carried it would un-cordon a draining host.

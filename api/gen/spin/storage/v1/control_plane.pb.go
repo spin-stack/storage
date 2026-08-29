@@ -341,15 +341,9 @@ type DeviceStatus struct {
 	// disk a guest's writes then cannot use.
 	TotalBytes int64 `protobuf:"varint,1,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`
 	// used_bytes is what is occupied on it right now, by everything.
-	UsedBytes int64 `protobuf:"varint,2,opt,name=used_bytes,json=usedBytes,proto3" json:"used_bytes,omitempty"`
-	// remote_backlog_bytes was the sum, over every volume, of bytes no verified object
-	// covered — a WAL number. Every Agent sends 0 and nothing reads it; what replaced it is
-	// per volume and measured against a chain that exists
-	// (VolumeReport.unpublished_local_bytes). Kept because deleting it is a wire change,
-	// and written down so that it is a decision and not an oversight.
-	RemoteBacklogBytes int64 `protobuf:"varint,3,opt,name=remote_backlog_bytes,json=remoteBacklogBytes,proto3" json:"remote_backlog_bytes,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	UsedBytes     int64 `protobuf:"varint,2,opt,name=used_bytes,json=usedBytes,proto3" json:"used_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DeviceStatus) Reset() {
@@ -392,13 +386,6 @@ func (x *DeviceStatus) GetTotalBytes() int64 {
 func (x *DeviceStatus) GetUsedBytes() int64 {
 	if x != nil {
 		return x.UsedBytes
-	}
-	return 0
-}
-
-func (x *DeviceStatus) GetRemoteBacklogBytes() int64 {
-	if x != nil {
-		return x.RemoteBacklogBytes
 	}
 	return 0
 }
@@ -486,9 +473,14 @@ type HeartbeatResponse struct {
 	LeaseTtlSeconds int32 `protobuf:"varint,1,opt,name=lease_ttl_seconds,json=leaseTtlSeconds,proto3" json:"lease_ttl_seconds,omitempty"`
 	// state is the fleet state the Control Plane holds for this host (§28.1).
 	State HostState `protobuf:"varint,2,opt,name=state,proto3,enum=spin.storage.v1.HostState" json:"state,omitempty"`
-	// term is the Control Plane term that served this heartbeat. It is
-	// informative — the Agent does not guard on it — and exists so an operator
-	// reading an Agent's logs during an incident can see which leader answered.
+	// term is the Control Plane term that served this heartbeat. The Agent does not guard
+	// on it — a term is the Control Plane's own fencing and no decision here is taken
+	// against it — and it logs a line when the number changes, which is the point: a
+	// failover is invisible from a host's journal otherwise, and it is exactly what an
+	// operator needs to correlate against everything that went strange at that minute.
+	//
+	// On change and not per heartbeat: at one line every few seconds it would be noise,
+	// and the fact is a transition rather than a level.
 	Term          int64 `protobuf:"varint,3,opt,name=term,proto3" json:"term,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -653,11 +645,10 @@ type DesiredVolume struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId  string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
 	SizeBytes int64                  `protobuf:"varint,2,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	BlockSize int32                  `protobuf:"varint,3,opt,name=block_size,json=blockSize,proto3" json:"block_size,omitempty"`
 	// epoch is the volume's current epoch (§12.3). Everything the Agent later
 	// reports about this volume is qualified by it.
-	Epoch int64       `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	State VolumeState `protobuf:"varint,5,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
+	Epoch int64       `protobuf:"varint,3,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	State VolumeState `protobuf:"varint,4,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
 	// ancestry is every generation this volume descends from, oldest first and empty for
 	// a volume that was created rather than cloned. The last entry is its own parent.
 	//
@@ -667,7 +658,7 @@ type DesiredVolume struct {
 	// a clone finds nothing under its own id in the object store and serves zeros for
 	// everything its ancestors wrote, which is a volume advertised as a copy and
 	// delivered blank (DEV-0007).
-	Ancestry []*Ancestor `protobuf:"bytes,14,rep,name=ancestry,proto3" json:"ancestry,omitempty"`
+	Ancestry []*Ancestor `protobuf:"bytes,5,rep,name=ancestry,proto3" json:"ancestry,omitempty"`
 	// pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
 	// empty when there is nothing to take. It is the whole trigger: an Agent is never
 	// *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —
@@ -681,7 +672,7 @@ type DesiredVolume struct {
 	// leaves CREATING, so a host that missed the report, restarted, or came back after
 	// a partition converges by doing the same thing again — and doing it again is free,
 	// because the manifest is written create-only (INV-16).
-	PendingSnapshotId string `protobuf:"bytes,9,opt,name=pending_snapshot_id,json=pendingSnapshotId,proto3" json:"pending_snapshot_id,omitempty"`
+	PendingSnapshotId string `protobuf:"bytes,6,opt,name=pending_snapshot_id,json=pendingSnapshotId,proto3" json:"pending_snapshot_id,omitempty"`
 	// head_commit_id is the newest commit any host has told the catalog it published for
 	// this volume, empty for a volume that has never published.
 	//
@@ -702,7 +693,7 @@ type DesiredVolume struct {
 	// has published and whose catalog row does not say so is served exactly as it is
 	// served today. Over-claiming would refuse a volume that is fine, which is why this is
 	// written from what a host reported publishing rather than derived from anything.
-	HeadCommitId string `protobuf:"bytes,15,opt,name=head_commit_id,json=headCommitId,proto3" json:"head_commit_id,omitempty"`
+	HeadCommitId string `protobuf:"bytes,7,opt,name=head_commit_id,json=headCommitId,proto3" json:"head_commit_id,omitempty"`
 	// rpo_target_seconds is how far behind the object store this volume is allowed to
 	// fall: the age at which the host seals its tip and commits it even though the tip
 	// has not reached the size threshold. Zero means the volume has no age trigger and
@@ -722,7 +713,7 @@ type DesiredVolume struct {
 	// nobody writes to does not produce layers, and the age trigger keeps it: the tip
 	// must also have grown past an empty image before age can fire it, so a volume that
 	// wrote nothing is *inside* its target rather than behind it.
-	RpoTargetSeconds int64 `protobuf:"varint,12,opt,name=rpo_target_seconds,json=rpoTargetSeconds,proto3" json:"rpo_target_seconds,omitempty"`
+	RpoTargetSeconds int64 `protobuf:"varint,8,opt,name=rpo_target_seconds,json=rpoTargetSeconds,proto3" json:"rpo_target_seconds,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -767,13 +758,6 @@ func (x *DesiredVolume) GetVolumeId() string {
 func (x *DesiredVolume) GetSizeBytes() int64 {
 	if x != nil {
 		return x.SizeBytes
-	}
-	return 0
-}
-
-func (x *DesiredVolume) GetBlockSize() int32 {
-	if x != nil {
-		return x.BlockSize
 	}
 	return 0
 }
@@ -1014,27 +998,6 @@ type VolumeReport struct {
 	// whose epoch is not the volume's current one is refused: it comes from a
 	// writer that has been fenced.
 	Epoch int64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	// snapshot_id is the pending snapshot this host has finished acting on, empty when
-	// it has nothing to say. The three fields below are one answer and are read
-	// together: an id plus a commit is "published, and this commit is it", an id plus an
-	// error is "FAILED, and here is what an operator needs to read".
-	//
-	// It is reported on the volume's own report rather than through a call of its own
-	// because the report is already the Agent's one channel for "what is true here",
-	// and a second channel would need its own retry, its own ordering against the
-	// watermarks, and its own way of being refused when the host has been fenced.
-	SnapshotId string `protobuf:"bytes,7,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
-	// snapshot_commit_id is the commit this snapshot names. A snapshot under v6 is not a
-	// copy of anything: it is a *name for a commit* that is already in the published
-	// history, so taking one costs a rotation and a publish when the tip has unpublished
-	// bytes, and nothing at all when it does not.
-	//
-	// That is the whole of what makes it durable, and it is worth saying because the
-	// v5 answer was the opposite: a snapshot was a manifest the host wrote, and it could
-	// exist while the data it named did not. A commit id can only be reported after
-	// `Commit() → SUCCESS`, which promises the state is reconstructible without this
-	// host — so a snapshot that is reported at all is a snapshot that can be restored.
-	SnapshotCommitId string `protobuf:"bytes,12,opt,name=snapshot_commit_id,json=snapshotCommitId,proto3" json:"snapshot_commit_id,omitempty"`
 	// The two numbers §28 asks for by name, and the only ones on this message that describe
 	// the *gap* between what a guest has written and what the bucket holds.
 	//
@@ -1051,22 +1014,16 @@ type VolumeReport struct {
 	//
 	// Both are zero for a volume that has never committed on this host, which is a state
 	// and not a measurement; the report's own refusal is what says why.
-	LastSuccessfulCommitAgeMs int64 `protobuf:"varint,13,opt,name=last_successful_commit_age_ms,json=lastSuccessfulCommitAgeMs,proto3" json:"last_successful_commit_age_ms,omitempty"`
-	UnpublishedLocalBytes     int64 `protobuf:"varint,14,opt,name=unpublished_local_bytes,json=unpublishedLocalBytes,proto3" json:"unpublished_local_bytes,omitempty"`
-	// The other two numbers §28 asks for per volume. They were computed on the host and
-	// written to a log line, which is a place nobody alerts on: an operator learns about a
-	// chain forty layers deep, or a host whose disk is being eaten by one volume, by
-	// reading the host's journal after the incident.
+	LastSuccessfulCommitAgeMs int64 `protobuf:"varint,3,opt,name=last_successful_commit_age_ms,json=lastSuccessfulCommitAgeMs,proto3" json:"last_successful_commit_age_ms,omitempty"`
+	UnpublishedLocalBytes     int64 `protobuf:"varint,4,opt,name=unpublished_local_bytes,json=unpublishedLocalBytes,proto3" json:"unpublished_local_bytes,omitempty"`
+	// published_commit_id is the newest commit this host has published for the volume,
+	// empty while it has published none. It is what the catalog remembers so that a *later*
+	// host can be told the volume has a history — see DesiredVolume.head_commit_id.
 	//
-	// chain_depth is how many layers a guest reads through — read amplification, and
-	// §19's compaction trigger. local_disk_bytes is every layer file this volume occupies
-	// here, the tip included and orphans included: it is about the disk, not the chain, so
-	// it is measured by listing the directory rather than walking the record.
-	//
-	// Both are zero for a volume this host is not serving, which is the same shape the two
-	// above take: the report's refusal is what says why.
-	ChainDepth     int32 `protobuf:"varint,15,opt,name=chain_depth,json=chainDepth,proto3" json:"chain_depth,omitempty"`
-	LocalDiskBytes int64 `protobuf:"varint,16,opt,name=local_disk_bytes,json=localDiskBytes,proto3" json:"local_disk_bytes,omitempty"`
+	// Not a durability claim and not an authority: the bucket is the authority on what a
+	// commit holds (§5.8), and the only thing this number is ever compared against is the
+	// absence of a HEAD.
+	PublishedCommitId string `protobuf:"bytes,5,opt,name=published_commit_id,json=publishedCommitId,proto3" json:"published_commit_id,omitempty"`
 	// publish_stalled says this host is holding a sealed layer it has tried and failed to
 	// get into the object store. It is not a refusal: the guest goes on writing and the
 	// volume goes on being served (§15 — "S3 no disponible: la VM sigue"), which is exactly
@@ -1077,18 +1034,7 @@ type VolumeReport struct {
 	// v6 §11 names the reaction: alarm on the backlog long before that, and stop placing
 	// new volumes on the host. This is the fact that reaction is taken on, and it is a
 	// fact rather than a threshold — the host tried, and it did not work.
-	PublishStalled bool `protobuf:"varint,18,opt,name=publish_stalled,json=publishStalled,proto3" json:"publish_stalled,omitempty"`
-	// published_commit_id is the newest commit this host has published for the volume,
-	// empty while it has published none. It is what the catalog remembers so that a *later*
-	// host can be told the volume has a history — see DesiredVolume.head_commit_id.
-	//
-	// Not a durability claim and not an authority: the bucket is the authority on what a
-	// commit holds (§5.8), and the only thing this number is ever compared against is the
-	// absence of a HEAD.
-	PublishedCommitId string `protobuf:"bytes,17,opt,name=published_commit_id,json=publishedCommitId,proto3" json:"published_commit_id,omitempty"`
-	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
-	// that fails silently stays CREATING forever and nothing ever collects it.
-	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
+	PublishStalled bool `protobuf:"varint,6,opt,name=publish_stalled,json=publishStalled,proto3" json:"publish_stalled,omitempty"`
 	// refusal says this host is **not serving** the volume, and why; unset is it saying
 	// it is. It is reported for a volume the Agent started and then failed closed on
 	// (the read view never resolved) and for one it never managed to start at all, which
@@ -1101,12 +1047,36 @@ type VolumeReport struct {
 	// recorded last-report-wins and qualified by this host and this epoch — see
 	// RecordVolumeReport — so a writer the fleet has moved past cannot mark a volume its
 	// successor is serving, nor stamp its RPO over the successor's.
-	Refusal VolumeRefusal `protobuf:"varint,10,opt,name=refusal,proto3,enum=spin.storage.v1.VolumeRefusal" json:"refusal,omitempty"`
+	Refusal VolumeRefusal `protobuf:"varint,7,opt,name=refusal,proto3,enum=spin.storage.v1.VolumeRefusal" json:"refusal,omitempty"`
 	// refusal_detail is the sentence behind it, verbatim from the Agent, empty when
 	// there is no refusal. `-fleet-status` prints it and nothing branches on it: it
 	// carries the numbers the enum cannot — which sequence was ACKed, which KEK is
 	// missing — and those are what an operator's next step is chosen from.
-	RefusalDetail string `protobuf:"bytes,11,opt,name=refusal_detail,json=refusalDetail,proto3" json:"refusal_detail,omitempty"`
+	RefusalDetail string `protobuf:"bytes,8,opt,name=refusal_detail,json=refusalDetail,proto3" json:"refusal_detail,omitempty"`
+	// snapshot_id is the pending snapshot this host has finished acting on, empty when
+	// it has nothing to say. The three fields below are one answer and are read
+	// together: an id plus a commit is "published, and this commit is it", an id plus an
+	// error is "FAILED, and here is what an operator needs to read".
+	//
+	// It is reported on the volume's own report rather than through a call of its own
+	// because the report is already the Agent's one channel for "what is true here",
+	// and a second channel would need its own retry, its own ordering against the
+	// watermarks, and its own way of being refused when the host has been fenced.
+	SnapshotId string `protobuf:"bytes,9,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// snapshot_commit_id is the commit this snapshot names. A snapshot under v6 is not a
+	// copy of anything: it is a *name for a commit* that is already in the published
+	// history, so taking one costs a rotation and a publish when the tip has unpublished
+	// bytes, and nothing at all when it does not.
+	//
+	// That is the whole of what makes it durable, and it is worth saying because the
+	// v5 answer was the opposite: a snapshot was a manifest the host wrote, and it could
+	// exist while the data it named did not. A commit id can only be reported after
+	// `Commit() → SUCCESS`, which promises the state is reconstructible without this
+	// host — so a snapshot that is reported at all is a snapshot that can be restored.
+	SnapshotCommitId string `protobuf:"bytes,10,opt,name=snapshot_commit_id,json=snapshotCommitId,proto3" json:"snapshot_commit_id,omitempty"`
+	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
+	// that fails silently stays CREATING forever and nothing ever collects it.
+	SnapshotError string `protobuf:"bytes,11,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1155,20 +1125,6 @@ func (x *VolumeReport) GetEpoch() int64 {
 	return 0
 }
 
-func (x *VolumeReport) GetSnapshotId() string {
-	if x != nil {
-		return x.SnapshotId
-	}
-	return ""
-}
-
-func (x *VolumeReport) GetSnapshotCommitId() string {
-	if x != nil {
-		return x.SnapshotCommitId
-	}
-	return ""
-}
-
 func (x *VolumeReport) GetLastSuccessfulCommitAgeMs() int64 {
 	if x != nil {
 		return x.LastSuccessfulCommitAgeMs
@@ -1183,27 +1139,6 @@ func (x *VolumeReport) GetUnpublishedLocalBytes() int64 {
 	return 0
 }
 
-func (x *VolumeReport) GetChainDepth() int32 {
-	if x != nil {
-		return x.ChainDepth
-	}
-	return 0
-}
-
-func (x *VolumeReport) GetLocalDiskBytes() int64 {
-	if x != nil {
-		return x.LocalDiskBytes
-	}
-	return 0
-}
-
-func (x *VolumeReport) GetPublishStalled() bool {
-	if x != nil {
-		return x.PublishStalled
-	}
-	return false
-}
-
 func (x *VolumeReport) GetPublishedCommitId() string {
 	if x != nil {
 		return x.PublishedCommitId
@@ -1211,11 +1146,11 @@ func (x *VolumeReport) GetPublishedCommitId() string {
 	return ""
 }
 
-func (x *VolumeReport) GetSnapshotError() string {
+func (x *VolumeReport) GetPublishStalled() bool {
 	if x != nil {
-		return x.SnapshotError
+		return x.PublishStalled
 	}
-	return ""
+	return false
 }
 
 func (x *VolumeReport) GetRefusal() VolumeRefusal {
@@ -1228,6 +1163,27 @@ func (x *VolumeReport) GetRefusal() VolumeRefusal {
 func (x *VolumeReport) GetRefusalDetail() string {
 	if x != nil {
 		return x.RefusalDetail
+	}
+	return ""
+}
+
+func (x *VolumeReport) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *VolumeReport) GetSnapshotCommitId() string {
+	if x != nil {
+		return x.SnapshotCommitId
+	}
+	return ""
+}
+
+func (x *VolumeReport) GetSnapshotError() string {
+	if x != nil {
+		return x.SnapshotError
 	}
 	return ""
 }
@@ -1385,13 +1341,12 @@ var File_spin_storage_v1_control_plane_proto protoreflect.FileDescriptor
 
 const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\n" +
-	"#spin/storage/v1/control_plane.proto\x12\x0fspin.storage.v1\"\x80\x01\n" +
+	"#spin/storage/v1/control_plane.proto\x12\x0fspin.storage.v1\"N\n" +
 	"\fDeviceStatus\x12\x1f\n" +
 	"\vtotal_bytes\x18\x01 \x01(\x03R\n" +
 	"totalBytes\x12\x1d\n" +
 	"\n" +
-	"used_bytes\x18\x02 \x01(\x03R\tusedBytes\x120\n" +
-	"\x14remote_backlog_bytes\x18\x03 \x01(\x03R\x12remoteBacklogBytes\"\xb5\x01\n" +
+	"used_bytes\x18\x02 \x01(\x03R\tusedBytes\"\xb5\x01\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12#\n" +
 	"\ragent_version\x18\x02 \x01(\tR\fagentVersion\x12,\n" +
@@ -1405,20 +1360,17 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"D\n" +
 	"\bAncestor\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1b\n" +
-	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\x93\x03\n" +
+	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\xd0\x02\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\x12\x1d\n" +
-	"\n" +
-	"block_size\x18\x03 \x01(\x05R\tblockSize\x12\x14\n" +
-	"\x05epoch\x18\x04 \x01(\x03R\x05epoch\x122\n" +
-	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x125\n" +
-	"\bancestry\x18\x0e \x03(\v2\x19.spin.storage.v1.AncestorR\bancestry\x12.\n" +
-	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12$\n" +
-	"\x0ehead_commit_id\x18\x0f \x01(\tR\fheadCommitId\x12,\n" +
-	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\r\x10\x0eJ\x04\b\n" +
-	"\x10\vJ\x04\b\v\x10\f\"S\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\x12\x14\n" +
+	"\x05epoch\x18\x03 \x01(\x03R\x05epoch\x122\n" +
+	"\x05state\x18\x04 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x125\n" +
+	"\bancestry\x18\x05 \x03(\v2\x19.spin.storage.v1.AncestorR\bancestry\x12.\n" +
+	"\x13pending_snapshot_id\x18\x06 \x01(\tR\x11pendingSnapshotId\x12$\n" +
+	"\x0ehead_commit_id\x18\a \x01(\tR\fheadCommitId\x12,\n" +
+	"\x12rpo_target_seconds\x18\b \x01(\x03R\x10rpoTargetSeconds\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +
@@ -1430,24 +1382,21 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xd4\x04\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xeb\x03\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
-	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12\x1f\n" +
-	"\vsnapshot_id\x18\a \x01(\tR\n" +
+	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12@\n" +
+	"\x1dlast_successful_commit_age_ms\x18\x03 \x01(\x03R\x19lastSuccessfulCommitAgeMs\x126\n" +
+	"\x17unpublished_local_bytes\x18\x04 \x01(\x03R\x15unpublishedLocalBytes\x12.\n" +
+	"\x13published_commit_id\x18\x05 \x01(\tR\x11publishedCommitId\x12'\n" +
+	"\x0fpublish_stalled\x18\x06 \x01(\bR\x0epublishStalled\x128\n" +
+	"\arefusal\x18\a \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +
+	"\x0erefusal_detail\x18\b \x01(\tR\rrefusalDetail\x12\x1f\n" +
+	"\vsnapshot_id\x18\t \x01(\tR\n" +
 	"snapshotId\x12,\n" +
-	"\x12snapshot_commit_id\x18\f \x01(\tR\x10snapshotCommitId\x12@\n" +
-	"\x1dlast_successful_commit_age_ms\x18\r \x01(\x03R\x19lastSuccessfulCommitAgeMs\x126\n" +
-	"\x17unpublished_local_bytes\x18\x0e \x01(\x03R\x15unpublishedLocalBytes\x12\x1f\n" +
-	"\vchain_depth\x18\x0f \x01(\x05R\n" +
-	"chainDepth\x12(\n" +
-	"\x10local_disk_bytes\x18\x10 \x01(\x03R\x0elocalDiskBytes\x12'\n" +
-	"\x0fpublish_stalled\x18\x12 \x01(\bR\x0epublishStalled\x12.\n" +
-	"\x13published_commit_id\x18\x11 \x01(\tR\x11publishedCommitId\x12%\n" +
-	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
-	"\arefusal\x18\n" +
-	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +
-	"\x0erefusal_detail\x18\v \x01(\tR\rrefusalDetailJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\b\x10\t\"l\n" +
+	"\x12snapshot_commit_id\x18\n" +
+	" \x01(\tR\x10snapshotCommitId\x12%\n" +
+	"\x0esnapshot_error\x18\v \x01(\tR\rsnapshotError\"l\n" +
 	"\x18ReportVolumeStateRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x127\n" +
 	"\avolumes\x18\x02 \x03(\v2\x1d.spin.storage.v1.VolumeReportR\avolumes\"k\n" +
@@ -1478,13 +1427,13 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x15VOLUME_REFUSAL_NO_KEY\x10\x04\x12\x1d\n" +
 	"\x19VOLUME_REFUSAL_LEASE_LOST\x10\x05\x12 \n" +
 	"\x1cVOLUME_REFUSAL_ATTACH_FAILED\x10\x06\x12!\n" +
-	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a*\xb5\x01\n" +
+	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a*\xaf\x01\n" +
 	"\rReportOutcome\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REPORT_OUTCOME_ACCEPTED\x10\x01\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_STALE_EPOCH\x10\x02\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_NOT_PRIMARY\x10\x03\x12!\n" +
-	"\x1dREPORT_OUTCOME_UNKNOWN_VOLUME\x10\x04\"\x04\b\x05\x10\x052\x9b\x03\n" +
+	"\x1dREPORT_OUTCOME_UNKNOWN_VOLUME\x10\x042\x9b\x03\n" +
 	"\x13ControlPlaneService\x12R\n" +
 	"\tHeartbeat\x12!.spin.storage.v1.HeartbeatRequest\x1a\".spin.storage.v1.HeartbeatResponse\x12d\n" +
 	"\x0fGetDesiredState\x12'.spin.storage.v1.GetDesiredStateRequest\x1a(.spin.storage.v1.GetDesiredStateResponse\x12j\n" +

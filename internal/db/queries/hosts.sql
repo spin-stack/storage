@@ -2,13 +2,13 @@
 -- Term-guarded (§7): the INSERT ... SELECT produces no row when the term is stale,
 -- so a zombie CP affects 0 rows.
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $8
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = sqlc.arg(term)
 )
 INSERT INTO hosts (
     host_id, state, agent_version, max_format_version,
-    nvme_total_bytes, nvme_used_bytes, nvme_remote_backlog_bytes, last_heartbeat
+    nvme_total_bytes, nvme_used_bytes, last_heartbeat
 )
-SELECT $1, $2, $3, $4, $5, $6, $7, now()
+SELECT $1, $2, $3, $4, $5, $6, now()
 WHERE EXISTS (SELECT 1 FROM valid)
 -- The conflict path is a heartbeat: it refreshes only what the host knows about
 -- itself. `state` is the Control Plane's (SetHostState) and is deliberately absent —
@@ -21,7 +21,6 @@ ON CONFLICT (host_id) DO UPDATE
       max_format_version = EXCLUDED.max_format_version,
       nvme_total_bytes = EXCLUDED.nvme_total_bytes,
       nvme_used_bytes = EXCLUDED.nvme_used_bytes,
-      nvme_remote_backlog_bytes = EXCLUDED.nvme_remote_backlog_bytes,
       last_heartbeat = now();
 
 -- name: GetHost :one

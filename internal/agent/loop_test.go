@@ -287,12 +287,6 @@ func TestReconcileReportsTheDevicePicture(t *testing.T) {
 	if dev.GetUsedBytes() != 300<<30 {
 		t.Errorf("used_bytes = %d, want %d", dev.GetUsedBytes(), int64(300)<<30)
 	}
-	// The heartbeat used to carry the host's remote backlog. It went with the uploader
-	// (ADR-0026 increment 4.5) and nothing measures what a host would lose mid-session
-	// now — recorded in STATUS.md rather than left to be noticed.
-	if dev.GetRemoteBacklogBytes() != 0 {
-		t.Errorf("remote_backlog_bytes = %d, want 0: nothing reports a backlog", dev.GetRemoteBacklogBytes())
-	}
 }
 
 // TestReconcileReportsEpochQualifiedMeasurements: everything the Agent reports carries
@@ -357,7 +351,7 @@ func TestRefusedReportMarksTheVolumeFenced(t *testing.T) {
 func TestReconcileRecordsDesiredState(t *testing.T) {
 	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 1})
 	h.cp.desired = []*storagev1.DesiredVolume{
-		{VolumeId: "vol-a", SizeBytes: 1 << 30, BlockSize: 4096, Epoch: 3, State: storagev1.VolumeState_VOLUME_STATE_ACTIVE},
+		{VolumeId: "vol-a", SizeBytes: 1 << 30, Epoch: 3, State: storagev1.VolumeState_VOLUME_STATE_ACTIVE},
 	}
 
 	if err := h.loop.Reconcile(t.Context()); err != nil {
