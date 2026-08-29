@@ -64,7 +64,7 @@ type State struct {
 	// published — is derived from Layers, Commits and the tip QEMU has open; this record
 	// only carries the commit id the layer was already promised under, so that a retry
 	// after a restart is the same commit rather than a second one. A lost Pending costs a
-	// duplicate id and never a lost layer; see sealedBelow.
+	// duplicate id and never a lost layer; see SealedBelow.
 	Pending *PendingCommit `json:"pending,omitempty"`
 	// Layers is every layer this host has observed as this volume's tip, newest first.
 	//
@@ -252,10 +252,10 @@ func WriteState(p Paths, root, volumeID string, s State) error {
 	return nil
 }
 
-// recordTip notes that `layerID` is the volume's tip, and reports whether that was news.
+// ObserveTip notes that `layerID` is the volume's tip, and reports whether that was news.
 // The caller writes the file only when it was: an fsync of the file and its directory per
 // heartbeat, for a line already there, is real I/O bought for nothing.
-func (s *State) recordTip(layerID string) bool {
+func (s *State) ObserveTip(layerID string) bool {
 	for _, id := range s.Layers {
 		if id == layerID {
 			return false
@@ -265,7 +265,11 @@ func (s *State) recordTip(layerID string) bool {
 	return true
 }
 
-// sealedBelow is every layer this host has sealed and not published, oldest first.
+// SealedBelow is every layer this host has sealed and not published, oldest first.
+//
+// Exported, with ObserveTip, because the two are the whole of the reconciler's decision
+// and neither touches qemu-img: internal/dst drives them across rotations, a crash and a
+// disk that lies about fsync, which is the half of reconcile a simulation can reach.
 //
 // Derived and not looked up: a layer is sealed exactly when it stops being the tip, and
 // `tip` is an observation, so a crash between the QMP switch and any write to state.json
@@ -277,7 +281,7 @@ func (s *State) recordTip(layerID string) bool {
 // whole backing chain. Layers *above* the tip are skipped rather than sealed: the pointer
 // moves before QEMU is told to switch, so a layer can be recorded that the guest never
 // moved to.
-func (s State) sealedBelow(tip string) []string {
+func (s State) SealedBelow(tip string) []string {
 	published := make(map[string]bool, len(s.Commits))
 	for _, c := range s.Commits {
 		published[c.LayerID] = true

@@ -81,20 +81,17 @@ type compaction struct {
 // would involve. A nil plan and a nil error is a chain that is not due — including every
 // chain when no policy is set.
 //
-// The depth is derived from this host's record rather than from `qemu-img info
-// --backing-chain`, which is the only other source and cannot be used: a guest holds the
-// tip's write lock, so the walk is refused (v6 §5 forbids it anyway). The record can name
-// commits of a chain this host no longer serves — clearFork keeps Commits after a fork is
-// re-derived, so the next rebuild can skip a download — and then the depth over-counts
-// *and* the collapse set names layers the tip does not read through. The second half is
-// the one that matters, because the collapse set is what a human would hand to a convert:
-// establishing that every layer named here is in the tip's backing chain is the first
-// thing the review of an act has to do, and nothing offline can do it from here.
+// The record can name commits of a chain this host no longer serves — clearFork keeps
+// Commits after a fork is re-derived, so the next rebuild can skip a download — and then
+// the collapse set names layers the tip does not read through. That is what matters here,
+// because the collapse set is what a human would hand to a convert: establishing that
+// every layer named is in the tip's backing chain is the first thing the review of an act
+// has to do, and nothing offline can do it from here.
 func planCompaction(p Paths, policy CompactionPolicy, root, volumeID, tip string, st State, virtualSize int64) (*compaction, error) {
 	if !policy.set() {
 		return nil, nil
 	}
-	depth := len(st.Commits) + len(st.sealedBelow(LayerIDOfImage(tip))) + 1
+	depth := chainDepth(st, tip)
 	if policy.AtBytes == 0 && depth < policy.AtLayers {
 		// Depth is free — it comes out of the record — and the bytes are one stat per
 		// layer per volume per cycle. With no size threshold set there is nothing to
@@ -139,6 +136,18 @@ func planCompaction(p Paths, policy CompactionPolicy, root, volumeID, tip string
 		c.writeAtMostBytes = virtualSize
 	}
 	return &c, nil
+}
+
+// chainDepth is how many layers a guest reading the tip reads through: every published
+// commit, every layer sealed under the tip and not published yet, and the tip itself.
+//
+// Derived from this host's record rather than from `qemu-img info --backing-chain`, which
+// is the only other source and cannot be used: a guest holds the tip's write lock, so the
+// walk is refused (v6 §5 forbids it anyway). The record can over-count a chain this host
+// no longer serves — clearFork keeps Commits after a fork is re-derived — which is the
+// direction an operator can act on.
+func chainDepth(st State, tip string) int {
+	return len(st.Commits) + len(st.SealedBelow(LayerIDOfImage(tip))) + 1
 }
 
 // layerBytes is what this volume's layers occupy on this host — v6 §21's

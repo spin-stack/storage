@@ -516,6 +516,8 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			SnapshotCommitId:          v.SnapshotCommitID,
 			LastSuccessfulCommitAgeMs: v.LastCommitAge.Milliseconds(),
 			UnpublishedLocalBytes:     v.UnpublishedLocalBytes,
+			ChainDepth:                int32(v.ChainDepth),
+			LocalDiskBytes:            v.LocalDiskBytes,
 			SnapshotError:             v.SnapshotError,
 			// The one field here that is not a measurement: this host saying it is not
 			// serving the volume, and why. Unset is it saying it is, so a healthy cycle
@@ -523,7 +525,20 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			Refusal:       v.Refusal,
 			RefusalDetail: v.RefusalDetail,
 		})
+		// The same four numbers, exported from the same v that is going on the wire, so a
+		// host cannot report one and scrape another.
+		//
+		// Recorded before the call and not after it: a host that cannot reach the Control
+		// Plane is the host whose commit age is growing, and the scrape is the only
+		// channel it has left. They are measurements of this host, true whether or not
+		// anybody was told.
+		vol := obs.String("volume", v.VolumeID)
+		l.rec.Gauge(ctx, "last_successful_commit_age_seconds", v.LastCommitAge.Seconds(), vol)
+		l.rec.Gauge(ctx, "unpublished_local_bytes", float64(v.UnpublishedLocalBytes), vol)
+		l.rec.Gauge(ctx, "local_chain_depth", float64(v.ChainDepth), vol)
+		l.rec.Gauge(ctx, "local_disk_bytes", float64(v.LocalDiskBytes), vol)
 	}
+
 	resp, err := l.cp.ReportVolumeState(ctx, connect.NewRequest(&storagev1.ReportVolumeStateRequest{
 		HostId:  l.cfg.HostID,
 		Volumes: reports,

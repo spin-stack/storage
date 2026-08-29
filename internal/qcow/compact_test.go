@@ -343,3 +343,101 @@ func TestLocalDiskBytesCountsALayerNoRecordNames(t *testing.T) {
 		t.Errorf("a layer no record names reached the collapse set:\n%s", line)
 	}
 }
+
+// TestTheReportCarriesTheChainAndTheDiskItOccupies. chain_depth and local_disk_bytes are
+// two of §28's numbers, and until now the only place either appeared was the compaction
+// warning — which a host writes when a policy is set and the chain is past it, so a fleet
+// with no policy configured produced neither number anywhere. They are on every report
+// instead, because what an operator alerts on is a chain getting deep, not a chain that
+// is already deep enough to warn about.
+func TestTheReportCarriesTheChainAndTheDiskItOccupies(t *testing.T) {
+	m, _, _, out := deepChain(t, qcow.CompactionPolicy{})
+
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if line := compactionLine(t, out); line != "" {
+		t.Fatalf("no policy is set and the host warned about a compaction anyway: %s", line)
+	}
+
+	got, err := m.Volumes(t.Context())
+	if err != nil {
+		t.Fatalf("Volumes: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("this host holds %d volumes, want 1", len(got))
+	}
+	if got[0].ChainDepth != 4 {
+		t.Errorf("chain depth = %d, want the 4 layers a guest reads through", got[0].ChainDepth)
+	}
+	if got[0].LocalDiskBytes != diskBytes {
+		t.Errorf("local disk bytes = %d, want the %d every layer file of this volume occupies",
+			got[0].LocalDiskBytes, diskBytes)
+	}
+}
+
+// TestAVolumeThisHostIsNotServingOccupiesNothing. A refused volume keeps reporting, and
+// what it must not report is the chain it used to hold: a depth and a byte count beside a
+// refusal read as a host still doing the work.
+func TestAVolumeThisHostIsNotServingOccupiesNothing(t *testing.T) {
+	m, _, _, _ := deepChain(t, qcow.CompactionPolicy{})
+
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if err := m.Fence(t.Context(), []string{vol}, storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST, "the lease lapsed"); err != nil {
+		t.Fatalf("fencing: %v", err)
+	}
+
+	got, err := m.Volumes(t.Context())
+	if err != nil {
+		t.Fatalf("Volumes: %v", err)
+	}
+	if got[0].ChainDepth != 0 || got[0].LocalDiskBytes != 0 {
+		t.Fatalf("a fenced volume reports chain_depth=%d local_disk_bytes=%d, want zeros beside its refusal",
+			got[0].ChainDepth, got[0].LocalDiskBytes)
+	}
+}
+
+// TestTheChainCountsTheLayerARotationSealed. Depth is what a guest reads through, and
+// between a rotation and the commit that publishes it there is one more layer down there
+// than the record of commits names. That window is exactly when the number is interesting
+// — the host is behind — so a depth of "commits plus the tip" is wrong in the direction
+// that hides the problem, and it is a term nothing pinned: the compaction report is silent
+// for a chain that is not due, and silence reads the same whichever way the arithmetic
+// went.
+func TestTheChainCountsTheLayerARotationSealed(t *testing.T) {
+	m, p, _, _ := deepChain(t, qcow.CompactionPolicy{})
+	if err := m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+
+	// A rotation: the guest moved to a new tip, so the layer that was the tip is sealed and
+	// nothing has published it yet.
+	const sealedLayer = "0198c0de-0000-7000-8000-000000000a55"
+	const sealedBytes = 400 << 20
+	image := qcow.LayerImage(root, vol, sealedLayer)
+	p.present[image] = true
+	p.sizes[image] = sealedBytes
+	st, err := qcow.ReadState(p, root, vol)
+	if err != nil {
+		t.Fatalf("reading the state back: %v", err)
+	}
+	st.Layers = []string{layerID, sealedLayer, newestLayer}
+	if err := qcow.WriteState(p, root, vol, st); err != nil {
+		t.Fatalf("recording the rotation: %v", err)
+	}
+
+	got, err := m.Volumes(t.Context())
+	if err != nil {
+		t.Fatalf("Volumes: %v", err)
+	}
+	if got[0].ChainDepth != 5 {
+		t.Errorf("chain depth = %d, want 5: three commits, the layer the rotation sealed, and the tip",
+			got[0].ChainDepth)
+	}
+	if want := int64(diskBytes + sealedBytes); got[0].LocalDiskBytes != want {
+		t.Errorf("local disk bytes = %d, want %d with the sealed layer still on the disk",
+			got[0].LocalDiskBytes, want)
+	}
+}

@@ -49,6 +49,12 @@ const (
 	// EventPut is an object arriving at the store, with the bytes. It is how a checker
 	// asserts on what really left the host instead of on a claim about it.
 	EventPut EventKind = "put"
+	// EventSeal is QEMU switching a volume's guest onto a new tip, which is what makes
+	// the old one a complete, read-only layer. It is a fact about the simulated world
+	// and not about the code under test: noticing it is the reconciler's job, and a
+	// checker that read the reconciler's own record of it could not tell a layer that
+	// was lost from a layer that never existed.
+	EventSeal EventKind = "seal"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -69,6 +75,9 @@ type Event struct {
 	Host           string
 	CommitID       string
 	ParentCommitID string
+	// LayerID is the layer a commit carries, read back from the manifest the protocol
+	// wrote, and on a Seal event the layer that has just stopped being the tip.
+	LayerID string
 	// OK is whether the operation succeeded, for Publish and Put alike.
 	OK bool
 }

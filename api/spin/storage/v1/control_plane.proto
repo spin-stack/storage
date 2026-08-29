@@ -406,6 +406,20 @@ message VolumeReport {
   // and not a measurement; the report's own refusal is what says why.
   int64 last_successful_commit_age_ms = 13;
   int64 unpublished_local_bytes = 14;
+  // The other two numbers §28 asks for per volume. They were computed on the host and
+  // written to a log line, which is a place nobody alerts on: an operator learns about a
+  // chain forty layers deep, or a host whose disk is being eaten by one volume, by
+  // reading the host's journal after the incident.
+  //
+  // chain_depth is how many layers a guest reads through — read amplification, and
+  // §19's compaction trigger. local_disk_bytes is every layer file this volume occupies
+  // here, the tip included and orphans included: it is about the disk, not the chain, so
+  // it is measured by listing the directory rather than walking the record.
+  //
+  // Both are zero for a volume this host is not serving, which is the same shape the two
+  // above take: the report's refusal is what says why.
+  int32 chain_depth = 15;
+  int64 local_disk_bytes = 16;
   // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
   // that fails silently stays CREATING forever and nothing ever collects it.
   string snapshot_error = 9;

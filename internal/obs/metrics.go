@@ -63,7 +63,7 @@ func Catalog() []MetricDesc {
 
 		// --- Fleet (§26.2) ---
 		{"clone_same_host_total", KindCounter, "Same-host clones", nil, nil},
-		{"chain_depth", KindGauge, "Snapshot chain depth", []string{"volume"}, nil},
+		{"chain_depth", KindGauge, "Lineage depth as the catalog holds it: how many clones deep the volume was created", []string{"volume"}, nil},
 
 		// --- The publish path (§28) ---
 		//
@@ -78,6 +78,20 @@ func Catalog() []MetricDesc {
 		{"cas_failures_total", KindCounter, "HEAD compare-and-set failures: this host is no longer the volume's writer", []string{"volume"}, nil},
 		{"recovery_duration_seconds", KindHistogram, "Time to rebuild a volume's published chain on this host", []string{"volume"}, secondsBuckets},
 		{"recovery_download_bytes_total", KindCounter, "Sealed bytes downloaded to rebuild a chain", []string{"volume"}, nil},
+
+		// --- Where each volume stands, recorded on every report (§28) ---
+		//
+		// Gauges and not histograms: each is a level with one current value per volume,
+		// and what an alert asks of them is "is this one above the line right now".
+		{"last_successful_commit_age_seconds", KindGauge, "Time since this host last published a commit for the volume — the RPO if the host is lost now", []string{"volume"}, nil},
+		{"unpublished_local_bytes", KindGauge, "Local bytes the volume has not published yet: what those seconds cost", []string{"volume"}, nil},
+		{"local_disk_bytes", KindGauge, "What the volume's layer files occupy on this host", []string{"volume"}, nil},
+		// Not `chain_depth`, which is already taken by a different number under the same
+		// `volume` label: the Control Plane records the catalog's lineage depth — the one
+		// MaxChainDepth refuses a clone on, capped at 1 — while this is the host counting
+		// the qcow2 layers a guest reads through, which is routinely tens. One name for
+		// both makes every query over it a coin flip on which process last exported.
+		{"local_chain_depth", KindGauge, "Layers of this volume's chain on this host — what a guest reads through", []string{"volume"}, nil},
 	}
 }
 

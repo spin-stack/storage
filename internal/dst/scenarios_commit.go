@@ -96,26 +96,35 @@ func scenarioTwoHostsCannotBothPublish(s *Sim) error {
 	return nil
 }
 
-// publishOne publishes one layer and records what happened, whichever way it went.
-//
-// The event carries the manifest's own parent and the error, not a judgement made here:
-// what the checker reads is what the protocol produced.
+// publishOne publishes one layer of this scenario's volume and returns its commit id.
 func publishOne(ctx context.Context, s *Sim, store objectstore.Store, enc *crypto.Encryption, volumeID, host string, n int) (string, error) {
 	plain := bytes.Repeat([]byte(fmt.Sprintf("layer-%d-of-%s ", n, host)), 512)
-	commitID := ids.NewAt(int64(1<<40+n), s.Rand).String()
-	m, err := commit.Publish(ctx, store, enc, bytes.NewReader(plain), commit.Request{
-		VolumeID: volumeID, CommitID: commitID, LayerID: ids.NewAt(int64(1<<40+100+n), s.Rand).String(),
-		Epoch: int64(n), VirtualSize: 1 << 30,
-	})
-	s.Emit(Event{
-		Kind: EventPublish, Host: host, CommitID: commitID,
-		ParentCommitID: m.ParentCommitID, OK: err == nil,
-		Msg: fmt.Sprintf("host=%s commit=%s parent=%q ok=%t", host, commitID, m.ParentCommitID, err == nil),
-	})
+	m, err := publishLayer(ctx, s, store, enc, host, commit.Request{
+		VolumeID: volumeID, CommitID: ids.NewAt(int64(1<<40+n), s.Rand).String(),
+		LayerID: ids.NewAt(int64(1<<40+100+n), s.Rand).String(),
+		Epoch:   int64(n), VirtualSize: 1 << 30,
+	}, plain)
 	if err != nil {
 		return "", err
 	}
-	return commitID, nil
+	return m.CommitID, nil
+}
+
+// publishLayer runs the publish protocol once and records what happened, whichever way it
+// went. Every scenario that publishes goes through here, so every checker reads one event
+// shape.
+//
+// The event carries the manifest's own parent and layer, not a judgement made here: what
+// the checker reads is what the protocol produced.
+func publishLayer(ctx context.Context, s *Sim, store objectstore.Store, enc *crypto.Encryption, host string, req commit.Request, plain []byte) (commit.Manifest, error) {
+	m, err := commit.Publish(ctx, store, enc, bytes.NewReader(plain), req)
+	s.Emit(Event{
+		Kind: EventPublish, Host: host, CommitID: req.CommitID,
+		ParentCommitID: m.ParentCommitID, LayerID: m.Layer.LayerID, OK: err == nil,
+		Msg: fmt.Sprintf("host=%s commit=%s parent=%q layer=%s ok=%t",
+			host, req.CommitID, m.ParentCommitID, m.Layer.LayerID, err == nil),
+	})
+	return m, err
 }
 
 // volumeKey builds a deterministic DEK bound to the volume. s.Rand is the only source of

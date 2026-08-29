@@ -23,7 +23,7 @@ import (
 // layer is published as the volume's first commit. It is an overlay over the older one,
 // so the commit's bytes do not reconstruct the volume; and once it lands, recordCommit
 // trims Layers at it, which puts the older layer permanently below a published floor
-// where sealedBelow will never look again.
+// where SealedBelow will never look again.
 //
 // The derivation exists to catch exactly this ("found a sealed layer nothing had
 // recorded"); it is simply not consulted while a Pending record is present, and the

@@ -1049,6 +1049,20 @@ type VolumeReport struct {
 	// and not a measurement; the report's own refusal is what says why.
 	LastSuccessfulCommitAgeMs int64 `protobuf:"varint,13,opt,name=last_successful_commit_age_ms,json=lastSuccessfulCommitAgeMs,proto3" json:"last_successful_commit_age_ms,omitempty"`
 	UnpublishedLocalBytes     int64 `protobuf:"varint,14,opt,name=unpublished_local_bytes,json=unpublishedLocalBytes,proto3" json:"unpublished_local_bytes,omitempty"`
+	// The other two numbers §28 asks for per volume. They were computed on the host and
+	// written to a log line, which is a place nobody alerts on: an operator learns about a
+	// chain forty layers deep, or a host whose disk is being eaten by one volume, by
+	// reading the host's journal after the incident.
+	//
+	// chain_depth is how many layers a guest reads through — read amplification, and
+	// §19's compaction trigger. local_disk_bytes is every layer file this volume occupies
+	// here, the tip included and orphans included: it is about the disk, not the chain, so
+	// it is measured by listing the directory rather than walking the record.
+	//
+	// Both are zero for a volume this host is not serving, which is the same shape the two
+	// above take: the report's refusal is what says why.
+	ChainDepth     int32 `protobuf:"varint,15,opt,name=chain_depth,json=chainDepth,proto3" json:"chain_depth,omitempty"`
+	LocalDiskBytes int64 `protobuf:"varint,16,opt,name=local_disk_bytes,json=localDiskBytes,proto3" json:"local_disk_bytes,omitempty"`
 	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
 	// that fails silently stays CREATING forever and nothing ever collects it.
 	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
@@ -1170,6 +1184,20 @@ func (x *VolumeReport) GetLastSuccessfulCommitAgeMs() int64 {
 func (x *VolumeReport) GetUnpublishedLocalBytes() int64 {
 	if x != nil {
 		return x.UnpublishedLocalBytes
+	}
+	return 0
+}
+
+func (x *VolumeReport) GetChainDepth() int32 {
+	if x != nil {
+		return x.ChainDepth
+	}
+	return 0
+}
+
+func (x *VolumeReport) GetLocalDiskBytes() int64 {
+	if x != nil {
+		return x.LocalDiskBytes
 	}
 	return 0
 }
@@ -1393,7 +1421,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xc3\x04\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\x8e\x05\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +
@@ -1405,7 +1433,10 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"snapshotId\x12,\n" +
 	"\x12snapshot_commit_id\x18\f \x01(\tR\x10snapshotCommitId\x12@\n" +
 	"\x1dlast_successful_commit_age_ms\x18\r \x01(\x03R\x19lastSuccessfulCommitAgeMs\x126\n" +
-	"\x17unpublished_local_bytes\x18\x0e \x01(\x03R\x15unpublishedLocalBytes\x12%\n" +
+	"\x17unpublished_local_bytes\x18\x0e \x01(\x03R\x15unpublishedLocalBytes\x12\x1f\n" +
+	"\vchain_depth\x18\x0f \x01(\x05R\n" +
+	"chainDepth\x12(\n" +
+	"\x10local_disk_bytes\x18\x10 \x01(\x03R\x0elocalDiskBytes\x12%\n" +
 	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
 	"\arefusal\x18\n" +
 	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +

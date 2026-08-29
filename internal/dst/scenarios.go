@@ -31,6 +31,7 @@ type MandatoryScenario struct {
 func MandatoryScenarios() []MandatoryScenario {
 	all := coreScenarios()
 	all = append(all, commitScenarios()...)
+	all = append(all, reconcileScenarios()...)
 	all = append(all, fencingScenarios()...)
 	all = append(all, harnessScenarios()...)
 	return all

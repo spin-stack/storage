@@ -31,6 +31,7 @@ type fakeCP struct {
 
 	mu        sync.Mutex
 	err       error // when non-nil every call fails with it
+	reportErr error // when non-nil only ReportVolumeState fails with it
 	leaseTTL  int32
 	state     storagev1.HostState
 	term      int64
@@ -103,6 +104,9 @@ func (f *fakeCP) ReportVolumeState(_ context.Context, req *connect.Request[stora
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.reportErr != nil {
+		return nil, f.reportErr
+	}
 	f.reports = append(f.reports, req.Msg)
 	results := make([]*storagev1.VolumeReportResult, 0, len(req.Msg.GetVolumes()))
 	for _, v := range req.Msg.GetVolumes() {
@@ -130,6 +134,12 @@ func (f *fakeCP) GetVolumeKeys(_ context.Context, req *connect.Request[storagev1
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("no such volume"))
 	}
 	return connect.NewResponse(keys), nil
+}
+
+func (f *fakeCP) setReportErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reportErr = err
 }
 
 func (f *fakeCP) setDesired(vols []*storagev1.DesiredVolume) {

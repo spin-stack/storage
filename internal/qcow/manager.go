@@ -796,7 +796,7 @@ func (m *Manager) reconcile(v *volume) error {
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
 	tip := LayerIDOfImage(v.chain.Active)
-	dirty := st.recordTip(tip)
+	dirty := st.ObserveTip(tip)
 	// Only with a publisher, and only when nothing is already in hand. A host with no
 	// object store configured has nothing to owe: giving it a pending layer would stop it
 	// rotating for ever (v6 §11), which is the one thing rotate's own no-publisher branch
@@ -835,7 +835,7 @@ func (m *Manager) adopt(v *volume, st *State, tip string, dirty *bool) error {
 	// owed underneath it, and a commit whose parent is not in the history yet is a hole
 	// spliced into the chain. Oldest first, always, and the record is consulted only once
 	// the oldest is known.
-	sealed := st.sealedBelow(tip)
+	sealed := st.SealedBelow(tip)
 	if len(sealed) == 0 {
 		return nil
 	}
@@ -1228,35 +1228,59 @@ func (m *Manager) withTimeout(ctx context.Context) (context.Context, context.Can
 	}
 }
 
-// gap is how far behind the object store this volume is: how long since the last commit
-// this host published, and how many local bytes are waiting on the next one.
+// gap is where this volume stands: how far behind the object store it is, and what it
+// costs this host to be there. They are §28's four per-volume numbers.
 //
-// It is the pair §28 asks for, measured on every report rather than kept in a counter. A
-// counter would be a third writer of a fact the disk and state.json already hold.
+// Measured on every report rather than kept in counters. A counter would be a fourth
+// writer of facts the disk and state.json already hold.
 //
 // A volume with no chain — refused, or given up — reports zeros rather than its last known
-// numbers: the refusal is what an operator needs, and a stale byte count beside it invites
-// the reading that the volume is still making progress.
-func (m *Manager) gap(v *volume) (time.Duration, int64) {
+// numbers: the refusal is what an operator needs, and stale numbers beside it invite the
+// reading that the volume is still making progress.
+func (m *Manager) gap(v *volume) volumeGap {
 	if v.chain == nil {
-		return 0, 0
+		return volumeGap{}
 	}
-	var bytes int64
+	g := volumeGap{}
 	if n, err := m.paths.Size(v.chain.Active); err == nil {
-		bytes = n
+		g.unpublishedLocalBytes = n
 	}
 	if v.pending != nil {
 		if n, err := m.paths.Size(v.pending.Path); err == nil {
-			bytes += n
+			g.unpublishedLocalBytes += n
 		}
 	}
+	// The disk's number and not the record's, which is why it is a listing: an orphan
+	// overlay a rotation left behind occupies space no record names. A directory that
+	// cannot be listed leaves it at zero rather than failing the report — every other
+	// number here is still true, and a host that stops reporting is a host that looks
+	// gone.
+	if n, err := layerBytes(m.paths, m.cfg.Root, v.id); err == nil {
+		g.localDiskBytes = n
+	}
 	st, err := ReadState(m.paths, m.cfg.Root, v.id)
-	if err != nil || st.LastCommitAt == 0 {
+	if err != nil {
+		// The record is unreadable; the tip on disk is still one layer a guest reads
+		// through, and claiming zero depth for a chain that exists would be worse.
+		g.chainDepth = 1
+		return g
+	}
+	g.chainDepth = chainDepth(st, v.chain.Active)
+	if st.LastCommitAt == 0 {
 		// Never committed here. Zero is the honest answer: an age measured from an anchor
 		// this host invented would read as an RPO somebody could rely on.
-		return 0, bytes
+		return g
 	}
-	return time.Duration(m.clk.Wall().UnixMilli()-st.LastCommitAt) * time.Millisecond, bytes
+	g.lastCommitAge = time.Duration(m.clk.Wall().UnixMilli()-st.LastCommitAt) * time.Millisecond
+	return g
+}
+
+// volumeGap is what one report says about one volume beyond its identity.
+type volumeGap struct {
+	lastCommitAge         time.Duration
+	unpublishedLocalBytes int64
+	chainDepth            int
+	localDiskBytes        int64
 }
 
 // Volumes reports what this host is holding, ordered by volume id (deterministic).
@@ -1272,7 +1296,7 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 
 	out := make([]agent.VolumeStatus, 0, len(m.vols))
 	for _, v := range m.vols {
-		age, unpublished := m.gap(v)
+		g := m.gap(v)
 		out = append(out, agent.VolumeStatus{
 			VolumeID:         v.id,
 			Epoch:            v.epoch,
@@ -1282,8 +1306,10 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 			// Measured here rather than tracked, because a tracked number is one more
 			// thing that can be wrong: the tip's size and the sealed layer's are on the
 			// disk, and the last commit's time is in state.json.
-			LastCommitAge:         age,
-			UnpublishedLocalBytes: unpublished,
+			LastCommitAge:         g.lastCommitAge,
+			UnpublishedLocalBytes: g.unpublishedLocalBytes,
+			ChainDepth:            g.chainDepth,
+			LocalDiskBytes:        g.localDiskBytes,
 			Refusal:               v.refusal,
 			// Empty when there is no refusal, which is what the wire's healthy value is.
 			RefusalDetail: v.detail,

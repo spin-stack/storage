@@ -64,9 +64,10 @@ system has no equivalent of vSphere's datastore lock.
 1. **A clone of a clone is refused, and raising that needs the walk to recurse.**
    `RestoreFrom` rebuilds one ancestor, so `MaxChainDepth` is 1. Lifting it means the
    Control Plane sending the whole ancestry and recovery walking it.
-2. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
-   while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
-   implementation of it. They belong in `internal/qcow`'s adversary lane.
+2. **Compaction still cannot run twice.** The plan and the report are in; the act is not,
+   because nothing rebases the local chain onto a new root — a second collapse is refused
+   for ever with the message a genuine fork produces. Fix that first.
+3. **The GC deletes nothing.** The report is in; the delete is not.
 
 ## What only a pilot can answer
 
@@ -92,9 +93,8 @@ system has no equivalent of vSphere's datastore lock.
 - **Nothing reclaims local disk.** Released volumes keep their layers, published layers
   keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
   never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.
-- **§28's numbers reach no consumer.** Seven are recorded and scrapeable; the two on the
-  wire (`last_successful_commit_age`, `unpublished_local_bytes`) reach no alert or cordon,
-  and nothing measures attachment.
+- **§28's numbers reach no consumer.** Eleven are recorded and scrapeable and four are on
+  the wire; none reaches an alert or a cordon, and nothing measures attachment.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
   DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
   expiring the descriptor's non-current versions.

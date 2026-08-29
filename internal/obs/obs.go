@@ -109,9 +109,9 @@ func (p *Provider) CollectedMetrics(ctx context.Context) (map[string]bool, error
 // GaugeValues cannot answer for a family with more than one label set: it keys by metric
 // name, so the last data point the SDK happens to hand back wins and which one that is is
 // not defined anywhere. That is harmless only for a gauge with one series per process,
-// and neither gauge in the catalogue is one: `chain_depth` has a series per volume and
-// `lease_remaining_seconds` one per host, so reading either by name alone would be
-// asserting on a coin flip and calling it evidence.
+// and no gauge in the catalogue is one: every per-volume gauge has a series per volume
+// and `lease_remaining_seconds` one per host, so reading any of them by name alone would
+// be asserting on a coin flip and calling it evidence.
 func (p *Provider) GaugeSeries(ctx context.Context, name string) (map[string]float64, error) {
 	var rm metricdata.ResourceMetrics
 	if err := p.reader.Collect(ctx, &rm); err != nil {

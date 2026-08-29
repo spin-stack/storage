@@ -61,6 +61,11 @@ type VolumeStatus struct {
 	// its cost; see the proto, which carries the reasoning.
 	LastCommitAge         time.Duration
 	UnpublishedLocalBytes int64
+	// ChainDepth is how many layers a guest reads through and LocalDiskBytes is what
+	// this volume's layer files occupy on this host. They were computed here and written
+	// to a log line, which no alert reads; see the proto.
+	ChainDepth     int
+	LocalDiskBytes int64
 	// SnapshotError is why it could not be taken. A snapshot that fails silently stays
 	// CREATING in the catalog forever.
 	SnapshotError string

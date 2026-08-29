@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-// These are in the package because what they test is the derivation itself, and the
-// derivation is not exported: what a caller can see is a layer being offered for
-// publishing, which internal/qcow's adversary tests assert through the Manager. This is
-// the same rule stated once, on its own, where a case can be added as a struct literal.
+// These are in the package because what they test is one call, case by case, where a case
+// is a struct literal. What the derivation does over a run — rotations, a crash, a
+// publisher — is asserted through the Manager by this package's adversary tests, and over
+// simulated I/O by internal/dst's no-sealed-layer-is-chained-past.
 func TestSealedLayersAreDerivedFromTheTipAndTheCommits(t *testing.T) {
 	t.Parallel()
 	commit := func(layers ...string) []CommitLayer {
@@ -70,12 +70,12 @@ func TestSealedLayersAreDerivedFromTheTipAndTheCommits(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := tt.state.sealedBelow(tt.tip)
+			got := tt.state.SealedBelow(tt.tip)
 			if len(got) == 0 && len(tt.want) == 0 {
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("sealedBelow(%q) = %v, want %v", tt.tip, got, tt.want)
+				t.Errorf("SealedBelow(%q) = %v, want %v", tt.tip, got, tt.want)
 			}
 		})
 	}
@@ -88,13 +88,13 @@ func TestSealedLayersAreDerivedFromTheTipAndTheCommits(t *testing.T) {
 func TestTheTipIsRecordedOnceAndTheListIsBounded(t *testing.T) {
 	t.Parallel()
 	var st State
-	if !st.recordTip("a") {
+	if !st.ObserveTip("a") {
 		t.Fatal("the first tip was not news")
 	}
-	if st.recordTip("a") {
+	if st.ObserveTip("a") {
 		t.Error("the same tip was written down a second time")
 	}
-	st.recordTip("b")
+	st.ObserveTip("b")
 	if want := []string{"b", "a"}; !reflect.DeepEqual(st.Layers, want) {
 		t.Fatalf("the list is %v, want %v — newest first", st.Layers, want)
 	}

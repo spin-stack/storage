@@ -62,6 +62,8 @@ var pinnedMandatorySet = []string{
 	// core (scenarios.go)
 	"clock-drift-beyond-skew",
 	"network-partition",
+	// reconcile (scenarios_reconcile.go)
+	"no-sealed-layer-is-chained-past",
 	// fencing (scenarios_fencing.go)
 	"an-isolated-host-keeps-its-guest",
 	// harness (scenarios_harness.go)

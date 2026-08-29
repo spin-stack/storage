@@ -23,8 +23,8 @@ import (
 // revalidates itself over it. The fault is injected into the simulated I/O or into how
 // the code under test is built — never into the code itself.
 //
-// Every checker still has one, and there is one checker: see coreCheckers for why the
-// other three left with the engine that emitted their events, and what brings them back.
+// Every checker still has one: see coreCheckers for why three left with the engine that
+// emitted their events, and what brings them back.
 // TestPlantedBugCoverageIsNotSilentlyWeakened pins the count, so a checker quietly
 // downgraded to a hand-written Emit fails there rather than disappearing into the
 // absence of a test.
@@ -122,8 +122,9 @@ const (
 // for, proved by hand-written Emits, is precisely the fiction the paragraph above
 // describes — the same shape, arrived at from the other direction.
 var plantedProofs = map[string]proofKind{
-	"monotonic-clock":         proofBehavioural,
-	"effective-single-writer": proofBehavioural,
+	"monotonic-clock":                    proofBehavioural,
+	"effective-single-writer":            proofBehavioural,
+	"sealed-layers-publish-oldest-first": proofBehavioural,
 }
 
 // proven records which checkers a plantedBug call actually exercised in this run.
@@ -213,8 +214,14 @@ func TestEveryCheckerHasAPlantedBugProof(t *testing.T) {
 //     — injected into the simulated store and not into the protocol, and the scenario
 //     that carries it is two hosts racing to publish onto one HEAD. This is the entry
 //     that was fiction in 2026-08-03's audit; it is not fiction now.
+//
+//   - 2026-08-29, +1: `sealed-layers-publish-oldest-first`, the reconciler's derivation.
+//     Its planted bug is a disk that acknowledges an fsync it does not honour, injected
+//     into the simulated disk, and the power failure that then rolls state.json back a
+//     version. Behavioural: the production derivation reads the rolled-back record, finds
+//     the layer between the two lost writes nowhere in it, and publishes past it.
 func TestPlantedBugCoverageIsNotSilentlyWeakened(t *testing.T) {
-	const wantBehavioural = 2
+	const wantBehavioural = 3
 	got := 0
 	var literal []string
 	for name, kind := range plantedProofs {
@@ -250,4 +257,28 @@ func TestSingleWriterCheckerCatchesAdvisoryPreconditions(t *testing.T) {
 		s.Emit(Event{Kind: EventFault, Msg: "the object store's conditional writes are advisory"})
 		return scenarioTwoHostsCannotBothPublish(s)
 	})
+}
+
+// A layer that was sealed and never published is a hole in the history that nothing
+// reports: every manifest on the chain is well formed, every digest matches, every object
+// is there, and the guest writes that were in the skipped layer are gone. The derivation
+// is what stands between the system and that — a layer is sealed because it is under the
+// tip, not because a record says so.
+//
+// The planted bug is the disk telling the truth about everything except durability: a
+// volatile write cache with no flush, so state records are acknowledged and not
+// persisted, and then a power failure. It reaches the derivation the only way anything
+// can, through what is left on disk, and it is a fault of the device and not an edit to
+// the code under test.
+//
+// What makes it a real proof: the crash on its own is survivable and the unplanted run
+// proves it — the tip is re-observed on the way back up and the layers under it are still
+// owed. With the acknowledged writes gone, the layer between them is in no record, no
+// error is returned anywhere, and the next commit is published straight past it. The only
+// surviving evidence is the order the layers left the host in, which is what the checker
+// reads.
+func TestSealOrderCheckerCatchesALostFsync(t *testing.T) {
+	const seed = 20260829
+	requirePasses(t, seed, NewSealOrderChecker(), reconcileScenario(false))
+	plantedBug(t, seed, NewSealOrderChecker(), "sealed-layers-publish-oldest-first", reconcileScenario(true))
 }
