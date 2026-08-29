@@ -18,41 +18,39 @@ import (
 )
 
 // MaxChainDepth is the deepest lineage this Control Plane will create. A volume that was
-// created rather than cloned is at depth 0, so one clone link is admitted above a root and
-// a clone of a clone is refused.
+// created rather than cloned is at depth 0.
 //
-// What a link costs at attach, measured against the code that pays it and pinned by
-// recovery.TestWhatOneChainLinkCostsAtAttach, which asserts the exact requests: an ancestor
-// costs two object-store GETs per commit in *its own* history — one manifest, one layer —
-// and no fixed per-link cost at all, because the parent is rebuilt to the commit the
-// snapshot names and its HEAD is deliberately never read. Depth is therefore not the
-// variable: one link over a forty-commit ancestor costs twenty times one link over a
-// two-commit ancestor, and what would bound both is §19's compaction, which nothing in
-// this tree implements yet — not this number.
+// The number is the depth a restore can still serve, and one measurement sets it.
+// recovery.maxRestoreDepth refuses a rebuild that would put more than 256 layers under one
+// volume, which is where the measured QEMU ceiling sits — 301 layers open in both qemu-img
+// and qemu-system at one file descriptor and ~140 KiB of RSS each, in *every* process that
+// opens the chain. That budget is spent across the whole lineage, because a rebuilt clone
+// is one image whose backing chain is every generation's layers end to end. Each
+// generation costs at least one layer (a snapshot names a commit, and a commit carries a
+// layer), so a lineage at depth 256 can be attached only while every ancestor holds
+// exactly one commit and the volume itself has published nothing — and its first commit
+// takes it over. 255 is the deepest lineage that survives its own first commit, so that is
+// the ceiling.
 //
-// What QEMU pays is per backing *file* for the same reason, and recovery.maxRestoreDepth
-// holds that measurement: 301 layers open in both qemu-img and qemu-system at one
-// descriptor and ~140 KiB of RSS each. What a guest read costs per backing file it crosses
-// is not measured anywhere and cannot be measured from here — it needs a real guest, so it
-// belongs in the guest lane and is not guessed at.
+// What it is *not* is a cost bound, and nothing here pretends otherwise. An ancestor costs
+// two object-store GETs per commit in its own history — one manifest, one layer — pinned
+// by recovery.TestWhatOneChainLinkCostsAtAttach, with no fixed per-link cost, because each
+// generation is rebuilt to the commit its snapshot names and its HEAD is deliberately never
+// read. One link over a forty-commit ancestor costs twenty times one link over a two-commit
+// one, and what would bound both is §19's compaction, which nothing in this tree implements
+// yet. What a guest read costs per backing file it crosses is not measured anywhere and
+// cannot be measured from here — it needs a real guest, so it belongs in the guest lane and
+// is not guessed at.
 //
-// What sets it is not a cost. Recovery rebuilds exactly one ancestor: qcow.Lineage carries
-// one parent, cpserver fills it from the snapshot row, RestoreFrom does not recurse, and a
-// clone's own published commits are overlays over a base no manifest of theirs names. A
-// depth-2 clone re-placed on a host that holds nothing therefore rebuilds a chain missing
-// everything its grandparent wrote and reports success
-// (recovery.TestARestoreReadsOneAncestorAndStops).
-//
-// So the ceiling is the depth this system can actually serve, and it stays there until the
-// walk learns the whole ancestry — which needs the Control Plane to send it, since the
-// Agent is told and cannot look a lineage up (ADR-0021). It was 5 while nothing had
-// measured what recovery does; a ceiling that admits four links no restore can rebuild is
-// worse than no ceiling, because it reads as a decision somebody made.
+// It was 1 while recovery rebuilt exactly one ancestor and a deeper clone came back missing
+// everything its grandparent wrote, with no error anywhere; the walk now follows the whole
+// ancestry the Control Plane sends (recovery.TestARestoreRebuildsEveryGeneration), which is
+// what moved the number.
 //
 // Rejected: a flag on cmd/control-plane. A ceiling an operator can raise per invocation is
 // one that gets raised during the incident it exists to prevent, and the number only means
 // anything if every clone in the fleet was admitted against the same one.
-const MaxChainDepth = 1
+const MaxChainDepth = 255
 
 // ErrChainTooDeep is what a clone past MaxChainDepth is refused with. A sentinel because a
 // caller has to tell "you are at the ceiling", which is about the lineage and is answered by

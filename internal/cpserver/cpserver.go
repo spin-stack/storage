@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"connectrpc.com/connect"
@@ -160,36 +161,68 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			// commits on the host's size threshold alone; the Agent reads it that way.
 			RpoTargetSeconds: int64(v.RPOTargetSeconds),
 		}
-		// A clone reads through its parent's objects (§20), and the Agent cannot look
-		// the chain up itself (ADR-0021). The parent's *volume* id lives on the
-		// snapshot row, so it is read here — one lookup per clone, on a path that
-		// already reads the volume — rather than duplicated into volumes, where it
-		// could disagree with the snapshot it names.
+		// A clone reads through its ancestors' objects (§20), and the Agent cannot look
+		// the chain up itself (ADR-0021), so the whole lineage is spelled out here.
 		if v.ParentSnapshotID != "" {
-			snap, serr := s.md.GetSnapshot(ctx, v.ParentSnapshotID)
-			if serr != nil {
+			ancestry, aerr := s.ancestry(ctx, v)
+			if aerr != nil {
 				// Refused, not degraded: a clone served without its chain reads zeros,
 				// and zeros are indistinguishable from a volume nobody wrote to.
-				return nil, rpcError(fmt.Errorf("cpserver: volume %s names parent snapshot %s: %w",
-					v.VolumeID, v.ParentSnapshotID, serr))
+				return nil, rpcError(aerr)
 			}
-			// A clone of a snapshot that names no commit is a clone of nothing. The
-			// column's CHECK says a PUBLISHED snapshot has one, so this is the CREATING
-			// case: the host that owns the parent has not finished taking it. Refused
-			// rather than served, for the reason above — a clone with no chain reads
-			// zeros, and zeros look exactly like a volume nobody wrote to.
-			if snap.CommitID == "" {
-				return nil, rpcError(fmt.Errorf("cpserver: volume %s clones snapshot %s, which is %s and names no commit",
-					v.VolumeID, v.ParentSnapshotID, snap.State))
-			}
-			d.ParentSnapshotId = v.ParentSnapshotID
-			d.ParentVolumeId = snap.VolumeID
-			d.ParentCommitId = snap.CommitID
+			d.Ancestry = ancestry
 		}
 		d.PendingSnapshotId = oldestPending[v.VolumeID]
 		out = append(out, d)
 	}
 	return connect.NewResponse(&storagev1.GetDesiredStateResponse{Volumes: out}), nil
+}
+
+// ancestry spells out every generation a clone descends from, oldest first, so the Agent
+// can rebuild them in that order. It walks the catalog the way the lineage was written:
+// a volume's row names its parent snapshot, that snapshot's row names the volume it was
+// taken of and the commit it froze, and that volume's row names *its* parent snapshot.
+//
+// Two reads per generation on a path that already reads the volume. Rejected: following
+// snapshots.parent_snapshot_id instead, which is one read per generation — it is the
+// same link copied onto the snapshot when it was requested, and a lineage assembled out
+// of copies is a lineage that can disagree with the volumes it names.
+//
+// The walk is bounded by the depth the catalog recorded for the volume, so a lineage that
+// loops is refused rather than followed for ever. A refusal here fails the whole desired
+// state for the host: an incomplete ancestry is a chain missing the bytes of whichever
+// generation was dropped, and a guest boots that without noticing.
+func (s *Server) ancestry(ctx context.Context, v metadata.Volume) ([]*storagev1.Ancestor, error) {
+	var newestFirst []*storagev1.Ancestor
+	for cur := v; cur.ParentSnapshotID != ""; {
+		if len(newestFirst) >= int(v.ChainDepth) {
+			return nil, fmt.Errorf("cpserver: volume %s is at depth %d and its lineage does not end there; the catalog's clone links form a cycle or a longer chain than the depth it recorded",
+				v.VolumeID, v.ChainDepth)
+		}
+		snap, err := s.md.GetSnapshot(ctx, cur.ParentSnapshotID)
+		if err != nil {
+			return nil, fmt.Errorf("cpserver: volume %s names parent snapshot %s: %w",
+				cur.VolumeID, cur.ParentSnapshotID, err)
+		}
+		// A clone of a snapshot that names no commit is a clone of nothing. The column's
+		// CHECK says a PUBLISHED snapshot has one, so this is the CREATING case: the host
+		// that owns that volume has not finished taking it.
+		if snap.CommitID == "" {
+			return nil, fmt.Errorf("cpserver: volume %s clones snapshot %s, which is %s and names no commit",
+				cur.VolumeID, cur.ParentSnapshotID, snap.State)
+		}
+		newestFirst = append(newestFirst, &storagev1.Ancestor{
+			VolumeId: snap.VolumeID, CommitId: snap.CommitID,
+		})
+		parent, err := s.md.GetVolume(ctx, snap.VolumeID)
+		if err != nil {
+			return nil, fmt.Errorf("cpserver: snapshot %s was taken of volume %s: %w",
+				snap.SnapshotID, snap.VolumeID, err)
+		}
+		cur = parent
+	}
+	slices.Reverse(newestFirst)
+	return newestFirst, nil
 }
 
 // GetVolumeKeys hands one volume's wrapped DEK to the host that writes it.

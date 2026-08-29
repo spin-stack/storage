@@ -130,6 +130,18 @@ message GetDesiredStateRequest {
   string host_id = 1;
 }
 
+// Ancestor is one generation of a volume's lineage.
+message Ancestor {
+  // volume_id is the volume whose published objects carry this generation's bytes, and
+  // whose id their layers were sealed under (the nonce binds it, so a descendant opens
+  // them with its own copy of the shared DEK and this volume's binding).
+  string volume_id = 1;
+  // commit_id is the commit in that volume's history the descendant starts from — the
+  // commit its snapshot named, not that volume's HEAD, which is whatever it has
+  // published since. Reading HEAD would deliver Thursday for a clone of Tuesday.
+  string commit_id = 2;
+}
+
 // DesiredVolume is one volume this host should be serving.
 message DesiredVolume {
   string volume_id = 1;
@@ -146,30 +158,22 @@ message DesiredVolume {
   // an enum, and a new field with a different type at the same number is the one
   // way a wire format lies to a reader that is otherwise doing everything right.
   reserved 6;
-  // parent_snapshot_id and parent_volume_id name the snapshot this volume was
-  // cloned from (§20), and the volume that snapshot belongs to. Both empty for a
-  // volume that was created rather than cloned.
+  // 7, 8 and 13 were `parent_snapshot_id`, `parent_volume_id` and
+  // `parent_commit_id`: one generation of lineage, which is all a rebuild could walk.
+  // `ancestry` carries every generation instead. Reserved rather than reused because a
+  // peer built before this change reads field 8 as the volume it must restore under,
+  // and one ancestor out of three is a chain missing everything the older ones wrote.
+  reserved 7, 8, 13;
+  // ancestry is every generation this volume descends from, oldest first and empty for
+  // a volume that was created rather than cloned. The last entry is its own parent.
   //
-  // They are on the wire because the Agent has to be *told*: ADR-0021 keeps it from
-  // knowing what a Control Plane is, so it cannot look either of them up. Without
-  // them a clone starts an empty WAL under its own id, finds nothing under that id
-  // in the object store, and serves zeros for everything its parent ever wrote —
-  // which is a volume advertised as a copy and delivered blank (DEV-0007).
-  //
-  // The volume id is carried rather than derived for the same reason: it lives on
-  // the snapshot row, which is one lookup the Agent cannot perform.
-  string parent_snapshot_id = 7;
-  string parent_volume_id = 8;
-  // parent_commit_id is the commit that snapshot names — the exact point in the parent's
-  // published history this clone starts from. Empty for a volume that was created rather
-  // than cloned.
-  //
-  // It is on the wire for the reason the two ids above are: the Agent is a thing that is
-  // told (ADR-0021), and this one lives on the snapshot row, which is a lookup it cannot
-  // perform. Without it a clone would have to read the parent's HEAD, which is whatever
-  // the parent has published *since* — a clone of "the volume as it was on Tuesday" that
-  // silently delivers Thursday.
-  string parent_commit_id = 13;
+  // It is on the wire because the Agent has to be *told*: ADR-0021 keeps it from knowing
+  // what a Control Plane is, so it cannot look a lineage up — the walk from a clone's
+  // row to its parent snapshot to that snapshot's volume is a catalog read. Without it
+  // a clone finds nothing under its own id in the object store and serves zeros for
+  // everything its ancestors wrote, which is a volume advertised as a copy and
+  // delivered blank (DEV-0007).
+  repeated Ancestor ancestry = 14;
   // pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
   // empty when there is nothing to take. It is the whole trigger: an Agent is never
   // *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —

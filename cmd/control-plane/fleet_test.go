@@ -164,7 +164,7 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 
 	// The volume nobody serves, and the count in the header that answers the question
 	// on its own.
-	mustSay(t, out, "VOLUMES (3, 1 with no primary host, 1 at the depth ceiling of 1")
+	mustSay(t, out, "VOLUMES (3, 1 with no primary host, 1 at the depth ceiling of "+strconv.Itoa(controlplane.MaxChainDepth))
 	if got, want := row(t, out, strandedVol),
 		[]string{strandedVol, "-", "DETACHED", "9", "2.0GiB", "0", "-"}; !equal(got, want) {
 		t.Errorf("unplaced volume row = %v, want %v", got, want)

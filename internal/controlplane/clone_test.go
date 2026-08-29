@@ -476,63 +476,82 @@ func TestACloneOpensItsParentsPublishedLayers(t *testing.T) {
 	}
 }
 
-// TestACloneOfACloneIsRefused pins the ceiling to what a restore can actually rebuild.
+// TestACloneOfACloneCarriesTheWholeLineagesKey.
 //
-// Recovery walks exactly one ancestor: qcow.Lineage carries one parent, cpserver fills it
-// from the snapshot row, and RestoreFrom does not recurse. A depth-2 clone re-placed on a
-// host holding nothing therefore comes back missing everything its grandparent wrote —
-// and says it succeeded, which is the failure this refusal exists to make impossible.
+// A grandchild is admitted now that a restore walks every generation, and the assertion
+// that matters is not the depth column: it is that the key the catalog hands the
+// grandchild opens the layers the *root* sealed, two rewraps ago. Each rewrap opens the
+// previous volume's wrapped DEK and seals the same bytes under the new id, so a rewrap
+// that minted a fresh key instead would leave a lineage whose oldest generation nothing
+// can read — and every check on rows, depths and descriptors would still pass.
 //
-// The assertion is on the sentinel and on the catalog, not only on the error: a clone
-// refused after its row was written is a volume nobody can serve and nothing will collect.
-func TestACloneOfACloneIsRefused(t *testing.T) {
+// The nonce binding is the other half and is asserted the same way: the layer is opened
+// with the grandchild's key bound to the *root's* id, because crypto.layerNonce binds the
+// volume that sealed it.
+func TestACloneOfACloneCarriesTheWholeLineagesKey(t *testing.T) {
 	ctx := t.Context()
 	md, store, term := cpStore(t)
 	kms := testKMS(t)
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
 	if err := md.CreateVolume(ctx, term, metadata.Volume{
-		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536,
-		State: lifecycle.VolumeActive, ChainDepth: 0,
-		DEKWrapped: wrapFor(t, kms, parentVol, 42), KEKID: "kek-test", DEKKeyID: 42,
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536, DEKKeyID: 1,
+		State: lifecycle.VolumeActive, DEKWrapped: wrapFor(t, kms, parentVol, 1), KEKID: "kek-test",
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, CommitID: ids.New().String(),
-		State: lifecycle.SnapshotPublished, RequestID: reqID,
-	}); err != nil {
+	createSnapshot(t, md, term, cloneHostA)
+
+	// The root publishes one layer, sealed with its own DEK bound to its own id.
+	rootRow, err := md.GetVolume(ctx, parentVol)
+	if err != nil {
 		t.Fatal(err)
 	}
-	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
+	rootU, err := ids.Parse(parentVol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootEnc, err := crypto.NewEncryption(unwrapOf(t, kms, rootRow), [16]byte(rootU))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := bytes.Repeat([]byte("what the oldest volume wrote"), 4096)
+	m, err := commit.Publish(ctx, store, rootEnc, bytes.NewReader(plain), commit.Request{
+		VolumeID: parentVol, CommitID: ids.New().String(), LayerID: ids.New().String(),
+		Epoch: 1, VirtualSize: 1 << 30,
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
 
-	first, err := controlplane.Clone(ctx, md, store, kms, &ramp{},
-		placement.Policy{}, nil, term, snapID, cloneVol)
+	middle, err := controlplane.Clone(ctx, md, store, kms, &ramp{}, placement.Policy{}, nil, term, snapID, cloneVol)
 	if err != nil {
 		t.Fatalf("cloning a root: %v", err)
 	}
-	if first.ChainDepth != 1 {
-		t.Fatalf("the first clone is at depth %d, want 1", first.ChainDepth)
+	deeper := publishSnapshotOf(t, md, term, middle.VolumeID)
+	grandchild, err := controlplane.Clone(ctx, md, store, kms, &ramp{},
+		placement.Policy{}, nil, term, deeper, ids.New().String())
+	if err != nil {
+		t.Fatalf("cloning a clone: %v", err)
+	}
+	if grandchild.ChainDepth != 2 {
+		t.Errorf("the grandchild is at depth %d, want 2", grandchild.ChainDepth)
+	}
+	if grandchild.ParentVolumeID != middle.VolumeID || grandchild.ParentSnapshotID != deeper {
+		t.Errorf("the grandchild's row names parent volume %q at snapshot %q, want %q at %q",
+			grandchild.ParentVolumeID, grandchild.ParentSnapshotID, middle.VolumeID, deeper)
 	}
 
-	// A snapshot of the clone, and a clone of that.
-	deeper := ids.New().String()
-	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
-		SnapshotID: deeper, VolumeID: first.VolumeID, Epoch: 1, CommitID: ids.New().String(),
-		SourceHostID: cloneHostA, State: lifecycle.SnapshotPublished, RequestID: ids.New().String(),
-	}); err != nil {
+	// The grandchild's Agent: unwrap what the catalog holds for the grandchild, then bind
+	// it to the volume whose layer it is about to read — the root's, two generations down.
+	readView, err := crypto.NewEncryption(unwrapOf(t, kms, grandchild), [16]byte(rootU))
+	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = controlplane.Clone(ctx, md, store, kms, &ramp{},
-		placement.Policy{}, nil, term, deeper, ids.New().String())
-	if !errors.Is(err, controlplane.ErrChainTooDeep) {
-		t.Fatalf("cloning a clone returned %v, want ErrChainTooDeep: recovery rebuilds one ancestor, so the grandparent's data would be missing and reported as success", err)
+	var out bytes.Buffer
+	if err := commit.Fetch(ctx, store, readView, m, &out); err != nil {
+		t.Fatalf("the grandchild cannot open the layer its oldest ancestor sealed: %v", err)
 	}
-	vols, lerr := md.ListVolumes(ctx)
-	if lerr != nil {
-		t.Fatal(lerr)
-	}
-	for _, v := range vols {
-		if v.ParentSnapshotID == deeper {
-			t.Fatalf("the refused clone %s is in the catalog; nothing can serve it and nothing collects it", v.VolumeID)
-		}
+	if !bytes.Equal(out.Bytes(), plain) {
+		t.Fatal("the oldest ancestor's layer opened into the wrong bytes")
 	}
 }

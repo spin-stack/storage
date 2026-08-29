@@ -964,7 +964,7 @@ func TestAbsentAnswersThatNothingIsPublished(t *testing.T) {
 	}
 	// A clone is the one thing it must not answer that way: "born empty" for a volume
 	// advertised as a copy is DEV-0007, served blank with no error anywhere.
-	cloned := qcow.Lineage{VolumeID: "any", ParentVolumeID: "parent", ParentCommitID: "commit"}
+	cloned := qcow.Lineage{VolumeID: "any", Ancestry: []qcow.Ancestor{{VolumeID: "parent", CommitID: "commit"}}}
 	if _, err := a.RestoreFrom(t.Context(), cloned, 1<<30); err == nil || errors.Is(err, commit.ErrNoHead) {
 		t.Errorf("RestoreFrom for a clone = %v, want a refusal and not ErrNoHead", err)
 	}
@@ -1124,7 +1124,7 @@ func TestASameHostCloneReadsTheParentsLayersOffTheLocalDisk(t *testing.T) {
 	w.keys.keys[clone] = cloneKeys(t, w, clone)
 
 	got, err := w.rec.RestoreFrom(ctx, qcow.Lineage{
-		VolumeID: clone, ParentVolumeID: w.vol, ParentCommitID: w.commits[len(w.commits)-1],
+		VolumeID: clone, Ancestry: []qcow.Ancestor{{VolumeID: w.vol, CommitID: w.commits[len(w.commits)-1]}},
 	}, virtualSize)
 	if err != nil {
 		t.Fatalf("the clone went to the object store for layers this host already holds: %v", err)

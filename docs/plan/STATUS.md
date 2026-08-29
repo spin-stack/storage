@@ -61,13 +61,10 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **A clone of a clone is refused, and raising that needs the walk to recurse.**
-   `RestoreFrom` rebuilds one ancestor, so `MaxChainDepth` is 1. Lifting it means the
-   Control Plane sending the whole ancestry and recovery walking it.
-2. **Compaction still cannot run twice.** The plan and the report are in; the act is not,
+1. **Compaction still cannot run twice.** The plan and the report are in; the act is not,
    because nothing rebases the local chain onto a new root — a second collapse is refused
    for ever with the message a genuine fork produces. Fix that first.
-3. **The GC deletes nothing.** The report is in; the delete is not.
+2. **The GC deletes nothing.** The report is in; the delete is not.
 
 ## What only a pilot can answer
 

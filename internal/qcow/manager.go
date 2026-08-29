@@ -456,13 +456,9 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 		chain, err := Open(openCtx, m.run, m.paths, m.cfg.QemuImg, OpenRequest{
 			Root: m.cfg.Root,
 			// The lineage comes from the desired state every cycle, because the Agent
-			// cannot look a parent up (ADR-0021) and the Control Plane is the only party
-			// that can read the snapshot row this points at.
-			Lineage: Lineage{
-				VolumeID:       id,
-				ParentVolumeID: d.GetParentVolumeId(),
-				ParentCommitID: d.GetParentCommitId(),
-			},
+			// cannot look an ancestor up (ADR-0021) and the Control Plane is the only
+			// party that can read the rows the chain is spelled out in.
+			Lineage:   Lineage{VolumeID: id, Ancestry: ancestry(d)},
 			SizeBytes: d.GetSizeBytes(),
 			LiveImage: live, NewLayerID: ids.New().String(), Recovery: m.rec,
 		})
@@ -1137,6 +1133,19 @@ func freeNodeName(c *qmp.Client) (string, error) {
 		}
 	}
 	return "", errors.New("qcow: this VM's block graph has a thousand nodes named spinN and no free one; something is not cleaning up after itself")
+}
+
+// ancestry copies the generations the Control Plane sent, in the order it sent them. The
+// order is the whole content of the field — a chain is rebuilt oldest first, each layer
+// repointed at the one below it — so it is never sorted or deduplicated here: a desired
+// state that named them in the wrong order is a Control Plane defect, and reordering it
+// would build a plausible chain out of somebody else's bytes.
+func ancestry(d *storagev1.DesiredVolume) []Ancestor {
+	out := make([]Ancestor, 0, len(d.GetAncestry()))
+	for _, a := range d.GetAncestry() {
+		out = append(out, Ancestor{VolumeID: a.GetVolumeId(), CommitID: a.GetCommitId()})
+	}
+	return out
 }
 
 // refuse records why a volume is not being served and returns the error for the caller

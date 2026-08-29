@@ -59,7 +59,7 @@ func TestAdversaryALayerIdThisHostHoldsForAnotherVolumeIsNotStoodInForThisOne(t 
 	w.keys.keys[clone] = cloneKeys(t, w, clone)
 
 	got, err := w.rec.RestoreFrom(ctx, qcow.Lineage{
-		VolumeID: clone, ParentVolumeID: w.vol, ParentCommitID: w.commits[len(w.commits)-1],
+		VolumeID: clone, Ancestry: []qcow.Ancestor{{VolumeID: w.vol, CommitID: w.commits[len(w.commits)-1]}},
 	}, virtualSize)
 	if err != nil {
 		t.Fatalf("restoring the clone: %v", err)

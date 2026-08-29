@@ -266,7 +266,7 @@ type imageInfo struct {
 // OpenRequest is what Open needs to know about one volume.
 type OpenRequest struct {
 	Root string
-	// Lineage is this volume's id and, for a clone, the parent commit it starts from.
+	// Lineage is this volume's id and, for a clone, the generations it starts from.
 	Lineage
 	// SizeBytes is the virtual size the catalog says this volume has.
 	SizeBytes int64
@@ -762,18 +762,24 @@ func inspect(ctx context.Context, r Runner, qemuImg, image string) (imageInfo, e
 	return info, nil
 }
 
-// Lineage is which volume a chain belongs to and, for a clone, where it starts.
+// Ancestor is one generation a chain is built on: whose published objects carry the
+// bytes, and where in that volume's history this generation stops.
 //
-// ParentCommitID is a *named* commit and not the parent's HEAD: a clone is the volume as
-// it was at the snapshot, and the parent's HEAD is whatever it has published since.
+// CommitID is a *named* commit and not that volume's HEAD: a clone is its parent as it
+// was at the snapshot, and the parent's HEAD is whatever it has published since.
+type Ancestor struct {
+	VolumeID string
+	CommitID string
+}
+
+// Lineage is which volume a chain belongs to and, for a clone, every generation under it.
 type Lineage struct {
 	VolumeID string
-	// ParentVolumeID and ParentCommitID are empty for a volume that was created rather
-	// than cloned. They travel together: a parent id with no commit names no point in a
-	// history, and a commit with no volume names no prefix to read it from.
-	ParentVolumeID string
-	ParentCommitID string
+	// Ancestry is oldest first — the order a chain is rebuilt in, each generation
+	// repointed at the one below it — and empty for a volume that was created rather
+	// than cloned. The last entry is this volume's own parent.
+	Ancestry []Ancestor
 }
 
 // Cloned reports whether this volume descends from another one.
-func (l Lineage) Cloned() bool { return l.ParentVolumeID != "" && l.ParentCommitID != "" }
+func (l Lineage) Cloned() bool { return len(l.Ancestry) > 0 }

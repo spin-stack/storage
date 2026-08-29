@@ -37,7 +37,9 @@ import (
 // volume is new" the same sentence.
 var ErrIncomplete = errors.New("recovery: this volume's published chain could not be rebuilt in full")
 
-// maxRestoreDepth bounds the walk.
+// maxRestoreDepth bounds how many layers one restore may put under a volume — the whole
+// lineage's, not one generation's, which is what controlplane.MaxChainDepth's ceiling is
+// derived from.
 //
 // 301 layers open fine in both qemu-img and qemu-system — measured — at one file
 // descriptor and about 140 KiB of RSS per layer *in every process that opens the chain*,
@@ -144,33 +146,44 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 	return r.RestoreFrom(ctx, qcow.Lineage{VolumeID: volumeID}, sizeBytes)
 }
 
-// RestoreFrom rebuilds a volume that may descend from another one.
+// RestoreFrom rebuilds a volume that may descend from others.
 //
-// With no parent it is Restore. With one it rebuilds the parent's chain up to the commit
-// the snapshot names, and then this volume's own published chain on top of it — in that
-// order, because a layer is repointed at a parent already on disk.
+// With no ancestry it is Restore. With one it rebuilds each generation in turn, oldest
+// first, up to the commit that generation's snapshot named, and then this volume's own
+// published chain on top of them — in that order, because a layer is repointed at a
+// parent already on disk.
 //
-// The parent's commit is *named*, not read from the parent's HEAD, and the difference is
-// the whole promise of §20: a clone is the volume as it was at that snapshot, and the
-// parent's HEAD is whatever it has published since. Reading HEAD would deliver Thursday
-// for a clone of Tuesday, with nothing anywhere reporting the difference.
+// Every generation is walked, not just the nearest: a clone's own manifests state only
+// what it wrote, so the bytes of a grandparent are named by nothing the parent published.
+// Stopping at the first ancestor rebuilds a chain missing everything the older ones wrote
+// and reports success — a volume advertised as a copy, delivered with holes.
+//
+// Each generation's commit is *named*, not read from that volume's HEAD, and the
+// difference is the whole promise of §20: a clone is the volume as it was at that
+// snapshot, and its HEAD is whatever it has published since. Reading HEAD would deliver
+// Thursday for a clone of Tuesday, with nothing anywhere reporting the difference.
 func (r *Recoverer) RestoreFrom(ctx context.Context, l qcow.Lineage, sizeBytes int64) (qcow.Restored, error) {
 	started := r.now()
 	base, parentTip, beneath := "", "", 0
-	if l.ParentVolumeID != "" {
-		got, n, err := r.rebuild(ctx, l.VolumeID, l.ParentVolumeID, l.ParentCommitID, sizeBytes, "", 0)
+	for _, a := range l.Ancestry {
+		// `local` stays this volume: every generation's layers land under the volume
+		// being served, so nothing here writes into another volume's directory — and
+		// `source` is whose objects are read and whose id sealed them, which is what
+		// keeps each generation's key binding its own.
+		got, n, err := r.rebuild(ctx, l.VolumeID, a.VolumeID, a.CommitID, sizeBytes, parentTip, beneath)
 		if err != nil {
 			return qcow.Restored{}, err
 		}
-		base, parentTip, beneath = got.Base, got.Base, n
+		base, parentTip, beneath = got.Base, got.Base, beneath+n
 	}
 	head, _, err := commit.ReadHead(ctx, r.store, l.VolumeID)
 	switch {
 	case errors.Is(err, commit.ErrNoHead) && parentTip != "":
-		// A clone that has published nothing of its own: its parent's chain is the whole
-		// of what it holds, and the new tip goes straight on top.
+		// A clone that has published nothing of its own: its ancestry is the whole of
+		// what it holds, and the new tip goes straight on top.
 		r.rec.Observe(ctx, "recovery_duration_seconds", r.elapsed(started), obs.String("volume", l.VolumeID))
-		return qcow.Restored{Base: base, VirtualSize: sizeBytes, HeadCommitID: l.ParentCommitID}, nil
+		return qcow.Restored{Base: base, VirtualSize: sizeBytes,
+			HeadCommitID: l.Ancestry[len(l.Ancestry)-1].CommitID}, nil
 	case errors.Is(err, commit.ErrNoHead):
 		return qcow.Restored{}, fmt.Errorf("recovery: volume %s: %w", l.VolumeID, err)
 	case err != nil:
@@ -189,11 +202,26 @@ func (r *Recoverer) RestoreFrom(ctx context.Context, l qcow.Lineage, sizeBytes i
 
 // rebuild materialises one chain: `source` is the volume whose published objects are read
 // and whose id the layers were sealed under, `local` is the volume whose directory they
-// land in. They differ exactly for a clone reading its parent.
+// land in. They differ for every generation of a clone's ancestry, and `local` is the same
+// volume throughout it: a rebuild never writes into a volume it does not own.
 func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string, sizeBytes int64, onTopOf string, beneath int) (qcow.Restored, int, error) {
-	manifests, err := r.walk(ctx, source, commitID)
+	manifests, err := r.walk(ctx, source, commitID, beneath)
 	if err != nil {
 		return qcow.Restored{}, 0, err
+	}
+	// A generation that names no commit walks to nothing, and every line below assumes at
+	// least one manifest. Refused rather than indexed: `ancestry` arrives over the wire as
+	// a repeated message, so an entry with an empty commit_id is a shape any producer can
+	// put on it, and `manifests[len-1]` on an empty walk panics the Agent's reconcile loop
+	// for every volume on the host, not only this one.
+	// A generation that names no commit walks to nothing, and every line below assumes at
+	// least one manifest. Refused rather than indexed: `ancestry` arrives over the wire as
+	// a repeated message, so an entry with an empty commit_id is a shape any producer can
+	// put on it, and `manifests[len-1]` on an empty walk panics the Agent's reconcile loop
+	// for every volume on the host, not only this one.
+	if len(manifests) == 0 {
+		return qcow.Restored{}, 0, fmt.Errorf("%w: volume %s names no commit to rebuild volume %s to",
+			ErrIncomplete, local, source)
 	}
 	// The head commit is the last element, the walk being oldest-first. The size comes
 	// from its manifest and not from the Head object, which names a commit and holds
@@ -312,10 +340,15 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 // walk follows parent_commit_id back from HEAD and returns the chain oldest-first, the
 // order it must be rebuilt in: a layer is repointed at a parent already on disk.
 //
+// `beneath` is how many layers earlier generations of this lineage already put under
+// this one, and maxRestoreDepth bounds their sum rather than one generation's history:
+// what the measurement bounds is how many backing files a single image opens, and a
+// per-generation bound would let a depth-D lineage build D times it.
+//
 // A repeated commit id is a cycle in the bucket — commit.Publish shipped one self-parent
 // bug — and following it is an infinite download. A repeated *layer* id is two commits
 // claiming one file, which would rebase a layer onto itself.
-func (r *Recoverer) walk(ctx context.Context, volumeID, headCommitID string) ([]commit.Manifest, error) {
+func (r *Recoverer) walk(ctx context.Context, volumeID, headCommitID string, beneath int) ([]commit.Manifest, error) {
 	var newestFirst []commit.Manifest
 	seenCommit := map[string]bool{}
 	seenLayer := map[string]bool{}
@@ -323,8 +356,8 @@ func (r *Recoverer) walk(ctx context.Context, volumeID, headCommitID string) ([]
 		if seenCommit[id] {
 			return nil, fmt.Errorf("%w: volume %s's history reaches commit %s twice", ErrIncomplete, volumeID, id)
 		}
-		if len(newestFirst) == maxRestoreDepth {
-			return nil, fmt.Errorf("%w: volume %s has more than %d commits to restore",
+		if beneath+len(newestFirst) == maxRestoreDepth {
+			return nil, fmt.Errorf("%w: volume %s reaches more than %d layers to restore",
 				ErrIncomplete, volumeID, maxRestoreDepth)
 		}
 		seenCommit[id] = true
@@ -564,8 +597,9 @@ func (Absent) RestoreFrom(_ context.Context, l qcow.Lineage, _ int64) (qcow.Rest
 	// oldest defect in this repository (DEV-0007). ErrNoHead would mean "new, start
 	// empty"; this must refuse instead.
 	if l.Cloned() {
-		return qcow.Restored{}, fmt.Errorf("%w: volume %s clones %s at commit %s and this Agent was started with no object store to read it from",
-			ErrIncomplete, l.VolumeID, l.ParentVolumeID, l.ParentCommitID)
+		parent := l.Ancestry[len(l.Ancestry)-1]
+		return qcow.Restored{}, fmt.Errorf("%w: volume %s clones %s at commit %s (%d generation(s) of lineage) and this Agent was started with no object store to read it from",
+			ErrIncomplete, l.VolumeID, parent.VolumeID, parent.CommitID, len(l.Ancestry))
 	}
 	return qcow.Restored{}, fmt.Errorf("%w: this Agent was started with no object store", commit.ErrNoHead)
 }

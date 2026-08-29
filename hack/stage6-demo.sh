@@ -7,16 +7,24 @@
 #   4. an operator clones that snapshot with the real control-plane binary;
 #   5. the Agent prepares the clone's chain — the parent's layers, fetched from the bucket
 #      and opened with the parent's key binding, with a fresh tip on top;
-#   6. a second guest boots the clone and reads back the pattern the FIRST guest wrote.
+#   6. a second guest boots the clone and reads back the pattern the FIRST guest wrote;
+#   7. that clone is snapshotted in turn and cloned again, and a guest boots the clone of
+#      the clone and reads back the pattern the FIRST guest wrote — two generations down.
 #
-# Step 6 is the whole demonstration and nothing short of it will do. Until this ran, a
-# clone was a volume the Control Plane created, the Agent served as an empty chain, and a
-# guest booted blank — the copy advertised and not delivered, with no error anywhere. That
-# is DEV-0007's shape, reintroduced by the v6 pivot rather than by a bug.
+# Step 6 is the whole demonstration of a clone and nothing short of it will do. Until it
+# ran, a clone was a volume the Control Plane created, the Agent served as an empty chain,
+# and a guest booted blank — the copy advertised and not delivered, with no error anywhere.
+# That is DEV-0007's shape, reintroduced by the v6 pivot rather than by a bug.
+#
+# Step 7 is the same sentence about a lineage, and it is the only thing that demonstrates
+# one: a chain that resolves is not a chain that carries the right bytes. Each generation's
+# guest writes in a slot of its own (`spin.slot`), so the last guest verifying slot 0 is
+# reading bytes only the ORIGINAL volume's guest ever wrote. A rebuild that stopped at the
+# nearest ancestor hands it a chain with zeros there and reports success.
 set -euo pipefail
 
 DEMO_NAME=stage6
-DEMO_DONE="the whole of Stage 6 ran: a clone was built from its parent's commit and its guest read the parent's bytes"
+DEMO_DONE="the whole of Stage 6 ran: a clone read its parent's bytes, and a clone of that clone read the original volume's"
 ROTATE_AT=${ROTATE_AT:-4194304}
 HEARTBEAT=${HEARTBEAT:-300ms}
 AGENT_FLAGS_TEMPLATE="-rotate-at-bytes $ROTATE_AT -retry-backoff $HEARTBEAT -object-store-dir @DIR@/store"
@@ -40,7 +48,7 @@ exec 9<>"$DIR/ctl"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
-  -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=8" \
+  -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=8 spin.slot=0" \
   -drive "file=$(cat "$POINTER"),format=qcow2,if=virtio,cache=writeback" \
   -qmp "unix:$SOCK,server=on,wait=off" \
   -serial stdio <"$DIR/ctl" >"$DIR/logs/guest1.log" 2>&1 &
@@ -97,16 +105,84 @@ test "$DEPTH" -ge 2 || die "the clone's chain is $DEPTH layer(s) deep: it was bo
 echo "    its chain is $DEPTH layers deep, so the parent's data is under it"
 
 say "7. a second guest boots the clone and reads the FIRST guest's pattern"
+# In the foreground and with no QMP socket, unlike the writing guests: a verify boot reads,
+# reports and powers itself off, so waiting for the process is waiting for the answer — and
+# the socket stays free for the guest in step 8, which needs the Agent to reach it.
 CSOCK=$(grep "volume_id=$CLONE" "$DIR/logs/agent1.log" | grep -m1 -o 'qmp_socket=[^ ]*' | cut -d= -f2)
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
-  -append "console=ttyS0 panic=1 spin.mode=verify" \
+  -append "console=ttyS0 panic=1 spin.mode=verify spin.slot=0" \
   -drive "file=$CIMAGE,format=qcow2,if=virtio,cache=writeback" \
-  -qmp "unix:$CSOCK,server=on,wait=off" \
-  -serial stdio </dev/null >"$DIR/logs/guest2.log" 2>&1 &
-PIDS+=($!)
-waitfor "$DIR/logs/guest2.log" "GUESTINIT-" 120
+  -serial stdio </dev/null >"$DIR/logs/guest2.log" 2>&1
 grep -q "GUESTINIT-PASS" "$DIR/logs/guest2.log" ||
   die "the clone's guest did not read its parent's pattern: $(grep -m1 'GUESTINIT' "$DIR/logs/guest2.log")"
 echo "GUESTINIT-PASS — the clone read back what a different volume's guest wrote"
+
+say "8. a guest on the clone, writing a slot of its own so the clone has a commit to name"
+# The clone must publish a commit before it can be snapshotted, and only a running QEMU
+# can seal a tip — the Agent rotates through QMP. This guest writes slot 1, which is
+# nowhere near slot 0: what the last guest of all reads back has to be attributable to the
+# ORIGINAL volume's guest, and two guests writing identical bytes at one offset would make
+# a chain missing a whole generation pass.
+CIMAGE=$(cat "$CPOINTER")
+mkfifo "$DIR/ctl2"
+exec 8<>"$DIR/ctl2"
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -L "$OUT/share/spin-stack/qemu" \
+  -kernel "$KERNEL" -initrd "$INITRAMFS" \
+  -append "console=ttyS0 panic=1 spin.mode=hold spin.slot=1" \
+  -drive "file=$CIMAGE,format=qcow2,if=virtio,cache=writeback" \
+  -qmp "unix:$CSOCK,server=on,wait=off" \
+  -serial stdio <"$DIR/ctl2" >"$DIR/logs/guest3.log" 2>&1 &
+PIDS+=($!)
+GUEST3=$!
+waitfor "$DIR/logs/guest3.log" "GUESTINIT-HELD" 120
+echo "the clone's guest wrote slot 1 and fsynced it; slot 0 is still only in the parent's layers"
+
+say "9. a snapshot of the clone, and the clone's guest stops"
+"$CP" "${CPFLAGS[@]}" -holder-id cp-snap2 -snapshot-volume "$CLONE" >"$DIR/logs/snapshot2.log" 2>&1
+SNAP2=$(grep -m1 -o 'snapshot_id=[^ ]*' "$DIR/logs/snapshot2.log" | head -1 | cut -d= -f2)
+test -n "$SNAP2" || die "no snapshot of the clone was recorded: $(cat "$DIR/logs/snapshot2.log")"
+waituntil "$DIR/logs/agent1.log" "snapshot taken" 2 90
+for _ in $(seq 60); do
+  COMMIT2=$(psql "SELECT COALESCE(commit_id::text,'') FROM snapshots WHERE snapshot_id = '$SNAP2'")
+  [ -n "$COMMIT2" ] && break
+  sleep 0.5
+done
+test -n "$COMMIT2" || die "the clone's snapshot never named a commit"
+echo "snapshot $SNAP2 of the clone names commit $COMMIT2"
+echo "GUESTCTL-STOP" >&8
+wait "$GUEST3" 2>/dev/null || true
+
+say "10. the clone of the clone"
+"$CP" "${CPFLAGS[@]}" -holder-id cp-clone2 -max-used-ratio ${CLONE_MAX_USED:-0.99} -clone-snapshot "$SNAP2" \
+  >"$DIR/logs/clone2.log" 2>&1 ||
+  die "the clone of a clone was refused: $(tail -3 "$DIR/logs/clone2.log")"
+GRAND=$(grep -m1 -o 'volume_id=[^ ]*' "$DIR/logs/clone2.log" | head -1 | cut -d= -f2)
+test -n "$GRAND" || die "no clone of the clone was created: $(cat "$DIR/logs/clone2.log")"
+test "$(psql "SELECT chain_depth FROM volumes WHERE volume_id = '$GRAND'")" = "2" ||
+  die "the clone of the clone is not at depth 2 in the catalog"
+echo "volume $GRAND, at depth 2, from snapshot $SNAP2"
+
+say "11. the Agent builds a chain out of both generations"
+waituntil "$DIR/logs/agent1.log" "volume ready" 3 180
+GPOINTER=$(grep "volume_id=$GRAND" "$DIR/logs/agent1.log" | grep -m1 -o 'pointer=[^ ]*' | cut -d= -f2)
+test -n "$GPOINTER" || die "the Agent never reported the clone of the clone as ready"
+GIMAGE=$(cat "$GPOINTER")
+GDEPTH=$("$QEMU_IMG" info --output=json --backing-chain "$GIMAGE" |
+  python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+# One tip, at least one layer from the middle generation, at least one from the original.
+test "$GDEPTH" -ge 3 || die "the grandchild's chain is $GDEPTH layer(s) deep: a generation is missing"
+echo "    its chain is $GDEPTH layers deep"
+
+say "12. a guest boots the clone of the clone and reads the ORIGINAL guest's slot"
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -L "$OUT/share/spin-stack/qemu" \
+  -kernel "$KERNEL" -initrd "$INITRAMFS" \
+  -append "console=ttyS0 panic=1 spin.mode=verify spin.slot=0" \
+  -drive "file=$GIMAGE,format=qcow2,if=virtio,cache=writeback" \
+  -serial stdio </dev/null >"$DIR/logs/guest4.log" 2>&1
+grep -q "GUESTINIT-PASS" "$DIR/logs/guest4.log" ||
+  die "the grandchild's guest did not read the original volume's slot: $(grep -m1 'GUESTINIT' "$DIR/logs/guest4.log")"
+echo "GUESTINIT-PASS — a clone of a clone read back what the first volume's guest wrote"

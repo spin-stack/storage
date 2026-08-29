@@ -591,6 +591,65 @@ func (x *GetDesiredStateRequest) GetHostId() string {
 	return ""
 }
 
+// Ancestor is one generation of a volume's lineage.
+type Ancestor struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// volume_id is the volume whose published objects carry this generation's bytes, and
+	// whose id their layers were sealed under (the nonce binds it, so a descendant opens
+	// them with its own copy of the shared DEK and this volume's binding).
+	VolumeId string `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	// commit_id is the commit in that volume's history the descendant starts from — the
+	// commit its snapshot named, not that volume's HEAD, which is whatever it has
+	// published since. Reading HEAD would deliver Thursday for a clone of Tuesday.
+	CommitId      string `protobuf:"bytes,2,opt,name=commit_id,json=commitId,proto3" json:"commit_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Ancestor) Reset() {
+	*x = Ancestor{}
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Ancestor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Ancestor) ProtoMessage() {}
+
+func (x *Ancestor) ProtoReflect() protoreflect.Message {
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Ancestor.ProtoReflect.Descriptor instead.
+func (*Ancestor) Descriptor() ([]byte, []int) {
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Ancestor) GetVolumeId() string {
+	if x != nil {
+		return x.VolumeId
+	}
+	return ""
+}
+
+func (x *Ancestor) GetCommitId() string {
+	if x != nil {
+		return x.CommitId
+	}
+	return ""
+}
+
 // DesiredVolume is one volume this host should be serving.
 type DesiredVolume struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
@@ -601,30 +660,16 @@ type DesiredVolume struct {
 	// reports about this volume is qualified by it.
 	Epoch int64       `protobuf:"varint,4,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	State VolumeState `protobuf:"varint,5,opt,name=state,proto3,enum=spin.storage.v1.VolumeState" json:"state,omitempty"`
-	// parent_snapshot_id and parent_volume_id name the snapshot this volume was
-	// cloned from (§20), and the volume that snapshot belongs to. Both empty for a
-	// volume that was created rather than cloned.
+	// ancestry is every generation this volume descends from, oldest first and empty for
+	// a volume that was created rather than cloned. The last entry is its own parent.
 	//
-	// They are on the wire because the Agent has to be *told*: ADR-0021 keeps it from
-	// knowing what a Control Plane is, so it cannot look either of them up. Without
-	// them a clone starts an empty WAL under its own id, finds nothing under that id
-	// in the object store, and serves zeros for everything its parent ever wrote —
-	// which is a volume advertised as a copy and delivered blank (DEV-0007).
-	//
-	// The volume id is carried rather than derived for the same reason: it lives on
-	// the snapshot row, which is one lookup the Agent cannot perform.
-	ParentSnapshotId string `protobuf:"bytes,7,opt,name=parent_snapshot_id,json=parentSnapshotId,proto3" json:"parent_snapshot_id,omitempty"`
-	ParentVolumeId   string `protobuf:"bytes,8,opt,name=parent_volume_id,json=parentVolumeId,proto3" json:"parent_volume_id,omitempty"`
-	// parent_commit_id is the commit that snapshot names — the exact point in the parent's
-	// published history this clone starts from. Empty for a volume that was created rather
-	// than cloned.
-	//
-	// It is on the wire for the reason the two ids above are: the Agent is a thing that is
-	// told (ADR-0021), and this one lives on the snapshot row, which is a lookup it cannot
-	// perform. Without it a clone would have to read the parent's HEAD, which is whatever
-	// the parent has published *since* — a clone of "the volume as it was on Tuesday" that
-	// silently delivers Thursday.
-	ParentCommitId string `protobuf:"bytes,13,opt,name=parent_commit_id,json=parentCommitId,proto3" json:"parent_commit_id,omitempty"`
+	// It is on the wire because the Agent has to be *told*: ADR-0021 keeps it from knowing
+	// what a Control Plane is, so it cannot look a lineage up — the walk from a clone's
+	// row to its parent snapshot to that snapshot's volume is a catalog read. Without it
+	// a clone finds nothing under its own id in the object store and serves zeros for
+	// everything its ancestors wrote, which is a volume advertised as a copy and
+	// delivered blank (DEV-0007).
+	Ancestry []*Ancestor `protobuf:"bytes,14,rep,name=ancestry,proto3" json:"ancestry,omitempty"`
 	// pending_snapshot_id names a snapshot this volume's host is asked to take (§19),
 	// empty when there is nothing to take. It is the whole trigger: an Agent is never
 	// *asked* for anything — ADR-0021 keeps it from knowing what a Control Plane is —
@@ -697,7 +742,7 @@ type DesiredVolume struct {
 
 func (x *DesiredVolume) Reset() {
 	*x = DesiredVolume{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[4]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -709,7 +754,7 @@ func (x *DesiredVolume) String() string {
 func (*DesiredVolume) ProtoMessage() {}
 
 func (x *DesiredVolume) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[4]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -722,7 +767,7 @@ func (x *DesiredVolume) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesiredVolume.ProtoReflect.Descriptor instead.
 func (*DesiredVolume) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{4}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *DesiredVolume) GetVolumeId() string {
@@ -760,25 +805,11 @@ func (x *DesiredVolume) GetState() VolumeState {
 	return VolumeState_VOLUME_STATE_UNSPECIFIED
 }
 
-func (x *DesiredVolume) GetParentSnapshotId() string {
+func (x *DesiredVolume) GetAncestry() []*Ancestor {
 	if x != nil {
-		return x.ParentSnapshotId
+		return x.Ancestry
 	}
-	return ""
-}
-
-func (x *DesiredVolume) GetParentVolumeId() string {
-	if x != nil {
-		return x.ParentVolumeId
-	}
-	return ""
-}
-
-func (x *DesiredVolume) GetParentCommitId() string {
-	if x != nil {
-		return x.ParentCommitId
-	}
-	return ""
+	return nil
 }
 
 func (x *DesiredVolume) GetPendingSnapshotId() string {
@@ -819,7 +850,7 @@ type GetDesiredStateResponse struct {
 
 func (x *GetDesiredStateResponse) Reset() {
 	*x = GetDesiredStateResponse{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[5]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -831,7 +862,7 @@ func (x *GetDesiredStateResponse) String() string {
 func (*GetDesiredStateResponse) ProtoMessage() {}
 
 func (x *GetDesiredStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[5]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -844,7 +875,7 @@ func (x *GetDesiredStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDesiredStateResponse.ProtoReflect.Descriptor instead.
 func (*GetDesiredStateResponse) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{5}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetDesiredStateResponse) GetVolumes() []*DesiredVolume {
@@ -867,7 +898,7 @@ type GetVolumeKeysRequest struct {
 
 func (x *GetVolumeKeysRequest) Reset() {
 	*x = GetVolumeKeysRequest{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[6]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -879,7 +910,7 @@ func (x *GetVolumeKeysRequest) String() string {
 func (*GetVolumeKeysRequest) ProtoMessage() {}
 
 func (x *GetVolumeKeysRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[6]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -892,7 +923,7 @@ func (x *GetVolumeKeysRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVolumeKeysRequest.ProtoReflect.Descriptor instead.
 func (*GetVolumeKeysRequest) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{6}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetVolumeKeysRequest) GetHostId() string {
@@ -938,7 +969,7 @@ type GetVolumeKeysResponse struct {
 
 func (x *GetVolumeKeysResponse) Reset() {
 	*x = GetVolumeKeysResponse{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[7]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -950,7 +981,7 @@ func (x *GetVolumeKeysResponse) String() string {
 func (*GetVolumeKeysResponse) ProtoMessage() {}
 
 func (x *GetVolumeKeysResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[7]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -963,7 +994,7 @@ func (x *GetVolumeKeysResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVolumeKeysResponse.ProtoReflect.Descriptor instead.
 func (*GetVolumeKeysResponse) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{7}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetVolumeKeysResponse) GetVolumeId() string {
@@ -1090,7 +1121,7 @@ type VolumeReport struct {
 
 func (x *VolumeReport) Reset() {
 	*x = VolumeReport{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[8]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1102,7 +1133,7 @@ func (x *VolumeReport) String() string {
 func (*VolumeReport) ProtoMessage() {}
 
 func (x *VolumeReport) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[8]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1115,7 +1146,7 @@ func (x *VolumeReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeReport.ProtoReflect.Descriptor instead.
 func (*VolumeReport) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{8}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *VolumeReport) GetVolumeId() string {
@@ -1233,7 +1264,7 @@ type ReportVolumeStateRequest struct {
 
 func (x *ReportVolumeStateRequest) Reset() {
 	*x = ReportVolumeStateRequest{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[9]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1245,7 +1276,7 @@ func (x *ReportVolumeStateRequest) String() string {
 func (*ReportVolumeStateRequest) ProtoMessage() {}
 
 func (x *ReportVolumeStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[9]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1258,7 +1289,7 @@ func (x *ReportVolumeStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportVolumeStateRequest.ProtoReflect.Descriptor instead.
 func (*ReportVolumeStateRequest) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{9}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ReportVolumeStateRequest) GetHostId() string {
@@ -1285,7 +1316,7 @@ type VolumeReportResult struct {
 
 func (x *VolumeReportResult) Reset() {
 	*x = VolumeReportResult{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[10]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1297,7 +1328,7 @@ func (x *VolumeReportResult) String() string {
 func (*VolumeReportResult) ProtoMessage() {}
 
 func (x *VolumeReportResult) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[10]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1310,7 +1341,7 @@ func (x *VolumeReportResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VolumeReportResult.ProtoReflect.Descriptor instead.
 func (*VolumeReportResult) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{10}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *VolumeReportResult) GetVolumeId() string {
@@ -1337,7 +1368,7 @@ type ReportVolumeStateResponse struct {
 
 func (x *ReportVolumeStateResponse) Reset() {
 	*x = ReportVolumeStateResponse{}
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[11]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1349,7 +1380,7 @@ func (x *ReportVolumeStateResponse) String() string {
 func (*ReportVolumeStateResponse) ProtoMessage() {}
 
 func (x *ReportVolumeStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[11]
+	mi := &file_spin_storage_v1_control_plane_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1362,7 +1393,7 @@ func (x *ReportVolumeStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportVolumeStateResponse.ProtoReflect.Descriptor instead.
 func (*ReportVolumeStateResponse) Descriptor() ([]byte, []int) {
-	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{11}
+	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ReportVolumeStateResponse) GetResults() []*VolumeReportResult {
@@ -1393,7 +1424,10 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1a.spin.storage.v1.HostStateR\x05state\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x03R\x04term\"1\n" +
 	"\x16GetDesiredStateRequest\x12\x17\n" +
-	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"\xf4\x03\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"D\n" +
+	"\bAncestor\x12\x1b\n" +
+	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1b\n" +
+	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\xbb\x03\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1401,15 +1435,13 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\n" +
 	"block_size\x18\x03 \x01(\x05R\tblockSize\x12\x14\n" +
 	"\x05epoch\x18\x04 \x01(\x03R\x05epoch\x122\n" +
-	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x12,\n" +
-	"\x12parent_snapshot_id\x18\a \x01(\tR\x10parentSnapshotId\x12(\n" +
-	"\x10parent_volume_id\x18\b \x01(\tR\x0eparentVolumeId\x12(\n" +
-	"\x10parent_commit_id\x18\r \x01(\tR\x0eparentCommitId\x12.\n" +
+	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x125\n" +
+	"\bancestry\x18\x0e \x03(\v2\x19.spin.storage.v1.AncestorR\bancestry\x12.\n" +
 	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12-\n" +
 	"\x12published_sequence\x18\n" +
 	" \x01(\x03R\x11publishedSequence\x12)\n" +
 	"\x10durable_sequence\x18\v \x01(\x03R\x0fdurableSequence\x12,\n" +
-	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\a\"S\n" +
+	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\r\x10\x0e\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +
@@ -1498,7 +1530,7 @@ func file_spin_storage_v1_control_plane_proto_rawDescGZIP() []byte {
 }
 
 var file_spin_storage_v1_control_plane_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_spin_storage_v1_control_plane_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_spin_storage_v1_control_plane_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_spin_storage_v1_control_plane_proto_goTypes = []any{
 	(HostState)(0),                    // 0: spin.storage.v1.HostState
 	(VolumeState)(0),                  // 1: spin.storage.v1.VolumeState
@@ -1508,37 +1540,39 @@ var file_spin_storage_v1_control_plane_proto_goTypes = []any{
 	(*HeartbeatRequest)(nil),          // 5: spin.storage.v1.HeartbeatRequest
 	(*HeartbeatResponse)(nil),         // 6: spin.storage.v1.HeartbeatResponse
 	(*GetDesiredStateRequest)(nil),    // 7: spin.storage.v1.GetDesiredStateRequest
-	(*DesiredVolume)(nil),             // 8: spin.storage.v1.DesiredVolume
-	(*GetDesiredStateResponse)(nil),   // 9: spin.storage.v1.GetDesiredStateResponse
-	(*GetVolumeKeysRequest)(nil),      // 10: spin.storage.v1.GetVolumeKeysRequest
-	(*GetVolumeKeysResponse)(nil),     // 11: spin.storage.v1.GetVolumeKeysResponse
-	(*VolumeReport)(nil),              // 12: spin.storage.v1.VolumeReport
-	(*ReportVolumeStateRequest)(nil),  // 13: spin.storage.v1.ReportVolumeStateRequest
-	(*VolumeReportResult)(nil),        // 14: spin.storage.v1.VolumeReportResult
-	(*ReportVolumeStateResponse)(nil), // 15: spin.storage.v1.ReportVolumeStateResponse
+	(*Ancestor)(nil),                  // 8: spin.storage.v1.Ancestor
+	(*DesiredVolume)(nil),             // 9: spin.storage.v1.DesiredVolume
+	(*GetDesiredStateResponse)(nil),   // 10: spin.storage.v1.GetDesiredStateResponse
+	(*GetVolumeKeysRequest)(nil),      // 11: spin.storage.v1.GetVolumeKeysRequest
+	(*GetVolumeKeysResponse)(nil),     // 12: spin.storage.v1.GetVolumeKeysResponse
+	(*VolumeReport)(nil),              // 13: spin.storage.v1.VolumeReport
+	(*ReportVolumeStateRequest)(nil),  // 14: spin.storage.v1.ReportVolumeStateRequest
+	(*VolumeReportResult)(nil),        // 15: spin.storage.v1.VolumeReportResult
+	(*ReportVolumeStateResponse)(nil), // 16: spin.storage.v1.ReportVolumeStateResponse
 }
 var file_spin_storage_v1_control_plane_proto_depIdxs = []int32{
 	4,  // 0: spin.storage.v1.HeartbeatRequest.device:type_name -> spin.storage.v1.DeviceStatus
 	0,  // 1: spin.storage.v1.HeartbeatResponse.state:type_name -> spin.storage.v1.HostState
 	1,  // 2: spin.storage.v1.DesiredVolume.state:type_name -> spin.storage.v1.VolumeState
-	8,  // 3: spin.storage.v1.GetDesiredStateResponse.volumes:type_name -> spin.storage.v1.DesiredVolume
-	2,  // 4: spin.storage.v1.VolumeReport.refusal:type_name -> spin.storage.v1.VolumeRefusal
-	12, // 5: spin.storage.v1.ReportVolumeStateRequest.volumes:type_name -> spin.storage.v1.VolumeReport
-	3,  // 6: spin.storage.v1.VolumeReportResult.outcome:type_name -> spin.storage.v1.ReportOutcome
-	14, // 7: spin.storage.v1.ReportVolumeStateResponse.results:type_name -> spin.storage.v1.VolumeReportResult
-	5,  // 8: spin.storage.v1.ControlPlaneService.Heartbeat:input_type -> spin.storage.v1.HeartbeatRequest
-	7,  // 9: spin.storage.v1.ControlPlaneService.GetDesiredState:input_type -> spin.storage.v1.GetDesiredStateRequest
-	13, // 10: spin.storage.v1.ControlPlaneService.ReportVolumeState:input_type -> spin.storage.v1.ReportVolumeStateRequest
-	10, // 11: spin.storage.v1.ControlPlaneService.GetVolumeKeys:input_type -> spin.storage.v1.GetVolumeKeysRequest
-	6,  // 12: spin.storage.v1.ControlPlaneService.Heartbeat:output_type -> spin.storage.v1.HeartbeatResponse
-	9,  // 13: spin.storage.v1.ControlPlaneService.GetDesiredState:output_type -> spin.storage.v1.GetDesiredStateResponse
-	15, // 14: spin.storage.v1.ControlPlaneService.ReportVolumeState:output_type -> spin.storage.v1.ReportVolumeStateResponse
-	11, // 15: spin.storage.v1.ControlPlaneService.GetVolumeKeys:output_type -> spin.storage.v1.GetVolumeKeysResponse
-	12, // [12:16] is the sub-list for method output_type
-	8,  // [8:12] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	8,  // 3: spin.storage.v1.DesiredVolume.ancestry:type_name -> spin.storage.v1.Ancestor
+	9,  // 4: spin.storage.v1.GetDesiredStateResponse.volumes:type_name -> spin.storage.v1.DesiredVolume
+	2,  // 5: spin.storage.v1.VolumeReport.refusal:type_name -> spin.storage.v1.VolumeRefusal
+	13, // 6: spin.storage.v1.ReportVolumeStateRequest.volumes:type_name -> spin.storage.v1.VolumeReport
+	3,  // 7: spin.storage.v1.VolumeReportResult.outcome:type_name -> spin.storage.v1.ReportOutcome
+	15, // 8: spin.storage.v1.ReportVolumeStateResponse.results:type_name -> spin.storage.v1.VolumeReportResult
+	5,  // 9: spin.storage.v1.ControlPlaneService.Heartbeat:input_type -> spin.storage.v1.HeartbeatRequest
+	7,  // 10: spin.storage.v1.ControlPlaneService.GetDesiredState:input_type -> spin.storage.v1.GetDesiredStateRequest
+	14, // 11: spin.storage.v1.ControlPlaneService.ReportVolumeState:input_type -> spin.storage.v1.ReportVolumeStateRequest
+	11, // 12: spin.storage.v1.ControlPlaneService.GetVolumeKeys:input_type -> spin.storage.v1.GetVolumeKeysRequest
+	6,  // 13: spin.storage.v1.ControlPlaneService.Heartbeat:output_type -> spin.storage.v1.HeartbeatResponse
+	10, // 14: spin.storage.v1.ControlPlaneService.GetDesiredState:output_type -> spin.storage.v1.GetDesiredStateResponse
+	16, // 15: spin.storage.v1.ControlPlaneService.ReportVolumeState:output_type -> spin.storage.v1.ReportVolumeStateResponse
+	12, // 16: spin.storage.v1.ControlPlaneService.GetVolumeKeys:output_type -> spin.storage.v1.GetVolumeKeysResponse
+	13, // [13:17] is the sub-list for method output_type
+	9,  // [9:13] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_spin_storage_v1_control_plane_proto_init() }
@@ -1552,7 +1586,7 @@ func file_spin_storage_v1_control_plane_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_spin_storage_v1_control_plane_proto_rawDesc), len(file_spin_storage_v1_control_plane_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   12,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

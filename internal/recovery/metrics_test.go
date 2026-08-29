@@ -126,7 +126,7 @@ func TestASameHostCloneDownloadsNothingAndSaysSo(t *testing.T) {
 	clone := ids.New().String()
 	w.keys.keys[clone] = cloneKeys(t, w, clone)
 	if _, err := w.rec.RestoreFrom(ctx, qcow.Lineage{
-		VolumeID: clone, ParentVolumeID: w.vol, ParentCommitID: w.commits[len(w.commits)-1],
+		VolumeID: clone, Ancestry: []qcow.Ancestor{{VolumeID: w.vol, CommitID: w.commits[len(w.commits)-1]}},
 	}, virtualSize); err != nil {
 		t.Fatalf("the clone went to the object store for layers this host already holds: %v", err)
 	}

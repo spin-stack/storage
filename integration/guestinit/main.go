@@ -32,6 +32,12 @@
 //
 // The churn is deliberately elsewhere on the device, so the pattern the verify boot reads
 // back is untouched by it and stays the assertion it was.
+//
+// Every run also takes `spin.slot=<n>`, which moves the pattern — its offsets and its
+// bytes — into a region of its own. It is what lets one demonstration tell two guests'
+// writes apart: a lineage's generations each write their own slot, so a descendant
+// verifying slot 0 is asserting on the bytes the oldest volume's guest wrote and nothing
+// else could have put there.
 package main
 
 import (
@@ -64,6 +70,12 @@ const (
 	churnOffset    = 32 << 20
 	churnChunk     = 1 << 20
 	churnSyncEvery = 4 << 20
+	// slotStride separates one guest's pattern from another's, selected by `spin.slot=<n>`
+	// and 0 for every boot that does not ask. A lineage needs it: each generation's guest
+	// writes into a slot of its own, so a descendant reading slot 0 back is reading bytes
+	// only the oldest volume's guest ever wrote — and a chain missing that generation
+	// returns zeros there instead of somebody else's copy of the same pattern.
+	slotStride = 4 << 20
 )
 
 // The verdict lines the host greps for. The host asserts on these exact strings: a lane
@@ -129,16 +141,19 @@ func mode() string {
 }
 
 func run(m string) error {
+	slot := cmdlineInt("spin.slot")
 	pattern := make([]byte, patternBytes)
 	for i := range pattern {
-		pattern[i] = byte('A' + (i % 23))
+		// The slot is in the bytes as well as in the offset, so a read that came back
+		// from the wrong slot fails rather than matching whatever was in the other one.
+		pattern[i] = byte('A' + ((i + int(slot)) % 23))
 	}
 
 	switch m {
 	case modeVerify:
 		// Nothing written and nothing synced: whatever comes back was put there by a
 		// previous boot and survived the machine being shut down.
-		return readBack(pattern)
+		return readBack(pattern, slot)
 	case modeWrite, modeHold:
 	default:
 		return fmt.Errorf("unknown spin.mode=%s on the kernel command line", m)
@@ -154,7 +169,7 @@ func run(m string) error {
 	}
 	defer func() { _ = f.Close() }()
 
-	for _, off := range offsets() {
+	for _, off := range offsets(slot) {
 		if _, err := f.WriteAt(pattern, off); err != nil {
 			return fmt.Errorf("writing at %d: %w", off, err)
 		}
@@ -168,11 +183,11 @@ func run(m string) error {
 	}
 	if m == modeHold {
 		report("%s", verdictHeld)
-		if err := churn(f, cmdlineMiB("spin.churn"), stopped()); err != nil {
+		if err := churn(f, cmdlineInt("spin.churn"), stopped()); err != nil {
 			return err
 		}
 	}
-	return readBack(pattern)
+	return readBack(pattern, slot)
 }
 
 // churn rewrites a region of mib megabytes, round and round, until stop closes.
@@ -232,9 +247,9 @@ func stopped() <-chan struct{} {
 	return done
 }
 
-// cmdlineMiB reads a numeric kernel-command-line parameter, in MiB. Absent or unreadable
-// is zero, which is the shape this had before the parameter existed.
-func cmdlineMiB(key string) int64 {
+// cmdlineInt reads a numeric kernel-command-line parameter. Absent or unreadable is zero,
+// which is the shape each of them had before it existed.
+func cmdlineInt(key string) int64 {
 	raw, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
 		return 0
@@ -269,17 +284,17 @@ func waitForStop() error {
 	return fmt.Errorf("the console closed before %s arrived", stopCommand)
 }
 
-func offsets() []int64 {
+func offsets(slot int64) []int64 {
 	offs := make([]int64, blocks)
 	for i := range offs {
-		offs[i] = int64(writeOffset + i*stride)
+		offs[i] = int64(writeOffset+i*stride) + slot*slotStride
 	}
 	return offs
 }
 
 // readBack reopens the device and compares. Reopening rather than reading through the
 // same descriptor is deliberate in the verify boot and harmless in the write one.
-func readBack(pattern []byte) error {
+func readBack(pattern []byte, slot int64) error {
 	g, err := os.Open(device)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", device, err)
@@ -287,7 +302,7 @@ func readBack(pattern []byte) error {
 	defer func() { _ = g.Close() }()
 
 	got := make([]byte, patternBytes)
-	for _, off := range offsets() {
+	for _, off := range offsets(slot) {
 		if _, err := g.ReadAt(got, off); err != nil {
 			return fmt.Errorf("reading back at %d: %w", off, err)
 		}

@@ -88,7 +88,7 @@ func Catalog() []MetricDesc {
 		{"local_disk_bytes", KindGauge, "What the volume's layer files occupy on this host", []string{"volume"}, nil},
 		// Not `chain_depth`, which is already taken by a different number under the same
 		// `volume` label: the Control Plane records the catalog's lineage depth — the one
-		// MaxChainDepth refuses a clone on, capped at 1 — while this is the host counting
+		// MaxChainDepth refuses a clone on — while this is the host counting
 		// the qcow2 layers a guest reads through, which is routinely tens. One name for
 		// both makes every query over it a coin flip on which process last exported.
 		{"local_chain_depth", KindGauge, "Layers of this volume's chain on this host — what a guest reads through", []string{"volume"}, nil},
