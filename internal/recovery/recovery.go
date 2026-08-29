@@ -243,6 +243,19 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 	if err != nil {
 		return qcow.Restored{}, 0, err
 	}
+	for _, layer := range chain {
+		// Before the tip is built and long before a guest is launched, which is the whole
+		// point: the same corrupt layer is refused on the *second* open — qcow.Open's
+		// adopt-a-local-chain branch walks the chain and checks this — and until now it
+		// was served on the first. Detection after the guest is the ordering §29 forbids.
+		//
+		// It costs nothing extra: this walk already opens every layer, which is why the
+		// check is here and not in a pass of its own.
+		if layer.Specific.Data.Corrupt {
+			return qcow.Restored{}, 0, fmt.Errorf("%w: volume %s rebuilt a chain whose layer %s has the qcow2 corrupt flag set",
+				ErrIncomplete, local, layer.Filename)
+		}
+	}
 	if len(chain) != len(manifests)+beneath {
 		return qcow.Restored{}, 0, fmt.Errorf("%w: volume %s rebuilt to %d commits and %s walks %d layers",
 			ErrIncomplete, local, len(manifests), parent, len(chain))
@@ -397,6 +410,16 @@ type imageInfo struct {
 	// FullBackingFilename is the backing path as the header records it, resolved to an
 	// absolute one. It is empty for a chain root.
 	FullBackingFilename string `json:"full-backing-filename"`
+	// Specific carries qcow2's own corrupt bit, which QEMU sets when it finds an
+	// inconsistency it could not resolve. It rides through the object store intact — the
+	// bit is inside the image the Agent sealed, so the layer's digest matches its
+	// manifest and every integrity check here passes — and the chain walk below is where
+	// a rebuilt volume gets to see it before a guest does.
+	Specific struct {
+		Data struct {
+			Corrupt bool `json:"corrupt"`
+		} `json:"data"`
+	} `json:"format-specific"`
 }
 
 // inspect asks about one image and opens no backing file. Plain `info` rather than

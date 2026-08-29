@@ -199,6 +199,10 @@ type fakeRunner struct {
 	files   *fakeFiles
 	runs    [][]string
 	backing map[string]string
+	// corrupt marks images whose qcow2 header carries the corrupt bit. It is per image
+	// and not a global flag because what matters is that a *layer under the tip* can be
+	// the corrupt one: a guest reads through all of them.
+	corrupt map[string]bool
 	// chainErr, when set, fails the whole-chain walk only.
 	chainErr error
 	// rebaseTo, when set, is what every rebase points the image at whatever -b said.
@@ -211,7 +215,7 @@ type fakeRunner struct {
 }
 
 func newRunner(files *fakeFiles) *fakeRunner {
-	return &fakeRunner{files: files, backing: map[string]string{}}
+	return &fakeRunner{files: files, backing: map[string]string{}, corrupt: map[string]bool{}}
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -260,10 +264,16 @@ func (r *fakeRunner) info(args []string) ([]byte, error) {
 		return nil, fmt.Errorf("Could not open '%s': No such file or directory", image)
 	}
 	one := func(path string) map[string]any {
-		return map[string]any{
+		m := map[string]any{
 			"format": "qcow2", "virtual-size": virtualSize, "filename": path,
 			"full-backing-filename": r.backing[path],
 		}
+		if r.corrupt[path] {
+			// The shape QEMU really answers with: the flag lives under
+			// format-specific.data, not at the top level.
+			m["format-specific"] = map[string]any{"data": map[string]any{"corrupt": true}}
+		}
+		return m
 	}
 	if !slices.Contains(args, "--backing-chain") {
 		return json.Marshal(one(image))
@@ -1117,4 +1127,39 @@ func cloneKeys(t *testing.T, w *world, clone string) agent.VolumeKeys {
 		t.Fatalf("rewrapping it for the clone: %v", err)
 	}
 	return agent.VolumeKeys{VolumeID: clone, DEKWrapped: wrapped, KEKID: w.kms.KEKID(), DEKKeyID: dek.KeyID}
+}
+
+// TestARebuiltChainWithTheCorruptFlagIsRefusedBeforeAGuestSeesIt.
+//
+// The qcow2 corrupt bit rides through the object store intact: QEMU sets it inside the
+// image, so the sealed layer's SHA-256 matches its manifest and every integrity check on
+// the way back passes. The bytes are the bytes that were published; what they say is that
+// QEMU already found an inconsistency it could not resolve.
+//
+// The five questions §29 asks: the visible commit is unchanged, the local state is a
+// half-built chain the next attempt replaces, no remote object is touched, the volume is
+// refused rather than served, and no confirmed commit is lost — this is a read path.
+//
+// It was found by auditing the boundary rather than by a failure: the same corrupt layer
+// is refused on the *second* open, because qcow.Open's adopt-a-local-chain branch walks
+// the chain and checks the flag, and was served on the first, because nothing on the
+// rebuild path looked. Detection after the guest is the ordering §29 exists to forbid.
+func TestARebuiltChainWithTheCorruptFlagIsRefusedBeforeAGuestSeesIt(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, 3)
+
+	// Not the tip: a guest reads through every layer, so the one under it is the case
+	// that a tip-only check would miss.
+	w.run.corrupt[w.image(0)] = true
+
+	_, err := w.rec.Restore(t.Context(), w.vol, virtualSize)
+	if err == nil {
+		t.Fatal("a chain carrying the qcow2 corrupt flag was handed back ready to boot")
+	}
+	if !errors.Is(err, recovery.ErrIncomplete) {
+		t.Fatalf("refused with %v, want a wrapped ErrIncomplete", err)
+	}
+	if !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
 }

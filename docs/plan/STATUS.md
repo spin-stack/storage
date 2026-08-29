@@ -17,9 +17,8 @@ layer under it, three times. `demo:stage3` adds the commit protocol and reads th
 back with `cat`: the chain from `HEAD` is walked to the first commit, checking each layer is
 present, matches its digest, and carries none of the guest's bytes in the clear.
 
-`demo:stage6` is §20: a snapshot is cloned, and a second guest boots the clone and reads
-back the bytes the parent's guest wrote — the parent's layers fetched from the bucket and
-opened with the parent's key binding, a fresh tip on top.
+`demo:stage6` is §20: a snapshot is cloned and a second guest boots the clone and reads
+back the bytes the parent's guest wrote, opened with the parent's key binding.
 
 `demo:stage5` is §19 under v6: a snapshot is a *name for a commit*. An operator asks with
 the real binary while a guest writes, the Agent seals the tip because it was asked, and the
@@ -65,7 +64,8 @@ system has no equivalent of vSphere's datastore lock.
 1. **`clone.go` still reasons about the withdrawn engine.** `MaxChainDepth` is justified by
    a measurement of `cow.IntervalMap`, `agent.awaitBase` and `agent.maxChainWalk`, none of
    which exist. The number wants re-measuring against the chain a clone actually builds.
-2. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
+2. **§29 has one point left**: qcow2 corruption a guest introduces *while running*.
+3. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
    while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
    implementation of it. They belong in `internal/qcow`'s adversary lane.
 
