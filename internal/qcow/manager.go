@@ -1006,11 +1006,13 @@ func (m *Manager) adopt(v *volume, st *State, tip string, dirty *bool) error {
 	if err != nil {
 		return fmt.Errorf("qcow: measuring the sealed layer %s of volume %s: %w", path, v.id, err)
 	}
-	// A fresh commit id, because the one this layer was promised under died with the
-	// process that minted it: a duplicate id in a history is something a human can read,
-	// and a layer nobody publishes is a hole nobody can see. The epoch is this host's
-	// current one, which is the honest value — it holds this volume now or it would not be
-	// here.
+	// A fresh commit id, and this is the one path that mints one for a layer that already
+	// exists: the record carries no Pending for it, which is the window between the QMP
+	// switch and recordPending and nothing else. Nothing was published under the id that
+	// window lost, so this is not a duplicate — a restart anywhere after the record lands
+	// reuses what it promised, which TestARestartBetweenSealingAndPublishingMintsNoSecondCommitID
+	// holds. The epoch is this host's current one, the honest value: it holds this volume
+	// now or it would not be here.
 	v.pending = &SealedLayer{
 		VolumeID: v.id, LayerID: layerID, CommitID: ids.New().String(), Path: path,
 		Epoch: v.epoch, PlainBytes: bytes, VirtualSize: v.chain.SizeBytes,

@@ -1851,3 +1851,61 @@ func TestAChainAtTheCeilingStopsRotatingInsteadOfBecomingUnrecoverable(t *testin
 		t.Fatalf("a volume at the depth ceiling was refused: %v %q", v.Refusal, v.RefusalDetail)
 	}
 }
+
+// A restart between sealing a layer and publishing it does not mint a second commit id
+// for it.
+//
+// It used to, and STATUS carried the cost: the id a sealed layer was promised under lived
+// in memory, and a process that died before writing it down had nothing to reuse. Two
+// things closed it, at different ends. The record is written the moment a layer is sealed
+// (recordPending), so a restart finds the id rather than inventing one; and a publish no
+// longer clears the pending layer until the note of the commit has landed, so a host that
+// cannot write that note republishes under the id it already used, which commit.Publish
+// answers from the manifest that is already there.
+//
+// Asserted on the ids that reached the object store, because that is where a duplicate
+// would be: an extra commit for bytes already published, on a chain a recovery walks.
+func TestARestartBetweenSealingAndPublishingMintsNoSecondCommitID(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{}
+	h := newHarnessFull(t, 8<<20, pub)
+	h.rotating(t, 9<<20)
+
+	// The cycle that seals. The publisher refuses, so the layer stays owed with its id
+	// written down and nothing in the bucket yet.
+	pub.err = errors.New("503 Service Unavailable")
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err == nil {
+		t.Fatal("the cycle whose publish was refused reported success")
+	}
+	sealed := h.state(t).Pending
+	if sealed == nil {
+		t.Fatal("the sealed layer this test is about was not recorded as owed")
+	}
+
+	// The process dies and comes back: everything in memory is gone and the record is all
+	// there is.
+	next := h.restart(t, 8<<20, pub)
+	next.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(next.tip(t))
+	pub.err = nil
+	for range 3 {
+		if err := next.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+			t.Fatalf("a cycle after the restart: %v", err)
+		}
+	}
+
+	ids := map[string]bool{}
+	for _, l := range pub.got {
+		if l.LayerID == sealed.LayerID {
+			ids[l.CommitID] = true
+		}
+	}
+	switch {
+	case len(ids) == 0:
+		t.Fatalf("the layer sealed before the restart (%s) never reached the object store: %+v", sealed.LayerID, pub.got)
+	case len(ids) > 1:
+		t.Fatalf("layer %s was published under %d commit ids across a restart: %v", sealed.LayerID, len(ids), ids)
+	}
+	if !ids[sealed.CommitID] {
+		t.Fatalf("the layer was published under an id the record did not promise: %v, recorded %s", ids, sealed.CommitID)
+	}
+}

@@ -84,8 +84,6 @@ Nothing on the §24 list. What is left is in the two sections below.
 - **A collapse waits for the guest to detach.** The rebase onto the new root needs the
   files, and QEMU holds every one of a live chain, so the last step is owed until the
   volume reads as unattached. Until then the chain does not shrink and one line says so.
-- **A restart between sealing and publishing duplicates a commit id** — the layer is
-  derived from the chain and never lost; only the id is.
 - **A volume detached and left detached keeps its layers.** A volume releases its claim
   when the object store confirms the fleet granted it elsewhere (`demo:stage4` step 10) and
   never on silence, so a volume nobody has moved is never released — and neither is one
