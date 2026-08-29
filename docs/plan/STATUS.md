@@ -9,7 +9,7 @@ format via qcow2; this system manages immutable commits, publication and recover
 
 ## What runs end to end
 
-Five demonstrations, each with the real binaries and a real Linux guest. `demo:stage1`: a
+Six demonstrations, each with the real binaries and a real Linux guest. `demo:stage1`: a
 volume is provisioned, a guest boots off its qcow2, the Agent is SIGKILLed and restarted
 **under the running guest**, and a second boot reads the bytes back. `demo:stage2` adds
 rotation — the guest writes without stopping while the Agent seals the tip and starts a new
@@ -29,7 +29,7 @@ volume's `HEAD` and shows the rebuilt machine refusing rather than serving a bla
 "no HEAD" means either a new volume or a lost one, and only the catalog knows which
 (`volumes.head_commit_id`).
 
-All five run in CI (`ci.yml`'s `guest` job), under TCG, from the mirrored kernel and the
+All six run in CI (`ci.yml`'s `guest` job), under TCG, from the mirrored kernel and the
 published QEMU. `integration/e2e` covers the same seams without a guest; the root diagrams
 are generated from the `.dot` beside each one and `task diagrams:check` fails on a stale one.
 

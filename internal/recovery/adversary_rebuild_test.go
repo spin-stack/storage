@@ -2,7 +2,6 @@ package recovery_test
 
 import (
 	"bytes"
-	"slices"
 	"testing"
 
 	"github.com/spin-stack/storage/internal/ids"
@@ -68,12 +67,6 @@ func TestAdversaryALayerIdThisHostHoldsForAnotherVolumeIsNotStoodInForThisOne(t 
 	}, virtualSize)
 	if err == nil {
 		t.Fatalf("the clone was rebuilt on a layer id another volume holds under a different commit: %+v", got)
-	}
-	// The impostor was never read to stand in for the commit, and — the half sharing
-	// adds — it was never written over either.
-	if slices.Contains(w.files.opened, at) {
-		t.Errorf("%s was read off the local disk to stand in for commit %s; the only thing that says"+
-			" it is that commit's layer is a record naming another commit", at, w.commits[0])
 	}
 	// The file another volume vouches for is untouched. A clone rewrites the headers of
 	// the layers it reads through, and every one of them is shared, so a rebuild that

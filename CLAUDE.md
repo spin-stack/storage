@@ -110,8 +110,9 @@ enforced by lint instead:
   wrong).
 - **Coverage.** `task cover` enforces a floor on production code (`-coverpkg=./...`); the
   number and why it moved are in `hack/coverage.sh`.
-  Excluded: `internal/db`, `internal/metadata/pg`, `cmd/` mains, `integration/`,
-  `internal/dst`. Don't chase unreachable `os`-error branches — the sim models those.
+  What is excluded, and why each one is, is the `EXCLUDE` line in that script — one copy,
+  because a list repeated here drifts and this one had. Don't chase unreachable `os`-error
+  branches: the sim models those.
 
 ## Go style (Dave Cheney's practical Go)
 
@@ -152,7 +153,8 @@ task backend:conformance # §6.1 object-store conformance (blocking per backend)
 QEMU is built by `.github/workflows/qemu.yml` (not the per-push gate), which calls the
 same Taskfile targets a developer runs and publishes `ghcr.io/<owner>/<repo>/qemu:<ver>`.
 Test object store: RustFS, pinned by digest, via TestContainers (`internal/testinfra`);
-the S3 SDK lives in exactly one file behind `objectstore.Store` (ADR-0010).
+the S3 SDK is confined to `internal/simio/real/s3*.go` behind `objectstore.Store`, and
+nothing else in the tree imports it.
 
 ## SQL: sqlc + pgschema + Postgres 18 (ADR-0007, ADR-0019)
 

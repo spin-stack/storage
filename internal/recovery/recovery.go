@@ -63,10 +63,6 @@ type Files interface {
 	Create(path string) (io.WriteCloser, error)
 	Rename(oldPath, newPath string) error
 	Remove(path string) error
-	// Open reads a layer this host already holds, so a clone can copy its parent's
-	// instead of downloading it. Streamed rather than read whole: a layer is measured in
-	// tens of megabytes, and ReadFile would put one in memory per clone.
-	Open(path string) (io.ReadSeekCloser, error)
 }
 
 // Runner runs qemu-img and returns its standard output. A qcow2 parser of our own is

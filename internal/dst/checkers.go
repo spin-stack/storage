@@ -77,6 +77,5 @@ func DefaultCheckers() []Checker {
 	all := coreCheckers()
 	all = append(all, commitCheckers()...)
 	all = append(all, reconcileCheckers()...)
-	all = append(all, harnessCheckers()...)
 	return all
 }

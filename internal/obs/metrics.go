@@ -85,7 +85,7 @@ func Catalog() []MetricDesc {
 		// and what an alert asks of them is "is this one above the line right now".
 		{"last_successful_commit_age_seconds", KindGauge, "Time since this host last published a commit for the volume — the RPO if the host is lost now", []string{"volume"}, nil},
 		{"unpublished_local_bytes", KindGauge, "Local bytes the volume has not published yet: what those seconds cost", []string{"volume"}, nil},
-		{"local_disk_bytes", KindGauge, "What the volume's layer files occupy on this host", []string{"volume"}, nil},
+		{"local_disk_bytes", KindGauge, "What this volume's chain occupies on this host; a layer several volumes read through is counted for each of them, so this does not sum to the disk", []string{"volume"}, nil},
 		// Not `chain_depth`, which is already taken by a different number under the same
 		// `volume` label: the Control Plane records the catalog's lineage depth — the one
 		// MaxChainDepth refuses a clone on — while this is the host counting

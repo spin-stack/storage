@@ -20,8 +20,6 @@ func harnessScenarios() []MandatoryScenario {
 	}
 }
 
-func harnessCheckers() []Checker { return nil }
-
 // rewoundLeadership is a metadata store whose leadership row was restored from a
 // backup: elections resume from an earlier term, so the same term is handed out
 // twice. Nothing inside the database can tell — the term is derived from the row.

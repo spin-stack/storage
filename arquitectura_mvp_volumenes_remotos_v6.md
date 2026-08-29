@@ -129,7 +129,6 @@ de datos son inmutables; sólo `HEAD` es mutable, mediante compare-and-swap.
 ├── layers/<layer-id>.qcow2       # TODAS las capas del host, de todos los volúmenes
 └── volumes/<volume-id>/
     ├── active/current            # una línea: el path absoluto del tip
-    ├── cache/
     └── state.json
 ```
 
@@ -313,14 +312,21 @@ Un guest Linux real escribiendo sobre NVMe, umbral de 4 MiB, ciclo de reconcilia
   vale leer la diferencia como un costo de la forma nueva: son tres muestras en una
   máquina que no estaba quieta. No es el
   piso de `rpo_target`: a este costo, rotar cada pocos segundos es gratis para el guest, y
-  lo que fija el default es el throughput de subida — que no se puede medir hasta la
-  Etapa 3, porque todavía nada sube.
+  lo que fija el default es el costo de un commit, medido abajo.
 - **El umbral de tamaño es un piso, no una cota.** Los layers sellados salieron de 32 MiB
   con el umbral en 4: el tip se mide una vez por ciclo, así que un layer pesa el umbral
   más lo que el guest escribió desde la última mirada. Con QEMU en el data path no
   podemos rechazar esa escritura, así que **no hay forma de acotar el tamaño de un
   layer**; sólo se elige cada cuánto se mira. Quien dimensione uploads debe planificar
   umbral + un ciclo del guest más rápido que vaya a alojar.
+- **Lo que cuesta un commit (`task measure:publish`, contra el RustFS pineado).** F = 12 ms
+  de costo fijo —el PUT del manifest, el CAS de HEAD y la lectura del commit sobre el que
+  se apoya— y R = 392 MiB/s para el payload, sobre las dos pasadas. Un commit de S bytes
+  cuesta F + S/R, así que el umbral donde el costo fijo es un décimo del commit es 9FR =
+  43 MiB. **Ese número casi no se mueve con el backend**: F y R se mueven en direcciones
+  opuestas, así que su producto es el bandwidth-delay product — S3 real a 50 ms y
+  100 MiB/s da 45 MiB, uno local rápido a 5 ms y 1 GiB/s da 45 MiB, uno remoto lento a
+  200 ms y 20 MiB/s da 36 MiB. El default es 32 MiB, el redondo por debajo de esa banda.
 
 ---
 

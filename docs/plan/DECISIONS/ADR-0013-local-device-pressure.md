@@ -4,7 +4,7 @@
   are open gaps; §4's subject was deleted with the WAL. **The section numbers are cited
   from ~45 places in the tree — they are never renumbered.**
 - **Extends:** §5.7, §28.1–28.2 (cordon/drain, capacity accounting), INV-04.
-- **ADR-0014** makes the per-volume quota *soft* — it never fails a guest write. So the
+- The per-volume quota is *soft* — it never fails a guest write. So the
   device is the only hard limit on the write path and the only source of an ENOSPC a
   guest can see.
 

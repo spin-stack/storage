@@ -1202,12 +1202,16 @@ func logLine(out *bytes.Buffer, needle string) string {
 // TestWhatACompactionReports is v6 §21's two chain numbers plus what the collapse costs, on
 // the line that is written *before* the convert — which is the line that is there when a
 // collapse does not finish, and the only one an operator has to read then.
-// local_disk_bytes is the directory and not the record: a layer that survived the sweep
-// because it was minted before the tip is space somebody is paying for.
+// local_disk_bytes is this volume's chain and not the host's directory. It was the
+// directory while every volume had one of its own; with layers shared between volumes
+// (ADR-0027) that number is the machine's total, and a per-volume gauge reporting it would
+// accuse every volume on the host of whatever any one of them is doing. An orphan no record
+// names is the sweep's business, not this volume's bill.
 func TestWhatACompactionReports(t *testing.T) {
 	h := deepChain(t, qcow.CompactionPolicy{AtLayers: 4}, true)
-	const orphanBytes = 7 << 20
-	h.paths.put(qcow.LayerImage(root, "0198c0de-0000-7000-8000-0000000000ff"), []byte(`{"size":1,"data":{}}`), orphanBytes)
+	// An orphan in the shared directory that no volume's record names: it is not charged to
+	// this volume, and the sweep is what collects it.
+	h.paths.put(qcow.LayerImage(root, "0198c0de-0000-7000-8000-0000000000ff"), []byte(`{"size":1,"data":{}}`), 7<<20)
 
 	if err := h.cycle(t); err != nil {
 		t.Fatalf("applying: %v", err)
@@ -1218,7 +1222,7 @@ func TestWhatACompactionReports(t *testing.T) {
 	}
 	for _, want := range []string{
 		"chain_depth=4",
-		fmt.Sprintf("local_disk_bytes=%d", diskBytes+orphanBytes),
+		fmt.Sprintf("local_disk_bytes=%d", diskBytes),
 		"trigger=chain_depth",
 		"collapsed_layers=3",
 		"collapsed_oldest=" + oldestLayer,

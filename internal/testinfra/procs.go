@@ -84,7 +84,6 @@ type Process struct {
 
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
-	stdin  io.WriteCloser
 
 	mu     sync.Mutex
 	lines  []string
@@ -106,17 +105,6 @@ type ProcessConfig struct {
 	// command line: storecfg takes them from the SDK's default chain precisely so they
 	// do not land in `ps` output (see internal/storecfg).
 	Env []string
-	// Stdin gives the process a pipe on its standard input instead of /dev/null, so a
-	// test can send it something. Exactly one caller needs it and it is the reason the
-	// field exists: QEMU's `-serial stdio` wires this process's stdin to the guest's
-	// ttyS0, which is the only channel a host test has to *tell a running guest*
-	// anything (see StartLinuxGuest).
-	//
-	// Off by default rather than always on, because the two daemons are started the way
-	// a supervisor starts them, and a supervisor hands a daemon /dev/null. A binary that
-	// grew a stdin read would then block here and nowhere else, which is precisely the
-	// kind of difference between the lane and production this file exists to remove.
-	Stdin bool
 }
 
 // Start launches the process and arranges for it to be killed when the test ends.
@@ -144,14 +132,6 @@ func Start(t *testing.T, cfg ProcessConfig) *Process {
 	p := &Process{
 		Name: cfg.Name, cmd: cmd, cancel: cancel,
 		waiter: make(chan struct{}), done: make(chan struct{}), pumped: make(chan struct{}),
-	}
-	if cfg.Stdin {
-		in, err := cmd.StdinPipe()
-		if err != nil {
-			cancel()
-			t.Fatalf("%s: stdin: %v", cfg.Name, err)
-		}
-		p.stdin = in
 	}
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -232,24 +212,6 @@ func (p *Process) WaitForLine(t *testing.T, want string, timeout time.Duration) 
 		case <-deadline:
 			t.Fatalf("%s did not print %q within %s", p.Name, want, timeout)
 		}
-	}
-}
-
-// WriteLine sends one line to the process's standard input, which exists only when
-// ProcessConfig.Stdin asked for it.
-//
-// It fails the test when the write does not land, and that is the point rather than a
-// convenience: the caller is telling something that is supposed to be running to do
-// something, and EPIPE here means it was already gone. Swallowing that would turn "the
-// guest obeyed" into "the guest was dead and nobody noticed", which is the exact class
-// of vacuous assertion this lane exists to remove.
-func (p *Process) WriteLine(t *testing.T, line string) {
-	t.Helper()
-	if p.stdin == nil {
-		t.Fatalf("%s: WriteLine needs ProcessConfig.Stdin", p.Name)
-	}
-	if _, err := io.WriteString(p.stdin, line+"\n"); err != nil {
-		t.Fatalf("%s: writing %q to stdin: %v (the process is gone?)", p.Name, line, err)
 	}
 }
 

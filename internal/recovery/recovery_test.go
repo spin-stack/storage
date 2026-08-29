@@ -41,9 +41,6 @@ type fakeFiles struct {
 	dirs    map[string]bool
 	files   map[string][]byte
 	removed []string
-	// opened records local reads, which is how a same-host clone is told apart from a
-	// download: the chain looks identical either way.
-	opened []string
 	// createErr, when set, is what every Create fails with.
 	createErr error
 }
@@ -100,26 +97,6 @@ func (f *fakeFiles) WriteAtomic(path string, data []byte) error {
 	f.files[path] = slices.Clone(data)
 	return nil
 }
-
-// Open serves a file this fake already holds. It counts the reads, because the whole
-// point of a same-host clone is that the object store is not touched — and a test that
-// only checked the resulting chain could not tell a copy from a download.
-func (f *fakeFiles) Open(path string) (io.ReadSeekCloser, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, ok := f.files[path]
-	if !ok {
-		return nil, fmt.Errorf("no such file: %s", path)
-	}
-	f.opened = append(f.opened, path)
-	return nopSeekCloser{bytes.NewReader(b)}, nil
-}
-
-// nopSeekCloser is a file this fake holds: readable, rewindable, and closing it costs
-// nothing.
-type nopSeekCloser struct{ *bytes.Reader }
-
-func (nopSeekCloser) Close() error { return nil }
 
 func (f *fakeFiles) Create(path string) (io.WriteCloser, error) {
 	f.mu.Lock()

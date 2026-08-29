@@ -179,17 +179,19 @@ const (
 	// is the healthy value, so an Agent that recovers reports it without doing anything,
 	// and an Agent built before this field says the true thing about itself by omission.
 	VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED VolumeRefusal = 0
-	// The catalog says this volume published an image and the object store holds none
-	// (agent.ErrImageMissing): a stray delete, a lifecycle expiry, a restore that missed
-	// one key. Look at the bucket.
+	// The volume's layers are not where this host has to find them: unlinked under a
+	// running guest, or a chain the object store cannot rebuild — a stray delete, a
+	// lifecycle expiry, a restore that missed one key. Look at the bucket.
 	VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING VolumeRefusal = 1
-	// The volume came back below the sequence a guest was already told was durable
-	// (agent.ErrDurabilityLost): this host's local WAL was lost with writes in it, and
-	// what is in the bucket is genuinely older than what the fleet promised.
+	// The QEMU writing this volume reports the qcow2 corrupt flag on the image it has
+	// open. Nothing sealed from that chain can be published — the bit rides through the
+	// object store and every reader refuses the result — so the newest restorable point
+	// is the last commit. The guest is not stopped: its bytes are still here, and this
+	// host is still the volume's writer.
 	VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST VolumeRefusal = 2
-	// The read view never resolved, so every read fails and the session will not be
-	// published (agent.ErrNoReadView, wal.ErrBaseUnavailable) — an unreadable ancestry,
-	// an object store that would not answer.
+	// The chain never resolved end to end, so the volume cannot be opened and nothing
+	// sealed from it will be published — an unreadable ancestry, an object store that
+	// would not answer.
 	VolumeRefusal_VOLUME_REFUSAL_NO_READ_VIEW VolumeRefusal = 3
 	// The catalog says the volume is encrypted and this host holds no KEK, or holds a
 	// different one (agent.ErrNoKEK). One missing flag on one process, or a
@@ -198,8 +200,9 @@ const (
 	// The host lease lapsed on the Agent's own monotonic clock and it gave the device up
 	// rather than keep answering for a volume it can no longer confirm it owns (§12.2).
 	VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST VolumeRefusal = 5
-	// Everything else that stopped the runtime from starting: a socket that could not be
-	// bound, a WAL that would not resume, this host's own -max-volumes ceiling. A
+	// Everything else that stopped the volume from being served: a QMP socket that would
+	// not answer, a qemu-img run that failed, an image QEMU has open that nothing this
+	// host records accounts for. A
 	// catch-all on purpose — without one, the next refusal to be written would be
 	// invisible again, which is the whole failure this enum exists to close.
 	VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED VolumeRefusal = 6
@@ -329,21 +332,21 @@ func (ReportOutcome) EnumDescriptor() ([]byte, []int) {
 	return file_spin_storage_v1_control_plane_proto_rawDescGZIP(), []int{3}
 }
 
-// DeviceStatus is what the Agent observes about the NVMe device it owns
-// (ADR-0013). All three numbers are needed and none is derivable from the
-// others: total and used give the pressure thresholds, and the remote backlog is
-// the part of `used` that no amount of local truncation can reclaim, because it
-// is bytes no verified object covers yet (INV-13).
+// DeviceStatus is what the Agent observes about the device holding its data directory
+// (ADR-0013): the two numbers the pressure cordon is decided on.
 type DeviceStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// total_bytes is the capacity of the device backing the WAL and checkpoints.
+	// total_bytes is the capacity of the filesystem holding --data-dir. It is that whole
+	// filesystem and not this Agent's share of it, because other tenants of it fill the
+	// disk a guest's writes then cannot use.
 	TotalBytes int64 `protobuf:"varint,1,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`
-	// used_bytes is what this Agent is occupying on it right now.
+	// used_bytes is what is occupied on it right now, by everything.
 	UsedBytes int64 `protobuf:"varint,2,opt,name=used_bytes,json=usedBytes,proto3" json:"used_bytes,omitempty"`
-	// remote_backlog_bytes is the sum, over every volume on this host, of the
-	// bytes that are not yet covered by a verified object. Per-volume
-	// backpressure (wal.Limits.MaxRemoteGapBytes) never sums to a device budget
-	// on its own — this is the number that does (ADR-0013 §1).
+	// remote_backlog_bytes was the sum, over every volume, of bytes no verified object
+	// covered — a WAL number. Every Agent sends 0 and nothing reads it; what replaced it is
+	// per volume and measured against a chain that exists
+	// (VolumeReport.unpublished_local_bytes). Kept because deleting it is a wire change,
+	// and written down so that it is a decision and not an oversight.
 	RemoteBacklogBytes int64 `protobuf:"varint,3,opt,name=remote_backlog_bytes,json=remoteBacklogBytes,proto3" json:"remote_backlog_bytes,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
@@ -1092,12 +1095,12 @@ type VolumeReport struct {
 	// is the case that used to produce no report whatsoever — the volume simply stopped
 	// appearing on the wire, and an absence is not a signal.
 	//
-	// The watermarks on a refused report are this host's honest zeros or whatever its
-	// WAL replayed, and they are safe next to a refusal precisely because the Control
-	// Plane merges them with GREATEST: a volume that could not open reports nothing that
-	// can pull the catalog's numbers backwards. The refusal itself is not merged that
-	// way — see SetVolumeRefusal, which is qualified by this host and this epoch, so a
-	// writer the fleet has moved past cannot mark a volume its successor is serving.
+	// The measurements on a refused report are this host's honest zeros: a volume with no
+	// chain reports nothing rather than the numbers its last healthy cycle left behind,
+	// because a stale byte count beside a refusal reads as progress. Every field here is
+	// recorded last-report-wins and qualified by this host and this epoch — see
+	// RecordVolumeReport — so a writer the fleet has moved past cannot mark a volume its
+	// successor is serving, nor stamp its RPO over the successor's.
 	Refusal VolumeRefusal `protobuf:"varint,10,opt,name=refusal,proto3,enum=spin.storage.v1.VolumeRefusal" json:"refusal,omitempty"`
 	// refusal_detail is the sentence behind it, verbatim from the Agent, empty when
 	// there is no refusal. `-fleet-status` prints it and nothing branches on it: it

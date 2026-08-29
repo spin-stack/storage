@@ -190,24 +190,48 @@ func chainDepth(st State, tip string) int {
 	return len(st.Commits) + len(st.SealedBelow(LayerIDOfImage(tip))) + 1
 }
 
-// layerBytes is what this volume's layers occupy on this host — v6 §21's
-// local_disk_bytes. The directory is listed rather than the record walked, because the
-// number an operator is watching is the disk's and not the record's: an orphan overlay a
-// rotation left behind occupies space no record names.
+// layerBytes is what ONE volume's chain occupies on this host — v6 §21's local_disk_bytes.
+//
+// Measured from the record and the pointer, not by listing the directory. Listing was right
+// while every volume had a layers directory of its own; layers live in one directory for
+// the whole host now (LayersDir says why), so the listing answers with the machine's total
+// and every volume on it would report the same number — a per-volume gauge that accuses
+// each of them equally for whatever any one of them is doing.
+//
+// A layer several volumes read through is counted for each of them, and that is the honest
+// answer to the question this gauge is asked: what this volume's chain costs to serve.
+// Summing the gauge across a host therefore over-counts, and is not what it is for — the
+// number that does not double-count is the size of the layers directory itself.
+//
+// What the record cannot see is a file no volume names, which is the orphan an interrupted
+// rotation leaves. That is the sweep's business and it is bounded by the sweep running
+// every cycle; charging it to a volume that does not read it would be the same lie one step
+// smaller.
 func layerBytes(p Paths, root, volumeID string) (int64, error) {
-	dir := LayersDir(root)
-	names, err := p.List(dir)
+	st, err := ReadState(p, root, volumeID)
 	if err != nil {
-		return 0, fmt.Errorf("qcow: listing %s to measure what volume %s occupies: %w", dir, volumeID, err)
+		return 0, err
+	}
+	named := map[string]bool{}
+	for _, id := range st.LayerIDs() {
+		named[id] = true
+	}
+	pointed, err := readPointer(p, root, volumeID, ActivePointer(root, volumeID))
+	if err != nil {
+		return 0, err
+	}
+	if pointed != "" {
+		named[LayerIDOfImage(pointed)] = true
 	}
 	var total int64
-	for _, name := range names {
-		if filepath.Ext(name) != layerSuffix {
-			continue
-		}
-		size, err := p.Size(filepath.Join(dir, name))
+	for id := range named {
+		size, err := p.Size(LayerImage(root, id))
 		if err != nil {
-			return 0, fmt.Errorf("qcow: measuring %s of volume %s: %w", name, volumeID, err)
+			// A layer the record names and the disk does not have. It is not this
+			// measurement's job to diagnose that — Open and the publish path both refuse
+			// on it — and a report that fails here would take the whole cycle's numbers
+			// down with it.
+			continue
 		}
 		total += size
 	}

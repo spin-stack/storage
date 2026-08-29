@@ -2,7 +2,7 @@
 
 - **Status:** Accepted — 2026-07-28
 - **Relates to:** ADR-0021 (storage consumes spinbox's artefacts, never its code),
-  ADR-0010 (pin by digest, not by tag)
+  the same pin-by-digest rule the object-store image follows
 
 ## Decision
 

@@ -46,7 +46,6 @@ package metadatatest
 import (
 	"context"
 	"errors"
-	"fmt"
 	"reflect"
 	"sort"
 	"sync"
@@ -97,69 +96,6 @@ func RunContract(t *testing.T, newStore Fixture) {
 			tc.run(t, newStore(t))
 		})
 	}
-}
-
-// --- the lifecycle mutations the schema implies -----------------------------
-//
-// The volume (§7) and snapshot (§19) state machines are stored by every
-// implementation and CHECK-constrained in Postgres, but until they are on the
-// Store interface no caller can move a volume into FENCING_WAIT or a crashed
-// snapshot out of CREATING. These assertions state that as a test failure rather
-// than a compile error, so the gap is visible as "the Store cannot express the
-// lifecycle it stores".
-
-// errNotExpressible means the Store stores a lifecycle it has no mutation for.
-var errNotExpressible = errors.New("metadatatest: lifecycle is stored but not expressible through the Store")
-
-type volumeStateSetter interface {
-	SetVolumeState(ctx context.Context, term int64, volumeID string, state lifecycle.VolumeState) error
-}
-
-type snapshotStateSetter interface {
-	SetSnapshotState(ctx context.Context, term int64, snapshotID string, state lifecycle.SnapshotState) error
-}
-
-func setVolumeState(ctx context.Context, s metadata.Store, term int64, volumeID string, state lifecycle.VolumeState) error {
-	m, ok := s.(volumeStateSetter)
-	if !ok {
-		return fmt.Errorf("%w: no SetVolumeState (§7 volume states)", errNotExpressible)
-	}
-	return m.SetVolumeState(ctx, term, volumeID, state)
-}
-
-func setSnapshotState(ctx context.Context, s metadata.Store, term int64, snapshotID string, state lifecycle.SnapshotState) error {
-	m, ok := s.(snapshotStateSetter)
-	if !ok {
-		return fmt.Errorf("%w: no SetSnapshotState (§19 snapshot states)", errNotExpressible)
-	}
-	return m.SetSnapshotState(ctx, term, snapshotID, state)
-}
-
-type authorityClocker interface {
-	Now(ctx context.Context) (time.Time, error)
-}
-
-func now(ctx context.Context, s metadata.Store) (time.Time, error) {
-	m, ok := s.(authorityClocker)
-	if !ok {
-		return time.Time{}, fmt.Errorf("%w: no Now (§12.1: the clock that stamps last_renewal)", errNotExpressible)
-	}
-	return m.Now(ctx)
-}
-
-type epochCASer interface {
-	BumpVolumeEpoch(ctx context.Context, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error)
-}
-
-// bumpVolumeEpoch is the compare-and-set form of the epoch bump. A blind increment
-// hands an epoch to whichever caller happened to run second, so the volume row ends
-// up naming a primary that never CASed the S3 epoch object and never got a lease.
-func bumpVolumeEpoch(ctx context.Context, s metadata.Store, term int64, volumeID, primaryHostID string, expectedEpoch int64) (int64, error) {
-	m, ok := s.(epochCASer)
-	if !ok {
-		return 0, fmt.Errorf("%w: BumpVolumeEpoch takes no expected epoch (§12.3: the bump is a blind increment)", errNotExpressible)
-	}
-	return m.BumpVolumeEpoch(ctx, term, volumeID, primaryHostID, expectedEpoch)
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -234,11 +170,11 @@ func everyMutation() []mutation {
 			}, nil)
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			_, err := bumpVolumeEpoch(ctx, s, term, w.vol, w.host, 0)
+			_, err := s.BumpVolumeEpoch(ctx, term, w.vol, w.host, 0)
 			return err
 		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return setVolumeState(ctx, s, term, w.vol, lifecycle.VolumePrimarySuspected)
+			return s.SetVolumeState(ctx, term, w.vol, lifecycle.VolumePrimarySuspected)
 		}},
 		{"SetVolumePrimaryHost", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.SetVolumePrimaryHost(ctx, term, w.vol, "")
@@ -249,7 +185,7 @@ func everyMutation() []mutation {
 			})
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return setSnapshotState(ctx, s, term, w.snap, lifecycle.SnapshotFailed)
+			return s.SetSnapshotState(ctx, term, w.snap, lifecycle.SnapshotFailed)
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.PublishSnapshot(ctx, term, w.snap, id(), w.host)
@@ -336,11 +272,11 @@ func missingRows(t *testing.T, s metadata.Store) {
 			return s.RenewHostLease(ctx, term, ghostHost, 10)
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			_, err := bumpVolumeEpoch(ctx, s, term, ghostVol, w.host, 0)
+			_, err := s.BumpVolumeEpoch(ctx, term, ghostVol, w.host, 0)
 			return err
 		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return setVolumeState(ctx, s, term, ghostVol, lifecycle.VolumePrimarySuspected)
+			return s.SetVolumeState(ctx, term, ghostVol, lifecycle.VolumePrimarySuspected)
 		}},
 		{"SetVolumePrimaryHost", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.SetVolumePrimaryHost(ctx, term, ghostVol, w.host)
@@ -361,7 +297,7 @@ func missingRows(t *testing.T, s metadata.Store) {
 			return s.DeleteVolume(ctx, term, ghostVol)
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return setSnapshotState(ctx, s, term, ghostSnap, lifecycle.SnapshotFailed)
+			return s.SetSnapshotState(ctx, term, ghostSnap, lifecycle.SnapshotFailed)
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.PublishSnapshot(ctx, term, ghostSnap, id(), "")
@@ -410,11 +346,11 @@ func staleTermWins(t *testing.T, s metadata.Store) {
 		call func() error
 	}{
 		{"missing volume under a stale term", func() error {
-			_, err := bumpVolumeEpoch(ctx, s, stale, ghost, w.host, 0)
+			_, err := s.BumpVolumeEpoch(ctx, stale, ghost, w.host, 0)
 			return err
 		}},
 		{"wrong expected epoch under a stale term", func() error {
-			_, err := bumpVolumeEpoch(ctx, s, stale, w.vol, w.host, 99)
+			_, err := s.BumpVolumeEpoch(ctx, stale, w.vol, w.host, 99)
 			return err
 		}},
 		{"illegal host transition under a stale term", func() error {
@@ -867,7 +803,7 @@ func volumeLifecycle(t *testing.T, s metadata.Store) {
 		lifecycle.VolumeRecoveryRequired, lifecycle.VolumeRecovering, lifecycle.VolumeActive,
 	}
 	for _, want := range path {
-		if err := setVolumeState(ctx, s, w.term, w.vol, want); err != nil {
+		if err := s.SetVolumeState(ctx, w.term, w.vol, want); err != nil {
 			t.Fatalf("SetVolumeState(%s): %v", want, err)
 		}
 		v, _ := s.GetVolume(ctx, w.vol)
@@ -878,7 +814,7 @@ func volumeLifecycle(t *testing.T, s metadata.Store) {
 
 	// §7: the way out of a suspicion never leads straight back to serving, and the
 	// guard belongs in the write, not in the caller.
-	if err := setVolumeState(ctx, s, w.term, w.vol, lifecycle.VolumeRecovering); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := s.SetVolumeState(ctx, w.term, w.vol, lifecycle.VolumeRecovering); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("ACTIVE -> RECOVERING: want ErrInvalidTransition, got %v", err)
 	}
 	if v, _ := s.GetVolume(ctx, w.vol); v.State != lifecycle.VolumeActive {
@@ -893,10 +829,10 @@ func snapshotLifecycle(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s) // w.snap is CREATING
 
-	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotFailed); err != nil {
+	if err := s.SetSnapshotState(ctx, w.term, w.snap, lifecycle.SnapshotFailed); err != nil {
 		t.Fatalf("CREATING -> FAILED: %v", err)
 	}
-	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotDeleting); err != nil {
+	if err := s.SetSnapshotState(ctx, w.term, w.snap, lifecycle.SnapshotDeleting); err != nil {
 		t.Fatalf("FAILED -> DELETING: %v", err)
 	}
 	if got, _ := s.GetSnapshot(ctx, w.snap); got.State != lifecycle.SnapshotDeleting {
@@ -911,7 +847,7 @@ func snapshotLifecycle(t *testing.T, s metadata.Store) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := setSnapshotState(ctx, s, w.term, other, lifecycle.SnapshotCreating); !errors.Is(err, lifecycle.ErrInvalidTransition) {
+	if err := s.SetSnapshotState(ctx, w.term, other, lifecycle.SnapshotCreating); !errors.Is(err, lifecycle.ErrInvalidTransition) {
 		t.Fatalf("PUBLISHED -> CREATING: want ErrInvalidTransition, got %v", err)
 	}
 	if got, _ := s.GetSnapshot(ctx, other); got.State != lifecycle.SnapshotPublished {
@@ -1077,7 +1013,7 @@ func fleetWideReads(t *testing.T, s metadata.Store) {
 	if published[0].CommitID == "" {
 		t.Fatalf("snapshot %s came back published naming no commit, so nothing could root a walk at it", w.snap)
 	}
-	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotDeleting); err != nil {
+	if err := s.SetSnapshotState(ctx, w.term, w.snap, lifecycle.SnapshotDeleting); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if got, err := s.ListUnfinishedSnapshots(ctx); err != nil ||
@@ -1122,7 +1058,7 @@ func concurrentBumps(t *testing.T, s metadata.Store) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e, err := bumpVolumeEpoch(ctx, s, w.term, w.vol, host, before.CurrentEpoch)
+			e, err := s.BumpVolumeEpoch(ctx, w.term, w.vol, host, before.CurrentEpoch)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -1666,7 +1602,7 @@ func authorityClock(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
 
-	before, err := now(ctx, s)
+	before, err := s.Now(ctx)
 	if err != nil {
 		t.Fatalf("Now: %v", err)
 	}
@@ -1680,7 +1616,7 @@ func authorityClock(t *testing.T, s metadata.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, err := now(ctx, s)
+	after, err := s.Now(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1720,11 +1656,11 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			}, nil)
 		}},
 		{"BumpVolumeEpoch", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			_, err := bumpVolumeEpoch(ctx, s, term, "", w.host, 0)
+			_, err := s.BumpVolumeEpoch(ctx, term, "", w.host, 0)
 			return err
 		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return setVolumeState(ctx, s, term, "", lifecycle.VolumePrimarySuspected)
+			return s.SetVolumeState(ctx, term, "", lifecycle.VolumePrimarySuspected)
 		}},
 		{"CreateSnapshot", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.CreateSnapshot(ctx, term, metadata.Snapshot{
@@ -1733,7 +1669,7 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			})
 		}},
 		{"SetSnapshotState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return setSnapshotState(ctx, s, term, "", lifecycle.SnapshotFailed)
+			return s.SetSnapshotState(ctx, term, "", lifecycle.SnapshotFailed)
 		}},
 		{"PublishSnapshot", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.PublishSnapshot(ctx, term, "", id(), "")
