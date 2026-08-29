@@ -243,7 +243,14 @@ func unpublished(v metadata.Volume) string {
 	if v.Progress.ReportedAt.IsZero() {
 		return "-"
 	}
-	return capacity(v.Progress.UnpublishedLocalBytes)
+	cell := capacity(v.Progress.UnpublishedLocalBytes)
+	if v.Progress.PublishStalled {
+		// The backlog alone does not say whether it is draining. Marked here rather than
+		// given a column of its own: it is a fact *about this number* — the reason it is
+		// not going down — and it is what the host's cordon is for.
+		cell += "(stalled)"
+	}
+	return cell
 }
 
 // volumeState renders the STATE cell, the same move hostState makes above: the catalog's word

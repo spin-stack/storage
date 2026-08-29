@@ -21,7 +21,7 @@ import (
 // created rather than cloned is at depth 0.
 //
 // The number is the depth a restore can still serve, and one measurement sets it.
-// recovery.maxRestoreDepth refuses a rebuild that would put more than 256 layers under one
+// qcow.MaxLayers refuses a rebuild that would put more than 256 layers under one
 // volume, which is where the measured QEMU ceiling sits — 301 layers open in both qemu-img
 // and qemu-system at one file descriptor and ~140 KiB of RSS each, in *every* process that
 // opens the chain. That budget is spent across the whole lineage, because a rebuilt clone
@@ -98,7 +98,7 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, kms 
 	}
 	// Refused before a host is chosen, before a row exists and before a byte is charged: a
 	// refusal that has already written something is one an operator has to clean up after.
-	// It is also the only place it can refuse — recovery.maxRestoreDepth is a termination
+	// It is also the only place it can refuse — qcow.MaxLayers is a termination
 	// guard on a walk, and refusing there turns a volume the fleet created successfully into
 	// one nothing can read, with a guest already booting.
 	//

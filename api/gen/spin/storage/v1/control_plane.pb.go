@@ -1064,6 +1064,17 @@ type VolumeReport struct {
 	// above take: the report's refusal is what says why.
 	ChainDepth     int32 `protobuf:"varint,15,opt,name=chain_depth,json=chainDepth,proto3" json:"chain_depth,omitempty"`
 	LocalDiskBytes int64 `protobuf:"varint,16,opt,name=local_disk_bytes,json=localDiskBytes,proto3" json:"local_disk_bytes,omitempty"`
+	// publish_stalled says this host is holding a sealed layer it has tried and failed to
+	// get into the object store. It is not a refusal: the guest goes on writing and the
+	// volume goes on being served (§15 — "S3 no disponible: la VM sigue"), which is exactly
+	// why the fleet cannot see this any other way. Everything else about the volume reads
+	// normal; the only symptom is `unpublished_local_bytes` climbing on a row nobody is
+	// looking at, until the filesystem fills and QEMU returns ENOSPC to the guest.
+	//
+	// v6 §11 names the reaction: alarm on the backlog long before that, and stop placing
+	// new volumes on the host. This is the fact that reaction is taken on, and it is a
+	// fact rather than a threshold — the host tried, and it did not work.
+	PublishStalled bool `protobuf:"varint,18,opt,name=publish_stalled,json=publishStalled,proto3" json:"publish_stalled,omitempty"`
 	// published_commit_id is the newest commit this host has published for the volume,
 	// empty while it has published none. It is what the catalog remembers so that a *later*
 	// host can be told the volume has a history — see DesiredVolume.head_commit_id.
@@ -1181,6 +1192,13 @@ func (x *VolumeReport) GetLocalDiskBytes() int64 {
 		return x.LocalDiskBytes
 	}
 	return 0
+}
+
+func (x *VolumeReport) GetPublishStalled() bool {
+	if x != nil {
+		return x.PublishStalled
+	}
+	return false
 }
 
 func (x *VolumeReport) GetPublishedCommitId() string {
@@ -1409,7 +1427,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xab\x04\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xd4\x04\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12\x1f\n" +
@@ -1420,7 +1438,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x17unpublished_local_bytes\x18\x0e \x01(\x03R\x15unpublishedLocalBytes\x12\x1f\n" +
 	"\vchain_depth\x18\x0f \x01(\x05R\n" +
 	"chainDepth\x12(\n" +
-	"\x10local_disk_bytes\x18\x10 \x01(\x03R\x0elocalDiskBytes\x12.\n" +
+	"\x10local_disk_bytes\x18\x10 \x01(\x03R\x0elocalDiskBytes\x12'\n" +
+	"\x0fpublish_stalled\x18\x12 \x01(\bR\x0epublishStalled\x12.\n" +
 	"\x13published_commit_id\x18\x11 \x01(\tR\x11publishedCommitId\x12%\n" +
 	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
 	"\arefusal\x18\n" +

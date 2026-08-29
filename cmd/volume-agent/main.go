@@ -72,8 +72,10 @@ func run() (err error) {
 			"path to the pinned qemu-img binary, which creates and inspects every qcow2 chain (required)")
 		probeTimeout = flag.Duration("qemu-timeout", 5*time.Second,
 			"how long one qemu-img run or one QMP exchange may take before the Agent gives up on it for this cycle")
-		rotateAt = flag.Int64("rotate-at-bytes", 0,
-			"seal a volume's tip and start a new layer once the tip occupies this many bytes. 0 disables rotation, which is the default until v6 §11's threshold is fixed by measurement")
+		compactAt = flag.Int("compact-at-layers", qcow.DefaultCompaction.AtLayers,
+			"collapse a volume's published prefix into a new immutable root once its chain is this many layers deep; 0 disables it. Past qcow.MaxLayers a chain cannot be rebuilt on another host, and this is what keeps a volume away from that")
+		rotateAt = flag.Int64("rotate-at-bytes", qcow.DefaultRotateAtBytes,
+			"seal a volume's tip and start a new layer once the tip occupies this many bytes; 0 disables rotation. The default is derived from what one commit costs — see qcow.DefaultRotateAtBytes, and `task measure:publish` to measure your own backend")
 	)
 	var storeFlags storecfg.Flags
 	storeFlags.Register(flag.CommandLine)
@@ -199,7 +201,21 @@ func run() (err error) {
 		// No object store: this host seals layers and publishes none of them, and it also
 		// cannot answer "does this volume have published commits". recovery.Absent is
 		// what makes that a refusal rather than a blank disk — see the type.
-		slog.Warn("no object store configured: this Agent seals layers and publishes none of them, so nothing it holds survives losing this host, and it cannot serve a volume that has published commits elsewhere")
+		// And nothing rotates. Rotation exists to produce a layer to publish; with no
+		// publisher it would seal one, stop at §11's second invariant — never rotate while
+		// a sealed layer is unpublished — and leave the tip growing anyway. That is the
+		// same disk with one more file in it and a chain one layer deeper, which is
+		// strictly worse than not having rotated. An explicit -rotate-at-bytes is still
+		// honoured, because a test measuring the rotation itself is a real caller.
+		if !flagWasSet("rotate-at-bytes") {
+			*rotateAt = 0
+		}
+		// And nothing collapses: a collapse publishes its root, so with no publisher it
+		// would convert a whole volume's worth of bytes and have nowhere to put the result.
+		if !flagWasSet("compact-at-layers") {
+			*compactAt = 0
+		}
+		slog.Warn("no object store configured: this Agent publishes nothing and does not rotate, so nothing it holds survives losing this host, and it cannot serve a volume that has published commits elsewhere")
 	case kms == nil:
 		return errors.New("an object store is configured but -kek-file is not: a layer is sealed with the volume's DEK on the way out (v6 §10), and this Agent could not unwrap one")
 	default:
@@ -222,6 +238,7 @@ func run() (err error) {
 		QemuImg:       *qemuImg,
 		ProbeTimeout:  *probeTimeout,
 		RotateAtBytes: *rotateAt,
+		Compaction:    qcow.CompactionPolicy{AtLayers: *compactAt},
 	}, qcow.Deps{
 		Clock:     real.NewClock(),
 		Disk:      dataDisk,
@@ -278,16 +295,23 @@ func run() (err error) {
 // start over a flag the operator never touched. An explicitly given backoff is left alone and
 // still validated: silently shrinking a number somebody typed would be worse than a refusal.
 func backoffFor(backoff, interval time.Duration) time.Duration {
-	explicit := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "retry-backoff" {
-			explicit = true
-		}
-	})
-	if explicit || backoff <= interval {
+	if flagWasSet("retry-backoff") || backoff <= interval {
 		return backoff
 	}
 	return interval
+}
+
+// flagWasSet reports whether the operator typed this flag, which is not the same question
+// as whether it holds a non-zero value: a default that a binary adjusts for itself must
+// never adjust a number somebody chose.
+func flagWasSet(name string) bool {
+	var set bool
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 // loopKeys is the knot between the publisher and the loop, tied in the one place that already

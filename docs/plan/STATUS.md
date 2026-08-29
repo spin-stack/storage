@@ -74,15 +74,13 @@ Nothing on the §24 list. What is left is in the two sections below.
 
 - **No RPO target is set anywhere.** The age trigger is in and per-volume
   (`volumes.rpo_target_seconds` → `DesiredVolume`), and what a host measures against it now
-  reaches the catalog; every volume carries a target of zero, because §11 forbids choosing
-  one instead of measuring, and the upload-throughput measurement has not been made.
-  `-seed-rpo-seconds` is the only way to set one, and `-fleet-status` only marks a volume
-  as past its target when there is one.
-- **Rotation and publishing have no production default.** `-rotate-at-bytes` is 0 and no
-  object store is required, so an Agent started without both seals and publishes nothing —
-  loudly, in one WARN line. A layer's size is a *floor*, not a bound: measured at 8x the
-  threshold with a 300 ms cycle, and nothing holds a layer to a size while QEMU takes the
-  guest's writes.
+  reaches the catalog; every volume carries a target of zero, because a target is a promise
+  sold to a tenant and nothing here has sold one. `task measure:publish` says what the floor
+  under any such promise is on a given backend. `-seed-rpo-seconds` sets one.
+- **A busy volume that never detaches walks towards the chain ceiling.** Rotation stops at
+  `qcow.MaxLayers` rather than building a chain nothing can rebuild, and the tip then grows
+  instead — the RPO degrades, visibly, in the pair §11 asks be watched. Only a collapse
+  undoes it, and a collapse needs the guest to let go of the files.
 - **A restart between sealing and publishing duplicates a commit id** — the layer is
   derived from the chain and never lost; only the id is.
 - **A collapse waits for the guest to detach.** The rebase onto the new root needs the
@@ -93,9 +91,9 @@ Nothing on the §24 list. What is left is in the two sections below.
   free them, and a collapse waits for the guest. What the sweep does remove is the orphan
   overlay an interrupted rotation leaves. The *bucket* side is done: `-gc-delete`.
 - **§21's numbers reach a human, not an alert.** Eleven are recorded and scrapeable; the
-  RPO and the unpublished backlog reach the catalog and `-fleet-status` per volume. None
-  reaches an alert or a cordon, and nothing measures attachment. §11's other half — deny
-  new attaches on a host that is falling behind — is not built.
+  RPO and the unpublished backlog reach the catalog and `-fleet-status` per volume. §11's
+  other half is built — a host holding a layer it failed to publish is cordoned — but
+  nothing else reaches an alert, and nothing measures attachment.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
   DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
   expiring the descriptor's non-current versions.

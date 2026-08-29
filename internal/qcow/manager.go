@@ -27,6 +27,34 @@ import (
 // site.
 const lockFile = "agent.lock"
 
+// DefaultRotateAtBytes is v6 §11's size trigger, fixed by measuring rather than choosing
+// — which is §23's exit criterion for Stage 2 and the reason this was 0 for so long.
+//
+// `task measure:publish` measures what §9's steps 9 to 13 cost through the real writer,
+// and the fit gives two numbers: F, what a commit costs before a byte of payload (the
+// manifest PUT, the HEAD compare-and-set, and the read of the commit being built on), and
+// R, the rate the payload moves at over both passes. A commit of S bytes costs F + S/R, so
+// the threshold at which the fixed cost is a tenth of the commit is S = 9FR.
+//
+// Against the pinned RustFS on loopback: F = 12 ms, R = 392 MiB/s, S = 43 MiB.
+//
+// **And that number barely moves with the backend**, which is what makes it a default at
+// all rather than a measurement of this laptop. F and R move in opposite directions — a
+// slower store costs more per round trip *and* less per byte — so their product is the
+// bandwidth-delay product, which is far more stable than either term. Working it through:
+// a real S3 at F = 50 ms and R = 100 MiB/s gives 45 MiB; a fast local store at F = 5 ms and
+// R = 1 GiB/s gives 45 MiB; a slow remote one at F = 200 ms and R = 20 MiB/s gives 36 MiB.
+// Two orders of magnitude of backend, and a band of 36 to 45.
+//
+// 32 MiB is the round number under that band, and under is the safe side: too small costs
+// overhead, too large costs RPO, and the second is the promise. A deployment that wants
+// its own number runs `task measure:publish` against its own store.
+//
+// It is a *floor* on the layer, never a bound (§11): the tip is measured once a cycle, so
+// a layer weighs the threshold plus whatever the guest wrote since the last look — measured
+// at 8x under a hard writer. Nothing can bound it while QEMU takes the writes.
+const DefaultRotateAtBytes = 32 << 20
+
 // minRotateAtBytes is the floor under Config.RotateAtBytes. A freshly created qcow2 is
 // already ~193 KiB of header, L1 table and refcount blocks before a guest writes a byte;
 // 1 MiB is the nearest round number above that with room for the metadata a few writes
@@ -185,6 +213,12 @@ type volume struct {
 	// unpublished, so a host that cannot reach S3 grows one tip and holds one sealed
 	// layer rather than a chain of small ones that are each a commit that never landed.
 	pending *SealedLayer
+	// stalled says the last attempt to publish `pending` failed. It is not a refusal —
+	// the volume goes on being served, which is what §15 promises when the object store
+	// is unreachable — and it is not derived from `pending` either: owing a layer is the
+	// ordinary state between a rotation and a publish, while having *tried and failed* is
+	// the one the fleet has to act on. Cleared by the publish that succeeds.
+	stalled bool
 	// rpo is this volume's age trigger, from the desired state. Zero is a volume with
 	// no RPO promise, which commits on size alone.
 	rpo time.Duration
@@ -686,11 +720,17 @@ func (m *Manager) publish(ctx context.Context, v *volume) error {
 				m.recordFenced(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED, err.Error()),
 				m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED, err))
 		}
-		slog.Error("could not publish this volume's sealed layer; it stays on this host and nothing rotates until it lands",
+		// Written down, not just logged. The volume goes on being served and the guest
+		// goes on writing — §15's "S3 no disponible: la VM sigue" — so every other number
+		// on this row reads normal and the only symptom is a backlog nobody is looking at.
+		// §11 asks that new volumes stop being placed here long before the disk fills, and
+		// this is the fact the fleet takes that decision on.
+		v.stalled = true
+		slog.Error("could not publish this volume's sealed layer; it stays on this host, nothing rotates until it lands, and this host stops taking new volumes",
 			"volume_id", v.id, "layer", layer.Path, "commit_id", layer.CommitID, "error", err)
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
-	v.pending = nil
+	v.pending, v.stalled = nil, false
 	slog.Info("committed: the sealed layer is in the object store and HEAD names it",
 		"volume_id", v.id, "epoch", layer.Epoch, "commit_id", layer.CommitID,
 		"layer_id", layer.LayerID, "bytes", layer.PlainBytes)
@@ -939,6 +979,26 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	// point in the history, not the one that was asked for. §11's "an idle volume does not
 	// commit" is about the automatic triggers, and being wrong this way costs one small
 	// layer.
+	// Nothing rotates a chain that is already as deep as anything can rebuild — the
+	// snapshot arm included, because a snapshot naming a commit on a chain no host can
+	// restore is a snapshot that cannot be cloned or recovered from, which is all a
+	// snapshot is for.
+	//
+	// The trade is that the tip grows instead. That degrades the RPO, and it does so
+	// visibly: the writes past the last commit are exactly what commit_age and
+	// unpublished_local_bytes report, and both climb from here. The other side is a
+	// volume nothing can restore, so it is not close. The volume is not refused either:
+	// every byte of it is still readable and still local, and taking a guest's disk away
+	// over bookkeeping would be the larger harm.
+	//
+	// What is meant to keep this unreachable is §19's collapse (DefaultCompaction), and
+	// what makes it reachable anyway is that a collapse waits for the guest to let go of
+	// the files. A volume that is written hard and never detached walks here.
+	if depth, err := m.depth(v); err == nil && depth >= MaxLayers {
+		slog.Warn("this volume's chain is as deep as a rebuild can go, so its tip grows instead of rotating; its RPO degrades from here and only a compaction can undo it, which needs the guest to detach",
+			"volume_id", v.id, "chain_depth", depth, "max_layers", MaxLayers, "tip_bytes", size)
+		return nil
+	}
 	if v.snapshotPending() {
 		slog.Info("sealing the tip for a snapshot: everything written before the request has to be in the history it names",
 			"volume_id", v.id, "snapshot_id", v.wantSnapshot,
@@ -962,6 +1022,15 @@ func (m *Manager) maybeRotate(ctx context.Context, v *volume) error {
 	slog.Info("committing on age: this volume's tip has been unpublished for longer than its RPO",
 		"volume_id", v.id, "age_s", age.Seconds(), "rpo_s", v.rpo.Seconds(), "tip_bytes", size)
 	return m.rotate(ctx, v, size)
+}
+
+// depth is how many layers a guest reads through for this volume.
+func (m *Manager) depth(v *volume) (int, error) {
+	st, err := ReadState(m.paths, m.cfg.Root, v.id)
+	if err != nil {
+		return 0, err
+	}
+	return chainDepth(st, v.chain.Active), nil
 }
 
 // tipAge is how long it has been since this host published a commit for the volume, or
@@ -1351,6 +1420,7 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 			ChainDepth:            g.chainDepth,
 			LocalDiskBytes:        g.localDiskBytes,
 			PublishedCommitID:     g.publishedCommitID,
+			PublishStalled:        v.stalled,
 			Refusal:               v.refusal,
 			// Empty when there is no refusal, which is what the wire's healthy value is.
 			RefusalDetail: v.detail,

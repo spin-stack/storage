@@ -15,7 +15,10 @@ set -euo pipefail
 
 DEMO_NAME=stage3
 DEMO_DONE="the whole of Stage 3 ran: a guest wrote, every sealed layer was published, and HEAD's chain is complete and sealed"
-ROTATE_AT=${ROTATE_AT:-4194304}
+# Unset by default, and the flag is then not passed at all: this demonstration runs on the
+# threshold the binary ships with, which is the only way that number is ever exercised by
+# something a human runs. The soak sets it to move the parameter (hack/soak.sh).
+ROTATE_AT=${ROTATE_AT:-}
 CHURN=${CHURN:-32}
 COMMITS_WANTED=${COMMITS_WANTED:-3}
 HEARTBEAT=${HEARTBEAT:-300ms}
@@ -23,7 +26,7 @@ HEARTBEAT=${HEARTBEAT:-300ms}
 # needs the same KEK: a layer is sealed with the volume's DEK, which is wrapped under it.
 # $DIR is chosen by demo-lib, so the store path is filled in after it is sourced — which
 # is why this is a template rather than the string itself.
-AGENT_FLAGS_TEMPLATE="-rotate-at-bytes $ROTATE_AT -retry-backoff $HEARTBEAT -object-store-dir @DIR@/store"
+AGENT_FLAGS_TEMPLATE="${ROTATE_AT:+-rotate-at-bytes $ROTATE_AT }-retry-backoff $HEARTBEAT -object-store-dir @DIR@/store"
 # shellcheck source=hack/demo-lib.sh
 source "$(dirname "$0")/demo-lib.sh"
 

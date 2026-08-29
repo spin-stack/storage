@@ -1769,3 +1769,52 @@ func TestTheReportedRPOIsWhatSection11Defines(t *testing.T) {
 		})
 	}
 }
+
+// TestAChainAtTheCeilingStopsRotatingInsteadOfBecomingUnrecoverable.
+//
+// Rotation is what makes a chain deeper, and past qcow.MaxLayers a chain cannot be rebuilt
+// on another host — so a volume that rotates past it is a volume that has quietly stopped
+// being recoverable, with no error anywhere and the guest none the wiser. Compaction is
+// what is supposed to keep the ceiling out of reach, and it cannot run while a guest holds
+// the files, so a busy volume that never detaches walks towards it.
+//
+// The trade when it arrives: the tip grows instead. That degrades the RPO — the writes
+// past the last commit are the ones the host still owes — and it shows up in the pair §11
+// asks be watched, `commit_age` and `unpublished_local_bytes`, both of which keep climbing.
+// The other side of the trade is a volume nothing can restore, so it is not close.
+func TestAChainAtTheCeilingStopsRotatingInsteadOfBecomingUnrecoverable(t *testing.T) {
+	t.Parallel()
+	h := newHarnessFull(t, 8<<20, &recordingPublisher{})
+	tip := h.rotating(t, 9<<20)
+
+	// A record whose chain is already as deep as anything can rebuild: a published commit
+	// per layer under the tip, which is what a volume that has been rotating for a long
+	// time actually looks like.
+	st, err := qcow.ReadState(h.paths, root, vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Commits = nil
+	for range qcow.MaxLayers - 1 {
+		st.Commits = append(st.Commits, qcow.CommitLayer{CommitID: ids.New().String(), LayerID: ids.New().String()})
+	}
+	if err := qcow.WriteState(h.paths, root, vol, st); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	if got := h.tip(t); got != tip {
+		t.Fatalf("a chain at the ceiling rotated to %q, so it can no longer be rebuilt anywhere", got)
+	}
+	// And the volume is still served: refusing it would take a guest's disk away over
+	// bookkeeping, and every byte on it is still readable and still local.
+	v, ok := h.volumes(t)[vol]
+	if !ok {
+		t.Fatal("the volume stopped being reported")
+	}
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("a volume at the depth ceiling was refused: %v %q", v.Refusal, v.RefusalDetail)
+	}
+}

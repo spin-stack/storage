@@ -643,6 +643,17 @@ tasks:
           --push \
           .
 
+  measure:publish:
+    desc: >-
+      What one commit costs against the pinned backend: the fixed cost of a commit and
+      the rate its payload moves at. v6 §11 says the rotation threshold and the RPO are
+      set by measuring and not by choosing, and these are the two numbers they are set
+      from. Point it at another backend with S3_* to measure that one instead — the rate
+      is a property of the backend, and a deployment gets its own.
+    cmds:
+      - MEASURE=1 RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v -timeout 30m
+        -run TestMeasureWhatOneCommitCosts ./integration/backend/...
+
   backend:conformance:
     desc: "§6.1/§25.4 object-store conformance suite against the pinned backend image (blocking per backend version)."
     cmds:

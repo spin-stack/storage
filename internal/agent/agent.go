@@ -49,6 +49,9 @@ type VolumeStatus struct {
 	// flight, because a half-taken snapshot is not a fact the catalog can hold. The
 	// two fields below are its outcome: a sequence, or an error.
 	SnapshotID string
+	// PublishStalled says this host tried to get this volume's sealed layer into the
+	// object store and could not. The volume is still being served; see the proto field.
+	PublishStalled bool
 	// PublishedCommitID is the newest commit this host has published for the volume,
 	// empty while it has published none. It is not about this host: the catalog keeps it
 	// so that the *next* host to hold the volume can be told the volume has a history,

@@ -97,6 +97,11 @@ type VolumeProgress struct {
 	CommitAge time.Duration
 	// UnpublishedLocalBytes is what losing the host at that moment would have cost.
 	UnpublishedLocalBytes int64
+	// PublishStalled says the host tried to get this volume's sealed layer into the object
+	// store and could not. It is not a refusal — the volume is still being served, which is
+	// what §15 promises when the object store is unreachable — and it is what the fleet
+	// stops placing new volumes on a host for (§11).
+	PublishStalled bool
 	// Refusal is why the host is not serving the volume, and RefusalDetail is the sentence
 	// it sent with it. RefusalNone — the zero value — is the host saying it is serving.
 	Refusal       lifecycle.Refusal
@@ -120,6 +125,7 @@ type VolumeReport struct {
 
 	CommitAge             time.Duration
 	UnpublishedLocalBytes int64
+	PublishStalled        bool
 	Refusal               lifecycle.Refusal
 	RefusalDetail         string
 }

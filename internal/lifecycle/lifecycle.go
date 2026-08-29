@@ -198,17 +198,28 @@ const (
 	CordonNone     CordonReason = ""
 	CordonOperator CordonReason = "OPERATOR"
 	CordonPressure CordonReason = "DEVICE_PRESSURE"
+	// CordonStalledPublish: a volume on this host has a sealed layer it tried and failed
+	// to publish (v6 §11). Separate from DEVICE_PRESSURE because it is a different fact
+	// with a different fix — the disk is fine and the object store is not — and because a
+	// host can be in one without the other. It is what stops the fleet placing more
+	// volumes on a machine where every one of them would inherit a broken RPO.
+	CordonStalledPublish CordonReason = "STALLED_PUBLISH"
 )
 
-var cordonReasons = []CordonReason{CordonNone, CordonOperator, CordonPressure}
+var cordonReasons = []CordonReason{CordonNone, CordonOperator, CordonPressure, CordonStalledPublish}
 
 // cordonOverwrite is the authority table: for a write made *for* the key reason, the stored
 // reasons it may replace. The asymmetry is the point — an operator write lands on anything,
 // while the pressure loop may only touch a host that is uncordoned or that it cordoned itself,
 // so the 70% rule cannot un-cordon a host a human took out of service.
 var cordonOverwrite = map[CordonReason][]CordonReason{
-	CordonOperator: {CordonNone, CordonOperator, CordonPressure},
-	CordonPressure: {CordonNone, CordonPressure},
+	CordonOperator: {CordonNone, CordonOperator, CordonPressure, CordonStalledPublish},
+	// The two automatic reasons may replace each other: both are the Control Plane's own
+	// decision from a number the host reported, and a host that is both full and unable to
+	// publish should read as whichever it currently is rather than as whichever happened
+	// first. Neither touches an operator's.
+	CordonPressure:       {CordonNone, CordonPressure, CordonStalledPublish},
+	CordonStalledPublish: {CordonNone, CordonPressure, CordonStalledPublish},
 }
 
 // ErrCordonHeld means a write was refused because the host's cordon was placed by an

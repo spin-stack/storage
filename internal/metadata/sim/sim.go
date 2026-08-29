@@ -582,7 +582,8 @@ func (s *Store) RecordVolumeReport(_ context.Context, term int64, r metadata.Vol
 	}
 	v.Progress = metadata.VolumeProgress{
 		CommitAge: r.CommitAge, UnpublishedLocalBytes: r.UnpublishedLocalBytes,
-		Refusal: r.Refusal, RefusalDetail: detail, ReportedAt: s.now(),
+		PublishStalled: r.PublishStalled,
+		Refusal:        r.Refusal, RefusalDetail: detail, ReportedAt: s.now(),
 	}
 	// Outside Progress, and never cleared by a report that names no commit: it is a fact
 	// about the volume's data rather than about the host, and it has to reach the *next*

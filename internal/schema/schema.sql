@@ -46,7 +46,7 @@ CREATE TABLE hosts (
     -- predicate). Emptied when the host leaves CORDONED: a reason that outlives its cordon
     -- is one the next reader will believe.
     cordon_reason        TEXT NOT NULL DEFAULT ''
-                           CHECK (cordon_reason IN ('', 'OPERATOR', 'DEVICE_PRESSURE')),
+                           CHECK (cordon_reason IN ('', 'OPERATOR', 'DEVICE_PRESSURE', 'STALLED_PUBLISH')),
     agent_version        TEXT NOT NULL DEFAULT '',
     max_format_version   INTEGER NOT NULL DEFAULT 2,  -- fleet-mixed gating (§27)
     nvme_total_bytes     BIGINT NOT NULL DEFAULT 0,
@@ -176,6 +176,13 @@ CREATE TABLE volumes (
     -- which is the safe direction: the volume is then served exactly as it was before
     -- this column existed.
     head_commit_id         UUIDV7,
+    -- The host tried to get this volume's sealed layer into the object store and could
+    -- not. Not a refusal: the volume goes on being served and the guest goes on writing,
+    -- which is what §15 promises when the object store is unreachable — and is exactly why
+    -- nothing else in this row shows it. §11 asks that new volumes stop being placed on
+    -- such a host long before its filesystem fills, and this is the fact that decision is
+    -- taken on (see cpserver's stalled-publish cordon).
+    publish_stalled        BOOLEAN NOT NULL DEFAULT false,
     commit_age_seconds     INTEGER CHECK (commit_age_seconds >= 0),
     unpublished_local_bytes BIGINT NOT NULL DEFAULT 0
                              CHECK (unpublished_local_bytes >= 0),

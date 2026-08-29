@@ -110,6 +110,7 @@ UPDATE volumes
        refusal_detail = '',
        commit_age_seconds = NULL,
        unpublished_local_bytes = 0,
+       publish_stalled = false,
        reported_at = NULL,
        updated_at = now()
  WHERE volume_id = sqlc.arg(volume_id)
@@ -153,6 +154,7 @@ UPDATE volumes
        -- exactly as long as it takes a new host to publish — which is the window the
        -- column exists for.
        head_commit_id = COALESCE(sqlc.narg(head_commit_id)::uuid, head_commit_id),
+       publish_stalled = sqlc.arg(publish_stalled)::boolean,
        commit_age_seconds = sqlc.arg(commit_age_seconds)::int,
        unpublished_local_bytes = sqlc.arg(unpublished_local_bytes)::bigint,
        reported_at = now(),

@@ -502,6 +502,7 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		Progress: metadata.VolumeProgress{
 			CommitAge:             time.Duration(v.CommitAgeSeconds.Int32) * time.Second,
 			UnpublishedLocalBytes: v.UnpublishedLocalBytes,
+			PublishStalled:        v.PublishStalled,
 			Refusal:               refusal,
 			RefusalDetail:         v.RefusalDetail,
 			ReportedAt:            fromTS(v.ReportedAt),
@@ -715,6 +716,7 @@ func (s *Store) RecordVolumeReport(ctx context.Context, term int64, r metadata.V
 		VolumeID: id, HostID: host, Epoch: r.Epoch, Term: term, HeadCommitID: head,
 		Refusal: r.Refusal.String(), RefusalDetail: r.RefusalDetail,
 		CommitAgeSeconds: age, UnpublishedLocalBytes: r.UnpublishedLocalBytes,
+		PublishStalled: r.PublishStalled,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {

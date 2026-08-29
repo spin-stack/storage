@@ -512,6 +512,7 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 			SnapshotId:                v.SnapshotID,
 			SnapshotCommitId:          v.SnapshotCommitID,
 			PublishedCommitId:         v.PublishedCommitID,
+			PublishStalled:            v.PublishStalled,
 			LastSuccessfulCommitAgeMs: v.LastCommitAge.Milliseconds(),
 			UnpublishedLocalBytes:     v.UnpublishedLocalBytes,
 			ChainDepth:                int32(v.ChainDepth),

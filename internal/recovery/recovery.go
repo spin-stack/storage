@@ -37,18 +37,6 @@ import (
 // volume is new" the same sentence.
 var ErrIncomplete = errors.New("recovery: this volume's published chain could not be rebuilt in full")
 
-// maxRestoreDepth bounds how many layers one restore may put under a volume — the whole
-// lineage's, not one generation's, which is what controlplane.MaxChainDepth's ceiling is
-// derived from.
-//
-// 301 layers open fine in both qemu-img and qemu-system — measured — at one file
-// descriptor and about 140 KiB of RSS per layer *in every process that opens the chain*,
-// so the real ceiling is the default 1024-descriptor limit and it is reached by the VM
-// rather than here. Refusing at 256 turns "the fleet quietly built a chain nobody can
-// open" into a loud refusal well before that. §19's compaction, whose example trigger is
-// 32 layers, is what is supposed to keep the number an order of magnitude below this.
-const maxRestoreDepth = 256
-
 // partSuffix names a layer that is still being downloaded. A layer only ever appears
 // under its real name complete: a crash mid-fetch leaves a `.part` nobody looks for,
 // where truncating the real path would leave a file that Exists, that the state record
@@ -341,7 +329,7 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 // order it must be rebuilt in: a layer is repointed at a parent already on disk.
 //
 // `beneath` is how many layers earlier generations of this lineage already put under
-// this one, and maxRestoreDepth bounds their sum rather than one generation's history:
+// this one, and qcow.MaxLayers bounds their sum rather than one generation's history:
 // what the measurement bounds is how many backing files a single image opens, and a
 // per-generation bound would let a depth-D lineage build D times it.
 //
@@ -356,9 +344,9 @@ func (r *Recoverer) walk(ctx context.Context, volumeID, headCommitID string, ben
 		if seenCommit[id] {
 			return nil, fmt.Errorf("%w: volume %s's history reaches commit %s twice", ErrIncomplete, volumeID, id)
 		}
-		if beneath+len(newestFirst) == maxRestoreDepth {
+		if beneath+len(newestFirst) == qcow.MaxLayers {
 			return nil, fmt.Errorf("%w: volume %s reaches more than %d layers to restore",
-				ErrIncomplete, volumeID, maxRestoreDepth)
+				ErrIncomplete, volumeID, qcow.MaxLayers)
 		}
 		seenCommit[id] = true
 		// ReadManifest already refuses an object that describes a different volume or

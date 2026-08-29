@@ -96,6 +96,14 @@ func (s *Server) Heartbeat(ctx context.Context, req *connect.Request[storagev1.H
 	if err != nil {
 		return nil, rpcError(err)
 	}
+	// And §11's reaction, after the device's: a host can be both full and unable to
+	// publish, and the second is the one an operator can do something about. The two
+	// reasons may replace each other and neither touches an operator's cordon
+	// (lifecycle.cordonOverwrite).
+	state, err = s.applyStall(ctx, term, host, state)
+	if err != nil {
+		return nil, rpcError(err)
+	}
 
 	// A DEAD host is refused a lease rather than an answer. The Agent needs to tell
 	// "the Control Plane is unreachable" from "the Control Plane will not renew me":
@@ -342,6 +350,7 @@ func (s *Server) applyProgress(ctx context.Context, term int64, hostID string, r
 		PublishedCommitID:     r.GetPublishedCommitId(),
 		CommitAge:             time.Duration(r.GetLastSuccessfulCommitAgeMs()) * time.Millisecond,
 		UnpublishedLocalBytes: r.GetUnpublishedLocalBytes(),
+		PublishStalled:        r.GetPublishStalled(),
 		Refusal:               refusal, RefusalDetail: detail,
 	})
 	if err != nil {

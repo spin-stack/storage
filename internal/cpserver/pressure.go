@@ -79,6 +79,90 @@ func pressureTarget(h metadata.Host, band Band) (lifecycle.HostState, bool) {
 	}
 }
 
+// stalledPublish reports whether any volume this host holds has a sealed layer it tried
+// and failed to get into the object store.
+//
+// A listing per heartbeat, and it is the same listing applyPressure's decision would need
+// if capacity were not derived: the host's own volumes, which is a single indexed read on
+// primary_host_id. Cheaper than a column on hosts, and truthful for a reason a column
+// would not be — it is derived from the reports, so a volume that moves away takes its
+// stall with it and no sweep has to notice.
+func (s *Server) stalledPublish(ctx context.Context, hostID string) (bool, string, error) {
+	vols, err := s.md.ListVolumesByHost(ctx, hostID)
+	if err != nil {
+		return false, "", fmt.Errorf("cpserver: reading the volumes of host %q: %w", hostID, err)
+	}
+	for _, v := range vols {
+		if v.Progress.PublishStalled {
+			return true, v.VolumeID, nil
+		}
+	}
+	return false, "", nil
+}
+
+// applyStall is v6 §11's other half: a host that cannot get its layers into the object
+// store stops taking new volumes.
+//
+// The failure is silent by construction. §15 promises the VM keeps running when the object
+// store is unreachable, so the host reports a healthy device, a healthy lease and volumes
+// in ACTIVE — and placement goes on sending it more, each of which inherits a host that
+// cannot publish, until the filesystem fills and QEMU hands every guest ENOSPC.
+//
+// Cordoned rather than drained or fenced. Nothing about the volumes here is wrong and the
+// store may come back in a minute; moving them would cost more than it saves, and the
+// cordon stops only what is about to become a problem, which is the *next* volume. It
+// clears itself on the report that carries no stall — no sweep, nothing to notice a
+// recovery, the same shape the volume refusal beside it has.
+//
+// A threshold would have been the other design and there is nothing to set one from: §11
+// says to alarm on the backlog, and how many bytes are too many is a property of the disk,
+// the guest and the store. "The host tried and it did not work" needs no number.
+func (s *Server) applyStall(ctx context.Context, term int64, h metadata.Host, state lifecycle.HostState) (lifecycle.HostState, error) {
+	stalled, volumeID, err := s.stalledPublish(ctx, h.HostID)
+	if err != nil {
+		return state, err
+	}
+	target, ok := stallTarget(state, h.CordonReason, stalled)
+	if !ok {
+		return state, nil
+	}
+	if err := s.md.SetHostState(ctx, term, h.HostID, target, lifecycle.CordonStalledPublish); err != nil {
+		if errors.Is(err, metadata.ErrStaleTerm) {
+			return "", fmt.Errorf("cpserver: cordoning host %q for a stalled publish: %w", h.HostID, err)
+		}
+		// A race with an operator writing the same row, and the operator winning is the
+		// outcome ADR-0013 §5 wants.
+		slog.WarnContext(ctx, "a stalled publish could not change a host's fleet state",
+			"host_id", h.HostID, "from", state, "to", target, "error", err)
+		return state, nil
+	}
+	slog.WarnContext(ctx, "a stalled publish changed a host's fleet state",
+		"host_id", h.HostID, "from", state, "to", target, "volume_id", volumeID)
+	return target, nil
+}
+
+// stallTarget is the move, as a pure function of the row and the fact — the same shape
+// pressureTarget has, and for the same reason: the previous decision is read back from the
+// state and reason it wrote, so there is no per-host memory anywhere.
+//
+// No hysteresis, and it is not an oversight. The device band needs one because a host
+// sitting on a fill line crosses it in both directions on consecutive heartbeats; this is
+// not a line, it is an attempt that failed, and a host that alternates between publishing
+// and not is a host whose object store is alternating — which is a thing to see rather
+// than to smooth away.
+func stallTarget(state lifecycle.HostState, reason lifecycle.CordonReason, stalled bool) (lifecycle.HostState, bool) {
+	switch {
+	case stalled && state == lifecycle.HostActive:
+		return lifecycle.HostCordoned, true
+	case !stalled && state == lifecycle.HostCordoned && reason == lifecycle.CordonStalledPublish:
+		return lifecycle.HostActive, true
+	default:
+		// Everything else is left alone: a DRAINING or DEAD host already refuses
+		// placement, and a cordon placed for another reason is not this one's to clear.
+		return "", false
+	}
+}
+
 // applyPressure runs the §3 reaction for one heartbeat and returns the host's state as the
 // Agent should be told it — this heartbeat, or an Agent learns it was cordoned a round trip
 // after the fleet stopped placing on it.

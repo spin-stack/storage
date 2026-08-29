@@ -344,7 +344,7 @@ func TestEveryAncestorOnThisDiskIsCopiedRatherThanDownloaded(t *testing.T) {
 
 // TestOneLineageSpendsOneRestoreBudget is what controlplane.MaxChainDepth is derived from.
 //
-// recovery.maxRestoreDepth is a bound on how many layers one image opens, and a rebuilt
+// qcow.MaxLayers is a bound on how many layers one image opens, and a rebuilt
 // clone is one image whose backing chain is every generation's layers end to end — so the
 // budget is the lineage's, not a generation's. Counted per generation instead, a depth-D
 // clone builds D times the chain the measurement says a process can open, and nothing

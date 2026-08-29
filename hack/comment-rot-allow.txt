@@ -62,7 +62,8 @@ internal/metadata/metadata.go:Store.Now:lease-valid          # about the Control
 
 # --- naming a withdrawn mechanism to say it is gone, and two forward references --------
 internal/qcow/chain.go:overlay:compaction              # "§19 already owns flattening, as compaction, outside the recovery path" — §21's chain compaction, which internal/qcow/compact.go performs. The comment is why a recovery does NOT flatten.
-internal/recovery/recovery.go:maxRestoreDepth:compaction # the ceiling's reason: §21's compaction is what keeps a chain an order of magnitude below it.
+internal/qcow/compact.go:MaxLayers:compaction         # the ceiling's reason: §19's compaction is what keeps a chain an order of magnitude below it, and it runs — DefaultCompaction is what a binary uses
+internal/qcow/manager.go:DefaultRotateAtBytes:remote  # "a slow remote one at F = 200 ms" is a point on the backend curve the threshold is derived over, not the withdrawn remote WAL
 internal/controlplane/clone.go:MaxChainDepth:compaction # the ceiling's cost is per commit of the ancestor, and §21's compaction is what bounds an ancestor's growth — the same subject, on the Control Plane's side.
 internal/controlplane/clone.go:Clone:compaction        # two constraints on §19's compaction: what it must leave true about a clone's depth, and that a clone mints a fresh DEK or breaks crypto-shred.
 internal/qcow/compact.go:CompactionPolicy.AtLayers:compaction   # §21's chain compaction, which this file performs. The withdrawn "compaction" the checker knows is v5's objectization of WAL extents, a different subject that shares a word.

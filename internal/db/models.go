@@ -68,6 +68,7 @@ type Volume struct {
 	KekID                 string             `json:"kek_id"`
 	DekKeyID              int64              `json:"dek_key_id"`
 	HeadCommitID          pgtype.UUID        `json:"head_commit_id"`
+	PublishStalled        bool               `json:"publish_stalled"`
 	CommitAgeSeconds      pgtype.Int4        `json:"commit_age_seconds"`
 	UnpublishedLocalBytes int64              `json:"unpublished_local_bytes"`
 	ReportedAt            pgtype.Timestamptz `json:"reported_at"`

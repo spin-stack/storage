@@ -18,15 +18,42 @@ import (
 // no record names and no chain reads through, and the sweep collects it.
 const compactSuffix = ".compacting"
 
+// MaxLayers is the deepest chain anything in this system builds or opens — the ceiling
+// §19's compaction exists to keep a volume away from, and a hard bound rather than a
+// policy: a chain past it cannot be rebuilt on another host, so a volume that reached it
+// would be one nothing can recover.
+//
+// 301 layers open fine in both qemu-img and qemu-system — measured — at one file
+// descriptor and about 140 KiB of RSS per layer *in every process that opens the chain*,
+// so the real ceiling is the default 1024-descriptor limit and it is reached by the VM
+// rather than by a rebuild. Refusing at 256 turns "the fleet quietly built a chain nobody
+// can open" into a loud refusal well before that.
+//
+// It bounds the whole lineage and not one generation's history, which is what
+// controlplane.MaxChainDepth is derived from.
+const MaxLayers = 256
+
+// DefaultCompaction is §19's policy, and it is on by default for a reason that is not
+// tidiness: without it a chain grows until it passes MaxLayers, and then the volume cannot
+// be rebuilt anywhere. A collapse is what keeps that from being reachable, so shipping the
+// size trigger on (DefaultRotateAtBytes) and the collapse off would be shipping a fleet
+// that slowly makes its own volumes unrecoverable.
+//
+// 32 layers is §19's own example and it is an eighth of the ceiling. The headroom is the
+// point rather than the number: a collapse waits for the guest to detach — QEMU holds
+// every file of a live chain and §5 forbids going around it — so between the policy firing
+// and the collapse running, the volume goes on rotating. 224 layers of room is what a
+// long attach is given.
+//
+// AtBytes is left at zero. Depth is the constraint with a hard bound behind it; a second
+// threshold measured against nothing would be choosing, which is what §19 says not to do.
+var DefaultCompaction = CompactionPolicy{AtLayers: 32}
+
 // CompactionPolicy is when a volume's chain has grown far enough that collapsing it is
 // worth doing (v6 §19: chains cannot grow without limit).
 //
-// Both numbers are zero unless a caller sets them, and nothing in this tree chooses one.
-// §19 says the policy is "ajustada por medición" and offers `layer_count >= 32` and
-// `total_incremental_size >= 20 GiB` as examples; no chain has been measured in
-// production, so those stay examples in the document rather than becoming defaults here.
-// Zero on both is the honest state and it is also free: no chain is evaluated and no
-// layer is stat'd.
+// Zero on both disables it entirely, which is free: no chain is evaluated and no layer is
+// stat'd. DefaultCompaction is what a binary uses.
 type CompactionPolicy struct {
 	// AtLayers is the chain depth — the tip plus every layer under it — at or above
 	// which a chain is due for compaction. Zero leaves depth out of the decision.

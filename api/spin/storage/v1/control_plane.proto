@@ -428,6 +428,17 @@ message VolumeReport {
   // above take: the report's refusal is what says why.
   int32 chain_depth = 15;
   int64 local_disk_bytes = 16;
+  // publish_stalled says this host is holding a sealed layer it has tried and failed to
+  // get into the object store. It is not a refusal: the guest goes on writing and the
+  // volume goes on being served (§15 — "S3 no disponible: la VM sigue"), which is exactly
+  // why the fleet cannot see this any other way. Everything else about the volume reads
+  // normal; the only symptom is `unpublished_local_bytes` climbing on a row nobody is
+  // looking at, until the filesystem fills and QEMU returns ENOSPC to the guest.
+  //
+  // v6 §11 names the reaction: alarm on the backlog long before that, and stop placing
+  // new volumes on the host. This is the fact that reaction is taken on, and it is a
+  // fact rather than a threshold — the host tried, and it did not work.
+  bool publish_stalled = 18;
   // published_commit_id is the newest commit this host has published for the volume,
   // empty while it has published none. It is what the catalog remembers so that a *later*
   // host can be told the volume has a history — see DesiredVolume.head_commit_id.
