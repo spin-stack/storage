@@ -9,6 +9,31 @@
 // is using it.
 //
 // Not a general QMP library: no event subscription, no command registry, no reconnection.
+//
+// # Why there is no event subscription, measured
+//
+// QEMU announces a guest corrupting its own qcow2 as BLOCK_IMAGE_CORRUPTED, which would
+// be the obvious way to hear about it while the guest runs. Measured against the pinned
+// 11.1.1, it is the wrong channel for this client:
+//
+//   - It is announced once. QEMU's own words on the console are "further corruption
+//     events will be suppressed", so a client that was not connected and negotiated at
+//     that instant never hears it again — and this client dials per exchange and closes,
+//     while a guest's first read can mark the image within milliseconds of launch. In a
+//     run with a real -drive, the corruption was signalled during the BIOS's first read
+//     and a monitor that attached a second later saw nothing.
+//   - Hearing it at all would mean a connection held open for the guest's whole life,
+//     with a reader goroutine draining a stream that mixes events with answers — see
+//     execute, which skips events precisely because a command's reply and an event share
+//     one stream. That is a different object with a different lifetime, and INV-01's
+//     ctx-bound connection is what bounds every read here.
+//   - The same fact is *state* on the connection this client already opens each cycle:
+//     query-block's inserted.image.format-specific.data.corrupt, which BlockDevice.Corrupt
+//     carries. A poll cannot miss a fact that stays true.
+//
+// What polling does not see is a *fatal* corruption: QEMU then drops the medium, so the
+// device comes back with no `inserted` at all (measured), which is indistinguishable here
+// from a guest that has gone away.
 package qmp
 
 import (
@@ -56,6 +81,12 @@ type BlockDevice struct {
 	// image is being read as raw is a volume whose backing chain is invisible to it,
 	// which is worth being able to notice.
 	Format string
+	// Corrupt is the qcow2 corrupt flag as the *running* QEMU reports it: an
+	// inconsistency it found in the guest's own image and could not resolve. It is the
+	// same bit `qemu-img info` reads offline, and reading it from here is the only way to
+	// read it at all while a guest holds the image (v6 §5, and qemu-img is refused on the
+	// write lock).
+	Corrupt bool
 	// NodeName is the block graph node holding the image, empty when QEMU generated an
 	// anonymous one. A VM launched with `-drive file=...,if=virtio` has an anonymous
 	// node — `#block126` — which QMP refuses as input, and a VM launched with
@@ -151,6 +182,15 @@ func (c *Client) BlockDevices() ([]BlockDevice, error) {
 			File     string `json:"file"`
 			Driver   string `json:"drv"`
 			NodeName string `json:"node-name"`
+			Image    struct {
+				// The same shape qemu-img info prints, because it is the same
+				// ImageInfo: QEMU renders one type for both.
+				FormatSpecific struct {
+					Data struct {
+						Corrupt bool `json:"corrupt"`
+					} `json:"data"`
+				} `json:"format-specific"`
+			} `json:"image"`
 		} `json:"inserted"`
 	}
 	if err := json.Unmarshal(raw, &devices); err != nil {
@@ -167,6 +207,7 @@ func (c *Client) BlockDevices() ([]BlockDevice, error) {
 		out = append(out, BlockDevice{
 			Device: d.Device, QDev: d.QDev,
 			File: d.Inserted.File, Format: d.Inserted.Driver,
+			Corrupt:  d.Inserted.Image.FormatSpecific.Data.Corrupt,
 			NodeName: nameOrAnonymous(d.Inserted.NodeName),
 		})
 	}

@@ -59,6 +59,10 @@ type Config struct {
 	// write cannot be refused (v6 §11), so nothing can hold a layer to a size; an operator
 	// sizing uploads should plan for the threshold plus one cycle of the fastest guest.
 	RotateAtBytes int64
+	// Compaction is when a chain has grown deep enough to be worth collapsing (v6 §19).
+	// The zero value is no policy at all, which is what every caller has until somebody
+	// measures one — see CompactionPolicy.
+	Compaction CompactionPolicy
 	// ProbeTimeout bounds one exchange with QEMU over QMP, and one run of `qemu-img`.
 	// Both are another process answering, and neither is allowed to park the Agent's
 	// reconciliation cycle: a heartbeat that does not go out is a lease that lapses.
@@ -88,7 +92,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("qcow: a rotation threshold of %d bytes is below the %d an empty image already occupies",
 			c.RotateAtBytes, minRotateAtBytes)
 	}
-	return nil
+	return c.Compaction.Validate()
 }
 
 // SealedLayer is a layer this host has finished writing and has not yet published. It
@@ -190,6 +194,9 @@ type volume struct {
 	snapshotID     string
 	snapshotCommit string
 	snapshotErr    string
+	// compactedDepth is the chain depth the last compaction warning carried, so that a
+	// condition which stays true until a human acts on it is not restated every cycle.
+	compactedDepth int
 	// openedAt is when this process opened the chain, in milliseconds on the injected
 	// clock. It is the age trigger's anchor for a volume that has never committed, and
 	// it is deliberately not durable: a volume with no commits has nothing to be late
@@ -397,7 +404,7 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	// QEMU's write lock. QEMU having opened it is a stronger statement about the image
 	// than any check made from here, and since rotation moves the tip while a VM runs,
 	// it is also the only thing that knows *which* layer is current.
-	open, err := m.probe(ctx, id)
+	open, corrupt, err := m.probe(ctx, id)
 	if err != nil {
 		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, err)
 	}
@@ -423,6 +430,21 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 		if _, err := m.paths.Size(open); err != nil {
 			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
 				fmt.Errorf("the VM has %s open and that path no longer exists, so this volume's layers were removed under a running guest; nothing here can name its bytes and no new chain will be prepared under it: %w", open, err))
+		}
+		// And QEMU does not say it is corrupt. This is the one moment a guest corrupting
+		// its own image can be *detected* — an offline tool is refused on the write lock
+		// (v6 §5 forbids it anyway), so the running QEMU is the only reader — and until
+		// now the consequence was closed at both ends and the fact itself was learned at
+		// the next open, which can be days later and on another host.
+		//
+		// The guest is not stopped: nobody else owns this volume, so this is not
+		// supersession, and stopping it would take away the operator's only copy of a disk
+		// whose newest bytes are on this host. It is refused instead, which is what stops
+		// the chain being rotated and published under a commit no host could restore.
+		if corrupt {
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST,
+				fmt.Errorf("%w: the QEMU writing %s reports the qcow2 corrupt flag set on it, so nothing sealed from this chain can be published and the newest restorable point is the last commit",
+					ErrChainMismatch, open))
 		}
 		live = open
 	}
@@ -800,7 +822,8 @@ func (m *Manager) reconcile(v *volume) error {
 	if err != nil {
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
-	return nil
+	// After the sweep, so the bytes reported are the ones that are still there.
+	return m.noteCompaction(v, st)
 }
 
 // adopt takes on the oldest layer this host owes the object store, from the record when
@@ -1153,33 +1176,36 @@ func (m *Manager) setAttached(v *volume, attached bool) {
 //
 // An empty string is "nothing is listening", the ordinary state of a prepared volume
 // whose VM has not been launched, and it is not an error.
-func (m *Manager) probe(ctx context.Context, volumeID string) (string, error) {
+func (m *Manager) probe(ctx context.Context, volumeID string) (image string, corrupt bool, err error) {
 	ctx, cancel := m.withTimeout(ctx)
 	defer cancel()
 
 	client, err := qmp.Dial(ctx, m.dialer, QMPSocket(m.cfg.Root, volumeID))
 	if err != nil {
 		if errors.Is(err, qmp.ErrNoEndpoint) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", err
+		return "", false, err
 	}
 	defer func() { _ = client.Close() }()
 
 	devices, err := client.BlockDevices()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	for _, d := range devices {
 		// The first file, reported rather than counted: what an operator does about a
 		// VM running the wrong image starts with knowing which image it is.
 		if d.File != "" {
-			return d.File, nil
+			// The corrupt flag comes back with it rather than in a question of its own:
+			// it is a field of the answer this cycle already asks for, so noticing costs
+			// nothing, and a second exchange would be a second chance to miss it.
+			return d.File, d.Corrupt, nil
 		}
 	}
 	// A QEMU with no block devices at all. It is not this volume's VM and it is not
 	// running anything else's image either, so there is nothing to refuse over.
-	return "", nil
+	return "", false, nil
 }
 
 // withTimeout bounds one exchange with another process, using the injected clock so the

@@ -64,8 +64,7 @@ system has no equivalent of vSphere's datastore lock.
 1. **A clone of a clone is refused, and raising that needs the walk to recurse.**
    `RestoreFrom` rebuilds one ancestor, so `MaxChainDepth` is 1. Lifting it means the
    Control Plane sending the whole ancestry and recovery walking it.
-2. **§29 has one point left**: qcow2 corruption a guest introduces *while running*.
-3. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
+2. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
    while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
    implementation of it. They belong in `internal/qcow`'s adversary lane.
 
@@ -88,6 +87,8 @@ system has no equivalent of vSphere's datastore lock.
   guest's writes.
 - **A restart between sealing and publishing duplicates a commit id** — the layer is
   derived from the chain and never lost; only the id is.
+- **Compaction is planned and never performed.** A chain past its threshold is reported;
+  turning the plan into the act needs a human — it publishes a new immutable root.
 - **Nothing reclaims local disk.** Released volumes keep their layers, published layers
   keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
   never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.

@@ -112,6 +112,20 @@ func TestBlockDevices(t *testing.T) {
 			}},
 		},
 		{
+			// The corrupt flag as a *running* QEMU reports it, in the same ImageInfo
+			// `qemu-img info` prints. Measured against the pinned 11.1.1: this is the
+			// only reader of that bit while a guest holds the image.
+			name: "an image the guest has corrupted",
+			reply: `{"return": [{"device": "virtio0", "inserted": {"file": "/var/lib/va/tip.qcow2", "drv": "qcow2",
+			          "image": {"format-specific": {"type": "qcow2", "data": {"corrupt": true}}}}}]}`,
+			want: []qmp.BlockDevice{{
+				Device:  "virtio0",
+				File:    "/var/lib/va/tip.qcow2",
+				Format:  "qcow2",
+				Corrupt: true,
+			}},
+		},
+		{
 			// An empty CD-ROM tray. Reporting it as a device with an empty path would
 			// make it indistinguishable from a device whose file could not be read.
 			name:  "a backend with no medium is skipped",
