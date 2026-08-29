@@ -76,14 +76,11 @@ type RenewLeadershipParams struct {
 	HolderID string `json:"holder_id"`
 }
 
-// Say "still here" without becoming a new leader (§7). The term and the holder are
-// both predicates and neither is written: this is the one leadership write that must
-// not move the term, because every admin one-shot in cmd/control-plane reads GetLeader
-// and then writes under the term it read.
-//
-// 0 rows is the whole point of the guard. It means this process is no longer the
-// leader — superseded by an election, or running against a database that was restored
-// underneath it — and the caller's answer to that is to exit, not to retry.
+// Say "still here" without becoming a new leader (§7). The term and the holder are both
+// predicates and neither is written: every admin one-shot in cmd/control-plane reads
+// GetLeader and then writes under the term it read. 0 rows means this process is no longer
+// the leader — superseded, or running against a restored database — and the answer to that
+// is to exit, not to retry.
 func (q *Queries) RenewLeadership(ctx context.Context, arg RenewLeadershipParams) (int64, error) {
 	result, err := q.db.Exec(ctx, renewLeadership, arg.Term, arg.HolderID)
 	if err != nil {

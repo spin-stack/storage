@@ -68,7 +68,14 @@ wait "$GUEST1" 2>/dev/null || true
 echo "the parent is quiet; everything it wrote is in the bucket"
 
 say "5. the clone, created with the real binary"
-"$CP" "${CPFLAGS[@]}" -holder-id cp-clone -clone-snapshot "$SNAP" >"$DIR/logs/clone.log" 2>&1
+# -max-used-ratio, because a clone is *placed* and every other stage seeds its volume onto
+# a named host. ADR-0013's ceiling is 85% of the device holding --data-dir, and a hosted CI
+# runner sits above that before this demo starts — so the default refuses the clone and the
+# failure reads as "the clone is broken" when what happened is the policy working. This
+# stage is about the chain a clone builds, not about admission; the ceiling has its own
+# tests, and placement refusing a full host is one of them.
+"$CP" "${CPFLAGS[@]}" -holder-id cp-clone -max-used-ratio ${CLONE_MAX_USED:-0.99} -clone-snapshot "$SNAP"   >"$DIR/logs/clone.log" 2>&1 ||
+  die "the clone was refused: $(tail -3 "$DIR/logs/clone.log")"
 CLONE=$(grep -m1 -o 'volume_id=[^ ]*' "$DIR/logs/clone.log" | head -1 | cut -d= -f2)
 test -n "$CLONE" || die "no clone was created: $(cat "$DIR/logs/clone.log")"
 echo "clone $CLONE, from snapshot $SNAP"
