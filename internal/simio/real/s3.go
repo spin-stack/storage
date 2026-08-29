@@ -188,19 +188,70 @@ func translate(err error) error {
 	return err
 }
 
+// Put stores an object whose bytes are already in memory.
+//
+// It does **not** go through PutStream, and the distinction is the whole of this pair.
+// PutStream gives up two things to be able to send a body it cannot hold — SigV4's payload
+// signature, and the SDK's retries — and neither concession has anything to do with a
+// request whose body is a bytes.Reader. Routing Put through it applied both anyway, which
+// cost the thing this store exists to get right: RustFS answers a burst of concurrent
+// conditional writes with a transient 503, one attempt turns that into a failure, and the
+// loser of a CAS then reports a transport error where it should report
+// ErrPreconditionFailed. A fenced host reads that as "the network hiccupped" and goes on
+// serving — measured at three conformance runs in eight.
 func (s *S3Store) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
-	return s.PutStream(ctx, key, bytes.NewReader(data), int64(len(data)), opts)
+	in := putInput(s.bucket, key, bytes.NewReader(data), int64(len(data)), opts)
+	out, err := s.client.PutObject(ctx, in)
+	if err != nil {
+		return objectstore.PutResult{}, translate(err)
+	}
+	return objectstore.PutResult{ETag: aws.ToString(out.ETag)}, nil
 }
 
-// PutStream sends the body as it is produced. ContentLength is set explicitly: without it
-// the SDK buffers a non-seekable body to discover its length, which is the allocation
-// this method exists to avoid, and the reader is bounded to the same number so a body
-// that runs long cannot append to the object.
+// PutStream sends the body as it is produced, for the one object nobody wants a second
+// copy of in memory: a sealed layer.
+//
+// ContentLength is set explicitly: without it the SDK buffers a non-seekable body to
+// discover its length, which is the allocation this method exists to avoid, and the
+// reader is bounded to the same number so a body that runs long cannot append to the
+// object.
+//
+// Two things are given up here and nowhere else.
+//
+// The payload goes unsigned, which is what makes a stream possible at all: SigV4 computes
+// a SHA-256 over the whole body before the first byte goes out, which means rewinding it,
+// and a body that can be rewound is a body that is already in memory. Against a real
+// backend the SDK does not fall back — it fails with "failed to seek body to start,
+// request stream is not seekable", which is how this was found: green in every local lane
+// and red in the one that talks to RustFS. Nothing is actually lost: the bytes are covered
+// by the SHA-256 the commit protocol takes over what the store consumed and compares
+// against the digest that names the key before the manifest is written — a stronger check
+// than the transport's, because it survives the object sitting in the bucket.
+//
+// And one attempt, which has to be said rather than left to the default. The SDK cannot
+// replay a body it cannot rewind, so its retry does not retry: it fails with "failed to
+// rewind transport stream for retry", and that error arrives *instead of* the one the
+// server actually sent. The retry could never have worked, and the commit protocol retries
+// the whole publish next cycle from the same SealedLayer under the same commit id — so a
+// lost connection costs a cycle rather than a commit.
 func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	in := putInput(s.bucket, key, io.LimitReader(body, size), size, opts)
+	out, err := s.client.PutObject(ctx, in,
+		s3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware),
+		func(o *s3.Options) { o.RetryMaxAttempts = 1 })
+	if err != nil {
+		return objectstore.PutResult{}, translate(err)
+	}
+	return objectstore.PutResult{ETag: aws.ToString(out.ETag)}, nil
+}
+
+// putInput is the request both spellings send, so the conditional-write vocabulary is
+// written once: the two differ in how the body travels, never in what is asked of the key.
+func putInput(bucket, key string, body io.Reader, size int64, opts objectstore.PutOptions) *s3.PutObjectInput {
 	in := &s3.PutObjectInput{
-		Bucket:        aws.String(s.bucket),
+		Bucket:        aws.String(bucket),
 		Key:           aws.String(key),
-		Body:          io.LimitReader(body, size),
+		Body:          body,
 		ContentLength: aws.Int64(size),
 	}
 	switch {
@@ -209,39 +260,7 @@ func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, siz
 	case opts.IfMatch != "":
 		in.IfMatch = aws.String(opts.IfMatch)
 	}
-	// The payload is sent unsigned, and that is what makes a stream possible at all:
-	// SigV4 computes a SHA-256 over the whole body before the first byte goes out, which
-	// means rewinding it, and a body that can be rewound is a body that is already in
-	// memory. Against a real backend the SDK does not fall back — it fails the request
-	// with "failed to seek body to start, request stream is not seekable", which is how
-	// this was found: green in every local lane and red in the one that talks to RustFS.
-	//
-	// Nothing is given up. The bytes are covered by the SHA-256 the commit protocol takes
-	// over what the store actually consumed, and compares against the digest that names
-	// the key before the manifest is written — a stronger check than the transport's,
-	// because it survives the object sitting in the bucket.
-	//
-	// What it does cost is the SDK's own retries: it cannot replay a body it cannot
-	// rewind, so a connection lost mid-upload fails the publish. The commit protocol
-	// retries the whole thing next cycle from the same SealedLayer under the same commit
-	// id, so that costs a cycle rather than a commit.
-	// One attempt, and it has to be said rather than left to the default. The SDK cannot
-	// replay a body it cannot rewind, so its retry does not retry: it fails with "failed
-	// to rewind transport stream for retry", and that error arrives *instead of* the one
-	// the server actually sent. A loser of the create-only race then reports a transport
-	// problem where it should report ErrPreconditionFailed — measured here as roughly one
-	// conformance run in three.
-	//
-	// Nothing is lost by saying so. The retry could never have worked, and the commit
-	// protocol retries the whole publish next cycle from the same SealedLayer under the
-	// same commit id.
-	out, err := s.client.PutObject(ctx, in,
-		s3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware),
-		func(o *s3.Options) { o.RetryMaxAttempts = 1 })
-	if err != nil {
-		return objectstore.PutResult{}, translate(err)
-	}
-	return objectstore.PutResult{ETag: aws.ToString(out.ETag)}, nil
+	return in
 }
 
 func (s *S3Store) Get(ctx context.Context, key string) ([]byte, error) {
