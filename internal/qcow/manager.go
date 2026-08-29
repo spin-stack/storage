@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"path/filepath"
 	"sort"
@@ -376,14 +377,54 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 		// space is a verb the Control Plane will ask for.
 		delete(m.vols, id)
 		slog.Info("released a volume: this host is no longer serving it, and its local layers are kept",
-			"volume_id", id, "epoch", v.epoch, "layers", LayersDir(m.cfg.Root, id))
+			"volume_id", id, "epoch", v.epoch, "layers", LayersDir(m.cfg.Root))
 	}
 	// And the disk of anything the fleet can be shown to have moved elsewhere — which is
 	// the volumes released above, and the ones a previous process released before this one
 	// started. It never touches a volume in `m.vols`, so it runs after the loop above and
 	// not inside it.
 	m.reclaim(ctx)
+	// And the one rule that frees a layer file: nothing on this host names it. It runs
+	// once per cycle for the whole host rather than once per volume, because with a
+	// shared layers directory that is the only scope in which the question has an answer
+	// — a file no *volume* names may still be the backing another volume reads through.
+	//
+	// A failure is reported and refuses nothing: what it costs is space, and every volume
+	// here is being served.
+	ids, err := m.volumeIDs()
+	if err != nil {
+		failures = append(failures, err)
+	} else if removed, serr := sweep(m.paths, m.cfg.Root, ids); serr != nil {
+		failures = append(failures, serr)
+	} else {
+		for _, path := range removed {
+			slog.Warn("swept a layer file nothing on this host reads through: no volume's record or pointer names it, which is what a rotation interrupted between creating the overlay and switching to it leaves behind, and what a volume that has left this host leaves once its record is gone",
+				"layer", path)
+		}
+	}
 	return errors.Join(failures...)
+}
+
+// volumeIDs is every volume this host has a directory for, served or not. The sweep needs
+// all of them: a volume nobody is serving still has a record, and that record is what
+// keeps its layers from being freed while the fleet may hand it back.
+// An error is returned rather than a short list, and the difference is the whole of it:
+// an empty list is a host with no volumes, whose leftover layers *are* garbage, while a
+// failed listing is a host whose volumes cannot be enumerated — and sweeping against that
+// as if it were empty deletes every chain on the machine.
+func (m *Manager) volumeIDs() ([]string, error) {
+	names, err := m.paths.List(volumesRoot(m.cfg.Root))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// A host that has never served a volume, which is every host on its first cycle.
+		// Not the same as a listing that failed: there is nothing to enumerate, so an
+		// empty answer is the true one — and a layer file on a host with no volumes at
+		// all is garbage by the same rule as any other.
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("qcow: listing this host's volumes: %w", err)
+	}
+	return names, nil
 }
 
 // latched says whether a refusal may only be lifted by the fleet, at a higher epoch.
@@ -461,12 +502,26 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	}
 	live := ""
 	if open != "" {
-		// Ours if it is a layer of this volume, whichever layer it is. The check is the
-		// directory and not one path, because after a rotation the tip is a file this
-		// Agent may never have named — a restarted Agent learns it here.
-		if filepath.Dir(filepath.Clean(open)) != filepath.Clean(LayersDir(m.cfg.Root, id)) {
+		// Ours if this volume's own record or pointer accounts for it — §5 calls this the
+		// one safety check this Agent has on an attached VM, and it used to be answered by
+		// the directory, back when each volume had one. Layers are shared between volumes
+		// now (LayersDir says why), so a path says only that the file is a layer of this
+		// host; which volume it belongs to is a question for the record.
+		//
+		// It is asked of both because neither alone covers a rotation: the pointer is
+		// written before QEMU is told to switch, so a restart in between finds the new tip
+		// there and the old one in the record.
+		st, serr := ReadState(m.paths, m.cfg.Root, id)
+		if serr != nil {
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, serr)
+		}
+		pointed, perr := readPointer(m.paths, m.cfg.Root, id, ActivePointer(m.cfg.Root, id))
+		if perr != nil {
+			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED, perr)
+		}
+		if !st.Names(pointed, open) {
 			return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED,
-				fmt.Errorf("%w: it has %q open, which is not a layer of volume %s", ErrForeignImage, open, id))
+				fmt.Errorf("%w: it has %q open, and nothing this host records about volume %s accounts for it", ErrForeignImage, open, id))
 		}
 		// And it still has a name. QEMU reports the path it opened, not whether that path
 		// still resolves: unlink a running guest's layer directory and the guest keeps
@@ -741,18 +796,24 @@ func (m *Manager) publish(ctx context.Context, v *volume) error {
 			"volume_id", v.id, "layer", layer.Path, "commit_id", layer.CommitID, "error", err)
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
-	v.pending, v.stalled = nil, false
 	slog.Info("committed: the sealed layer is in the object store and HEAD names it",
 		"volume_id", v.id, "epoch", layer.Epoch, "commit_id", layer.CommitID,
 		"layer_id", layer.LayerID, "bytes", layer.PlainBytes)
 	if err := m.recordCommit(v, layer); err != nil {
 		// The commit is in the bucket and HEAD names it; only this host's note of that
-		// failed. The consequence is bounded and self-correcting: a restart re-publishes
-		// the same commit id, which commit.Publish recognises as its own retry. It is
-		// reported rather than swallowed because the note is also what lets a later
+		// failed. What is *not* cleared is the pending layer, and that is the whole of
+		// the correction: cleared here, the next cycle would derive the same sealed layer
+		// from the chain, find no note of it, and mint a *second* commit id for bytes that
+		// are already published — measured, with a device too full to write the note, as
+		// one layer under four commit ids in four cycles. Kept, the retry goes out under
+		// the id it already has, which commit.Publish recognises as its own and answers
+		// from the manifest that is already there.
+		//
+		// Reported rather than swallowed because the note is also what lets a later
 		// recovery skip re-downloading this layer.
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
+	v.pending, v.stalled = nil, false
 	return nil
 }
 
@@ -874,20 +935,7 @@ func (m *Manager) reconcile(ctx context.Context, v *volume) error {
 			return fmt.Errorf("volume %s: %w", v.id, err)
 		}
 	}
-	// The orphan overlay an interrupted rotation leaves; reclaim.go is the other half,
-	// for volumes this host no longer serves. Runs every cycle over a directory only this
-	// host writes to. A failure is reported and never refuses the volume: what it costs is
-	// space, and the guest is being served.
-	removed, err := sweep(m.paths, m.cfg.Root, v.id, v.chain.Active, st, v.pending)
-	for _, path := range removed {
-		slog.Warn("swept a layer file no chain reads through: it sits above the tip QEMU has open and no record names it, which is what a rotation interrupted between creating the overlay and switching to it leaves behind",
-			"volume_id", v.id, "layer", path, "tip", v.chain.Active)
-	}
-	if err != nil {
-		return fmt.Errorf("volume %s: %w", v.id, err)
-	}
-	// After the sweep, so the numbers a plan is made of are the ones still on disk. A
-	// compaction touches only published files, so it runs whether or not a guest is
+	// A compaction touches only published files, so it runs whether or not a guest is
 	// attached — and its last step *needs* the volume unattached. A failure is returned
 	// and does not refuse the volume, because the chain it would have collapsed is exactly
 	// the chain that goes on being served.
@@ -911,14 +959,14 @@ func (m *Manager) adopt(v *volume, st *State, tip string, dirty *bool) error {
 	if st.Pending != nil && st.Pending.LayerID == layerID {
 		v.pending = &SealedLayer{
 			VolumeID: v.id, LayerID: st.Pending.LayerID, CommitID: st.Pending.CommitID,
-			Path:  LayerImage(m.cfg.Root, v.id, st.Pending.LayerID),
+			Path:  LayerImage(m.cfg.Root, st.Pending.LayerID),
 			Epoch: st.Pending.Epoch, PlainBytes: st.Pending.PlainBytes, VirtualSize: st.Pending.VirtualSize,
 		}
 		slog.Info("this host owes the object store a sealed layer it recorded earlier; it will be published under the commit id it was sealed with",
 			"volume_id", v.id, "commit_id", st.Pending.CommitID, "layer_id", st.Pending.LayerID)
 		return nil
 	}
-	path := LayerImage(m.cfg.Root, v.id, layerID)
+	path := LayerImage(m.cfg.Root, layerID)
 	bytes, err := m.paths.Size(path)
 	if err != nil {
 		return fmt.Errorf("qcow: measuring the sealed layer %s of volume %s: %w", path, v.id, err)

@@ -81,16 +81,17 @@ Nothing on the §24 list. What is left is in the two sections below.
   `qcow.MaxLayers` rather than building a chain nothing can rebuild, and the tip then grows
   instead — the RPO degrades, visibly, in the pair §11 asks be watched. Only a collapse
   undoes it, and a collapse needs the guest to let go of the files.
-- **A restart between sealing and publishing duplicates a commit id** — the layer is
-  derived from the chain and never lost; only the id is.
 - **A collapse waits for the guest to detach.** The rebase onto the new root needs the
   files, and QEMU holds every one of a live chain, so the last step is owed until the
   volume reads as unattached. Until then the chain does not shrink and one line says so.
-- **A volume detached and left detached keeps its layers.** Local disk comes back when the
-  object store confirms the fleet granted the volume elsewhere (`demo:stage4` step 10) and
-  never on silence, so a volume nobody has moved is never reclaimed — and neither is one
-  that was deleted, because absence is not a fact. Published layers under a live chain are
-  a separate matter: the guest reads through them, so only a collapse frees those.
+- **A restart between sealing and publishing duplicates a commit id** — the layer is
+  derived from the chain and never lost; only the id is.
+- **A volume detached and left detached keeps its layers.** A volume releases its claim
+  when the object store confirms the fleet granted it elsewhere (`demo:stage4` step 10) and
+  never on silence, so a volume nobody has moved is never released — and neither is one
+  that was deleted, because absence is not a fact. What frees a file is one rule: no volume
+  on this host names it — so an interrupted rotation, whose layer is recorded before the
+  pointer names it, leaves ~190 KiB the sweep is not allowed to overrule.
 - **§21's numbers reach a human, not an alert.** Eleven are recorded and scrapeable; the
   RPO and the unpublished backlog reach the catalog and `-fleet-status` per volume. §11's
   other half is built — a host holding a layer it failed to publish is cordoned — but

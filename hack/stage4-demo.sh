@@ -77,7 +77,7 @@ while [ -n "$c" ]; do
   DEPTH=$((DEPTH + 1))
 done
 echo "    HEAD names $COMMIT; the published history is $DEPTH commits deep"
-LOCAL_BEFORE=$(ls "$DIR/agent/volumes/$VOLUME/layers" | wc -l)
+LOCAL_BEFORE=$(ls "$DIR/agent/layers" | wc -l)
 echo "    this host holds $LOCAL_BEFORE local layers, and is about to hold none"
 
 say "5. the host is destroyed"
@@ -131,7 +131,7 @@ GOT=$("$QEMU_IMG" info --backing-chain "$RECOVERED" | grep -c "^image:")
 [ "$GOT" -eq "$((DEPTH + 1))" ] ||
   die "the rebuilt chain is $GOT images deep and the published history is $DEPTH commits plus a new tip"
 echo "    $GOT images: $DEPTH downloaded layers and one new tip"
-for layer in "$DIR/agent/volumes/$VOLUME"/layers/*.qcow2; do
+for layer in "$DIR/agent"/layers/*.qcow2; do
   "$QEMU_IMG" check "$layer" >"$DIR/logs/check.log" 2>&1 ||
     { cat "$DIR/logs/check.log" >&2; die "qemu-img check failed on the downloaded $layer"; }
 done
@@ -155,7 +155,7 @@ say "10. the disk comes back when the fleet moves the volume somewhere else"
 # time passing but a fact — `volumes/<id>/epoch` naming a grant this host does not hold.
 # From that moment this chain is a fork that can never be published, so the files are
 # holding a disk for a history nothing will accept.
-LAYERS="$DIR/agent/volumes/$VOLUME/layers"
+LAYERS="$DIR/agent/layers"
 BEFORE=$(ls "$LAYERS" | wc -l)
 [ "$BEFORE" -gt 0 ] || die "there are no layers to reclaim"
 
@@ -187,8 +187,15 @@ kill -9 "$OTHER_PID" 2>/dev/null || true
 wait "$OTHER_PID" 2>/dev/null || true
 echo "    volume $VOLUME now belongs to host $OTHER"
 
-waitfor "$DIR/logs/agent2.log" "reclaimed the local disk" 120
-grep -m1 "reclaimed the local disk" "$DIR/logs/agent2.log" | sed 's/^/    /'
+waitfor "$DIR/logs/agent2.log" "released the local disk" 120
+grep -m1 "released the local disk" "$DIR/logs/agent2.log" | sed 's/^/    /'
+# Two steps, and the split is the point: releasing drops the volume's claim, and the one
+# rule that frees any layer file — nothing on this host names it — is what takes the disk.
+# Routing it through that rule is what keeps a clone of this volume from losing the layers
+# it reads through.
+waitfor "$DIR/logs/agent2.log" "swept a layer file" 120
 AFTER=$(ls "$LAYERS" 2>/dev/null | wc -l)
 [ "$AFTER" -eq 0 ] || die "$AFTER layers are still on the first host after the volume moved"
 echo "    $BEFORE layers freed on the host that no longer holds it"
+test ! -e "$DIR/agent/volumes/$VOLUME/active/current" ||
+  die "the pointer of a volume this host released still names a layer"

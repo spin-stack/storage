@@ -113,7 +113,7 @@ func TestAdversaryAHostThatKnowsItHoldsCommitsStillCreatesABlankDisk(t *testing.
 	// No pointer, but the layers of two published commits and the record that vouches
 	// for them: exactly what a restore leaves behind, and what a host that published
 	// them itself holds.
-	held := qcow.LayerImage(root, vol, baseID)
+	held := qcow.LayerImage(root, baseID)
 	p := newPaths(held)
 	if err := qcow.WriteState(p, root, vol, qcow.State{Commits: []qcow.CommitLayer{
 		{CommitID: headCommit, LayerID: baseID},
@@ -130,7 +130,7 @@ func TestAdversaryAHostThatKnowsItHoldsCommitsStillCreatesABlankDisk(t *testing.
 		t.Fatalf("reading the state back: %v", stErr)
 	}
 	if err == nil && len(st.Commits) > 0 {
-		fresh := qcow.LayerImage(root, vol, layerID)
+		fresh := qcow.LayerImage(root, layerID)
 		t.Errorf("this host records holding commit %s in layer %s and was handed a blank tip %q anyway (qemu-img: %v);"+
 			" a guest launched now reads zeros over a chain that is on this disk",
 			st.Commits[0].CommitID, st.Commits[0].LayerID, chain.Active, r.commands())

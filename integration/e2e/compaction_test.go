@@ -43,7 +43,7 @@ func TestACompactedRootReadsBackAsTheChainItReplaced(t *testing.T) {
 	root := filepath.Join(dir, "data")
 	vol := ids.New().String()
 	files := real.NewPaths()
-	for _, d := range []string{qcow.LayersDir(root, vol), filepath.Dir(qcow.ActivePointer(root, vol))} {
+	for _, d := range []string{qcow.LayersDir(root), filepath.Dir(qcow.ActivePointer(root, vol))} {
 		if err := files.MkdirAll(d); err != nil {
 			t.Fatalf("making %s: %v", d, err)
 		}
@@ -56,10 +56,10 @@ func TestACompactedRootReadsBackAsTheChainItReplaced(t *testing.T) {
 	var layers []string
 	for i, fill := range []byte{0xA0, 0xB1, 0xC2, 0xD3} {
 		id := ids.New().String()
-		image := qcow.LayerImage(root, vol, id)
+		image := qcow.LayerImage(root, id)
 		create := []string{"create", "-f", "qcow2", image, "4M"}
 		if i > 0 {
-			create = []string{"create", "-f", "qcow2", "-b", qcow.LayerImage(root, vol, layers[i-1]), "-F", "qcow2", image, "4M"}
+			create = []string{"create", "-f", "qcow2", "-b", qcow.LayerImage(root, layers[i-1]), "-F", "qcow2", image, "4M"}
 		}
 		run(t, qemuImg, create...)
 		// The pattern carries the layer's own index in every fourth byte, so a disk read
@@ -75,8 +75,8 @@ func TestACompactedRootReadsBackAsTheChainItReplaced(t *testing.T) {
 		run(t, qemuImg, "convert", "-n", "-f", "raw", "-O", "qcow2", patch, image)
 		layers = append(layers, id)
 	}
-	prefixTop := qcow.LayerImage(root, vol, layers[2])
-	tip := qcow.LayerImage(root, vol, layers[3])
+	prefixTop := qcow.LayerImage(root, layers[2])
+	tip := qcow.LayerImage(root, layers[3])
 	if err := files.WriteAtomic(qcow.ActivePointer(root, vol), []byte(tip)); err != nil {
 		t.Fatalf("writing the pointer: %v", err)
 	}

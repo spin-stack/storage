@@ -67,7 +67,7 @@ func TestAdversaryAFencedHostResumesItsForkWhenTheGuestNeverStopped(t *testing.T
 			// While this host was not the writer, the successor served the volume and
 			// published. What the bucket holds is a history none of the local layers
 			// sit under, rebuilt here on demand.
-			base := qcow.LayerImage(root, vol, baseID)
+			base := qcow.LayerImage(root, baseID)
 			h.paths.present[base] = true
 			h.rec.res, h.rec.err, h.rec.calls = qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}, nil, nil
 			h.rec.head = headCommit
@@ -164,7 +164,7 @@ func TestAdversaryTheForkLayerSurvivesInMemoryTheClearForkThatDroppedItFromDisk(
 			// The guest is gone — the VM died with the host that lost the volume — so
 			// the re-grant takes the branch that can rebuild.
 			delete(h.dialer.scripts, qcow.QMPSocket(root, vol))
-			base := qcow.LayerImage(root, vol, baseID)
+			base := qcow.LayerImage(root, baseID)
 			h.paths.present[base] = true
 			h.rec.res, h.rec.err, h.rec.calls = qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}, nil, nil
 			h.runner.info = overlayJSON(size, base)

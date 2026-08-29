@@ -115,12 +115,36 @@ func newPaths(present ...string) *fakePaths {
 	return p
 }
 
-// withPointer is a volume whose `active/current` already names a layer.
+// newPathsAt is a volume whose `active/current` already names a layer.
+//
+// The record names it too, and that pairing is not decoration: a layer is written into
+// the record before the pointer names it (recordThenPoint), so a pointer the record
+// cannot account for is the one thing readPointer refuses — a data directory restored
+// from a backup of another volume. A fixture that set only the pointer would be building
+// a world this Agent is written to reject.
 func newPathsAt(image string) *fakePaths {
+	return newPathsAtFor(vol, image)
+}
+
+// newPathsAtFor is newPathsAt for a named volume.
+func newPathsAtFor(volumeID, image string) *fakePaths {
 	p := newPaths(image)
-	p.present[qcow.ActivePointer(root, vol)] = true
-	p.files[qcow.ActivePointer(root, vol)] = image
+	p.present[qcow.ActivePointer(root, volumeID)] = true
+	p.files[qcow.ActivePointer(root, volumeID)] = image
+	p.recordTip(volumeID, image)
 	return p
+}
+
+// recordTip writes a record for volumeID naming image as a layer it has served.
+func (p *fakePaths) recordTip(volumeID, image string) {
+	st, err := qcow.ReadState(p, root, volumeID)
+	if err != nil {
+		panic(err)
+	}
+	st.ObserveTip(qcow.LayerIDOfImage(image))
+	if err := qcow.WriteState(p, root, volumeID, st); err != nil {
+		panic(err)
+	}
 }
 
 func (p *fakePaths) MkdirAll(dir string) error {
@@ -345,8 +369,11 @@ func TestPathsAreTheContractWithWhoeverLaunchesQEMU(t *testing.T) {
 	// the expectation the same way the code does would assert nothing.
 	tests := []struct{ name, got, want string }{
 		{"the pointer", qcow.ActivePointer(root, vol), root + "/volumes/" + vol + "/active/current"},
-		{"a layer", qcow.LayerImage(root, vol, layerID), root + "/volumes/" + vol + "/layers/" + layerID + ".qcow2"},
-		{"the layer directory", qcow.LayersDir(root, vol), root + "/volumes/" + vol + "/layers"},
+		// One layers directory for the whole host, and a layer named by its own id: that
+		// is what lets any number of clones share one copy of a published history instead
+		// of each holding their own (qcow.LayersDir says why the path is the reason).
+		{"a layer", qcow.LayerImage(root, layerID), root + "/layers/" + layerID + ".qcow2"},
+		{"the layer directory", qcow.LayersDir(root), root + "/layers"},
 		{"the socket", qcow.QMPSocket(root, vol), root + "/volumes/" + vol + "/qmp.sock"},
 		{"the volume", qcow.VolumeDir(root, vol), root + "/volumes/" + vol},
 	}
@@ -359,7 +386,7 @@ func TestPathsAreTheContractWithWhoeverLaunchesQEMU(t *testing.T) {
 	// a publish after a restart, a sweep, a recovery — has only its filename to learn
 	// its identity from, and that identity is in the nonce of every frame it is sealed
 	// with.
-	if got := qcow.LayerIDOfImage(qcow.LayerImage(root, vol, layerID)); got != layerID {
+	if got := qcow.LayerIDOfImage(qcow.LayerImage(root, layerID)); got != layerID {
 		t.Errorf("LayerIDOfImage round trip = %q, want %q", got, layerID)
 	}
 }
@@ -373,7 +400,7 @@ func TestOpenCreatesTheFirstLayerAndPointsAtIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening a fresh volume: %v", err)
 	}
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	if chain.Active != image {
 		t.Errorf("the tip is %q, want %q", chain.Active, image)
 	}
@@ -390,7 +417,7 @@ func TestOpenCreatesTheFirstLayerAndPointsAtIt(t *testing.T) {
 
 func TestOpenChecksAnImageThatIsAlreadyThere(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 
 	tests := []struct {
 		name string
@@ -442,7 +469,7 @@ func TestOpenChecksAnImageThatIsAlreadyThere(t *testing.T) {
 // running guest.
 func TestOpenNeverTouchesAnImageQEMUHasOpen(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	r := &fakeRunner{err: errors.New(`Failed to get shared "write" lock`)}
 	p := newPathsAt(image)
 
@@ -465,8 +492,8 @@ func TestOpenNeverTouchesAnImageQEMUHasOpen(t *testing.T) {
 // wrong until it stopped.
 func TestOpenRepairsThePointerFromWhatQEMUHasOpen(t *testing.T) {
 	t.Parallel()
-	live := qcow.LayerImage(root, vol, layerID)
-	ahead := qcow.LayerImage(root, vol, nextID)
+	live := qcow.LayerImage(root, layerID)
+	ahead := qcow.LayerImage(root, nextID)
 	p := newPathsAt(ahead)
 
 	chain, err := qcow.Open(t.Context(), &fakeRunner{}, p, "/qemu-img",
@@ -521,7 +548,7 @@ func TestOpenRefusesAVolumeWithNoSize(t *testing.T) {
 
 func TestOpenReportsTheFailuresOfTheThingsItDrives(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	tests := []struct {
 		name  string
 		runs  *fakeRunner
@@ -589,8 +616,8 @@ func (*failingMkdir) MkdirAll(string) error { return errors.New("read-only file 
 // relaunched in that window writes into a file QEMU is reading through.
 func TestRotateMovesThePointerBeforeQEMUSwitches(t *testing.T) {
 	t.Parallel()
-	tip := qcow.LayerImage(root, vol, layerID)
-	next := qcow.LayerImage(root, vol, nextID)
+	tip := qcow.LayerImage(root, layerID)
+	next := qcow.LayerImage(root, nextID)
 	var events []string
 	p := newPathsAt(tip)
 	p.log = &events
@@ -604,9 +631,19 @@ func TestRotateMovesThePointerBeforeQEMUSwitches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rotating: %v", err)
 	}
-	want := []string{"wrote " + qcow.ActivePointer(root, vol) + " = " + next, "switched QEMU to " + next}
-	if fmt.Sprint(events) != fmt.Sprint(want) {
-		t.Errorf("the order was %v, want %v", events, want)
+	// The record first, then the pointer, then QEMU. Both orderings are load-bearing and
+	// they guard different things: the record before the pointer is what lets a pointer be
+	// believed at all (a bare path into a directory shared by every volume on the host
+	// cannot say whose layer it names), and the pointer before the switch is what leaves a
+	// crash one layer ahead rather than one behind.
+	//
+	// The record's contents are a framed digest, so it is matched by prefix; the other two
+	// are matched whole.
+	if len(events) != 3 ||
+		!strings.HasPrefix(events[0], "wrote "+qcow.StateFile(root, vol)+" = ") ||
+		events[1] != "wrote "+qcow.ActivePointer(root, vol)+" = "+next ||
+		events[2] != "switched QEMU to "+next {
+		t.Errorf("the order was %v, want the record, then the pointer, then the switch", events)
 	}
 	if sealed != tip {
 		t.Errorf("sealed %q, want the previous tip %q", sealed, tip)
@@ -628,7 +665,7 @@ func TestRotateMovesThePointerBeforeQEMUSwitches(t *testing.T) {
 // VM stops, and comes back on the next boot as somebody else's disk.
 func TestRotateRefusesAnOverlayThatIsNotOverTheTip(t *testing.T) {
 	t.Parallel()
-	tip := qcow.LayerImage(root, vol, layerID)
+	tip := qcow.LayerImage(root, layerID)
 	tests := []struct {
 		name, info, want string
 	}{
@@ -663,7 +700,7 @@ func TestRotateRefusesAnOverlayThatIsNotOverTheTip(t *testing.T) {
 
 func TestRotateKeepsTheTipWhenQEMUWillNotSwitch(t *testing.T) {
 	t.Parallel()
-	tip := qcow.LayerImage(root, vol, layerID)
+	tip := qcow.LayerImage(root, layerID)
 	p := newPathsAt(tip)
 	chain := &qcow.Chain{Active: tip, SizeBytes: size}
 
@@ -679,15 +716,15 @@ func TestRotateKeepsTheTipWhenQEMUWillNotSwitch(t *testing.T) {
 	if chain.Active != tip {
 		t.Errorf("the tip moved to %q after a snapshot that did not happen", chain.Active)
 	}
-	if got := p.pointer(); got != qcow.LayerImage(root, vol, nextID) {
+	if got := p.pointer(); got != qcow.LayerImage(root, nextID) {
 		t.Errorf("active/current names %q; the window this leaves is the one Open repairs", got)
 	}
 }
 
 func TestRotateRefusesToReuseALayerId(t *testing.T) {
 	t.Parallel()
-	tip := qcow.LayerImage(root, vol, layerID)
-	next := qcow.LayerImage(root, vol, nextID)
+	tip := qcow.LayerImage(root, layerID)
+	next := qcow.LayerImage(root, nextID)
 	p := newPathsAt(tip)
 	p.present[next] = true
 	chain := &qcow.Chain{Active: tip, SizeBytes: size}
@@ -737,7 +774,7 @@ func TestOpenAsksAboutTheHistoryBeforeCreatingAVolumeEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opening a volume that has never published: %v", err)
 	}
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	if chain.Active != image {
 		t.Errorf("the tip is %q, want %q", chain.Active, image)
 	}
@@ -795,8 +832,8 @@ func TestOpenRefusesAVolumeWhoseHistoryCouldNotBeRebuilt(t *testing.T) {
 // every byte the recovery just wrote (§19 owns flattening, as compaction).
 func TestOpenBuildsANewTipOverARecoveredChain(t *testing.T) {
 	t.Parallel()
-	base := qcow.LayerImage(root, vol, baseID)
-	tip := qcow.LayerImage(root, vol, layerID)
+	base := qcow.LayerImage(root, baseID)
+	tip := qcow.LayerImage(root, layerID)
 	r := &fakeRunner{info: overlayJSON(size, base)}
 	p := newPaths(base)
 
@@ -829,9 +866,9 @@ func TestOpenBuildsANewTipOverARecoveredChain(t *testing.T) {
 // until it stops.
 func TestOpenRefusesATipThatIsNotOverTheRecoveredChain(t *testing.T) {
 	t.Parallel()
-	base := qcow.LayerImage(root, vol, baseID)
+	base := qcow.LayerImage(root, baseID)
 	tests := []struct{ name, info, want string }{
-		{"backed by another layer", overlayJSON(size, qcow.LayerImage(root, "other", nextID)), "not by the recovered chain"},
+		{"backed by another layer", overlayJSON(size, qcow.LayerImage(root, nextID)), "not by the recovered chain"},
 		{"backed by nothing at all", infoJSON("qcow2", size, false), "not by the recovered chain"},
 		{"the wrong virtual size", overlayJSON(size/2, base), "the head commit says"},
 	}
@@ -865,7 +902,7 @@ func TestOpenRefusesATipThatIsNotOverTheRecoveredChain(t *testing.T) {
 // The check is one HEAD read, on a path that was about to run qemu-img anyway.
 func TestAVolumeThatAlreadyHasAChainIsStillCheckedAgainstTheBucket(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	rec := bornEmpty()
 	r := &fakeRunner{info: infoJSON("qcow2", size, false)}
 
@@ -892,8 +929,8 @@ func TestAVolumeThatAlreadyHasAChainIsStillCheckedAgainstTheBucket(t *testing.T)
 // It is safe here and only here: this branch is an image no VM has open.
 func TestOpenWalksTheWholeChainOfAnImageItAdopts(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
-	base := qcow.LayerImage(root, vol, baseID)
+	image := qcow.LayerImage(root, layerID)
+	base := qcow.LayerImage(root, baseID)
 
 	t.Run("the walk is what is run", func(t *testing.T) {
 		t.Parallel()
@@ -942,7 +979,7 @@ func TestOpenWalksTheWholeChainOfAnImageItAdopts(t *testing.T) {
 // shapes one, so rotation broke on exactly the launcher we expect to meet.
 func TestTargetForNamesWhateverTheLauncherLeftUsToNameItWith(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	open := func(device, node string) []string {
 		return []string{
 			`{"QMP": {"version": {}, "capabilities": []}}`,
@@ -1017,7 +1054,7 @@ func TestWritePointerReportsADirectoryItCannotMake(t *testing.T) {
 // and because a lock failure is retried next cycle while a corrupt image is not.
 func TestInspectSaysWhichKindOfFailureItMet(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 
 	tests := []struct {
 		name  string
@@ -1060,7 +1097,7 @@ func TestInspectSaysWhichKindOfFailureItMet(t *testing.T) {
 // and the guess that is wrong hands a guest a fork of its own history.
 func TestCheckNotStaleReportsAStoreThatWillNotAnswer(t *testing.T) {
 	t.Parallel()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	rec := bornEmpty()
 	rec.headErr = errors.New("dial tcp: connection refused")
 
@@ -1129,7 +1166,7 @@ func TestAVolumeTheCatalogSaysNothingAboutIsStillBornEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a genuinely new volume was refused: %v", err)
 	}
-	if chain.Active != qcow.LayerImage(root, vol, layerID) {
+	if chain.Active != qcow.LayerImage(root, layerID) {
 		t.Fatalf("the tip is %q", chain.Active)
 	}
 }

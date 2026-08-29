@@ -241,7 +241,7 @@ func TestApplyPreparesAChainAndReportsIt(t *testing.T) {
 	}
 
 	image := h.tip(t)
-	if !strings.HasPrefix(image, qcow.LayersDir(root, vol)+"/") {
+	if !strings.HasPrefix(image, qcow.LayersDir(root)+"/") {
 		t.Fatalf("the pointer names %q, which is not a layer of this volume", image)
 	}
 	if cmds := h.runner.commands(); len(cmds) != 1 || !strings.HasPrefix(cmds[0], "/qemu-img create -f qcow2 "+image) {
@@ -347,9 +347,8 @@ func TestOnlyAnActiveVolumeGetsAChain(t *testing.T) {
 func TestARestartUnderARunningGuestDoesNotTouchTheImage(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	image := qcow.LayerImage(root, vol, layerID)
-	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(image)
-	h.paths.present[image] = true
+	image := qcow.LayerImage(root, layerID)
+	h.guestHas(vol, image)
 	// Any offline run at all would fail the way a real one does, on QEMU's lock.
 	h.runner.err = errors.New(`Failed to get shared "write" lock`)
 
@@ -685,6 +684,18 @@ func TestAVMComingAndGoingDoesNotChangeWhoServesTheVolume(t *testing.T) {
 	}
 }
 
+// guestHas declares that a VM at this volume's socket has `image` open, and records the
+// layer the way production would have: a layer is written into the record before anything
+// points at it (recordThenPoint), so a fixture that declared only the QMP answer would be
+// building a world this Agent refuses — and refuses for the right reason, since with one
+// layers directory per host the record is the only thing that says which volume a file
+// belongs to.
+func (h *harness) guestHas(volumeID, image string) {
+	h.dialer.scripts[qcow.QMPSocket(root, volumeID)] = attachedTo(image)
+	h.paths.present[image] = true
+	h.paths.recordTip(volumeID, image)
+}
+
 // rotating prepares a volume, attaches a VM to it, and says how large its tip has grown.
 func (h *harness) rotating(t *testing.T, tipBytes int64) string {
 	t.Helper()
@@ -716,7 +727,7 @@ func TestATipThatCrossesTheThresholdIsSealedUnderTheRunningGuest(t *testing.T) {
 	if next == tip {
 		t.Fatalf("the pointer still names %q; the tip was not rotated", tip)
 	}
-	if !strings.HasPrefix(next, qcow.LayersDir(root, vol)+"/") {
+	if !strings.HasPrefix(next, qcow.LayersDir(root)+"/") {
 		t.Fatalf("the new tip %q is not a layer of this volume", next)
 	}
 	// The overlay is created over the old tip and QEMU is never asked to open its
@@ -809,8 +820,10 @@ func TestAPointerThatRanAheadIsRepairedFromTheGuest(t *testing.T) {
 		t.Fatalf("preparing: %v", err)
 	}
 	live := h.tip(t)
-	// The pointer ran ahead, and then everything stopped.
-	ahead := qcow.LayerImage(root, vol, nextID)
+	// The pointer ran ahead, and then everything stopped — recorded first, which is the
+	// order a rotation writes them in and the order that lets a pointer be believed.
+	ahead := qcow.LayerImage(root, nextID)
+	h.paths.recordTip(vol, ahead)
 	if err := h.paths.WriteAtomic(qcow.ActivePointer(root, vol), []byte(ahead)); err != nil {
 		t.Fatalf("moving the pointer: %v", err)
 	}
@@ -998,7 +1011,7 @@ func (h *harness) state(t *testing.T) qcow.State {
 func TestAVolumeWithCommitsIsRecoveredRatherThanCreatedEmpty(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	base := qcow.LayerImage(root, vol, baseID)
+	base := qcow.LayerImage(root, baseID)
 	h.rec.err, h.rec.res = nil, qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}
 	h.runner.info = overlayJSON(size, base)
 	h.paths.present[base] = true
@@ -1008,7 +1021,7 @@ func TestAVolumeWithCommitsIsRecoveredRatherThanCreatedEmpty(t *testing.T) {
 	}
 
 	tip := h.tip(t)
-	if tip == base || !strings.HasPrefix(tip, qcow.LayersDir(root, vol)+"/") {
+	if tip == base || !strings.HasPrefix(tip, qcow.LayersDir(root)+"/") {
 		t.Fatalf("the pointer names %q, want a new layer of this volume over %q", tip, base)
 	}
 	create := fmt.Sprintf("/qemu-img create -f qcow2 -b %s -F qcow2 -u %s %d", base, tip, size)

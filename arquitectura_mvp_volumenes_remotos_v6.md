@@ -125,12 +125,37 @@ de datos son inmutables; sólo `HEAD` es mutable, mediante compare-and-swap.
 ## 5. Layout local
 
 ```text
-/var/lib/volume-agent/volumes/<volume-id>/
-├── layers/<layer-id>.qcow2   # todos los tips que tuvo, tip actual incluido
-├── active/current            # una línea: el path absoluto del tip
-├── cache/
-└── state.json
+/var/lib/volume-agent/
+├── layers/<layer-id>.qcow2       # TODAS las capas del host, de todos los volúmenes
+└── volumes/<volume-id>/
+    ├── active/current            # una línea: el path absoluto del tip
+    ├── cache/
+    └── state.json
 ```
+
+**Las capas viven en un único directorio del host, no uno por volumen** — corregido
+2026-08-29. La razón son los clones. `qemu-img rebase -u` reescribe el *header* de una capa
+para nombrar a su padre, así que bajo `volumes/<id>/layers/` cada clon necesita un path
+distinto y por lo tanto su propia copia rebaseada: cien clones de un volumen con 20 GiB de
+historia publicada costaban 2 TB de disco local. La duplicación nunca fue por los bytes —el
+object store siempre tuvo un objeto por capa, desciendan de él los volúmenes que sea— sino
+por el path. Con un solo directorio el header se escribe una vez y ya es correcto para
+todos; medido en `demo:stage6`, ocho clones agregan ocho tips vacíos y ni un byte de
+historia.
+
+Compartirlas es seguro porque una capa sellada es inmutable (§6): es un backing file de
+qcow2, abierto read-only, que es exactamente para lo que existen las backing chains. Lo que
+se rechaza es el lock de escritura del *tip*, y un tip lo lee un solo guest.
+
+Lo que el path deja de poder decir es **de quién** es una capa, y eso pasa a decirlo el
+registro: una capa se escribe en `state.json` *antes* de que el puntero la nombre, así que
+un `active/current` que el registro no explica se rechaza — que es la forma de un data
+directory restaurado del backup de otro volumen.
+
+Y una sola regla libera una capa: **ningún volumen de este host la nombra**. Reemplaza a
+tres —el barrido de overlays huérfanos, la recuperación del disco de un volumen que se fue,
+y el prefijo que una compactación reemplazó— y se niega a correr, en vez de contar de menos,
+si algún volumen no se puede enumerar.
 
 El archivo que QEMU está usando nunca se procesa con herramientas offline que puedan
 modificarlo.

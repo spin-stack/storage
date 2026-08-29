@@ -33,7 +33,7 @@ func TestTheAncestryOnTheWireIsTheLineageTheChainIsBuiltFrom(t *testing.T) {
 	h := newHarness(t)
 	// A clone whose ancestors' layers the recovery has just put on this disk, which is
 	// the only case the lineage travels in: a rebuild is what reads it.
-	base := qcow.LayerImage(root, vol, baseID)
+	base := qcow.LayerImage(root, baseID)
 	h.paths.present[base] = true
 	h.runner.info = overlayJSON(size, base)
 	h.rec.res, h.rec.err = qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}, nil

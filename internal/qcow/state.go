@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"github.com/spin-stack/storage/internal/framed"
 )
@@ -174,7 +175,7 @@ type CommitLayer struct {
 // it stays on purpose: writing the record *before* the QMP switch would publish a file
 // QEMU is still writing into — a corrupt commit, against a duplicate history entry.
 //
-// It carries no path; the file is LayerImage(root, volumeID, LayerID).
+// It carries no path; the file is LayerImage(root, LayerID).
 type PendingCommit struct {
 	CommitID string `json:"commit_id"`
 	LayerID  string `json:"layer_id"`
@@ -364,6 +365,60 @@ func reversed(in []string) []string {
 	out := make([]string, 0, len(in))
 	for i := len(in) - 1; i >= 0; i-- {
 		out = append(out, in[i])
+	}
+	return out
+}
+
+// Names reports whether this record accounts for the layer — that it is the tip a
+// pointer named, one this volume has served, one whose commit it holds, the layer it
+// owes, or a collapse's. It is the volume-identity question that a per-volume layers
+// directory used to answer by construction: with one directory per host, "is the file
+// QEMU has open ours" cannot be asked of a path any more, so it is asked of the record.
+//
+// It is a stronger answer than the directory ever was. The directory said "some layer of
+// this volume", including files this volume had abandoned; this says which fact accounts
+// for it. `pointed` is `active/current`'s target, passed in because it lives outside the
+// record and is the one thing that accounts for a tip created by a rotation this process
+// did not perform — the pointer is written before QEMU is told to switch, so a restart
+// mid-rotation finds it there.
+func (s State) Names(pointed, image string) bool {
+	if image == "" {
+		return false
+	}
+	if pointed != "" && filepath.Clean(pointed) == filepath.Clean(image) {
+		return true
+	}
+	id := LayerIDOfImage(image)
+	if slices.Contains(s.Layers, id) {
+		return true
+	}
+	for _, c := range s.Commits {
+		if c.LayerID == id {
+			return true
+		}
+	}
+	if s.Pending != nil && s.Pending.LayerID == id {
+		return true
+	}
+	if s.Compacting != nil && (s.Compacting.LayerID == id || s.Compacting.RebaseLayerID == id) {
+		return true
+	}
+	return false
+}
+
+// LayerIDs is every layer this record accounts for, which is what a host-wide sweep
+// unions across volumes to decide what nothing reads through any more.
+func (s State) LayerIDs() []string {
+	out := make([]string, 0, len(s.Layers)+len(s.Commits)+2)
+	out = append(out, s.Layers...)
+	for _, c := range s.Commits {
+		out = append(out, c.LayerID)
+	}
+	if s.Pending != nil {
+		out = append(out, s.Pending.LayerID)
+	}
+	if s.Compacting != nil {
+		out = append(out, s.Compacting.LayerID, s.Compacting.RebaseLayerID)
 	}
 	return out
 }

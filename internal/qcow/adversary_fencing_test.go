@@ -100,7 +100,7 @@ func TestAdversaryARegrantedHostServesItsStaleLocalChain(t *testing.T) {
 
 	// While this host was out, the volume's successor wrote and published. What the
 	// bucket holds is a history this host has no layer of, rebuilt here on demand.
-	base := qcow.LayerImage(root, vol, baseID)
+	base := qcow.LayerImage(root, baseID)
 	h.paths.present[base] = true
 	h.runner.info = overlayJSON(size, base)
 	h.rec.res, h.rec.err, h.rec.calls = qcow.Restored{Base: base, VirtualSize: size, HeadCommitID: headCommit}, nil, nil

@@ -22,7 +22,7 @@ const successorCommit = "0198c0de-0000-7000-8000-0000000505ec"
 //   - an object store whose HEAD names a later commit, written by somebody else.
 func overtaken(t *testing.T, h *harness) string {
 	t.Helper()
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
 	h.paths.present[image] = true
 	pointer := qcow.ActivePointer(root, vol)
 	h.paths.present[pointer], h.paths.files[pointer] = true, image

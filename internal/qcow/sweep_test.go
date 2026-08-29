@@ -54,7 +54,7 @@ func shift(t *testing.T, layerID string, deltaMs int64) string {
 // layers is what is actually in this volume's layers directory.
 func (h *harness) layers(t *testing.T) []string {
 	t.Helper()
-	names, err := h.paths.List(qcow.LayersDir(root, vol))
+	names, err := h.paths.List(qcow.LayersDir(root))
 	if err != nil {
 		t.Fatalf("listing the layers directory: %v", err)
 	}
@@ -92,21 +92,26 @@ func TestTheSweepRemovesOnlyWhatNoChainReadsThrough(t *testing.T) {
 	// What an interrupted rotation leaves: the overlay was created and the pointer may
 	// even have moved, but QEMU is still on the tip below it, so nothing ever wrote to it
 	// and nothing backs onto it.
-	orphan := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(tip), 1))
+	orphan := qcow.LayerImage(root, shift(t, qcow.LayerIDOfImage(tip), 1))
 	// A layer older than the tip that no record names — a fork this host abandoned, say.
-	// It cannot be told apart from a backing file, so it stays.
-	stray := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(l1), -1))
+	// It goes. It used to stay, because the sweep asked "was this minted after the tip"
+	// and a backing file is always older; that heuristic existed to make a lost record
+	// survivable, and what replaced it is stronger — the sweep refuses to run at all
+	// against a volume it cannot enumerate, so a record that is *there* is a record that
+	// is complete, and a layer no complete record names is not read through by anything.
+	stray := qcow.LayerImage(root, shift(t, qcow.LayerIDOfImage(l1), -1))
 	// A download that did not finish. It is not a layer and the sweep does not touch it.
 	part := orphan + ".part"
 	// A compaction's flattened root that `qemu-img convert` was killed in the middle of. It
 	// is a whole volume's worth of disk that nothing will ever name — a collapse that is
 	// planned again converts under a new id — so it is the one non-layer file this sweep
 	// does take.
-	unfinished := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(tip), 2)) + ".compacting"
+	unfinished := qcow.LayerImage(root, shift(t, qcow.LayerIDOfImage(tip), 2)) + ".compacting"
 	// A layer this host downloaded from a commit another host published while its clock
-	// ran ahead of this one's. Its id is later than the tip's and it is the base the
-	// whole chain reads through, so the record is the only thing that can vouch for it.
-	skewed := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(tip), 3_600_000))
+	// ran ahead of this one's. Its id is later than the tip's, which is what the old
+	// heuristic would have condemned it for; the record vouches for it and that is all
+	// that is asked now.
+	skewed := qcow.LayerImage(root, shift(t, qcow.LayerIDOfImage(tip), 3_600_000))
 	for _, path := range []string{orphan, stray, part, skewed, unfinished} {
 		h.paths.present[path] = true
 	}
@@ -122,12 +127,15 @@ func TestTheSweepRemovesOnlyWhatNoChainReadsThrough(t *testing.T) {
 		t.Fatalf("the cycle that publishes the sealed layer and sweeps: %v", err)
 	}
 
-	want := []string{base(l1), base(l2), base(l3), base(tip), base(stray), base(part), base(skewed)}
+	want := []string{base(l1), base(l2), base(l3), base(tip), base(part), base(skewed)}
 	got := h.layers(t)
 	for _, name := range want {
 		if !slices.Contains(got, name) {
 			t.Errorf("%s was swept, and the chain reads through it (or it is not this sweep's to remove); the directory holds %v", name, got)
 		}
+	}
+	if slices.Contains(got, base(stray)) {
+		t.Errorf("the abandoned layer %s is still on disk; no volume's record names it, so nothing reads through it", stray)
 	}
 	if slices.Contains(got, base(unfinished)) {
 		t.Errorf("the half-converted root %s is still on disk; the compaction that was killed will never name it again", unfinished)
@@ -163,7 +171,7 @@ func TestTheSweepKeepsTheLayerActiveCurrentNames(t *testing.T) {
 	tip := h.rotateOnce(t, l1)
 
 	// The overlay the refused rotation left, and the pointer moved onto it.
-	orphan := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(tip), 1))
+	orphan := qcow.LayerImage(root, shift(t, qcow.LayerIDOfImage(tip), 1))
 	h.paths.present[orphan] = true
 	if err := h.paths.WriteAtomic(qcow.ActivePointer(root, vol), []byte(orphan)); err != nil {
 		t.Fatal(err)

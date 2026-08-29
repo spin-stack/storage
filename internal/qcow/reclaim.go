@@ -60,20 +60,21 @@ func (m *Manager) reclaim(ctx context.Context) {
 	}
 }
 
-// reclaimOne frees one released volume's layers, if the object store confirms the fleet
-// granted it to somebody else.
+// reclaimOne releases one volume's claim on this host's disk, if the object store
+// confirms the fleet granted the volume to somebody else.
 func (m *Manager) reclaimOne(ctx context.Context, volumeID string) {
 	st, err := ReadState(m.paths, m.cfg.Root, volumeID)
 	if err != nil {
-		// A directory with no readable record: it may be a volume this host is in the
-		// middle of preparing, or one whose state file is corrupt. Neither is a licence
-		// to delete, and the record is where the epoch to compare against lives.
+		// A directory with no readable record: a volume this host is in the middle of
+		// preparing, or one whose state file is corrupt. Neither is a licence to act, and
+		// the record is where the epoch to compare against lives.
 		return
 	}
 	held := heldEpoch(st)
-	if held == 0 || !hasLayers(m.paths, m.cfg.Root, volumeID) {
-		// Nothing recorded, or nothing left to free. Asking the object store about it
-		// would be a request per cycle for a directory with no disk in it.
+	if held == 0 || len(st.LayerIDs()) == 0 {
+		// Nothing recorded, or a record that already claims nothing. Asking the object
+		// store about it would be a request per cycle about a volume with no disk behind
+		// it — and there would be nothing to release.
 		return
 	}
 	ctx, cancel := m.withTimeout(ctx)
@@ -82,33 +83,40 @@ func (m *Manager) reclaimOne(ctx context.Context, volumeID string) {
 	if err != nil || granted <= held {
 		return
 	}
-	freed, err := dropLayers(m.paths, m.cfg.Root, volumeID)
-	if err != nil {
-		slog.Warn("could not reclaim the disk of a volume the fleet moved elsewhere",
-			"volume_id", volumeID, "held_epoch", held, "granted_epoch", granted, "error", err)
-		return
-	}
-	// The record is replaced rather than left behind: one that still vouched for layers
-	// that are gone is what would make a later Open believe this host holds a history it
-	// does not. What it keeps is the fence — at the epoch that was observed, so a desired
-	// state that arrives late naming the old epoch is refused rather than served off a
-	// chain that is not there.
+	// The claim goes; the files are not touched here. What frees a layer file is the one
+	// rule that frees any of them — nothing on this host names it — and routing through it
+	// is what keeps a clone of this volume, or any volume sharing its published history,
+	// from losing the files it reads through. Dropping the claim is precisely the act that
+	// makes the files unnamed, and the sweep at the end of this same cycle collects
+	// whatever that leaves with no other claimant.
+	//
+	// What replaces it keeps the fence, at the epoch that was observed: a desired state
+	// that arrives late naming the epoch this host used to hold is then refused, rather
+	// than served off a chain whose files are gone.
 	next := State{
-		FormatVersion: st.FormatVersion, VolumeID: volumeID,
+		FormatVersion: st.FormatVersion, VolumeID: volumeID, Epoch: granted,
 		Fenced: &Fencing{
 			Epoch:   granted,
 			Refusal: int32(storagev1.VolumeRefusal_VOLUME_REFUSAL_LEASE_LOST),
-			Detail:  "the fleet granted this volume elsewhere and its local layers were reclaimed",
+			Detail:  "the fleet granted this volume elsewhere and this host released its layers",
 		},
 	}
 	if err := WriteState(m.paths, m.cfg.Root, volumeID, next); err != nil {
-		slog.Warn("reclaimed a volume's layers and could not replace its record",
+		slog.Warn("could not release the disk of a volume the fleet moved elsewhere",
 			"volume_id", volumeID, "error", err)
 		return
 	}
-	slog.Info("reclaimed the local disk of a volume the fleet granted elsewhere",
+	// And the pointer, which is the contract with whoever launches the VM: left naming a
+	// file the sweep is about to collect, it would send a launcher at a path that does not
+	// resolve.
+	if err := m.paths.Remove(ActivePointer(m.cfg.Root, volumeID)); err != nil && !strings.Contains(err.Error(), "not exist") {
+		slog.Warn("released a volume's layers and could not drop its pointer",
+			"volume_id", volumeID, "error", err)
+		return
+	}
+	slog.Info("released the local disk of a volume the fleet granted elsewhere; its layers go with the next sweep unless another volume reads through them",
 		"volume_id", volumeID, "held_epoch", held, "granted_epoch", granted,
-		"layers", freed.count, "bytes", freed.bytes)
+		"layers", len(st.LayerIDs()))
 }
 
 // volumesRoot is the directory holding one subdirectory per volume this host has.
@@ -120,45 +128,4 @@ func heldEpoch(st State) int64 {
 		return st.Fenced.Epoch
 	}
 	return st.Epoch
-}
-
-// hasLayers reports whether there is any disk here to free.
-func hasLayers(p Paths, root, volumeID string) bool {
-	names, err := p.List(LayersDir(root, volumeID))
-	return err == nil && len(names) > 0
-}
-
-// reclaimed is what one volume's cleanup freed, for the line that records it.
-type reclaimed struct {
-	count int
-	bytes int64
-}
-
-// dropLayers removes every file in a volume's layers directory and the pointer that named
-// one of them. Files only: no directory is removed and no path outside this volume's
-// layers directory is touched, because the blast radius of a wrong path here is a data
-// directory rather than a file.
-func dropLayers(p Paths, root, volumeID string) (reclaimed, error) {
-	var out reclaimed
-	dir := LayersDir(root, volumeID)
-	names, err := p.List(dir)
-	if err != nil {
-		return out, err
-	}
-	for _, name := range names {
-		path := filepath.Join(dir, name)
-		if n, serr := p.Size(path); serr == nil {
-			out.bytes += n
-		}
-		if err := p.Remove(path); err != nil {
-			return out, err
-		}
-		out.count++
-	}
-	// And the pointer, which is the contract with whoever launches the VM: left naming a
-	// file that is gone, it would send a launcher at a path that does not resolve.
-	if err := p.Remove(ActivePointer(root, volumeID)); err != nil && !strings.Contains(err.Error(), "not exist") {
-		return out, err
-	}
-	return out, nil
 }

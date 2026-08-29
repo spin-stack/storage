@@ -165,15 +165,35 @@ func VolumeDir(root, volumeID string) string {
 	return filepath.Join(root, volumesDir, volumeID)
 }
 
-// LayersDir holds every layer of one volume, tip and sealed alike. Which one is the tip
-// is not encoded in the directory, because that is the fact that changes.
-func LayersDir(root, volumeID string) string {
-	return filepath.Join(VolumeDir(root, volumeID), layersDir)
+// LayersDir holds every layer this host has, tip and sealed alike, for every volume.
+//
+// **One directory for the whole host, not one per volume**, and the reason is clones. A
+// layer's file is named by its own id, so the path a chain records as its backing file is
+// the same on this host whoever reads it — which is what lets a hundred clones of one
+// volume share a single copy of its published history instead of each holding their own.
+//
+// It is per-volume directories that force the copy, and the mechanism is worth stating
+// because it is not obvious: `qemu-img rebase -u` rewrites a layer's *header* to name its
+// parent's path. Under `volumes/<id>/layers/` every clone needs a different path, so every
+// clone needs its own rebased file. Under one directory the header is written once, when
+// the layer is materialized, and is already correct for everyone. The object store has
+// always worked this way — `layers/sha256/<digest>` is one object however many volumes
+// descend from it — and the local disk was the only place in this system that did not.
+//
+// Sharing them is safe because a sealed layer is immutable (v6 §6): it is a qcow2 backing
+// file, opened read-only, which is exactly what backing chains are for. What is refused is
+// the *tip's* write lock, and a tip is read by one guest.
+//
+// Which layer is the tip of which volume is not encoded here, because that is the fact
+// that changes: `active/current` says it, per volume.
+func LayersDir(root string) string {
+	return filepath.Join(root, layersDir)
 }
 
-// LayerImage is one layer's file.
-func LayerImage(root, volumeID, layerID string) string {
-	return filepath.Join(LayersDir(root, volumeID), layerID+layerSuffix)
+// LayerImage is one layer's file, named by the layer's own id — see LayersDir for why the
+// name carries no volume.
+func LayerImage(root, layerID string) string {
+	return filepath.Join(LayersDir(root), layerID+layerSuffix)
 }
 
 // LayerIDOfImage recovers a layer's id from its path. The id is in the filename because
@@ -325,7 +345,7 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 		return &Chain{Active: req.LiveImage, SizeBytes: req.SizeBytes}, nil
 	}
 
-	if err := p.MkdirAll(LayersDir(req.Root, req.VolumeID)); err != nil {
+	if err := p.MkdirAll(LayersDir(req.Root)); err != nil {
 		return nil, fmt.Errorf("qcow: making the layer directory for volume %s: %w", req.VolumeID, err)
 	}
 	image, err := readPointer(p, req.Root, req.VolumeID, pointer)
@@ -488,11 +508,11 @@ func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 			return nil, fmt.Errorf("%w: the catalog says volume %s published commit %s and the object store has no HEAD for it, so this host will not create it empty over a history that exists",
 				ErrChainMissing, req.VolumeID, req.HeadCommitID)
 		}
-		image := LayerImage(req.Root, req.VolumeID, req.NewLayerID)
+		image := LayerImage(req.Root, req.NewLayerID)
 		if _, err := r.Run(ctx, qemuImg, "create", "-f", "qcow2", image, fmt.Sprint(req.SizeBytes)); err != nil {
 			return nil, fmt.Errorf("qcow: creating %s: %w", image, err)
 		}
-		if err := writePointer(p, pointer, image); err != nil {
+		if err := recordThenPoint(p, req.Root, req.VolumeID, pointer, image); err != nil {
 			return nil, err
 		}
 		return &Chain{Active: image, SizeBytes: req.SizeBytes}, nil
@@ -553,7 +573,7 @@ func overlay(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReq
 	// It is not published either: v6 §11's "an idle volume does not commit" means this
 	// layer becomes a commit only when a rotation seals it, and commit.Publish reads HEAD
 	// itself, so its parent is automatically the commit the chain was rebuilt to.
-	tip := LayerImage(req.Root, req.VolumeID, req.NewLayerID)
+	tip := LayerImage(req.Root, req.NewLayerID)
 	if _, err := r.Run(ctx, qemuImg, "create", "-f", "qcow2", "-b", restored.Base, "-F", "qcow2",
 		"-u", tip, fmt.Sprint(restored.VirtualSize)); err != nil {
 		return nil, fmt.Errorf("qcow: creating the new tip %s over the recovered chain %s: %w", tip, restored.Base, err)
@@ -575,7 +595,7 @@ func overlay(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReq
 		return nil, fmt.Errorf("%w: the new tip %s is backed by %q, not by the recovered chain %q",
 			ErrChainMismatch, tip, info.FullBackingFilename, restored.Base)
 	}
-	if err := writePointer(p, pointer, tip); err != nil {
+	if err := recordThenPoint(p, req.Root, req.VolumeID, pointer, tip); err != nil {
 		return nil, err
 	}
 	return &Chain{Active: tip, SizeBytes: restored.VirtualSize}, nil
@@ -609,7 +629,7 @@ func clearFork(p Paths, root, volumeID string) error {
 	if st.Pending != nil {
 		slog.Warn("dropping a sealed layer that was never published: it belongs to the chain this host held before it lost the volume, and the published history has moved on without it",
 			"volume_id", volumeID, "commit_id", st.Pending.CommitID, "layer_id", st.Pending.LayerID,
-			"layer", LayerImage(root, volumeID, st.Pending.LayerID))
+			"layer", LayerImage(root, st.Pending.LayerID))
 	}
 	// Compacting goes with them and for the same reason: it names a root built out of a
 	// prefix of the history this host has just stopped serving, and a rebase onto it
@@ -643,7 +663,7 @@ func clearFork(p Paths, root, volumeID string) error {
 // The new layer is created with `-u` because qemu-img cannot open the backing file: QEMU
 // holds its write lock.
 func (c *Chain) Rotate(ctx context.Context, r Runner, p Paths, qemuImg, root, volumeID, layerID string, switchTo func(newTip string) error) (sealed string, err error) {
-	next := LayerImage(root, volumeID, layerID)
+	next := LayerImage(root, layerID)
 	exists, err := p.Exists(next)
 	if err != nil {
 		return "", fmt.Errorf("qcow: looking for %s: %w", next, err)
@@ -670,7 +690,7 @@ func (c *Chain) Rotate(ctx context.Context, r Runner, p Paths, qemuImg, root, vo
 		return "", fmt.Errorf("%w: the new layer %s is backed by %q, not by the tip %q",
 			ErrChainMismatch, next, info.FullBackingFilename, c.Active)
 	}
-	if err := writePointer(p, ActivePointer(root, volumeID), next); err != nil {
+	if err := recordThenPoint(p, root, volumeID, ActivePointer(root, volumeID), next); err != nil {
 		return "", err
 	}
 	if err := switchTo(next); err != nil {
@@ -694,22 +714,37 @@ func readPointer(p Paths, root, volumeID, pointer string) (string, error) {
 		return "", fmt.Errorf("qcow: reading %s: %w", pointer, err)
 	}
 	image := strings.TrimSpace(string(body))
-	// A layer of *this* volume, not any layer: `active/current` is one line of text with no
-	// identity of its own, and a data directory restored from a backup leaves it pointing at
-	// somebody else's tip — another tenant's disk served under this volume's name.
-	// Cleaned before the prefix is compared, because `<vol>/layers/../../<other>/layers/x`
-	// has the right prefix as a string and resolves elsewhere, and every path here is handed
+	// Cleaned before anything is compared, because `layers/../../elsewhere/x` has the
+	// right prefix as a string and resolves somewhere else, and every path here is handed
 	// to another process that resolves it.
 	image = filepath.Clean(image)
-	if !strings.HasPrefix(image, filepath.Clean(LayersDir(root, volumeID))+string(filepath.Separator)) {
-		return "", fmt.Errorf("%w: %s names %q, which is not a layer of volume %s",
-			ErrChainMismatch, pointer, image, volumeID)
-	}
 	if !filepath.IsAbs(image) {
 		// Including the empty string, which is what a pointer truncated by a crash
 		// looks like. Refused rather than treated as "no volume yet": creating a fresh
 		// empty layer for a volume that has one is how a guest is handed a blank disk.
 		return "", fmt.Errorf("%w: %s names %q, which is not an absolute path", ErrChainMismatch, pointer, image)
+	}
+	if !strings.HasPrefix(image, filepath.Clean(LayersDir(root))+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: %s names %q, which is not a layer of this host",
+			ErrChainMismatch, pointer, image)
+	}
+	// And a layer of *this* volume, which the path can no longer say: `active/current` is
+	// one line of text with no identity of its own, and layers live in one directory for
+	// the whole host, so a data directory restored from a backup of another volume — or
+	// copied when a volume was re-placed — leaves this pointer naming somebody else's tip.
+	// That file passes every integrity check intact, and serving it is another tenant's
+	// disk under this volume's name.
+	//
+	// The record answers it, and can answer it absolutely because a layer is written into
+	// the record *before* the pointer names it (recordThenPoint). So a target the record
+	// does not account for is not a window to be tolerated; it is this.
+	st, err := ReadState(p, root, volumeID)
+	if err != nil {
+		return "", err
+	}
+	if !st.Names("", image) {
+		return "", fmt.Errorf("%w: %s names %q, and nothing this host records about volume %s accounts for it",
+			ErrChainMismatch, pointer, image, volumeID)
 	}
 	return image, nil
 }
@@ -739,6 +774,34 @@ func syncPointer(p Paths, pointer, image string) error {
 		}
 		if strings.TrimSpace(string(body)) == image {
 			return nil
+		}
+	}
+	return writePointer(p, pointer, image)
+}
+
+// recordThenPoint writes the layer into this volume's record and only then moves the
+// pointer at it. The order is the invariant that lets Open answer "is this pointer's
+// target ours" without a heuristic: **the record accounts for whatever the pointer
+// names**, always, because the record is written first.
+//
+// It matters more than it used to. Layers live in one directory for the whole host, so a
+// pointer is a bare path into a directory full of other volumes' layers — and a data
+// directory restored from a backup of a different volume, or copied when a volume was
+// re-placed, hands this volume a tip that belongs to another one and passes every
+// integrity check intact. When each volume had its own directory the path itself refused
+// that; now the record does.
+//
+// A crash between the two leaves a record naming a layer no pointer names, which the
+// sweep keeps and the next Open ignores — the safe direction. The reverse order would
+// leave a pointer the record cannot vouch for, which is indistinguishable from the attack.
+func recordThenPoint(p Paths, root, volumeID, pointer, image string) error {
+	st, err := ReadState(p, root, volumeID)
+	if err != nil {
+		return err
+	}
+	if st.ObserveTip(LayerIDOfImage(image)) {
+		if err := WriteState(p, root, volumeID, st); err != nil {
+			return err
 		}
 	}
 	return writePointer(p, pointer, image)

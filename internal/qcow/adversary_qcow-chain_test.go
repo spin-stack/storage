@@ -88,17 +88,20 @@ func TestAdversaryTheOldestSealedLayerIsPublishedFirstWhenAPublisherArrives(t *t
 
 // TestAdversaryThePointerCannotNameAnotherVolumesLayer attacks readPointer's one guard.
 //
-// `active/current` is the single local file with no identity of its own, and the check
-// that it names a layer of *this* volume is a string prefix over an uncleaned path. A
-// pointer that walks back out of the layer directory satisfies the prefix, satisfies
-// IsAbs, and resolves to another volume's tip — which is the very thing the guard is
-// written against: another tenant's disk served under this volume's name, and every
-// layer this host then seals over it is theirs too.
+// `active/current` is the single local file with no identity of its own. Layers live in
+// one directory for the whole host, so the path can only say "a layer of this machine",
+// and which volume it belongs to is a question for the record — which is why a layer is
+// written into the record before the pointer names it.
+//
+// This aims at both halves at once: a pointer that walks back out of the layers directory
+// and returns to it satisfies IsAbs and, after cleaning, the prefix — and lands on a layer
+// this volume has no claim to. That is the thing the guard is written against: another
+// tenant's disk served under this volume's name, and every layer this host then seals over
+// it is theirs too.
 func TestAdversaryThePointerCannotNameAnotherVolumesLayer(t *testing.T) {
 	t.Parallel()
-	const other = "0198c0de-0000-7000-8000-00000000beef"
-	victim := qcow.LayerImage(root, other, baseID)
-	escape := qcow.LayersDir(root, vol) + "/../../" + other + "/layers/" + baseID + ".qcow2"
+	victim := qcow.LayerImage(root, baseID)
+	escape := qcow.LayersDir(root) + "/../" + filepath.Base(qcow.LayersDir(root)) + "/" + baseID + ".qcow2"
 	if filepath.Clean(escape) != victim {
 		t.Fatalf("the crafted pointer resolves to %q, not to %q", filepath.Clean(escape), victim)
 	}
@@ -110,9 +113,9 @@ func TestAdversaryThePointerCannotNameAnotherVolumesLayer(t *testing.T) {
 	chain, err := qcow.Open(t.Context(), &fakeRunner{info: infoJSON("qcow2", size, false)},
 		p, "/qemu-img", req(nil))
 	if err == nil {
-		t.Fatalf("volume %s was opened on %q, which is volume %s's tip", vol, chain.Active, other)
+		t.Fatalf("volume %s was opened on %q, which nothing about it accounts for", vol, chain.Active)
 	}
-	if !strings.Contains(err.Error(), "not a layer of volume") {
+	if !strings.Contains(err.Error(), "accounts for it") {
 		t.Errorf("refused for the wrong reason: %v", err)
 	}
 }

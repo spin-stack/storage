@@ -50,7 +50,7 @@ func TestAdversaryAHeadThatNamesNoCommitCrashesTheRestore(t *testing.T) {
 
 // TestAdversaryALayerIdFromTheBucketWritesOutsideTheVolumeDirectory.
 //
-// Every local path a restore writes is LayerImage(root, volumeID, m.Layer.LayerID), and
+// Every local path a restore writes is LayerImage(root, m.Layer.LayerID), and
 // layer_id is a string out of a manifest. ReadManifest checks that the object describes
 // the volume and commit it was asked for; nothing checks that the layer id is an id.
 //
@@ -81,7 +81,7 @@ func TestAdversaryALayerIdFromTheBucketWritesOutsideTheVolumeDirectory(t *testin
 	if _, err := rec.Restore(t.Context(), w.vol, virtualSize); err == nil {
 		t.Fatal("a manifest whose layer id is not an id was rebuilt")
 	}
-	layers := qcow.LayersDir(tmp, w.vol)
+	layers := qcow.LayersDir(tmp)
 	for _, path := range files.created() {
 		if !strings.HasPrefix(filepath.Clean(path), layers+string(filepath.Separator)) {
 			t.Errorf("a manifest in the bucket made this host write %s, outside %s", filepath.Clean(path), layers)

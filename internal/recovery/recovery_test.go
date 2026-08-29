@@ -148,6 +148,10 @@ func (f *fakeFiles) Rename(oldPath, newPath string) error {
 
 // List names the files this fake holds directly under dir. qcow.Paths carries it for the
 // sweep; nothing in this package lists anything.
+// List names the entries directly under dir, directories included — which os.ReadDir
+// always did, and which a fake that returned only files made invisible: walking
+// `<root>/volumes` for the per-volume records then found an empty host, so every clone
+// downloaded a chain that was already on the disk.
 func (f *fakeFiles) List(dir string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -157,8 +161,13 @@ func (f *fakeFiles) List(dir string) ([]string, error) {
 			names = append(names, filepath.Base(path))
 		}
 	}
+	for d := range f.dirs {
+		if filepath.Dir(d) == dir {
+			names = append(names, filepath.Base(d))
+		}
+	}
 	slices.Sort(names)
-	return names, nil
+	return slices.Compact(names), nil
 }
 
 func (f *fakeFiles) Remove(path string) error {
@@ -434,7 +443,7 @@ func (w *world) publish() {
 }
 
 // image is where the i-th layer of the chain must land.
-func (w *world) image(i int) string { return qcow.LayerImage(root, w.vol, w.layers[i]) }
+func (w *world) image(i int) string { return qcow.LayerImage(root, w.layers[i]) }
 
 // TestRestoreRebuildsAOneCommitChain is the thinnest real answer: a host that holds
 // nothing is handed a volume with one published commit and ends up with the layer's
@@ -648,14 +657,21 @@ func TestRestoreRefusesAChainItCannotAssemble(t *testing.T) {
 	}
 }
 
-// TestRestoreDoesNotTrustAFileNothingVouchesFor. A layer file can be on disk without the
+// TestRestoreDoesNotTrustAFileNothingVouchesFor. A layer file can be on disk without any
 // record naming it: an interrupted restore, a sweep that never ran, a copy somebody made.
 // The path is derived from the layer id, so it looks exactly like the real thing, and the
-// only reason to believe it is a record that says this commit's layer is this layer.
+// only reason to believe it is a record saying this commit's layer is this layer.
+//
+// Not believed, and — since layers are shared between volumes — not overwritten either.
+// Downloading over it would replace a file every volume reading through it depends on,
+// under a running guest, and a file nothing vouches for cannot be told apart from one a
+// record this restore could not read does. So it is refused, which costs a cycle and no
+// more: the sweep collects a layer no volume names, and the next restore finds the path
+// free.
 func TestRestoreDoesNotTrustAFileNothingVouchesFor(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, 2)
-	if err := w.files.MkdirAll(qcow.LayersDir(root, w.vol)); err != nil {
+	if err := w.files.MkdirAll(qcow.LayersDir(root)); err != nil {
 		t.Fatalf("making the layer directory: %v", err)
 	}
 	f, err := w.files.Create(w.image(0))
@@ -676,11 +692,17 @@ func TestRestoreDoesNotTrustAFileNothingVouchesFor(t *testing.T) {
 		t.Fatalf("writing the state: %v", err)
 	}
 
-	if _, err := w.rec.Restore(t.Context(), w.vol, virtualSize); err != nil {
-		t.Fatalf("restoring: %v", err)
+	_, err = w.rec.Restore(t.Context(), w.vol, virtualSize)
+	if err == nil {
+		t.Fatal("a layer file no record vouches for was taken into the chain")
 	}
-	if !bytes.Equal(w.files.content(w.image(0)), w.plain[0]) {
-		t.Error("a layer file no record vouches for was left in the chain")
+	if !errors.Is(err, recovery.ErrIncomplete) {
+		t.Fatalf("refused with %v, want ErrIncomplete", err)
+	}
+	// And the impostor is still there, untouched: this restore did not overwrite a file
+	// it could not account for. Which volume it belongs to is the sweep's question.
+	if got := string(w.files.content(w.image(0))); got != "not this volume's first layer" {
+		t.Errorf("the file was rewritten by a restore that could not account for it: %q", got)
 	}
 }
 
@@ -717,8 +739,8 @@ func TestRestoreIsIdempotent(t *testing.T) {
 func TestRestoreRefusesALayerWhoseHeaderDoesNotNameItsParent(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t, 2)
-	decoy := qcow.LayerImage(root, w.vol, ids.New().String())
-	if err := w.files.MkdirAll(qcow.LayersDir(root, w.vol)); err != nil {
+	decoy := qcow.LayerImage(root, ids.New().String())
+	if err := w.files.MkdirAll(qcow.LayersDir(root)); err != nil {
 		t.Fatalf("making the layer directory: %v", err)
 	}
 	f, err := w.files.Create(decoy)
@@ -806,7 +828,7 @@ func TestRestoreDoesNotRefetchWhatThisHostAlreadyHolds(t *testing.T) {
 // records it the way a publish by this host would have.
 func plant(w *world, i int) {
 	w.t.Helper()
-	if err := w.files.MkdirAll(qcow.LayersDir(root, w.vol)); err != nil {
+	if err := w.files.MkdirAll(qcow.LayersDir(root)); err != nil {
 		w.t.Fatalf("making the layer directory: %v", err)
 	}
 	f, err := w.files.Create(w.image(i))
@@ -1133,7 +1155,7 @@ func TestASameHostCloneReadsTheParentsLayersOffTheLocalDisk(t *testing.T) {
 		t.Fatal("the clone was restored to no base at all")
 	}
 	for _, layerID := range w.layers {
-		there, ferr := w.files.Exists(qcow.LayerImage(root, clone, layerID))
+		there, ferr := w.files.Exists(qcow.LayerImage(root, layerID))
 		if ferr != nil || !there {
 			t.Fatalf("layer %s is not under the clone: %v", layerID, ferr)
 		}

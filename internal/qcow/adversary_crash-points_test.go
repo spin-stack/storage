@@ -27,11 +27,20 @@ import (
 type crashPaths struct {
 	*fakePaths
 	failState error
+	// failStateAfter skips that many successful writes before failState starts biting,
+	// so a test can name a kill point *inside* a cycle that writes the record more than
+	// once — a rotation records the new layer before it moves the pointer, and the sealed
+	// one after QEMU has switched.
+	failStateAfter int
 }
 
 func (p *crashPaths) WriteAtomic(path string, data []byte) error {
 	if p.failState != nil && path == qcow.StateFile(root, vol) {
-		return p.failState
+		if p.failStateAfter > 0 {
+			p.failStateAfter--
+		} else {
+			return p.failState
+		}
 	}
 	return p.fakePaths.WriteAtomic(path, data)
 }
@@ -179,9 +188,12 @@ func TestAdversaryASealedLayerNobodyRecordedIsDroppedFromTheHistory(t *testing.T
 	first := a.tip(t)
 	a.guestWriting(first, 9<<20)
 
-	// The cycle that rotates. The QMP snapshot takes effect — the guest is writing to
-	// the new layer from here on — and the process dies before state.json lands.
-	a.paths.failState = errors.New("SIGKILL between blockdev-snapshot-sync and state.json")
+	// The cycle that rotates. A rotation writes the record twice: the new layer before
+	// the pointer names it, and the sealed one once QEMU has switched. The kill point is
+	// the second — the QMP snapshot has taken effect, the guest is writing to the new
+	// layer, and the process dies before anything records what the old one became.
+	a.paths.failStateAfter = 1
+	a.paths.failState = errors.New("SIGKILL after blockdev-snapshot-sync and before the sealed layer is recorded")
 	if err := a.apply(t, 1); err == nil {
 		t.Fatal("the rotation whose record never landed was reported as a success")
 	}
@@ -195,7 +207,7 @@ func TestAdversaryASealedLayerNobodyRecordedIsDroppedFromTheHistory(t *testing.T
 
 	// The next Agent. The disk is healthy again; only what was lost is lost.
 	a.crash(t, 8<<20, &recordingPublisher{})
-	a.paths.failState = nil
+	a.paths.failState, a.paths.failStateAfter = nil, 0
 
 	// Three cycles of a guest that keeps writing, enough for the layer above to cross
 	// the threshold and be committed.
@@ -362,7 +374,7 @@ func TestAdversaryOneMissedQMPDialLatchesTheVolumeForever(t *testing.T) {
 		t.Errorf("three cycles after the socket came back the volume is still refused as %v (%q),"+
 			" while its guest is writing to %s", v.Refusal, v.RefusalDetail, live)
 	}
-	if !strings.HasPrefix(live, qcow.LayersDir(root, vol)) {
+	if !strings.HasPrefix(live, qcow.LayersDir(root)) {
 		t.Fatalf("the live image %q is not a layer of this volume", live)
 	}
 	// The control, and the proof of what is holding the refusal on: the identical cycle

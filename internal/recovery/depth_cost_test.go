@@ -259,7 +259,7 @@ func TestARestoreRebuildsEveryGeneration(t *testing.T) {
 	// Oldest first: the order the layers must sit in for a guest to read the newest write
 	// at any offset. The tip the caller is told to build over is the newest of them.
 	whole := append(append([]string{}, oldestCommits...), middleCommits...)
-	if want := qcow.LayerImage(root, grandchild, l.layerOf[whole[len(whole)-1]]); got.Base != want {
+	if want := qcow.LayerImage(root, l.layerOf[whole[len(whole)-1]]); got.Base != want {
 		t.Errorf("the clone would be built over %q, want the newest generation's layer %q", got.Base, want)
 	}
 	if got.HeadCommitID != middleCommits[0] {
@@ -267,7 +267,7 @@ func TestARestoreRebuildsEveryGeneration(t *testing.T) {
 			got.HeadCommitID, middleCommits[0])
 	}
 	for _, id := range whole {
-		at := qcow.LayerImage(root, grandchild, l.layerOf[id])
+		at := qcow.LayerImage(root, l.layerOf[id])
 		if !bytes.Equal(l.files.content(at), l.plainOf[id]) {
 			t.Errorf("commit %s's layer is not on this disk as the bytes it published: %s", id, at)
 		}
@@ -282,15 +282,14 @@ func TestARestoreRebuildsEveryGeneration(t *testing.T) {
 	}
 }
 
-// TestEveryAncestorOnThisDiskIsCopiedRatherThanDownloaded is §19's local reuse over more
-// than one generation (§32's eleventh criterion), which is the half a deeper walk is most
-// likely to lose: the reuse is decided from the ancestor's own state.json, and there is
-// now one of those per generation.
+// TestEveryAncestorOnThisDiskIsSharedRatherThanDownloaded is §18's local reuse over more
+// than one generation, which is the half a deeper walk is most likely to lose: the reuse
+// is decided from the ancestors' records, and there is one of those per generation.
 //
 // Every layer object is REMOVED from the bucket before the grandchild is restored, so a
 // restore that downloads anything cannot pass and one that copies does not notice. The
 // manifests and HEADs stay: a clone must still be told what each generation's history is.
-func TestEveryAncestorOnThisDiskIsCopiedRatherThanDownloaded(t *testing.T) {
+func TestEveryAncestorOnThisDiskIsSharedRatherThanDownloaded(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	l := newLineage(t)
@@ -335,7 +334,7 @@ func TestEveryAncestorOnThisDiskIsCopiedRatherThanDownloaded(t *testing.T) {
 		t.Fatalf("a clone went to the object store for layers this host already holds: %v", err)
 	}
 	for _, id := range append(append([]string{}, oldestCommits...), middleCommits...) {
-		at := qcow.LayerImage(root, grandchild, l.layerOf[id])
+		at := qcow.LayerImage(root, l.layerOf[id])
 		if !bytes.Equal(l.files.content(at), l.plainOf[id]) {
 			t.Errorf("commit %s's layer did not reach %s as the bytes it published", id, at)
 		}
@@ -390,5 +389,76 @@ func TestOneLineageSpendsOneRestoreBudget(t *testing.T) {
 				t.Fatalf("a lineage of %d layers was refused: %v", tt.older+tt.younger, err)
 			}
 		})
+	}
+}
+
+// TestAHundredClonesCostOneCopyOfTheHistory is the number that decided the local layout.
+//
+// A clone reuses its ancestors' layers, and for a long time "reuse" meant *copy*: layers
+// lived under `volumes/<id>/layers/`, so every clone needed its own rebased file, and a
+// hundred clones of a volume with a 20 GiB published history cost 2 TB of local disk. The
+// duplication was never about the bytes — the object store has always held one object per
+// layer, however many volumes descend from it — it was about the path, because
+// `qemu-img rebase -u` rewrites a layer's header to name its parent.
+//
+// One directory for the whole host makes that path the same for everyone, so the header is
+// written once and a hundred clones share the file. Asserted by counting the files on
+// disk, which is the thing that ran out: a design that satisfied every other assertion here
+// and copied would show up as a hundred times as many.
+func TestAHundredClonesCostOneCopyOfTheHistory(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	l := newLineage(t)
+	parent := l.volume()
+	commits, _ := l.publish(parent, 3)
+	if _, err := l.rec.Restore(ctx, parent, virtualSize); err != nil {
+		t.Fatalf("restoring the parent: %v", err)
+	}
+	before, err := l.files.List(qcow.LayersDir(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The bucket loses every layer object, so a clone that downloads cannot pass and one
+	// that shares does not notice.
+	objs, err := l.store.List(ctx, "layers/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range objs {
+		if err := l.store.Delete(ctx, o.Key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const clones = 100
+	for range clones {
+		clone := l.cloneOf(parent)
+		if _, err := l.rec.RestoreFrom(ctx, qcow.Lineage{
+			VolumeID: clone,
+			Ancestry: []qcow.Ancestor{{VolumeID: parent, CommitID: commits[len(commits)-1]}},
+		}, virtualSize); err != nil {
+			t.Fatalf("a clone went to the object store for layers this host already holds: %v", err)
+		}
+	}
+
+	after, err := l.files.List(qcow.LayersDir(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not one file more. The tips the clones will write to are made by qcow.Open, which
+	// this restore does not run — what it lands is exactly the ancestors' layers, and those
+	// were already here.
+	if len(after) != len(before) {
+		t.Fatalf("%d clones of a %d-layer history left %d layer files on disk, up from %d: they are copying it",
+			clones, len(before), len(after), len(before))
+	}
+	// And the bytes are still the ones the parent published, not something a clone
+	// rewrote on its way past.
+	for _, id := range commits {
+		at := qcow.LayerImage(root, l.layerOf[id])
+		if !bytes.Equal(l.files.content(at), l.plainOf[id]) {
+			t.Errorf("commit %s's layer at %s is not the bytes it published", id, at)
+		}
 	}
 }

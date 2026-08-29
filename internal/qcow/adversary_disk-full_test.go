@@ -47,8 +47,12 @@ func TestAdversaryTheDeviceFillsWhileALayerIsSealedAndNothingSealedIsForgotten(t
 	first := a.tip(t)
 	a.guestWriting(first, 9<<20)
 
-	// The device fills. Every write this Agent makes about itself — the record of what
-	// it sealed, and later the record of what it published — meets ENOSPC.
+	// The device fills, at the point this test is about: after the snapshot. A rotation
+	// writes the record twice — the new layer before the pointer names it, and the sealed
+	// one once QEMU has switched — and a device that filled before the first would simply
+	// stop the rotation, which is a different and much easier story. From here every write
+	// this Agent makes about itself meets ENOSPC.
+	a.paths.failStateAfter = 1
 	a.paths.failState = fmt.Errorf("qcow: writing state.json: %w", disk.ErrNoSpace)
 
 	err := a.apply(t, 1)
@@ -105,9 +109,17 @@ func TestAdversaryTheDeviceFillsWhileALayerIsSealedAndNothingSealedIsForgotten(t
 		t.Errorf("the layer sealed in the cycle whose record failed (%s) was never offered for publishing; the layers that were: %v",
 			qcow.LayerIDOfImage(first), a.offered())
 	}
+	// Distinct ids, not offers. A layer offered again under the id it already has is a
+	// retry, and commit.Publish answers it from the manifest that is already there — which
+	// is precisely what a host whose note of the commit could not be written is supposed
+	// to do. Two *different* ids for one layer is the duplicate history.
 	for layerID, commits := range perLayer {
-		if len(commits) > 1 {
-			t.Errorf("layer %s was published under %d commit ids while the device was full: %v", layerID, len(commits), commits)
+		distinct := map[string]bool{}
+		for _, c := range commits {
+			distinct[c] = true
+		}
+		if len(distinct) > 1 {
+			t.Errorf("layer %s was published under %d commit ids while the device was full: %v", layerID, len(distinct), commits)
 		}
 	}
 

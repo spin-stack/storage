@@ -37,9 +37,12 @@ func attachedToCorrupt(image string) []string {
 func TestAGuestCorruptingItsOwnImageIsNoticedWhileItRuns(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	image := qcow.LayerImage(root, vol, layerID)
+	image := qcow.LayerImage(root, layerID)
+	h.guestHas(vol, image)
+	// The same attachment, with QEMU reporting the corrupt flag. Declared after guestHas
+	// so the record still accounts for the layer: the volume must be refused for *this*
+	// reason and not for being unrecognised.
 	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedToCorrupt(image)
-	h.paths.present[image] = true
 
 	err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 4)})
 	if !errors.Is(err, qcow.ErrChainMismatch) {
@@ -73,9 +76,8 @@ func TestAGuestCorruptingItsOwnImageIsNoticedWhileItRuns(t *testing.T) {
 func TestAHealthyLiveImageIsNotRefused(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
-	image := qcow.LayerImage(root, vol, layerID)
-	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(image)
-	h.paths.present[image] = true
+	image := qcow.LayerImage(root, layerID)
+	h.guestHas(vol, image)
 
 	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 4)}); err != nil {
 		t.Fatalf("applying: %v", err)

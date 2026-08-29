@@ -223,8 +223,13 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 	if err != nil {
 		return qcow.Restored{}, 0, err
 	}
-	if err := r.files.MkdirAll(qcow.LayersDir(r.root, local)); err != nil {
-		return qcow.Restored{}, 0, fmt.Errorf("%w: making the layer directory for volume %s: %w", ErrIncomplete, local, err)
+	// The host's one layers directory, and this volume's own — which holds the record and
+	// the pointer, and which used to be made as a side effect of making its layers
+	// directory underneath it.
+	for _, dir := range []string{qcow.LayersDir(r.root), qcow.VolumeDir(r.root, local)} {
+		if err := r.files.MkdirAll(dir); err != nil {
+			return qcow.Restored{}, 0, fmt.Errorf("%w: making %s for volume %s: %w", ErrIncomplete, dir, local, err)
+		}
 	}
 	// What this host already holds, so a re-placement skips most downloads. It cannot be
 	// replaced by hashing the local files: `qemu-img rebase -u` rewrites a layer's header,
@@ -235,39 +240,28 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 	if err != nil {
 		return qcow.Restored{}, 0, fmt.Errorf("%w: %w", ErrIncomplete, err)
 	}
-	held := make(map[string]string, len(st.Commits))
-	for _, c := range st.Commits {
-		held[c.CommitID] = c.LayerID
-	}
-	// A clone on the same host as its parent: the layers it needs are already on this
-	// disk, under the parent's directory, and downloading them again costs a full chain
-	// of object-store GETs for bytes that are feet away. §19 asks for this by name.
+	// What this host already holds, over every volume's record and not just this one's.
+	// Layers live in one directory for the whole host (qcow.LayersDir says why), so a
+	// layer another volume vouches for is a layer this restore can use as it stands.
 	//
-	// Copied and not linked or shared. `qemu-img rebase -u` rewrites a layer's header to
-	// point at its local parent, so a hard link would rewrite the *parent volume's* file —
-	// §19's one prohibition — and a backing file pointing into another volume's directory
-	// would make the clone's chain depend on a volume nobody told it about.
-	local2 := ""
-	if source != local {
-		if pst, perr := qcow.ReadState(r.files, r.root, source); perr == nil {
-			local2 = source
-			for _, c := range pst.Commits {
-				if held[c.CommitID] == "" {
-					held[c.CommitID] = c.LayerID
-				}
-			}
-		}
+	// That is what makes a clone on the same host as its parent free: §18 asks that it
+	// reuse the local files, and it reuses them now rather than copying them. The copy this
+	// replaced was never about the bytes, it was about the path — `qemu-img rebase -u`
+	// rewrites a layer's header to name its parent, so under a directory per volume every
+	// clone needed its own rebased file, and a hundred clones of one volume needed a
+	// hundred copies of its history. Under one directory the header is written once and is
+	// already correct for everyone.
+	//
+	// Still a record and never a stat: a file at the right path is not evidence that it is
+	// the layer the manifest names.
+	held, err := qcow.HeldCommits(r.files, r.root)
+	if err != nil {
+		return qcow.Restored{}, 0, fmt.Errorf("%w: %w", ErrIncomplete, err)
 	}
-
 	parent := onTopOf
 	for _, m := range manifests {
-		path := qcow.LayerImage(r.root, local, m.Layer.LayerID)
-		known := held[m.CommitID] == m.Layer.LayerID
-		from := ""
-		if known && local2 != "" {
-			from = qcow.LayerImage(r.root, local2, m.Layer.LayerID)
-		}
-		downloaded, err := r.materialize(ctx, enc, m, path, known, from)
+		path := qcow.LayerImage(r.root, m.Layer.LayerID)
+		downloaded, err := r.materialize(ctx, enc, m, path, held[m.CommitID] == m.Layer.LayerID)
 		if err != nil {
 			return qcow.Restored{}, 0, err
 		}
@@ -281,16 +275,16 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 		if err := r.repoint(ctx, m, path, parent); err != nil {
 			return qcow.Restored{}, 0, err
 		}
-		if !known {
-			// One write per layer that is new to this host, rather than one at the end:
-			// a crash mid-restore then costs the layers not yet fetched and not the ones
-			// already on disk. A layer that was already recorded is not appended again —
-			// the list would grow by the whole chain on every re-placement.
+		// One write per layer rather than one at the end: a crash mid-restore then costs
+		// the layers not yet fetched and not the ones already on disk. It is also what
+		// makes the file safe to keep — the sweep frees a layer no record names, and a
+		// clone that has downloaded three of its ancestors and not the fourth must not
+		// have those three collected out from under it on the next cycle.
+		if !st.Names("", path) {
 			st.Commits = append(st.Commits, qcow.CommitLayer{CommitID: m.CommitID, LayerID: m.Layer.LayerID})
 			if err := qcow.WriteState(r.files, r.root, local, st); err != nil {
 				return qcow.Restored{}, 0, fmt.Errorf("%w: recording commit %s: %w", ErrIncomplete, m.CommitID, err)
 			}
-			held[m.CommitID] = m.Layer.LayerID
 		}
 		parent = path
 	}
@@ -396,23 +390,30 @@ func checkGeometry(volumeID string, sizeBytes int64, head commit.Manifest, manif
 //
 // held — the durable record that this host already has this commit's layer — is believed
 // only together with the file being there.
-func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool, from string) (int64, error) {
+func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool) (int64, error) {
+	there, err := r.files.Exists(path)
+	if err != nil {
+		return 0, fmt.Errorf("%w: looking for %s: %w", ErrIncomplete, path, err)
+	}
 	if held {
-		there, err := r.files.Exists(path)
-		if err != nil {
-			return 0, fmt.Errorf("%w: looking for %s: %w", ErrIncomplete, path, err)
-		}
 		if there {
 			return 0, nil
 		}
-		// The same layer under another volume on this disk — a clone's parent. Copying it
-		// skips the download and the unsealing; if the copy fails for any reason we fall
-		// through to the object store, which is the authority either way.
-		if from != "" {
-			if copied, err := r.copyLocal(from, path); err == nil && copied {
-				return 0, nil
-			}
-		}
+	} else if there {
+		// The path is taken and nothing here says it holds *this* commit's layer. Layers
+		// are shared between volumes now, so the download that would follow does not
+		// replace a file of this volume's — it replaces one every volume reading through
+		// it depends on, and a rename into place is not something a chain under a running
+		// guest survives.
+		//
+		// It is refused rather than worked around. In an honest system a layer id names
+		// one layer's plaintext for ever, so this shape means a record and a manifest
+		// disagree about which commit owns the id — a fork restored here, a data directory
+		// copied between machines, a forged manifest — and picking a winner is choosing
+		// which volume gets the wrong bytes. Refusing costs a cycle: if nothing vouches
+		// for the file at all, the sweep collects it and the next restore proceeds.
+		return 0, fmt.Errorf("%w: commit %s says its layer is %s, and this host already holds a file there that no record ties to this commit",
+			ErrIncomplete, m.CommitID, m.Layer.LayerID)
 	}
 	part := path + partSuffix
 	w, err := r.files.Create(part)
@@ -595,41 +596,4 @@ func (Absent) RestoreFrom(_ context.Context, l qcow.Lineage, _ int64) (qcow.Rest
 // Current answers the same way and for the same reason.
 func (Absent) Current(context.Context, string) (string, error) {
 	return "", fmt.Errorf("%w: this Agent was started with no object store", commit.ErrNoHead)
-}
-
-// copyLocal puts a layer this host already holds under another volume where this one
-// needs it, without going to the object store. It reports false when the source is not
-// there, which is not an error: the caller falls through to the download.
-//
-// Through the same .part-then-rename path a download uses, so a crash halfway leaves no
-// file a later run would mistake for a complete layer.
-func (r *Recoverer) copyLocal(from, to string) (bool, error) {
-	there, err := r.files.Exists(from)
-	if err != nil || !there {
-		return false, err
-	}
-	src, err := r.files.Open(from)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = src.Close() }()
-	part := to + partSuffix
-	w, err := r.files.Create(part)
-	if err != nil {
-		return false, err
-	}
-	if _, err := io.Copy(w, src); err != nil {
-		_ = w.Close()
-		r.discard(part)
-		return false, err
-	}
-	if err := w.Close(); err != nil {
-		r.discard(part)
-		return false, err
-	}
-	if err := r.files.Rename(part, to); err != nil {
-		r.discard(part)
-		return false, err
-	}
-	return true, nil
 }

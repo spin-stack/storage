@@ -186,3 +186,34 @@ say "12. a guest boots the clone of the clone and reads the ORIGINAL guest's slo
 grep -q "GUESTINIT-PASS" "$DIR/logs/guest4.log" ||
   die "the grandchild's guest did not read the original volume's slot: $(grep -m1 'GUESTINIT' "$DIR/logs/guest4.log")"
 echo "GUESTINIT-PASS — a clone of a clone read back what the first volume's guest wrote"
+
+say "13. eight more clones of the same snapshot, and the disk does not move"
+# The number that decided the local layout. A clone reuses its ancestors' layers, and for
+# a long time "reuse" meant *copy*: layers lived under `volumes/<id>/layers/`, so every
+# clone needed its own rebased file — `qemu-img rebase -u` rewrites a layer's header to
+# name its parent — and a hundred clones of a volume with a 20 GiB published history cost
+# 2 TB of local disk. The duplication was never about the bytes; the object store has
+# always held one object per layer however many volumes descend from it.
+#
+# One directory for the whole host makes the backing path the same for everyone, so the
+# header is written once and every clone shares the file. Counted in files and in bytes,
+# because the bytes are what ran out.
+LAYERS_DIR="$DIR/agent/layers"
+FILES_BEFORE=$(ls "$LAYERS_DIR"/*.qcow2 | wc -l)
+BYTES_BEFORE=$(du -sb "$LAYERS_DIR" | cut -f1)
+for i in $(seq 1 8); do
+  "$CP" "${CPFLAGS[@]}" -holder-id "cp-clone-$i" -max-used-ratio ${CLONE_MAX_USED:-0.99} \
+    -clone-snapshot "$SNAP" >"$DIR/logs/clone-$i.log" 2>&1 ||
+    die "clone $i was refused: $(tail -3 "$DIR/logs/clone-$i.log")"
+done
+waituntil "$DIR/logs/agent1.log" "volume ready" 11 300
+FILES_AFTER=$(ls "$LAYERS_DIR"/*.qcow2 | wc -l)
+BYTES_AFTER=$(du -sb "$LAYERS_DIR" | cut -f1)
+# Eight clones, eight new tips — an empty qcow2 each — and not one copied ancestor. The
+# check is on the *growth*: eight tips are the honest cost of eight volumes, and anything
+# beyond that is a history duplicated.
+GREW=$((FILES_AFTER - FILES_BEFORE))
+[ "$GREW" -le 8 ] ||
+  die "8 clones added $GREW layer files: their ancestors are being copied"
+echo "    $FILES_BEFORE layer files before, $FILES_AFTER after: 8 new tips and no copied history"
+echo "    $(numfmt --to=iec $BYTES_BEFORE) before, $(numfmt --to=iec $BYTES_AFTER) after"

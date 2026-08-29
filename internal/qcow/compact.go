@@ -118,7 +118,7 @@ type compaction struct {
 // checkCollapseSet walks the files before a byte is converted.
 func publishedPrefix(p Paths, root, volumeID string, st State) (layers []string, into string, readBytes int64, err error) {
 	for _, published := range st.Commits {
-		size, err := p.Size(LayerImage(root, volumeID, published.LayerID))
+		size, err := p.Size(LayerImage(root, published.LayerID))
 		if err != nil {
 			return nil, "", 0, fmt.Errorf("qcow: measuring layer %s of volume %s to plan a compaction: %w",
 				published.LayerID, volumeID, err)
@@ -195,7 +195,7 @@ func chainDepth(st State, tip string) int {
 // number an operator is watching is the disk's and not the record's: an orphan overlay a
 // rotation left behind occupies space no record names.
 func layerBytes(p Paths, root, volumeID string) (int64, error) {
-	dir := LayersDir(root, volumeID)
+	dir := LayersDir(root)
 	names, err := p.List(dir)
 	if err != nil {
 		return 0, fmt.Errorf("qcow: listing %s to measure what volume %s occupies: %w", dir, volumeID, err)
@@ -419,7 +419,7 @@ func (m *Manager) abandonCompaction(v *volume, st *State, why string) error {
 // it is: the convert is deterministic over immutable inputs, so the file on disk is the
 // file this would write again, and it was checked before it was given that name.
 func (m *Manager) flatten(ctx context.Context, v *volume, prefix []string, layerID string) (string, error) {
-	image := LayerImage(m.cfg.Root, v.id, layerID)
+	image := LayerImage(m.cfg.Root, layerID)
 	there, err := m.paths.Exists(image)
 	if err != nil {
 		return "", fmt.Errorf("qcow: looking for %s: %w", image, err)
@@ -427,7 +427,7 @@ func (m *Manager) flatten(ctx context.Context, v *volume, prefix []string, layer
 	if there {
 		return image, nil
 	}
-	from := LayerImage(m.cfg.Root, v.id, prefix[len(prefix)-1])
+	from := LayerImage(m.cfg.Root, prefix[len(prefix)-1])
 	if err := m.checkCollapseSet(ctx, v, prefix, from); err != nil {
 		return "", err
 	}
@@ -469,7 +469,7 @@ func (m *Manager) checkCollapseSet(ctx context.Context, v *volume, prefix []stri
 	// layer this host recorded as published that the chain does not read through — a count
 	// says a fork happened and not where.
 	for _, id := range prefix {
-		if want := LayerImage(m.cfg.Root, v.id, id); !walked[filepath.Clean(want)] {
+		if want := LayerImage(m.cfg.Root, id); !walked[filepath.Clean(want)] {
 			return fmt.Errorf("%w: volume %s records layer %s as published, and the chain under %s does not read through it",
 				ErrChainMismatch, v.id, id, from)
 		}
@@ -480,7 +480,7 @@ func (m *Manager) checkCollapseSet(ctx context.Context, v *volume, prefix []stri
 	}
 	// The walk is top-first and the prefix is oldest-first: same layers, same order.
 	for i, layer := range chain {
-		want := LayerImage(m.cfg.Root, v.id, prefix[len(prefix)-1-i])
+		want := LayerImage(m.cfg.Root, prefix[len(prefix)-1-i])
 		if filepath.Clean(layer.Filename) != filepath.Clean(want) {
 			return fmt.Errorf("%w: volume %s would collapse %s, and the chain under %s has %s in that place",
 				ErrChainMismatch, v.id, want, from, layer.Filename)
@@ -535,12 +535,12 @@ func (m *Manager) rebase(ctx context.Context, v *volume, root CompactedRoot) err
 			v.awaitingRebase = true
 			slog.Info("this volume's compacted root is published and its chain still reads through the layers that root replaces: repointing them needs the files, and a guest holds every file of the chain it has open",
 				"volume_id", v.id, "commit_id", root.CommitID,
-				"layer", LayerImage(m.cfg.Root, v.id, root.RebaseLayerID))
+				"layer", LayerImage(m.cfg.Root, root.RebaseLayerID))
 		}
 		return nil
 	}
-	onto := LayerImage(m.cfg.Root, v.id, root.LayerID)
-	if err := m.repoint(ctx, LayerImage(m.cfg.Root, v.id, root.RebaseLayerID), onto, v.chain.Active); err != nil {
+	onto := LayerImage(m.cfg.Root, root.LayerID)
+	if err := m.repoint(ctx, LayerImage(m.cfg.Root, root.RebaseLayerID), onto, v.chain.Active); err != nil {
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
 	if err := m.recordCollapsed(v, root); err != nil {

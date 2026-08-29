@@ -315,7 +315,7 @@ type host struct {
 func deepChain(t *testing.T, policy qcow.CompactionPolicy, attached bool) *host {
 	t.Helper()
 
-	tip := qcow.LayerImage(root, vol, layerID)
+	tip := qcow.LayerImage(root, layerID)
 	p := newPathsAt(tip)
 	q := &qemuImg{paths: p}
 	backing := ""
@@ -328,7 +328,7 @@ func deepChain(t *testing.T, policy qcow.CompactionPolicy, attached bool) *host 
 		for off, b := range layerBytesAt[l.id] {
 			img.Data[fmt.Sprint(off)] = int(b)
 		}
-		path := qcow.LayerImage(root, vol, l.id)
+		path := qcow.LayerImage(root, l.id)
 		body, err := json.Marshal(img)
 		if err != nil {
 			t.Fatal(err)
@@ -490,7 +490,7 @@ func TestACompactedRootReconstructsWhatTheCollapsedPrefixDid(t *testing.T) {
 			published.layer.ReplacesCommitID, collapseNewest)
 	}
 	// What the prefix reconstructed, read out of the files the guest is still sitting on.
-	want := readBack(t, h.paths, qcow.LayerImage(root, vol, newestLayer))
+	want := readBack(t, h.paths, qcow.LayerImage(root, newestLayer))
 	if got := bytesOf(t, published.body); !maps.Equal(got, want) {
 		t.Errorf("the published root reconstructs %v and the prefix it replaces reconstructs %v", got, want)
 	}
@@ -592,7 +592,7 @@ func TestNothingInALiveChainIsRepointed(t *testing.T) {
 	// The chain the guest reads is the one it had: every layer of the prefix, in order.
 	want := []string{layerID, newestLayer, middleLayer, oldestLayer}
 	var got []string
-	for _, path := range h.chainUnder(t, qcow.LayerImage(root, vol, layerID)) {
+	for _, path := range h.chainUnder(t, qcow.LayerImage(root, layerID)) {
 		got = append(got, qcow.LayerIDOfImage(path))
 	}
 	if !slices.Equal(got, want) {
@@ -627,7 +627,7 @@ func TestTheChainIsRepointedAtTheRootOnceTheGuestLetsGo(t *testing.T) {
 		t.Fatalf("the cycle after the guest stopped: %v", err)
 	}
 
-	if got := h.chainUnder(t, qcow.LayerImage(root, vol, layerID)); len(got) != 2 || got[1] != qcow.LayerImage(root, vol, root0.LayerID) {
+	if got := h.chainUnder(t, qcow.LayerImage(root, layerID)); len(got) != 2 || got[1] != qcow.LayerImage(root, root0.LayerID) {
 		t.Errorf("the guest's chain is %v; it should be the tip over the compacted root alone", got)
 	}
 	st := h.state(t)
@@ -638,11 +638,18 @@ func TestTheChainIsRepointedAtTheRootOnceTheGuestLetsGo(t *testing.T) {
 	if !slices.Equal(st.Commits, want) {
 		t.Errorf("this host records commits %v; the prefix has been replaced by %v", st.Commits, want)
 	}
-	// The layers the root replaced are still there. A guest that was reading through them a
-	// moment ago is not something a transformation gets to delete.
+	// And the disk comes back. The layers the root replaced are gone, which is the whole
+	// reason to collapse a chain: until the record stopped naming them a collapse cost a
+	// volume's worth of disk and freed none of it.
+	//
+	// Nothing here deletes them, and that ordering is the safety. The repoint happens
+	// first and is checked — the root's immediate child must be the layer that was
+	// repointed onto it, or the whole collapse is refused — and only then does the record
+	// stop naming the prefix. The sweep is what acts on that, on the one rule it acts on
+	// everything: no volume on this host names the file.
 	for _, layer := range []string{oldestLayer, middleLayer, newestLayer} {
-		if there, err := h.paths.Exists(qcow.LayerImage(root, vol, layer)); err != nil || !there {
-			t.Errorf("layer %s was deleted by a compaction (%v)", layer, err)
+		if there, err := h.paths.Exists(qcow.LayerImage(root, layer)); err != nil || there {
+			t.Errorf("layer %s survived the collapse that replaced it (%v)", layer, err)
 		}
 	}
 	// And nothing under the tip reads as a layer this host owes the object store: a prefix
@@ -670,10 +677,10 @@ func TestACollapseKeepsTheCommitsThatLandedWhileItWaited(t *testing.T) {
 	// The guest rotates: the old tip is sealed under a new one, and the next cycle
 	// publishes it as an ordinary commit while the collapse is still waiting.
 	const nextTip = "0198c0de-0000-7000-8000-0000000f2058"
-	h.q.write(qcow.LayerImage(root, vol, nextTip), image{
-		Backing: qcow.LayerImage(root, vol, layerID), Size: size, Data: map[string]int{"4": 0xE4},
+	h.q.write(qcow.LayerImage(root, nextTip), image{
+		Backing: qcow.LayerImage(root, layerID), Size: size, Data: map[string]int{"4": 0xE4},
 	})
-	if err := qcow.SyncPointer(h.paths, root, vol, qcow.LayerImage(root, vol, nextTip)); err != nil {
+	if err := qcow.SyncPointer(h.paths, root, vol, qcow.LayerImage(root, nextTip)); err != nil {
 		t.Fatal(err)
 	}
 	st := h.state(t)
@@ -681,8 +688,8 @@ func TestACollapseKeepsTheCommitsThatLandedWhileItWaited(t *testing.T) {
 	if err := qcow.WriteState(h.paths, root, vol, st); err != nil {
 		t.Fatal(err)
 	}
-	h.q.locked = qcow.LayerImage(root, vol, nextTip)
-	h.dialer.scripts = map[string][]string{qcow.QMPSocket(root, vol): attachedTo(qcow.LayerImage(root, vol, nextTip))}
+	h.q.locked = qcow.LayerImage(root, nextTip)
+	h.dialer.scripts = map[string][]string{qcow.QMPSocket(root, vol): attachedTo(qcow.LayerImage(root, nextTip))}
 	if err := h.cycle(t); err != nil {
 		t.Fatalf("the cycle that publishes the rotated layer: %v", err)
 	}
@@ -712,15 +719,15 @@ func TestACollapseKeepsTheCommitsThatLandedWhileItWaited(t *testing.T) {
 	// leaves a record that reads exactly like this one and a disk with everything in
 	// between unhooked. So the chain is walked and the guest's disk read back.
 	wantChain := []string{
-		qcow.LayerImage(root, vol, nextTip),
-		qcow.LayerImage(root, vol, layerID),
-		qcow.LayerImage(root, vol, root0.LayerID),
+		qcow.LayerImage(root, nextTip),
+		qcow.LayerImage(root, layerID),
+		qcow.LayerImage(root, root0.LayerID),
 	}
-	if got := h.chainUnder(t, qcow.LayerImage(root, vol, nextTip)); !slices.Equal(got, wantChain) {
+	if got := h.chainUnder(t, qcow.LayerImage(root, nextTip)); !slices.Equal(got, wantChain) {
 		t.Errorf("the guest's chain is %v, want %v: the layer published while the collapse waited belongs between the tip and the root", got, wantChain)
 	}
 	wantBytes := map[int]byte{0: 0xA0, 1: 0xB1, 2: 0xC2, 3: 0xD3, 4: 0xE4}
-	if got := readBack(t, h.paths, qcow.LayerImage(root, vol, nextTip)); !maps.Equal(got, wantBytes) {
+	if got := readBack(t, h.paths, qcow.LayerImage(root, nextTip)); !maps.Equal(got, wantBytes) {
 		t.Errorf("the guest's disk reads back as %v, want %v", got, wantBytes)
 	}
 }
@@ -749,10 +756,10 @@ func TestASecondCollapseRunsOnceTheChainReadsThroughTheFirstRoot(t *testing.T) {
 	// the sealed layer becomes an ordinary commit. That is the chain the second collapse
 	// has to be able to read.
 	const nextTip = "0198c0de-0000-7000-8000-0000000f2058"
-	h.q.write(qcow.LayerImage(root, vol, nextTip), image{
-		Backing: qcow.LayerImage(root, vol, layerID), Size: size, Data: map[string]int{"4": 0xE4},
+	h.q.write(qcow.LayerImage(root, nextTip), image{
+		Backing: qcow.LayerImage(root, layerID), Size: size, Data: map[string]int{"4": 0xE4},
 	})
-	if err := qcow.SyncPointer(h.paths, root, vol, qcow.LayerImage(root, vol, nextTip)); err != nil {
+	if err := qcow.SyncPointer(h.paths, root, vol, qcow.LayerImage(root, nextTip)); err != nil {
 		t.Fatal(err)
 	}
 	st := h.state(t)
@@ -764,9 +771,9 @@ func TestASecondCollapseRunsOnceTheChainReadsThroughTheFirstRoot(t *testing.T) {
 	// The guest is back, on the new tip, and the cycle publishes the layer it sealed
 	// (v6 §11 keeps one layer in flight, so this is a cycle of its own).
 	h2 := newHost(t, qcow.CompactionPolicy{AtLayers: 2}, h.paths, h.q, map[string][]string{
-		qcow.QMPSocket(root, vol): attachedTo(qcow.LayerImage(root, vol, nextTip)),
+		qcow.QMPSocket(root, vol): attachedTo(qcow.LayerImage(root, nextTip)),
 	})
-	h2.q.locked = qcow.LayerImage(root, vol, nextTip)
+	h2.q.locked = qcow.LayerImage(root, nextTip)
 	h2.pub.published = h.pub.published
 	if err := h2.cycle(t); err != nil {
 		t.Fatalf("the cycle that publishes the rotated layer: %v", err)
@@ -789,14 +796,14 @@ func TestASecondCollapseRunsOnceTheChainReadsThroughTheFirstRoot(t *testing.T) {
 		t.Errorf("the second root replaces %s, which is not the newest commit of the history", second.ReplacesCommitID)
 	}
 	// The guest's chain: the tip over the second root, and nothing else.
-	got := h2.chainUnder(t, qcow.LayerImage(root, vol, nextTip))
-	if len(got) != 2 || got[1] != qcow.LayerImage(root, vol, second.LayerID) {
+	got := h2.chainUnder(t, qcow.LayerImage(root, nextTip))
+	if len(got) != 2 || got[1] != qcow.LayerImage(root, second.LayerID) {
 		t.Errorf("the chain under the tip is %v; it should be the tip over the second root alone", got)
 	}
 	// And what it reconstructs is still every write, including the one made after the
 	// first collapse.
 	want := map[int]byte{0: 0xA0, 1: 0xB1, 2: 0xC2, 3: 0xD3, 4: 0xE4}
-	if bytes := readBack(t, h2.paths, qcow.LayerImage(root, vol, nextTip)); !maps.Equal(bytes, want) {
+	if bytes := readBack(t, h2.paths, qcow.LayerImage(root, nextTip)); !maps.Equal(bytes, want) {
 		t.Errorf("the guest's disk reads back as %v, want %v", bytes, want)
 	}
 }
@@ -874,7 +881,7 @@ func TestACrashBetweenTheCASAndTheRecordDoesNotRefuseTheVolume(t *testing.T) {
 	// The process comes back, and the object store says HEAD is the root it published —
 	// which is in no list this host holds, because the record of it never landed.
 	h2 := newHost(t, qcow.CompactionPolicy{AtLayers: 4}, h.paths, h.q, map[string][]string{
-		qcow.QMPSocket(root, vol): attachedTo(qcow.LayerImage(root, vol, layerID)),
+		qcow.QMPSocket(root, vol): attachedTo(qcow.LayerImage(root, layerID)),
 	})
 	h2.rec.head = began.CommitID
 	st := h.state(t)
@@ -938,7 +945,7 @@ func TestACollapseIsAbandonedWhenTheHistoryMovesUnderIt(t *testing.T) {
 	// published by this host between one cycle and the next.
 	const laterLayer = "0198c0de-0000-7000-8000-000000000a44"
 	const laterCommit = "0198c0de-0000-7000-8000-0000000c0044"
-	h.paths.put(qcow.LayerImage(root, vol, laterLayer), []byte(`{"size":268435456,"data":{}}`), 1<<20)
+	h.paths.put(qcow.LayerImage(root, laterLayer), []byte(`{"size":268435456,"data":{}}`), 1<<20)
 	st := h.state(t)
 	st.Commits = append(st.Commits, qcow.CommitLayer{CommitID: laterCommit, LayerID: laterLayer})
 	if err := qcow.WriteState(h.paths, root, vol, st); err != nil {
@@ -974,7 +981,7 @@ func TestAConvertThatDidNotFinishPublishesNothing(t *testing.T) {
 		t.Fatalf("a convert that was killed published %+v", h.pub.published)
 	}
 	// The name the root would have had is not on the disk: only the temporary one is.
-	final := qcow.LayerImage(root, vol, h.state(t).Compacting.LayerID)
+	final := qcow.LayerImage(root, h.state(t).Compacting.LayerID)
 	there, err := h.paths.Exists(final)
 	if err != nil {
 		t.Fatal(err)
@@ -992,7 +999,7 @@ func TestAConvertThatDidNotFinishPublishesNothing(t *testing.T) {
 // returned SUCCESS and reconstructs a hole.
 func TestARootThatIsNotARootIsNotPublished(t *testing.T) {
 	h := deepChain(t, qcow.CompactionPolicy{AtLayers: 4}, true)
-	h.q.backRoot = qcow.LayerImage(root, vol, oldestLayer)
+	h.q.backRoot = qcow.LayerImage(root, oldestLayer)
 
 	err := h.cycle(t)
 	if err == nil || !strings.Contains(err.Error(), "not a root") {
@@ -1002,7 +1009,7 @@ func TestARootThatIsNotARootIsNotPublished(t *testing.T) {
 		t.Fatalf("an image that is not a root was published: %+v", h.pub.published)
 	}
 	// Removed rather than left: the next cycle must convert again, not adopt this.
-	tmp := qcow.LayerImage(root, vol, h.state(t).Compacting.LayerID) + ".compacting"
+	tmp := qcow.LayerImage(root, h.state(t).Compacting.LayerID) + ".compacting"
 	if there, err := h.paths.Exists(tmp); err != nil || there {
 		t.Errorf("the refused image is still at the temporary name (%v), so a retry would find it", err)
 	}
@@ -1017,7 +1024,7 @@ func TestACollapseSetThatIsNotTheChainIsRefused(t *testing.T) {
 	h := deepChain(t, qcow.CompactionPolicy{AtLayers: 4}, true)
 	// A commit whose layer is not in the chain under the tip: the shape a fork leaves.
 	const strayLayer = "0198c0de-0000-7000-8000-000000000aff"
-	h.paths.put(qcow.LayerImage(root, vol, strayLayer), []byte(`{"size":268435456,"data":{}}`), 1<<20)
+	h.paths.put(qcow.LayerImage(root, strayLayer), []byte(`{"size":268435456,"data":{}}`), 1<<20)
 	st := h.state(t)
 	st.Commits = append([]qcow.CommitLayer{{CommitID: "0198c0de-0000-7000-8000-0000000c00ff", LayerID: strayLayer}}, st.Commits...)
 	if err := qcow.WriteState(h.paths, root, vol, st); err != nil {
@@ -1063,7 +1070,7 @@ func TestACompactionWaitsForTheLayerThisHostStillOwes(t *testing.T) {
 	// A layer sealed under the tip and not published: what a rotation whose publish has
 	// not run yet leaves. It is discovered by the reconciliation, which owes it.
 	const sealed = "0198c0de-0000-7000-8000-000000000a44"
-	h.paths.put(qcow.LayerImage(root, vol, sealed), []byte(`{"size":268435456,"data":{}}`), 1<<20)
+	h.paths.put(qcow.LayerImage(root, sealed), []byte(`{"size":268435456,"data":{}}`), 1<<20)
 	st := h.state(t)
 	st.Layers = []string{layerID, sealed, newestLayer}
 	if err := qcow.WriteState(h.paths, root, vol, st); err != nil {
@@ -1170,7 +1177,7 @@ func TestADueChainWithNothingToCollapseIsSilent(t *testing.T) {
 // arithmetic, which is a convert over a set nobody could measure.
 func TestAPlanThatCannotBeMeasuredIsNotActedOn(t *testing.T) {
 	h := deepChain(t, qcow.CompactionPolicy{AtLayers: 4}, true)
-	h.paths.remove(qcow.LayerImage(root, vol, middleLayer))
+	h.paths.remove(qcow.LayerImage(root, middleLayer))
 
 	err := h.cycle(t)
 	if err == nil || !strings.Contains(err.Error(), middleLayer) {
@@ -1200,7 +1207,7 @@ func logLine(out *bytes.Buffer, needle string) string {
 func TestWhatACompactionReports(t *testing.T) {
 	h := deepChain(t, qcow.CompactionPolicy{AtLayers: 4}, true)
 	const orphanBytes = 7 << 20
-	h.paths.put(qcow.LayerImage(root, vol, "0198c0de-0000-7000-8000-0000000000ff"), []byte(`{"size":1,"data":{}}`), orphanBytes)
+	h.paths.put(qcow.LayerImage(root, "0198c0de-0000-7000-8000-0000000000ff"), []byte(`{"size":1,"data":{}}`), orphanBytes)
 
 	if err := h.cycle(t); err != nil {
 		t.Fatalf("applying: %v", err)
