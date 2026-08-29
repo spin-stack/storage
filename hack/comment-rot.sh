@@ -191,8 +191,8 @@ awk -v terms="$work/terms" "$MATCHES"'
 	# ---- per-file state ----
 	# The flush happens before `fname` moves: a file whose last line is a comment leaves a
 	# buffered block, and reporting it under the *next* file’s name is a finding pointing
-	# at a line that says something else — which is how internal/lifecycle.go’s trailing
-	# note was first reported against internal/lineage/delete.go.
+	# at a line that says something else — which is how internal/lifecycle/lifecycle.go’s
+	# trailing note was first reported against the file that followed it.
 	FNR == 1 {
 		flushblock("")
 		fname = FILENAME

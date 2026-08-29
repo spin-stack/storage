@@ -27,7 +27,7 @@ linters:
         - pattern: '^time\.(Now|Since|Sleep|After|Tick|Until|NewTimer|NewTicker)$'
           msg: "§25.1/INV-01: use internal/simio/clock, not the time package directly"
         - pattern: '^net\.(Dial|DialTimeout|DialTCP|DialUDP|DialIP|DialUnix|Listen|ListenTCP|ListenUDP|ListenUnix|ListenPacket)$'
-          msg: "§25.1/INV-01: use internal/simio/net, not the net package directly"
+          msg: "§25.1/INV-01: use internal/simio/network, not the net package directly"
         - pattern: '^os\.(Open|Create|OpenFile|ReadFile|WriteFile|Remove|RemoveAll|Mkdir|MkdirAll|Rename|Truncate)$'
           msg: "§25.1/INV-01: use internal/simio/disk, not the os package directly"
         - pattern: '^uuid\.(New|NewString|NewRandom)$'

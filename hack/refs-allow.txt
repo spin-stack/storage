@@ -1,0 +1,57 @@
+# References this tree makes on purpose to something that is not here.
+#
+# Read hack/refs.sh first. A reference that resolves needs no entry; one that does not is
+# either a sentence to fix or a deliberate mention, and there are exactly two kinds of
+# deliberate mention:
+#
+#   - naming a mechanism **to say it is gone**, which is what the withdrawn-mechanism
+#     vocabulary is made of and what a planted-bug history is made of. The sentence is
+#     true precisely because the thing is absent;
+#   - naming something in **another repository**, which this one cannot resolve and should
+#     not try to.
+#
+# The ratchet turns both ways (hack/refs.sh enforces it): a reference in neither place
+# fails the gate, and a line here that matches nothing fails it too — so an entry cannot
+# outlive the sentence it excuses. Format: `<file><TAB><reference>  # why`.
+
+# --- the withdrawn-mechanism vocabulary, whose whole job is to name what is gone --------
+hack/comment-rot.sh	internal/wal  # the `wal` term's evidence: "There is no internal/wal package and nothing appends records anywhere"
+hack/comment-rot.sh	internal/checkpoint  # the `checkpoint` term's: "internal/checkpoint, 215 lines, deleted with the remote chain"
+hack/comment-rot.sh	internal/gc  # the `gc` term's: "internal/gc, 381 lines, deleted"
+hack/comment-rot.sh	internal/blockdev  # named in the rejected-terms list to say the *package* is the mechanism and `-blockdev` the live flag
+hack/comment-rot.sh	image.Publish  # the `upload` term's counter-example: the verb that outlived the package
+
+# --- the planted-bug history, which is a record of what was deleted and when ------------
+internal/dst/mandatory_set_test.go	internal/wal  # the scenario set's history: which subjects went with the block engine
+internal/dst/mandatory_set_test.go	internal/blockdev  # same
+internal/dst/mandatory_set_test.go	internal/image  # same
+internal/dst/dst_test.go	internal/gc  # a checker's subject that was deleted, named so the count's movement can be read
+internal/dst/planted_bug_test.go	internal/gc  # same: the registry of claims records which packages its bugs were planted in
+internal/controlplane/provision_test.go	blockdev.New  # names the constructor that used to refuse a non-sector capacity, to say the refusal moved here
+
+# --- the vhost transport, deleted 2026-08-09 -------------------------------------------
+hack/deadcode-allow.txt	internal/vhost/hostio  # explains why simio/network has no production consumer: vhost had its own transport, and it is gone
+hack/analyzers/simulable/simulable.go	internal/vhost/hostio  # the same fact, in the analyzer's exemption reasoning
+hack/analyzers/simulable/simulable.go	internal/testinfradriver  # deliberately hypothetical: the path that would break a prefix match, named to show why the rule is exact
+docs/plan/DECISIONS/ADR-0026-v1-accepts-session-rpo.md	internal/wal  # an ADR records the decision as it was taken; the package it names is what the decision was about
+
+# --- other repositories -----------------------------------------------------------------
+internal/qcow/chain.go	cmd/runner  # spin's runner, which launches the VMs (ADR-0021). Not ours to resolve.
+docs/plan/DECISIONS/ADR-0021-integration-with-spin.md	cmd/cli  # spin's operator CLI, the reason storage ships no volctl
+
+# --- a regex that reads as a path --------------------------------------------------------
+.golangci.yml	integration/backend/edgecases_test  # `integration/backend/edgecases_test\.go` — an escaped dot the scanner stops at
+
+# --- this checker's own worked examples --------------------------------------------------
+# Every one names something that is genuinely gone, which is the point: the specification of
+# what this looks for is written in the findings it was built from, and those are the six it
+# found on the day it landed.
+hack/refs.sh	internal/wal  # "deadcode-allow.txt citing internal/wal" — one of the six
+hack/refs.sh	internal/vhost  # "metadata.go arguing that V1 has no resize because internal/vhost does not offer a protocol feature"
+hack/refs.sh	internal/checkpoint  # the vocabulary's reason column, quoted as the legitimate case
+hack/refs.sh	wal.StrictOrder  # "this repository's own comment-rot.sh citing wal.StrictOrder"
+hack/refs.sh	ADR-0010  # "CLAUDE.md and two ADRs citing ADR-0010 and ADR-0014"
+hack/refs.sh	ADR-0014  # same sentence
+hack/refs.sh	cmd/buf  # the module-path example: `github.com/bufbuild/buf/cmd/buf` is not a cmd/buf of ours
+hack/refs.sh	internal/pkg  # the placeholder in the rule's own description
+hack/refs.sh	pkg.Symbol  # the same placeholder, in the symbol rule

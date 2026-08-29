@@ -922,10 +922,10 @@ type GetVolumeKeysResponse struct {
 	// dek_wrapped because a wrapped key and another key's version describe a volume
 	// nothing can open.
 	//
-	// It is never 0. On the WAL path 0 means "plaintext record" (§14.1), so
-	// wal.NewEncryption refuses it and volumes.dek_key_id carries a CHECK that keeps
-	// it out of the catalog. A host that receives 0 here has been handed a volume it
-	// must decline rather than serve in the clear.
+	// It is never 0. A key with no version is one rotation cannot work with, so
+	// crypto.NewEncryption refuses it at the binding and volumes.dek_key_id carries a CHECK
+	// that keeps it out of the catalog. A host that receives 0 here has been handed a volume
+	// it must decline rather than serve.
 	DekKeyId      uint32 `protobuf:"varint,4,opt,name=dek_key_id,json=dekKeyId,proto3" json:"dek_key_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

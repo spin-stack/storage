@@ -92,9 +92,9 @@ CREATE TABLE volumes (
     -- ('remote' | 'local') lost its remote half to ADR-0026, and nothing ever branched on
     -- what was left; a column still saying 'remote' would claim a durability the data path
     -- no longer provides.
-    -- The logical block size reported to the guest. It is carried to the Agent in the
-    -- desired state and lands in the virtio-blk config as blk_size
-    -- (vhost.Config.BlockSize, set by VolumeManager.supervise);
+    -- The logical block size a guest addresses the volume in. Nothing carries it to a host:
+    -- QEMU owns the device under v6 and this system does not launch it (ADR-0021), so the
+    -- number lives here and in descriptor.json for whoever does.
     -- controlplane.VolumeSpec.validate refuses one that is not a multiple of the
     -- 512-byte sector, and control-plane -seed-block-size defaults it to 4096.
     --
@@ -135,9 +135,9 @@ CREATE TABLE volumes (
     -- sealed it — and the Agent can only say that if the catalog remembers it.
     --
     -- BIGINT because the format field is uint32 and Postgres INTEGER is signed 32-bit.
-    -- The lower bound is not a sanity check: KeyID 0 means "plaintext record" on the
-    -- WAL path, so a row carrying 0 would hand the Agent a version it must refuse
-    -- (wal.ErrUnversionedKey) at attach, with the DEK already unwrapped. Refusing it
+    -- The lower bound is not a sanity check: a key with no version is one rotation cannot
+    -- work with, so a row carrying 0 would hand the Agent a key it must refuse
+    -- (crypto.ErrUnversionedKey) at the binding, with the DEK already unwrapped. Refusing it
     -- at the write is refusing it where it can still be corrected.
     dek_key_id         BIGINT NOT NULL
                          CHECK (dek_key_id > 0 AND dek_key_id <= 4294967295),
@@ -315,9 +315,8 @@ CREATE INDEX snapshots_source_host_id_idx ON snapshots (source_host_id);
 -- destination — went with the operations table, and changes no number this view ever
 -- produced (nothing outside a test wrote an operations row). What it removes is headroom
 -- for a move spanning two hosts, and V1 performs none. The one move a V1 catalog can
--- make, detach-then-attach, carries no CapacityBound at all — an open gap recorded
--- against D6 in docs/plan/tracks/TRACK-D.md, which a reservation term would not have
--- closed. The sum is a correlated subquery rather than an aggregate over a join, so a
+-- make, detach-then-attach, carries no CapacityBound at all — an open gap that a
+-- reservation term would not have closed either. The sum is a correlated subquery rather than an aggregate over a join, so a
 -- reader asking about one host is charged for one host (TestPGCommittedBytesViewDoesNotDeriveTheWholeFleet).
 CREATE VIEW host_committed_bytes AS
 SELECT h.host_id,

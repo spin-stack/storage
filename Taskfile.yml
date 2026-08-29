@@ -840,6 +840,15 @@ tasks:
     cmds:
       - bash hack/comment-rot.sh
 
+  refs:
+    desc: >-
+      Fail on prose that points at something that is not there — a repository path, an ADR
+      id, or a symbol of a package this tree deleted — unless hack/refs-allow.txt says
+      naming it is the point. It needs no vocabulary: what is gone is derived from what
+      does not resolve. In `ci`.
+    cmds:
+      - bash hack/refs.sh
+
   lint:
     desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).
     cmds:
@@ -915,6 +924,7 @@ tasks:
       # The same rule pointed at the comments that replaced the deleted Markdown. One `go
       # list`, one awk pass.
       - task: comment:rot
+      - task: refs
       # Beside it, and the same kind of claim: a rule CLAUDE.md states as part of "done"
       # that nothing computed. One `wc`.
       - task: status:cap

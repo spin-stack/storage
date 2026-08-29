@@ -479,7 +479,7 @@ type Store interface {
 	// ClearVolumeParent records that a volume descends from nothing any more:
 	// parent_snapshot_id back to NULL and chain_depth back to 0 (term-guarded).
 	//
-	// It is the one write `lineage.Flatten` cannot make and cannot do without. CreateVolume's
+	// It is the one write a flattening cannot make and cannot do without. CreateVolume's
 	// conflict path COALESCEs the column so a converging rebuild can never drop a clone's
 	// link — which also means no write here could say a lineage had ended, while everything
 	// that *counted* lineage kept counting it: `controlplane.Clone`'s ceiling, and a delete of
@@ -518,13 +518,10 @@ type Store interface {
 	// whose opinion is void — and returns nil. ErrNotFound only for a volume not in the
 	// catalog.
 	RecordVolumeReport(ctx context.Context, term int64, r VolumeReport) error
-	// There is no ResizeVolume here, and **V1 does not resize a volume**. §3's objective 14
-	// and §9's config-space propagation have no mechanism behind them: blockdev.Device fixes
-	// its capacity at construction; the guest cannot be told at all, because announcing a new
-	// capacity needs VHOST_USER_BACKEND_CONFIG_CHANGE_MSG over the backend request channel
-	// and internal/vhost deliberately does not offer VHOST_USER_PROTOCOL_F_BACKEND_REQ (a
-	// test pins that it is not offered); and descriptor.json carries size_bytes and is
-	// written only at create, so a resized volume disagrees with the object
+	// There is no ResizeVolume here, and **V1 does not resize a volume**. The device is
+	// QEMU's under v6 and this system never speaks to the guest about it, so growing one
+	// would be a conversation nothing here can have. And descriptor.json carries size_bytes
+	// and is written only at create, so a resized volume disagrees with the object
 	// -rebuild-metadata restores it from (INV-20).
 	//
 	// Rejected: keep the correct grow-only method and wait — an uncallable verb reads as a

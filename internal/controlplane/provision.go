@@ -14,9 +14,10 @@ import (
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
-// sectorSize is the unit a guest addresses the device in. A capacity that is not a
-// whole number of them is one blockdev.New refuses, so it is refused here instead —
-// where the operator who typed the number is still watching.
+// sectorSize is the unit a guest addresses the device in. A capacity that is not a whole
+// number of them is one no block device can present, so it is refused here — where the
+// operator who typed the number is still watching — rather than at the attach that would
+// have to explain it to a guest.
 const sectorSize = 512
 
 // VolumeSpec is what an operator asks for.
