@@ -103,6 +103,11 @@ func (p simPaths) List(dir string) ([]string, error) {
 	return out, nil
 }
 
+// Rename is one name replacing another, which the simulated disk gives atomically.
+func (p simPaths) Rename(oldPath, newPath string) error {
+	return p.disk.Rename(oldPath, newPath)
+}
+
 func (p simPaths) Remove(path string) error {
 	if err := p.disk.Remove(path); err != nil && !errors.Is(err, disk.ErrNotExist) {
 		return err

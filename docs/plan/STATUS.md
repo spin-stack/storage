@@ -85,8 +85,9 @@ system has no equivalent of vSphere's datastore lock.
   guest's writes.
 - **A restart between sealing and publishing duplicates a commit id** — the layer is
   derived from the chain and never lost; only the id is.
-- **Compaction is planned and never performed.** A chain past its threshold is reported;
-  turning the plan into the act needs a human — it publishes a new immutable root.
+- **A collapse waits for the guest to detach.** The rebase onto the new root needs the
+  files, and QEMU holds every one of a live chain, so the last step is owed until the
+  volume reads as unattached. Until then the chain does not shrink and one line says so.
 - **Nothing reclaims local disk.** Released volumes keep their layers, published layers
   keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
   never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.

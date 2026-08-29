@@ -54,9 +54,16 @@ func (p *statePaths) WriteAtomic(path string, data []byte) error {
 	return nil
 }
 
-// List and Remove are here because qcow.Paths carries them for the sweep. Nothing in
-// this file names a directory, so listing one is empty and removing a file is a delete.
+// List, Rename and Remove are here because qcow.Paths carries them for the sweep and for a
+// compaction. Nothing in this file names a directory, so listing one is empty, renaming
+// moves the bytes and removing a file is a delete.
 func (*statePaths) List(string) ([]string, error) { return nil, nil }
+
+func (p *statePaths) Rename(oldPath, newPath string) error {
+	p.files[newPath] = p.files[oldPath]
+	delete(p.files, oldPath)
+	return nil
+}
 
 func (p *statePaths) Remove(path string) error {
 	delete(p.files, path)
@@ -285,6 +292,19 @@ func genState(rt *rapid.T, volumeID string) qcow.State {
 	if ln == 0 {
 		layers = nil
 	}
+	// The record of a collapse in flight. It is what a restart reads to decide whether it
+	// is finishing a root or starting one, so losing it in the round trip is a second root
+	// published for the same prefix — or a chain that is never repointed at the first.
+	var compacting *qcow.CompactedRoot
+	if rapid.Bool().Draw(rt, "has_compacting") {
+		compacting = &qcow.CompactedRoot{
+			CommitID:         stateID(rt, "compacting_commit_ms"),
+			LayerID:          stateID(rt, "compacting_layer_ms"),
+			ReplacesCommitID: stateID(rt, "compacting_replaces_ms"),
+			RebaseLayerID:    stateID(rt, "compacting_rebase_ms"),
+			Published:        rapid.Bool().Draw(rt, "compacting_published"),
+		}
+	}
 	var fenced *qcow.Fencing
 	if rapid.Bool().Draw(rt, "has_fence") {
 		fenced = &qcow.Fencing{
@@ -302,6 +322,7 @@ func genState(rt *rapid.T, volumeID string) qcow.State {
 		LastCommitAt:  lastCommitAt,
 		Pending:       pending,
 		Layers:        layers,
+		Compacting:    compacting,
 		Fenced:        fenced,
 	}
 }

@@ -176,6 +176,29 @@ func (p *fakePaths) List(dir string) ([]string, error) {
 	return names, nil
 }
 
+// Rename moves the name and everything this fake knows about the file: its presence, its
+// contents and its size. A rename that moved only the name would leave a test asserting on
+// the bytes of a compacted root reading the ones the convert wrote under the temporary
+// name, which is the one thing the rename exists to make impossible to confuse.
+func (p *fakePaths) Rename(oldPath, newPath string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.present[oldPath] {
+		return fmt.Errorf("rename %s: %w", oldPath, fs.ErrNotExist)
+	}
+	p.present[newPath] = true
+	delete(p.present, oldPath)
+	if body, ok := p.files[oldPath]; ok {
+		p.files[newPath] = body
+		delete(p.files, oldPath)
+	}
+	if size, ok := p.sizes[oldPath]; ok {
+		p.sizes[newPath] = size
+		delete(p.sizes, oldPath)
+	}
+	return nil
+}
+
 func (p *fakePaths) Remove(path string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

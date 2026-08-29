@@ -69,8 +69,9 @@ func (h *harness) layers(t *testing.T) []string {
 // under it, so a published layer's file is still load-bearing and publishing it is not a
 // licence to delete it. Beside the chain are the files a crash and another host's clock
 // leave: an overlay above the tip that an interrupted rotation created and the guest
-// never moved to, a half-finished download, a layer no record names, and a downloaded
-// layer whose id is later than the tip's. Exactly one of the seven may go.
+// never moved to, a half-finished download, a layer no record names, a downloaded layer
+// whose id is later than the tip's, and the half-written image of a compaction that was
+// killed. Exactly two of the eight may go.
 func TestTheSweepRemovesOnlyWhatNoChainReadsThrough(t *testing.T) {
 	t.Parallel()
 	pub := &recordingPublisher{}
@@ -97,11 +98,16 @@ func TestTheSweepRemovesOnlyWhatNoChainReadsThrough(t *testing.T) {
 	stray := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(l1), -1))
 	// A download that did not finish. It is not a layer and the sweep does not touch it.
 	part := orphan + ".part"
+	// A compaction's flattened root that `qemu-img convert` was killed in the middle of. It
+	// is a whole volume's worth of disk that nothing will ever name — a collapse that is
+	// planned again converts under a new id — so it is the one non-layer file this sweep
+	// does take.
+	unfinished := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(tip), 2)) + ".compacting"
 	// A layer this host downloaded from a commit another host published while its clock
 	// ran ahead of this one's. Its id is later than the tip's and it is the base the
 	// whole chain reads through, so the record is the only thing that can vouch for it.
 	skewed := qcow.LayerImage(root, vol, shift(t, qcow.LayerIDOfImage(tip), 3_600_000))
-	for _, path := range []string{orphan, stray, part, skewed} {
+	for _, path := range []string{orphan, stray, part, skewed, unfinished} {
 		h.paths.present[path] = true
 	}
 	st := h.state(t)
@@ -122,6 +128,9 @@ func TestTheSweepRemovesOnlyWhatNoChainReadsThrough(t *testing.T) {
 		if !slices.Contains(got, name) {
 			t.Errorf("%s was swept, and the chain reads through it (or it is not this sweep's to remove); the directory holds %v", name, got)
 		}
+	}
+	if slices.Contains(got, base(unfinished)) {
+		t.Errorf("the half-converted root %s is still on disk; the compaction that was killed will never name it again", unfinished)
 	}
 	if slices.Contains(got, base(orphan)) {
 		t.Errorf("the overlay %s an interrupted rotation left is still on disk; nothing reads through it and nothing ever will", orphan)

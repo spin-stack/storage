@@ -78,6 +78,16 @@ type State struct {
 	// Trimmed at the newest published layer (trimLayers): everything under a published
 	// commit is published, so nothing older is ever a question.
 	Layers []string `json:"layers,omitempty"`
+	// Compacting, when set, is the chain collapse this host has under way (v6 §19). It is
+	// written before anything is converted and cleared only when the local chain reads
+	// through the root it published, which is the last of the collapse's three steps.
+	//
+	// It is durable because each of the three has to survive a crash. Without it a host
+	// that died after the compare-and-set would meet a HEAD it has no memory of, which
+	// reads exactly like a chain another host has moved past, and refuse the volume for
+	// good; and a collapse whose rebase is still owed would be planned again every
+	// heartbeat over a prefix the record no longer describes.
+	Compacting *CompactedRoot `json:"compacting,omitempty"`
 	// Fenced, when set, is this host's own record that it stopped being this volume's
 	// writer while it believed it was one — HEAD moved under it, or its lease lapsed.
 	//
@@ -113,6 +123,29 @@ type Fencing struct {
 	// change how an existing state.json decodes.
 	Refusal int32  `json:"refusal"`
 	Detail  string `json:"detail,omitempty"`
+}
+
+// CompactedRoot is a chain collapse in flight: the commit and layer being published, the
+// commit the flattened bytes reconstruct, and the local layer whose header still has to
+// be repointed at the result.
+//
+// It carries no epoch: the bytes are a re-derivation of what the object store already
+// holds, so a retry states the epoch this host holds now, which is the one it is entitled
+// to publish under.
+type CompactedRoot struct {
+	CommitID string `json:"commit_id"`
+	LayerID  string `json:"layer_id"`
+	// ReplacesCommitID is the newest commit of the collapsed prefix — what the root
+	// reconstructs, and the only HEAD it may ever land on.
+	ReplacesCommitID string `json:"replaces_commit_id"`
+	// RebaseLayerID is the layer directly above the collapsed prefix: the one file whose
+	// backing has to move from the prefix to the root, and the reason a collapse cannot
+	// be finished while a guest has the chain open (v6 §5).
+	RebaseLayerID string `json:"rebase_layer_id"`
+	// Published says the compare-and-set has happened, so HEAD names CommitID. Recorded
+	// rather than re-derived from the bucket: without it every cycle spent waiting for
+	// the guest to detach re-runs a publish to be told it already happened.
+	Published bool `json:"published,omitempty"`
 }
 
 // CommitLayer is one published commit and the local file that belongs to it.

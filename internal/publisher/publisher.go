@@ -75,7 +75,7 @@ func (p *Publisher) Publish(ctx context.Context, l qcow.SealedLayer) error {
 
 	m, err := commit.Publish(ctx, p.store, enc, f, commit.Request{
 		VolumeID: l.VolumeID, CommitID: l.CommitID, LayerID: l.LayerID,
-		Epoch: l.Epoch, VirtualSize: l.VirtualSize,
+		Epoch: l.Epoch, VirtualSize: l.VirtualSize, ReplacesCommitID: l.ReplacesCommitID,
 	}, commit.WithTelemetry(p.clk, p.rec))
 	if err != nil {
 		return err

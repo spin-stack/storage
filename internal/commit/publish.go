@@ -31,6 +31,13 @@ var ErrLayerKeyTaken = errors.New("commit: the layer's key holds an object of a 
 // Commit() reported SUCCESS.
 var ErrSealDrifted = errors.New("commit: the layer sealed differently on the upload pass than on the pass that hashed it")
 
+// ErrRootSuperseded means a compacted root was offered for a HEAD that has moved on. The
+// layer flattens one commit and only that commit, so publishing it over a descendant
+// would drop the commits in between; the collapse is planned again over what the history
+// is now. It is not ErrHeadMoved: nobody else took the volume, so this host is still its
+// writer and fencing it would stop a guest for its own bookkeeping.
+var ErrRootSuperseded = errors.New("commit: the commit this root flattens is not the one HEAD names")
+
 // Request is everything one commit needs that is not the bytes.
 type Request struct {
 	VolumeID string
@@ -49,6 +56,22 @@ type Request struct {
 	VirtualSize int64
 	// FrameBytes is the sealing frame; zero means crypto.LayerFrameBytes.
 	FrameBytes int
+	// ReplacesCommitID, when set, publishes this commit as a root: the layer is a whole
+	// image of the volume rather than a delta, so the manifest carries no parent and a
+	// recovery stops here instead of walking and downloading the history it flattens.
+	// That is what a chain collapse produces (v6 §19).
+	//
+	// It names the commit the flattened layer reconstructs, and HEAD has to still be that
+	// commit or nothing is published. The check is here and not only in the caller
+	// because of what it rules out: HEAD moves to a commit that is *not* a child of the
+	// one it replaces, so a root landing on a HEAD that has moved on drops every commit
+	// in between out of the history — each of which returned SUCCESS.
+	//
+	// Nothing else about the protocol changes: HEAD is still read first, the epoch of the
+	// commit being replaced is still the fence this must clear, and the CAS is still
+	// against the etag that read produced. A root is not a licence to overwrite a
+	// history; it is a commit like any other that happens to carry the whole volume.
+	ReplacesCommitID string
 }
 
 // Option carries what Publish measures itself with. It is optional because most callers
@@ -115,15 +138,30 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 	//
 	// The wider window for another writer to move HEAD is not a cost: a CAS that fails is
 	// precisely the signal wanted.
-	parent, etag := "", ""
+	// `replaces` is the commit HEAD names and `parent` is what the manifest will claim.
+	// They are the same thing for every commit but a root, which carries no parent and
+	// still has to clear the epoch of the commit it moves HEAD off: drop both and a host
+	// that was fenced could publish a root over the history it was fenced out of.
+	parent, replaces, etag := "", "", ""
 	current, currentETag, err := ReadHead(ctx, store, req.VolumeID)
 	switch {
 	case err == nil && current.CommitID == req.CommitID:
 		// Already published, by an attempt whose answer never came back. The manifest in
 		// the bucket is the truth about it; nothing is uploaded and nothing is moved.
 		return ReadManifest(ctx, store, req.VolumeID, req.CommitID)
+	case err == nil && req.ReplacesCommitID != "" && current.CommitID != req.ReplacesCommitID:
+		return Manifest{}, fmt.Errorf("%w: it flattens %s and HEAD is at %s",
+			ErrRootSuperseded, req.ReplacesCommitID, current.CommitID)
 	case err == nil:
-		parent, etag = current.CommitID, currentETag
+		replaces, etag = current.CommitID, currentETag
+		if req.ReplacesCommitID == "" {
+			parent = replaces
+		}
+	case errors.Is(err, ErrNoHead) && req.ReplacesCommitID != "":
+		// A root replaces a commit, and there is none. Whatever this host is holding, the
+		// history it was flattening is not in this bucket.
+		return Manifest{}, fmt.Errorf("%w: it flattens %s and the volume has no HEAD",
+			ErrRootSuperseded, req.ReplacesCommitID)
 	case errors.Is(err, ErrNoHead):
 		// The volume's first commit. HEAD is written create-only, which is what stops
 		// two hosts that both read "no HEAD" from both winning.
@@ -152,10 +190,10 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 	// for a fenced Agent that read it a moment ago — so the parent's manifest is read and
 	// its epoch compared. One GET per commit against a host appending a divergent chain onto
 	// the volume it was fenced out of.
-	if parent != "" {
-		prev, err := ReadManifest(ctx, store, req.VolumeID, parent)
+	if replaces != "" {
+		prev, err := ReadManifest(ctx, store, req.VolumeID, replaces)
 		if err != nil {
-			return Manifest{}, fmt.Errorf("commit: reading the parent of %s: %w", req.CommitID, err)
+			return Manifest{}, fmt.Errorf("commit: reading the commit %s is published onto: %w", req.CommitID, err)
 		}
 		if prev.Epoch > req.Epoch {
 			return Manifest{}, fmt.Errorf("%w: this host holds epoch %d and the commit it would build on was written at %d",

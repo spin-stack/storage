@@ -61,13 +61,17 @@ internal/agent/loop.go:Loop.giveUpWhatIsNoLongerOurs:lease-valid # "not 'the lea
 internal/metadata/metadata.go:Store.Now:lease-valid          # about the Control Plane granting an epoch "while the old writer's monotonic lease is still valid" — mutual exclusion, the one part of fencing V1 keeps
 
 # --- naming a withdrawn mechanism to say it is gone, and two forward references --------
-internal/qcow/chain.go:overlay:compaction              # "§19 already owns flattening, as compaction, outside the recovery path" — compaction is v6 §23.7 and is ahead of this tree, not behind it. The comment is why a recovery does NOT flatten.
-internal/recovery/recovery.go:maxRestoreDepth:compaction # the depth ceiling exists because nothing compacts yet; the mention is the reason for the number, and it goes when §23.7 lands.
-internal/controlplane/clone.go:MaxChainDepth:compaction # the ceiling's cost is per commit of the ancestor, so the sentence says what *would* bound a chain's growth and that nothing implements it yet — the same forward reference as recovery.go's maxRestoreDepth.
-internal/controlplane/clone.go:Clone:compaction        # two constraints on the compaction §19 asks for, both saying it does not exist yet: what it must leave true about a clone's depth, and that it must mint a fresh DEK or break crypto-shred.
-internal/qcow/compact.go:CompactionPolicy.AtLayers:compaction   # §21's chain compaction, which this file plans and does not perform. The withdrawn "compaction" the checker knows is v5's objectization of WAL extents, a different subject that shares a word.
+internal/qcow/chain.go:overlay:compaction              # "§19 already owns flattening, as compaction, outside the recovery path" — §21's chain compaction, which internal/qcow/compact.go performs. The comment is why a recovery does NOT flatten.
+internal/recovery/recovery.go:maxRestoreDepth:compaction # the ceiling's reason: §21's compaction is what keeps a chain an order of magnitude below it.
+internal/controlplane/clone.go:MaxChainDepth:compaction # the ceiling's cost is per commit of the ancestor, and §21's compaction is what bounds an ancestor's growth — the same subject, on the Control Plane's side.
+internal/controlplane/clone.go:Clone:compaction        # two constraints on §19's compaction: what it must leave true about a clone's depth, and that a clone mints a fresh DEK or breaks crypto-shred.
+internal/qcow/compact.go:CompactionPolicy.AtLayers:compaction   # §21's chain compaction, which this file performs. The withdrawn "compaction" the checker knows is v5's objectization of WAL extents, a different subject that shares a word.
 internal/qcow/compact.go:CompactionPolicy.Validate:compaction   # same subject: the thresholds §21 says must be measured rather than chosen.
-internal/qcow/compact.go:Manager.noteCompaction:compaction      # same subject: reporting a chain that is due, so an operator meets it before an incident does.
+internal/qcow/compact.go:Manager.compact:gc                     # same subject: what a collapse deliberately does not delete, and whose job that is instead.
+internal/qcow/compact.go:Manager.recordCollapsed:compaction     # same subject: why a collapse leaves the RPO anchor where it is — it publishes nothing the guest wrote.
 internal/qcow/compact.go:compaction:compaction                  # same subject: the package comment naming what this file is for.
-internal/qcow/manager.go:Config.Compaction:compaction           # same subject: the policy an operator sets, zero being "say nothing until somebody has measured".
-internal/qcow/manager.go:volume.compactedDepth:compaction       # same subject: what the last report said, so a chain that stops growing stops repeating itself.
+internal/qcow/chain.go:Paths.Rename:compaction                  # same subject: the one caller of Rename is the flattened root a collapse builds under a temporary name.
+internal/qcow/chain.go:checkNotStale:compaction                 # same subject: a HEAD this host's own collapse published is not a chain another host moved past.
+internal/qcow/sweep.go:sweep:compaction                         # same subject: the half-written image a killed convert leaves, which is the one non-layer file the sweep takes.
+internal/qcow/manager.go:Config.Compaction:compaction           # same subject: the policy an operator sets, zero being "collapse nothing until somebody has measured".
+internal/qcow/manager.go:Manager.reconcile:compaction           # same subject: where a collapse runs in the cycle, and why it runs for an unattached volume too.

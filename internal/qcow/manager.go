@@ -114,6 +114,11 @@ type SealedLayer struct {
 	// volume the commit reconstructs.
 	PlainBytes  int64
 	VirtualSize int64
+	// ReplacesCommitID, when set, publishes this layer as a root — a whole image rather
+	// than a delta, so the commit carries no parent and a recovery stops at it instead of
+	// walking the history it flattens. Only a chain collapse sets it (v6 §19), and it
+	// names the commit the flattened bytes reconstruct.
+	ReplacesCommitID string
 }
 
 // Publisher publishes a sealed layer as a commit. It is injected rather than done here
@@ -194,9 +199,10 @@ type volume struct {
 	snapshotID     string
 	snapshotCommit string
 	snapshotErr    string
-	// compactedDepth is the chain depth the last compaction warning carried, so that a
-	// condition which stays true until a human acts on it is not restated every cycle.
-	compactedDepth int
+	// awaitingRebase says this volume's collapsed root is published and the chain has not
+	// been repointed at it yet, so that a wait which lasts until the guest detaches is
+	// reported once rather than once a heartbeat.
+	awaitingRebase bool
 	// openedAt is when this process opened the chain, in milliseconds on the injected
 	// clock. It is the age trigger's anchor for a volume that has never committed, and
 	// it is deliberately not durable: a volume with no commits has nothing to be late
@@ -526,7 +532,7 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 	// What this host holds and what it owes, against the record on disk — both facts are
 	// about files, so it runs for an unattached volume too. A failure here is a note about
 	// work already done and does not refuse the volume; it is returned so the loop backs off.
-	stateErr := m.reconcile(v)
+	stateErr := m.reconcile(ctx, v)
 	if !attached {
 		return stateErr
 	}
@@ -786,7 +792,7 @@ func (m *Manager) recordFenced(v *volume, why storagev1.VolumeRefusal, detail st
 //
 // Pending stays as what it always was: the commit id a sealed layer was promised under,
 // so a retry is the same commit. Losing it costs a duplicate id, never a layer.
-func (m *Manager) reconcile(v *volume) error {
+func (m *Manager) reconcile(ctx context.Context, v *volume) error {
 	st, err := ReadState(m.paths, m.cfg.Root, v.id)
 	if err != nil {
 		return fmt.Errorf("volume %s: %w", v.id, err)
@@ -818,8 +824,12 @@ func (m *Manager) reconcile(v *volume) error {
 	if err != nil {
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
-	// After the sweep, so the bytes reported are the ones that are still there.
-	return m.noteCompaction(v, st)
+	// After the sweep, so the numbers a plan is made of are the ones still on disk. A
+	// compaction touches only published files, so it runs whether or not a guest is
+	// attached — and its last step *needs* the volume unattached. A failure is returned
+	// and does not refuse the volume, because the chain it would have collapsed is exactly
+	// the chain that goes on being served.
+	return m.compact(ctx, v, st)
 }
 
 // adopt takes on the oldest layer this host owes the object store, from the record when

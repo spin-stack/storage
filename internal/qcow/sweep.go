@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -33,6 +34,12 @@ import (
 // tip, which nothing backs onto and which no guest ever wrote to — the guest is on the
 // tip, and the tip is QEMU's own answer. Anything whose name is not a v7 layer file is
 // left alone, which covers a download that did not finish.
+//
+// A compaction's half-written root is the one exception, and it meets the same two
+// conditions: `<layer-id>.qcow2.compacting` is a file `qemu-img convert` was killed in the
+// middle of, its id is minted after the tip like any other new layer, and nothing but that
+// convert ever names it. Left alone it would occupy a whole volume's worth of disk for
+// ever, because a collapse that is planned again converts under a new id.
 func sweep(p Paths, root, volumeID, tip string, st State, pending *SealedLayer) ([]string, error) {
 	tipID, err := ids.Parse(LayerIDOfImage(tip))
 	if err != nil {
@@ -47,6 +54,13 @@ func sweep(p Paths, root, volumeID, tip string, st State, pending *SealedLayer) 
 	}
 	if pending != nil {
 		keep[pending.LayerID] = true
+	}
+	if st.Compacting != nil {
+		// The root of a collapse that is under way, and the temporary file it is being
+		// converted into. Between the rename and the record it is a complete image no
+		// commit names yet, which is precisely the shape this sweep removes — and by then
+		// it may already be the layer of a commit that has landed.
+		keep[st.Compacting.LayerID] = true
 	}
 	// And whatever `active/current` names, which is not always the tip. Rotate writes the
 	// pointer *before* it tells QEMU to switch — deliberately, so a crash leaves it one
@@ -69,10 +83,11 @@ func sweep(p Paths, root, volumeID, tip string, st State, pending *SealedLayer) 
 	}
 	var removed []string
 	for _, name := range names {
-		if filepath.Ext(name) != layerSuffix {
+		unfinished := strings.HasSuffix(name, layerSuffix+compactSuffix)
+		if filepath.Ext(name) != layerSuffix && !unfinished {
 			continue
 		}
-		id := LayerIDOfImage(name)
+		id := LayerIDOfImage(strings.TrimSuffix(name, compactSuffix))
 		if keep[id] {
 			continue
 		}

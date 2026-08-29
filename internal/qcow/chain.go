@@ -221,6 +221,10 @@ type Paths interface {
 	// for is precisely the files no record names, so it cannot be found by asking about
 	// paths this host already knows.
 	List(dir string) ([]string, error)
+	// Rename moves a file within the layers directory. It is how a file that is built in
+	// several steps — a compaction's flattened root — only ever appears under its real
+	// name complete.
+	Rename(oldPath, newPath string) error
 	// Remove deletes a file. A path that is already gone is not an error: the sweep runs
 	// every cycle over the same directory.
 	Remove(path string) error
@@ -422,6 +426,14 @@ func checkNotStale(ctx context.Context, p Paths, req OpenRequest, image string) 
 			return nil
 		}
 	}
+	// And a collapse this host began. Between the compare-and-set and the record of the
+	// prefix it replaces, HEAD names a commit that is in no list here — and refusing on
+	// that is refusing a volume for this host's own compaction, permanently, since
+	// nothing ever puts that commit into Commits afterwards. It is the same statement the
+	// list makes: this host published it.
+	if local.Compacting != nil && local.Compacting.CommitID == head {
+		return nil
+	}
 	return fmt.Errorf("%w: volume %s has a local chain at %s, and the published history is at commit %s, which this host did not write",
 		ErrStaleChain, req.VolumeID, image, head)
 }
@@ -579,7 +591,10 @@ func clearFork(p Paths, root, volumeID string) error {
 			"volume_id", volumeID, "commit_id", st.Pending.CommitID, "layer_id", st.Pending.LayerID,
 			"layer", LayerImage(root, volumeID, st.Pending.LayerID))
 	}
-	st.Fenced, st.Layers, st.Pending = nil, nil, nil
+	// Compacting goes with them and for the same reason: it names a root built out of a
+	// prefix of the history this host has just stopped serving, and a rebase onto it
+	// would put the served chain on top of bytes another host's history does not have.
+	st.Fenced, st.Layers, st.Pending, st.Compacting = nil, nil, nil, nil
 	return WriteState(p, root, volumeID, st)
 }
 
