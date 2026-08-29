@@ -475,3 +475,64 @@ func TestACloneOpensItsParentsPublishedLayers(t *testing.T) {
 		t.Fatal("the inherited layer opened into the wrong bytes")
 	}
 }
+
+// TestACloneOfACloneIsRefused pins the ceiling to what a restore can actually rebuild.
+//
+// Recovery walks exactly one ancestor: qcow.Lineage carries one parent, cpserver fills it
+// from the snapshot row, and RestoreFrom does not recurse. A depth-2 clone re-placed on a
+// host holding nothing therefore comes back missing everything its grandparent wrote —
+// and says it succeeded, which is the failure this refusal exists to make impossible.
+//
+// The assertion is on the sentinel and on the catalog, not only on the error: a clone
+// refused after its row was written is a volume nobody can serve and nothing will collect.
+func TestACloneOfACloneIsRefused(t *testing.T) {
+	ctx := t.Context()
+	md, store, term := cpStore(t)
+	kms := testKMS(t)
+	if err := md.CreateVolume(ctx, term, metadata.Volume{
+		VolumeID: parentVol, SizeBytes: 1 << 30, BlockSize: 65536,
+		State: lifecycle.VolumeActive, ChainDepth: 0,
+		DEKWrapped: wrapFor(t, kms, parentVol, 42), KEKID: "kek-test", DEKKeyID: 42,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: snapID, VolumeID: parentVol, Epoch: 1, CommitID: ids.New().String(),
+		State: lifecycle.SnapshotPublished, RequestID: reqID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	addHost(t, md, term, cloneHostA, lifecycle.HostActive, 1<<40)
+
+	first, err := controlplane.Clone(ctx, md, store, kms, &ramp{},
+		placement.Policy{}, nil, term, snapID, cloneVol)
+	if err != nil {
+		t.Fatalf("cloning a root: %v", err)
+	}
+	if first.ChainDepth != 1 {
+		t.Fatalf("the first clone is at depth %d, want 1", first.ChainDepth)
+	}
+
+	// A snapshot of the clone, and a clone of that.
+	deeper := ids.New().String()
+	if err := md.CreateSnapshot(ctx, term, metadata.Snapshot{
+		SnapshotID: deeper, VolumeID: first.VolumeID, Epoch: 1, CommitID: ids.New().String(),
+		SourceHostID: cloneHostA, State: lifecycle.SnapshotPublished, RequestID: ids.New().String(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = controlplane.Clone(ctx, md, store, kms, &ramp{},
+		placement.Policy{}, nil, term, deeper, ids.New().String())
+	if !errors.Is(err, controlplane.ErrChainTooDeep) {
+		t.Fatalf("cloning a clone returned %v, want ErrChainTooDeep: recovery rebuilds one ancestor, so the grandparent's data would be missing and reported as success", err)
+	}
+	vols, lerr := md.ListVolumes(ctx)
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	for _, v := range vols {
+		if v.ParentSnapshotID == deeper {
+			t.Fatalf("the refused clone %s is in the catalog; nothing can serve it and nothing collects it", v.VolumeID)
+		}
+	}
+}

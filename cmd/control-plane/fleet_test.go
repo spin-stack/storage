@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -163,7 +164,7 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 
 	// The volume nobody serves, and the count in the header that answers the question
 	// on its own.
-	mustSay(t, out, "VOLUMES (3, 1 with no primary host, 1 at the depth ceiling of 5")
+	mustSay(t, out, "VOLUMES (3, 1 with no primary host, 1 at the depth ceiling of 1")
 	if got, want := row(t, out, strandedVol),
 		[]string{strandedVol, "-", "DETACHED", "9", "2.0GiB", "0", "-"}; !equal(got, want) {
 		t.Errorf("unplaced volume row = %v, want %v", got, want)
@@ -176,7 +177,8 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 	// `chain_depth` series cannot: a clone of it is refused until someone flattens it,
 	// and until then its depth is a fact about the fleet rather than an event.
 	if got, want := row(t, out, deepVol),
-		[]string{deepVol, activeHost, "ACTIVE", "1", "1.0GiB", "5", doneSnap}; !equal(got, want) {
+		[]string{deepVol, activeHost, "ACTIVE", "1", "1.0GiB",
+			strconv.Itoa(controlplane.MaxChainDepth), doneSnap}; !equal(got, want) {
 		t.Errorf("volume at the ceiling row = %v, want %v", got, want)
 	}
 

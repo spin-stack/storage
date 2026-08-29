@@ -18,8 +18,8 @@ import (
 )
 
 // MaxChainDepth is the deepest lineage this Control Plane will create. A volume that was
-// created rather than cloned is at depth 0, so five clone links are admitted above a root
-// and the sixth is refused.
+// created rather than cloned is at depth 0, so one clone link is admitted above a root and
+// a clone of a clone is refused.
 //
 // What a link costs at attach, measured against the code that pays it and pinned by
 // recovery.TestWhatOneChainLinkCostsAtAttach, which asserts the exact requests: an ancestor
@@ -36,20 +36,23 @@ import (
 // is not measured anywhere and cannot be measured from here — it needs a real guest, so it
 // belongs in the guest lane and is not guessed at.
 //
-// The measurement that should move this ceiling is not a cost. Recovery rebuilds exactly
-// one ancestor: qcow.Lineage carries one parent, cpserver fills it from the snapshot row,
-// recovery.RestoreFrom does not recurse, and a clone's own published commits are overlays
-// over a base no manifest of theirs names. So a depth-2 clone re-placed on a host that
-// holds nothing rebuilds a chain missing everything its grandparent wrote, and reports
-// success (recovery.TestARestoreReadsOneAncestorAndStops). The depth this system can
-// actually serve is 1. Five is left standing rather than silently corrected because the two
-// repairs are different products — lower the ceiling, or teach the walk the whole ancestry
-// — and neither is a comment's decision to make.
+// What sets it is not a cost. Recovery rebuilds exactly one ancestor: qcow.Lineage carries
+// one parent, cpserver fills it from the snapshot row, RestoreFrom does not recurse, and a
+// clone's own published commits are overlays over a base no manifest of theirs names. A
+// depth-2 clone re-placed on a host that holds nothing therefore rebuilds a chain missing
+// everything its grandparent wrote and reports success
+// (recovery.TestARestoreReadsOneAncestorAndStops).
+//
+// So the ceiling is the depth this system can actually serve, and it stays there until the
+// walk learns the whole ancestry — which needs the Control Plane to send it, since the
+// Agent is told and cannot look a lineage up (ADR-0021). It was 5 while nothing had
+// measured what recovery does; a ceiling that admits four links no restore can rebuild is
+// worse than no ceiling, because it reads as a decision somebody made.
 //
 // Rejected: a flag on cmd/control-plane. A ceiling an operator can raise per invocation is
 // one that gets raised during the incident it exists to prevent, and the number only means
 // anything if every clone in the fleet was admitted against the same one.
-const MaxChainDepth = 5
+const MaxChainDepth = 1
 
 // ErrChainTooDeep is what a clone past MaxChainDepth is refused with. A sentinel because a
 // caller has to tell "you are at the ceiling", which is about the lineage and is answered by

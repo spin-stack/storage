@@ -61,9 +61,9 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **`MaxChainDepth` admits five links and recovery rebuilds one.** `RestoreFrom` does not
-   recurse, so a depth-2 clone re-placed on a bare host comes back missing what its
-   grandparent wrote and reports SUCCESS. Lower the ceiling, or walk the whole ancestry.
+1. **A clone of a clone is refused, and raising that needs the walk to recurse.**
+   `RestoreFrom` rebuilds one ancestor, so `MaxChainDepth` is 1. Lifting it means the
+   Control Plane sending the whole ancestry and recovery walking it.
 2. **§29 has one point left**: qcow2 corruption a guest introduces *while running*.
 3. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
    while both drive `qemu-img`: a runner fake in `internal/dst` would be a second
