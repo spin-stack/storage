@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -208,7 +209,23 @@ func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, siz
 	case opts.IfMatch != "":
 		in.IfMatch = aws.String(opts.IfMatch)
 	}
-	out, err := s.client.PutObject(ctx, in)
+	// The payload is sent unsigned, and that is what makes a stream possible at all:
+	// SigV4 computes a SHA-256 over the whole body before the first byte goes out, which
+	// means rewinding it, and a body that can be rewound is a body that is already in
+	// memory. Against a real backend the SDK does not fall back — it fails the request
+	// with "failed to seek body to start, request stream is not seekable", which is how
+	// this was found: green in every local lane and red in the one that talks to RustFS.
+	//
+	// Nothing is given up. The bytes are covered by the SHA-256 the commit protocol takes
+	// over what the store actually consumed, and compares against the digest that names
+	// the key before the manifest is written — a stronger check than the transport's,
+	// because it survives the object sitting in the bucket.
+	//
+	// What it does cost is the SDK's own retries: it cannot replay a body it cannot
+	// rewind, so a connection lost mid-upload fails the publish. The commit protocol
+	// retries the whole thing next cycle from the same SealedLayer under the same commit
+	// id, so that costs a cycle rather than a commit.
+	out, err := s.client.PutObject(ctx, in, s3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware))
 	if err != nil {
 		return objectstore.PutResult{}, translate(err)
 	}
