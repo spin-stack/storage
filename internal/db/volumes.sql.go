@@ -79,14 +79,13 @@ func (q *Queries) ClearVolumeParent(ctx context.Context, arg ClearVolumeParentPa
 
 const createVolume = `-- name: CreateVolume :execrows
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $14
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $18
 )
 INSERT INTO volumes (volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
-                     chain_depth, parent_snapshot_id,
-                     local_sequence, durable_sequence, published_sequence)
-SELECT $1, $2, $3, $15::int, $4, $5, $6, $7, $16::bigint, $8, $9, $10,
-       $17::uuid, $11, $12, $13
+                     chain_depth, parent_snapshot_id)
+SELECT $1, $2, $3, $11::int, $4, $5, $6, $7, $12::bigint, $8, $9, $10,
+       $13::uuid
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The capacity bound, as a predicate of the write that places the volume (ADR-0017): a
   -- clone admitted by a pure placement.Choose against a fleet read another operation shared
@@ -97,13 +96,13 @@ WHERE EXISTS (SELECT 1 FROM valid)
   -- *using*. The measured arm charges bound_add_bytes nothing on purpose, and reads the
   -- column rather than a caller's copy so the freshest heartbeat wins. A bound naming an
   -- unregistered host admits nothing: no view row, a NULL comparison, no write.
-  AND ($18::uuid IS NULL
+  AND ($14::uuid IS NULL
        OR (EXISTS (SELECT 1 FROM hosts
-                    WHERE host_id = $18::uuid
-                      AND nvme_used_bytes <= $19::bigint)
+                    WHERE host_id = $14::uuid
+                      AND nvme_used_bytes <= $15::bigint)
            AND (SELECT c.committed_bytes FROM host_committed_bytes c
-                 WHERE c.host_id = $18::uuid)
-               + $20::bigint <= $21::bigint))
+                 WHERE c.host_id = $14::uuid)
+               + $16::bigint <= $17::bigint))
 ON CONFLICT (volume_id) DO UPDATE
   SET size_bytes = GREATEST(volumes.size_bytes, EXCLUDED.size_bytes),
       block_size = EXCLUDED.block_size,
@@ -123,34 +122,28 @@ ON CONFLICT (volume_id) DO UPDATE
       -- Never cleared by a converging write: a clone that lost its parent link reads
       -- zeros, and rebuild-metadata's re-INSERT must not be able to cause that.
       parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED.parent_snapshot_id),
-      local_sequence = GREATEST(volumes.local_sequence, EXCLUDED.local_sequence),
-      durable_sequence = GREATEST(volumes.durable_sequence, EXCLUDED.durable_sequence),
-      published_sequence = GREATEST(volumes.published_sequence, EXCLUDED.published_sequence),
       updated_at = now()
 `
 
 type CreateVolumeParams struct {
-	VolumeID          uuid.UUID   `json:"volume_id"`
-	SizeBytes         int64       `json:"size_bytes"`
-	BlockSize         int32       `json:"block_size"`
-	CurrentEpoch      int64       `json:"current_epoch"`
-	State             string      `json:"state"`
-	DekWrapped        []byte      `json:"dek_wrapped"`
-	KekID             string      `json:"kek_id"`
-	PrimaryHostID     pgtype.UUID `json:"primary_host_id"`
-	StandbyHostID     pgtype.UUID `json:"standby_host_id"`
-	ChainDepth        int32       `json:"chain_depth"`
-	LocalSequence     int64       `json:"local_sequence"`
-	DurableSequence   int64       `json:"durable_sequence"`
-	PublishedSequence int64       `json:"published_sequence"`
-	Term              int64       `json:"term"`
-	RpoTargetSeconds  int32       `json:"rpo_target_seconds"`
-	DekKeyID          int64       `json:"dek_key_id"`
-	ParentSnapshotID  pgtype.UUID `json:"parent_snapshot_id"`
-	BoundHost         pgtype.UUID `json:"bound_host"`
-	BoundUsedLimit    int64       `json:"bound_used_limit"`
-	BoundAddBytes     int64       `json:"bound_add_bytes"`
-	BoundLimit        int64       `json:"bound_limit"`
+	VolumeID         uuid.UUID   `json:"volume_id"`
+	SizeBytes        int64       `json:"size_bytes"`
+	BlockSize        int32       `json:"block_size"`
+	CurrentEpoch     int64       `json:"current_epoch"`
+	State            string      `json:"state"`
+	DekWrapped       []byte      `json:"dek_wrapped"`
+	KekID            string      `json:"kek_id"`
+	PrimaryHostID    pgtype.UUID `json:"primary_host_id"`
+	StandbyHostID    pgtype.UUID `json:"standby_host_id"`
+	ChainDepth       int32       `json:"chain_depth"`
+	RpoTargetSeconds int32       `json:"rpo_target_seconds"`
+	DekKeyID         int64       `json:"dek_key_id"`
+	ParentSnapshotID pgtype.UUID `json:"parent_snapshot_id"`
+	BoundHost        pgtype.UUID `json:"bound_host"`
+	BoundUsedLimit   int64       `json:"bound_used_limit"`
+	BoundAddBytes    int64       `json:"bound_add_bytes"`
+	BoundLimit       int64       `json:"bound_limit"`
+	Term             int64       `json:"term"`
 }
 
 // Term-guarded create (§7). current_epoch is normally 0 for new volumes but is set
@@ -175,10 +168,6 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.PrimaryHostID,
 		arg.StandbyHostID,
 		arg.ChainDepth,
-		arg.LocalSequence,
-		arg.DurableSequence,
-		arg.PublishedSequence,
-		arg.Term,
 		arg.RpoTargetSeconds,
 		arg.DekKeyID,
 		arg.ParentSnapshotID,
@@ -186,6 +175,7 @@ func (q *Queries) CreateVolume(ctx context.Context, arg CreateVolumeParams) (int
 		arg.BoundUsedLimit,
 		arg.BoundAddBytes,
 		arg.BoundLimit,
+		arg.Term,
 	)
 	if err != nil {
 		return 0, err
@@ -246,7 +236,7 @@ func (q *Queries) DeleteVolume(ctx context.Context, arg DeleteVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -261,16 +251,14 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.State,
 		&i.PrimaryHostID,
 		&i.StandbyHostID,
-		&i.ActiveRootID,
-		&i.PublishedRootID,
 		&i.ChainDepth,
 		&i.ParentSnapshotID,
 		&i.DekWrapped,
 		&i.KekID,
 		&i.DekKeyID,
-		&i.LocalSequence,
-		&i.DurableSequence,
-		&i.PublishedSequence,
+		&i.CommitAgeSeconds,
+		&i.UnpublishedLocalBytes,
+		&i.ReportedAt,
 		&i.Refusal,
 		&i.RefusalDetail,
 		&i.FencingStartedAt,
@@ -281,7 +269,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumes = `-- name: ListVolumes :many
-SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
 `
 
 // Every volume, placed or not, for a human reading the catalog: a NULL primary matches no
@@ -305,16 +293,14 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 			&i.State,
 			&i.PrimaryHostID,
 			&i.StandbyHostID,
-			&i.ActiveRootID,
-			&i.PublishedRootID,
 			&i.ChainDepth,
 			&i.ParentSnapshotID,
 			&i.DekWrapped,
 			&i.KekID,
 			&i.DekKeyID,
-			&i.LocalSequence,
-			&i.DurableSequence,
-			&i.PublishedSequence,
+			&i.CommitAgeSeconds,
+			&i.UnpublishedLocalBytes,
+			&i.ReportedAt,
 			&i.Refusal,
 			&i.RefusalDetail,
 			&i.FencingStartedAt,
@@ -332,7 +318,7 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, active_root_id, published_root_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -354,16 +340,14 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.State,
 			&i.PrimaryHostID,
 			&i.StandbyHostID,
-			&i.ActiveRootID,
-			&i.PublishedRootID,
 			&i.ChainDepth,
 			&i.ParentSnapshotID,
 			&i.DekWrapped,
 			&i.KekID,
 			&i.DekKeyID,
-			&i.LocalSequence,
-			&i.DurableSequence,
-			&i.PublishedSequence,
+			&i.CommitAgeSeconds,
+			&i.UnpublishedLocalBytes,
+			&i.ReportedAt,
 			&i.Refusal,
 			&i.RefusalDetail,
 			&i.FencingStartedAt,
@@ -380,6 +364,72 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 	return items, nil
 }
 
+const recordVolumeReport = `-- name: RecordVolumeReport :execrows
+
+UPDATE volumes
+   SET refusal = $1::text,
+       -- One statement, so the two can never disagree: an explanation with nothing to
+       -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
+       refusal_detail = CASE WHEN $1::text = ''
+                            THEN '' ELSE $2::text END,
+       commit_age_seconds = $3::int,
+       unpublished_local_bytes = $4::bigint,
+       reported_at = now(),
+       updated_at = now()
+ WHERE volume_id = $5
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $6
+   AND primary_host_id = $7::uuid
+   AND current_epoch = $8
+`
+
+type RecordVolumeReportParams struct {
+	Refusal               string    `json:"refusal"`
+	RefusalDetail         string    `json:"refusal_detail"`
+	CommitAgeSeconds      int32     `json:"commit_age_seconds"`
+	UnpublishedLocalBytes int64     `json:"unpublished_local_bytes"`
+	VolumeID              uuid.UUID `json:"volume_id"`
+	Term                  int64     `json:"term"`
+	HostID                uuid.UUID `json:"host_id"`
+	Epoch                 int64     `json:"epoch"`
+}
+
+// There is no ResizeVolume query. It was here, it was grow-only and term-guarded, and
+// nothing but a contract test ever ran it: V1 has no resize, because the row is the only
+// half of it that existed (see metadata.Store, where the method was). No statement in
+// this file writes size_bytes after CreateVolume, and that is what makes the geometry the
+// Agent and descriptor.json were handed at create still true when they are read back.
+// One report from one host, recorded in one statement: how far behind the object store the
+// volume is, how much would be lost with the host, and whether the host is serving it at
+// all. They are one write because they are one observation, and splitting them would let a
+// volume render as behind and serving, or as refused and current, out of two rounds.
+//
+// Term-guarded like every other mutation and — unlike every other one — qualified by the
+// *reporting* host and epoch. Without that predicate a host the fleet has moved past would
+// mark a volume NOT SERVED while its successor serves it, and would stamp its own RPO over
+// the successor's; the term guard does not catch it, because promotion does not change the
+// CP term. 0 rows is therefore normal, and means the reporter is not the writer any more.
+//
+// Last-report-wins and not a monotonic merge. The three columns the watermarks left behind
+// were merged with GREATEST because they only ever grew; an age and a backlog both shrink
+// when a commit lands, and a max over them would freeze the row at the worst moment the
+// volume ever had.
+func (q *Queries) RecordVolumeReport(ctx context.Context, arg RecordVolumeReportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordVolumeReport,
+		arg.Refusal,
+		arg.RefusalDetail,
+		arg.CommitAgeSeconds,
+		arg.UnpublishedLocalBytes,
+		arg.VolumeID,
+		arg.Term,
+		arg.HostID,
+		arg.Epoch,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setVolumePrimaryHost = `-- name: SetVolumePrimaryHost :execrows
 UPDATE volumes
    SET primary_host_id = $1::uuid,
@@ -388,6 +438,9 @@ UPDATE volumes
        fencing_started_at = NULL,
        refusal = '',
        refusal_detail = '',
+       commit_age_seconds = NULL,
+       unpublished_local_bytes = 0,
+       reported_at = NULL,
        updated_at = now()
  WHERE volume_id = $2
    AND (SELECT term FROM control_plane_leader WHERE singleton) = $3
@@ -416,60 +469,16 @@ type SetVolumePrimaryHostParams struct {
 // a second Control Plane; and the placement guard, which refuses only the straight
 // hand-over A -> B, since a host discovers it has lost a volume on its next poll.
 //
-// fencing_started_at and the refusal are cleared for the same reason: neither is true of a
-// volume that has just changed hands, and a dwell or an explanation left behind would be
-// inherited by the next promotion or printed against a host that is serving fine.
+// fencing_started_at and everything the departing host reported are cleared for the same
+// reason: none of it is true of a volume that has just changed hands, and a dwell, an
+// explanation or an RPO left behind would be inherited by the next promotion or printed
+// against a host that is serving fine.
 func (q *Queries) SetVolumePrimaryHost(ctx context.Context, arg SetVolumePrimaryHostParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setVolumePrimaryHost,
 		arg.PrimaryHostID,
 		arg.VolumeID,
 		arg.Term,
 		arg.AllowedStates,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const setVolumeRefusal = `-- name: SetVolumeRefusal :execrows
-UPDATE volumes
-   SET refusal = $1::text,
-       -- One statement, so the two can never disagree: an explanation with nothing to
-       -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
-       refusal_detail = CASE WHEN $1::text = ''
-                            THEN '' ELSE $2::text END,
-       updated_at = now()
- WHERE volume_id = $3
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $4
-   AND primary_host_id = $5::uuid
-   AND current_epoch = $6
-`
-
-type SetVolumeRefusalParams struct {
-	Refusal       string    `json:"refusal"`
-	RefusalDetail string    `json:"refusal_detail"`
-	VolumeID      uuid.UUID `json:"volume_id"`
-	Term          int64     `json:"term"`
-	HostID        uuid.UUID `json:"host_id"`
-	Epoch         int64     `json:"epoch"`
-}
-
-// Record why the host holding this volume is not serving it, or clear the record when it
-// is. Term-guarded like every other mutation and — unlike every other one — qualified by
-// the *reporting* host and epoch. That predicate is exactly what UpdateVolumeWatermarks
-// must not have: a watermark is monotonic and GREATEST makes a late report harmless, while
-// a refusal is a state about right now, and an unqualified last-report-wins would let a
-// host the fleet moved past mark a volume NOT SERVED while its successor serves it (the
-// term guard passes: promotion does not change the CP term). 0 rows is therefore normal.
-func (q *Queries) SetVolumeRefusal(ctx context.Context, arg SetVolumeRefusalParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setVolumeRefusal,
-		arg.Refusal,
-		arg.RefusalDetail,
-		arg.VolumeID,
-		arg.Term,
-		arg.HostID,
-		arg.Epoch,
 	)
 	if err != nil {
 		return 0, err
@@ -514,49 +523,6 @@ func (q *Queries) SetVolumeState(ctx context.Context, arg SetVolumeStateParams) 
 		arg.State,
 		arg.Term,
 		arg.AllowedStates,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const updateVolumeWatermarks = `-- name: UpdateVolumeWatermarks :execrows
-
-UPDATE volumes
-   SET local_sequence = GREATEST(local_sequence, $2),
-       durable_sequence = GREATEST(durable_sequence, $3),
-       published_sequence = GREATEST(published_sequence, $4),
-       updated_at = now()
- WHERE volume_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $5
-`
-
-type UpdateVolumeWatermarksParams struct {
-	VolumeID          uuid.UUID `json:"volume_id"`
-	LocalSequence     int64     `json:"local_sequence"`
-	DurableSequence   int64     `json:"durable_sequence"`
-	PublishedSequence int64     `json:"published_sequence"`
-	Term              int64     `json:"term"`
-}
-
-// There is no ResizeVolume query. It was here, it was grow-only and term-guarded, and
-// nothing but a contract test ever ran it: V1 has no resize, because the row is the only
-// half of it that existed (see metadata.Store, where the method was). No statement in
-// this file writes size_bytes after CreateVolume, and that is what makes the geometry the
-// Agent and descriptor.json were handed at create still true when they are read back.
-// Lazy, informative watermark update (§5.8, §12.6), term-guarded and monotonic.
-// GREATEST is the fencing part: promotion does not change the CP term, so an
-// epoch-N primary's report that was queued behind a retry still passes the term
-// guard after epoch N+1 has published its own. Component-wise max preserves
-// published ≤ durable ≤ local (INV-03), which the caller already validated.
-func (q *Queries) UpdateVolumeWatermarks(ctx context.Context, arg UpdateVolumeWatermarksParams) (int64, error) {
-	result, err := q.db.Exec(ctx, updateVolumeWatermarks,
-		arg.VolumeID,
-		arg.LocalSequence,
-		arg.DurableSequence,
-		arg.PublishedSequence,
-		arg.Term,
 	)
 	if err != nil {
 		return 0, err

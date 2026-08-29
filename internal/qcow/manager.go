@@ -1290,6 +1290,20 @@ func (m *Manager) gap(v *volume) volumeGap {
 		// this host invented would read as an RPO somebody could rely on.
 		return g
 	}
+	// §11's definition, which is not "how long since the last commit": *the age of the
+	// newest commit that covers everything written*. A tip the guest has not written to
+	// is covered by the commit below it, so the volume is inside its RPO however long ago
+	// that was — and the other reading has both errors in it. An idle fleet drifts into
+	// looking like a fleet about to lose data, until the alert that fires on all of it
+	// gets turned off; and a volume whose guest is writing hard reads 0 at the instant a
+	// commit lands, which is the instant its exposure starts growing again.
+	//
+	// The condition is the trigger's own (see maybeRotate), so the reported number and
+	// the decision to commit can never contradict each other: a volume cannot report
+	// itself past a target the trigger is treating it as idle for.
+	if tip, err := m.paths.Size(v.chain.Active); err == nil && tip < minRotateAtBytes {
+		return g
+	}
 	g.lastCommitAge = time.Duration(m.clk.Wall().UnixMilli()-st.LastCommitAt) * time.Millisecond
 	return g
 }
@@ -1303,12 +1317,6 @@ type volumeGap struct {
 }
 
 // Volumes reports what this host is holding, ordered by volume id (deterministic).
-//
-// LocalSequence, DurableSequence and PublishedSequence are reported as zero: they were
-// the write-ahead log's counters and that log is withdrawn. Durability past this host is
-// what a published commit means, and the catalog's columns get their meaning back from
-// the commit protocol. A fabricated watermark would be a fencing decision made on a
-// fiction.
 func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

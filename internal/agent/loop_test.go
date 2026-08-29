@@ -295,12 +295,12 @@ func TestReconcileReportsTheDevicePicture(t *testing.T) {
 	}
 }
 
-// TestReconcileReportsEpochQualifiedWatermarks: every watermark the Agent reports
-// carries the epoch it was produced under, in volume-id order (INV-02).
-func TestReconcileReportsEpochQualifiedWatermarks(t *testing.T) {
+// TestReconcileReportsEpochQualifiedMeasurements: everything the Agent reports carries
+// the epoch it was produced under, in volume-id order (INV-02).
+func TestReconcileReportsEpochQualifiedMeasurements(t *testing.T) {
 	h := newHarness(t, testConfig(), disk.Usage{TotalBytes: 100, UsedBytes: 10})
-	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-b", Epoch: 9, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10})
-	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 4, LocalSequence: 3, DurableSequence: 2, PublishedSequence: 1})
+	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-b", Epoch: 9, LastCommitAge: 30 * time.Second, UnpublishedLocalBytes: 4096})
+	h.vols.Set(agent.VolumeStatus{VolumeID: "vol-a", Epoch: 4, LastCommitAge: 3 * time.Second})
 
 	if err := h.loop.Reconcile(t.Context()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -316,8 +316,8 @@ func TestReconcileReportsEpochQualifiedWatermarks(t *testing.T) {
 	if got[0].GetEpoch() != 4 || got[1].GetEpoch() != 9 {
 		t.Fatalf("epochs not carried: %d, %d", got[0].GetEpoch(), got[1].GetEpoch())
 	}
-	if got[1].GetLocalSequence() != 30 || got[1].GetDurableSequence() != 20 || got[1].GetPublishedSequence() != 10 {
-		t.Fatalf("watermarks not carried: %+v", got[1])
+	if got[1].GetLastSuccessfulCommitAgeMs() != 30_000 || got[1].GetUnpublishedLocalBytes() != 4096 {
+		t.Fatalf("the measurements are not carried: %+v", got[1])
 	}
 }
 
@@ -334,7 +334,6 @@ func TestRefusedReportMarksTheVolumeFenced(t *testing.T) {
 		{"stale epoch", storagev1.ReportOutcome_REPORT_OUTCOME_STALE_EPOCH, true},
 		{"not primary", storagev1.ReportOutcome_REPORT_OUTCOME_NOT_PRIMARY, true},
 		{"unknown volume", storagev1.ReportOutcome_REPORT_OUTCOME_UNKNOWN_VOLUME, true},
-		{"out of order", storagev1.ReportOutcome_REPORT_OUTCOME_OUT_OF_ORDER, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

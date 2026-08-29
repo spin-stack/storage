@@ -16,10 +16,10 @@
 -- UUIDv7 enforcement (INV-22, ADR-0007) as a type: the version nibble is the high 4 bits
 -- of the UUID's 7th byte, so requiring it to equal 7 rejects a non-v7 id at insert whatever
 -- the client. A domain rather than a predicate copied onto every identity column, because a
--- copied rule holds only where somebody remembered to copy it — active_root_id and
--- published_root_id went without one and nothing said so. FK-referencing columns stay plain
--- `uuid` (the rule reaches them transitively); TestPGIdentityColumnsUseTheUUIDv7Domain
--- exempts exactly those.
+-- copied rule holds only where somebody remembered to copy it, and two columns went
+-- without one for a year before anyone noticed. FK-referencing columns stay plain `uuid`
+-- (the rule reaches them transitively); TestPGIdentityColumnsUseTheUUIDv7Domain exempts
+-- exactly those.
 CREATE DOMAIN uuidv7 AS uuid CHECK ((get_byte(uuid_send(VALUE), 6) >> 4) = 7);
 
 -- Single-active Control Plane leadership with a verified term (§7). Every CP write
@@ -121,8 +121,6 @@ CREATE TABLE volumes (
                                           'RECOVERY_REQUIRED', 'RECOVERING', 'DETACHED')),
     primary_host_id    UUID REFERENCES hosts(host_id),
     standby_host_id    UUID REFERENCES hosts(host_id),
-    active_root_id     UUIDV7,
-    published_root_id  UUIDV7,
     chain_depth        INTEGER NOT NULL DEFAULT 0,
     -- The snapshot this volume was cloned from (§20), NULL for a volume that was created
     -- rather than cloned. chain_depth says a chain exists; this says what is on the other end
@@ -145,25 +143,38 @@ CREATE TABLE volumes (
     -- at the write is refusing it where it can still be corrected.
     dek_key_id         BIGINT NOT NULL
                          CHECK (dek_key_id > 0 AND dek_key_id <= 4294967295),
-    -- Watermarks are INFORMATIVE (lazy); authority is S3 (§5.8). Informative is not
-    -- unconstrained: INV-03 (§5.6) says published <= durable <= local, stated at the table
-    -- rather than in each query that writes it. Nothing on the reporting path can trip it —
-    -- the writers advance with GREATEST, and component-wise max preserves order. What it
-    -- catches is a row written out of order at birth, which no later report could repair.
-    local_sequence     BIGINT NOT NULL DEFAULT 0,
-    durable_sequence   BIGINT NOT NULL DEFAULT 0,
-    published_sequence BIGINT NOT NULL DEFAULT 0,
+    -- What §11 calls the product: how far behind the object store this volume was when
+    -- its host last said. `commit_age_seconds` is the age of the newest published commit
+    -- that covers everything the guest has written — so a volume nobody writes to reads
+    -- as 0 and is *inside* its RPO rather than behind it — and `unpublished_local_bytes`
+    -- is what would be lost with the host at that moment. The pair is what §11 asks be
+    -- alarmed on, and until it was stored the fleet's headline number lived only as a
+    -- gauge on each Agent, where nothing can ask a question about a volume by name.
+    --
+    -- They replace local_sequence, durable_sequence and published_sequence, three columns
+    -- of the withdrawn write-ahead log that every v6 Agent reported as zero.
+    --
+    -- NULL means no host has reported yet, which is not the same as zero and must not
+    -- render as an RPO of nothing. Stated as an age rather than a timestamp because the
+    -- Agent has no wall clock (INV-01): it measures an interval, and reported_at is this
+    -- database's clock — the one every other deadline here lives on — so a reader adds
+    -- `now() - reported_at` and gets an age that keeps growing while a host is silent.
+    commit_age_seconds     INTEGER CHECK (commit_age_seconds >= 0),
+    unpublished_local_bytes BIGINT NOT NULL DEFAULT 0
+                             CHECK (unpublished_local_bytes >= 0),
+    reported_at            TIMESTAMPTZ,
+    CONSTRAINT volumes_progress_is_reported_together
+        CHECK ((commit_age_seconds IS NULL) = (reported_at IS NULL)),
     -- Why the host that holds this volume is not serving it, empty when it is
     -- (internal/lifecycle.Refusal). The Agent fails closed in five places — a missing image,
     -- a durability floor, a read view that never resolved, a KEK it does not hold, a lost
     -- lease — and without this column every one of them was invisible to the fleet:
     -- `-fleet-status` rendered the volume as normal off its last healthy watermarks.
     --
-    -- **It is not a watermark.** The three above are monotonic and merged with GREATEST.
-    -- This is a state that must clear the moment the volume serves again, so its write is
-    -- last-report-wins, qualified by primary_host_id and current_epoch so a host the fleet
-    -- has moved past cannot resurrect it. That predicate is why SetVolumeRefusal is not
-    -- folded into UpdateVolumeWatermarks.
+    -- Last-report-wins, qualified by primary_host_id and current_epoch so a host the fleet
+    -- has moved past cannot resurrect a refusal its successor has cleared. The three
+    -- columns above are written by the same statement and want the same predicate for the
+    -- same reason, which is why one report is one write.
     refusal            TEXT NOT NULL DEFAULT ''
                          CHECK (refusal IN ('', 'IMAGE_MISSING', 'DURABILITY_LOST',
                                             'NO_READ_VIEW', 'NO_KEY', 'LEASE_LOST',
@@ -174,8 +185,6 @@ CREATE TABLE volumes (
     refusal_detail     TEXT NOT NULL DEFAULT '',
     CONSTRAINT volumes_refusal_detail_needs_a_refusal
         CHECK (refusal <> '' OR refusal_detail = ''),
-    CONSTRAINT volumes_watermarks_ordered
-        CHECK (published_sequence <= durable_sequence AND durable_sequence <= local_sequence),
     -- When the Control Plane observed the lease of the writer it is fencing (ADR-0015),
     -- stamped by this database's clock — the one that also stamps host_leases.last_renewal,
     -- and so the one every fencing deadline lives on — on entry to FENCING_WAIT, cleared on

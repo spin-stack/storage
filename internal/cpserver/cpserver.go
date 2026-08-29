@@ -149,14 +149,6 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			BlockSize: v.BlockSize,
 			Epoch:     v.CurrentEpoch,
 			State:     volumeState(v.State),
-			// The two watermarks the catalog holds, sent back to the host that will
-			// serve the volume: they are what lets an Agent tell "this volume is new"
-			// from "this volume's data is missing". Copied verbatim — metadata.Volume
-			// calls them informative (§5.8), which was read as "not worth sending" and
-			// left the Agent deciding with the one authority that cannot distinguish
-			// the two cases, the bucket.
-			PublishedSequence: v.PublishedSequence,
-			DurableSequence:   v.DurableSequence,
 			// The age trigger (v6 §11). Zero is a volume that was never sold an RPO and
 			// commits on the host's size threshold alone; the Agent reads it that way.
 			RpoTargetSeconds: int64(v.RPOTargetSeconds),
@@ -306,14 +298,7 @@ func (s *Server) applyReport(ctx context.Context, term int64, hostID string, r *
 		return storagev1.ReportOutcome_REPORT_OUTCOME_STALE_EPOCH, nil
 	}
 
-	err = s.md.UpdateWatermarks(ctx, term, r.GetVolumeId(), r.GetLocalSequence(), r.GetDurableSequence(), r.GetPublishedSequence())
-	switch {
-	case errors.Is(err, metadata.ErrWatermarkOrder):
-		return storagev1.ReportOutcome_REPORT_OUTCOME_OUT_OF_ORDER, nil
-	case err != nil:
-		return 0, fmt.Errorf("cpserver: updating the watermarks of %q: %w", r.GetVolumeId(), err)
-	}
-	if err := s.applyRefusal(ctx, term, hostID, r); err != nil {
+	if err := s.applyProgress(ctx, term, hostID, r); err != nil {
 		return 0, err
 	}
 	if err := s.applySnapshotReport(ctx, term, hostID, r); err != nil {
@@ -322,20 +307,17 @@ func (s *Server) applyReport(ctx context.Context, term int64, hostID string, r *
 	return storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED, nil
 }
 
-// applyRefusal records whether the reporting host is serving this volume, and why it is
-// not. It runs on every accepted report, including the ones that say nothing is wrong —
-// that is what clears a refusal when the volume comes back, with no sweep and nothing that
-// has to notice a recovery.
+// applyProgress records what the reporting host observed about this volume: how far
+// behind the object store it is (§11's product), how much would be lost with the host,
+// and why it is not being served. It runs on every accepted report, including the ones
+// that say nothing is wrong — that is what clears a refusal when the volume comes back,
+// with no sweep and nothing that has to notice a recovery.
 //
-// A separate write from the watermarks because the two facts want opposite storage: a
-// watermark is monotonic and merged with GREATEST, while a refusal is a state and so is
-// last-report-wins, where "last" must exclude a writer the fleet has moved past.
-//
-// The epoch check above makes SetVolumeRefusal's host-and-epoch predicate look redundant.
-// It is not: between that read and this write the volume can be promoted, and a fenced
-// host would then mark a volume NOT SERVED while its successor serves it — with the term
-// guard passing, because promotion does not move the CP term.
-func (s *Server) applyRefusal(ctx context.Context, term int64, hostID string, r *storagev1.VolumeReport) error {
+// The epoch check above makes RecordVolumeReport's host-and-epoch predicate look
+// redundant. It is not: between that read and this write the volume can be promoted, and
+// a fenced host would then mark a volume NOT SERVED while its successor serves it — with
+// the term guard passing, because promotion does not move the CP term.
+func (s *Server) applyProgress(ctx context.Context, term int64, hostID string, r *storagev1.VolumeReport) error {
 	refusal, err := refusalOf(r.GetRefusal())
 	if err != nil {
 		// An Agent from the future naming a refusal this Control Plane has never heard
@@ -351,8 +333,14 @@ func (s *Server) applyRefusal(ctx context.Context, term int64, hostID string, r 
 		// stores answer the same way rather than one relying on a CASE the other lacks.
 		detail = ""
 	}
-	if err := s.md.SetVolumeRefusal(ctx, term, r.GetVolumeId(), hostID, r.GetEpoch(), refusal, detail); err != nil {
-		return fmt.Errorf("cpserver: recording that %q is not being served: %w", r.GetVolumeId(), err)
+	err = s.md.RecordVolumeReport(ctx, term, metadata.VolumeReport{
+		VolumeID: r.GetVolumeId(), HostID: hostID, Epoch: r.GetEpoch(),
+		CommitAge:             time.Duration(r.GetLastSuccessfulCommitAgeMs()) * time.Millisecond,
+		UnpublishedLocalBytes: r.GetUnpublishedLocalBytes(),
+		Refusal:               refusal, RefusalDetail: detail,
+	})
+	if err != nil {
+		return fmt.Errorf("cpserver: recording what %q's host observed: %w", r.GetVolumeId(), err)
 	}
 	if refusal.Refused() {
 		// One line per refused report, not one per transition: an operator arriving an hour

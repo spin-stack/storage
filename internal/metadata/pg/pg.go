@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -440,11 +441,6 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
-	// INV-03 before the insert, so a disordered triple is ErrWatermarkOrder rather
-	// than the volumes_watermarks_ordered constraint arriving as an opaque 23514.
-	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
-		return err
-	}
 	if err := metadata.CheckDEKKeyID(v.DEKKeyID); err != nil {
 		return err
 	}
@@ -464,8 +460,7 @@ func (s *Store) CreateVolume(ctx context.Context, term int64, v metadata.Volume,
 			DekWrapped: v.DEKWrapped, KekID: v.KEKID, DekKeyID: int64(v.DEKKeyID),
 			ParentSnapshotID: parentSnap,
 			PrimaryHostID:    primary, StandbyHostID: standby, ChainDepth: v.ChainDepth,
-			LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
-			PublishedSequence: v.PublishedSequence, Term: term,
+			Term:      term,
 			BoundHost: boundHost, BoundAddBytes: addBytes, BoundLimit: limit,
 			BoundUsedLimit: usedLimit,
 		})
@@ -502,12 +497,15 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		// The column's CHECK bounds it to (0, 2^32), so the narrowing is total —
 		// and it is the same 16-byte-id story as volume_id: BIGINT at the boundary,
 		// the format's own width in the interface.
-		DEKKeyID:      uint32(v.DekKeyID), //nolint:gosec // bounded by volumes.dek_key_id's CHECK
-		LocalSequence: v.LocalSequence, DurableSequence: v.DurableSequence,
-		PublishedSequence: v.PublishedSequence,
-		Refusal:           refusal,
-		RefusalDetail:     v.RefusalDetail,
-		FencingStartedAt:  fromTS(v.FencingStartedAt),
+		DEKKeyID: uint32(v.DekKeyID), //nolint:gosec // bounded by volumes.dek_key_id's CHECK
+		Progress: metadata.VolumeProgress{
+			CommitAge:             time.Duration(v.CommitAgeSeconds.Int32) * time.Second,
+			UnpublishedLocalBytes: v.UnpublishedLocalBytes,
+			Refusal:               refusal,
+			RefusalDetail:         v.RefusalDetail,
+			ReportedAt:            fromTS(v.ReportedAt),
+		},
+		FencingStartedAt: fromTS(v.FencingStartedAt),
 	}, nil
 }
 
@@ -681,61 +679,60 @@ func (s *Store) DeleteVolume(ctx context.Context, term int64, volumeID string) e
 	return fmt.Errorf("%w: %s", metadata.ErrHasDescendants, volumeID)
 }
 
-func (s *Store) UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error {
-	id, err := requireUUID("volume", volumeID)
-	if err != nil {
-		return err
-	}
-	if err := metadata.CheckWatermarkOrder(local, durable, published); err != nil {
-		return err
-	}
-	// The query itself is monotonic (GREATEST), so a late report is ignored rather
-	// than rejected — see volumes.sql.
-	rows, err := s.q.UpdateVolumeWatermarks(ctx, db.UpdateVolumeWatermarksParams{
-		VolumeID: id, LocalSequence: local, DurableSequence: durable,
-		PublishedSequence: published, Term: term,
-	})
-	ok, err := s.wrote(ctx, term, rows, err)
-	if err != nil || ok {
-		return err
-	}
-	return metadata.ErrNotFound
-}
-
-// SetVolumeRefusal records, or clears, why the volume's host is not serving it.
+// RecordVolumeReport records one host's observation of one volume.
 //
 // The 0-row path is the one that differs from every other write here, and volumes.sql
 // says why: the statement is qualified by the reporting host and epoch, so no rows means
-// the volume has moved on and this report's opinion about whether it is being served is
-// void. That is not an error and must not be diagnosed as one — only a volume that is
-// not in the catalog at all is. So the re-read is a bare existence check rather than the
-// four-way diagnosis SetVolumePrimaryHost does.
-func (s *Store) SetVolumeRefusal(ctx context.Context, term int64, volumeID, hostID string, epoch int64,
-	refusal lifecycle.Refusal, detail string,
-) error {
-	id, err := requireUUID("volume", volumeID)
+// the volume has moved on and this report's opinion about it is void. That is not an
+// error and must not be diagnosed as one — only a volume that is not in the catalog at
+// all is. So the re-read is a bare existence check rather than the four-way diagnosis
+// SetVolumePrimaryHost does.
+func (s *Store) RecordVolumeReport(ctx context.Context, term int64, r metadata.VolumeReport) error {
+	id, err := requireUUID("volume", r.VolumeID)
 	if err != nil {
 		return err
 	}
-	host, err := requireUUID("host", hostID)
+	host, err := requireUUID("host", r.HostID)
 	if err != nil {
 		return err
 	}
-	if !refusal.Valid() {
-		return fmt.Errorf("%w: volume refusal %q", lifecycle.ErrUnknownState, refusal)
+	if !r.Refusal.Valid() {
+		return fmt.Errorf("%w: volume refusal %q", lifecycle.ErrUnknownState, r.Refusal)
 	}
-	rows, err := s.q.SetVolumeRefusal(ctx, db.SetVolumeRefusalParams{
-		VolumeID: id, HostID: host, Epoch: epoch, Term: term,
-		Refusal: refusal.String(), RefusalDetail: detail,
+	age, err := ageSeconds(r.CommitAge)
+	if err != nil {
+		return err
+	}
+	if r.UnpublishedLocalBytes < 0 {
+		return fmt.Errorf("%w: unpublished local bytes %d", metadata.ErrInvalidReport, r.UnpublishedLocalBytes)
+	}
+	rows, err := s.q.RecordVolumeReport(ctx, db.RecordVolumeReportParams{
+		VolumeID: id, HostID: host, Epoch: r.Epoch, Term: term,
+		Refusal: r.Refusal.String(), RefusalDetail: r.RefusalDetail,
+		CommitAgeSeconds: age, UnpublishedLocalBytes: r.UnpublishedLocalBytes,
 	})
 	ok, err := s.wrote(ctx, term, rows, err)
 	if err != nil || ok {
 		return err
 	}
-	if _, gerr := s.GetVolume(ctx, volumeID); gerr != nil {
+	if _, gerr := s.GetVolume(ctx, r.VolumeID); gerr != nil {
 		return gerr
 	}
 	return nil
+}
+
+// ageSeconds narrows a duration onto the column, which is an INTEGER of seconds.
+//
+// Both bounds are refused rather than clamped. A negative age is a host that measured an
+// interval backwards, and a saturating clamp would store 0 — a volume rendering as
+// perfectly current is the one wrong answer that nobody investigates. The upper bound is
+// the column's, and 68 years of not committing is not a number to round.
+func ageSeconds(d time.Duration) (int32, error) {
+	secs := int64(d / time.Second)
+	if secs < 0 || secs > math.MaxInt32 {
+		return 0, fmt.Errorf("%w: commit age %s", metadata.ErrInvalidReport, d)
+	}
+	return int32(secs), nil
 }
 
 // SetVolumeState moves a volume through the §7 ownership machine.

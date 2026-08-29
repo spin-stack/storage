@@ -188,18 +188,62 @@ func reportVolumes(ctx context.Context, md metadata.Store, p *printer) ([]metada
 	// them the fleet serves nothing. At the ceiling: controlplane.Clone refuses a clone of a
 	// volume at MaxChainDepth, and the `chain_depth` series cannot say — it is recorded when
 	// the Control Plane changes a depth, so it says what was created, not what the fleet
-	// holds now. Refused: a volume whose host has fail-closed keeps the watermarks its last
-	// healthy report left, so every other number on its row reads normal.
+	// holds now. Refused: without the count, a volume whose host has fail-closed is one
+	// row among many and every other cell on it reads normal.
 	p.printf("VOLUMES (%d, %d with no primary host, %d at the depth ceiling of %d — a clone of one is refused until it is flattened; %d not being served by the host that holds it)\n",
 		len(vols), unplaced, atCeiling, controlplane.MaxChainDepth, countRefused(vols))
-	s := p.section("VOLUME_ID", "PRIMARY_HOST", "STATE", "EPOCH", "SIZE", "DEPTH", "PARENT_SNAPSHOT")
+	now, err := md.Now(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading the catalog's clock: %w", err)
+	}
+	s := p.section("VOLUME_ID", "PRIMARY_HOST", "STATE", "EPOCH", "SIZE", "DEPTH", "RPO", "UNPUBLISHED", "PARENT_SNAPSHOT")
 	for _, v := range vols {
-		s.row("%s\t%s\t%s\t%d\t%s\t%d\t%s\n",
+		s.row("%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\n",
 			v.VolumeID, orNone(v.PrimaryHostID), volumeState(v), v.CurrentEpoch,
-			capacity(v.SizeBytes), v.ChainDepth, orNone(v.ParentSnapshotID))
+			capacity(v.SizeBytes), v.ChainDepth, rpo(v, now), unpublished(v),
+			orNone(v.ParentSnapshotID))
 	}
 	s.end()
 	return vols, nil
+}
+
+// rpo renders what §11 calls the product: how long ago the volume's newest commit covering
+// everything written was published — the data that would be lost if its host went away now.
+//
+// It is aged forward from the report rather than printed as it arrived, because a host that
+// stopped reporting an hour ago last said "3 seconds", and printing 3 seconds against a
+// machine nobody has heard from is the single most misleading number this report could
+// carry. A volume nobody has reported prints "-": no measurement is not an RPO of zero.
+//
+// A volume past the target it was sold is marked, and the target is printed with it. Not a
+// separate column: an RPO is only interesting against the promise it was measured against,
+// and a volume with no promise (rpo_target_seconds 0, which is every volume until an
+// operator sets one) has nothing to be past.
+func rpo(v metadata.Volume, now time.Time) string {
+	if v.Progress.ReportedAt.IsZero() {
+		return "-"
+	}
+	age := v.Progress.CommitAge + now.Sub(v.Progress.ReportedAt)
+	if age < 0 {
+		age = v.Progress.CommitAge
+	}
+	cell := age.Truncate(time.Second).String()
+	target := time.Duration(v.RPOTargetSeconds) * time.Second
+	if target > 0 && age > target {
+		cell += fmt.Sprintf("(>%s)", target)
+	}
+	return cell
+}
+
+// unpublished renders what would be lost with the host: the bytes the guest has written
+// that no commit covers yet. It is the other half of the pair §11 asks be alarmed on, and
+// it is the one an operator can act on — an RPO that is growing because the object store
+// is unreachable shows up here as a number that only goes up.
+func unpublished(v metadata.Volume) string {
+	if v.Progress.ReportedAt.IsZero() {
+		return "-"
+	}
+	return capacity(v.Progress.UnpublishedLocalBytes)
 }
 
 // volumeState renders the STATE cell, the same move hostState makes above: the catalog's word
@@ -208,7 +252,7 @@ func reportVolumes(ctx context.Context, md metadata.Store, p *printer) ([]metada
 // belongs in the section below, not in a fourth column that would push PARENT_SNAPSHOT off an
 // eighty-column terminal.
 func volumeState(v metadata.Volume) string {
-	if !v.Refusal.Refused() {
+	if !v.Progress.Refusal.Refused() {
 		return string(v.State)
 	}
 	return fmt.Sprintf("NOT_SERVED(%s)", v.State)
@@ -224,14 +268,14 @@ func reportRefusals(p *printer, vols []metadata.Volume) {
 		countRefused(vols))
 	s := p.section("VOLUME_ID", "ON_HOST", "REASON", "DETAIL")
 	for _, v := range vols {
-		if !v.Refusal.Refused() {
+		if !v.Progress.Refusal.Refused() {
 			continue
 		}
 		// DETAIL last and unpadded: it is the only free-text cell in this report, it is
 		// the longest, and tabwriter would otherwise widen every row to the longest one.
 		// orNone because a refusal an older Agent reported without a sentence is still a
 		// refusal, and a blank final cell reads as a truncated line.
-		s.row("%s\t%s\t%s\t%s\n", v.VolumeID, orNone(v.PrimaryHostID), v.Refusal, orNone(v.RefusalDetail))
+		s.row("%s\t%s\t%s\t%s\n", v.VolumeID, orNone(v.PrimaryHostID), v.Progress.Refusal, orNone(v.Progress.RefusalDetail))
 	}
 	s.end()
 }
@@ -239,7 +283,7 @@ func reportRefusals(p *printer, vols []metadata.Volume) {
 func countRefused(vols []metadata.Volume) int {
 	var n int
 	for _, v := range vols {
-		if v.Refusal.Refused() {
+		if v.Progress.Refusal.Refused() {
 			n++
 		}
 	}

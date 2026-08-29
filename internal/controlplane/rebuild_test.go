@@ -93,14 +93,11 @@ func TestRebuildMetadataFromTheBucket(t *testing.T) {
 	if got.PrimaryHostID != "" {
 		t.Errorf("the rebuild invented a primary host: %q", got.PrimaryHostID)
 	}
-	// Nothing above zero can be proved from any object now: the manifest that stated a
-	// volume's published sequence is withdrawn. Zero is the safe direction for both of
-	// the Agent's floors — `published > 0` arms on any positive number and the durability
-	// floor compares with `<` — so a rebuild that under-claims never refuses a volume
-	// that is fine, while one that guessed high would refuse one that is.
-	if got.PublishedSequence != 0 || got.DurableSequence != 0 || got.LocalSequence != 0 {
-		t.Errorf("a rebuild claimed sequences it has no object for: %d/%d/%d",
-			got.LocalSequence, got.DurableSequence, got.PublishedSequence)
+	// And a rebuild states nothing about how far behind the volume is. That is an
+	// observation a host makes, no object in the bucket holds it, and a zero here would
+	// render as a volume perfectly up to date on a fleet that has just lost its catalog.
+	if (got.Progress != metadata.VolumeProgress{}) {
+		t.Errorf("a rebuild claimed an observation no object holds: %+v", got.Progress)
 	}
 
 	// The snapshot does not come back, and its absence is the assertion. Its existence

@@ -1,0 +1,74 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-08-29T12:18:00-03:00",
+  "source_fingerprint": {
+    "hash": "fd722d1f007e109a148a470b82630c4e08aeb02fc1c553c78fa0490bd2f2569b"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE volumes DROP COLUMN active_root_id;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.volumes.active_root_id"
+        },
+        {
+          "sql": "ALTER TABLE volumes DROP COLUMN published_root_id;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.volumes.published_root_id"
+        },
+        {
+          "sql": "ALTER TABLE volumes DROP COLUMN local_sequence;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.volumes.local_sequence"
+        },
+        {
+          "sql": "ALTER TABLE volumes DROP COLUMN durable_sequence;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.volumes.durable_sequence"
+        },
+        {
+          "sql": "ALTER TABLE volumes DROP COLUMN published_sequence;",
+          "type": "table.column",
+          "operation": "drop",
+          "path": "public.volumes.published_sequence"
+        },
+        {
+          "sql": "ALTER TABLE volumes\nADD COLUMN commit_age_seconds integer CONSTRAINT volumes_commit_age_seconds_check CHECK (commit_age_seconds >= 0);",
+          "type": "table.column",
+          "operation": "create",
+          "path": "public.volumes.commit_age_seconds"
+        },
+        {
+          "sql": "ALTER TABLE volumes\nADD COLUMN unpublished_local_bytes bigint DEFAULT 0 NOT NULL CONSTRAINT volumes_unpublished_local_bytes_check CHECK (unpublished_local_bytes >= 0);",
+          "type": "table.column",
+          "operation": "create",
+          "path": "public.volumes.unpublished_local_bytes"
+        },
+        {
+          "sql": "ALTER TABLE volumes ADD COLUMN reported_at timestamptz;",
+          "type": "table.column",
+          "operation": "create",
+          "path": "public.volumes.reported_at"
+        },
+        {
+          "sql": "ALTER TABLE volumes\nADD CONSTRAINT volumes_progress_is_reported_together CHECK ((commit_age_seconds IS NULL) = (reported_at IS NULL)) NOT VALID;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.volumes.volumes_progress_is_reported_together"
+        },
+        {
+          "sql": "ALTER TABLE volumes VALIDATE CONSTRAINT volumes_progress_is_reported_together;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.volumes.volumes_progress_is_reported_together"
+        }
+      ]
+    }
+  ]
+}

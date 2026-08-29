@@ -29,9 +29,10 @@ service ControlPlaneService {
   // the Agent must stop serving.
   rpc GetDesiredState(GetDesiredStateRequest) returns (GetDesiredStateResponse);
 
-  // ReportVolumeState reports epoch-qualified watermarks. The epoch is the point:
-  // a report from a fenced writer names an epoch the volume has moved past, and
-  // is refused rather than applied (INV-03, §12.3).
+  // ReportVolumeState reports, epoch-qualified, what a host observes about the volumes
+  // it holds — above all how far behind the object store each one is, which v6 §11 calls
+  // the product. The epoch is the point: a report from a fenced writer names an epoch the
+  // volume has moved past, and is refused rather than applied (§12.3).
   rpc ReportVolumeState(ReportVolumeStateRequest) returns (ReportVolumeStateResponse);
 
   // GetVolumeKeys returns the wrapped DEK of one volume, and the id of the KEK
@@ -189,38 +190,19 @@ message DesiredVolume {
   // because the manifest is written create-only (INV-16).
   string pending_snapshot_id = 9;
 
-  // published_sequence and durable_sequence are the two numbers the catalog already
-  // holds about this volume's data and that the attach path had no way to ask for.
-  // That is the whole of the two failures they close: both were reproduced against
-  // real binaries, and in both the fact that would have caught them was sitting in
-  // Postgres while the Agent decided, alone, that finding nothing means there was
-  // never anything.
+  // 10 and 11 were `published_sequence` and `durable_sequence`, floors an attach
+  // checked itself against so that a missing image read as "the manifest is gone"
+  // rather than "this volume is new". They were the write-ahead log's counters; under
+  // v6 every Agent reports zero, so both floors have been permanently zero and have
+  // checked nothing. Reserved rather than reused: a peer built before this change
+  // reads them as floors and would compare against whatever took their number.
   //
-  // published_sequence is the highest sequence a published image is known to
-  // reproduce. It is what tells "this volume has never stopped cleanly, boot it
-  // empty" apart from "its manifest is gone". Without it a stray delete, a lifecycle
-  // expiry, or a restore that missed one key produces a blank device with an INFO
-  // line — and the next graceful stop replaces the volume's real image with the
-  // blank one's successor, which makes it permanent.
-  //
-  // durable_sequence is the highest sequence this fleet ACKed to a guest's fsync. It
-  // is the floor an attach has to be able to reproduce out of its image plus whatever
-  // its local WAL replayed; coming back below it is the volume silently rolled back
-  // to an earlier state, which reads without an I/O error anywhere.
-  //
-  // They are on the wire for the same reason the parent ids are: ADR-0021 keeps the
-  // Agent from knowing what a Control Plane is, so it cannot look either of them up.
-  // They are floors to *check* against and never inputs to the read path — the object
-  // store stays the authority on what the volume holds, and these only decide whether
-  // what it holds is enough.
-  //
-  // Both can lag and neither can lead, which is what makes checking them safe. The
-  // catalog is written from a report the Agent sends after the fdatasync and after
-  // the publish, so an attach that satisfies these floors may legitimately be ahead
-  // of them; one that falls below them has lost data. Comparing with < rather than !=
-  // is that asymmetry.
-  int64 published_sequence = 10;
-  int64 durable_sequence = 11;
+  // The failure they were written for is real and is not gone with them: a volume
+  // whose HEAD object is lost is indistinguishable, to a host, from a volume that has
+  // never published, and a host that guesses wrong boots the tenant a blank disk. What
+  // v6 has to answer it with is the commit the catalog last saw published, which is a
+  // fact and not a counter — and which nothing carries yet.
+  reserved 10, 11;
 
   // rpo_target_seconds is how far behind the object store this volume is allowed to
   // fall: the age at which the host seals its tip and commits it even though the tip
@@ -347,21 +329,21 @@ enum VolumeRefusal {
   VOLUME_REFUSAL_PUBLISH_FENCED = 7;
 }
 
-// VolumeReport is one volume's watermarks as the Agent observes them, qualified
-// by the epoch under which they were produced.
+// VolumeReport is what one host observes about one volume, qualified by the epoch
+// under which it observed it.
 message VolumeReport {
   string volume_id = 1;
   // epoch is the epoch this Agent believes it holds the volume under. A report
   // whose epoch is not the volume's current one is refused: it comes from a
   // writer that has been fenced.
   int64 epoch = 2;
-  // Watermarks are informative (§5.8) and must satisfy
-  // published <= durable <= local (INV-03).
-  int64 local_sequence = 3;
-  int64 durable_sequence = 4;
-  int64 published_sequence = 5;
-  // remote_gap_bytes is this volume's share of the device's remote backlog.
-  int64 remote_gap_bytes = 6;
+  // 3, 4, 5 and 6 were `local_sequence`, `durable_sequence`, `published_sequence` and
+  // `remote_gap_bytes` — the write-ahead log's counters and its backlog. That log is
+  // withdrawn (v6), so every Agent reported the four as zero and the catalog stored
+  // zeros in three columns for a year. What v6 measures instead is below:
+  // last_successful_commit_age_ms, which §11 calls the product, and
+  // unpublished_local_bytes, which is the backlog stated in the unit that exists.
+  reserved 3, 4, 5, 6;
 
   // snapshot_id is the pending snapshot this host has finished acting on, empty when
   // it has nothing to say. The three fields below are one answer and are read
@@ -458,8 +440,7 @@ message ReportVolumeStateRequest {
 // writer and must stop behaving like one.
 enum ReportOutcome {
   REPORT_OUTCOME_UNSPECIFIED = 0;
-  // ACCEPTED: the watermarks were applied (or were already at least as high —
-  // each watermark is monotonic, so a late report is not an error).
+  // ACCEPTED: the report was recorded.
   REPORT_OUTCOME_ACCEPTED = 1;
   // STALE_EPOCH: the volume has moved past the epoch the report names.
   REPORT_OUTCOME_STALE_EPOCH = 2;
@@ -467,8 +448,11 @@ enum ReportOutcome {
   REPORT_OUTCOME_NOT_PRIMARY = 3;
   // UNKNOWN_VOLUME: the Control Plane has no such volume.
   REPORT_OUTCOME_UNKNOWN_VOLUME = 4;
-  // OUT_OF_ORDER: the report violates published <= durable <= local (INV-03).
-  REPORT_OUTCOME_OUT_OF_ORDER = 5;
+  // 5 was OUT_OF_ORDER, the one refusal a report could earn on its own contents:
+  // published <= durable <= local. It went with the watermarks. Reserved rather than
+  // reused because an Agent built before this change reads an unknown outcome as
+  // "something is wrong with what I sent" and stops reporting.
+  reserved 5;
 }
 
 message VolumeReportResult {

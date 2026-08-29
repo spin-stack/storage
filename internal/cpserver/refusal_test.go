@@ -45,13 +45,13 @@ func TestEveryWireRefusalHasAStoredOne(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if wire == storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED && v.Refusal != lifecycle.RefusalNone {
-				t.Fatalf("an unset refusal stored %q; unset is the Agent saying it is serving", v.Refusal)
+			if wire == storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED && v.Progress.Refusal != lifecycle.RefusalNone {
+				t.Fatalf("an unset refusal stored %q; unset is the Agent saying it is serving", v.Progress.Refusal)
 			}
-			if wire != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED && !v.Refusal.Refused() {
-				t.Fatalf("%s stored %q, which is not a refusal at all", wire, v.Refusal)
+			if wire != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED && !v.Progress.Refusal.Refused() {
+				t.Fatalf("%s stored %q, which is not a refusal at all", wire, v.Progress.Refusal)
 			}
-			seen[v.Refusal] = true
+			seen[v.Progress.Refusal] = true
 		})
 	}
 
@@ -92,7 +92,7 @@ func TestARefusalIsNotResurrectedByAFencedWriter(t *testing.T) {
 		t.Fatalf("the volume's own host at its own epoch was refused: %v", got)
 	}
 	v, _ := f.md.GetVolume(t.Context(), "vol-a")
-	if v.Refusal != lifecycle.RefusalImageMissing || v.RefusalDetail == "" {
+	if v.Progress.Refusal != lifecycle.RefusalImageMissing || v.Progress.RefusalDetail == "" {
 		t.Fatalf("the refusal did not land: %+v", v)
 	}
 
@@ -111,7 +111,7 @@ func TestARefusalIsNotResurrectedByAFencedWriter(t *testing.T) {
 		t.Fatalf("the new primary's report outcome = %v", got)
 	}
 	v, _ = f.md.GetVolume(t.Context(), "vol-a")
-	if v.Refusal != lifecycle.RefusalNone || v.RefusalDetail != "" {
+	if v.Progress.Refusal != lifecycle.RefusalNone || v.Progress.RefusalDetail != "" {
 		t.Fatalf("a volume its new host is serving still reads as refused: %+v", v)
 	}
 
@@ -123,7 +123,7 @@ func TestARefusalIsNotResurrectedByAFencedWriter(t *testing.T) {
 		t.Fatalf("the fenced writer's late report outcome = %v", got)
 	}
 	v, _ = f.md.GetVolume(t.Context(), "vol-a")
-	if v.Refusal != lifecycle.RefusalNone {
+	if v.Progress.Refusal != lifecycle.RefusalNone {
 		t.Fatalf("a writer the fleet moved past marked a volume its successor is serving: %+v", v)
 	}
 }
@@ -161,8 +161,8 @@ func TestAReportFromAHostTheFleetMovedPastIsRefusedBeforeItCanSayAnything(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Refusal != lifecycle.RefusalImageMissing {
-		t.Fatalf("the host holding the volume reported IMAGE_MISSING and the catalog says %q", got.Refusal)
+	if got.Progress.Refusal != lifecycle.RefusalImageMissing {
+		t.Fatalf("the host holding the volume reported IMAGE_MISSING and the catalog says %q", got.Progress.Refusal)
 	}
 
 	// The previous host is still running and still believes it owns the volume at the
@@ -177,8 +177,8 @@ func TestAReportFromAHostTheFleetMovedPastIsRefusedBeforeItCanSayAnything(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Refusal != lifecycle.RefusalImageMissing {
-		t.Errorf("a stale host's report cleared the refusal: %q — the operator is now told a volume nobody is serving is fine", got.Refusal)
+	if got.Progress.Refusal != lifecycle.RefusalImageMissing {
+		t.Errorf("a stale host's report cleared the refusal: %q — the operator is now told a volume nobody is serving is fine", got.Progress.Refusal)
 	}
 
 	// And the holder clearing it works, or the column would never come back.
@@ -187,8 +187,8 @@ func TestAReportFromAHostTheFleetMovedPastIsRefusedBeforeItCanSayAnything(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Refusal != lifecycle.RefusalNone || got.RefusalDetail != "" {
+	if got.Progress.Refusal != lifecycle.RefusalNone || got.Progress.RefusalDetail != "" {
 		t.Errorf("the holder reported it is serving again and the catalog still says %q/%q; a reason that outlives its cause is the one way this column misleads",
-			got.Refusal, got.RefusalDetail)
+			got.Progress.Refusal, got.Progress.RefusalDetail)
 	}
 }

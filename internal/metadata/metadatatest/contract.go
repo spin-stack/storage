@@ -76,8 +76,7 @@ func RunContract(t *testing.T, newStore Fixture) {
 		{"RecreatingAVolumeNeverRegresses", volumeRecreate},
 		{"VolumeGeometryIsImmutable", volumeGeometry},
 		{"RecreatingASnapshotIsANoOp", snapshotRecreate},
-		{"WatermarksAreOrderedAndNeverGoBackwards", watermarks},
-		{"ARefusalClearsAndCannotBeWrittenByAFencedHost", refusals},
+		{"AReportIsRecordedAndCannotBeWrittenByAFencedHost", reports},
 		{"UpsertHostDoesNotClobberStateOrCapacity", upsertHost},
 		{"ACordonRecordsWhoPlacedItAndOutranksThePressureLoop", cordonAuthority},
 		{"VolumeLifecycleIsExpressible", volumeLifecycle},
@@ -238,9 +237,6 @@ func everyMutation() []mutation {
 			_, err := bumpVolumeEpoch(ctx, s, term, w.vol, w.host, 0)
 			return err
 		}},
-		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.UpdateWatermarks(ctx, term, w.vol, 3, 2, 1)
-		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return setVolumeState(ctx, s, term, w.vol, lifecycle.VolumePrimarySuspected)
 		}},
@@ -261,8 +257,12 @@ func everyMutation() []mutation {
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, w world) error {
 			return s.ClearVolumeParent(ctx, term, w.vol)
 		}},
-		{"SetVolumeRefusal", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.SetVolumeRefusal(ctx, term, w.vol, w.host, 0, lifecycle.RefusalImageMissing, "the bucket has no manifest")
+		{"RecordVolumeReport", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.RecordVolumeReport(ctx, term, metadata.VolumeReport{
+				VolumeID: w.vol, HostID: w.host, Epoch: 0,
+				CommitAge: 90 * time.Second, UnpublishedLocalBytes: 1 << 20,
+				Refusal: lifecycle.RefusalImageMissing, RefusalDetail: "the bucket has no manifest",
+			})
 		}},
 		// DeleteVolume builds its own row and destroys that one. Every other entry
 		// here operates on the fixture, and this one cannot: volumeGeometry runs the
@@ -339,9 +339,6 @@ func missingRows(t *testing.T, s metadata.Store) {
 			_, err := bumpVolumeEpoch(ctx, s, term, ghostVol, w.host, 0)
 			return err
 		}},
-		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.UpdateWatermarks(ctx, term, ghostVol, 3, 2, 1)
-		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setVolumeState(ctx, s, term, ghostVol, lifecycle.VolumePrimarySuspected)
 		}},
@@ -351,8 +348,11 @@ func missingRows(t *testing.T, s metadata.Store) {
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.ClearVolumeParent(ctx, term, ghostVol)
 		}},
-		{"SetVolumeRefusal", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.SetVolumeRefusal(ctx, term, ghostVol, w.host, 0, lifecycle.RefusalImageMissing, "the bucket has no manifest")
+		{"RecordVolumeReport", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.RecordVolumeReport(ctx, term, metadata.VolumeReport{
+				VolumeID: ghostVol, HostID: w.host, Refusal: lifecycle.RefusalImageMissing,
+				RefusalDetail: "the bucket has no manifest",
+			})
 		}},
 		// A re-run of a delete that already finished lands here, and it is the reason
 		// the sentinel matters rather than a detail of it: the command reads
@@ -446,7 +446,6 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 		BlockSize: 65536, RPOTargetSeconds: 900, CurrentEpoch: 7, State: lifecycle.VolumeDetached,
 		PrimaryHostID: w.host, StandbyHostID: standby, ChainDepth: 3,
 		DEKWrapped: []byte{9, 8, 7}, KEKID: "kek-7",
-		LocalSequence: 900, DurableSequence: 800, PublishedSequence: 700,
 	}
 	if err := s.CreateVolume(ctx, w.term, want, nil); err != nil {
 		t.Fatal(err)
@@ -460,18 +459,16 @@ func volumeRoundTrip(t *testing.T, s metadata.Store) {
 		got.CurrentEpoch != want.CurrentEpoch ||
 		got.State != want.State || got.PrimaryHostID != want.PrimaryHostID ||
 		got.StandbyHostID != want.StandbyHostID || got.ChainDepth != want.ChainDepth ||
-		string(got.DEKWrapped) != string(want.DEKWrapped) || got.KEKID != want.KEKID ||
-		got.LocalSequence != want.LocalSequence || got.DurableSequence != want.DurableSequence ||
-		got.PublishedSequence != want.PublishedSequence {
+		string(got.DEKWrapped) != string(want.DEKWrapped) || got.KEKID != want.KEKID {
 		t.Fatalf("CreateVolume did not round-trip:\n got %+v\nwant %+v", got, want)
 	}
 }
 
 // volumeRecreate: two operators run rebuild-metadata at once; both see ErrNotFound
 // for the same volume and both create it. Whatever the loser's insert does, it must
-// not lower the epoch, blank the owner, shrink the volume, rewind the watermarks or
-// rewrite the lifecycle state — each of those hands the fleet to the wrong writer or
-// hides data that is durable in S3.
+// not lower the epoch, blank the owner, shrink the volume, rewrite the lifecycle state or
+// overwrite what the volume's host has observed — each of those hands the fleet to the
+// wrong writer or replaces a measurement with a default.
 func volumeRecreate(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
@@ -482,7 +479,10 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateWatermarks(ctx, w.term, vol, 500, 400, 300); err != nil {
+	if err := s.RecordVolumeReport(ctx, w.term, metadata.VolumeReport{
+		VolumeID: vol, HostID: w.host, Epoch: 5,
+		CommitAge: 42 * time.Second, UnpublishedLocalBytes: 1 << 20,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -507,8 +507,8 @@ func volumeRecreate(t *testing.T, s metadata.Store) {
 		t.Fatalf("volume shrank to %d", got.SizeBytes)
 	case got.State != lifecycle.VolumeActive:
 		t.Fatalf("lifecycle state was rewritten to %q", got.State)
-	case got.LocalSequence != 500 || got.DurableSequence != 400 || got.PublishedSequence != 300:
-		t.Fatalf("watermarks were rewound: %+v", got)
+	case got.Progress.CommitAge != 42*time.Second || got.Progress.UnpublishedLocalBytes != 1<<20:
+		t.Fatalf("what the volume's host observed was overwritten by a re-create: %+v", got.Progress)
 	}
 }
 
@@ -575,113 +575,60 @@ func snapshotRecreate(t *testing.T, s metadata.Store) {
 	}
 }
 
-// watermarks: an epoch-N primary's report can be queued behind a retry and land
-// after epoch N+1's writer has published its own. Promotion does not change the CP
-// term, so the stale report passes the term guard — the store is the only thing left
-// that can refuse to move durable_sequence backwards, and that number is what an
-// operator uses during an incident to decide whether to accept data loss.
-func watermarks(t *testing.T, s metadata.Store) {
-	ctx := t.Context()
-	w := newWorld(t, s)
-	if err := s.UpdateWatermarks(ctx, w.term, w.vol, 100, 90, 80); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("a late report never lowers a watermark", func(t *testing.T) {
-		if err := s.UpdateWatermarks(ctx, w.term, w.vol, 50, 40, 30); err != nil {
-			t.Fatalf("a stale report is ignored, not an error: %v", err)
-		}
-		v, _ := s.GetVolume(ctx, w.vol)
-		if v.LocalSequence != 100 || v.DurableSequence != 90 || v.PublishedSequence != 80 {
-			t.Fatalf("watermarks went backwards: %+v", v)
-		}
-	})
-
-	t.Run("out-of-order reports are rejected", func(t *testing.T) {
-		tests := []struct {
-			name                      string
-			local, durable, published int64
-		}{
-			{"durable above local", 100, 200, 80},
-			{"published above durable", 300, 90, 200},
-			{"published above local", 100, 400, 500},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				err := s.UpdateWatermarks(ctx, w.term, w.vol, tc.local, tc.durable, tc.published)
-				if !errors.Is(err, metadata.ErrWatermarkOrder) {
-					t.Fatalf("want ErrWatermarkOrder, got %v", err)
-				}
-			})
-		}
-		v, _ := s.GetVolume(ctx, w.vol)
-		if v.LocalSequence != 100 || v.DurableSequence != 90 || v.PublishedSequence != 80 {
-			t.Fatalf("a rejected report still mutated the row: %+v", v)
-		}
-	})
-
-	t.Run("a forward report advances", func(t *testing.T) {
-		if err := s.UpdateWatermarks(ctx, w.term, w.vol, 400, 300, 200); err != nil {
-			t.Fatal(err)
-		}
-		v, _ := s.GetVolume(ctx, w.vol)
-		if v.LocalSequence != 400 || v.DurableSequence != 300 || v.PublishedSequence != 200 {
-			t.Fatalf("forward report did not land: %+v", v)
-		}
-	})
-
-	// The reporting path has always refused disorder; the *creating* path did not,
-	// so INV-03 could be violated at birth by rebuild-metadata or by a test fixture
-	// and no later report would ever repair it (each watermark only moves forward).
-	// Postgres now refuses such a row outright; this is the same refusal one layer
-	// up, so both stores answer with the same sentinel instead of one of them
-	// answering with a constraint violation.
-	t.Run("a create with out-of-order watermarks is rejected", func(t *testing.T) {
-		tests := []struct {
-			name                      string
-			local, durable, published int64
-		}{
-			{"durable above local", 10, 20, 5},
-			{"published above durable", 30, 9, 20},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				vol := id()
-				err := s.CreateVolume(ctx, w.term, metadata.Volume{DEKKeyID: 1,
-					VolumeID: vol, SizeBytes: 1 << 20, BlockSize: 65536,
-					State: lifecycle.VolumeActive, DEKWrapped: []byte{1}, KEKID: "k",
-					LocalSequence: tc.local, DurableSequence: tc.durable, PublishedSequence: tc.published,
-				}, nil)
-				if !errors.Is(err, metadata.ErrWatermarkOrder) {
-					t.Fatalf("want ErrWatermarkOrder, got %v", err)
-				}
-				if _, err := s.GetVolume(ctx, vol); !errors.Is(err, metadata.ErrNotFound) {
-					t.Fatalf("the refused volume was created anyway: %v", err)
-				}
-			})
-		}
-	})
-}
-
-// refusals: the two ways a state column goes wrong, neither visible from an assertion on
-// the returned error because both writes "succeed" — it fails to clear when the condition
-// ends (the volume reads NOT SERVED for ever), and it is written by somebody whose opinion
-// no longer counts (a host the fleet moved past marking a volume its successor is serving).
-func refusals(t *testing.T, s metadata.Store) {
+// reports: what one host says about one volume, and the two ways such a column goes
+// wrong — neither visible from an assertion on the returned error, because both writes
+// "succeed". It fails to clear when the condition ends (the volume reads NOT SERVED, or
+// behind on its RPO, for ever), and it is written by somebody whose opinion no longer
+// counts: a host the fleet moved past marking a volume its successor is serving.
+func reports(t *testing.T, s metadata.Store) {
 	ctx := t.Context()
 	w := newWorld(t, s)
 	// newWorld places the volume on w.host at epoch 0, which is the epoch its reports
 	// are qualified by until something promotes it.
 	const epoch = 0
+	report := func(r metadata.VolumeReport) error {
+		r.VolumeID, r.HostID = w.vol, w.host
+		return s.RecordVolumeReport(ctx, w.term, r)
+	}
 
-	t.Run("a refusal from the volume's own host at its own epoch lands", func(t *testing.T) {
-		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch,
-			lifecycle.RefusalImageMissing, "published up to 512 and the bucket holds nothing"); err != nil {
+	t.Run("a report from the volume's own host at its own epoch lands", func(t *testing.T) {
+		err := report(metadata.VolumeReport{
+			Epoch: epoch, CommitAge: 90 * time.Second, UnpublishedLocalBytes: 3 << 20,
+			Refusal:       lifecycle.RefusalImageMissing,
+			RefusalDetail: "the bucket holds no manifest",
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
 		v, _ := s.GetVolume(ctx, w.vol)
-		if v.Refusal != lifecycle.RefusalImageMissing || v.RefusalDetail == "" {
-			t.Fatalf("the refusal was not recorded: %+v", v)
+		switch {
+		case v.Progress.Refusal != lifecycle.RefusalImageMissing || v.Progress.RefusalDetail == "":
+			t.Fatalf("the refusal was not recorded: %+v", v.Progress)
+		case v.Progress.CommitAge != 90*time.Second:
+			t.Fatalf("the RPO was not recorded: %+v", v.Progress)
+		case v.Progress.UnpublishedLocalBytes != 3<<20:
+			t.Fatalf("the backlog was not recorded: %+v", v.Progress)
+		case v.Progress.ReportedAt.IsZero():
+			// Without it, an age of 0 from a host that stopped reporting a week ago is
+			// indistinguishable from one measured a second ago, and the number §11 calls
+			// the product would be a lie that reads as perfect health.
+			t.Fatalf("the report is not stamped with when the catalog heard it: %+v", v.Progress)
+		}
+	})
+
+	t.Run("a later report replaces it rather than merging", func(t *testing.T) {
+		// The watermarks this replaced were merged with GREATEST, because they only grew.
+		// An age and a backlog both *shrink* when a commit lands, and a max over them
+		// would freeze the row at the worst moment the volume ever had.
+		if err := report(metadata.VolumeReport{Epoch: epoch, CommitAge: time.Second}); err != nil {
+			t.Fatal(err)
+		}
+		v, _ := s.GetVolume(ctx, w.vol)
+		if v.Progress.CommitAge != time.Second || v.Progress.UnpublishedLocalBytes != 0 {
+			t.Fatalf("a volume that caught up still reads as behind: %+v", v.Progress)
+		}
+		if v.Progress.Refusal != lifecycle.RefusalNone || v.Progress.RefusalDetail != "" {
+			t.Fatalf("a healthy report did not clear the refusal: %+v", v.Progress)
 		}
 	})
 
@@ -694,34 +641,26 @@ func refusals(t *testing.T, s metadata.Store) {
 		}
 		// Not an error: it is a writer that has been fenced, and a caller that treated
 		// this as a failure would retry it for ever.
-		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, other, epoch,
-			lifecycle.RefusalLeaseLost, "somebody else's opinion"); err != nil {
+		err := s.RecordVolumeReport(ctx, w.term, metadata.VolumeReport{
+			VolumeID: w.vol, HostID: other, Epoch: epoch,
+			CommitAge: time.Hour, Refusal: lifecycle.RefusalLeaseLost, RefusalDetail: "somebody else's opinion",
+		})
+		if err != nil {
 			t.Fatalf("a report from a host that does not hold the volume is ignored, not an error: %v", err)
 		}
 		v, _ := s.GetVolume(ctx, w.vol)
-		if v.Refusal != lifecycle.RefusalImageMissing {
-			t.Fatalf("a host that does not hold the volume rewrote its refusal: %+v", v)
+		if v.Progress.Refusal != lifecycle.RefusalNone || v.Progress.CommitAge != time.Second {
+			t.Fatalf("a host that does not hold the volume rewrote its row: %+v", v.Progress)
 		}
 	})
 
 	t.Run("a report under a superseded epoch does not write it", func(t *testing.T) {
-		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch+7,
-			lifecycle.RefusalNone, ""); err != nil {
+		if err := report(metadata.VolumeReport{Epoch: epoch + 7, CommitAge: time.Hour}); err != nil {
 			t.Fatalf("a report under the wrong epoch is ignored, not an error: %v", err)
 		}
 		v, _ := s.GetVolume(ctx, w.vol)
-		if v.Refusal != lifecycle.RefusalImageMissing {
-			t.Fatalf("a report under a foreign epoch cleared the refusal: %+v", v)
-		}
-	})
-
-	t.Run("the volume serving again clears it, detail and all", func(t *testing.T) {
-		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch, lifecycle.RefusalNone, ""); err != nil {
-			t.Fatal(err)
-		}
-		v, _ := s.GetVolume(ctx, w.vol)
-		if v.Refusal != lifecycle.RefusalNone || v.RefusalDetail != "" {
-			t.Fatalf("a healthy report did not clear the refusal: %+v", v)
+		if v.Progress.CommitAge != time.Second {
+			t.Fatalf("a report under a foreign epoch rewrote the row: %+v", v.Progress)
 		}
 	})
 
@@ -729,36 +668,55 @@ func refusals(t *testing.T, s metadata.Store) {
 		// The one shape the schema refuses outright. It is asserted through the Store
 		// rather than in SQL so both implementations answer the same way, and because a
 		// sentence with nothing to explain is exactly what the next reader believes.
-		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch,
-			lifecycle.RefusalNone, "a sentence about nothing"); err != nil {
+		if err := report(metadata.VolumeReport{Epoch: epoch, RefusalDetail: "a sentence about nothing"}); err != nil {
 			t.Fatal(err)
 		}
 		v, _ := s.GetVolume(ctx, w.vol)
-		if v.RefusalDetail != "" {
-			t.Fatalf("a detail survived with no refusal on it: %+v", v)
+		if v.Progress.RefusalDetail != "" {
+			t.Fatalf("a detail survived with no refusal on it: %+v", v.Progress)
 		}
 	})
 
 	t.Run("a value outside the vocabulary is refused", func(t *testing.T) {
-		err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch, lifecycle.Refusal("NOPE"), "x")
+		err := report(metadata.VolumeReport{Epoch: epoch, Refusal: lifecycle.Refusal("NOPE"), RefusalDetail: "x"})
 		if !errors.Is(err, lifecycle.ErrUnknownState) {
 			t.Fatalf("want ErrUnknownState, got %v", err)
 		}
 	})
 
+	t.Run("a measurement no observation produces is refused", func(t *testing.T) {
+		// Refused and not clamped. A negative age clamped to zero renders the volume as
+		// perfectly current, which is the one wrong answer nobody goes looking at.
+		for _, tc := range []struct {
+			name string
+			r    metadata.VolumeReport
+		}{
+			{"a negative age", metadata.VolumeReport{Epoch: epoch, CommitAge: -time.Second}},
+			{"a negative backlog", metadata.VolumeReport{Epoch: epoch, UnpublishedLocalBytes: -1}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := report(tc.r); !errors.Is(err, metadata.ErrInvalidReport) {
+					t.Fatalf("want ErrInvalidReport, got %v", err)
+				}
+			})
+		}
+	})
+
 	t.Run("placing the volume elsewhere clears it", func(t *testing.T) {
-		if err := s.SetVolumeRefusal(ctx, w.term, w.vol, w.host, epoch,
-			lifecycle.RefusalNoKey, "this host holds no KEK"); err != nil {
+		if err := report(metadata.VolumeReport{
+			Epoch: epoch, CommitAge: time.Hour, UnpublishedLocalBytes: 1 << 30,
+			Refusal: lifecycle.RefusalNoKey, RefusalDetail: "this host holds no KEK",
+		}); err != nil {
 			t.Fatal(err)
 		}
-		// Detach: the refusal was a statement about a host this volume no longer has,
-		// and a reason that outlives its cause is one the next reader will believe.
+		// Detach: every one of those was a statement about a host this volume no longer
+		// has, and a reason that outlives its cause is one the next reader will believe.
 		if err := s.SetVolumePrimaryHost(ctx, w.term, w.vol, ""); err != nil {
 			t.Fatal(err)
 		}
 		v, _ := s.GetVolume(ctx, w.vol)
-		if v.Refusal != lifecycle.RefusalNone || v.RefusalDetail != "" {
-			t.Fatalf("a detached volume still says its old host is refusing it: %+v", v)
+		if v.Progress != (metadata.VolumeProgress{}) {
+			t.Fatalf("a detached volume still carries what its old host observed: %+v", v.Progress)
 		}
 	})
 }
@@ -1765,9 +1723,6 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 			_, err := bumpVolumeEpoch(ctx, s, term, "", w.host, 0)
 			return err
 		}},
-		{"UpdateWatermarks", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
-			return s.UpdateWatermarks(ctx, term, "", 3, 2, 1)
-		}},
 		{"SetVolumeState", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return setVolumeState(ctx, s, term, "", lifecycle.VolumePrimarySuspected)
 		}},
@@ -1786,8 +1741,8 @@ func emptyIDs(t *testing.T, s metadata.Store) {
 		{"ClearVolumeParent", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.ClearVolumeParent(ctx, term, "")
 		}},
-		{"SetVolumeRefusal", func(ctx context.Context, s metadata.Store, term int64, w world) error {
-			return s.SetVolumeRefusal(ctx, term, "", w.host, 0, lifecycle.RefusalNone, "")
+		{"RecordVolumeReport", func(ctx context.Context, s metadata.Store, term int64, w world) error {
+			return s.RecordVolumeReport(ctx, term, metadata.VolumeReport{VolumeID: "", HostID: w.host})
 		}},
 		{"DeleteVolume", func(ctx context.Context, s metadata.Store, term int64, _ world) error {
 			return s.DeleteVolume(ctx, term, "")

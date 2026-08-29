@@ -241,13 +241,6 @@ func TestApplyPreparesAChainAndReportsIt(t *testing.T) {
 	case v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED:
 		t.Errorf("a healthy volume reported a refusal: %v %q", v.Refusal, v.RefusalDetail)
 	}
-	// The watermarks are zero and mean nothing yet: they were the write-ahead log's
-	// counters and get their meaning back from the commit protocol. Asserted, because a
-	// number invented here is a fencing decision made on a fiction.
-	if v.LocalSequence|v.DurableSequence|v.PublishedSequence != 0 {
-		t.Errorf("a watermark was invented: local=%d durable=%d published=%d",
-			v.LocalSequence, v.DurableSequence, v.PublishedSequence)
-	}
 }
 
 func TestApplyIsIdempotent(t *testing.T) {
@@ -1717,5 +1710,62 @@ func TestTheReportCarriesHowFarBehindTheBucketAVolumeIs(t *testing.T) {
 	// The new tip, and nothing else: the layer that was published is not owed any more.
 	if got.UnpublishedLocalBytes != 3<<20 {
 		t.Fatalf("unpublished = %d bytes, want the %d the tip holds", got.UnpublishedLocalBytes, 3<<20)
+	}
+}
+
+// TestTheReportedRPOIsWhatSection11Defines, which is not "how long since the last commit".
+//
+// §11's definition is the age of the newest commit that *covers everything written*, and
+// the difference is not pedantry — it is both directions of a wrong answer, and the whole
+// point of the number is that an operator can trust it:
+//
+//   - a volume nobody writes to is inside its RPO, not falling further behind for ever.
+//     Reported the other way, every idle volume in a fleet eventually reads as a volume
+//     about to lose data, and the alert that fires on all of them gets turned off;
+//   - a volume whose guest has written since the last commit is exposed for as long as
+//     that has been true. Reported as "0s just after a commit", the number goes to zero
+//     at the exact moment the exposure starts growing again.
+//
+// The condition is the same one the age trigger uses to decide a tip has been written to,
+// deliberately: a volume can then never report itself past a target the trigger considers
+// it idle for, which is the pair of numbers contradicting each other in the catalog.
+func TestTheReportedRPOIsWhatSection11Defines(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		tipBytes int64
+		want     time.Duration
+	}{
+		// A freshly created qcow2 is ~193 KiB of header and tables before a guest writes
+		// anything, which is why "untouched" is not "zero bytes".
+		{"a volume nobody has written to is inside its RPO", 200 << 10, 0},
+		{"a volume written to since its last commit is exposed for as long as that", 2 << 20, time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// With a publisher, so a commit actually lands and the volume has an anchor
+			// to be measured from. Without one nothing is ever published, and both cases
+			// report zero for the honest reason that this host has never committed.
+			h := newHarnessFull(t, 8<<20, &recordingPublisher{})
+			h.rotating(t, 9<<20)
+			if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+				t.Fatalf("the cycle that commits: %v", err)
+			}
+			// The guest follows the rotation onto the new tip, and grows it by the amount
+			// under test.
+			tip := h.tip(t)
+			h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(tip)
+			h.paths.sizes[tip] = tc.tipBytes
+			h.clk.Advance(time.Hour)
+			if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+				t.Fatalf("applying: %v", err)
+			}
+
+			got := h.volumes(t)[vol].LastCommitAge
+			if got != tc.want {
+				t.Fatalf("reported RPO %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

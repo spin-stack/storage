@@ -509,9 +509,6 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 		reports = append(reports, &storagev1.VolumeReport{
 			VolumeId:                  v.VolumeID,
 			Epoch:                     v.Epoch,
-			LocalSequence:             v.LocalSequence,
-			DurableSequence:           v.DurableSequence,
-			PublishedSequence:         v.PublishedSequence,
 			SnapshotId:                v.SnapshotID,
 			SnapshotCommitId:          v.SnapshotCommitID,
 			LastSuccessfulCommitAgeMs: v.LastCommitAge.Milliseconds(),

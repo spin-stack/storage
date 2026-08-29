@@ -82,8 +82,8 @@ func TestStaleTermRejectedAcrossMutations(t *testing.T) {
 			_, err := s.BumpVolumeEpoch(ctx, term, "v", "h", 0)
 			return err
 		}},
-		{"UpdateWatermarks", func(s *sim.Store, term int64) error {
-			return s.UpdateWatermarks(ctx, term, "v", 1, 1, 1)
+		{"RecordVolumeReport", func(s *sim.Store, term int64) error {
+			return s.RecordVolumeReport(ctx, term, metadata.VolumeReport{VolumeID: "v", HostID: "h"})
 		}},
 	}
 	for _, tc := range tests {
@@ -132,16 +132,10 @@ func TestGettersRoundTripAndNotFound(t *testing.T) {
 	if err := s.CreateVolume(ctx, term, metadata.Volume{DEKKeyID: 1, VolumeID: "v1", State: lifecycle.VolumeActive}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateWatermarks(ctx, term, "v1", 10, 5, 3); err != nil {
-		t.Fatal(err)
-	}
-	v, err := s.GetVolume(ctx, "v1")
-	if err != nil || v.LocalSequence != 10 || v.DurableSequence != 5 || v.PublishedSequence != 3 {
-		t.Fatalf("GetVolume after watermarks: %+v err=%v", v, err)
-	}
-	// UpdateWatermarks on a missing volume is ErrNotFound.
-	if err := s.UpdateWatermarks(ctx, term, "absent", 1, 1, 1); !errors.Is(err, metadata.ErrNotFound) {
-		t.Fatalf("UpdateWatermarks missing: %v", err)
+	// RecordVolumeReport on a missing volume is ErrNotFound.
+	err = s.RecordVolumeReport(ctx, term, metadata.VolumeReport{VolumeID: "absent", HostID: "h1"})
+	if !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("RecordVolumeReport missing: %v", err)
 	}
 	// BumpVolumeEpoch on a missing volume is ErrNotFound.
 	if _, err := s.BumpVolumeEpoch(ctx, term, "absent", "h1", 0); !errors.Is(err, metadata.ErrNotFound) {

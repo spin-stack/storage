@@ -292,11 +292,6 @@ func (s *Store) CreateVolume(_ context.Context, term int64, v metadata.Volume, b
 	if !v.State.Valid() {
 		return fmt.Errorf("%w: volume state %q", lifecycle.ErrUnknownState, v.State)
 	}
-	// INV-03 at birth: a row created out of order can never be repaired, because
-	// every later report only moves each watermark forward.
-	if err := metadata.CheckWatermarkOrder(v.LocalSequence, v.DurableSequence, v.PublishedSequence); err != nil {
-		return err
-	}
 	if err := metadata.CheckDEKKeyID(v.DEKKeyID); err != nil {
 		return err
 	}
@@ -340,9 +335,7 @@ func converge(cur, next metadata.Volume) metadata.Volume {
 	if cur.SizeBytes != 0 {
 		next.SizeBytes, next.BlockSize = cur.SizeBytes, cur.BlockSize
 	}
-	next.LocalSequence = max(cur.LocalSequence, next.LocalSequence)
-	next.DurableSequence = max(cur.DurableSequence, next.DurableSequence)
-	next.PublishedSequence = max(cur.PublishedSequence, next.PublishedSequence)
+	next.Progress = cur.Progress                 // what a host observed, never what a re-INSERT carries
 	next.State = cur.State                       // moves only through SetVolumeState (§7)
 	next.FencingStartedAt = cur.FencingStartedAt // and neither does its fence record
 	if cur.PrimaryHostID != "" {
@@ -458,12 +451,13 @@ func (s *Store) SetVolumePrimaryHost(_ context.Context, term int64, volumeID, pr
 	// SetVolumeState's, spelled here rather than shared: there are two lines of it and
 	// a helper would hide which write owns the field.
 	v.FencingStartedAt = time.Time{}
-	// And the refusal, for the same shape of reason one step out: it is a statement
-	// about a host, made by that host, and this write is the volume leaving that host.
-	// Left behind, a volume detached from the machine that could not open it would keep
-	// printing NOT_SERVED wherever it landed next, until that host's first report
-	// happened to overwrite it.
-	v.Refusal, v.RefusalDetail = lifecycle.RefusalNone, ""
+	// And everything the departing host observed, for the same shape of reason one step
+	// out: it is a statement about a host, made by that host, and this write is the
+	// volume leaving that host. Left behind, a volume detached from the machine that
+	// could not open it would keep printing NOT_SERVED — and the RPO of a host that is
+	// no longer measuring it — wherever it landed next, until its new host's first
+	// report happened to overwrite them.
+	v.Progress = metadata.VolumeProgress{}
 	s.vols[volumeID] = v
 	return nil
 }
@@ -549,71 +543,48 @@ func (s *Store) DeleteVolume(_ context.Context, term int64, volumeID string) err
 	return nil
 }
 
-// SetVolumeRefusal records, or clears, why the volume's host is not serving it.
-// metadata.Store carries the whole reasoning; the two lines that matter here are the
-// guard and its non-error.
-func (s *Store) SetVolumeRefusal(_ context.Context, term int64, volumeID, hostID string, epoch int64,
-	refusal lifecycle.Refusal, detail string,
-) error {
-	if err := requireID("volume", volumeID); err != nil {
+// RecordVolumeReport records one host's observation of one volume. metadata.Store carries
+// the whole reasoning; the two lines that matter here are the guard and its non-error.
+func (s *Store) RecordVolumeReport(_ context.Context, term int64, r metadata.VolumeReport) error {
+	if err := requireID("volume", r.VolumeID); err != nil {
 		return err
 	}
-	if !refusal.Valid() {
-		return fmt.Errorf("%w: volume refusal %q", lifecycle.ErrUnknownState, refusal)
+	if !r.Refusal.Valid() {
+		return fmt.Errorf("%w: volume refusal %q", lifecycle.ErrUnknownState, r.Refusal)
+	}
+	if r.CommitAge < 0 || r.UnpublishedLocalBytes < 0 {
+		return fmt.Errorf("%w: commit age %s, unpublished %d bytes",
+			metadata.ErrInvalidReport, r.CommitAge, r.UnpublishedLocalBytes)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkTerm(term); err != nil {
 		return err
 	}
-	v, ok := s.vols[volumeID]
+	v, ok := s.vols[r.VolumeID]
 	if !ok {
 		return metadata.ErrNotFound
 	}
 	// The fencing guard, and the reason this is not a read-then-write in the caller:
 	// between a GetVolume and this line the volume can be promoted away, and the whole
-	// point of the column is that a host the fleet has moved past cannot write it. In
+	// point of these columns is that a host the fleet has moved past cannot write them. In
 	// Postgres it is one UPDATE ... WHERE primary_host_id = $ AND current_epoch = $;
 	// here it is these three lines, and both must answer the same way.
-	if v.PrimaryHostID != hostID || v.CurrentEpoch != epoch {
+	if v.PrimaryHostID != r.HostID || v.CurrentEpoch != r.Epoch {
 		return nil
 	}
 	// A detail with no refusal is a sentence about nothing — it would outlive the
 	// condition it explains, which is the mistake hosts.cordon_reason exists not to
 	// repeat. Cleared together, always.
-	v.Refusal, v.RefusalDetail = refusal, detail
-	if !refusal.Refused() {
-		v.RefusalDetail = ""
+	detail := r.RefusalDetail
+	if !r.Refusal.Refused() {
+		detail = ""
 	}
-	s.vols[volumeID] = v
-	return nil
-}
-
-func (s *Store) UpdateWatermarks(_ context.Context, term int64, volumeID string, local, durable, published int64) error {
-	if err := requireID("volume", volumeID); err != nil {
-		return err
+	v.Progress = metadata.VolumeProgress{
+		CommitAge: r.CommitAge, UnpublishedLocalBytes: r.UnpublishedLocalBytes,
+		Refusal: r.Refusal, RefusalDetail: detail, ReportedAt: s.now(),
 	}
-	if err := metadata.CheckWatermarkOrder(local, durable, published); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkTerm(term); err != nil {
-		return err
-	}
-	v, ok := s.vols[volumeID]
-	if !ok {
-		return metadata.ErrNotFound
-	}
-	// Monotonic per column. A report from epoch N delivered after epoch N+1 has
-	// published its own passes the term guard (promotion does not change the CP
-	// term), so this is the only thing standing between a retry queue and a
-	// durable_sequence that goes backwards during an incident. Component-wise max
-	// preserves published ≤ durable ≤ local.
-	v.LocalSequence = max(v.LocalSequence, local)
-	v.DurableSequence = max(v.DurableSequence, durable)
-	v.PublishedSequence = max(v.PublishedSequence, published)
-	s.vols[volumeID] = v
+	s.vols[r.VolumeID] = v
 	return nil
 }
 

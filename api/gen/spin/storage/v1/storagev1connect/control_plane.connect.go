@@ -63,9 +63,10 @@ type ControlPlaneServiceClient interface {
 	// reconciles towards it; a volume that disappears from the answer is a volume
 	// the Agent must stop serving.
 	GetDesiredState(context.Context, *connect.Request[v1.GetDesiredStateRequest]) (*connect.Response[v1.GetDesiredStateResponse], error)
-	// ReportVolumeState reports epoch-qualified watermarks. The epoch is the point:
-	// a report from a fenced writer names an epoch the volume has moved past, and
-	// is refused rather than applied (INV-03, §12.3).
+	// ReportVolumeState reports, epoch-qualified, what a host observes about the volumes
+	// it holds — above all how far behind the object store each one is, which v6 §11 calls
+	// the product. The epoch is the point: a report from a fenced writer names an epoch the
+	// volume has moved past, and is refused rather than applied (§12.3).
 	ReportVolumeState(context.Context, *connect.Request[v1.ReportVolumeStateRequest]) (*connect.Response[v1.ReportVolumeStateResponse], error)
 	// GetVolumeKeys returns the wrapped DEK of one volume, and the id of the KEK
 	// that wraps it (§15.1). Without it the desired state is an instruction the
@@ -170,9 +171,10 @@ type ControlPlaneServiceHandler interface {
 	// reconciles towards it; a volume that disappears from the answer is a volume
 	// the Agent must stop serving.
 	GetDesiredState(context.Context, *connect.Request[v1.GetDesiredStateRequest]) (*connect.Response[v1.GetDesiredStateResponse], error)
-	// ReportVolumeState reports epoch-qualified watermarks. The epoch is the point:
-	// a report from a fenced writer names an epoch the volume has moved past, and
-	// is refused rather than applied (INV-03, §12.3).
+	// ReportVolumeState reports, epoch-qualified, what a host observes about the volumes
+	// it holds — above all how far behind the object store each one is, which v6 §11 calls
+	// the product. The epoch is the point: a report from a fenced writer names an epoch the
+	// volume has moved past, and is refused rather than applied (§12.3).
 	ReportVolumeState(context.Context, *connect.Request[v1.ReportVolumeStateRequest]) (*connect.Response[v1.ReportVolumeStateResponse], error)
 	// GetVolumeKeys returns the wrapped DEK of one volume, and the id of the KEK
 	// that wraps it (§15.1). Without it the desired state is an instruction the

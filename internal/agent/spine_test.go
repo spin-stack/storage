@@ -55,8 +55,8 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	}
 
 	vols := agent.NewVolumeSet()
-	vols.Set(agent.VolumeStatus{VolumeID: "vol-mine", Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10})
-	vols.Set(agent.VolumeStatus{VolumeID: "vol-stolen", Epoch: 8, LocalSequence: 7, DurableSequence: 7, PublishedSequence: 7})
+	vols.Set(agent.VolumeStatus{VolumeID: "vol-mine", Epoch: 4, LastCommitAge: 30 * time.Second, UnpublishedLocalBytes: 4096})
+	vols.Set(agent.VolumeStatus{VolumeID: "vol-stolen", Epoch: 8, LastCommitAge: 7 * time.Second})
 
 	loop, err := agent.New(testConfig(), agent.Deps{
 		Clock:        clk,
@@ -104,15 +104,15 @@ func TestTheSpineEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mine.LocalSequence != 30 || mine.DurableSequence != 20 || mine.PublishedSequence != 10 {
-		t.Fatalf("in-epoch watermarks were not applied: %+v", mine)
+	if mine.Progress.CommitAge != 30*time.Second || mine.Progress.UnpublishedLocalBytes != 4096 {
+		t.Fatalf("an in-epoch report was not applied: %+v", mine.Progress)
 	}
 	stolen, err := md.GetVolume(t.Context(), "vol-stolen")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stolen.LocalSequence != 0 {
-		t.Fatalf("a report under a superseded epoch was applied: %+v", stolen)
+	if (stolen.Progress != metadata.VolumeProgress{}) {
+		t.Fatalf("a report under a superseded epoch was applied: %+v", stolen.Progress)
 	}
 	fenced := loop.Fenced()
 	if len(fenced) != 1 || fenced[0] != "vol-stolen" {
@@ -160,17 +160,14 @@ func TestARefusalCrossesTheSpineAndClears(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The watermarks are the healthy ones a previous session left behind, on purpose:
-	// that is exactly the state the catalog was in while a volume was refusing to serve,
-	// and the reason nothing could see it.
-	const detail = "agent: volume vol-mine published up to sequence 512 and the object store holds no image for it"
+	const detail = "agent: the object store holds no HEAD for vol-mine and the catalog says it has published"
 	vols.Set(agent.VolumeStatus{
-		VolumeID: "vol-mine", Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10,
+		VolumeID: "vol-mine", Epoch: 4, LastCommitAge: 30 * time.Second,
 		Refusal:       storagev1.VolumeRefusal_VOLUME_REFUSAL_IMAGE_MISSING,
 		RefusalDetail: detail,
 	})
 	// A fenced writer reporting a refusal for a volume that has moved past it. Its
-	// watermarks are already refused by the epoch check; the refusal must be too, and by
+	// measurements are already refused by the epoch check; the refusal must be too, and by
 	// the same fact rather than by a second rule that can drift from it.
 	vols.Set(agent.VolumeStatus{
 		VolumeID: "vol-stolen", Epoch: 8,
@@ -186,24 +183,24 @@ func TestARefusalCrossesTheSpineAndClears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mine.Refusal != lifecycle.RefusalImageMissing {
-		t.Fatalf("the catalog does not record that vol-mine is not being served: %+v", mine)
+	if mine.Progress.Refusal != lifecycle.RefusalImageMissing {
+		t.Fatalf("the catalog does not record that vol-mine is not being served: %+v", mine.Progress)
 	}
-	if mine.RefusalDetail != detail {
-		t.Fatalf("refusal detail = %q, want the Agent's own sentence", mine.RefusalDetail)
+	if mine.Progress.RefusalDetail != detail {
+		t.Fatalf("refusal detail = %q, want the Agent's own sentence", mine.Progress.RefusalDetail)
 	}
 	stolen, err := md.GetVolume(t.Context(), "vol-stolen")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stolen.Refusal != lifecycle.RefusalNone {
-		t.Fatalf("a writer the fleet moved past marked vol-stolen as not served: %+v", stolen)
+	if stolen.Progress.Refusal != lifecycle.RefusalNone {
+		t.Fatalf("a writer the fleet moved past marked vol-stolen as not served: %+v", stolen.Progress)
 	}
 
 	// The volume comes back. Nothing sweeps, nothing notices: the next report simply
 	// carries no refusal, and that is the whole of the clearing mechanism.
 	vols.Set(agent.VolumeStatus{
-		VolumeID: "vol-mine", Epoch: 4, LocalSequence: 40, DurableSequence: 30, PublishedSequence: 20,
+		VolumeID: "vol-mine", Epoch: 4, LastCommitAge: 2 * time.Second,
 	})
 	if err := loop.Reconcile(t.Context()); err != nil {
 		t.Fatalf("the cycle after the volume recovered failed: %v", err)
@@ -212,11 +209,11 @@ func TestARefusalCrossesTheSpineAndClears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mine.Refusal != lifecycle.RefusalNone || mine.RefusalDetail != "" {
-		t.Fatalf("a volume that is serving again still reads as refused: %+v", mine)
+	if mine.Progress.Refusal != lifecycle.RefusalNone || mine.Progress.RefusalDetail != "" {
+		t.Fatalf("a volume that is serving again still reads as refused: %+v", mine.Progress)
 	}
-	if mine.LocalSequence != 40 {
-		t.Fatalf("the recovered watermarks were not applied: %+v", mine)
+	if mine.Progress.CommitAge != 2*time.Second {
+		t.Fatalf("the recovered volume's RPO was not applied: %+v", mine.Progress)
 	}
 }
 

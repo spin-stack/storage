@@ -40,9 +40,11 @@ var (
 	// policy admits. Nothing was written, and the caller re-places the volume
 	// somewhere else.
 	ErrCapacityExceeded = errors.New("metadata: committed capacity would exceed the placement bound")
-	// ErrWatermarkOrder means a watermark report violates
-	// published ≤ durable ≤ local (INV-03).
-	ErrWatermarkOrder = errors.New("metadata: watermarks out of order")
+	// ErrInvalidReport means a volume report carries a number no observation produces —
+	// a negative age or backlog, or an age past what the catalog can hold. Refused
+	// rather than clamped: clamping a bad age to zero renders the volume as perfectly
+	// current, which is the one wrong answer nobody investigates.
+	ErrInvalidReport = errors.New("metadata: volume report carries an impossible measurement")
 	// ErrInvalidID means an identifier is not usable as a key — empty, or (in an
 	// implementation that constrains identifier syntax) malformed. It is never
 	// coerced to NULL or to a row nobody can find again.
@@ -79,25 +81,48 @@ var (
 	ErrHasDescendants = errors.New("metadata: a volume whose snapshots something still descends from")
 )
 
-// CheckWatermarkOrder returns ErrWatermarkOrder unless published ≤ durable ≤ local
-// (INV-03, §5.6). It is the Go half of the CHECK constraint the volumes table
-// carries: every store validates the triple before writing it, so the two
-// implementations refuse the same input with the same sentinel instead of one of
-// them surfacing an integrity error the caller cannot classify.
-//
-// Only the writes that *set* the triple need it. The ones that advance it take a
-// component-wise maximum, and the max of two ordered triples is ordered.
-func CheckWatermarkOrder(local, durable, published int64) error {
-	if published > durable || durable > local {
-		return fmt.Errorf("%w: published=%d durable=%d local=%d",
-			ErrWatermarkOrder, published, durable, local)
-	}
-	return nil
+// VolumeProgress is what a volume's host last said about it, plus when the catalog heard
+// it. The zero value is a volume no host has reported, which is not the same as one
+// reporting an RPO of zero — ReportedAt.IsZero() is what tells the two apart, and it is why
+// the age is not simply stored as a timestamp.
+type VolumeProgress struct {
+	// CommitAge is how far behind the object store the volume was when its host measured
+	// it: the age of the newest published commit covering everything the guest has
+	// written. §11 calls this the product. A volume nobody writes to reports zero and is
+	// inside its RPO rather than behind it.
+	//
+	// It ages after it is stored, and a reader that wants the number *now* adds the time
+	// since ReportedAt — which is the honest answer while a host is silent, and the reason
+	// the Agent (which has no wall clock, INV-01) sends an interval rather than an instant.
+	CommitAge time.Duration
+	// UnpublishedLocalBytes is what losing the host at that moment would have cost.
+	UnpublishedLocalBytes int64
+	// Refusal is why the host is not serving the volume, and RefusalDetail is the sentence
+	// it sent with it. RefusalNone — the zero value — is the host saying it is serving.
+	Refusal       lifecycle.Refusal
+	RefusalDetail string
+	// ReportedAt is this store's own clock at the write.
+	ReportedAt time.Time
+}
+
+// VolumeReport is one host's observation, as RecordVolumeReport takes it.
+type VolumeReport struct {
+	VolumeID string
+	// HostID and Epoch are the qualification, not information: a report from a writer the
+	// fleet has moved past is discarded rather than stored. See RecordVolumeReport.
+	HostID string
+	Epoch  int64
+
+	CommitAge             time.Duration
+	UnpublishedLocalBytes int64
+	Refusal               lifecycle.Refusal
+	RefusalDetail         string
 }
 
 // CheckDEKKeyID returns ErrUnversionedDEK unless keyID is a real DEK version. It is
-// the Go half of volumes.dek_key_id's CHECK, for the same reason CheckWatermarkOrder
-// exists: both stores must refuse the same input with the same sentinel.
+// the Go half of volumes.dek_key_id's CHECK: both stores must refuse the same input with
+// the same sentinel, rather than one of them surfacing an integrity error no caller can
+// branch on.
 //
 // Zero is the whole rule. It is not "unset" — on the WAL path KeyID 0 means *this
 // record is plaintext* (§14.1), so a volume row carrying 0 describes a key the Agent
@@ -149,11 +174,10 @@ type Host struct {
 	NVMeTotalBytes   int64
 	NVMeUsedBytes    int64
 	// RemoteBacklogBytes is a byte count the host reports about itself (ADR-0013 §1). Every
-	// Agent reports 0 and the column holds 0 fleet-wide: a FLUSH is ACKed on an fdatasync and
-	// a volume reaches the object store when it stops, so there is no running distance to
-	// measure. Stored rather than derived — the opposite call from NVMeCommittedBytes — because
-	// the catalog holds watermarks in sequence numbers, not bytes. Nothing branches on it;
-	// removing it is a change to the wire and the schema, which is why it is written down.
+	// Agent reports 0 and the column holds 0 fleet-wide, and what replaced it is per volume:
+	// Volume.Progress.UnpublishedLocalBytes, which a host measures against a chain that
+	// exists rather than against a WAL that does not. Nothing branches on it; removing it is
+	// a change to the wire and the schema, which is why it is written down.
 	RemoteBacklogBytes int64
 	// NVMeCommittedBytes is §28.2 committed capacity. It is *derived*, computed by the store
 	// on every read and never stored anywhere (ADR-0017):
@@ -242,16 +266,10 @@ type Volume struct {
 	// DEKWrapped because a wrapped key and another key's version describe a volume
 	// nothing can open. Zero is not a version: it is the WAL's plaintext marker, and
 	// wal.NewEncryption refuses it.
-	DEKKeyID          uint32
-	LocalSequence     int64
-	DurableSequence   int64
-	PublishedSequence int64
-	// Refusal is why the host that holds this volume is not serving it, and RefusalDetail is
-	// the sentence the Agent sent with it. RefusalNone — the zero value — is the host saying
-	// it is serving. It is a state and not a watermark; SetVolumeRefusal carries the storage
-	// rule that follows from that.
-	Refusal       lifecycle.Refusal
-	RefusalDetail string
+	DEKKeyID uint32
+	// Progress is what the volume's host last observed about it: the RPO, the backlog,
+	// and whether it is being served at all. Zero for a volume no host has reported.
+	Progress VolumeProgress
 	// FencingStartedAt is the instant the Control Plane observed the lease of the
 	// writer it is fencing, stamped by the store's own clock when the volume entered
 	// FENCING_WAIT (§7, ADR-0015). It is the durable half of the promotion dwell: a
@@ -382,8 +400,8 @@ type Store interface {
 	// CreateVolume inserts a volume (term-guarded). It is idempotent and never
 	// destructive: for an id that already exists it converges instead of aborting —
 	// two operators running rebuild-metadata at once must both finish — but it never
-	// lowers current_epoch, shrinks size_bytes, rewinds a watermark, blanks an
-	// owner, or rewrites the lifecycle state. Ownership and state move only through
+	// lowers current_epoch, shrinks size_bytes, overwrites what a host has observed,
+	// blanks an owner, or rewrites the lifecycle state. Ownership and state move only through
 	// BumpVolumeEpoch, SetVolumePrimaryHost and SetVolumeState.
 	//
 	// A volume with a primary host is a placement, so this is one of the two writes
@@ -471,23 +489,20 @@ type Store interface {
 	// It does not check placement: `primary_host_id IS NULL` is the delete command's
 	// precondition, a statement about a host this Store cannot see.
 	DeleteVolume(ctx context.Context, term int64, volumeID string) error
-	// UpdateWatermarks lazily updates the informative watermarks (term-guarded).
-	// A report violating published ≤ durable ≤ local is ErrWatermarkOrder (INV-03).
-	// A report that is merely *late* — an epoch-N primary's, delivered after epoch
-	// N+1 published its own — is not an error and is not applied: each watermark is
-	// monotonic, because promotion does not change the CP term and this number is
-	// what an operator reads during an incident.
-	UpdateWatermarks(ctx context.Context, term int64, volumeID string, local, durable, published int64) error
-	// SetVolumeRefusal records why the host holding a volume is not serving it, or clears the
-	// record when it is (lifecycle.RefusalNone). Term-guarded, and — unlike UpdateWatermarks —
-	// qualified by the reporting host and epoch: a watermark is monotonic and a late report is
-	// harmless under GREATEST, while a refusal is a state about right now, so the write is
-	// last-report-wins **within** (hostID, epoch) and a no-op outside it.
+	// RecordVolumeReport records one host's observation of one volume: the RPO, the
+	// backlog, and why it is not being served (lifecycle.RefusalNone clears that).
 	//
-	// A report naming the wrong host or epoch is not an error — it is a fenced writer whose
-	// opinion is void — and returns nil. ErrNotFound only for a volume not in the catalog.
-	SetVolumeRefusal(ctx context.Context, term int64, volumeID, hostID string, epoch int64,
-		refusal lifecycle.Refusal, detail string) error
+	// Term-guarded, and qualified by the reporting host and epoch, which is what no other
+	// mutation here needs: a report is a statement about right now, so the write is
+	// last-report-wins **within** (hostID, epoch) and a no-op outside it. Without the
+	// qualification a host the fleet has moved past would mark a volume NOT SERVED while
+	// its successor serves it, and would stamp its own RPO over the successor's — and the
+	// term guard would pass, because promotion does not change the CP term.
+	//
+	// A report naming the wrong host or epoch is not an error — it is a fenced writer
+	// whose opinion is void — and returns nil. ErrNotFound only for a volume not in the
+	// catalog.
+	RecordVolumeReport(ctx context.Context, term int64, r VolumeReport) error
 	// There is no ResizeVolume here, and **V1 does not resize a volume**. §3's objective 14
 	// and §9's config-space propagation have no mechanism behind them: blockdev.Device fixes
 	// its capacity at construction; the guest cannot be told at all, because announcing a new

@@ -251,21 +251,6 @@ func TestPGRejectsNonV7OnEveryIdentityColumn(t *testing.T) {
 		"11111111-1111-1111-1111-111111111111", // v1
 		"00000000-0000-0000-0000-000000000000", // nil
 	}
-	// The two root ids nothing writes yet are probed by UPDATE for the same reason
-	// they are covered at all: a column whose rule arrives with its first writer
-	// arrives without one.
-	for _, col := range []string{"active_root_id", "published_root_id"} {
-		tests = append(tests, struct {
-			name   string
-			insert string
-			row    func(id string) []any
-		}{
-			name:   "volumes." + col,
-			insert: `UPDATE volumes SET ` + col + ` = $1 WHERE volume_id = $2`,
-			row:    func(id string) []any { return []any{id, seedVolume} },
-		})
-	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := pool.Exec(ctx, tc.insert, tc.row(ids.New().String())...); err != nil {
@@ -339,15 +324,14 @@ SELECT c.table_name, c.column_name, COALESCE(c.domain_name, '')
 	}
 }
 
-// TestPGWatermarkOrderIsAConstraint proves INV-03 is structural, not merely a rule
-// the queries and the Go caller happen to follow: the row itself cannot be written
-// out of order. It matters because published/durable/local is the number an operator
-// reads during an incident to decide whether to accept data loss (§5.6), and a
-// disordered triple is not a wrong number — it is three numbers that cannot all be
-// true, from which no decision can be taken at all.
+// Raw SQL on purpose throughout: this asserts the constraints, not the Go guards above
+// them.
 //
-// Raw SQL on purpose: this asserts the constraint, not the Go guard above it.
-func TestPGWatermarkOrderIsAConstraint(t *testing.T) {
+// TestPGRefusesAProgressRowThatSaysHalfOfWhatItMeans: the two ways this pair can be
+// stored as something no observation produces, both refused by the schema rather than by
+// the Go layer alone — a report reaches these columns from two implementations, and a
+// rule that lives in one of them holds only there.
+func TestPGRefusesAProgressRowThatSaysHalfOfWhatItMeans(t *testing.T) {
 	ctx := t.Context()
 	pool := startPostgres(t)
 	store := pg.New(pool)
@@ -357,50 +341,43 @@ func TestPGWatermarkOrderIsAConstraint(t *testing.T) {
 	if err := store.CreateVolume(ctx, term, metadata.Volume{
 		VolumeID: volID, SizeBytes: 1 << 30, BlockSize: 65536, State: lifecycle.VolumeActive,
 		DEKWrapped: []byte{1}, KEKID: "k", DEKKeyID: 1,
-		LocalSequence: 100, DurableSequence: 90, PublishedSequence: 80,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	// Both ends of the predicate, each broken on its own.
 	tests := []struct {
 		name string
 		sql  string
 	}{
-		{"published above durable", `UPDATE volumes SET published_sequence = 95 WHERE volume_id = $1`},
-		{"durable above local", `UPDATE volumes SET durable_sequence = 101 WHERE volume_id = $1`},
-		{"local below both", `UPDATE volumes SET local_sequence = 70 WHERE volume_id = $1`},
-		// dek_key_id is supplied so this row fails for the reason the case is named
-		// after. Without it the INSERT trips the NOT NULL first and the test would
-		// pass while proving nothing about the watermark ordering.
-		{"inserted out of order", `INSERT INTO volumes (volume_id, size_bytes, block_size, state,
-			dek_wrapped, kek_id, dek_key_id, local_sequence, durable_sequence, published_sequence)
-			VALUES ($1, 1, 65536, 'ACTIVE', '\x01', 'k', 1, 1, 2, 3)`},
+		// An age with no instant to age it from reads as measured now, for ever: the
+		// number §11 calls the product, frozen at whatever it was when a host went quiet.
+		{"an age with no report behind it", `UPDATE volumes SET commit_age_seconds = 5 WHERE volume_id = $1`},
+		// And the inverse, which renders as "no measurement" while carrying one.
+		{"a report with no age in it", `UPDATE volumes SET reported_at = now() WHERE volume_id = $1`},
+		{"a negative age", `UPDATE volumes SET commit_age_seconds = -1, reported_at = now() WHERE volume_id = $1`},
+		{"a negative backlog", `UPDATE volumes SET unpublished_local_bytes = -1 WHERE volume_id = $1`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			arg := volID
-			if strings.HasPrefix(tc.sql, "INSERT") {
-				arg = ids.New().String()
-			}
-			if _, err := pool.Exec(ctx, tc.sql, arg); err == nil {
-				t.Fatal("the database accepted watermarks out of order (INV-03)")
+			if _, err := pool.Exec(ctx, tc.sql, volID); err == nil {
+				t.Fatal("the database accepted a measurement no host can produce")
 			}
 		})
 	}
 
-	// The row is untouched, and a move that keeps the order is still allowed.
+	// And the pair written together is accepted, so the constraint is not simply refusing
+	// everything.
+	if _, err := pool.Exec(ctx,
+		`UPDATE volumes SET commit_age_seconds = 90, reported_at = now(), unpublished_local_bytes = 4096
+		  WHERE volume_id = $1`, volID); err != nil {
+		t.Fatalf("a whole report must be accepted: %v", err)
+	}
 	v, err := store.GetVolume(ctx, volID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.LocalSequence != 100 || v.DurableSequence != 90 || v.PublishedSequence != 80 {
-		t.Fatalf("a refused write still mutated the row: %+v", v)
-	}
-	if _, err := pool.Exec(ctx,
-		`UPDATE volumes SET local_sequence = 200, durable_sequence = 200, published_sequence = 200
-		  WHERE volume_id = $1`, volID); err != nil {
-		t.Fatalf("an ordered write must still be accepted: %v", err)
+	if v.Progress.CommitAge != 90*time.Second || v.Progress.UnpublishedLocalBytes != 4096 {
+		t.Fatalf("the report did not read back: %+v", v.Progress)
 	}
 }
 
@@ -738,8 +715,8 @@ func assertIndexed(t *testing.T, pool *pgxpool.Pool, index, table, query string,
 // TestPGRejectsAnUnversionedDEK is volumes.dek_key_id's CHECK, on the database rather
 // than on the Go guard in front of it.
 //
-// Both layers exist for the reason CheckWatermarkOrder's two layers do: the Go check
-// gives a caller a sentinel it can branch on, and the constraint is what holds when a
+// Both layers exist for one reason: the Go check gives a caller a sentinel it can branch
+// on, and the constraint is what holds when a
 // row is written by something that is not this adapter — a repair script, a restore, a
 // future migration. Testing only the Go half would prove the guard, not the rule.
 //

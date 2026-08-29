@@ -10,14 +10,13 @@
 -- columns keep the higher/existing value, and `state` is not touched at all — the
 -- §7 lifecycle moves only through SetVolumeState.
 WITH valid AS (
-    SELECT 1 FROM control_plane_leader WHERE singleton AND term = $14
+    SELECT 1 FROM control_plane_leader WHERE singleton AND term = sqlc.arg(term)
 )
 INSERT INTO volumes (volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state,
                      dek_wrapped, kek_id, dek_key_id, primary_host_id, standby_host_id,
-                     chain_depth, parent_snapshot_id,
-                     local_sequence, durable_sequence, published_sequence)
+                     chain_depth, parent_snapshot_id)
 SELECT $1, $2, $3, sqlc.arg(rpo_target_seconds)::int, $4, $5, $6, $7, sqlc.arg(dek_key_id)::bigint, $8, $9, $10,
-       sqlc.narg(parent_snapshot_id)::uuid, $11, $12, $13
+       sqlc.narg(parent_snapshot_id)::uuid
 WHERE EXISTS (SELECT 1 FROM valid)
   -- The capacity bound, as a predicate of the write that places the volume (ADR-0017): a
   -- clone admitted by a pure placement.Choose against a fleet read another operation shared
@@ -54,9 +53,6 @@ ON CONFLICT (volume_id) DO UPDATE
       -- Never cleared by a converging write: a clone that lost its parent link reads
       -- zeros, and rebuild-metadata's re-INSERT must not be able to cause that.
       parent_snapshot_id = COALESCE(volumes.parent_snapshot_id, EXCLUDED.parent_snapshot_id),
-      local_sequence = GREATEST(volumes.local_sequence, EXCLUDED.local_sequence),
-      durable_sequence = GREATEST(volumes.durable_sequence, EXCLUDED.durable_sequence),
-      published_sequence = GREATEST(volumes.published_sequence, EXCLUDED.published_sequence),
       updated_at = now();
 
 -- name: GetVolume :one
@@ -101,9 +97,10 @@ RETURNING current_epoch;
 -- a second Control Plane; and the placement guard, which refuses only the straight
 -- hand-over A -> B, since a host discovers it has lost a volume on its next poll.
 --
--- fencing_started_at and the refusal are cleared for the same reason: neither is true of a
--- volume that has just changed hands, and a dwell or an explanation left behind would be
--- inherited by the next promotion or printed against a host that is serving fine.
+-- fencing_started_at and everything the departing host reported are cleared for the same
+-- reason: none of it is true of a volume that has just changed hands, and a dwell, an
+-- explanation or an RPO left behind would be inherited by the next promotion or printed
+-- against a host that is serving fine.
 UPDATE volumes
    SET primary_host_id = sqlc.narg(primary_host_id)::uuid,
        state = CASE WHEN sqlc.narg(primary_host_id)::uuid IS NULL
@@ -111,6 +108,9 @@ UPDATE volumes
        fencing_started_at = NULL,
        refusal = '',
        refusal_detail = '',
+       commit_age_seconds = NULL,
+       unpublished_local_bytes = 0,
+       reported_at = NULL,
        updated_at = now()
  WHERE volume_id = sqlc.arg(volume_id)
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
@@ -125,34 +125,31 @@ UPDATE volumes
 -- this file writes size_bytes after CreateVolume, and that is what makes the geometry the
 -- Agent and descriptor.json were handed at create still true when they are read back.
 
--- name: UpdateVolumeWatermarks :execrows
--- Lazy, informative watermark update (§5.8, §12.6), term-guarded and monotonic.
--- GREATEST is the fencing part: promotion does not change the CP term, so an
--- epoch-N primary's report that was queued behind a retry still passes the term
--- guard after epoch N+1 has published its own. Component-wise max preserves
--- published ≤ durable ≤ local (INV-03), which the caller already validated.
-UPDATE volumes
-   SET local_sequence = GREATEST(local_sequence, $2),
-       durable_sequence = GREATEST(durable_sequence, $3),
-       published_sequence = GREATEST(published_sequence, $4),
-       updated_at = now()
- WHERE volume_id = $1
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $5;
-
--- name: SetVolumeRefusal :execrows
--- Record why the host holding this volume is not serving it, or clear the record when it
--- is. Term-guarded like every other mutation and — unlike every other one — qualified by
--- the *reporting* host and epoch. That predicate is exactly what UpdateVolumeWatermarks
--- must not have: a watermark is monotonic and GREATEST makes a late report harmless, while
--- a refusal is a state about right now, and an unqualified last-report-wins would let a
--- host the fleet moved past mark a volume NOT SERVED while its successor serves it (the
--- term guard passes: promotion does not change the CP term). 0 rows is therefore normal.
+-- name: RecordVolumeReport :execrows
+-- One report from one host, recorded in one statement: how far behind the object store the
+-- volume is, how much would be lost with the host, and whether the host is serving it at
+-- all. They are one write because they are one observation, and splitting them would let a
+-- volume render as behind and serving, or as refused and current, out of two rounds.
+--
+-- Term-guarded like every other mutation and — unlike every other one — qualified by the
+-- *reporting* host and epoch. Without that predicate a host the fleet has moved past would
+-- mark a volume NOT SERVED while its successor serves it, and would stamp its own RPO over
+-- the successor's; the term guard does not catch it, because promotion does not change the
+-- CP term. 0 rows is therefore normal, and means the reporter is not the writer any more.
+--
+-- Last-report-wins and not a monotonic merge. The three columns the watermarks left behind
+-- were merged with GREATEST because they only ever grew; an age and a backlog both shrink
+-- when a commit lands, and a max over them would freeze the row at the worst moment the
+-- volume ever had.
 UPDATE volumes
    SET refusal = sqlc.arg(refusal)::text,
        -- One statement, so the two can never disagree: an explanation with nothing to
        -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
        refusal_detail = CASE WHEN sqlc.arg(refusal)::text = ''
                             THEN '' ELSE sqlc.arg(refusal_detail)::text END,
+       commit_age_seconds = sqlc.arg(commit_age_seconds)::int,
+       unpublished_local_bytes = sqlc.arg(unpublished_local_bytes)::bigint,
+       reported_at = now(),
        updated_at = now()
  WHERE volume_id = sqlc.arg(volume_id)
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)

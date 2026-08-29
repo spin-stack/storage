@@ -221,26 +221,26 @@ func TestReportVolumeState(t *testing.T) {
 	}{
 		{
 			name:    "accepted",
-			report:  &storagev1.VolumeReport{VolumeId: vol, Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10},
+			report:  &storagev1.VolumeReport{VolumeId: vol, Epoch: 4, LastSuccessfulCommitAgeMs: 30_000, UnpublishedLocalBytes: 4096},
 			host:    hostA,
 			want:    storagev1.ReportOutcome_REPORT_OUTCOME_ACCEPTED,
 			applied: true,
 		},
 		{
 			name:   "stale epoch",
-			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 3, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10},
+			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 3, LastSuccessfulCommitAgeMs: 30_000, UnpublishedLocalBytes: 4096},
 			host:   hostA,
 			want:   storagev1.ReportOutcome_REPORT_OUTCOME_STALE_EPOCH,
 		},
 		{
 			name:   "epoch from the future",
-			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 5, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10},
+			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 5, LastSuccessfulCommitAgeMs: 30_000, UnpublishedLocalBytes: 4096},
 			host:   hostA,
 			want:   storagev1.ReportOutcome_REPORT_OUTCOME_STALE_EPOCH,
 		},
 		{
 			name:   "not primary",
-			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 4, LocalSequence: 30, DurableSequence: 20, PublishedSequence: 10},
+			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 4, LastSuccessfulCommitAgeMs: 30_000, UnpublishedLocalBytes: 4096},
 			host:   hostB,
 			want:   storagev1.ReportOutcome_REPORT_OUTCOME_NOT_PRIMARY,
 		},
@@ -249,12 +249,6 @@ func TestReportVolumeState(t *testing.T) {
 			report: &storagev1.VolumeReport{VolumeId: "vol-nope", Epoch: 4},
 			host:   hostA,
 			want:   storagev1.ReportOutcome_REPORT_OUTCOME_UNKNOWN_VOLUME,
-		},
-		{
-			name:   "out of order",
-			report: &storagev1.VolumeReport{VolumeId: vol, Epoch: 4, LocalSequence: 1, DurableSequence: 2, PublishedSequence: 3},
-			host:   hostA,
-			want:   storagev1.ReportOutcome_REPORT_OUTCOME_OUT_OF_ORDER,
 		},
 		{
 			name:   "empty volume id",
@@ -290,9 +284,9 @@ func TestReportVolumeState(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			written := v.LocalSequence != 0 || v.DurableSequence != 0 || v.PublishedSequence != 0
+			written := !v.Progress.ReportedAt.IsZero()
 			if written != tc.applied {
-				t.Fatalf("watermarks written = %v, want %v (%+v)", written, tc.applied, v)
+				t.Fatalf("the report was recorded = %v, want %v (%+v)", written, tc.applied, v.Progress)
 			}
 		})
 	}
@@ -308,7 +302,7 @@ func TestReportVolumeStateAnswersEveryVolume(t *testing.T) {
 	resp, err := f.srv.ReportVolumeState(t.Context(), connect.NewRequest(&storagev1.ReportVolumeStateRequest{
 		HostId: hostA,
 		Volumes: []*storagev1.VolumeReport{
-			{VolumeId: "vol-b", Epoch: 2, LocalSequence: 5, DurableSequence: 5, PublishedSequence: 5},
+			{VolumeId: "vol-b", Epoch: 2, LastSuccessfulCommitAgeMs: 5_000},
 			{VolumeId: "vol-a", Epoch: 99},
 		},
 	}))

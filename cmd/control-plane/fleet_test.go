@@ -166,11 +166,11 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 	// on its own.
 	mustSay(t, out, "VOLUMES (3, 1 with no primary host, 1 at the depth ceiling of "+strconv.Itoa(controlplane.MaxChainDepth))
 	if got, want := row(t, out, strandedVol),
-		[]string{strandedVol, "-", "DETACHED", "9", "2.0GiB", "0", "-"}; !equal(got, want) {
+		[]string{strandedVol, "-", "DETACHED", "9", "2.0GiB", "0", "-", "-", "-"}; !equal(got, want) {
 		t.Errorf("unplaced volume row = %v, want %v", got, want)
 	}
 	if got, want := row(t, out, servedVol),
-		[]string{servedVol, activeHost, "ACTIVE", "3", "1.0GiB", "0", "-"}; !equal(got, want) {
+		[]string{servedVol, activeHost, "ACTIVE", "3", "1.0GiB", "0", "-", "-", "-"}; !equal(got, want) {
 		t.Errorf("served volume row = %v, want %v", got, want)
 	}
 	// The volume at the ceiling, which is the one this section can answer for and the
@@ -178,7 +178,7 @@ func TestFleetStatusShowsWhatTheHostScopedReadsCannot(t *testing.T) {
 	// and until then its depth is a fact about the fleet rather than an event.
 	if got, want := row(t, out, deepVol),
 		[]string{deepVol, activeHost, "ACTIVE", "1", "1.0GiB",
-			strconv.Itoa(controlplane.MaxChainDepth), doneSnap}; !equal(got, want) {
+			strconv.Itoa(controlplane.MaxChainDepth), "-", "-", doneSnap}; !equal(got, want) {
 		t.Errorf("volume at the ceiling row = %v, want %v", got, want)
 	}
 
@@ -506,16 +506,15 @@ func TestFleetStatusNamesTheVolumesNobodyIsServing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The refusal as the Control Plane records it from the Agent's report. The
-	// watermarks are left healthy on purpose — that is precisely the state this whole
-	// report used to render as normal.
-	if err := md.SetVolumeRefusal(ctx, term, refusedVol, activeHost, 4,
-		lifecycle.RefusalImageMissing,
-		"agent: the catalog says this volume has published an image and the object store holds none: "+
-			"volume "+refusedVol+" published up to sequence 512 and the object store holds no image for it"); err != nil {
-		t.Fatal(err)
-	}
-	if err := md.UpdateWatermarks(ctx, term, refusedVol, 512, 512, 512); err != nil {
+	// The refusal as the Control Plane records it from the Agent's report, with an RPO
+	// that is fine on the same row: a volume can be measured as current and still not be
+	// served, and this report used to render exactly that as normal.
+	if err := md.RecordVolumeReport(ctx, term, metadata.VolumeReport{
+		VolumeID: refusedVol, HostID: activeHost, Epoch: 4,
+		CommitAge: 3 * time.Second, UnpublishedLocalBytes: 1 << 20,
+		Refusal:       lifecycle.RefusalImageMissing,
+		RefusalDetail: "agent: the catalog says this volume has published and the object store holds no HEAD for it",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -545,7 +544,7 @@ func TestFleetStatusNamesTheVolumesNobodyIsServing(t *testing.T) {
 	}
 
 	// And the section that says why, in the words an operator acts on: the reason token
-	// they can grep and alert on, and the sentence with the sequence in it.
+	// they can grep and alert on, and the Agent's own sentence.
 	mustSay(t, out, "NOT SERVED (1)")
 	notServed := out[strings.Index(out, "NOT SERVED ("):]
 	if strings.Contains(notServed, servedVol) {
@@ -555,7 +554,14 @@ func TestFleetStatusNamesTheVolumesNobodyIsServing(t *testing.T) {
 		[]string{refusedVol, activeHost, "IMAGE_MISSING"}; !equal(got, want) {
 		t.Errorf("NOT SERVED row = %v, want %v:\n%s", got, want, out)
 	}
-	mustSay(t, out, "published up to sequence 512 and the object store holds no image for it")
+	mustSay(t, out, "the object store holds no HEAD for it")
+
+	// The RPO on the same row, which is the pair §11 asks be watched together: a volume
+	// can be measured as current and still not be served, and reading only one of the two
+	// is how this report used to say nothing was wrong.
+	if got, want := row(t, out, refusedVol)[6:8], []string{"3s", "1.0MiB"}; !equal(got, want) {
+		t.Errorf("RPO cells = %v, want %v:\n%s", got, want, out)
+	}
 }
 
 func equal(a, b []string) bool {

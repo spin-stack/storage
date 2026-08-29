@@ -71,10 +71,12 @@ Nothing on the §24 list. What is left is in the two sections below.
 
 ## Thin paths that shipped without being deepened
 
-- **No RPO is set anywhere.** The age trigger is in and per-volume
-  (`volumes.rpo_target_seconds` → `DesiredVolume`); every volume carries zero, because §11
-  forbids choosing a target instead of measuring one and the upload-throughput measurement
-  has not been made. `-seed-rpo-seconds` is the only way to set one.
+- **No RPO target is set anywhere.** The age trigger is in and per-volume
+  (`volumes.rpo_target_seconds` → `DesiredVolume`), and what a host measures against it now
+  reaches the catalog; every volume carries a target of zero, because §11 forbids choosing
+  one instead of measuring, and the upload-throughput measurement has not been made.
+  `-seed-rpo-seconds` is the only way to set one, and `-fleet-status` only marks a volume
+  as past its target when there is one.
 - **Rotation and publishing have no production default.** `-rotate-at-bytes` is 0 and no
   object store is required, so an Agent started without both seals and publishes nothing —
   loudly, in one WARN line. A layer's size is a *floor*, not a bound: measured at 8x the
@@ -89,8 +91,10 @@ Nothing on the §24 list. What is left is in the two sections below.
   keep their files (§9 step 15) — the chain reads through them, so only a collapse can
   free them, and a collapse waits for the guest. What the sweep does remove is the orphan
   overlay an interrupted rotation leaves. The *bucket* side is done: `-gc-delete`.
-- **§28's numbers reach no consumer.** Eleven are recorded and scrapeable and four are on
-  the wire; none reaches an alert or a cordon, and nothing measures attachment.
+- **§21's numbers reach a human, not an alert.** Eleven are recorded and scrapeable; the
+  RPO and the unpublished backlog reach the catalog and `-fleet-status` per volume. None
+  reaches an alert or a cordon, and nothing measures attachment. §11's other half — deny
+  new attaches on a host that is falling behind — is not built.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
   DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
   expiring the descriptor's non-current versions.

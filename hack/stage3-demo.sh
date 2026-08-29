@@ -108,7 +108,19 @@ for L in "$DIR"/store/layers/sha256/*/*/*; do
 done
 echo "    $(ls "$DIR"/store/layers/sha256/*/*/* | wc -l) layer objects, none carrying the guest's bytes"
 
-say "7. the guest is told to stop, and powers itself off"
+say "7. the fleet can answer what the RPO is (v6 §11, §21)"
+# The number this system exists to keep small, asked of the Control Plane rather than
+# scraped off the host: every commit above happened on the Agent, and until it reached the
+# catalog nobody could ask about a volume by name.
+"$CP" -database-url "$DSN" -object-store-dir "$DIR/store" -fleet-status >"$DIR/logs/fleet.txt" 2>&1 ||
+  die "-fleet-status failed: $(tail -5 "$DIR/logs/fleet.txt")"
+RPO=$(awk -v v="$VOLUME" '$1 == v {print $7}' "$DIR/logs/fleet.txt")
+UNPUB=$(awk -v v="$VOLUME" '$1 == v {print $8}' "$DIR/logs/fleet.txt")
+[ -n "$RPO" ] && [ "$RPO" != "-" ] ||
+  die "the catalog has no RPO for $VOLUME after $depth commits: $(grep "$VOLUME" "$DIR/logs/fleet.txt")"
+echo "    the catalog says volume $VOLUME is $RPO behind the object store, with $UNPUB unpublished"
+
+say "8. the guest is told to stop, and powers itself off"
 echo "GUESTCTL-STOP" >&9
 waitfor "$DIR/logs/guest1.log" "GUESTINIT-CHURNED" 120
 echo "    the guest wrote $(grep -m1 -o 'GUESTINIT-CHURNED [0-9]*' "$DIR/logs/guest1.log" | awk '{print $2}') MiB while that happened"
@@ -116,7 +128,7 @@ waitfor "$DIR/logs/guest1.log" "GUESTINIT-PASS" 120
 wait "$GUEST1" 2>/dev/null || true
 grep -m1 "GUESTINIT-PASS" "$DIR/logs/guest1.log"
 
-say "8. a second boot, reading only"
+say "9. a second boot, reading only"
 TIP=$(cat "$POINTER")
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
   -L "$OUT/share/spin-stack/qemu" \

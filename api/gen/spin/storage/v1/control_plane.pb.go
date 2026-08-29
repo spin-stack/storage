@@ -274,8 +274,7 @@ type ReportOutcome int32
 
 const (
 	ReportOutcome_REPORT_OUTCOME_UNSPECIFIED ReportOutcome = 0
-	// ACCEPTED: the watermarks were applied (or were already at least as high —
-	// each watermark is monotonic, so a late report is not an error).
+	// ACCEPTED: the report was recorded.
 	ReportOutcome_REPORT_OUTCOME_ACCEPTED ReportOutcome = 1
 	// STALE_EPOCH: the volume has moved past the epoch the report names.
 	ReportOutcome_REPORT_OUTCOME_STALE_EPOCH ReportOutcome = 2
@@ -283,8 +282,6 @@ const (
 	ReportOutcome_REPORT_OUTCOME_NOT_PRIMARY ReportOutcome = 3
 	// UNKNOWN_VOLUME: the Control Plane has no such volume.
 	ReportOutcome_REPORT_OUTCOME_UNKNOWN_VOLUME ReportOutcome = 4
-	// OUT_OF_ORDER: the report violates published <= durable <= local (INV-03).
-	ReportOutcome_REPORT_OUTCOME_OUT_OF_ORDER ReportOutcome = 5
 )
 
 // Enum value maps for ReportOutcome.
@@ -295,7 +292,6 @@ var (
 		2: "REPORT_OUTCOME_STALE_EPOCH",
 		3: "REPORT_OUTCOME_NOT_PRIMARY",
 		4: "REPORT_OUTCOME_UNKNOWN_VOLUME",
-		5: "REPORT_OUTCOME_OUT_OF_ORDER",
 	}
 	ReportOutcome_value = map[string]int32{
 		"REPORT_OUTCOME_UNSPECIFIED":    0,
@@ -303,7 +299,6 @@ var (
 		"REPORT_OUTCOME_STALE_EPOCH":    2,
 		"REPORT_OUTCOME_NOT_PRIMARY":    3,
 		"REPORT_OUTCOME_UNKNOWN_VOLUME": 4,
-		"REPORT_OUTCOME_OUT_OF_ORDER":   5,
 	}
 )
 
@@ -684,38 +679,6 @@ type DesiredVolume struct {
 	// a partition converges by doing the same thing again — and doing it again is free,
 	// because the manifest is written create-only (INV-16).
 	PendingSnapshotId string `protobuf:"bytes,9,opt,name=pending_snapshot_id,json=pendingSnapshotId,proto3" json:"pending_snapshot_id,omitempty"`
-	// published_sequence and durable_sequence are the two numbers the catalog already
-	// holds about this volume's data and that the attach path had no way to ask for.
-	// That is the whole of the two failures they close: both were reproduced against
-	// real binaries, and in both the fact that would have caught them was sitting in
-	// Postgres while the Agent decided, alone, that finding nothing means there was
-	// never anything.
-	//
-	// published_sequence is the highest sequence a published image is known to
-	// reproduce. It is what tells "this volume has never stopped cleanly, boot it
-	// empty" apart from "its manifest is gone". Without it a stray delete, a lifecycle
-	// expiry, or a restore that missed one key produces a blank device with an INFO
-	// line — and the next graceful stop replaces the volume's real image with the
-	// blank one's successor, which makes it permanent.
-	//
-	// durable_sequence is the highest sequence this fleet ACKed to a guest's fsync. It
-	// is the floor an attach has to be able to reproduce out of its image plus whatever
-	// its local WAL replayed; coming back below it is the volume silently rolled back
-	// to an earlier state, which reads without an I/O error anywhere.
-	//
-	// They are on the wire for the same reason the parent ids are: ADR-0021 keeps the
-	// Agent from knowing what a Control Plane is, so it cannot look either of them up.
-	// They are floors to *check* against and never inputs to the read path — the object
-	// store stays the authority on what the volume holds, and these only decide whether
-	// what it holds is enough.
-	//
-	// Both can lag and neither can lead, which is what makes checking them safe. The
-	// catalog is written from a report the Agent sends after the fdatasync and after
-	// the publish, so an attach that satisfies these floors may legitimately be ahead
-	// of them; one that falls below them has lost data. Comparing with < rather than !=
-	// is that asymmetry.
-	PublishedSequence int64 `protobuf:"varint,10,opt,name=published_sequence,json=publishedSequence,proto3" json:"published_sequence,omitempty"`
-	DurableSequence   int64 `protobuf:"varint,11,opt,name=durable_sequence,json=durableSequence,proto3" json:"durable_sequence,omitempty"`
 	// rpo_target_seconds is how far behind the object store this volume is allowed to
 	// fall: the age at which the host seals its tip and commits it even though the tip
 	// has not reached the size threshold. Zero means the volume has no age trigger and
@@ -817,20 +780,6 @@ func (x *DesiredVolume) GetPendingSnapshotId() string {
 		return x.PendingSnapshotId
 	}
 	return ""
-}
-
-func (x *DesiredVolume) GetPublishedSequence() int64 {
-	if x != nil {
-		return x.PublishedSequence
-	}
-	return 0
-}
-
-func (x *DesiredVolume) GetDurableSequence() int64 {
-	if x != nil {
-		return x.DurableSequence
-	}
-	return 0
 }
 
 func (x *DesiredVolume) GetRpoTargetSeconds() int64 {
@@ -1025,8 +974,8 @@ func (x *GetVolumeKeysResponse) GetDekKeyId() uint32 {
 	return 0
 }
 
-// VolumeReport is one volume's watermarks as the Agent observes them, qualified
-// by the epoch under which they were produced.
+// VolumeReport is what one host observes about one volume, qualified by the epoch
+// under which it observed it.
 type VolumeReport struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	VolumeId string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
@@ -1034,13 +983,6 @@ type VolumeReport struct {
 	// whose epoch is not the volume's current one is refused: it comes from a
 	// writer that has been fenced.
 	Epoch int64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	// Watermarks are informative (§5.8) and must satisfy
-	// published <= durable <= local (INV-03).
-	LocalSequence     int64 `protobuf:"varint,3,opt,name=local_sequence,json=localSequence,proto3" json:"local_sequence,omitempty"`
-	DurableSequence   int64 `protobuf:"varint,4,opt,name=durable_sequence,json=durableSequence,proto3" json:"durable_sequence,omitempty"`
-	PublishedSequence int64 `protobuf:"varint,5,opt,name=published_sequence,json=publishedSequence,proto3" json:"published_sequence,omitempty"`
-	// remote_gap_bytes is this volume's share of the device's remote backlog.
-	RemoteGapBytes int64 `protobuf:"varint,6,opt,name=remote_gap_bytes,json=remoteGapBytes,proto3" json:"remote_gap_bytes,omitempty"`
 	// snapshot_id is the pending snapshot this host has finished acting on, empty when
 	// it has nothing to say. The three fields below are one answer and are read
 	// together: an id plus a commit is "published, and this commit is it", an id plus an
@@ -1159,34 +1101,6 @@ func (x *VolumeReport) GetVolumeId() string {
 func (x *VolumeReport) GetEpoch() int64 {
 	if x != nil {
 		return x.Epoch
-	}
-	return 0
-}
-
-func (x *VolumeReport) GetLocalSequence() int64 {
-	if x != nil {
-		return x.LocalSequence
-	}
-	return 0
-}
-
-func (x *VolumeReport) GetDurableSequence() int64 {
-	if x != nil {
-		return x.DurableSequence
-	}
-	return 0
-}
-
-func (x *VolumeReport) GetPublishedSequence() int64 {
-	if x != nil {
-		return x.PublishedSequence
-	}
-	return 0
-}
-
-func (x *VolumeReport) GetRemoteGapBytes() int64 {
-	if x != nil {
-		return x.RemoteGapBytes
 	}
 	return 0
 }
@@ -1427,7 +1341,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"D\n" +
 	"\bAncestor\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1b\n" +
-	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\xbb\x03\n" +
+	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\xed\x02\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1437,11 +1351,9 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05epoch\x18\x04 \x01(\x03R\x05epoch\x122\n" +
 	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x125\n" +
 	"\bancestry\x18\x0e \x03(\v2\x19.spin.storage.v1.AncestorR\bancestry\x12.\n" +
-	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12-\n" +
-	"\x12published_sequence\x18\n" +
-	" \x01(\x03R\x11publishedSequence\x12)\n" +
-	"\x10durable_sequence\x18\v \x01(\x03R\x0fdurableSequence\x12,\n" +
-	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\r\x10\x0e\"S\n" +
+	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12,\n" +
+	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\r\x10\x0eJ\x04\b\n" +
+	"\x10\vJ\x04\b\v\x10\f\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
 	"\avolumes\x18\x01 \x03(\v2\x1e.spin.storage.v1.DesiredVolumeR\avolumes\"L\n" +
 	"\x14GetVolumeKeysRequest\x12\x17\n" +
@@ -1453,14 +1365,10 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\x8e\x05\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xfb\x03\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
-	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +
-	"\x0elocal_sequence\x18\x03 \x01(\x03R\rlocalSequence\x12)\n" +
-	"\x10durable_sequence\x18\x04 \x01(\x03R\x0fdurableSequence\x12-\n" +
-	"\x12published_sequence\x18\x05 \x01(\x03R\x11publishedSequence\x12(\n" +
-	"\x10remote_gap_bytes\x18\x06 \x01(\x03R\x0eremoteGapBytes\x12\x1f\n" +
+	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12\x1f\n" +
 	"\vsnapshot_id\x18\a \x01(\tR\n" +
 	"snapshotId\x12,\n" +
 	"\x12snapshot_commit_id\x18\f \x01(\tR\x10snapshotCommitId\x12@\n" +
@@ -1472,7 +1380,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
 	"\arefusal\x18\n" +
 	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +
-	"\x0erefusal_detail\x18\v \x01(\tR\rrefusalDetailJ\x04\b\b\x10\t\"l\n" +
+	"\x0erefusal_detail\x18\v \x01(\tR\rrefusalDetailJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\b\x10\t\"l\n" +
 	"\x18ReportVolumeStateRequest\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x127\n" +
 	"\avolumes\x18\x02 \x03(\v2\x1d.spin.storage.v1.VolumeReportR\avolumes\"k\n" +
@@ -1503,14 +1411,13 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x15VOLUME_REFUSAL_NO_KEY\x10\x04\x12\x1d\n" +
 	"\x19VOLUME_REFUSAL_LEASE_LOST\x10\x05\x12 \n" +
 	"\x1cVOLUME_REFUSAL_ATTACH_FAILED\x10\x06\x12!\n" +
-	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a*\xd0\x01\n" +
+	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a*\xb5\x01\n" +
 	"\rReportOutcome\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REPORT_OUTCOME_ACCEPTED\x10\x01\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_STALE_EPOCH\x10\x02\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_NOT_PRIMARY\x10\x03\x12!\n" +
-	"\x1dREPORT_OUTCOME_UNKNOWN_VOLUME\x10\x04\x12\x1f\n" +
-	"\x1bREPORT_OUTCOME_OUT_OF_ORDER\x10\x052\x9b\x03\n" +
+	"\x1dREPORT_OUTCOME_UNKNOWN_VOLUME\x10\x04\"\x04\b\x05\x10\x052\x9b\x03\n" +
 	"\x13ControlPlaneService\x12R\n" +
 	"\tHeartbeat\x12!.spin.storage.v1.HeartbeatRequest\x1a\".spin.storage.v1.HeartbeatResponse\x12d\n" +
 	"\x0fGetDesiredState\x12'.spin.storage.v1.GetDesiredStateRequest\x1a(.spin.storage.v1.GetDesiredStateResponse\x12j\n" +

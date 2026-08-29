@@ -38,15 +38,12 @@ type Device interface {
 }
 
 // VolumeStatus is what the Agent knows about one volume it is serving. The epoch is
-// the load-bearing field: every watermark reported to the Control Plane is qualified
-// by the epoch it was produced under, so a fenced writer's report can be refused
-// rather than applied (§12.3).
+// the load-bearing field: everything reported to the Control Plane is qualified by the
+// epoch it was produced under, so a fenced writer's report can be refused rather than
+// applied (§12.3).
 type VolumeStatus struct {
-	VolumeID          string
-	Epoch             int64
-	LocalSequence     int64
-	DurableSequence   int64
-	PublishedSequence int64
+	VolumeID string
+	Epoch    int64
 	// SnapshotID is the snapshot this host was asked to take and has finished acting
 	// on, empty while there is nothing to say — including while an upload is still in
 	// flight, because a half-taken snapshot is not a fact the catalog can hold. The
