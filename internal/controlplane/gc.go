@@ -58,6 +58,11 @@ type GCPlan struct {
 	// object that keeps appearing here across runs is either a stuck publish or a grace
 	// period that is too long, and neither is visible if the section is silent.
 	Held []GCCandidate
+	// heads is the ETag every rooted volume's HEAD carried when the walk read it, and
+	// the whole of what ApplyGC re-checks. Unexported because it is not information for
+	// a human: nothing but the delete can use it, and a plan a human edited is a plan
+	// nothing re-checked.
+	heads map[string]string
 }
 
 // PlanGC lists the objects in the bucket that no root reaches, and deletes nothing.
@@ -83,9 +88,9 @@ type GCPlan struct {
 // are a volume's identity rather than its history — nothing in the commit graph points at
 // them, so a walk can never make them reachable and this command must never propose them.
 func PlanGC(ctx context.Context, md GCCatalog, store objectstore.Store, now time.Time, grace time.Duration) (GCPlan, error) {
-	plan := GCPlan{Now: now, Grace: grace}
+	plan := GCPlan{Now: now, Grace: grace, heads: map[string]string{}}
 
-	roots, err := gcRoots(ctx, md, store)
+	roots, err := gcRoots(ctx, md, store, plan.heads)
 	if err != nil {
 		return GCPlan{}, err
 	}
@@ -128,7 +133,7 @@ type gcRoot struct {
 	named    string
 }
 
-func gcRoots(ctx context.Context, md GCCatalog, store objectstore.Store) ([]gcRoot, error) {
+func gcRoots(ctx context.Context, md GCCatalog, store objectstore.Store, heads map[string]string) ([]gcRoot, error) {
 	vols, err := md.ListVolumes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("controlplane: listing volumes: %w", err)
@@ -150,7 +155,7 @@ func gcRoots(ctx context.Context, md GCCatalog, store objectstore.Store) ([]gcRo
 
 	var roots []gcRoot
 	for _, id := range ids {
-		head, _, err := commit.ReadHead(ctx, store, id)
+		head, etag, err := commit.ReadHead(ctx, store, id)
 		if errors.Is(err, commit.ErrNoHead) {
 			// A volume that has never published, or whose HEAD is gone. Not an error:
 			// the snapshots below may still root its history, and if they do not, its
@@ -160,6 +165,7 @@ func gcRoots(ctx context.Context, md GCCatalog, store objectstore.Store) ([]gcRo
 		if err != nil {
 			return nil, fmt.Errorf("controlplane: reading the HEAD of volume %s: %w", id, err)
 		}
+		heads[id] = etag
 		roots = append(roots, gcRoot{volumeID: id, commitID: head.CommitID, named: "the HEAD of volume " + id})
 	}
 
@@ -330,4 +336,95 @@ func (p *gcPrinter) section(title, subtitle string, cs []GCCandidate) {
 		p.printf("  (none)\n")
 	}
 	p.printf("\n")
+}
+
+// ErrGCPlanStale means a volume's HEAD is not where the report read it, so the report is
+// about a bucket that no longer exists. Nothing is deleted; the answer is another report.
+var ErrGCPlanStale = errors.New("controlplane: a HEAD moved after the report was taken, so the report no longer describes the bucket")
+
+// GCResult is what one delete pass did. Deleted is what stopped answering; Bytes is what
+// the bucket stops being billed for once the lifecycle policy expires the markers.
+type GCResult struct {
+	Deleted []GCCandidate
+	Bytes   int64
+}
+
+// ApplyGC deletes the objects a plan named as candidates, and only those.
+//
+// The delete is the object store's reversible mark on every implementation (INV-14):
+// removing the bytes is a bucket lifecycle policy this interface deliberately cannot
+// reach, so being wrong here costs a Restore rather than a volume. That is what makes a
+// delete a reasonable thing for this command to do at all, and it is not a licence to be
+// wrong: a restore is a human noticing.
+//
+// One thing is re-read before anything goes, and it is HEAD.
+//
+// The report is a walk of a bucket that other processes keep writing, and exactly one
+// change between the walk and the delete can turn a candidate into a commit that returned
+// SUCCESS: an Agent killed between its manifest and its CAS republishes the *same* commit
+// id — that is what makes a retry idempotent — and neither of its two objects is rewritten
+// when it does. The layer is content-addressed and verified in place; the manifest is
+// byte-identical and create-only. So their age never moves, a long enough outage makes the
+// report correct about them, and the CAS landing a second later makes it wrong. Nothing
+// about the objects can show it. What moved is HEAD.
+//
+// A HEAD that *appeared* is not that: a volume publishing its first commit reaches nothing
+// the report saw, and with a volume per tenant, refusing on an appearing HEAD is a command
+// that never runs.
+//
+// Manifests go before layers, so an interruption never leaves a manifest naming a layer
+// that is gone — the torn shape a reader can see. The other order leaves an orphan layer,
+// which is what this command exists to collect.
+func ApplyGC(ctx context.Context, store objectstore.Store, plan GCPlan) (GCResult, error) {
+	for volumeID, etag := range plan.heads {
+		_, current, err := commit.ReadHead(ctx, store, volumeID)
+		if err != nil {
+			return GCResult{}, fmt.Errorf("%w: re-reading the HEAD of volume %s: %w", ErrGCPlanStale, volumeID, err)
+		}
+		if current != etag {
+			return GCResult{}, fmt.Errorf("%w: volume %s was at %s and is now at %s",
+				ErrGCPlanStale, volumeID, etag, current)
+		}
+	}
+
+	var res GCResult
+	for _, c := range manifestsFirst(plan.Candidates) {
+		err := store.Delete(ctx, c.Key)
+		if errors.Is(err, objectstore.ErrNotFound) {
+			// Already gone, or already marked. Nothing to undo and nothing to report:
+			// the object is in the state this pass wanted it in.
+			continue
+		}
+		if err != nil {
+			return res, fmt.Errorf("controlplane: deleting %s: %w", c.Key, err)
+		}
+		res.Deleted = append(res.Deleted, c)
+		res.Bytes += c.SizeBytes
+	}
+	return res, nil
+}
+
+// manifestsFirst orders one pass: commit manifests, then layers. See ApplyGC.
+func manifestsFirst(cs []GCCandidate) []GCCandidate {
+	out := make([]GCCandidate, 0, len(cs))
+	for _, c := range cs {
+		if !strings.HasPrefix(c.Key, commit.LayerPrefix) {
+			out = append(out, c)
+		}
+	}
+	for _, c := range cs {
+		if strings.HasPrefix(c.Key, commit.LayerPrefix) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Print writes what was deleted, in the same shape as the plan's own sections.
+func (r GCResult) Print(w io.Writer) error {
+	out := &gcPrinter{w: w}
+	out.printf("deleted %d objects, %d bytes — the object store keeps the bytes behind a delete marker, so this is reversible with Restore until the bucket lifecycle expires them\n\n",
+		len(r.Deleted), r.Bytes)
+	out.section("DELETED", "unreachable for longer than the grace period", r.Deleted)
+	return out.err
 }

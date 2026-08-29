@@ -114,11 +114,12 @@ func run() error {
 		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
 
 		// gc-dry-run: print the objects no HEAD and no published snapshot reaches, and
-		// exit. It deletes nothing, and there is no flag that would make it: §20's first
-		// rule is that an object is never removed because it does not appear in the
-		// current HEAD, and the object store's own delete is a marker whose removal is a
-		// bucket lifecycle policy. What to do with the list is a human's call.
+		// exit. -gc-delete is the same walk followed by the delete, and it is a second
+		// flag rather than a `-yes` on the first because the report is the thing an
+		// operator reads and the delete is the thing they decide.
 		gcDryRun = flag.Bool("gc-dry-run", false, "print the objects nothing in the fleet reaches, and exit; deletes nothing")
+		gcDelete = flag.Bool("gc-delete", false,
+			"print that same report and then delete its candidates, and exit. The object store's delete is a reversible marker on every backend (a mistake costs a Restore), and expiring the bytes is a bucket lifecycle policy this binary cannot reach")
 		// 24 hours is a policy and not a measurement, and it is deliberately far longer
 		// than any publish this system performs: the objects it protects are a layer
 		// uploaded seconds before the manifest that names it, and the cost of a grace
@@ -174,12 +175,18 @@ func run() error {
 	flag.Parse()
 
 	switch {
-	// -fleet-status and -gc-dry-run are exempt from the identity. Both identify
-	// nobody, because they take no term and write nothing, and demanding an identity
-	// for a read is friction in front of the commands an operator runs when they do
-	// not yet know what is wrong. The DSN they still need: the catalog is what
-	// -fleet-status reports and where -gc-dry-run's roots come from.
-	case *holderID == "" && !*fleetStatus && !*gcDryRun:
+	// -fleet-status and the two GC commands are exempt from the identity. None of them
+	// takes a term: they read the catalog and never write it, and demanding an identity
+	// for a read is friction in front of the commands an operator runs when they do not
+	// yet know what is wrong. The DSN they still need: the catalog is what -fleet-status
+	// reports and where the GC's roots come from.
+	//
+	// -gc-delete does write, to the bucket — and a term would not make it safer. What
+	// keeps two Control Planes running it at once from being a problem is that they
+	// delete the same unreachable objects, and what keeps a *stale* one from being a
+	// problem is that its roots come from PostgreSQL as it is now, not from anything it
+	// remembers.
+	case *holderID == "" && !*fleetStatus && !*gcDryRun && !*gcDelete:
 		return errors.New("-holder-id is required")
 	case *databaseDSN == "":
 		return errors.New("-database-url (or $DATABASE_URL) is required")
@@ -315,7 +322,7 @@ func run() error {
 		return nil
 	}
 
-	if *gcDryRun {
+	if *gcDryRun || *gcDelete {
 		// No term and no leader, unlike the one-shots below: it writes nothing, and the
 		// moment an operator most wants to know what is in their bucket is the moment
 		// nothing is leading. The clock is the catalog's, the same one fleetReport reads
@@ -329,7 +336,16 @@ func run() error {
 		if gerr != nil {
 			return gerr
 		}
-		return plan.Print(os.Stdout)
+		if perr := plan.Print(os.Stdout); perr != nil || !*gcDelete {
+			return perr
+		}
+		res, aerr := controlplane.ApplyGC(ctx, store, plan)
+		// Printed before the error is returned: a pass that stopped half way has still
+		// deleted what it names, and an operator holding the list can undo it.
+		if perr := res.Print(os.Stdout); perr != nil {
+			return errors.Join(aerr, perr)
+		}
+		return aerr
 	}
 
 	if *detachVolume != "" || *attachVolume != "" {

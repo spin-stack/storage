@@ -108,7 +108,8 @@ enforced by lint instead:
 - **Property tests** (`pgregory.net/rapid`) for serialize/replay and algebraic code (the
   commit manifest and HEAD: truncate-at-every-byte + bit-flip → refused, never silently
   wrong).
-- **Coverage.** `task cover` enforces 90% on production code (`-coverpkg=./...`).
+- **Coverage.** `task cover` enforces a floor on production code (`-coverpkg=./...`); the
+  number and why it moved are in `hack/coverage.sh`.
   Excluded: `internal/db`, `internal/metadata/pg`, `cmd/` mains, `integration/`,
   `internal/dst`. Don't chase unreachable `os`-error branches — the sim models those.
 

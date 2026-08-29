@@ -54,7 +54,7 @@ internal/simio/real/objectstore.go:ObjectStore.Restore:gc  # the operator step b
 internal/simio/real/s3.go:ErrBucketNotVersioned:gc         # quotes INV-14 to say what is false on an unversioned bucket. The sentinel is returned by a live check
 internal/simio/real/s3.go:NewS3Store:gc                    # "refuses a bucket the GC could not undo a delete on" — a property of the bucket, in the constructor that enforces it
 internal/simio/real/s3.go:S3Store.Delete:gc                # "the object stays recoverable and the GC cannot destroy data" — the guarantee this Delete provides, whoever ends up calling it
-cmd/control-plane/main.go:run:gc                           # names `-gc-dry-run`, a flag that exists and prints: it lists what a sweep *would* remove and removes nothing, which is the opposite of claiming a sweeper runs
+cmd/control-plane/main.go:run:gc                           # names `-gc-dry-run` and `-gc-delete`, two flags that exist and are the whole of the GC: an operator runs them, no sweeper runs on its own
 
 # --- the lease is live; these say so about the right thing ----------------------------
 internal/agent/loop.go:Loop.giveUpWhatIsNoLongerOurs:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use

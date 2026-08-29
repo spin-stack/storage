@@ -61,10 +61,7 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **Compaction still cannot run twice.** The plan and the report are in; the act is not,
-   because nothing rebases the local chain onto a new root — a second collapse is refused
-   for ever with the message a genuine fork produces. Fix that first.
-2. **The GC deletes nothing.** The report is in; the delete is not.
+Nothing on the §24 list. What is left is in the two sections below.
 
 ## What only a pilot can answer
 
@@ -88,9 +85,10 @@ system has no equivalent of vSphere's datastore lock.
 - **A collapse waits for the guest to detach.** The rebase onto the new root needs the
   files, and QEMU holds every one of a live chain, so the last step is owed until the
   volume reads as unattached. Until then the chain does not shrink and one line says so.
-- **Nothing reclaims local disk.** Released volumes keep their layers, published layers
-  keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
-  never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.
+- **Nothing reclaims local disk.** Released volumes keep their layers and published layers
+  keep their files (§9 step 15) — the chain reads through them, so only a collapse can
+  free them, and a collapse waits for the guest. What the sweep does remove is the orphan
+  overlay an interrupted rotation leaves. The *bucket* side is done: `-gc-delete`.
 - **§28's numbers reach no consumer.** Eleven are recorded and scrapeable and four are on
   the wire; none reaches an alert or a cordon, and nothing measures attachment.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
