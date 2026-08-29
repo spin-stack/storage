@@ -531,9 +531,20 @@ type Store interface {
 	// volumes.primary_host_id, so a CREATING snapshot of a detached volume — precisely the
 	// stuck one — belongs to no host and appears in no per-host listing.
 	//
-	// The two states are hard-coded: one caller, one question, and a state filter would let
-	// a future caller ask for PUBLISHED — a fleet-wide scan of the largest table here.
+	// The two states are hard-coded: one caller, one question. The caller that wanted
+	// PUBLISHED got a method of its own below rather than a filter here, so each read
+	// carries the reason its own scan is worth making.
 	ListUnfinishedSnapshots(ctx context.Context) ([]Snapshot, error)
+	// ListPublishedSnapshots returns every PUBLISHED snapshot, fleet-wide and ordered by
+	// snapshot id. It is the catalog half of §20's reachability roots: a published
+	// snapshot names a commit, and that commit and its whole ancestry stay alive even
+	// after the volume's HEAD has moved far past them. Nothing else in this interface can
+	// answer that question — the per-host and unfinished listings both exclude PUBLISHED.
+	//
+	// DELETING is not included, deliberately: it is the state that says a human has asked
+	// for the snapshot to go, and the only caller prints candidates rather than removing
+	// anything.
+	ListPublishedSnapshots(ctx context.Context) ([]Snapshot, error)
 	// PublishSnapshot moves CREATING → PUBLISHED, recording the two facts only the host
 	// that took it knows: the commit its history is named by, and which host reported it
 	// (term-guarded).

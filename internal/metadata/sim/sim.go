@@ -701,6 +701,21 @@ func (s *Store) ListUnfinishedSnapshots(_ context.Context) ([]metadata.Snapshot,
 	return out, nil
 }
 
+// ListPublishedSnapshots returns the snapshots that hold a commit alive, fleet-wide.
+func (s *Store) ListPublishedSnapshots(_ context.Context) ([]metadata.Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]metadata.Snapshot, 0, len(s.snaps))
+	for _, snap := range s.snaps {
+		if snap.State != lifecycle.SnapshotPublished {
+			continue
+		}
+		out = append(out, snap)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SnapshotID < out[j].SnapshotID })
+	return out, nil
+}
+
 // PublishSnapshot records what the host that took the snapshot observed.
 func (s *Store) PublishSnapshot(_ context.Context, term int64, snapshotID, commitID, sourceHostID string) error {
 	if err := requireID("snapshot", snapshotID); err != nil {

@@ -603,6 +603,22 @@ func (m *Manager) settleSnapshot(v *volume) error {
 // chain of small layers each of which is a commit that never landed; with it the tip
 // grows instead and at most one sealed layer waits. §15 wants the same at restart:
 // publish the sealed layer, do not rotate again.
+// checkSealed refuses a layer whose qcow2 header says QEMU already found an inconsistency
+// it could not resolve. Nothing else in the publish path opens the image: the digest is
+// over the bytes as stored and says only that they are the bytes that were written.
+func (m *Manager) checkSealed(ctx context.Context, path string) error {
+	ctx, cancel := m.withTimeout(ctx)
+	defer cancel()
+	info, err := inspect(ctx, m.run, m.cfg.QemuImg, path)
+	if err != nil {
+		return fmt.Errorf("qcow: inspecting the sealed layer %s before publishing it: %w", path, err)
+	}
+	if info.Specific.Data.Corrupt {
+		return fmt.Errorf("%w: the sealed layer %s has the qcow2 corrupt flag set, so a commit naming it could never be restored", ErrChainMismatch, path)
+	}
+	return nil
+}
+
 func (m *Manager) publish(ctx context.Context, v *volume) error {
 	if v.pending == nil || m.pub == nil {
 		return nil
@@ -613,6 +629,22 @@ func (m *Manager) publish(ctx context.Context, v *volume) error {
 	// the same SealedLayer — which is idempotent, so a duplicated attempt costs a HEAD
 	// request and nothing else.
 	layer := *v.pending
+	// The sealed layer is inspected before it becomes a commit, and this is the only
+	// place that can. A guest can corrupt its own image while it runs; QEMU sets the
+	// qcow2 corrupt bit inside the file, so the bit rides through the object store —
+	// the sealed bytes hash to what the manifest says and every integrity check passes.
+	// Both readers refuse such a chain (Open's local branch and recovery's rebuild), so
+	// publishing it produces a commit that returned SUCCESS and that no host can ever
+	// restore: the one sentence §32 is built on.
+	//
+	// Doing it here rather than at the rotation is what makes it possible at all. The
+	// tip QEMU holds is refused on the write lock, and after the snapshot the sealed
+	// layer is QEMU's read-only backing — measured against the pinned 11.1.1, `qemu-img
+	// info` reads it while the guest runs and is refused on the live tip with `Failed to
+	// get shared "write" lock`. §7 allows exactly this: qemu-img on a sealed layer.
+	if err := m.checkSealed(ctx, layer.Path); err != nil {
+		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST, err)
+	}
 	if err := m.pub.Publish(ctx, layer); err != nil {
 		if errors.Is(err, commit.ErrHeadMoved) {
 			// Another host published for this volume, so this one is not its writer: it
@@ -752,10 +784,20 @@ func (m *Manager) reconcile(v *volume) error {
 			return err
 		}
 	}
-	if !dirty {
-		return nil
+	if dirty {
+		if err := WriteState(m.paths, m.cfg.Root, v.id, st); err != nil {
+			return fmt.Errorf("volume %s: %w", v.id, err)
+		}
 	}
-	if err := WriteState(m.paths, m.cfg.Root, v.id, st); err != nil {
+	// Nothing else reclaims local disk, so this runs every cycle over a directory only
+	// this host writes to. A failure is reported and never refuses the volume: what it
+	// costs is space, and the guest is being served.
+	removed, err := sweep(m.paths, m.cfg.Root, v.id, v.chain.Active, st, v.pending)
+	for _, path := range removed {
+		slog.Warn("swept a layer file no chain reads through: it sits above the tip QEMU has open and no record names it, which is what a rotation interrupted between creating the overlay and switching to it leaves behind",
+			"volume_id", v.id, "layer", path, "tip", v.chain.Active)
+	}
+	if err != nil {
 		return fmt.Errorf("volume %s: %w", v.id, err)
 	}
 	return nil

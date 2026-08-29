@@ -337,8 +337,10 @@ func TestALineageStopsGrowingAtTheCeiling(t *testing.T) {
 	case !errors.Is(cerr, controlplane.ErrChainTooDeep):
 		t.Errorf("a clone of a volume at the ceiling: want ErrChainTooDeep, got %v", cerr)
 	// The message is the operator's whole interface to this refusal: it has to name the
-	// verb that gets them back under the ceiling and the volume to run it on.
-	case !strings.Contains(cerr.Error(), "FLATTEN") || !strings.Contains(cerr.Error(), deepest):
+	// volume that is at the ceiling and something they can actually do. It used to name
+	// FLATTEN, which went with the withdrawn engine; nothing reduces an existing lineage's
+	// depth today, so what is left to offer is a shallower volume in the same lineage.
+	case !strings.Contains(cerr.Error(), "clone a shallower") || !strings.Contains(cerr.Error(), deepest):
 		t.Errorf("the refusal tells an operator nothing to do: %v", cerr)
 	}
 

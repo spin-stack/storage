@@ -217,6 +217,13 @@ type Paths interface {
 	// path or the new one and never a truncated line. The pointer is read by another
 	// process, at a moment this one does not choose.
 	WriteAtomic(path string, data []byte) error
+	// List names the entries of a directory, without their paths. What a sweep is looking
+	// for is precisely the files no record names, so it cannot be found by asking about
+	// paths this host already knows.
+	List(dir string) ([]string, error)
+	// Remove deletes a file. A path that is already gone is not an error: the sweep runs
+	// every cycle over the same directory.
+	Remove(path string) error
 }
 
 // Chain is one volume's local qcow2 chain: a stack of layers, the newest of which the

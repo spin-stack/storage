@@ -54,6 +54,7 @@ internal/simio/real/objectstore.go:ObjectStore.Restore:gc  # the operator step b
 internal/simio/real/s3.go:ErrBucketNotVersioned:gc         # quotes INV-14 to say what is false on an unversioned bucket. The sentinel is returned by a live check
 internal/simio/real/s3.go:NewS3Store:gc                    # "refuses a bucket the GC could not undo a delete on" — a property of the bucket, in the constructor that enforces it
 internal/simio/real/s3.go:S3Store.Delete:gc                # "the object stays recoverable and the GC cannot destroy data" — the guarantee this Delete provides, whoever ends up calling it
+cmd/control-plane/main.go:run:gc                           # names `-gc-dry-run`, a flag that exists and prints: it lists what a sweep *would* remove and removes nothing, which is the opposite of claiming a sweeper runs
 
 # --- the lease is live; these say so about the right thing ----------------------------
 internal/agent/loop.go:Loop.giveUpWhatIsNoLongerOurs:lease-valid # "not 'the lease is invalid': a nil lease is also every Agent's first cycle" — about ownership and the device, which is the live use
@@ -62,3 +63,5 @@ internal/metadata/metadata.go:Store.Now:lease-valid          # about the Control
 # --- naming a withdrawn mechanism to say it is gone, and two forward references --------
 internal/qcow/chain.go:overlay:compaction              # "§19 already owns flattening, as compaction, outside the recovery path" — compaction is v6 §23.7 and is ahead of this tree, not behind it. The comment is why a recovery does NOT flatten.
 internal/recovery/recovery.go:maxRestoreDepth:compaction # the depth ceiling exists because nothing compacts yet; the mention is the reason for the number, and it goes when §23.7 lands.
+internal/controlplane/clone.go:MaxChainDepth:compaction # the ceiling's cost is per commit of the ancestor, so the sentence says what *would* bound a chain's growth and that nothing implements it yet — the same forward reference as recovery.go's maxRestoreDepth.
+internal/controlplane/clone.go:Clone:compaction        # two constraints on the compaction §19 asks for, both saying it does not exist yet: what it must leave true about a clone's depth, and that it must mint a fresh DEK or break crypto-shred.

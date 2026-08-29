@@ -862,6 +862,24 @@ func (s *Store) ListUnfinishedSnapshots(ctx context.Context) ([]metadata.Snapsho
 	return snaps, nil
 }
 
+// ListPublishedSnapshots returns the snapshots that hold a commit alive, fleet-wide. The
+// state is lifecycle's, handed to the query, so the §19 vocabulary is not copied into SQL.
+func (s *Store) ListPublishedSnapshots(ctx context.Context) ([]metadata.Snapshot, error) {
+	rows, err := s.q.ListPublishedSnapshots(ctx, string(lifecycle.SnapshotPublished))
+	if err != nil {
+		return nil, err
+	}
+	snaps := make([]metadata.Snapshot, 0, len(rows))
+	for _, row := range rows {
+		snap, err := snapshotFromRow(row)
+		if err != nil {
+			return nil, err
+		}
+		snaps = append(snaps, snap)
+	}
+	return snaps, nil
+}
+
 // PublishSnapshot records what the host that took the snapshot observed.
 func (s *Store) PublishSnapshot(ctx context.Context, term int64, snapshotID, commitID, sourceHostID string) error {
 	id, err := requireUUID("snapshot", snapshotID)

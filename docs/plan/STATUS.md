@@ -61,9 +61,9 @@ system has no equivalent of vSphere's datastore lock.
 
 ## Do this next
 
-1. **`clone.go` still reasons about the withdrawn engine.** `MaxChainDepth` is justified by
-   a measurement of `cow.IntervalMap`, `agent.awaitBase` and `agent.maxChainWalk`, none of
-   which exist. The number wants re-measuring against the chain a clone actually builds.
+1. **`MaxChainDepth` admits five links and recovery rebuilds one.** `RestoreFrom` does not
+   recurse, so a depth-2 clone re-placed on a bare host comes back missing what its
+   grandparent wrote and reports SUCCESS. Lower the ceiling, or walk the whole ancestry.
 2. **§29 has one point left**: qcow2 corruption a guest introduces *while running*.
 3. **DST for the reconciler and the rebuild.** Neither has a scenario, and neither can
    while both drive `qemu-img`: a runner fake in `internal/dst` would be a second

@@ -70,3 +70,19 @@ UPDATE snapshots
  WHERE snapshot_id = $1
    AND (SELECT term FROM control_plane_leader WHERE singleton) = sqlc.arg(term)
    AND state = 'CREATING';
+
+-- name: ListPublishedSnapshots :many
+-- The snapshots that hold a commit alive, fleet-wide. A published snapshot is a name for
+-- a point in a volume's history, so its commit — and every ancestor of that commit — is a
+-- reachability root even when the volume's HEAD has moved far past it.
+--
+-- The state comes in as a parameter rather than being written here, the same move
+-- ListUnfinishedSnapshots makes: §19's vocabulary belongs to internal/lifecycle. DELETING
+-- is deliberately not included: it is the state that says a human asked for the snapshot
+-- to go.
+--
+-- No index, deliberately, and for ListUnfinishedSnapshots's reason: an operator runs this
+-- by hand, and an index on `state` would be maintained by every snapshot write for it.
+SELECT * FROM snapshots
+ WHERE state = sqlc.arg(state)::text
+ ORDER BY snapshot_id;

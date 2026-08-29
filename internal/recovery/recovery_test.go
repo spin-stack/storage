@@ -140,6 +140,21 @@ func (f *fakeFiles) Rename(oldPath, newPath string) error {
 	return nil
 }
 
+// List names the files this fake holds directly under dir. qcow.Paths carries it for the
+// sweep; nothing in this package lists anything.
+func (f *fakeFiles) List(dir string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var names []string
+	for path := range f.files {
+		if filepath.Dir(path) == dir {
+			names = append(names, filepath.Base(path))
+		}
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
 func (f *fakeFiles) Remove(path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

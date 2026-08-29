@@ -131,6 +131,54 @@ func (q *Queries) ListPendingSnapshots(ctx context.Context, primaryHostID pgtype
 	return items, nil
 }
 
+const listPublishedSnapshots = `-- name: ListPublishedSnapshots :many
+SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, commit_id, source_host_id, state, portable, request_id, created_at FROM snapshots
+ WHERE state = $1::text
+ ORDER BY snapshot_id
+`
+
+// The snapshots that hold a commit alive, fleet-wide. A published snapshot is a name for
+// a point in a volume's history, so its commit — and every ancestor of that commit — is a
+// reachability root even when the volume's HEAD has moved far past it.
+//
+// The state comes in as a parameter rather than being written here, the same move
+// ListUnfinishedSnapshots makes: §19's vocabulary belongs to internal/lifecycle. DELETING
+// is deliberately not included: it is the state that says a human asked for the snapshot
+// to go.
+//
+// No index, deliberately, and for ListUnfinishedSnapshots's reason: an operator runs this
+// by hand, and an index on `state` would be maintained by every snapshot write for it.
+func (q *Queries) ListPublishedSnapshots(ctx context.Context, state string) ([]*Snapshot, error) {
+	rows, err := q.db.Query(ctx, listPublishedSnapshots, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*Snapshot{}
+	for rows.Next() {
+		var i Snapshot
+		if err := rows.Scan(
+			&i.SnapshotID,
+			&i.VolumeID,
+			&i.ParentSnapshotID,
+			&i.Epoch,
+			&i.CommitID,
+			&i.SourceHostID,
+			&i.State,
+			&i.Portable,
+			&i.RequestID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnfinishedSnapshots = `-- name: ListUnfinishedSnapshots :many
 SELECT snapshot_id, volume_id, parent_snapshot_id, epoch, commit_id, source_host_id, state, portable, request_id, created_at FROM snapshots
  WHERE state = ANY($1::text[])

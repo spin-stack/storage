@@ -117,8 +117,12 @@ type Head struct {
 // parent would delete its clones' data. Content addressing also makes a re-upload a no-op
 // instead of an orphan, which is what makes step 11 of v6 §9 safe to retry.
 func LayerKey(sha256hex string) string {
-	return "layers/sha256/" + sha256hex[0:2] + "/" + sha256hex[2:4] + "/" + sha256hex
+	return LayerPrefix + sha256hex[0:2] + "/" + sha256hex[2:4] + "/" + sha256hex
 }
+
+// LayerPrefix is where every layer object lives, whoever wrote it. Listing it is how the
+// orphan report finds objects no commit names.
+const LayerPrefix = "layers/sha256/"
 
 // ManifestKey is where one commit's manifest lives.
 func ManifestKey(volumeID, commitID string) string {

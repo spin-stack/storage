@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -153,13 +155,34 @@ func (p *fakePaths) Size(path string) (int64, error) {
 	return p.sizes[path], nil
 }
 
-// remove is a file being unlinked out from under this Agent.
-func (p *fakePaths) remove(path string) {
+// remove is a file being unlinked out from under this Agent. It is the same unlink the
+// Agent itself performs, which is why it goes through Remove.
+func (p *fakePaths) remove(path string) { _ = p.Remove(path) }
+
+// List names the files this fake holds directly under dir.
+func (p *fakePaths) List(dir string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.statFail != nil {
+		return nil, p.statFail
+	}
+	var names []string
+	for path := range p.present {
+		if filepath.Dir(path) == dir {
+			names = append(names, filepath.Base(path))
+		}
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+func (p *fakePaths) Remove(path string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.removed[path] = true
 	delete(p.present, path)
 	delete(p.files, path)
+	return nil
 }
 
 func (p *fakePaths) ReadFile(path string) ([]byte, error) {
@@ -202,10 +225,13 @@ func overlayJSON(size int64, backing string) string {
 }
 
 const (
-	root    = "/var/lib/volume-agent"
-	vol     = "0198c0de-0000-7000-8000-00000000cafe"
-	size    = int64(268435456)
-	layerID = "0198c0de-0000-7000-8000-0000000f1r57"
+	root = "/var/lib/volume-agent"
+	vol  = "0198c0de-0000-7000-8000-00000000cafe"
+	size = int64(268435456)
+	// A real v7 uuid, not a readable word: layer ids name files the sweep has to be able
+	// to place in time, so a fake one that is not a uuid tests a layout production cannot
+	// produce.
+	layerID = "0198c0de-0000-7000-8000-0000000f1057"
 	nextID  = "0198c0de-0000-7000-8000-000000005ec0"
 	baseID  = "0198c0de-0000-7000-8000-000000000ba5"
 	// headCommit is what HEAD named when the chain was rebuilt.

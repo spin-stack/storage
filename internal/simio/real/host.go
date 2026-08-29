@@ -83,6 +83,21 @@ func (*Paths) Size(path string) (int64, error) {
 	return fi.Size(), nil
 }
 
+// List names the entries of dir, without their paths. A directory that cannot be read is
+// an error and never an empty listing, for the reason Exists carries: the caller decides
+// from this which files may be removed.
+func (*Paths) List(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names, nil
+}
+
 // ReadFile returns the file's contents.
 func (*Paths) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
 

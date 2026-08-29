@@ -54,6 +54,15 @@ func (p *statePaths) WriteAtomic(path string, data []byte) error {
 	return nil
 }
 
+// List and Remove are here because qcow.Paths carries them for the sweep. Nothing in
+// this file names a directory, so listing one is empty and removing a file is a delete.
+func (*statePaths) List(string) ([]string, error) { return nil, nil }
+
+func (p *statePaths) Remove(path string) error {
+	delete(p.files, path)
+	return nil
+}
+
 // aState is one host that has published two commits and owes the object store a third.
 func aState() qcow.State {
 	return qcow.State{

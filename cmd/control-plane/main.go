@@ -112,7 +112,20 @@ func run() error {
 		// INV-20). It is why descriptors are written at all — without it a lost
 		// PostgreSQL is unrecoverable even though every byte of every volume is intact.
 		rebuildMetadata = flag.Bool("rebuild-metadata", false, "rebuild the volume and snapshot catalog from the object store, and exit")
-		oversubscribe   = flag.Float64("max-oversubscription", 1.0,
+
+		// gc-dry-run: print the objects no HEAD and no published snapshot reaches, and
+		// exit. It deletes nothing, and there is no flag that would make it: §20's first
+		// rule is that an object is never removed because it does not appear in the
+		// current HEAD, and the object store's own delete is a marker whose removal is a
+		// bucket lifecycle policy. What to do with the list is a human's call.
+		gcDryRun = flag.Bool("gc-dry-run", false, "print the objects nothing in the fleet reaches, and exit; deletes nothing")
+		// 24 hours is a policy and not a measurement, and it is deliberately far longer
+		// than any publish this system performs: the objects it protects are a layer
+		// uploaded seconds before the manifest that names it, and the cost of a grace
+		// period that is too long is a report that is late.
+		gcGrace = flag.Duration("gc-grace", 24*time.Hour,
+			"with -gc-dry-run: how long an object must have been in the bucket before it can be listed as a candidate")
+		oversubscribe = flag.Float64("max-oversubscription", 1.0,
 			"with -clone-snapshot / -attach-volume: committed/total ceiling a host may reach (§28.2)")
 		// The second ceiling is the measured one (ADR-0013 §3): a separate flag because promises
 		// are oversubscribed on purpose and bytes are not, and because a dedicated NVMe tolerates
@@ -161,11 +174,12 @@ func run() error {
 	flag.Parse()
 
 	switch {
-	// -fleet-status is exempt from both. It identifies nobody, because it takes no
-	// term and writes nothing, and demanding an identity for a read is friction in
-	// front of the one command an operator runs when they do not yet know what is
-	// wrong. The DSN it still needs: the catalog is what it reports.
-	case *holderID == "" && !*fleetStatus:
+	// -fleet-status and -gc-dry-run are exempt from the identity. Both identify
+	// nobody, because they take no term and write nothing, and demanding an identity
+	// for a read is friction in front of the commands an operator runs when they do
+	// not yet know what is wrong. The DSN they still need: the catalog is what
+	// -fleet-status reports and where -gc-dry-run's roots come from.
+	case *holderID == "" && !*fleetStatus && !*gcDryRun:
 		return errors.New("-holder-id is required")
 	case *databaseDSN == "":
 		return errors.New("-database-url (or $DATABASE_URL) is required")
@@ -299,6 +313,23 @@ func run() error {
 		slog.Info("catalog rebuilt from the object store; no volume has a primary host — place them to resume serving",
 			"volumes", sum.Volumes)
 		return nil
+	}
+
+	if *gcDryRun {
+		// No term and no leader, unlike the one-shots below: it writes nothing, and the
+		// moment an operator most wants to know what is in their bucket is the moment
+		// nothing is leading. The clock is the catalog's, the same one fleetReport reads
+		// against, so an operator's laptop being minutes off cannot age an object into
+		// being a candidate.
+		now, nerr := md.Now(ctx)
+		if nerr != nil {
+			return fmt.Errorf("reading the catalog's clock: %w", nerr)
+		}
+		plan, gerr := controlplane.PlanGC(ctx, md, store, now, *gcGrace)
+		if gerr != nil {
+			return gerr
+		}
+		return plan.Print(os.Stdout)
 	}
 
 	if *detachVolume != "" || *attachVolume != "" {

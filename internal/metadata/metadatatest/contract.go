@@ -1105,12 +1105,29 @@ func fleetWideReads(t *testing.T, s metadata.Store) {
 	if got, err := s.ListUnfinishedSnapshots(ctx); err != nil || len(got) != 0 {
 		t.Fatalf("a PUBLISHED snapshot is still outstanding: %v (err %v)", snapshotIDs(t, got), err)
 	}
+	// The complementary read, and the one §20's reachability roots are built from: a
+	// snapshot appears here exactly while it is PUBLISHED. It was invisible to every
+	// listing on this Store while it was CREATING, which is what an orphan sweep reading
+	// the wrong listing would have concluded about the commit it names.
+	published, err := s.ListPublishedSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListPublishedSnapshots: %v", err)
+	}
+	if got := snapshotIDs(t, published); !reflect.DeepEqual(got, []string{w.snap}) {
+		t.Fatalf("published = %v, want the published snapshot %s", got, w.snap)
+	}
+	if published[0].CommitID == "" {
+		t.Fatalf("snapshot %s came back published naming no commit, so nothing could root a walk at it", w.snap)
+	}
 	if err := setSnapshotState(ctx, s, w.term, w.snap, lifecycle.SnapshotDeleting); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if got, err := s.ListUnfinishedSnapshots(ctx); err != nil ||
 		!reflect.DeepEqual(snapshotIDs(t, got), []string{w.snap}) {
 		t.Fatalf("a DELETING snapshot nothing reclaims = %v (err %v), want %s", snapshotIDs(t, got), err, w.snap)
+	}
+	if got, err := s.ListPublishedSnapshots(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("a DELETING snapshot is still published: %v (err %v)", snapshotIDs(t, got), err)
 	}
 }
 

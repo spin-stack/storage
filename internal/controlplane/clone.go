@@ -21,34 +21,49 @@ import (
 // created rather than cloned is at depth 0, so five clone links are admitted above a root
 // and the sixth is refused.
 //
-// It is a policy, not a measurement, and there is no measurement to make. Each ancestor
-// costs three fixed object reads at attach (agent.TestWhatDepthCostsAtAttach: its
-// descriptor, a Head and a Get for its snapshot manifest), so fifteen fixed round trips at
-// this ceiling — an order of magnitude inside agent.awaitBase's ShutdownGrace. The steady
-// state is what would choose the number and it has no knee: cow.IntervalMap.Read scans
-// every extent list of every layer it crosses, so a guest read at depth D scans D+1, which
-// is linear and does not distinguish four from five from six. So the number is §20.1's and
-// §10's max_chain_depth, the one an operator has already been told, and FLATTEN is the verb
-// that gets a lineage back under it. Two measurements would move it: a per-link constant
-// that stops being small, or an index in `cow` that stops a read from scanning every layer.
+// What a link costs at attach, measured against the code that pays it and pinned by
+// recovery.TestWhatOneChainLinkCostsAtAttach, which asserts the exact requests: an ancestor
+// costs two object-store GETs per commit in *its own* history — one manifest, one layer —
+// and no fixed per-link cost at all, because the parent is rebuilt to the commit the
+// snapshot names and its HEAD is deliberately never read. Depth is therefore not the
+// variable: one link over a forty-commit ancestor costs twenty times one link over a
+// two-commit ancestor, and what would bound both is §19's compaction, which nothing in
+// this tree implements yet — not this number.
+//
+// What QEMU pays is per backing *file* for the same reason, and recovery.maxRestoreDepth
+// holds that measurement: 301 layers open in both qemu-img and qemu-system at one
+// descriptor and ~140 KiB of RSS each. What a guest read costs per backing file it crosses
+// is not measured anywhere and cannot be measured from here — it needs a real guest, so it
+// belongs in the guest lane and is not guessed at.
+//
+// The measurement that should move this ceiling is not a cost. Recovery rebuilds exactly
+// one ancestor: qcow.Lineage carries one parent, cpserver fills it from the snapshot row,
+// recovery.RestoreFrom does not recurse, and a clone's own published commits are overlays
+// over a base no manifest of theirs names. So a depth-2 clone re-placed on a host that
+// holds nothing rebuilds a chain missing everything its grandparent wrote, and reports
+// success (recovery.TestARestoreReadsOneAncestorAndStops). The depth this system can
+// actually serve is 1. Five is left standing rather than silently corrected because the two
+// repairs are different products — lower the ceiling, or teach the walk the whole ancestry
+// — and neither is a comment's decision to make.
 //
 // Rejected: a flag on cmd/control-plane. A ceiling an operator can raise per invocation is
 // one that gets raised during the incident it exists to prevent, and the number only means
 // anything if every clone in the fleet was admitted against the same one.
 const MaxChainDepth = 5
 
-// ErrChainTooDeep is what a clone past MaxChainDepth is refused with. A sentinel because
-// FLATTEN's one-shot has to tell "you are at the ceiling" apart from "that snapshot does not
-// exist"; every other refusal in Clone says the fleet or the snapshot is wrong.
+// ErrChainTooDeep is what a clone past MaxChainDepth is refused with. A sentinel because a
+// caller has to tell "you are at the ceiling", which is about the lineage and is answered by
+// cloning something shallower, apart from "that snapshot does not exist"; every other
+// refusal in Clone says the fleet or the snapshot is wrong.
 var ErrChainTooDeep = errors.New("controlplane: the lineage is at its depth ceiling")
 
 // Clone creates a new volume from a parent snapshot (§20): pure metadata — a new active
 // child at epoch 1 that reads *through* the parent snapshot's already-durable objects
 // rather than copying them, inheriting the parent's size, block size and DEK, at the
-// parent's depth+1 or refused with ErrChainTooDeep. A clone is not independent: a manifest
-// states only what its own volume wrote and a read walks the ancestry
-// (image.uploadChunks, agent.parentView), which is why deleting a parent whose clones read
-// through it is refused rather than cascaded.
+// parent's depth+1 or refused with ErrChainTooDeep. A clone is not independent: its
+// manifests state only what its own volume wrote, and an attach rebuilds the parent's
+// layers underneath them (recovery.RestoreFrom), which is why deleting a parent whose
+// clones read through it is refused rather than cascaded.
 //
 // KeyRewrapper is what a clone needs from the KMS: open the parent's wrapped DEK and seal
 // the same key bytes again under the child's id. A second, narrow interface rather than a
@@ -82,22 +97,25 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, kms 
 	}
 	// Refused before a host is chosen, before a row exists and before a byte is charged: a
 	// refusal that has already written something is one an operator has to clean up after.
-	// It is also the only place it can refuse — agent.maxChainWalk is a termination guard on
-	// a walk, and refusing there turns a volume the fleet created successfully into one
-	// nothing can read, with a guest already booting.
+	// It is also the only place it can refuse — recovery.maxRestoreDepth is a termination
+	// guard on a walk, and refusing there turns a volume the fleet created successfully into
+	// one nothing can read, with a guest already booting.
 	//
 	// It compares the *parent volume's* depth, which holds only while a snapshot is at its
-	// volume's depth. FLATTEN can break that — a flattened volume is back at depth 0 while
-	// the snapshots it published before are still deltas over the old lineage — so whatever
-	// FLATTEN does about them must leave that sentence true.
+	// volume's depth. Republishing a volume as a new root — §19's compaction, which nothing
+	// implements yet — breaks it: the volume is back at depth 0 while the snapshots it
+	// published before are still deltas over the old lineage. Whatever lands must leave that
+	// sentence true or move this check.
 	if parent.ChainDepth >= MaxChainDepth {
 		return metadata.Volume{}, fmt.Errorf(
 			"%w: volume %s is at depth %d, so a clone of snapshot %s would be depth %d and the ceiling is %d. "+
-				"Every guest read on a clone scans one extent list per link and every attach reads one more ancestor, "+
-				"which is what this refuses to grow further. FLATTEN volume %s — the operator one-shot that makes it "+
-				"self-contained and returns it to depth 0 — then snapshot the flattened volume and clone that",
+				"Every attach of a clone rebuilds an ancestor's whole published history from the object store, "+
+				"and every guest read crosses one more backing file, which is what this refuses to grow further. "+
+				"Nothing reduces an existing lineage's depth today — §19's compaction, an offline qemu-img convert "+
+				"republished as a new immutable root, is what would, and it has no verb — so clone a shallower "+
+				"volume in this lineage instead",
 			ErrChainTooDeep, parent.VolumeID, parent.ChainDepth, parentSnapshotID,
-			parent.ChainDepth+1, MaxChainDepth, parent.VolumeID)
+			parent.ChainDepth+1, MaxChainDepth)
 	}
 	hosts, err := md.ListHosts(ctx)
 	if err != nil {
@@ -141,9 +159,10 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, kms 
 	// carries it, so a child handed the parent's blob cannot unwrap it under its own id.
 	//
 	// Crypto-shred is therefore lineage-scoped, and this is the line that makes it so:
-	// deleting the parent destroys no secret the child does not still hold. A FLATTEN that
-	// re-uploads a clone's data must mint a *fresh* DEK while it does, or deleting the
-	// flattened clone's parent shreds nothing and the delete verb's promise is false.
+	// deleting the parent destroys no secret the child does not still hold. The compaction
+	// §19 asks for does not exist yet; when it re-uploads a clone's data it must mint a
+	// *fresh* DEK while it does, or deleting the parent of the volume it rewrote shreds
+	// nothing and the delete verb's promise is false.
 	parentID, err := ids.Parse(snap.VolumeID)
 	if err != nil {
 		return metadata.Volume{}, fmt.Errorf("controlplane: parent volume id %q: %w", snap.VolumeID, err)
@@ -195,10 +214,10 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, kms 
 		return metadata.Volume{}, err
 	}
 	// `chain_depth` (§26.2), recorded here rather than on the Agent because it is the
-	// catalog's number: the one the ceiling above refuses on and a FLATTEN reduces. Recorded
-	// at the change and not polled, because between a clone and a FLATTEN a volume's depth
-	// cannot move; the cost is that the series goes quiet, so "which volumes are deep now" is
-	// answered by `-fleet-status` and this answers "how deep was it when created".
+	// catalog's number: the one the ceiling above refuses on. Recorded at the change and not
+	// polled, because nothing else moves a volume's depth once it exists; the cost is that
+	// the series goes quiet, so "which volumes are deep now" is answered by `-fleet-status`
+	// and this answers "how deep was it when created".
 	//
 	// After CreateVolume, deliberately: a depth nothing has committed may never exist — the
 	// term guard can refuse this write, and a gauge that leads the catalog is one an operator
@@ -219,9 +238,8 @@ func Clone(ctx context.Context, md metadata.Store, store objectstore.Store, kms 
 		DEKWrapped:       clone.DEKWrapped,
 		DEKKeyID:         clone.DEKKeyID,
 		ParentSnapshotID: clone.ParentSnapshotID,
-		// Both halves: a snapshot id names an object only together with the volume it
-		// lives under (image.SnapshotKey), and agent.parentView follows both past the
-		// first link.
+		// Both halves: a snapshot names a commit only together with the volume it lives
+		// under (commit.ManifestKey), and a rebuild is handed both.
 		ParentVolumeID: clone.ParentVolumeID,
 	}); err != nil {
 		return clone, fmt.Errorf("writing the descriptor for clone %s (the row exists; rebuild-metadata cannot see it until this succeeds): %w",
