@@ -204,6 +204,28 @@ message DesiredVolume {
   // fact and not a counter — and which nothing carries yet.
   reserved 10, 11;
 
+  // head_commit_id is the newest commit any host has told the catalog it published for
+  // this volume, empty for a volume that has never published.
+  //
+  // It answers exactly one question, and it is the question a host cannot answer for
+  // itself: **the object store has no HEAD for this volume — is that because the volume
+  // is new, or because its HEAD is gone?** A host that guesses "new" creates a blank
+  // qcow2, a guest boots it and finds an empty disk with no I/O error anywhere, and the
+  // first commit off that chain makes it the volume's history. A host that guesses
+  // "gone" refuses a genuinely new volume and nothing in the fleet can ever start.
+  //
+  // The Agent already refuses this when *it* is the host that published — its own
+  // state.json says so — and that is precisely the case that does not matter: the host
+  // that published is the one that still has the layers. The case that loses a tenant's
+  // disk is the volume placed on a machine that has never seen it, which is §14's whole
+  // recovery path and where no local record exists to consult. Only the catalog knows.
+  //
+  // Under-claiming is the safe direction and is what an empty value means: a volume that
+  // has published and whose catalog row does not say so is served exactly as it is
+  // served today. Over-claiming would refuse a volume that is fine, which is why this is
+  // written from what a host reported publishing rather than derived from anything.
+  string head_commit_id = 15;
+
   // rpo_target_seconds is how far behind the object store this volume is allowed to
   // fall: the age at which the host seals its tip and commits it even though the tip
   // has not reached the size threshold. Zero means the volume has no age trigger and
@@ -406,6 +428,14 @@ message VolumeReport {
   // above take: the report's refusal is what says why.
   int32 chain_depth = 15;
   int64 local_disk_bytes = 16;
+  // published_commit_id is the newest commit this host has published for the volume,
+  // empty while it has published none. It is what the catalog remembers so that a *later*
+  // host can be told the volume has a history — see DesiredVolume.head_commit_id.
+  //
+  // Not a durability claim and not an authority: the bucket is the authority on what a
+  // commit holds (§5.8), and the only thing this number is ever compared against is the
+  // absence of a HEAD.
+  string published_commit_id = 17;
   // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
   // that fails silently stays CREATING forever and nothing ever collects it.
   string snapshot_error = 9;

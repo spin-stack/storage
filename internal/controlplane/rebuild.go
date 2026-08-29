@@ -93,6 +93,12 @@ func volumeFromDescriptor(ctx context.Context, store objectstore.Store, d descri
 		// volume a token this catalog accepts. Raised *past* the floor rather than restored to
 		// it, because coming back at the same number leaves every predecessor's token live.
 		CurrentEpoch: epochFloor(ctx, store, d) + 1,
+		// And what the bucket's HEAD names, so the blank-disk refusal is armed the moment
+		// the catalog comes back rather than after each volume's next publish. A HEAD that
+		// does not answer leaves it empty, which under-claims: the rebuild cannot tell a
+		// volume that never published from one whose HEAD is the object that went missing,
+		// and refusing on that guess would strand a fleet on the day it lost its catalog.
+		HeadCommitID: headCommit(ctx, store, d.VolumeID),
 		// ACTIVE with no primary: the volume exists and nobody is serving it. There is
 		// no object that records placement, and inventing one would make a rebuilt
 		// catalog claim a host is writing when nothing is.
@@ -165,6 +171,15 @@ func checkKey(d descriptor.Descriptor, kms KeyChecker) error {
 			descriptor.Key(d.VolumeID), err)
 	}
 	return nil
+}
+
+// headCommit is what the bucket's HEAD names, or empty when it will not answer.
+func headCommit(ctx context.Context, store objectstore.Store, volumeID string) string {
+	head, err := commit.ReadHeadCommit(ctx, store, volumeID)
+	if err != nil {
+		return ""
+	}
+	return head
 }
 
 // epochFloor is the highest epoch this volume can be shown to have used: the greater of

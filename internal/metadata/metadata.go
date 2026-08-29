@@ -113,6 +113,11 @@ type VolumeReport struct {
 	HostID string
 	Epoch  int64
 
+	// PublishedCommitID is the newest commit this host has published, empty while it has
+	// published none. Empty never clears what the catalog holds: a host that has just
+	// taken the volume has published nothing yet and says so every cycle until it does.
+	PublishedCommitID string
+
 	CommitAge             time.Duration
 	UnpublishedLocalBytes int64
 	Refusal               lifecycle.Refusal
@@ -267,6 +272,15 @@ type Volume struct {
 	// nothing can open. Zero is not a version: it is the WAL's plaintext marker, and
 	// wal.NewEncryption refuses it.
 	DEKKeyID uint32
+	// HeadCommitID is the newest commit a host has reported publishing for this volume,
+	// empty for one that has never published.
+	//
+	// It is not part of Progress, and the difference is the whole of what it is for:
+	// Progress is what one host observed and is cleared when the volume leaves that host,
+	// while this is a fact about the volume's *data* and has to survive the move. The
+	// host it has to reach is the next one — see the schema, and qcow.Open's blank-disk
+	// refusal.
+	HeadCommitID string
 	// Progress is what the volume's host last observed about it: the RPO, the backlog,
 	// and whether it is being served at all. Zero for a volume no host has reported.
 	Progress VolumeProgress

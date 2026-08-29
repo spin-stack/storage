@@ -466,7 +466,11 @@ func (m *Manager) ensure(ctx context.Context, d *storagev1.DesiredVolume) error 
 			// party that can read the rows the chain is spelled out in.
 			Lineage:   Lineage{VolumeID: id, Ancestry: ancestry(d)},
 			SizeBytes: d.GetSizeBytes(),
-			LiveImage: live, NewLayerID: ids.New().String(), Recovery: m.rec,
+			// What the catalog says this volume has published, which is the only thing
+			// that separates a new volume from one whose HEAD is gone on a host that has
+			// never held it (see chain.Open's born branch).
+			HeadCommitID: d.GetHeadCommitId(),
+			LiveImage:    live, NewLayerID: ids.New().String(), Recovery: m.rec,
 		})
 		if err != nil {
 			if errors.Is(err, ErrStaleChain) && live != "" {
@@ -1285,6 +1289,14 @@ func (m *Manager) gap(v *volume) volumeGap {
 		return g
 	}
 	g.chainDepth = chainDepth(st, v.chain.Active)
+	// The newest commit this host published, which the catalog keeps so it can tell a
+	// *later* host that this volume has a history — see metadata.Volume.HeadCommitID. Read
+	// from the record rather than tracked in memory, for the reason every other number
+	// here is: a restarted Agent that reported nothing would look like a volume that has
+	// never published, and that is the exact claim the guard turns on.
+	if n := len(st.Commits); n > 0 {
+		g.publishedCommitID = st.Commits[n-1].CommitID
+	}
 	if st.LastCommitAt == 0 {
 		// Never committed here. Zero is the honest answer: an age measured from an anchor
 		// this host invented would read as an RPO somebody could rely on.
@@ -1314,6 +1326,7 @@ type volumeGap struct {
 	unpublishedLocalBytes int64
 	chainDepth            int
 	localDiskBytes        int64
+	publishedCommitID     string
 }
 
 // Volumes reports what this host is holding, ordered by volume id (deterministic).
@@ -1337,6 +1350,7 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 			UnpublishedLocalBytes: g.unpublishedLocalBytes,
 			ChainDepth:            g.chainDepth,
 			LocalDiskBytes:        g.localDiskBytes,
+			PublishedCommitID:     g.publishedCommitID,
 			Refusal:               v.refusal,
 			// Empty when there is no refusal, which is what the wire's healthy value is.
 			RefusalDetail: v.detail,

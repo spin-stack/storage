@@ -497,7 +497,8 @@ func volumeFromRow(v *db.Volume) (metadata.Volume, error) {
 		// The column's CHECK bounds it to (0, 2^32), so the narrowing is total —
 		// and it is the same 16-byte-id story as volume_id: BIGINT at the boundary,
 		// the format's own width in the interface.
-		DEKKeyID: uint32(v.DekKeyID), //nolint:gosec // bounded by volumes.dek_key_id's CHECK
+		DEKKeyID:     uint32(v.DekKeyID), //nolint:gosec // bounded by volumes.dek_key_id's CHECK
+		HeadCommitID: fromNullUUID(v.HeadCommitID),
 		Progress: metadata.VolumeProgress{
 			CommitAge:             time.Duration(v.CommitAgeSeconds.Int32) * time.Second,
 			UnpublishedLocalBytes: v.UnpublishedLocalBytes,
@@ -706,8 +707,12 @@ func (s *Store) RecordVolumeReport(ctx context.Context, term int64, r metadata.V
 	if r.UnpublishedLocalBytes < 0 {
 		return fmt.Errorf("%w: unpublished local bytes %d", metadata.ErrInvalidReport, r.UnpublishedLocalBytes)
 	}
+	head, err := nullUUID("published commit", r.PublishedCommitID)
+	if err != nil {
+		return err
+	}
 	rows, err := s.q.RecordVolumeReport(ctx, db.RecordVolumeReportParams{
-		VolumeID: id, HostID: host, Epoch: r.Epoch, Term: term,
+		VolumeID: id, HostID: host, Epoch: r.Epoch, Term: term, HeadCommitID: head,
 		Refusal: r.Refusal.String(), RefusalDetail: r.RefusalDetail,
 		CommitAgeSeconds: age, UnpublishedLocalBytes: r.UnpublishedLocalBytes,
 	})

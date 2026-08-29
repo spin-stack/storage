@@ -283,6 +283,10 @@ type OpenRequest struct {
 	// Recovery answers whether this volume has published commits, and puts them on this
 	// disk when it has. It is required: an optional guard is not a guard.
 	Recovery Recovery
+	// HeadCommitID is the newest commit the *catalog* says this volume has published,
+	// empty when it says nothing. It is only ever read against a missing HEAD, where it
+	// separates "this volume is new" from "this volume's HEAD is gone" — see born.
+	HeadCommitID string
 }
 
 // Open returns the chain for one volume, creating the first layer the first time.
@@ -467,6 +471,22 @@ func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 		if local.Fenced != nil {
 			return nil, fmt.Errorf("%w: volume %s stopped being this host's at epoch %d and its local chain was set aside, and the object store says the volume has never published",
 				ErrChainMissing, req.VolumeID, local.Fenced.Epoch)
+		}
+		// And the catalog's answer, which is the only one a host that has never held this
+		// volume can get. The two checks above are this host's own record and cover the
+		// host that published — the one that still has the layers, and so the one whose
+		// mistake is recoverable. §14's recovery path puts the volume on a machine with no
+		// record at all, and there "the bucket has no HEAD" reads as "this volume is new".
+		// It is not: it is a HEAD that a lifecycle rule expired, a repair script deleted, a
+		// restore missed, or that was written to a bucket this process is not pointed at.
+		// Creating a blank qcow2 over that produces no error anywhere — the guest boots and
+		// finds an empty disk — and the first commit off the chain makes it the history.
+		//
+		// Empty means the catalog is not saying, which is every volume on its first cycle,
+		// so this can only ever refuse a volume something has published.
+		if req.HeadCommitID != "" {
+			return nil, fmt.Errorf("%w: the catalog says volume %s published commit %s and the object store has no HEAD for it, so this host will not create it empty over a history that exists",
+				ErrChainMissing, req.VolumeID, req.HeadCommitID)
 		}
 		image := LayerImage(req.Root, req.VolumeID, req.NewLayerID)
 		if _, err := r.Run(ctx, qemuImg, "create", "-f", "qcow2", image, fmt.Sprint(req.SizeBytes)); err != nil {

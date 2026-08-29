@@ -1052,3 +1052,63 @@ func TestCheckNotStaleReportsAStoreThatWillNotAnswer(t *testing.T) {
 		t.Errorf("the refusal does not carry what the store said: %v", err)
 	}
 }
+
+// TestAHostThatHasNeverSeenAPublishedVolumeRefusesToInventOne is the blank-disk refusal,
+// and the one case the host's own record cannot cover.
+//
+// The object store answering "no HEAD" has two meanings and they are not close: the
+// volume is new, or its HEAD is gone — expired by a lifecycle rule, deleted by a repair
+// script, missed by a restore, or written to a bucket this Agent is not pointed at. A
+// host that guesses "new" creates a blank qcow2, and there is no error anywhere: the
+// guest boots, finds an empty disk, and the first commit off that chain makes the blank
+// disk the volume's history.
+//
+// A host that published this volume already refuses, from its own state.json — and that
+// is the case that does not matter, because it still has the layers. The one that loses a
+// tenant's disk is a volume *placed on a machine that has never seen it*, which is §14's
+// recovery path and the reason this fleet exists. There is nothing local to consult, so
+// the answer has to arrive with the desired state.
+func TestAHostThatHasNeverSeenAPublishedVolumeRefusesToInventOne(t *testing.T) {
+	t.Parallel()
+	r := &fakeRunner{}
+	p := newPaths()
+
+	_, err := qcow.Open(t.Context(), r, p, "/qemu-img", req(func(o *qcow.OpenRequest) {
+		o.Recovery = bornEmpty()
+		o.HeadCommitID = headCommit
+	}))
+	if !errors.Is(err, qcow.ErrChainMissing) {
+		t.Fatalf("a volume the catalog says has published was opened over a missing HEAD: %v", err)
+	}
+	if !strings.Contains(err.Error(), headCommit) {
+		t.Fatalf("the refusal does not name the commit that should be there: %v", err)
+	}
+	// And nothing was created. Asserted on the runner rather than on the error, because a
+	// gate that returns the right error and creates the image anyway satisfies any
+	// assertion on err — and the image it creates is the one the next boot serves.
+	if got := r.commands(); len(got) != 0 {
+		t.Fatalf("qemu-img ran %v while refusing to invent a volume", got)
+	}
+	if got := p.pointer(); got != "" {
+		t.Fatalf("the active pointer was written to %q", got)
+	}
+}
+
+// And the other direction, which is the one that would take a fleet down: a volume the
+// catalog says nothing about is still born empty. Every volume is that on its first
+// cycle, so a guard that fired on silence would refuse all of them.
+func TestAVolumeTheCatalogSaysNothingAboutIsStillBornEmpty(t *testing.T) {
+	t.Parallel()
+	r := &fakeRunner{}
+	p := newPaths()
+
+	chain, err := qcow.Open(t.Context(), r, p, "/qemu-img", req(func(o *qcow.OpenRequest) {
+		o.Recovery = bornEmpty()
+	}))
+	if err != nil {
+		t.Fatalf("a genuinely new volume was refused: %v", err)
+	}
+	if chain.Active != qcow.LayerImage(root, vol, layerID) {
+		t.Fatalf("the tip is %q", chain.Active)
+	}
+}

@@ -18,15 +18,16 @@ back with `cat`: the chain from `HEAD` is walked to the first commit, checking e
 present, matches its digest, and carries none of the guest's bytes in the clear.
 
 `demo:stage6` is §20: a snapshot is cloned and a second guest boots the clone and reads
-back the bytes the parent's guest wrote, opened with the parent's key binding.
-
-`demo:stage5` is §19 under v6: a snapshot is a *name for a commit*. An operator asks with
-the real binary while a guest writes, the Agent seals the tip because it was asked, and the
-catalog names a commit the bucket holds and that is on the chain from HEAD.
+back the bytes the parent's guest wrote, opened with the parent's key binding. `demo:stage5`
+is §19 under v6: a snapshot is a *name for a commit*, asked for with the real binary while a
+guest writes, and the catalog names a commit on the chain from HEAD.
 
 `demo:stage4` closes v6 §26's cycle: it destroys the host — process killed, data directory
 deleted — and a rebuilt machine brings the volume back from the bucket alone, a guest
-reading bytes another guest wrote on a host that no longer exists.
+reading bytes another guest wrote on a host that no longer exists. It also destroys the
+volume's `HEAD` and shows the rebuilt machine refusing rather than serving a blank disk:
+"no HEAD" means either a new volume or a lost one, and only the catalog knows which
+(`volumes.head_commit_id`).
 
 All five run in CI (`ci.yml`'s `guest` job), under TCG, from the mirrored kernel and the
 published QEMU. `integration/e2e` covers the same seams without a guest; the root diagrams

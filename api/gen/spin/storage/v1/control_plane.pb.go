@@ -679,6 +679,27 @@ type DesiredVolume struct {
 	// a partition converges by doing the same thing again — and doing it again is free,
 	// because the manifest is written create-only (INV-16).
 	PendingSnapshotId string `protobuf:"bytes,9,opt,name=pending_snapshot_id,json=pendingSnapshotId,proto3" json:"pending_snapshot_id,omitempty"`
+	// head_commit_id is the newest commit any host has told the catalog it published for
+	// this volume, empty for a volume that has never published.
+	//
+	// It answers exactly one question, and it is the question a host cannot answer for
+	// itself: **the object store has no HEAD for this volume — is that because the volume
+	// is new, or because its HEAD is gone?** A host that guesses "new" creates a blank
+	// qcow2, a guest boots it and finds an empty disk with no I/O error anywhere, and the
+	// first commit off that chain makes it the volume's history. A host that guesses
+	// "gone" refuses a genuinely new volume and nothing in the fleet can ever start.
+	//
+	// The Agent already refuses this when *it* is the host that published — its own
+	// state.json says so — and that is precisely the case that does not matter: the host
+	// that published is the one that still has the layers. The case that loses a tenant's
+	// disk is the volume placed on a machine that has never seen it, which is §14's whole
+	// recovery path and where no local record exists to consult. Only the catalog knows.
+	//
+	// Under-claiming is the safe direction and is what an empty value means: a volume that
+	// has published and whose catalog row does not say so is served exactly as it is
+	// served today. Over-claiming would refuse a volume that is fine, which is why this is
+	// written from what a host reported publishing rather than derived from anything.
+	HeadCommitId string `protobuf:"bytes,15,opt,name=head_commit_id,json=headCommitId,proto3" json:"head_commit_id,omitempty"`
 	// rpo_target_seconds is how far behind the object store this volume is allowed to
 	// fall: the age at which the host seals its tip and commits it even though the tip
 	// has not reached the size threshold. Zero means the volume has no age trigger and
@@ -778,6 +799,13 @@ func (x *DesiredVolume) GetAncestry() []*Ancestor {
 func (x *DesiredVolume) GetPendingSnapshotId() string {
 	if x != nil {
 		return x.PendingSnapshotId
+	}
+	return ""
+}
+
+func (x *DesiredVolume) GetHeadCommitId() string {
+	if x != nil {
+		return x.HeadCommitId
 	}
 	return ""
 }
@@ -1036,6 +1064,14 @@ type VolumeReport struct {
 	// above take: the report's refusal is what says why.
 	ChainDepth     int32 `protobuf:"varint,15,opt,name=chain_depth,json=chainDepth,proto3" json:"chain_depth,omitempty"`
 	LocalDiskBytes int64 `protobuf:"varint,16,opt,name=local_disk_bytes,json=localDiskBytes,proto3" json:"local_disk_bytes,omitempty"`
+	// published_commit_id is the newest commit this host has published for the volume,
+	// empty while it has published none. It is what the catalog remembers so that a *later*
+	// host can be told the volume has a history — see DesiredVolume.head_commit_id.
+	//
+	// Not a durability claim and not an authority: the bucket is the authority on what a
+	// commit holds (§5.8), and the only thing this number is ever compared against is the
+	// absence of a HEAD.
+	PublishedCommitId string `protobuf:"bytes,17,opt,name=published_commit_id,json=publishedCommitId,proto3" json:"published_commit_id,omitempty"`
 	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
 	// that fails silently stays CREATING forever and nothing ever collects it.
 	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
@@ -1145,6 +1181,13 @@ func (x *VolumeReport) GetLocalDiskBytes() int64 {
 		return x.LocalDiskBytes
 	}
 	return 0
+}
+
+func (x *VolumeReport) GetPublishedCommitId() string {
+	if x != nil {
+		return x.PublishedCommitId
+	}
+	return ""
 }
 
 func (x *VolumeReport) GetSnapshotError() string {
@@ -1341,7 +1384,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\"D\n" +
 	"\bAncestor\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1b\n" +
-	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\xed\x02\n" +
+	"\tcommit_id\x18\x02 \x01(\tR\bcommitId\"\x93\x03\n" +
 	"\rDesiredVolume\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x1d\n" +
 	"\n" +
@@ -1351,7 +1394,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x05epoch\x18\x04 \x01(\x03R\x05epoch\x122\n" +
 	"\x05state\x18\x05 \x01(\x0e2\x1c.spin.storage.v1.VolumeStateR\x05state\x125\n" +
 	"\bancestry\x18\x0e \x03(\v2\x19.spin.storage.v1.AncestorR\bancestry\x12.\n" +
-	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12,\n" +
+	"\x13pending_snapshot_id\x18\t \x01(\tR\x11pendingSnapshotId\x12$\n" +
+	"\x0ehead_commit_id\x18\x0f \x01(\tR\fheadCommitId\x12,\n" +
 	"\x12rpo_target_seconds\x18\f \x01(\x03R\x10rpoTargetSecondsJ\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\r\x10\x0eJ\x04\b\n" +
 	"\x10\vJ\x04\b\v\x10\f\"S\n" +
 	"\x17GetDesiredStateResponse\x128\n" +
@@ -1365,7 +1409,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xfb\x03\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xab\x04\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12\x1f\n" +
@@ -1376,7 +1420,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x17unpublished_local_bytes\x18\x0e \x01(\x03R\x15unpublishedLocalBytes\x12\x1f\n" +
 	"\vchain_depth\x18\x0f \x01(\x05R\n" +
 	"chainDepth\x12(\n" +
-	"\x10local_disk_bytes\x18\x10 \x01(\x03R\x0elocalDiskBytes\x12%\n" +
+	"\x10local_disk_bytes\x18\x10 \x01(\x03R\x0elocalDiskBytes\x12.\n" +
+	"\x13published_commit_id\x18\x11 \x01(\tR\x11publishedCommitId\x12%\n" +
 	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
 	"\arefusal\x18\n" +
 	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +

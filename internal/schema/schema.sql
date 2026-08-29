@@ -159,6 +159,23 @@ CREATE TABLE volumes (
     -- Agent has no wall clock (INV-01): it measures an interval, and reported_at is this
     -- database's clock — the one every other deadline here lives on — so a reader adds
     -- `now() - reported_at` and gets an age that keeps growing while a host is silent.
+    -- The newest commit a host has told the catalog it published for this volume, NULL
+    -- for one that has never published.
+    --
+    -- It answers the question a host cannot answer for itself: the object store has no
+    -- HEAD for this volume — is it new, or is its HEAD gone? Guess "new" and a guest boots
+    -- a blank qcow2 with no I/O error anywhere, and the first commit off that chain makes
+    -- the blank disk the volume's history. The host that published can consult its own
+    -- state.json, and that is the case that does not matter: it still has the layers. The
+    -- case that loses a tenant's disk is a volume placed on a machine that has never seen
+    -- it — §14's recovery path — where only the catalog knows.
+    --
+    -- Not a foreign key and not an authority on what the commit holds: commits live in
+    -- the object store (§5.8), and a catalog row that could only exist alongside a bucket
+    -- object would make -rebuild-metadata impossible by construction. NULL under-claims,
+    -- which is the safe direction: the volume is then served exactly as it was before
+    -- this column existed.
+    head_commit_id         UUIDV7,
     commit_age_seconds     INTEGER CHECK (commit_age_seconds >= 0),
     unpublished_local_bytes BIGINT NOT NULL DEFAULT 0
                              CHECK (unpublished_local_bytes >= 0),

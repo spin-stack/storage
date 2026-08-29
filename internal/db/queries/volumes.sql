@@ -147,6 +147,12 @@ UPDATE volumes
        -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
        refusal_detail = CASE WHEN sqlc.arg(refusal)::text = ''
                             THEN '' ELSE sqlc.arg(refusal_detail)::text END,
+       -- Never cleared by a report that names no commit: a host restarting has published
+       -- nothing *yet* and says so every cycle until it does, and taking the column down
+       -- on that would answer "is this volume's HEAD supposed to exist" with "no" for
+       -- exactly as long as it takes a new host to publish — which is the window the
+       -- column exists for.
+       head_commit_id = COALESCE(sqlc.narg(head_commit_id)::uuid, head_commit_id),
        commit_age_seconds = sqlc.arg(commit_age_seconds)::int,
        unpublished_local_bytes = sqlc.arg(unpublished_local_bytes)::bigint,
        reported_at = now(),

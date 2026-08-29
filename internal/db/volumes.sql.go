@@ -236,7 +236,7 @@ func (q *Queries) DeleteVolume(ctx context.Context, arg DeleteVolumeParams) (int
 }
 
 const getVolume = `-- name: GetVolume :one
-SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, head_commit_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE volume_id = $1
 `
 
 func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, error) {
@@ -256,6 +256,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 		&i.DekWrapped,
 		&i.KekID,
 		&i.DekKeyID,
+		&i.HeadCommitID,
 		&i.CommitAgeSeconds,
 		&i.UnpublishedLocalBytes,
 		&i.ReportedAt,
@@ -269,7 +270,7 @@ func (q *Queries) GetVolume(ctx context.Context, volumeID uuid.UUID) (*Volume, e
 }
 
 const listVolumes = `-- name: ListVolumes :many
-SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, head_commit_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes ORDER BY volume_id
 `
 
 // Every volume, placed or not, for a human reading the catalog: a NULL primary matches no
@@ -298,6 +299,7 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 			&i.DekWrapped,
 			&i.KekID,
 			&i.DekKeyID,
+			&i.HeadCommitID,
 			&i.CommitAgeSeconds,
 			&i.UnpublishedLocalBytes,
 			&i.ReportedAt,
@@ -318,7 +320,7 @@ func (q *Queries) ListVolumes(ctx context.Context) ([]*Volume, error) {
 }
 
 const listVolumesByHost = `-- name: ListVolumesByHost :many
-SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
+SELECT volume_id, size_bytes, block_size, rpo_target_seconds, current_epoch, state, primary_host_id, standby_host_id, chain_depth, parent_snapshot_id, dek_wrapped, kek_id, dek_key_id, head_commit_id, commit_age_seconds, unpublished_local_bytes, reported_at, refusal, refusal_detail, fencing_started_at, created_at, updated_at FROM volumes WHERE primary_host_id = $1 ORDER BY volume_id
 `
 
 // The volumes a drain must evacuate (§28.1), in a deterministic order.
@@ -345,6 +347,7 @@ func (q *Queries) ListVolumesByHost(ctx context.Context, primaryHostID pgtype.UU
 			&i.DekWrapped,
 			&i.KekID,
 			&i.DekKeyID,
+			&i.HeadCommitID,
 			&i.CommitAgeSeconds,
 			&i.UnpublishedLocalBytes,
 			&i.ReportedAt,
@@ -372,25 +375,32 @@ UPDATE volumes
        -- explain is what volumes_refusal_detail_needs_a_refusal refuses outright.
        refusal_detail = CASE WHEN $1::text = ''
                             THEN '' ELSE $2::text END,
-       commit_age_seconds = $3::int,
-       unpublished_local_bytes = $4::bigint,
+       -- Never cleared by a report that names no commit: a host restarting has published
+       -- nothing *yet* and says so every cycle until it does, and taking the column down
+       -- on that would answer "is this volume's HEAD supposed to exist" with "no" for
+       -- exactly as long as it takes a new host to publish — which is the window the
+       -- column exists for.
+       head_commit_id = COALESCE($3::uuid, head_commit_id),
+       commit_age_seconds = $4::int,
+       unpublished_local_bytes = $5::bigint,
        reported_at = now(),
        updated_at = now()
- WHERE volume_id = $5
-   AND (SELECT term FROM control_plane_leader WHERE singleton) = $6
-   AND primary_host_id = $7::uuid
-   AND current_epoch = $8
+ WHERE volume_id = $6
+   AND (SELECT term FROM control_plane_leader WHERE singleton) = $7
+   AND primary_host_id = $8::uuid
+   AND current_epoch = $9
 `
 
 type RecordVolumeReportParams struct {
-	Refusal               string    `json:"refusal"`
-	RefusalDetail         string    `json:"refusal_detail"`
-	CommitAgeSeconds      int32     `json:"commit_age_seconds"`
-	UnpublishedLocalBytes int64     `json:"unpublished_local_bytes"`
-	VolumeID              uuid.UUID `json:"volume_id"`
-	Term                  int64     `json:"term"`
-	HostID                uuid.UUID `json:"host_id"`
-	Epoch                 int64     `json:"epoch"`
+	Refusal               string      `json:"refusal"`
+	RefusalDetail         string      `json:"refusal_detail"`
+	HeadCommitID          pgtype.UUID `json:"head_commit_id"`
+	CommitAgeSeconds      int32       `json:"commit_age_seconds"`
+	UnpublishedLocalBytes int64       `json:"unpublished_local_bytes"`
+	VolumeID              uuid.UUID   `json:"volume_id"`
+	Term                  int64       `json:"term"`
+	HostID                uuid.UUID   `json:"host_id"`
+	Epoch                 int64       `json:"epoch"`
 }
 
 // There is no ResizeVolume query. It was here, it was grow-only and term-guarded, and
@@ -417,6 +427,7 @@ func (q *Queries) RecordVolumeReport(ctx context.Context, arg RecordVolumeReport
 	result, err := q.db.Exec(ctx, recordVolumeReport,
 		arg.Refusal,
 		arg.RefusalDetail,
+		arg.HeadCommitID,
 		arg.CommitAgeSeconds,
 		arg.UnpublishedLocalBytes,
 		arg.VolumeID,

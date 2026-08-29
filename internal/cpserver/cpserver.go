@@ -152,6 +152,10 @@ func (s *Server) GetDesiredState(ctx context.Context, req *connect.Request[stora
 			// The age trigger (v6 §11). Zero is a volume that was never sold an RPO and
 			// commits on the host's size threshold alone; the Agent reads it that way.
 			RpoTargetSeconds: int64(v.RPOTargetSeconds),
+			// And whether this volume has a history at all, which is the one question a
+			// host that has never seen it cannot answer from anything it holds. Empty is
+			// "the catalog does not say", and is served exactly as before.
+			HeadCommitId: v.HeadCommitID,
 		}
 		// A clone reads through its ancestors' objects (§20), and the Agent cannot look
 		// the chain up itself (ADR-0021), so the whole lineage is spelled out here.
@@ -335,6 +339,7 @@ func (s *Server) applyProgress(ctx context.Context, term int64, hostID string, r
 	}
 	err = s.md.RecordVolumeReport(ctx, term, metadata.VolumeReport{
 		VolumeID: r.GetVolumeId(), HostID: hostID, Epoch: r.GetEpoch(),
+		PublishedCommitID:     r.GetPublishedCommitId(),
 		CommitAge:             time.Duration(r.GetLastSuccessfulCommitAgeMs()) * time.Millisecond,
 		UnpublishedLocalBytes: r.GetUnpublishedLocalBytes(),
 		Refusal:               refusal, RefusalDetail: detail,

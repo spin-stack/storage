@@ -90,7 +90,29 @@ rm -rf "$DIR/agent"
 test ! -d "$DIR/agent" || die "the data directory is still there"
 echo "    the Agent is gone and $DIR/agent no longer exists"
 
-say "6. a rebuilt machine, same host id, empty disk"
+say "6. the same machine, with the volume's HEAD also gone"
+# The failure this step exists for is silent: the object store answering "no HEAD" means
+# either "this volume is new" or "this volume's HEAD is gone", and a host with no local
+# record of the volume cannot tell them apart. Guessing "new" creates a blank qcow2 and
+# the guest boots an empty disk with no I/O error anywhere. The catalog is the only party
+# that knows, and it is asked here with everything else destroyed — which is the state a
+# lifecycle rule, a bad restore or a wrong bucket leaves.
+mv "$DIR/store/volumes/$VOLUME/HEAD" "$DIR/head.saved"
+mkdir -p "$DIR/agent"
+start_agent "$DIR/logs/agent-blank.log"
+waitfor "$DIR/logs/agent-blank.log" "refusing a volume" 300
+grep -m1 "refusing a volume" "$DIR/logs/agent-blank.log" | sed 's/^/    /'
+grep -q "will not create it empty over a history that exists" "$DIR/logs/agent-blank.log" ||
+  die "the host refused the volume for some other reason than the missing HEAD"
+test ! -e "$DIR/agent/volumes/$VOLUME/active/current" ||
+  die "a blank chain was prepared for a volume whose history is in the catalog"
+echo "    no chain was created: a guest would have booted this as an empty disk"
+kill -9 "$AGENT_PID" 2>/dev/null || true
+wait "$AGENT_PID" 2>/dev/null || true
+rm -rf "$DIR/agent"
+mv "$DIR/head.saved" "$DIR/store/volumes/$VOLUME/HEAD"
+
+say "7. a rebuilt machine, same host id, empty disk"
 # The same host id on purpose: to the catalog this is the machine coming back, which is
 # what makes the volume still placed here. What it does not have is a single byte of it.
 mkdir -p "$DIR/agent"
@@ -102,7 +124,7 @@ grep -q "refusing a volume" "$DIR/logs/agent2.log" &&
 
 RECOVERED=$(cat "$DIR/agent/volumes/$VOLUME/active/current")
 test -f "$RECOVERED" || die "the pointer names $RECOVERED and there is nothing there"
-say "7. the chain this machine rebuilt out of the bucket"
+say "8. the chain this machine rebuilt out of the bucket"
 "$QEMU_IMG" info --backing-chain "$RECOVERED" | grep -E "^image|^backing file:" | sed 's/^/    /'
 # One layer per published commit, plus the new empty tip the guest will write to.
 GOT=$("$QEMU_IMG" info --backing-chain "$RECOVERED" | grep -c "^image:")
@@ -115,7 +137,7 @@ for layer in "$DIR/agent/volumes/$VOLUME"/layers/*.qcow2; do
 done
 echo "    qemu-img check: every downloaded layer is sound"
 
-say "8. a guest reads back what a guest on a host that no longer exists wrote"
+say "9. a guest reads back what a guest on a host that no longer exists wrote"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
