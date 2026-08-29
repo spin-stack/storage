@@ -74,3 +74,4 @@ internal/qcow/chain.go:checkNotStale:compaction                 # same subject: 
 internal/qcow/sweep.go:sweep:compaction                         # same subject: the half-written image a killed convert leaves, which is the one non-layer file the sweep takes.
 internal/qcow/manager.go:Config.Compaction:compaction           # same subject: the policy an operator sets, zero being "collapse nothing until somebody has measured".
 internal/qcow/manager.go:Manager.reconcile:compaction           # same subject: where a collapse runs in the cycle, and why it runs for an unattached volume too.
+internal/qcow/sweep.go:LiveImage:compaction                 # §21's collapse, which is live: the sentence is about the `.compacting` file a killed `qemu-img convert` leaves, and why the sweep does take that one

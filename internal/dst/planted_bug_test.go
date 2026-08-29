@@ -125,6 +125,7 @@ var plantedProofs = map[string]proofKind{
 	"monotonic-clock":                    proofBehavioural,
 	"effective-single-writer":            proofBehavioural,
 	"sealed-layers-publish-oldest-first": proofBehavioural,
+	"no-live-layer-is-swept":             proofLiteral,
 }
 
 // proven records which checkers a plantedBug call actually exercised in this run.
@@ -277,6 +278,36 @@ func TestSingleWriterCheckerCatchesAdvisoryPreconditions(t *testing.T) {
 // error is returned anywhere, and the next commit is published straight past it. The only
 // surviving evidence is the order the layers left the host in, which is what the checker
 // reads.
+// **A literal proof, and the reason is worth stating because this file is hostile to
+// them.** Three behavioural routes were built and every one is closed by the rule as it
+// stands, which is the finding rather than a shortcoming:
+//
+//   - the record acknowledged and not persisted, then a power failure: the pointer
+//     survives, does not match the record, and readPointer refuses the whole sweep;
+//   - the record *and* the pointer lost together, so the two are consistent with each
+//     other and a power failure out of date: the layer the guest is on is missing from
+//     both, and asking the running QEMU is what puts it back in the keep-set;
+//   - both of those plus a QMP socket that stops answering, so there is nobody to ask:
+//     an unknown live image stops the sweep instead of shortening it.
+//
+// Each was written, run, and watched go red before the line that closes it existed. The
+// second is the sharp one and it is still checkable in one edit: delete the
+// `keep[LayerIDOfImage(open.Path)]` line in internal/qcow/sweep.go and
+// `sweepScenario(true)` removes the layer a guest is writing into, which is how that line
+// came to be there.
+//
+// What is left for the checker itself is whether it can fire at all, and that is what a
+// planted event settles.
+func TestLiveLayerCheckerFires(t *testing.T) {
+	const seed = 20260830
+	requirePasses(t, seed, NewLiveLayerChecker(), sweepScenario(false))
+	plantedBug(t, seed, NewLiveLayerChecker(), "no-live-layer-is-swept", func(s *Sim) error {
+		s.Emit(Event{Kind: EventChain, VolumeID: "vol", Layers: []string{"layer-a", "layer-b"}})
+		s.Emit(Event{Kind: EventSweep, LayerID: "layer-b"})
+		return nil
+	})
+}
+
 func TestSealOrderCheckerCatchesALostFsync(t *testing.T) {
 	const seed = 20260829
 	requirePasses(t, seed, NewSealOrderChecker(), reconcileScenario(false))

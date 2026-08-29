@@ -76,3 +76,10 @@ package hack/analyzers/simulable/cmd/simulable # its main; `go run` builds it, n
 # has its own transport in internal/vhost/hostio; and the Control Plane speaks Connect over
 # net/http. If a component ever needs a simulable network, this is where it plugs in.
 package internal/simio/network  # harness-only: the DST partition scenario drives it, no binary does
+# --- the one rule that deletes a file, driven by the simulation ---------------------------
+# The deterministic harness runs this rule directly against a disk that lies about fsync
+# (internal/dst's no-live-layer-is-swept). A copy of the decision there would be a model of
+# it agreeing with the scenario and with nothing else, which is the shape a checker cannot
+# catch — so the production function is exported and a binary reaches it through
+# Manager.Apply.
+internal/qcow.Sweep  # driven by internal/dst; production reaches the same code through Manager.Apply

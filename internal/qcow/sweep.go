@@ -31,9 +31,28 @@ import (
 // A name that is not a layer file is left alone, which covers a download's `.part` and a
 // compaction's `.compacting`: both are files another step will rename into place, and
 // neither is anything a chain reads through yet.
-func sweep(p Paths, root string, volumes []string) ([]string, error) {
+// LiveImage is what QEMU has open for one volume — and whether this host was able to ask.
+//
+// The distinction is the whole of it. "No guest is attached" is an answer; "the QMP socket
+// did not respond" is the absence of one, and a sweep that treated them alike would take a
+// running guest's layer the first time a socket timed out.
+type LiveImage struct {
+	// Path is the image QEMU reports, empty when no guest is attached.
+	Path string
+	// Known is whether QEMU was asked and answered.
+	Known bool
+}
+
+func Sweep(p Paths, root string, live map[string]LiveImage) ([]string, error) {
+	return sweep(p, root, live)
+}
+
+// sweep is Sweep. The exported name exists for the deterministic simulation, which drives
+// this rule directly (internal/dst): a copy of it there would be a model of the rule
+// agreeing with the scenario and with nothing else.
+func sweep(p Paths, root string, live map[string]LiveImage) ([]string, error) {
 	keep := map[string]bool{}
-	for _, id := range volumes {
+	for id, open := range live {
 		// A directory with no record at all is the shape that matters most, and
 		// ReadState answers it with an empty record and no error — which would read as
 		// "this volume claims nothing" and take its whole chain while a guest is writing
@@ -66,6 +85,27 @@ func sweep(p Paths, root string, volumes []string) ([]string, error) {
 		}
 		if pointed != "" {
 			keep[LayerIDOfImage(pointed)] = true
+		}
+		// And what QEMU says this volume's guest has open, which is the one thing here
+		// that does not come from a file this host wrote.
+		//
+		// A volume whose QEMU could not be asked stops the whole sweep. Not asking and
+		// being told "nothing is attached" are different answers, and only one of them
+		// completes the keep-set: with the other, the layer a guest is on is in no record
+		// this host can currently trust and in no answer at all.
+		//
+		// The record and the pointer are both written through the same disk, so a disk
+		// that acknowledges an fsync it does not honour gives them back *together* a
+		// power failure out of date — consistent with each other, framed, digest-sound,
+		// and short by exactly the layer the guest is writing into now. Nothing that
+		// compares the two can see it. The running guest is outside that pair, which is
+		// why its answer is asked for and kept: internal/dst plants the lost fsync, and
+		// without this line the simulated sweep removes the file a guest is on.
+		if !open.Known {
+			return nil, fmt.Errorf("qcow: volume %s's QEMU could not be asked what it has open, so the keep-set cannot be completed and nothing is swept", id)
+		}
+		if open.Path != "" {
+			keep[LayerIDOfImage(open.Path)] = true
 		}
 	}
 

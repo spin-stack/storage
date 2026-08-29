@@ -391,10 +391,10 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 	//
 	// A failure is reported and refuses nothing: what it costs is space, and every volume
 	// here is being served.
-	ids, err := m.volumeIDs()
+	open, err := m.liveImages()
 	if err != nil {
 		failures = append(failures, err)
-	} else if removed, serr := sweep(m.paths, m.cfg.Root, ids); serr != nil {
+	} else if removed, serr := sweep(m.paths, m.cfg.Root, open); serr != nil {
 		failures = append(failures, serr)
 	} else {
 		for _, path := range removed {
@@ -408,6 +408,41 @@ func (m *Manager) Apply(ctx context.Context, desired []*storagev1.DesiredVolume)
 // volumeIDs is every volume this host has a directory for, served or not. The sweep needs
 // all of them: a volume nobody is serving still has a record, and that record is what
 // keeps its layers from being freed while the fleet may hand it back.
+// liveImages is every volume this host has a directory for, mapped to the image QEMU has
+// open for it — empty when no guest is attached, or when the volume is one this process is
+// not serving.
+//
+// The image is what proves a record current, and the sweep says why. It comes from
+// `query-block` on this cycle, through the same probe that decides whether a volume is
+// being served, so nothing here asks QEMU a second time.
+func (m *Manager) liveImages() (map[string]LiveImage, error) {
+	ids, err := m.volumeIDs()
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[string]LiveImage, len(ids))
+	for _, id := range ids {
+		v, held := m.vols[id]
+		switch {
+		case !held:
+			// A directory this process is not serving: nothing is attached to it, and
+			// this cycle established that by not being asked to serve it.
+			live[id] = LiveImage{Known: true}
+		case v.refusal == storagev1.VolumeRefusal_VOLUME_REFUSAL_ATTACH_FAILED:
+			// The one refusal that means "this host could not establish what is going on":
+			// a QMP socket that would not answer, a qemu-img run that failed. Every other
+			// refusal is a decision this host reached — a lost lease stops the guest, a
+			// missing image has none — and a decision is an answer.
+			live[id] = LiveImage{}
+		case v.attached && v.chain != nil:
+			live[id] = LiveImage{Path: v.chain.Active, Known: true}
+		default:
+			live[id] = LiveImage{Known: true}
+		}
+	}
+	return live, nil
+}
+
 // An error is returned rather than a short list, and the difference is the whole of it:
 // an empty list is a host with no volumes, whose leftover layers *are* garbage, while a
 // failed listing is a host whose volumes cannot be enumerated — and sweeping against that

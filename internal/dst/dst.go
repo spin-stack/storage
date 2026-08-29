@@ -55,6 +55,14 @@ const (
 	// checker that read the reconciler's own record of it could not tell a layer that
 	// was lost from a layer that never existed.
 	EventSeal EventKind = "seal"
+	// EventChain is the scenario stating which layers one volume's guest reads through
+	// right now. Like EventSeal it is a fact about the simulated world and not about the
+	// code under test — the whole point is that a checker can compare what was removed
+	// against a truth the record did not produce, because the record is what the fault
+	// corrupts.
+	EventChain EventKind = "chain"
+	// EventSweep is one layer file the sweep removed.
+	EventSweep EventKind = "sweep"
 )
 
 // Event is one recorded step. Fields are typed and optional; only those relevant
@@ -76,8 +84,12 @@ type Event struct {
 	CommitID       string
 	ParentCommitID string
 	// LayerID is the layer a commit carries, read back from the manifest the protocol
-	// wrote, and on a Seal event the layer that has just stopped being the tip.
+	// wrote, and on a Seal event the layer that has just stopped being the tip. On a
+	// Sweep event it is the layer that was removed.
 	LayerID string
+	// VolumeID and Layers carry a Chain event: whose guest, and what it reads through.
+	VolumeID string
+	Layers   []string
 	// OK is whether the operation succeeded, for Publish and Put alike.
 	OK bool
 }
