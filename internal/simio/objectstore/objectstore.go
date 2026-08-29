@@ -8,6 +8,7 @@ package objectstore
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 )
 
@@ -57,6 +58,16 @@ type Store interface {
 	// Put stores data at key subject to opts. With IfNoneMatch it returns
 	// ErrPreconditionFailed if the key exists; with IfMatch it CASes on ETag.
 	Put(ctx context.Context, key string, data []byte, opts PutOptions) (PutResult, error)
+	// PutStream is Put for an object nobody wants a second copy of in memory: it stores
+	// exactly size bytes read from body, under the same conditional-write semantics. A
+	// sealed layer is the only such object here, and holding one was an OOM waiting for
+	// a volume an order of magnitude past the rotation threshold.
+	//
+	// size is authoritative because that is what S3 needs before the first byte goes out
+	// (Content-Length) — an implementation reads no further than it, and a body that ends
+	// early is an error and stores nothing. The caller knows the exact number: for a
+	// layer it is measured by the pass that computed the digest.
+	PutStream(ctx context.Context, key string, body io.Reader, size int64, opts PutOptions) (PutResult, error)
 	// Get returns the object bytes (strong read-after-write).
 	Get(ctx context.Context, key string) ([]byte, error)
 	// Head returns object metadata without the body.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/google/uuid"
 
@@ -104,7 +105,7 @@ func publishOne(ctx context.Context, s *Sim, store objectstore.Store, enc *crypt
 	commitID := ids.NewAt(int64(1<<40+n), s.Rand).String()
 	m, err := commit.Publish(ctx, store, enc, bytes.NewReader(plain), commit.Request{
 		VolumeID: volumeID, CommitID: commitID, LayerID: ids.NewAt(int64(1<<40+100+n), s.Rand).String(),
-		Epoch: int64(n), VirtualSize: 1 << 30, PlainBytes: int64(len(plain)),
+		Epoch: int64(n), VirtualSize: 1 << 30,
 	})
 	s.Emit(Event{
 		Kind: EventPublish, Host: host, CommitID: commitID,
@@ -141,9 +142,30 @@ type recordingStore struct {
 
 func (r *recordingStore) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	res, err := r.Store.Put(ctx, key, data, opts)
+	r.emit(key, data, err)
+	return res, err
+}
+
+// PutStream is recorded too, and it is the one a layer takes. Without this the object a
+// checker most wants to read — the sealed layer — reaches the store through a method the
+// recorder does not see, and every assertion about it passes vacuously.
+//
+// The body is read whole here, which is exactly what the streaming PUT exists to avoid;
+// that is affordable only because a scenario's layers are kilobytes and the recording
+// already keeps every object in memory.
+func (r *recordingStore) PutStream(ctx context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	data, err := io.ReadAll(io.LimitReader(body, size))
+	if err != nil {
+		return objectstore.PutResult{}, err
+	}
+	res, perr := r.Store.PutStream(ctx, key, bytes.NewReader(data), size, opts)
+	r.emit(key, data, perr)
+	return res, perr
+}
+
+func (r *recordingStore) emit(key string, data []byte, err error) {
 	r.sim.Emit(Event{
 		Kind: EventPut, Key: key, Body: data, OK: err == nil,
 		Msg: fmt.Sprintf("key=%s bytes=%d ok=%t", key, len(data), err == nil),
 	})
-	return res, err
 }

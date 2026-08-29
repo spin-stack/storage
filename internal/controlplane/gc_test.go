@@ -74,7 +74,7 @@ func (w *gcWorld) publish(volumeID string, payload string) commit.Manifest {
 	}
 	m, err := commit.Publish(w.t.Context(), w.store, enc, strings.NewReader(payload), commit.Request{
 		VolumeID: volumeID, CommitID: ids.New().String(), LayerID: ids.New().String(),
-		Epoch: 1, VirtualSize: 1 << 30, PlainBytes: int64(len(payload)),
+		Epoch: 1, VirtualSize: 1 << 30,
 	})
 	if err != nil {
 		w.t.Fatalf("Publish: %v", err)

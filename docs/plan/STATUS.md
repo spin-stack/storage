@@ -86,17 +86,14 @@ system has no equivalent of vSphere's datastore lock.
   loudly, in one WARN line. A layer's size is a *floor*, not a bound: measured at 8x the
   threshold with a 300 ms cycle, and nothing holds a layer to a size while QEMU takes the
   guest's writes.
-- **A whole sealed layer is held in memory to publish it.** `objectstore.Store` takes a
-  `[]byte`. At 32 MiB that is a buffer; an order of magnitude more and it is an OOM in a
-  process holding somebody's disk. The fix is a streaming PUT on the store interface.
 - **A restart between sealing and publishing duplicates a commit id** — the layer is
   derived from the chain and never lost; only the id is.
 - **Nothing reclaims local disk.** Released volumes keep their layers, published layers
   keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
   never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.
-- **Two of §28's numbers are on the wire and nothing reads them.**
-  `last_successful_commit_age` and `unpublished_local_bytes` — the RPO and what it costs —
-  reach no alert, cordon or operator view, and nothing measures chain depth or attachment.
+- **§28's numbers reach no consumer.** Seven are recorded and scrapeable; the two on the
+  wire (`last_successful_commit_age`, `unpublished_local_bytes`) reach no alert or cordon,
+  and nothing measures attachment.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
   DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
   expiring the descriptor's non-current versions.

@@ -13,24 +13,30 @@ import (
 // killedReader is the host dying with the sealed layer half-read: n bytes come out and
 // then the file stops answering. It is how a kill *inside* the seal-and-hash step is
 // reached at all — that step touches no object store, so no store fault can aim at it.
+//
+// It rewinds, because the publish protocol rewinds: the file answers the same n bytes and
+// then stops on every pass, which is what a file that has gone away actually does.
 type killedReader struct {
 	body []byte
 	left int
+	off  int
 }
 
 var errKilled = errors.New("the host stopped mid-read")
 
 func (r *killedReader) Read(p []byte) (int, error) {
-	if r.left <= 0 {
+	if r.off >= r.left || r.off >= len(r.body) {
 		return 0, errKilled
 	}
-	n := len(p)
-	if n > r.left {
-		n = r.left
-	}
-	n = copy(p[:n], r.body)
-	r.body, r.left = r.body[n:], r.left-n
+	n := min(len(p), r.left-r.off, len(r.body)-r.off)
+	n = copy(p[:n], r.body[r.off:])
+	r.off += n
 	return n, nil
+}
+
+func (r *killedReader) Seek(int64, int) (int64, error) {
+	r.off = 0
+	return 0, nil
 }
 
 // killWorld is a volume that already holds one commit, so every kill below cuts into a
@@ -50,12 +56,12 @@ func newKillWorld(t *testing.T) killWorld {
 	t.Helper()
 	vol := newID()
 	store, d := sim.NewObjectStore(), dek(t, vol)
-	first, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 4096)), request(vol, 4096))
+	first, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 4096)), request(vol))
 	if err != nil {
 		t.Fatalf("the commit this volume already had: %v", err)
 	}
 	plain := layerBytes(t, 4096*3)
-	req := request(vol, len(plain))
+	req := request(vol)
 
 	// Where the second commit's layer will land. Sealing is deterministic in the volume,
 	// the layer id and the frame size, so a rehearsal on a throwaway store names the key

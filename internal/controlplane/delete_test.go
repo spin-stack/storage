@@ -33,7 +33,7 @@ func (f *fleet) publishOne(t *testing.T, id string, plain []byte) commit.Manifes
 	}
 	m, err := commit.Publish(t.Context(), f.store, f.encryption(t, v), bytes.NewReader(plain), commit.Request{
 		VolumeID: id, CommitID: ids.New().String(), LayerID: ids.New().String(),
-		Epoch: 1, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)),
+		Epoch: 1, VirtualSize: 1 << 30,
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)

@@ -59,10 +59,11 @@ func (p *Provider) Scrape(ctx context.Context) ([]byte, error) {
 			}
 			writeFamily(&b, m, kind)
 			writeSamples(&b, m.Name, numbers(data.DataPoints))
+		case metricdata.Histogram[float64]:
+			writeFamily(&b, m, "histogram")
+			writeHistogram(&b, m.Name, data)
 		default:
-			// A kind Catalog() cannot produce — every histogram left with the local block
-			// engine, so this is the branch a returning duration lands in until its
-			// renderer comes back with it. Named rather than dropped: a scrape that
+			// A kind Catalog() cannot produce. Named rather than dropped: a scrape that
 			// silently omits a series is the failure this endpoint exists to end, and a
 			// comment line is valid in the format.
 			fmt.Fprintf(&b, "# UNSUPPORTED %s\n", m.Name)
@@ -85,6 +86,46 @@ func numbers[N int64 | float64](dps []metricdata.DataPoint[N]) []sample {
 		out = append(out, sample{labels: labelsOf(dp.Attributes), value: float64(dp.Value)})
 	}
 	return out
+}
+
+// writeHistogram renders one histogram family the way the exposition format defines it:
+// cumulative `_bucket` counts with an `le` label, then `_sum` and `_count`. The buckets
+// are cumulative and the SDK's are not, so they are added up here; the +Inf bucket is
+// mandatory and equals the total count.
+func writeHistogram(b *bytes.Buffer, name string, data metricdata.Histogram[float64]) {
+	type series struct {
+		labels string
+		dp     metricdata.HistogramDataPoint[float64]
+	}
+	all := make([]series, 0, len(data.DataPoints))
+	for _, dp := range data.DataPoints {
+		all = append(all, series{labels: labelsOf(dp.Attributes), dp: dp})
+	}
+	slices.SortFunc(all, func(x, y series) int { return cmp.Compare(x.labels, y.labels) })
+	for _, s := range all {
+		cumulative := uint64(0)
+		for i, count := range s.dp.BucketCounts {
+			cumulative += count
+			le := "+Inf"
+			if i < len(s.dp.Bounds) {
+				le = formatValue(s.dp.Bounds[i])
+			}
+			fmt.Fprintf(b, "%s_bucket%s %d\n", name, withLabel(s.labels, "le", le), cumulative)
+		}
+		fmt.Fprintf(b, "%s_sum%s %s\n", name, s.labels, formatValue(s.dp.Sum))
+		fmt.Fprintf(b, "%s_count%s %d\n", name, s.labels, s.dp.Count)
+	}
+}
+
+// withLabel adds one label to an already-rendered label set. `le` sorts after nothing in
+// particular — the exposition format does not require label order, and a bucket line is
+// only ever read with its family.
+func withLabel(labels, key, value string) string {
+	pair := key + `="` + escapeLabel(value) + `"`
+	if labels == "" {
+		return "{" + pair + "}"
+	}
+	return labels[:len(labels)-1] + "," + pair + "}"
 }
 
 func writeFamily(b *bytes.Buffer, m metricdata.Metrics, kind string) {

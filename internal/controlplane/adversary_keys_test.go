@@ -134,7 +134,7 @@ func TestAdversaryDescriptorSwapOrphansThePublishedHistory(t *testing.T) {
 	layerID := ids.New().String()
 	m, err := commit.Publish(t.Context(), f.store, enc, bytes.NewReader(plain), commit.Request{
 		VolumeID: victim, CommitID: ids.New().String(), LayerID: layerID,
-		Epoch: 1, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)),
+		Epoch: 1, VirtualSize: 1 << 30,
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -264,7 +264,7 @@ func TestAdversaryControlsUntamperedBucket(t *testing.T) {
 	m, err := commit.Publish(t.Context(), f.store, f.encryption(t, before), bytes.NewReader(plain),
 		commit.Request{
 			VolumeID: id, CommitID: ids.New().String(), LayerID: ids.New().String(),
-			Epoch: 1, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)),
+			Epoch: 1, VirtualSize: 1 << 30,
 		})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)

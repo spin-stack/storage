@@ -20,7 +20,7 @@ func TestAdversarySameSizeObjectAtALayerKey(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096*2)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 
 	// Sealing is deterministic — that is what makes a retry the same object — so a
 	// rehearsal against a scratch bucket says where this layer will land and how long it
@@ -64,7 +64,7 @@ func TestAdversaryPublishingACommitWithNoID(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 	req.CommitID = ""
 
 	if _, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), req); err == nil {

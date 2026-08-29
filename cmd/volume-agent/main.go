@@ -208,8 +208,12 @@ func run() (err error) {
 			return serr
 		}
 		paths := real.NewPaths()
-		pub = publisher.New(store, kms, keys, paths)
-		rec = recovery.New(root, *qemuImg, store, kms, keys, paths, real.NewRunner())
+		// The §28 numbers of the publish path are recorded only if the clock and the
+		// recorder reach the two components that produce them: this is the wiring whose
+		// absence left the metrics catalogue describing a system nobody was measuring.
+		pub = publisher.New(store, kms, keys, paths).WithTelemetry(real.NewClock(), telemetry.Recorder())
+		rec = recovery.New(root, *qemuImg, store, kms, keys, paths, real.NewRunner()).
+			WithTelemetry(real.NewClock(), telemetry.Recorder())
 		wit = descriptor.EpochWitness{Store: store}
 	}
 

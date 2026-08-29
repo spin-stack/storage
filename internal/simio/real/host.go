@@ -105,7 +105,7 @@ func (*Paths) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
 // are the one thing here measured in tens of megabytes, and reading one into memory to
 // hand it to a sealer that is going to stream it anyway would double the only allocation
 // in the publish path that is worth counting.
-func (*Paths) Open(path string) (io.ReadCloser, error) { return os.Open(path) }
+func (*Paths) Open(path string) (io.ReadSeekCloser, error) { return os.Open(path) }
 
 // WriteAtomic replaces path's contents with data in one step: temp file, fsync, rename,
 // fsync the directory. The reader is another process choosing its own moment and the

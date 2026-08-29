@@ -20,7 +20,9 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
@@ -74,7 +76,7 @@ type Files interface {
 	// Open reads a layer this host already holds, so a clone can copy its parent's
 	// instead of downloading it. Streamed rather than read whole: a layer is measured in
 	// tens of megabytes, and ReadFile would put one in memory per clone.
-	Open(path string) (io.ReadCloser, error)
+	Open(path string) (io.ReadSeekCloser, error)
 }
 
 // Runner runs qemu-img and returns its standard output. A qcow2 parser of our own is
@@ -92,6 +94,8 @@ type Recoverer struct {
 	keys    Keys
 	files   Files
 	run     Runner
+	clk     clock.Clock
+	rec     *obs.Recorder
 }
 
 // New returns a Recoverer rooted at the Agent's data directory.
@@ -100,6 +104,31 @@ func New(root, qemuImg string, store objectstore.Store, kms crypto.KMS,
 ) *Recoverer {
 	return &Recoverer{root: root, qemuImg: qemuImg, store: store, kms: kms,
 		keys: keys, files: files, run: run}
+}
+
+// WithTelemetry attaches the clock and recorder the §28 numbers are written with, and
+// returns the Recoverer so a binary wires it in one expression. Separate from New because
+// a Recoverer that measures nothing rebuilds exactly the same chain.
+func (r *Recoverer) WithTelemetry(clk clock.Clock, rec *obs.Recorder) *Recoverer {
+	r.clk, r.rec = clk, rec
+	return r
+}
+
+// elapsed is the whole of this package's relationship with time: a nil clock is a caller
+// that is not measuring, and the duration is then zero rather than a branch at the one
+// record site.
+func (r *Recoverer) elapsed(since clock.Instant) float64 {
+	if r.clk == nil {
+		return 0
+	}
+	return r.clk.Now().Sub(since).Seconds()
+}
+
+func (r *Recoverer) now() clock.Instant {
+	if r.clk == nil {
+		return 0
+	}
+	return r.clk.Now()
 }
 
 // Restore rebuilds volumeID's published chain on this host and returns what a caller must
@@ -126,6 +155,7 @@ func (r *Recoverer) Restore(ctx context.Context, volumeID string, sizeBytes int6
 // parent's HEAD is whatever it has published since. Reading HEAD would deliver Thursday
 // for a clone of Tuesday, with nothing anywhere reporting the difference.
 func (r *Recoverer) RestoreFrom(ctx context.Context, l qcow.Lineage, sizeBytes int64) (qcow.Restored, error) {
+	started := r.now()
 	base, parentTip, beneath := "", "", 0
 	if l.ParentVolumeID != "" {
 		got, n, err := r.rebuild(ctx, l.VolumeID, l.ParentVolumeID, l.ParentCommitID, sizeBytes, "", 0)
@@ -139,6 +169,7 @@ func (r *Recoverer) RestoreFrom(ctx context.Context, l qcow.Lineage, sizeBytes i
 	case errors.Is(err, commit.ErrNoHead) && parentTip != "":
 		// A clone that has published nothing of its own: its parent's chain is the whole
 		// of what it holds, and the new tip goes straight on top.
+		r.rec.Observe(ctx, "recovery_duration_seconds", r.elapsed(started), obs.String("volume", l.VolumeID))
 		return qcow.Restored{Base: base, VirtualSize: sizeBytes, HeadCommitID: l.ParentCommitID}, nil
 	case errors.Is(err, commit.ErrNoHead):
 		return qcow.Restored{}, fmt.Errorf("recovery: volume %s: %w", l.VolumeID, err)
@@ -146,7 +177,14 @@ func (r *Recoverer) RestoreFrom(ctx context.Context, l qcow.Lineage, sizeBytes i
 		return qcow.Restored{}, fmt.Errorf("%w: reading the HEAD of volume %s: %w", ErrIncomplete, l.VolumeID, err)
 	}
 	got, _, err := r.rebuild(ctx, l.VolumeID, l.VolumeID, head.CommitID, sizeBytes, parentTip, beneath)
-	return got, err
+	if err != nil {
+		return got, err
+	}
+	// Only a rebuild that finished is timed. A refusal has a duration too, and mixing the
+	// two would make the series answer "how long does a restore take" with the time it
+	// takes to fail — which is the number nobody is asking for.
+	r.rec.Observe(ctx, "recovery_duration_seconds", r.elapsed(started), obs.String("volume", l.VolumeID))
+	return got, nil
 }
 
 // rebuild materialises one chain: `source` is the volume whose published objects are read
@@ -213,8 +251,16 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 		if known && local2 != "" {
 			from = qcow.LayerImage(r.root, local2, m.Layer.LayerID)
 		}
-		if err := r.materialize(ctx, enc, m, path, known, from); err != nil {
+		downloaded, err := r.materialize(ctx, enc, m, path, known, from)
+		if err != nil {
 			return qcow.Restored{}, 0, err
+		}
+		if downloaded > 0 {
+			// The sealed length, which is what crossed the network. Counted per layer as
+			// it lands rather than once at the end: a restore that is refused halfway
+			// still cost the bytes it pulled, and that is the cost an operator is
+			// watching.
+			r.rec.Count(ctx, "recovery_download_bytes_total", downloaded, obs.String("volume", local))
 		}
 		if err := r.repoint(ctx, m, path, parent); err != nil {
 			return qcow.Restored{}, 0, err
@@ -323,32 +369,34 @@ func checkGeometry(volumeID string, sizeBytes int64, head commit.Manifest, manif
 	return nil
 }
 
-// materialize puts one layer's plaintext qcow2 at path.
+// materialize puts one layer's plaintext qcow2 at path and reports how many sealed bytes
+// it had to download to do it — zero when the layer was already here or copied from
+// another volume on this disk.
 //
 // held — the durable record that this host already has this commit's layer — is believed
 // only together with the file being there.
-func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool, from string) error {
+func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool, from string) (int64, error) {
 	if held {
 		there, err := r.files.Exists(path)
 		if err != nil {
-			return fmt.Errorf("%w: looking for %s: %w", ErrIncomplete, path, err)
+			return 0, fmt.Errorf("%w: looking for %s: %w", ErrIncomplete, path, err)
 		}
 		if there {
-			return nil
+			return 0, nil
 		}
 		// The same layer under another volume on this disk — a clone's parent. Copying it
 		// skips the download and the unsealing; if the copy fails for any reason we fall
 		// through to the object store, which is the authority either way.
 		if from != "" {
 			if copied, err := r.copyLocal(from, path); err == nil && copied {
-				return nil
+				return 0, nil
 			}
 		}
 	}
 	part := path + partSuffix
 	w, err := r.files.Create(part)
 	if err != nil {
-		return fmt.Errorf("%w: creating %s: %w", ErrIncomplete, part, err)
+		return 0, fmt.Errorf("%w: creating %s: %w", ErrIncomplete, part, err)
 	}
 	// commit.Fetch checks the digest over the bytes as stored before unsealing and
 	// GCM-authenticates every frame; there must be one answer to "is this the object the
@@ -356,17 +404,17 @@ func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m c
 	if err := commit.Fetch(ctx, r.store, enc, m, w); err != nil {
 		_ = w.Close()
 		r.discard(part)
-		return fmt.Errorf("%w: layer %s of commit %s: %w", ErrIncomplete, m.Layer.LayerID, m.CommitID, err)
+		return 0, fmt.Errorf("%w: layer %s of commit %s: %w", ErrIncomplete, m.Layer.LayerID, m.CommitID, err)
 	}
 	if err := w.Close(); err != nil {
 		r.discard(part)
-		return fmt.Errorf("%w: finishing %s: %w", ErrIncomplete, part, err)
+		return 0, fmt.Errorf("%w: finishing %s: %w", ErrIncomplete, part, err)
 	}
 	if err := r.files.Rename(part, path); err != nil {
 		r.discard(part)
-		return fmt.Errorf("%w: renaming %s: %w", ErrIncomplete, part, err)
+		return 0, fmt.Errorf("%w: renaming %s: %w", ErrIncomplete, part, err)
 	}
-	return nil
+	return m.Layer.SizeBytes, nil
 }
 
 // discard drops a partial download. Its own failure is not reported: the caller is

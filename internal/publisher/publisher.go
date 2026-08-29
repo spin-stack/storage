@@ -15,7 +15,9 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
@@ -27,9 +29,11 @@ type Keys interface {
 	VolumeKeys(ctx context.Context, volumeID string) (agent.VolumeKeys, error)
 }
 
-// Files opens a sealed layer for reading, the one filesystem verb this needs.
+// Files opens a sealed layer for reading, the one filesystem verb this needs. Seekable
+// because the publish protocol reads the layer twice — once to name the object by the
+// digest of its sealed form, once to upload it — and never holds it in memory.
 type Files interface {
-	Open(path string) (io.ReadCloser, error)
+	Open(path string) (io.ReadSeekCloser, error)
 }
 
 // Publisher publishes sealed layers.
@@ -38,11 +42,22 @@ type Publisher struct {
 	kms   crypto.KMS
 	keys  Keys
 	files Files
+	clk   clock.Clock
+	rec   *obs.Recorder
 }
 
 // New returns a Publisher.
 func New(store objectstore.Store, kms crypto.KMS, keys Keys, files Files) *Publisher {
 	return &Publisher{store: store, kms: kms, keys: keys, files: files}
+}
+
+// WithTelemetry attaches the clock and recorder the §28 numbers are written with, and
+// returns the Publisher so a binary wires it in one expression. Separate from New because
+// a Publisher that measures nothing is a working Publisher — every test and the DST
+// harness builds one.
+func (p *Publisher) WithTelemetry(clk clock.Clock, rec *obs.Recorder) *Publisher {
+	p.clk, p.rec = clk, rec
+	return p
 }
 
 // Publish is qcow's Publisher: it seals the layer with the volume's DEK and runs v6 §9's
@@ -60,12 +75,16 @@ func (p *Publisher) Publish(ctx context.Context, l qcow.SealedLayer) error {
 
 	m, err := commit.Publish(ctx, p.store, enc, f, commit.Request{
 		VolumeID: l.VolumeID, CommitID: l.CommitID, LayerID: l.LayerID,
-		Epoch: l.Epoch, VirtualSize: l.VirtualSize, PlainBytes: l.PlainBytes,
-	})
+		Epoch: l.Epoch, VirtualSize: l.VirtualSize,
+	}, commit.WithTelemetry(p.clk, p.rec))
 	if err != nil {
 		return err
 	}
-	_ = m
+	// The sealed length, which is what left this host and what the bucket is charged
+	// for; the qcow2's own length is the local number and internal/qcow records it.
+	volume := obs.String("volume", l.VolumeID)
+	p.rec.Observe(ctx, "layer_size_bytes", float64(m.Layer.SizeBytes), volume)
+	p.rec.Count(ctx, "layer_upload_bytes_total", m.Layer.SizeBytes, volume)
 	return nil
 }
 

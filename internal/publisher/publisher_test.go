@@ -44,7 +44,7 @@ type fakeFiles struct {
 	err   error
 }
 
-func (f *fakeFiles) Open(path string) (io.ReadCloser, error) {
+func (f *fakeFiles) Open(path string) (io.ReadSeekCloser, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -52,8 +52,14 @@ func (f *fakeFiles) Open(path string) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("no such file: " + path)
 	}
-	return io.NopCloser(bytes.NewReader(body)), nil
+	return nopSeekCloser{bytes.NewReader(body)}, nil
 }
+
+// nopSeekCloser is a layer file: readable, rewindable, and closing it costs nothing. The
+// publish protocol reads a layer twice, so io.NopCloser is not enough here.
+type nopSeekCloser struct{ *bytes.Reader }
+
+func (nopSeekCloser) Close() error { return nil }
 
 type world struct {
 	pub   *publisher.Publisher

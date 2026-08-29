@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -41,10 +42,10 @@ func layerBytes(t *testing.T, n int) []byte {
 	return b
 }
 
-func request(volumeID string, plain int) commit.Request {
+func request(volumeID string) commit.Request {
 	return commit.Request{
 		VolumeID: volumeID, CommitID: newID(), LayerID: newID(),
-		Epoch: 3, VirtualSize: 1 << 30, PlainBytes: int64(plain), FrameBytes: 4096,
+		Epoch: 3, VirtualSize: 1 << 30, FrameBytes: 4096,
 	}
 }
 
@@ -56,7 +57,7 @@ func TestPublishRoundTripsALayer(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096*3+17)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 
 	m, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), req)
 	if err != nil {
@@ -100,14 +101,14 @@ func TestPublishChainsOntoTheCommitBefore(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 
-	first, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 100)), request(volumeID, 100))
+	first, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 100)), request(volumeID))
 	if err != nil {
 		t.Fatalf("first commit: %v", err)
 	}
 	if first.ParentCommitID != "" {
 		t.Errorf("the first commit claims a parent: %q", first.ParentCommitID)
 	}
-	second, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 100)), request(volumeID, 100))
+	second, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 100)), request(volumeID))
 	if err != nil {
 		t.Fatalf("second commit: %v", err)
 	}
@@ -127,7 +128,7 @@ func TestPublishIsIdempotent(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096*2)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 
 	first, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), req)
 	if err != nil {
@@ -159,7 +160,7 @@ func TestPublishStopsAtAHeadThatMoved(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 
-	if _, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 100)), request(volumeID, 100)); err != nil {
+	if _, err := commit.Publish(t.Context(), store, d, bytes.NewReader(layerBytes(t, 100)), request(volumeID)); err != nil {
 		t.Fatalf("the first commit: %v", err)
 	}
 	// A second writer that publishes between this commit's HEAD read and its CAS is not
@@ -190,7 +191,7 @@ func TestPublishRefusesALayerKeyHoldingSomethingElse(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 
 	// Work out where it will land, and put something else there first.
 	var sealed bytes.Buffer
@@ -220,7 +221,7 @@ func TestFetchRefusesALayerThatCameBackWrong(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096)
-	m, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), request(volumeID, len(plain)))
+	m, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), request(volumeID))
 	if err != nil {
 		t.Fatalf("publishing: %v", err)
 	}
@@ -254,7 +255,7 @@ func TestFetchRefusesAnotherVolumesLayer(t *testing.T) {
 	volumeID := newID()
 	store, d := sim.NewObjectStore(), dek(t, volumeID)
 	plain := layerBytes(t, 4096)
-	m, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), request(volumeID, len(plain)))
+	m, err := commit.Publish(t.Context(), store, d, bytes.NewReader(plain), request(volumeID))
 	if err != nil {
 		t.Fatalf("publishing: %v", err)
 	}
@@ -285,6 +286,17 @@ func (f *failAfter) Put(ctx context.Context, key string, data []byte, opts objec
 	return f.Store.Put(ctx, key, data, opts)
 }
 
+// The layer is the one write that takes the streaming path, so a fake that counts only
+// Put stops counting the first of the three writes this test is about — and every kill
+// point moves one step later, silently.
+func (f *failAfter) PutStream(ctx context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	if f.left <= 0 {
+		return objectstore.PutResult{}, errCrashed
+	}
+	f.left--
+	return f.Store.PutStream(ctx, key, body, size, opts)
+}
+
 // TestAPublishedCommitIsAlwaysReconstructible is the commit contract, checked at every
 // point a commit can be cut in half: crash after every write and assert the invariant
 // rather than the steps — whatever HEAD names must be fully there, and so must every
@@ -302,12 +314,12 @@ func TestAPublishedCommitIsAlwaysReconstructible(t *testing.T) {
 
 			// A first commit that completes, so the crash cases below are cutting into
 			// a volume with a history rather than into an empty bucket.
-			if _, err := commit.Publish(t.Context(), base, d, bytes.NewReader(plain), request(volumeID, len(plain))); err != nil {
+			if _, err := commit.Publish(t.Context(), base, d, bytes.NewReader(plain), request(volumeID)); err != nil {
 				t.Fatalf("the first commit: %v", err)
 			}
 			store := &failAfter{Store: base, left: writes}
 			second := layerBytes(t, 4096*3)
-			_, _ = commit.Publish(t.Context(), store, d, bytes.NewReader(second), request(volumeID, len(second)))
+			_, _ = commit.Publish(t.Context(), store, d, bytes.NewReader(second), request(volumeID))
 
 			// Whatever survived, HEAD must name a commit that can be rebuilt.
 			head, _, err := commit.ReadHead(t.Context(), base, volumeID)
@@ -347,7 +359,7 @@ func TestPublishRefusesAKeyForAnotherVolume(t *testing.T) {
 	store, wrongKey := sim.NewObjectStore(), dek(t, theirs)
 	plain := layerBytes(t, 100)
 
-	_, err := commit.Publish(t.Context(), store, wrongKey, bytes.NewReader(plain), request(mine, len(plain)))
+	_, err := commit.Publish(t.Context(), store, wrongKey, bytes.NewReader(plain), request(mine))
 	if err == nil {
 		t.Fatal("a commit was published under a key belonging to another volume")
 	}

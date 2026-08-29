@@ -1,11 +1,13 @@
 package real
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -177,7 +179,14 @@ func (l *dirLock) stillExcludes() error {
 // the crash case self-healing, so there is deliberately no separate LOCK_UN to forget.
 func (l *dirLock) release() { _ = l.f.Close() }
 
-func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+func (s *ObjectStore) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	return s.PutStream(ctx, key, bytes.NewReader(data), int64(len(data)), opts)
+}
+
+// PutStream stages size bytes of body into a temp file and publishes that, so the object
+// never exists in this process whole. Put is the same operation with the bytes already in
+// hand.
+func (s *ObjectStore) PutStream(_ context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	if isSidecar(key) {
 		return objectstore.PutResult{}, fmt.Errorf("simio/real: %q collides with the store's own bookkeeping", key)
 	}
@@ -187,8 +196,8 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	}
 
 	// Staged outside the lock: the temp name is unique, and an fsync of a multi-megabyte
-	// WAL object must not serialise the whole key.
-	tmp, err := stage(p, data)
+	// object must not serialise the whole key.
+	tmp, etag, err := stage(p, body, size)
 	if err != nil {
 		return objectstore.PutResult{}, err
 	}
@@ -243,39 +252,52 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 			return objectstore.PutResult{}, err
 		}
 	}
-	return objectstore.PutResult{ETag: etagOf(data)}, nil
+	return objectstore.PutResult{ETag: etag}, nil
 }
 
-// stage writes data to a temp file beside p and fsyncs it, returning its path. The
-// caller publishes it with link (create-only) or rename (overwrite); both are atomic,
-// so a reader sees the old object or the new one and never a torn one.
-func stage(p string, data []byte) (string, error) {
+// stage copies exactly size bytes of body into a temp file beside p and fsyncs it,
+// returning its path and the ETag of what it wrote. The caller publishes it with link
+// (create-only) or rename (overwrite); both are atomic, so a reader sees the old object
+// or the new one and never a torn one.
+//
+// The ETag is computed as the bytes go past rather than from a buffer the caller holds:
+// that is the whole point of the streaming path, and it is also the only way this store
+// can hash a body it never has whole.
+func stage(p string, body io.Reader, size int64) (string, string, error) {
+	if size < 0 {
+		return "", "", fmt.Errorf("simio/real: a body of %d bytes is not a body", size)
+	}
 	dir, base := filepath.Split(p)
 	f, err := os.CreateTemp(dir, base+".*"+tmpSuffix)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	tmp := f.Name()
-	fail := func(err error) (string, error) {
+	fail := func(err error) (string, string, error) {
 		_ = f.Close()
 		_ = os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
-	if _, err := f.Write(data); err != nil {
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, size))
+	if err != nil {
 		return fail(err)
+	}
+	if n != size {
+		return fail(fmt.Errorf("simio/real: the body of %s ended after %d of %d bytes", p, n, size))
 	}
 	if err := f.Sync(); err != nil {
 		return fail(err)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
 	if err := os.Chmod(tmp, 0o644); err != nil {
 		_ = os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
-	return tmp, nil
+	return tmp, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // syncDir fsyncs a directory so a rename or link into it survives a crash.

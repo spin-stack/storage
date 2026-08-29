@@ -104,7 +104,7 @@ func (f *fakeFiles) WriteAtomic(path string, data []byte) error {
 // Open serves a file this fake already holds. It counts the reads, because the whole
 // point of a same-host clone is that the object store is not touched — and a test that
 // only checked the resulting chain could not tell a copy from a download.
-func (f *fakeFiles) Open(path string) (io.ReadCloser, error) {
+func (f *fakeFiles) Open(path string) (io.ReadSeekCloser, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	b, ok := f.files[path]
@@ -112,8 +112,14 @@ func (f *fakeFiles) Open(path string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("no such file: %s", path)
 	}
 	f.opened = append(f.opened, path)
-	return io.NopCloser(bytes.NewReader(b)), nil
+	return nopSeekCloser{bytes.NewReader(b)}, nil
 }
+
+// nopSeekCloser is a file this fake holds: readable, rewindable, and closing it costs
+// nothing.
+type nopSeekCloser struct{ *bytes.Reader }
+
+func (nopSeekCloser) Close() error { return nil }
 
 func (f *fakeFiles) Create(path string) (io.WriteCloser, error) {
 	f.mu.Lock()
@@ -227,6 +233,10 @@ type fakeRunner struct {
 	// failOn, when set, fails every run whose argv contains it — the way a qemu-img that
 	// is present and cannot do one particular thing behaves.
 	failOn string
+	// onRun, when set, runs before every invocation. A restore's time is spent in these
+	// processes and in the downloads between them, and the simulated clock moves only
+	// when something moves it.
+	onRun func()
 }
 
 func newRunner(files *fakeFiles) *fakeRunner {
@@ -234,6 +244,9 @@ func newRunner(files *fakeFiles) *fakeRunner {
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	if r.onRun != nil {
+		r.onRun()
+	}
 	if r.failOn != "" && strings.Contains(strings.Join(args, " "), r.failOn) {
 		return nil, fmt.Errorf("qemu-img: %s: cannot do that here", r.failOn)
 	}
@@ -411,7 +424,7 @@ func (w *world) publish() {
 	commitID, layerID := ids.New().String(), ids.New().String()
 	if _, err := commit.Publish(w.t.Context(), w.store, w.enc, bytes.NewReader(plain), commit.Request{
 		VolumeID: w.vol, CommitID: commitID, LayerID: layerID,
-		Epoch: 7, VirtualSize: virtualSize, PlainBytes: int64(len(plain)),
+		Epoch: 7, VirtualSize: virtualSize,
 	}); err != nil {
 		w.t.Fatalf("publishing: %v", err)
 	}

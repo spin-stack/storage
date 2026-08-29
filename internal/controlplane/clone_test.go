@@ -450,7 +450,7 @@ func TestACloneOpensItsParentsPublishedLayers(t *testing.T) {
 	plain := bytes.Repeat([]byte("what the parent wrote"), 4096)
 	m, err := commit.Publish(ctx, store, parentEnc, bytes.NewReader(plain), commit.Request{
 		VolumeID: parentVol, CommitID: ids.New().String(), LayerID: ids.New().String(),
-		Epoch: 1, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)),
+		Epoch: 1, VirtualSize: 1 << 30,
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)

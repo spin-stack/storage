@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"sort"
 	"strings"
@@ -332,6 +333,36 @@ func (s *ObjectStore) Put(_ context.Context, key string, data []byte, opts objec
 	if s.throttled() || s.throttledKey(key) {
 		return objectstore.PutResult{}, ErrThrottled
 	}
+	return s.put(key, data, opts)
+}
+
+// PutStream reads the body first and then stores it exactly as Put does: the store is in
+// memory, so there is nothing to stream to, and the value of the method here is that a
+// scenario exercises the same code path production takes.
+//
+// The refusals come before the body is touched, which is what a real backend does with a
+// throttled or precondition-failed request, and what keeps a fault injected at a key from
+// depending on how the caller produces its bytes.
+func (s *ObjectStore) PutStream(_ context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.begin()
+	if s.throttled() || s.throttledKey(key) {
+		return objectstore.PutResult{}, ErrThrottled
+	}
+	if size < 0 {
+		return objectstore.PutResult{}, fmt.Errorf("simio/sim: a body of %d bytes is not a body", size)
+	}
+	data := make([]byte, size)
+	if _, err := io.ReadFull(body, data); err != nil {
+		return objectstore.PutResult{}, fmt.Errorf("simio/sim: reading %d bytes for %s: %w", size, key, err)
+	}
+	return s.put(key, data, opts)
+}
+
+// put is the half of a PUT that touches the map. Callers hold s.mu and have already
+// counted the operation and consumed any injected fault.
+func (s *ObjectStore) put(key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	existing, exists := s.objs[key]
 	rewroteAMarkedKey := exists && existing.marked
 	if rewroteAMarkedKey {

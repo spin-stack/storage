@@ -42,6 +42,16 @@ func (r *Recorder) Count(ctx context.Context, name string, delta int64, attrs ..
 	}
 }
 
+// Observe adds one sample to a registered histogram.
+func (r *Recorder) Observe(ctx context.Context, name string, value float64, attrs ...Attr) {
+	if r == nil || r.m == nil {
+		return
+	}
+	if h, ok := r.m.Histogram(name); ok {
+		h.Record(ctx, value, metric.WithAttributes(attrs...))
+	}
+}
+
 // Gauge records the current value of a registered gauge.
 func (r *Recorder) Gauge(ctx context.Context, name string, value float64, attrs ...Attr) {
 	if r == nil || r.m == nil {

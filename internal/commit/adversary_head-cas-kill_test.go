@@ -107,13 +107,13 @@ func TestAdversaryTheCASOnHeadIsInterruptedAndNeverLands(t *testing.T) {
 	store := &advCASKill{Store: sim.NewObjectStore(), headKey: commit.HeadKey(volumeID)}
 
 	base := layerBytes(t, 4096*2)
-	parent, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(base), request(volumeID, len(base)))
+	parent, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(base), request(volumeID))
 	if err != nil {
 		t.Fatalf("the commit this one is layered on: %v", err)
 	}
 
 	plain := layerBytes(t, 4096*2)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 	store.armed, store.applied = true, false
 	if m, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(plain), req); err == nil {
 		t.Fatalf("the interrupted commit reported success: %+v", m)
@@ -179,13 +179,13 @@ func TestAdversaryTheCASOnHeadLandsAndTheAnswerIsLost(t *testing.T) {
 	store := &advCASKill{Store: sim.NewObjectStore(), headKey: commit.HeadKey(volumeID)}
 
 	base := layerBytes(t, 4096*2)
-	parent, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(base), request(volumeID, len(base)))
+	parent, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(base), request(volumeID))
 	if err != nil {
 		t.Fatalf("the commit this one is layered on: %v", err)
 	}
 
 	plain := layerBytes(t, 4096*2)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 	store.armed, store.applied = true, true
 	if m, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(plain), req); err == nil {
 		t.Fatalf("the commit whose answer was lost reported success: %+v", m)

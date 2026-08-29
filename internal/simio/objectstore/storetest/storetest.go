@@ -157,6 +157,80 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 	})
 
+	// The streaming PUT, which is how a sealed layer reaches the bucket: it is the one
+	// object nobody wants a second copy of in memory. Every assertion below is about the
+	// object that ends up stored, because the caller's next act is to publish a manifest
+	// naming the digest of exactly those bytes.
+	t.Run("PutStream stores what the body yields", func(t *testing.T) {
+		s := newStore(t)
+		body := bytes.Repeat([]byte("sealed-frame"), 4096)
+		res, err := s.PutStream(ctx, "layers/sha256/ab/cd/abcd", bytes.NewReader(body), int64(len(body)), objectstore.PutOptions{IfNoneMatch: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.ETag == "" {
+			t.Fatal("expected an ETag")
+		}
+		got, err := s.Get(ctx, "layers/sha256/ab/cd/abcd")
+		if err != nil || !bytes.Equal(got, body) {
+			t.Fatalf("get after PutStream: %d bytes err=%v", len(got), err)
+		}
+		info, err := s.Head(ctx, "layers/sha256/ab/cd/abcd")
+		if err != nil || info.Size != int64(len(body)) || info.ETag != res.ETag {
+			t.Fatalf("head after PutStream: %+v err=%v", info, err)
+		}
+		// The two entry points must agree byte for byte and ETag for ETag, or a retry
+		// that takes the other path reads its own object as somebody else's.
+		if _, err := s.Put(ctx, "same", body, objectstore.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if other, _ := s.Head(ctx, "same"); other.ETag != res.ETag {
+			t.Fatalf("Put and PutStream disagree about the same bytes: %q vs %q", other.ETag, res.ETag)
+		}
+	})
+
+	t.Run("PutStream honours create-only", func(t *testing.T) {
+		s := newStore(t)
+		opts := objectstore.PutOptions{IfNoneMatch: true}
+		if _, err := s.PutStream(ctx, "k", strings.NewReader("v1"), 2, opts); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.PutStream(ctx, "k", strings.NewReader("v2"), 2, opts); !errors.Is(err, objectstore.ErrPreconditionFailed) {
+			t.Fatalf("want ErrPreconditionFailed on the second create, got %v", err)
+		}
+		if got, _ := s.Get(ctx, "k"); string(got) != "v1" {
+			t.Fatalf("create-only must not overwrite: %q", got)
+		}
+	})
+
+	// A body that ends early must leave nothing. The size is what the caller measured
+	// while it computed the digest, so a short body means the source changed underneath
+	// the upload, and a truncated object at a content-addressed key is an object that
+	// hashes to something other than its own name — permanently, since the key is
+	// create-only from then on.
+	t.Run("PutStream refuses a body that ends early", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.PutStream(ctx, "short", strings.NewReader("four"), 64, objectstore.PutOptions{IfNoneMatch: true}); err == nil {
+			t.Fatal("a body shorter than the declared size must be an error")
+		}
+		if _, err := s.Get(ctx, "short"); !errors.Is(err, objectstore.ErrNotFound) {
+			t.Fatalf("a refused stream must store nothing, got %v", err)
+		}
+	})
+
+	// And a body that runs long is cut at the declared size rather than appended: size
+	// is what the object store was told the object is, and S3 sends exactly that many
+	// bytes whatever the reader goes on to offer.
+	t.Run("PutStream stores no more than the declared size", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.PutStream(ctx, "long", strings.NewReader("0123456789"), 4, objectstore.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.Get(ctx, "long"); err != nil || string(got) != "0123" {
+			t.Fatalf("stored %q err=%v, want %q", got, err, "0123")
+		}
+	})
+
 	// Finding 6. Create-only is what makes a retried WAL upload harmless (INV-21) and
 	// a published manifest immutable (INV-16); the If-Match CAS is the §12.4 epoch
 	// fence (INV-10). Both are claims about *concurrent* writers, and neither had a

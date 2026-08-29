@@ -18,7 +18,7 @@ func advPublish(t *testing.T, store objectstore.Store, enc *crypto.Encryption, v
 	t.Helper()
 	return commit.Publish(t.Context(), store, enc, bytes.NewReader(plain), commit.Request{
 		VolumeID: volumeID, CommitID: newID(), LayerID: newID(),
-		Epoch: epoch, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)), FrameBytes: 4096,
+		Epoch: epoch, VirtualSize: 1 << 30, FrameBytes: 4096,
 	})
 }
 
@@ -117,7 +117,7 @@ func TestAdversaryALostRaceReportedAsSomethingOtherThanAFence(t *testing.T) {
 	plain := layerBytes(t, 4096)
 	req := commit.Request{
 		VolumeID: volumeID, CommitID: newID(), LayerID: newID(),
-		Epoch: 5, VirtualSize: 1 << 30, PlainBytes: int64(len(plain)), FrameBytes: 4096,
+		Epoch: 5, VirtualSize: 1 << 30, FrameBytes: 4096,
 	}
 	store.fail = true
 	if _, err := commit.Publish(t.Context(), store, enc, bytes.NewReader(plain), req); err == nil {

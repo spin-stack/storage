@@ -135,6 +135,66 @@ func (p *Provider) GaugeSeries(ctx context.Context, name string) (map[string]flo
 	return out, nil
 }
 
+// Distribution is what a test asserting on a recorded histogram needs: how many samples
+// landed in one series and what they added up to. The buckets themselves are the
+// scrape's business, not an assertion's — a test that pinned them would fail on a
+// boundary change that measured nothing differently.
+type Distribution struct {
+	Count uint64
+	Sum   float64
+}
+
+// HistogramSeries returns every collected data point of one Float64 histogram family,
+// keyed by its label set rendered the way a scrape renders it.
+func (p *Provider) HistogramSeries(ctx context.Context, name string) (map[string]Distribution, error) {
+	var rm metricdata.ResourceMetrics
+	if err := p.reader.Collect(ctx, &rm); err != nil {
+		return nil, err
+	}
+	out := map[string]Distribution{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != name {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				continue
+			}
+			for _, dp := range h.DataPoints {
+				out[labelsOf(dp.Attributes)] = Distribution{Count: dp.Count, Sum: dp.Sum}
+			}
+		}
+	}
+	return out, nil
+}
+
+// CounterSeries returns every collected data point of one Int64 counter family, keyed
+// the same way. A counter read by name alone has the coin-flip problem GaugeSeries
+// exists for: every counter in the catalogue that is worth asserting on is labelled.
+func (p *Provider) CounterSeries(ctx context.Context, name string) (map[string]int64, error) {
+	var rm metricdata.ResourceMetrics
+	if err := p.reader.Collect(ctx, &rm); err != nil {
+		return nil, err
+	}
+	out := map[string]int64{}
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				out[labelsOf(dp.Attributes)] = dp.Value
+			}
+		}
+	}
+	return out, nil
+}
+
 // GaugeValues returns the latest value of every collected Float64 gauge. A state gauge
 // is only useful to an operator if it reads 1 while the condition holds and 0 once it
 // clears, so a test that asserts merely "the name was recorded" would pass on a gauge

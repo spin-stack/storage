@@ -141,7 +141,7 @@ func (l *lineage) publish(volumeID string, n int) (commits, layerKeys []string) 
 		commitID, layerID := ids.New().String(), ids.New().String()
 		m, err := commit.Publish(l.t.Context(), l.store, enc, bytes.NewReader(plain), commit.Request{
 			VolumeID: volumeID, CommitID: commitID, LayerID: layerID,
-			Epoch: 7, VirtualSize: virtualSize, PlainBytes: int64(len(plain)),
+			Epoch: 7, VirtualSize: virtualSize,
 		})
 		if err != nil {
 			l.t.Fatalf("publishing to %s: %v", volumeID, err)

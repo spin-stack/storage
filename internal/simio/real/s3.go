@@ -188,10 +188,19 @@ func translate(err error) error {
 }
 
 func (s *S3Store) Put(ctx context.Context, key string, data []byte, opts objectstore.PutOptions) (objectstore.PutResult, error) {
+	return s.PutStream(ctx, key, bytes.NewReader(data), int64(len(data)), opts)
+}
+
+// PutStream sends the body as it is produced. ContentLength is set explicitly: without it
+// the SDK buffers a non-seekable body to discover its length, which is the allocation
+// this method exists to avoid, and the reader is bounded to the same number so a body
+// that runs long cannot append to the object.
+func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	in := &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(data),
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          io.LimitReader(body, size),
+		ContentLength: aws.Int64(size),
 	}
 	switch {
 	case opts.IfNoneMatch:

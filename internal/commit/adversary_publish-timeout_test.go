@@ -43,7 +43,7 @@ func TestAdversaryATimeoutMidPublishLosesNoCommitAndPublishesNoSecondOne(t *test
 	d := dek(t, volumeID)
 	parentPlain := layerBytes(t, 4096*2)
 	plain := layerBytes(t, 4096*3+11)
-	req := request(volumeID, len(plain))
+	req := request(volumeID)
 
 	// The layer's key is the digest of the sealed bytes, which nothing outside can
 	// predict, so it is learned by publishing this very Request into a store that is
@@ -72,7 +72,7 @@ func TestAdversaryATimeoutMidPublishLosesNoCommitAndPublishesNoSecondOne(t *test
 			// A commit that completed, so the timeout below cuts into a volume with a
 			// history — the case where a mistake costs somebody's data rather than an
 			// empty bucket.
-			parentReq := request(volumeID, len(parentPlain))
+			parentReq := request(volumeID)
 			parent, err := commit.Publish(t.Context(), store, d, bytes.NewReader(parentPlain), parentReq)
 			if err != nil {
 				t.Fatalf("the commit before the timeout: %v", err)

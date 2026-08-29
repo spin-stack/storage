@@ -53,6 +53,8 @@ internal/obs.NewTestProvider          # the in-memory meter provider tests colle
 internal/obs.Provider.CollectedMetrics # reading it is how a test asserts on what left the process
 internal/obs.Provider.GaugeValues      # same, for gauges
 internal/obs.Provider.GaugeSeries      # same, for a gauge family whose label set varies — chain_depth has one series per volume and a test has to see them apart
+internal/obs.Provider.HistogramSeries  # same, for a duration or a size: a test asserts on the count and the sum of the samples that landed
+internal/obs.Provider.CounterSeries    # same, for a counter family — cas_failures_total is per volume, and a value read by name alone is whichever data point came back last
 # --- packages no binary imports (the coarse pass) -------------------------------------------
 package internal/dst        # the deterministic simulation harness. It is the test lane, so a binary importing it would be the defect.
 package internal/metadata/sim   # the in-memory metadata.Store DST runs against; binaries take metadata/pg

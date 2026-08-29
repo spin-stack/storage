@@ -3,13 +3,18 @@ package commit
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 
 	"github.com/google/uuid"
 
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/obs"
+	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 )
 
@@ -18,6 +23,13 @@ import (
 // the bytes — so it is a bucket somebody else has written into, and publishing a manifest
 // that points at it would name an object this Agent never wrote.
 var ErrLayerKeyTaken = errors.New("commit: the layer's key holds an object of a different size")
+
+// ErrSealDrifted means the pass that uploaded the layer produced different bytes from the
+// pass that hashed it. The object is content-addressed by the first digest, so anything
+// but a refusal here puts an object at layers/sha256/<d> that does not hash to <d> — and
+// Fetch checks the digest before it unseals, so that commit is unreadable forever while
+// Commit() reported SUCCESS.
+var ErrSealDrifted = errors.New("commit: the layer sealed differently on the upload pass than on the pass that hashed it")
 
 // Request is everything one commit needs that is not the bytes.
 type Request struct {
@@ -35,10 +47,24 @@ type Request struct {
 	Epoch int64
 	// VirtualSize is the guest-visible size a recovery must recreate the tip at.
 	VirtualSize int64
-	// PlainBytes is the sealed layer's plaintext length, used to size the buffer.
-	PlainBytes int64
 	// FrameBytes is the sealing frame; zero means crypto.LayerFrameBytes.
 	FrameBytes int
+}
+
+// Option carries what Publish measures itself with. It is optional because most callers
+// of this package are a test or a simulation, where the recorder would be nil anyway;
+// the Agent passes both.
+type Option func(*options)
+
+type options struct {
+	clk clock.Clock
+	rec *obs.Recorder
+}
+
+// WithTelemetry makes Publish record its §28 numbers. Without it nothing is recorded and
+// the protocol is unchanged.
+func WithTelemetry(clk clock.Clock, rec *obs.Recorder) Option {
+	return func(o *options) { o.clk = clk; o.rec = rec }
 }
 
 // Publish performs steps 9 to 13 of v6 §9 for one sealed layer: digest it, upload it,
@@ -55,11 +81,24 @@ type Request struct {
 // its layer, turned nothing red. Layer-first is kept anyway so that an existing manifest
 // is always complete.
 //
-// The whole sealed layer is held in memory, objectstore.Store taking a []byte. At the
-// sizes rotation produces (32 MiB measured, and RotateAtBytes is a floor rather than a
-// bound) that is a buffer and not a problem; the fix at an order of magnitude more is a
-// streaming PUT on the store interface.
-func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryption, layer io.Reader, req Request) (Manifest, error) {
+// # Why the layer is read twice
+//
+// The key is the digest of the sealed object, so the digest has to exist before the
+// upload can be addressed, and the sealed bytes are far too large to keep while that
+// happens — which is what this code used to do. So the layer is sealed once to be
+// measured and hashed, and sealed again straight into the upload; sealing is
+// deterministic (crypto.SealLayer derives its nonces), so the two agree unless the source
+// changed underneath. The upload pass is hashed as the store consumes it and compared
+// before anything points at the object, because "the digest is over the bytes as stored"
+// is the property every recovery leans on and a same-length difference would leave it
+// silently false.
+func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryption, layer io.ReadSeeker, req Request, opts ...Option) (Manifest, error) {
+	var o options
+	for _, apply := range opts {
+		apply(&o)
+	}
+	started := now(o.clk)
+
 	layerID, err := boundLayerID(enc, req.VolumeID, req.LayerID)
 	if err != nil {
 		return Manifest{}, err
@@ -92,17 +131,22 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 		return Manifest{}, err
 	}
 
-	sealed := bytes.NewBuffer(make([]byte, 0, sealedSize(req.PlainBytes, frameBytes)))
-	if err := enc.SealLayer(layerID, frameBytes, layer, sealed); err != nil {
+	upload := now(o.clk)
+	digest, size, err := measureLayer(enc, layerID, frameBytes, layer)
+	if err != nil {
 		return Manifest{}, fmt.Errorf("commit: sealing layer %s: %w", req.LayerID, err)
 	}
-	body := sealed.Bytes()
-	digest := Digest(body)
 	key := LayerKey(digest)
 
-	if err := putLayer(ctx, store, key, body); err != nil {
+	if err := putLayer(ctx, store, key, sealer{enc: enc, layerID: layerID, frameBytes: frameBytes, layer: layer}, digest, size); err != nil {
 		return Manifest{}, err
 	}
+	// Recorded here rather than in internal/publisher, which owns the other layer_*
+	// numbers: this is the only place that knows when the sealing began and when the last
+	// byte was acknowledged. It covers both passes over the layer, because both are what
+	// getting it into the bucket costs.
+	o.rec.Observe(ctx, "layer_upload_duration_seconds", elapsed(o.clk, upload),
+		obs.String("volume", req.VolumeID))
 
 	// The epoch fence (v6 §13). The CAS only asks "is HEAD what I last read", which is true
 	// for a fenced Agent that read it a moment ago — so the parent's manifest is read and
@@ -123,7 +167,7 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 		VolumeID: req.VolumeID, CommitID: req.CommitID, ParentCommitID: parent,
 		Epoch: req.Epoch, VirtualSize: req.VirtualSize,
 		Layer: Layer{
-			ObjectKey: key, SizeBytes: int64(len(body)), SHA256: digest,
+			ObjectKey: key, SizeBytes: size, SHA256: digest,
 			FrameBytes: int32(frameBytes), LayerID: req.LayerID,
 		},
 	}
@@ -131,12 +175,101 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 		return Manifest{}, err
 	}
 	if err := CASHead(ctx, store, req.VolumeID, req.CommitID, etag); err != nil {
+		if errors.Is(err, ErrHeadMoved) {
+			// Counted here and not inside CASHead: this is the CAS that publishes a
+			// commit, and an operator reading the series wants the number of commits
+			// that lost the volume under them, not every conditional write in the tree.
+			o.rec.Count(ctx, "cas_failures_total", 1, obs.String("volume", req.VolumeID))
+		}
 		return Manifest{}, err
 	}
+	o.rec.Observe(ctx, "commit_publish_latency_seconds", elapsed(o.clk, started),
+		obs.String("volume", req.VolumeID))
 	return m, nil
 }
 
-// putLayer stores the sealed bytes at their content-addressed key.
+// now and elapsed are the whole of this package's relationship with time: a nil clock is
+// a caller that is not measuring, and every duration is then zero rather than a branch at
+// each record site.
+func now(clk clock.Clock) clock.Instant {
+	if clk == nil {
+		return 0
+	}
+	return clk.Now()
+}
+
+func elapsed(clk clock.Clock, since clock.Instant) float64 {
+	if clk == nil {
+		return 0
+	}
+	return clk.Now().Sub(since).Seconds()
+}
+
+// sealer produces the sealed form of one layer, as many times as it is asked to. Each
+// call rewinds the plaintext, so the caller must not hold the two streams at once.
+type sealer struct {
+	enc        *crypto.Encryption
+	layerID    [16]byte
+	frameBytes int
+	layer      io.ReadSeeker
+}
+
+// stream returns the sealed bytes as a reader, sealing them as they are consumed, and the
+// hash of everything the consumer took. Closing the reader stops the sealing.
+func (s sealer) stream() (io.ReadCloser, hash.Hash, error) {
+	if _, err := s.layer.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, fmt.Errorf("commit: rewinding the layer: %w", err)
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		_ = pw.CloseWithError(s.enc.SealLayer(s.layerID, s.frameBytes, s.layer, pw))
+	}()
+	h := sha256.New()
+	// Hashed on the reading side rather than the writing one, so what is hashed is
+	// exactly what the store consumed — and so there is no race to read the digest the
+	// moment the store stops reading.
+	return sealedStream{Reader: io.TeeReader(pr, h), pr: pr}, h, nil
+}
+
+// sealedStream is the pipe's read half with the tee in front of it. Close closes the
+// pipe, which is what makes the sealing goroutine return when the store stops reading —
+// a store that refuses the request before touching the body is the ordinary case.
+type sealedStream struct {
+	io.Reader
+	pr *io.PipeReader
+}
+
+func (s sealedStream) Close() error { return s.pr.Close() }
+
+// measureLayer is the pass that names the object: it seals the layer and keeps only the
+// digest and the length. Nothing is stored, so a layer of any size costs one frame of
+// memory here.
+func measureLayer(enc *crypto.Encryption, layerID [16]byte, frameBytes int, layer io.ReadSeeker) (string, int64, error) {
+	if _, err := layer.Seek(0, io.SeekStart); err != nil {
+		return "", 0, fmt.Errorf("rewinding the layer: %w", err)
+	}
+	h := sha256.New()
+	c := &counter{w: h}
+	if err := enc.SealLayer(layerID, frameBytes, layer, c); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), c.n, nil
+}
+
+// counter is a writer that keeps the length of what went through it.
+type counter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *counter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// putLayer streams the sealed bytes to their content-addressed key and refuses to go on
+// unless what the store consumed hashes to the name it was stored under.
 //
 // Create-only, and a key already taken is the ordinary shape of a retry: the key is the
 // digest of the content, so what is there should be this object. "Should be" is why it is
@@ -146,10 +279,26 @@ func Publish(ctx context.Context, store objectstore.Store, enc *crypto.Encryptio
 //
 // It costs a GET of a whole layer, and only on the retry path, where a wrong answer is
 // permanent.
-func putLayer(ctx context.Context, store objectstore.Store, key string, body []byte) error {
-	_, err := store.Put(ctx, key, body, objectstore.PutOptions{IfNoneMatch: true})
+func putLayer(ctx context.Context, store objectstore.Store, key string, s sealer, digest string, size int64) error {
+	body, h, err := s.stream()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = body.Close() }()
+
+	_, err = store.PutStream(ctx, key, body, size, objectstore.PutOptions{IfNoneMatch: true})
 	if err == nil {
-		return nil
+		stored := hex.EncodeToString(h.Sum(nil))
+		if stored == digest {
+			return nil
+		}
+		// The object at this key is not the object this key names, and the key is
+		// create-only from now on: leaving it there would refuse the same layer for
+		// ever. Delete is a reversible mark on every implementation (INV-14), so the
+		// bytes remain for whoever investigates.
+		derr := store.Delete(ctx, key)
+		return fmt.Errorf("%w: %s was uploaded as %s (the object was withdrawn: %v)",
+			ErrSealDrifted, key, stored, derr)
 	}
 	if !errors.Is(err, objectstore.ErrPreconditionFailed) {
 		return fmt.Errorf("commit: uploading %s: %w", key, err)
@@ -158,20 +307,11 @@ func putLayer(ctx context.Context, store objectstore.Store, key string, body []b
 	if err != nil {
 		return fmt.Errorf("commit: reading the object already at %s: %w", key, err)
 	}
-	if got := Digest(existing); got != Digest(body) {
+	if got := Digest(existing); got != digest {
 		return fmt.Errorf("%w: %s holds an object that hashes to %s, this layer hashes to %s",
-			ErrLayerKeyTaken, key, got, Digest(body))
+			ErrLayerKeyTaken, key, got, digest)
 	}
 	return nil
-}
-
-// sealedSize is what SealLayer will produce, so the buffer is allocated once.
-func sealedSize(plain int64, frameBytes int) int64 {
-	frames := (plain + int64(frameBytes) - 1) / int64(frameBytes)
-	if frames == 0 {
-		frames = 1
-	}
-	return plain + frames*crypto.TagSize
 }
 
 // Fetch is Publish's inverse for one layer: download it, check the digest the manifest
