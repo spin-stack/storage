@@ -41,6 +41,9 @@ type fakeFiles struct {
 	dirs    map[string]bool
 	files   map[string][]byte
 	removed []string
+	// opened records local reads, which is how a same-host clone is told apart from a
+	// download: the chain looks identical either way.
+	opened []string
 	// createErr, when set, is what every Create fails with.
 	createErr error
 }
@@ -96,6 +99,20 @@ func (f *fakeFiles) WriteAtomic(path string, data []byte) error {
 	}
 	f.files[path] = slices.Clone(data)
 	return nil
+}
+
+// Open serves a file this fake already holds. It counts the reads, because the whole
+// point of a same-host clone is that the object store is not touched — and a test that
+// only checked the resulting chain could not tell a copy from a download.
+func (f *fakeFiles) Open(path string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.files[path]
+	if !ok {
+		return nil, fmt.Errorf("no such file: %s", path)
+	}
+	f.opened = append(f.opened, path)
+	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
 func (f *fakeFiles) Create(path string) (io.WriteCloser, error) {
@@ -1026,4 +1043,78 @@ func TestRestoreRefusesWhenTheDiskOrQemuImgWillNotCooperate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestASameHostCloneReadsTheParentsLayersOffTheLocalDisk is v6 §19's "reutilizar
+// files/cache locales" and §32's eleventh success criterion.
+//
+// The parent's layers are already on this disk. Fetching them again costs one download per
+// layer of the whole chain for bytes that are feet away — and nothing about the resulting
+// chain would look different, which is why this asserts on the object store rather than on
+// the chain: every layer object is REMOVED from the bucket before the clone is restored.
+// A clone that downloads cannot pass; one that copies from its parent does not notice.
+//
+// Copied rather than linked or shared: `qemu-img rebase -u` rewrites a layer's header to
+// point at its local parent, so a hard link would rewrite the parent volume's own file,
+// which is the one thing §19 forbids.
+func TestASameHostCloneReadsTheParentsLayersOffTheLocalDisk(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t, 3)
+	ctx := t.Context()
+
+	// The parent is restored here first, which is what "same host" means.
+	if _, err := w.rec.Restore(ctx, w.vol, virtualSize); err != nil {
+		t.Fatalf("restoring the parent: %v", err)
+	}
+
+	// Every layer object goes. The manifests and HEAD stay: a clone must still be told
+	// what its parent's history is, and that is a read this test does not begrudge.
+	objs, err := w.store.List(ctx, "layers/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) == 0 {
+		t.Fatal("the fixture published no layer objects")
+	}
+	for _, o := range objs {
+		if err := w.store.Delete(ctx, o.Key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	clone := ids.New().String()
+	w.keys.keys[clone] = cloneKeys(t, w, clone)
+
+	got, err := w.rec.RestoreFrom(ctx, qcow.Lineage{
+		VolumeID: clone, ParentVolumeID: w.vol, ParentCommitID: w.commits[len(w.commits)-1],
+	}, virtualSize)
+	if err != nil {
+		t.Fatalf("the clone went to the object store for layers this host already holds: %v", err)
+	}
+	if got.Base == "" {
+		t.Fatal("the clone was restored to no base at all")
+	}
+	for _, layerID := range w.layers {
+		there, ferr := w.files.Exists(qcow.LayerImage(root, clone, layerID))
+		if ferr != nil || !there {
+			t.Fatalf("layer %s is not under the clone: %v", layerID, ferr)
+		}
+	}
+}
+
+// cloneKeys is what controlplane.Clone hands a clone: the parent's DEK rewrapped under the
+// child's id. The same key bytes, bound to a different volume — which is why a clone can
+// open its parent's layers at all (§10).
+func cloneKeys(t *testing.T, w *world, clone string) agent.VolumeKeys {
+	t.Helper()
+	parent := w.keys.keys[w.vol]
+	dek, err := w.kms.UnwrapDEK(parent.DEKWrapped, parent.DEKKeyID, uuid.MustParse(w.vol))
+	if err != nil {
+		t.Fatalf("unwrapping the parent's DEK: %v", err)
+	}
+	wrapped, err := w.kms.WrapDEK(rand.Reader, dek, uuid.MustParse(clone))
+	if err != nil {
+		t.Fatalf("rewrapping it for the clone: %v", err)
+	}
+	return agent.VolumeKeys{VolumeID: clone, DEKWrapped: wrapped, KEKID: w.kms.KEKID(), DEKKeyID: dek.KeyID}
 }

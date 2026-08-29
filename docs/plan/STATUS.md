@@ -94,8 +94,9 @@ system has no equivalent of vSphere's datastore lock.
 - **Nothing reclaims local disk.** Released volumes keep their layers, published layers
   keep their files (§9 step 15), and the orphan overlay an interrupted rotation leaves is
   never swept. A sweep needs a `List` on `qcow.Paths`, which does not exist.
-- **Nothing measures the chain or the commits.** No metric for depth, size, attachment,
-  `unpublished_local_bytes` or `last_successful_commit_age` — which §11 calls the product.
+- **Two of §28's numbers are on the wire and nothing reads them.**
+  `last_successful_commit_age` and `unpublished_local_bytes` — the RPO and what it costs —
+  reach no alert, cordon or operator view, and nothing measures chain depth or attachment.
 - **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
   DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
   expiring the descriptor's non-current versions.

@@ -507,14 +507,16 @@ func (l *Loop) report(ctx context.Context, vols []VolumeStatus) error {
 	reports := make([]*storagev1.VolumeReport, 0, len(vols))
 	for _, v := range vols {
 		reports = append(reports, &storagev1.VolumeReport{
-			VolumeId:          v.VolumeID,
-			Epoch:             v.Epoch,
-			LocalSequence:     v.LocalSequence,
-			DurableSequence:   v.DurableSequence,
-			PublishedSequence: v.PublishedSequence,
-			SnapshotId:        v.SnapshotID,
-			SnapshotCommitId:  v.SnapshotCommitID,
-			SnapshotError:     v.SnapshotError,
+			VolumeId:                  v.VolumeID,
+			Epoch:                     v.Epoch,
+			LocalSequence:             v.LocalSequence,
+			DurableSequence:           v.DurableSequence,
+			PublishedSequence:         v.PublishedSequence,
+			SnapshotId:                v.SnapshotID,
+			SnapshotCommitId:          v.SnapshotCommitID,
+			LastSuccessfulCommitAgeMs: v.LastCommitAge.Milliseconds(),
+			UnpublishedLocalBytes:     v.UnpublishedLocalBytes,
+			SnapshotError:             v.SnapshotError,
 			// The one field here that is not a measurement: this host saying it is not
 			// serving the volume, and why. Unset is it saying it is, so a healthy cycle
 			// clears whatever the catalog holds without anything having to notice.

@@ -56,6 +56,11 @@ type VolumeStatus struct {
 	// point in the published history, so this can only be set after a commit succeeded —
 	// which is what makes a reported snapshot one that can actually be restored.
 	SnapshotCommitID string
+	// LastCommitAge is how long ago this host published a commit for this volume, and
+	// UnpublishedLocalBytes is what has accumulated since. Together they are the RPO and
+	// its cost; see the proto, which carries the reasoning.
+	LastCommitAge         time.Duration
+	UnpublishedLocalBytes int64
 	// SnapshotError is why it could not be taken. A snapshot that fails silently stays
 	// CREATING in the catalog forever.
 	SnapshotError string

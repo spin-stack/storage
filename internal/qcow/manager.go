@@ -1160,6 +1160,37 @@ func (m *Manager) withTimeout(ctx context.Context) (context.Context, context.Can
 	}
 }
 
+// gap is how far behind the object store this volume is: how long since the last commit
+// this host published, and how many local bytes are waiting on the next one.
+//
+// It is the pair §28 asks for, measured on every report rather than kept in a counter. A
+// counter would be a third writer of a fact the disk and state.json already hold.
+//
+// A volume with no chain — refused, or given up — reports zeros rather than its last known
+// numbers: the refusal is what an operator needs, and a stale byte count beside it invites
+// the reading that the volume is still making progress.
+func (m *Manager) gap(v *volume) (time.Duration, int64) {
+	if v.chain == nil {
+		return 0, 0
+	}
+	var bytes int64
+	if n, err := m.paths.Size(v.chain.Active); err == nil {
+		bytes = n
+	}
+	if v.pending != nil {
+		if n, err := m.paths.Size(v.pending.Path); err == nil {
+			bytes += n
+		}
+	}
+	st, err := ReadState(m.paths, m.cfg.Root, v.id)
+	if err != nil || st.LastCommitAt == 0 {
+		// Never committed here. Zero is the honest answer: an age measured from an anchor
+		// this host invented would read as an RPO somebody could rely on.
+		return 0, bytes
+	}
+	return time.Duration(m.clk.Wall().UnixMilli()-st.LastCommitAt) * time.Millisecond, bytes
+}
+
 // Volumes reports what this host is holding, ordered by volume id (deterministic).
 //
 // LocalSequence, DurableSequence and PublishedSequence are reported as zero: they were
@@ -1173,13 +1204,19 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 
 	out := make([]agent.VolumeStatus, 0, len(m.vols))
 	for _, v := range m.vols {
+		age, unpublished := m.gap(v)
 		out = append(out, agent.VolumeStatus{
 			VolumeID:         v.id,
 			Epoch:            v.epoch,
 			SnapshotID:       v.snapshotID,
 			SnapshotCommitID: v.snapshotCommit,
 			SnapshotError:    v.snapshotErr,
-			Refusal:          v.refusal,
+			// Measured here rather than tracked, because a tracked number is one more
+			// thing that can be wrong: the tip's size and the sealed layer's are on the
+			// disk, and the last commit's time is in state.json.
+			LastCommitAge:         age,
+			UnpublishedLocalBytes: unpublished,
+			Refusal:               v.refusal,
 			// Empty when there is no refusal, which is what the wire's healthy value is.
 			RefusalDetail: v.detail,
 		})

@@ -71,6 +71,10 @@ type Files interface {
 	Create(path string) (io.WriteCloser, error)
 	Rename(oldPath, newPath string) error
 	Remove(path string) error
+	// Open reads a layer this host already holds, so a clone can copy its parent's
+	// instead of downloading it. Streamed rather than read whole: a layer is measured in
+	// tens of megabytes, and ReadFile would put one in memory per clone.
+	Open(path string) (io.ReadCloser, error)
 }
 
 // Runner runs qemu-img and returns its standard output. A qcow2 parser of our own is
@@ -181,12 +185,35 @@ func (r *Recoverer) rebuild(ctx context.Context, local, source, commitID string,
 	for _, c := range st.Commits {
 		held[c.CommitID] = c.LayerID
 	}
+	// A clone on the same host as its parent: the layers it needs are already on this
+	// disk, under the parent's directory, and downloading them again costs a full chain
+	// of object-store GETs for bytes that are feet away. §19 asks for this by name.
+	//
+	// Copied and not linked or shared. `qemu-img rebase -u` rewrites a layer's header to
+	// point at its local parent, so a hard link would rewrite the *parent volume's* file —
+	// §19's one prohibition — and a backing file pointing into another volume's directory
+	// would make the clone's chain depend on a volume nobody told it about.
+	local2 := ""
+	if source != local {
+		if pst, perr := qcow.ReadState(r.files, r.root, source); perr == nil {
+			local2 = source
+			for _, c := range pst.Commits {
+				if held[c.CommitID] == "" {
+					held[c.CommitID] = c.LayerID
+				}
+			}
+		}
+	}
 
 	parent := onTopOf
 	for _, m := range manifests {
 		path := qcow.LayerImage(r.root, local, m.Layer.LayerID)
 		known := held[m.CommitID] == m.Layer.LayerID
-		if err := r.materialize(ctx, enc, m, path, known); err != nil {
+		from := ""
+		if known && local2 != "" {
+			from = qcow.LayerImage(r.root, local2, m.Layer.LayerID)
+		}
+		if err := r.materialize(ctx, enc, m, path, known, from); err != nil {
 			return qcow.Restored{}, 0, err
 		}
 		if err := r.repoint(ctx, m, path, parent); err != nil {
@@ -287,7 +314,7 @@ func checkGeometry(volumeID string, sizeBytes int64, head commit.Manifest, manif
 //
 // held — the durable record that this host already has this commit's layer — is believed
 // only together with the file being there.
-func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool) error {
+func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m commit.Manifest, path string, held bool, from string) error {
 	if held {
 		there, err := r.files.Exists(path)
 		if err != nil {
@@ -295,6 +322,14 @@ func (r *Recoverer) materialize(ctx context.Context, enc *crypto.Encryption, m c
 		}
 		if there {
 			return nil
+		}
+		// The same layer under another volume on this disk — a clone's parent. Copying it
+		// skips the download and the unsealing; if the copy fails for any reason we fall
+		// through to the object store, which is the authority either way.
+		if from != "" {
+			if copied, err := r.copyLocal(from, path); err == nil && copied {
+				return nil
+			}
 		}
 	}
 	part := path + partSuffix
@@ -467,4 +502,41 @@ func (Absent) RestoreFrom(_ context.Context, l qcow.Lineage, _ int64) (qcow.Rest
 // Current answers the same way and for the same reason.
 func (Absent) Current(context.Context, string) (string, error) {
 	return "", fmt.Errorf("%w: this Agent was started with no object store", commit.ErrNoHead)
+}
+
+// copyLocal puts a layer this host already holds under another volume where this one
+// needs it, without going to the object store. It reports false when the source is not
+// there, which is not an error: the caller falls through to the download.
+//
+// Through the same .part-then-rename path a download uses, so a crash halfway leaves no
+// file a later run would mistake for a complete layer.
+func (r *Recoverer) copyLocal(from, to string) (bool, error) {
+	there, err := r.files.Exists(from)
+	if err != nil || !there {
+		return false, err
+	}
+	src, err := r.files.Open(from)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = src.Close() }()
+	part := to + partSuffix
+	w, err := r.files.Create(part)
+	if err != nil {
+		return false, err
+	}
+	if _, err := io.Copy(w, src); err != nil {
+		_ = w.Close()
+		r.discard(part)
+		return false, err
+	}
+	if err := w.Close(); err != nil {
+		r.discard(part)
+		return false, err
+	}
+	if err := r.files.Rename(part, to); err != nil {
+		r.discard(part)
+		return false, err
+	}
+	return true, nil
 }

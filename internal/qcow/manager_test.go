@@ -1678,3 +1678,44 @@ func TestASnapshotWaitsForItsOwnCommitToLand(t *testing.T) {
 		t.Fatalf("the snapshot names %q, the commit that landed before it was asked for", before)
 	}
 }
+
+// TestTheReportCarriesHowFarBehindTheBucketAVolumeIs.
+//
+// §28 calls last_successful_commit_age the most important measurement here, and the reason
+// is that it IS the RPO: lose the host now and this is what the tenant loses. Until it was
+// reported, a volume that had not committed for an hour looked on the wire exactly like
+// one that committed a second ago — and the bytes waiting on the next commit, which is
+// what those seconds cost, were not on the wire at all.
+func TestTheReportCarriesHowFarBehindTheBucketAVolumeIs(t *testing.T) {
+	t.Parallel()
+	pub := &recordingPublisher{}
+	h := newHarnessFull(t, 8<<20, pub)
+	tip := h.rotating(t, 9<<20)
+	h.paths.sizes[tip] = 9 << 20
+
+	// Before anything is published: no age to report, and the tip is already local bytes
+	// that would be lost with the host.
+	if got := h.volumes(t)[vol]; got.LastCommitAge != 0 {
+		t.Fatalf("a volume that has never committed reports an age of %s", got.LastCommitAge)
+	} else if got.UnpublishedLocalBytes == 0 {
+		t.Fatal("the tip holds the guest's writes and the report says nothing is unpublished")
+	}
+
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 1)}); err != nil {
+		t.Fatalf("the cycle that rotates and publishes: %v", err)
+	}
+	next := h.tip(t)
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(next)
+	h.paths.sizes[next] = 3 << 20
+	h.runner.info = overlayJSON(size, next)
+
+	h.clk.Advance(7 * time.Minute)
+	got := h.volumes(t)[vol]
+	if got.LastCommitAge != 7*time.Minute {
+		t.Fatalf("last commit age = %s, want the 7 minutes since the commit landed", got.LastCommitAge)
+	}
+	// The new tip, and nothing else: the layer that was published is not owed any more.
+	if got.UnpublishedLocalBytes != 3<<20 {
+		t.Fatalf("unpublished = %d bytes, want the %d the tip holds", got.UnpublishedLocalBytes, 3<<20)
+	}
+}

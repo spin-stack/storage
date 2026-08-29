@@ -1031,6 +1031,24 @@ type VolumeReport struct {
 	// `Commit() → SUCCESS`, which promises the state is reconstructible without this
 	// host — so a snapshot that is reported at all is a snapshot that can be restored.
 	SnapshotCommitId string `protobuf:"bytes,12,opt,name=snapshot_commit_id,json=snapshotCommitId,proto3" json:"snapshot_commit_id,omitempty"`
+	// The two numbers §28 asks for by name, and the only ones on this message that describe
+	// the *gap* between what a guest has written and what the bucket holds.
+	//
+	// last_successful_commit_age_ms is how long ago this host last published a commit for
+	// the volume. §28 calls it the most important measurement here, and the reason is that
+	// it IS the RPO: lose the host now and this is what a tenant loses. Nothing else on the
+	// wire says it — a volume that has not committed for an hour looks exactly like one that
+	// committed a second ago.
+	//
+	// unpublished_local_bytes is what those seconds cost: the sealed layer this host still
+	// owes plus the tip nobody has sealed yet. It is measured, not estimated, and it answers
+	// the question an operator actually asks when a disk fills — how much of this is data
+	// that has nowhere to go.
+	//
+	// Both are zero for a volume that has never committed on this host, which is a state
+	// and not a measurement; the report's own refusal is what says why.
+	LastSuccessfulCommitAgeMs int64 `protobuf:"varint,13,opt,name=last_successful_commit_age_ms,json=lastSuccessfulCommitAgeMs,proto3" json:"last_successful_commit_age_ms,omitempty"`
+	UnpublishedLocalBytes     int64 `protobuf:"varint,14,opt,name=unpublished_local_bytes,json=unpublishedLocalBytes,proto3" json:"unpublished_local_bytes,omitempty"`
 	// snapshot_error, when set, is why the snapshot could not be taken. A snapshot
 	// that fails silently stays CREATING forever and nothing ever collects it.
 	SnapshotError string `protobuf:"bytes,9,opt,name=snapshot_error,json=snapshotError,proto3" json:"snapshot_error,omitempty"`
@@ -1140,6 +1158,20 @@ func (x *VolumeReport) GetSnapshotCommitId() string {
 		return x.SnapshotCommitId
 	}
 	return ""
+}
+
+func (x *VolumeReport) GetLastSuccessfulCommitAgeMs() int64 {
+	if x != nil {
+		return x.LastSuccessfulCommitAgeMs
+	}
+	return 0
+}
+
+func (x *VolumeReport) GetUnpublishedLocalBytes() int64 {
+	if x != nil {
+		return x.UnpublishedLocalBytes
+	}
+	return 0
 }
 
 func (x *VolumeReport) GetSnapshotError() string {
@@ -1361,7 +1393,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"dekWrapped\x12\x15\n" +
 	"\x06kek_id\x18\x03 \x01(\tR\x05kekId\x12\x1c\n" +
 	"\n" +
-	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xc9\x03\n" +
+	"dek_key_id\x18\x04 \x01(\rR\bdekKeyId\"\xc3\x04\n" +
 	"\fVolumeReport\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\tR\bvolumeId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x03R\x05epoch\x12%\n" +
@@ -1371,7 +1403,9 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x10remote_gap_bytes\x18\x06 \x01(\x03R\x0eremoteGapBytes\x12\x1f\n" +
 	"\vsnapshot_id\x18\a \x01(\tR\n" +
 	"snapshotId\x12,\n" +
-	"\x12snapshot_commit_id\x18\f \x01(\tR\x10snapshotCommitId\x12%\n" +
+	"\x12snapshot_commit_id\x18\f \x01(\tR\x10snapshotCommitId\x12@\n" +
+	"\x1dlast_successful_commit_age_ms\x18\r \x01(\x03R\x19lastSuccessfulCommitAgeMs\x126\n" +
+	"\x17unpublished_local_bytes\x18\x0e \x01(\x03R\x15unpublishedLocalBytes\x12%\n" +
 	"\x0esnapshot_error\x18\t \x01(\tR\rsnapshotError\x128\n" +
 	"\arefusal\x18\n" +
 	" \x01(\x0e2\x1e.spin.storage.v1.VolumeRefusalR\arefusal\x12%\n" +

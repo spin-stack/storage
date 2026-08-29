@@ -387,6 +387,25 @@ message VolumeReport {
   // `Commit() → SUCCESS`, which promises the state is reconstructible without this
   // host — so a snapshot that is reported at all is a snapshot that can be restored.
   string snapshot_commit_id = 12;
+
+  // The two numbers §28 asks for by name, and the only ones on this message that describe
+  // the *gap* between what a guest has written and what the bucket holds.
+  //
+  // last_successful_commit_age_ms is how long ago this host last published a commit for
+  // the volume. §28 calls it the most important measurement here, and the reason is that
+  // it IS the RPO: lose the host now and this is what a tenant loses. Nothing else on the
+  // wire says it — a volume that has not committed for an hour looks exactly like one that
+  // committed a second ago.
+  //
+  // unpublished_local_bytes is what those seconds cost: the sealed layer this host still
+  // owes plus the tip nobody has sealed yet. It is measured, not estimated, and it answers
+  // the question an operator actually asks when a disk fills — how much of this is data
+  // that has nowhere to go.
+  //
+  // Both are zero for a volume that has never committed on this host, which is a state
+  // and not a measurement; the report's own refusal is what says why.
+  int64 last_successful_commit_age_ms = 13;
+  int64 unpublished_local_bytes = 14;
   // snapshot_error, when set, is why the snapshot could not be taken. A snapshot
   // that fails silently stays CREATING forever and nothing ever collects it.
   string snapshot_error = 9;
