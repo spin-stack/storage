@@ -258,13 +258,19 @@ func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, siz
 // the volume stops committing with the guest still running. RustFS accepts a single PUT of
 // any size, which is why the container lane certified a path S3 refuses.
 //
-// minPartSize is S3's floor on every part but the last, and maxParts its cap on how many
-// there may be. A part size is picked from the object's own size rather than fixed, so the
-// cap is never what decides whether a layer can be stored: at 5 MiB parts the cap alone
+// minPartSize is the part a layer travels in, and maxParts S3's cap on how many there may
+// be. A part size is picked from the object's own size rather than fixed, so the cap is
+// never what decides whether a layer can be stored: at S3's own 5 MiB floor the cap alone
 // would stop at 50 GiB, which is an ordinary volume.
+//
+// The part and the window match what GetStream reads with, and for the same reason: what
+// decides throughput to S3 is how many bytes are in flight, and one direction being three
+// times narrower than the other would be a number nobody chose. 8 MiB is comfortably over
+// S3's 5 MiB floor and large enough that a round trip is a small share of it.
 const (
-	minPartSize = 5 << 20
+	minPartSize = getChunkBytes
 	maxParts    = 10_000
+	putParallel = getConcurrency
 )
 
 // partSizeFor is also the threshold: a body that fits in one part is sent as one request,
@@ -308,7 +314,7 @@ func partSizeFor(size int64) int64 {
 func (s *S3Store) putParts(ctx context.Context, in *s3.PutObjectInput, part int64) (objectstore.PutResult, error) {
 	up := manager.NewUploader(s.client, func(u *manager.Uploader) {
 		u.PartSize = part
-		u.Concurrency = 4
+		u.Concurrency = putParallel
 	})
 	out, err := up.Upload(ctx, in)
 	if err != nil {
