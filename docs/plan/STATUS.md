@@ -73,8 +73,8 @@ Nothing on the §24 list. What is left is in the two sections below.
   which places at once and with no dwell: the fleet cannot split-brain, and an operator can,
   in one command.
 - **Nothing has been measured where it will run.** `measure:transfer` carries 6 GiB both
-  ways, past S3's ceiling on a single PUT, but against the container, and
-  `measure:publish:aws` times a commit from outside its region.
+  ways against real S3, past its ceiling on a single PUT, at ~30 MiB/s each way — which is
+  this link and not the store, as is the F = 966 ms `measure:publish:aws` fits.
   `_output/measure-in-region.sh` has never run; nor has a fleet upgrade (INV-19).
 - **No RPO target is set anywhere.** The age trigger is in and per-volume
   (`volumes.rpo_target_seconds` → `DesiredVolume`), and what a host measures against it now

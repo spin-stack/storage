@@ -52,14 +52,19 @@ const lockFile = "agent.lock"
 // its own number runs `task measure:publish` against its own store.
 //
 // Measured against real S3 since (`task measure:publish:aws`, us-west-2 from a developer's
-// machine): F = 940 ms, R = 12 MiB/s, which puts S at 105 MiB — outside the band above, and
-// it does not move this default. F there is 940 ms against a measured 220 ms round trip to
-// the region: four round trips and nothing else, so the commit protocol costs exactly the
-// requests it makes and adds nothing of its own. Both terms are the path, not the store —
-// a WAN latency and a domestic uplink. An Agent sits in the region it publishes to, where
-// the same four round trips are single-digit milliseconds and R is a NIC. The band
-// argument holds when F and R describe one machine; it says nothing about a laptop
-// reaching across a continent, and neither does the number it produces.
+// machine): F = 966 ms, R = 29 MiB/s, which puts S at 252 MiB — outside the band above, and
+// it does not move this default. F is 966 ms against a measured 220 ms round trip to the
+// region: four round trips and nothing else, so the commit protocol costs exactly the
+// requests it makes and adds nothing of its own.
+//
+// R was 12 MiB/s on the same link a few hours earlier, and what changed was this code —
+// a layer used to go as one PUT and now goes as eight parts at once. That is the argument
+// above failing in a way worth keeping: R is not a property of the backend, it is a
+// property of the backend *and how many bytes the client keeps in flight*, so the two
+// terms cannot be relied on to move in opposite directions. Both are the path here anyway
+// — a WAN latency and a domestic uplink — and an Agent sits in the region it publishes to,
+// where the same four round trips are single-digit milliseconds and R is a NIC. Nothing
+// measured from a laptop reaching across a continent sets this number.
 //
 // It is a *floor* on the layer, never a bound (§11): the tip is measured once a cycle, so
 // a layer weighs the threshold plus whatever the guest wrote since the last look — measured
