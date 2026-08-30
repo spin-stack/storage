@@ -181,6 +181,19 @@ is corrected, not worked around. This narrows scope, not the bar: format changes
 review zone, and INV-19 (read-old / write-new, `max_format_version`) becomes binding the
 moment two Agents can run different versions.
 
+**The wire is not one of those formats, and its clock is already running.** An on-S3 format
+is read by our own binaries, which ship together; `api/` is read by *spin*, another repo on
+another release cadence, so "client and server are deployed together" stops being true the
+day spin calls this API and not the day the spine ships. `task lint` runs `buf breaking
+--against main` at `FILE` — the level that catches a **rename**, which is the change that
+looks like a refactor and is not: the field number survives it and every generated accessor
+and JSON key does not. So, in `api/`: a field number is permanent, a deleted number and
+name are `reserved`, an enum value is never reinterpreted, and a change is additive or it
+is a new version. If `buf breaking` fails, that is the answer and not the obstacle — the
+order to try is *additive field → new RPC → deprecate and migrate → new package version*,
+and only then a break somebody signed for. The generated code in `api/gen` is never edited;
+`task generate` is the only way it moves.
+
 ## Human-review zones (data-loss)
 
 Spec reviewed in the PR before implementation, diff reviewed before merge, plus a DST

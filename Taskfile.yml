@@ -210,6 +210,15 @@ tasks:
     cmds:
       - "{{.TOOLS_BIN}}/buf lint"
       - "{{.TOOLS_BIN}}/buf format --diff --exit-code"
+      # buf.yaml has declared `breaking: use: [FILE]` since the schema existed and
+      # nothing ran it, so the strictest compatibility level in the file was a
+      # preference nobody was held to. FILE is the level that catches a rename, which
+      # is the change that looks like a refactor and is not: the field number survives
+      # it, and every generated accessor and every JSON key does not.
+      #
+      # Against main and not against a tag: main is what spin will be built against.
+      # It needs the history, which is why ci.yml checks out with fetch-depth 0.
+      - "{{.TOOLS_BIN}}/buf breaking --against '../.git#branch=main,subdir=api'"
 
   # --- schema (pgschema, ADR-0019) --------------------------------------------
   #

@@ -50,6 +50,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # The whole history, because `task lint` asks buf what this branch changed
+          # about the wire contract and needs main to compare against. A shallow clone
+          # makes that check error rather than pass, which is the right failure and
+          # still a failure.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v6
