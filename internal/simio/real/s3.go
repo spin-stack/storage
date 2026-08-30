@@ -14,7 +14,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -295,25 +295,22 @@ func partSizeFor(size int64) int64 {
 // and invisible to LIST, and the caller republishes the same bytes under the same commit id
 // next cycle.
 //
-// feature/s3/manager is the older spelling of this and is deprecated; transfermanager is
-// the successor, and the reason to prefer it here beyond that is that it maps IfNoneMatch
-// onto the complete explicitly rather than by reflecting one struct onto another.
+// feature/s3/manager is deprecated in favour of feature/s3/transfermanager, and the
+// deprecation is knowingly not taken. transfermanager logs "failed to complete multipart
+// upload" with the standard library's global logger, unconditionally, whenever the
+// complete returns an error — and here the commonest such error is 412, which is not a
+// failure but the fence doing its job: a create-only layer already in the bucket, or a
+// host that lost a CAS. An operator would read a line saying failure every time this
+// system worked correctly, with no way to turn it off. A suppressed lint warning is a
+// cost paid once by whoever reads this file; that line is paid by whoever is on call.
+//
+//nolint:staticcheck // see above: the successor logs a false failure on the fencing path
 func (s *S3Store) putParts(ctx context.Context, in *s3.PutObjectInput, part int64) (objectstore.PutResult, error) {
-	tm := transfermanager.New(s.client, func(o *transfermanager.Options) {
-		o.PartSizeBytes = part
-		// This method is only called for a body that does not fit in one part, so the
-		// threshold has nothing left to decide.
-		o.MultipartUploadThreshold = part
-		o.Concurrency = 4
+	up := manager.NewUploader(s.client, func(u *manager.Uploader) {
+		u.PartSize = part
+		u.Concurrency = 4
 	})
-	out, err := tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
-		Bucket:        in.Bucket,
-		Key:           in.Key,
-		Body:          in.Body,
-		ContentLength: in.ContentLength,
-		IfMatch:       in.IfMatch,
-		IfNoneMatch:   in.IfNoneMatch,
-	})
+	out, err := up.Upload(ctx, in)
 	if err != nil {
 		return objectstore.PutResult{}, translate(err)
 	}
