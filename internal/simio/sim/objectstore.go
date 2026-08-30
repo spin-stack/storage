@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -419,6 +420,17 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 		return nil, objectstore.ErrNotFound
 	}
 	return append([]byte(nil), o.data...), nil
+}
+
+// GetStream is Get with the bytes behind a reader. It goes through the same visibility,
+// throttling and fault surface, because a scenario that could fault Get and not this one
+// would leave the whole recovery path unsimulated.
+func (s *ObjectStore) GetStream(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	data, err := s.Get(ctx, key)
+	if err != nil {
+		return nil, 0, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
 }
 
 func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInfo, error) {

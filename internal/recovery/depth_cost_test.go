@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -34,6 +35,15 @@ type countingStore struct {
 func (c *countingStore) Get(ctx context.Context, key string) ([]byte, error) {
 	c.record("GET " + key)
 	return c.Store.Get(ctx, key)
+}
+
+// A layer is fetched with GetStream, which under the S3 store is several range requests
+// rather than one GET. It is recorded as a read of the object, because what this test
+// counts is which objects a rebuild has to read — how many requests that takes is the
+// store's business and changing it must not change these numbers.
+func (c *countingStore) GetStream(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	c.record("GET " + key)
+	return c.Store.GetStream(ctx, key)
 }
 
 func (c *countingStore) Head(ctx context.Context, key string) (objectstore.ObjectInfo, error) {

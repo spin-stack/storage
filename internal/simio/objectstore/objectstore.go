@@ -70,6 +70,17 @@ type Store interface {
 	PutStream(ctx context.Context, key string, body io.Reader, size int64, opts PutOptions) (PutResult, error)
 	// Get returns the object bytes (strong read-after-write).
 	Get(ctx context.Context, key string) ([]byte, error)
+	// GetStream is Get for the same object PutStream exists for: it hands back a
+	// reader and the object's size instead of its bytes. Get holds the whole object,
+	// which for a sealed layer is the OOM PutStream was written to avoid, on the way
+	// back — a compacted root is bounded by the guest's disk, so an Agent restoring a
+	// volume of any size buffered all of it.
+	//
+	// The caller closes the reader. How the bytes are fetched is the implementation's
+	// business: the S3 store reads many ranges at once and hands them over in order,
+	// because a single stream leaves most of a host's bandwidth unused and the time
+	// this takes is the time a guest is not running.
+	GetStream(ctx context.Context, key string) (io.ReadCloser, int64, error)
 	// Head returns object metadata without the body.
 	Head(ctx context.Context, key string) (ObjectInfo, error)
 	// List returns objects whose key has the prefix, sorted by key. LIST may be

@@ -203,6 +203,40 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 	})
 
+	// GetStream is the way back out for the object PutStream exists for, and it has to
+	// agree with Get about every byte and about the length: the length is what the
+	// caller checks a body against, and a stream that ends early where Get would not is
+	// a layer silently short of what the manifest says it is.
+	t.Run("GetStream yields the same bytes and length as Get", func(t *testing.T) {
+		s := newStore(t)
+		body := bytes.Repeat([]byte("frame"), 5000)
+		if _, err := s.PutStream(ctx, "layers/sha256/streamed", bytes.NewReader(body), int64(len(body)), objectstore.PutOptions{IfNoneMatch: true}); err != nil {
+			t.Fatal(err)
+		}
+		rc, size, err := s.GetStream(ctx, "layers/sha256/streamed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		if size != int64(len(body)) {
+			t.Fatalf("GetStream reports %d bytes, the object is %d", size, len(body))
+		}
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("GetStream yielded %d bytes and they are not the ones stored", len(got))
+		}
+	})
+
+	t.Run("GetStream of a missing key is ErrNotFound", func(t *testing.T) {
+		s := newStore(t)
+		if _, _, err := s.GetStream(ctx, "nothing/here"); !errors.Is(err, objectstore.ErrNotFound) {
+			t.Fatalf("want ErrNotFound, got %v", err)
+		}
+	})
+
 	// A layer larger than one request is the case only a real backend can answer. S3
 	// refuses a single PUT over 5 GiB, and a compacted root is bounded by the guest's
 	// disk — so the store has to be able to send a layer in parts, and the conditional

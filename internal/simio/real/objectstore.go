@@ -321,6 +321,27 @@ func (s *ObjectStore) Get(_ context.Context, key string) ([]byte, error) {
 	return data, err
 }
 
+// GetStream hands back the file itself. A single-machine deployment reads a layer off
+// its own disk, so there is nothing to parallelise and nothing to buffer.
+func (s *ObjectStore) GetStream(_ context.Context, key string) (io.ReadCloser, int64, error) {
+	if isSidecar(key) || s.marked(key) {
+		return nil, 0, objectstore.ErrNotFound
+	}
+	f, err := os.Open(s.path(key)) //nolint:forbidigo,gosec // simio/real is where the real disk lives
+	if os.IsNotExist(err) {
+		return nil, 0, objectstore.ErrNotFound
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	return f, info.Size(), nil
+}
+
 func (s *ObjectStore) Head(_ context.Context, key string) (objectstore.ObjectInfo, error) {
 	if isSidecar(key) || s.marked(key) {
 		return objectstore.ObjectInfo{}, objectstore.ErrNotFound

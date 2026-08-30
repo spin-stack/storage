@@ -1,7 +1,6 @@
 package commit
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -364,16 +363,50 @@ func Fetch(ctx context.Context, store objectstore.Store, enc *crypto.Encryption,
 	if err != nil {
 		return err
 	}
-	body, err := store.Get(ctx, m.Layer.ObjectKey)
+	body, size, err := store.GetStream(ctx, m.Layer.ObjectKey)
 	if err != nil {
 		return fmt.Errorf("commit: downloading %s: %w", m.Layer.ObjectKey, err)
 	}
-	if got := Digest(body); got != m.Layer.SHA256 {
+	defer body.Close()
+	// The manifest records the sealed length, so a wrong one is answerable before a byte
+	// is unsealed — and the reason it is worth saying here is that the digest below can
+	// only speak at the end.
+	if size != m.Layer.SizeBytes {
+		return fmt.Errorf("%w: %s is %d bytes, the manifest says %d",
+			ErrCorrupt, m.Layer.ObjectKey, size, m.Layer.SizeBytes)
+	}
+	// The layer is unsealed as it arrives and the digest is taken over the same bytes on
+	// the way past, rather than the object being held whole and hashed first.
+	//
+	// Holding it was an OOM with no upper bound: PutStream exists so that publishing a
+	// layer does not buffer one, and this is the same object coming back — a compacted
+	// root is bounded by the guest's disk, so restoring a large volume buffered all of
+	// it, on the recovery path, where the alternative to succeeding is a host that
+	// cannot start any of its volumes.
+	//
+	// What that moves is *when* the digest speaks, not whether: it is still over the
+	// bytes as stored, and it is still checked before the plaintext is anything but a
+	// `.part` file the caller discards. Every frame is GCM-authenticated on the way
+	// through besides, so tampering is caught frame by frame and this catches the rest.
+	sum := sha256.New()
+	tee := io.TeeReader(body, sum)
+	openErr := enc.OpenLayer(layerID, int(m.Layer.FrameBytes), tee, w)
+	if openErr != nil {
+		// Read the rest before answering. Unsealing gives up at the first frame that
+		// does not authenticate, which is one symptom of an object that is not what the
+		// manifest names — and the digest below is the diagnosis, but only if it has
+		// seen the whole thing. A prefix would hash to something true of no object.
+		_, _ = io.Copy(io.Discard, tee)
+	}
+	if got := hex.EncodeToString(sum.Sum(nil)); got != m.Layer.SHA256 {
 		return fmt.Errorf("%w: %s hashes to %s, the manifest says %s",
 			ErrCorrupt, m.Layer.ObjectKey, got, m.Layer.SHA256)
 	}
-	if err := enc.OpenLayer(layerID, int(m.Layer.FrameBytes), bytes.NewReader(body), w); err != nil {
-		return fmt.Errorf("commit: opening layer %s: %w", m.Layer.LayerID, err)
+	if openErr != nil {
+		// The bytes are the ones the manifest names and they still would not open: not
+		// corruption but the wrong key or the wrong framing, which is a different thing
+		// for an operator to be told.
+		return fmt.Errorf("commit: opening layer %s: %w", m.Layer.LayerID, openErr)
 	}
 	return nil
 }
