@@ -13,7 +13,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -26,17 +25,18 @@ import (
 	"github.com/spin-stack/storage/internal/testinfra"
 )
 
-// backendUnderTest starts the pinned backend and returns a client for it.
-func backendUnderTest(t *testing.T) (*s3.Client, context.Context) {
+// backendUnderTest starts the backend under test and returns a client for it.
+func backendUnderTest(t *testing.T) (testinfra.ObjectStoreBackend, *s3.Client, context.Context) {
 	t.Helper()
-	return backendConfig(t).Client(), t.Context()
+	be := backendConfig(t)
+	return be, be.Client(), t.Context()
 }
 
-// backendConfig starts the pinned backend and returns its connection details, for
-// tests that need to build their own client (different SDK options).
+// backendConfig starts the backend under test and returns its connection details,
+// for tests that need to build their own client (different SDK options).
 func backendConfig(t *testing.T) testinfra.ObjectStoreBackend {
 	t.Helper()
-	return testinfra.RustFS(t, os.Getenv("RUSTFS_IMAGE"))
+	return testinfra.ObjectStore(t)
 }
 
 // apiErrorCode returns the S3 error code of err ("PreconditionFailed", ...).
@@ -48,15 +48,12 @@ func apiErrorCode(err error) string {
 	return ""
 }
 
-func makeBucket(t *testing.T, ctx context.Context, c *s3.Client, name string, objectLock bool) {
+// makeBucket creates one bucket for this test and returns the name it actually
+// got: on AWS the suite's plain names are taken, so every bucket is namespaced by
+// run. Tests must use the returned name and never the one they asked for.
+func makeBucket(t *testing.T, ctx context.Context, be testinfra.ObjectStoreBackend, name string, objectLock bool) string {
 	t.Helper()
-	in := &s3.CreateBucketInput{Bucket: aws.String(name)}
-	if objectLock {
-		in.ObjectLockEnabledForBucket = aws.Bool(true)
-	}
-	if _, err := c.CreateBucket(ctx, in); err != nil {
-		t.Fatalf("create bucket %s: %v", name, err)
-	}
+	return be.MakeBucket(t, ctx, name, objectLock)
 }
 
 func put(ctx context.Context, c *s3.Client, bucket, key, body string, mut func(*s3.PutObjectInput)) (*s3.PutObjectOutput, error) {
@@ -75,10 +72,10 @@ func put(ctx context.Context, c *s3.Client, bucket, key, body string, mut func(*
 // object, manifest, checkpoint, recovery-point) is written create-only, so a
 // retried PUT after a lost response cannot overwrite what is already there.
 func TestCreateOnlyPutIsAtomic(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "create-only", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "create-only", false)
 
-	first, err := put(ctx, c, "create-only", "wal/1.wal", "first", func(in *s3.PutObjectInput) {
+	first, err := put(ctx, c, bucket, "wal/1.wal", "first", func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	})
 	if err != nil {
@@ -88,7 +85,7 @@ func TestCreateOnlyPutIsAtomic(t *testing.T) {
 		t.Fatal("PUT returned no ETag; the CAS protocol (§12.4) needs one")
 	}
 
-	_, err = put(ctx, c, "create-only", "wal/1.wal", "second", func(in *s3.PutObjectInput) {
+	_, err = put(ctx, c, bucket, "wal/1.wal", "second", func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	})
 	if code := apiErrorCode(err); code != "PreconditionFailed" {
@@ -96,7 +93,7 @@ func TestCreateOnlyPutIsAtomic(t *testing.T) {
 	}
 
 	// And the original bytes are untouched — the failed write is not partial.
-	got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("create-only"), Key: aws.String("wal/1.wal")})
+	got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("wal/1.wal")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,17 +107,17 @@ func TestCreateOnlyPutIsAtomic(t *testing.T) {
 // TestCompareAndSwapOnETag is §12.4: the epoch object is advanced with If-Match,
 // so two Control Planes racing to promote cannot both win.
 func TestCompareAndSwapOnETag(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "cas", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "cas", false)
 
-	created, err := put(ctx, c, "cas", "volumes/v1/epoch", `{"epoch":1}`, nil)
+	created, err := put(ctx, c, bucket, "volumes/v1/epoch", `{"epoch":1}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	etag := aws.ToString(created.ETag)
 
 	// The holder of the current ETag advances the epoch.
-	advanced, err := put(ctx, c, "cas", "volumes/v1/epoch", `{"epoch":2}`, func(in *s3.PutObjectInput) {
+	advanced, err := put(ctx, c, bucket, "volumes/v1/epoch", `{"epoch":2}`, func(in *s3.PutObjectInput) {
 		in.IfMatch = aws.String(etag)
 	})
 	if err != nil {
@@ -131,14 +128,14 @@ func TestCompareAndSwapOnETag(t *testing.T) {
 	}
 
 	// The loser of the race still holds the old ETag and must be refused.
-	_, err = put(ctx, c, "cas", "volumes/v1/epoch", `{"epoch":99}`, func(in *s3.PutObjectInput) {
+	_, err = put(ctx, c, bucket, "volumes/v1/epoch", `{"epoch":99}`, func(in *s3.PutObjectInput) {
 		in.IfMatch = aws.String(etag)
 	})
 	if code := apiErrorCode(err); code != "PreconditionFailed" {
 		t.Fatalf("CAS with a stale ETag must fail with PreconditionFailed, got %q (err=%v)", code, err)
 	}
 
-	head, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String("cas"), Key: aws.String("volumes/v1/epoch")})
+	head, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("volumes/v1/epoch")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,11 +149,11 @@ func TestCompareAndSwapOnETag(t *testing.T) {
 // must answer with the stored object's identity so the retry can be resolved
 // without a double effect (INV-21).
 func TestHeadResolvesALostPutResponse(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "lost-response", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "lost-response", false)
 
 	const body = "batch-bytes"
-	written, err := put(ctx, c, "lost-response", "wal/7.wal", body, func(in *s3.PutObjectInput) {
+	written, err := put(ctx, c, bucket, "wal/7.wal", body, func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	})
 	if err != nil {
@@ -166,7 +163,7 @@ func TestHeadResolvesALostPutResponse(t *testing.T) {
 	// Pretend the response never arrived: HEAD tells us the object is there and
 	// which bytes it holds.
 	head, err := c.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String("lost-response"), Key: aws.String("wal/7.wal"),
+		Bucket: aws.String(bucket), Key: aws.String("wal/7.wal"),
 	})
 	if err != nil {
 		t.Fatalf("HEAD after a lost PUT response must find the object: %v", err)
@@ -179,7 +176,7 @@ func TestHeadResolvesALostPutResponse(t *testing.T) {
 	}
 
 	// The blind retry is refused rather than duplicating the write.
-	_, err = put(ctx, c, "lost-response", "wal/7.wal", body, func(in *s3.PutObjectInput) {
+	_, err = put(ctx, c, bucket, "wal/7.wal", body, func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	})
 	if code := apiErrorCode(err); code != "PreconditionFailed" {
@@ -190,25 +187,25 @@ func TestHeadResolvesALostPutResponse(t *testing.T) {
 // TestVersioningKeepsDeletedObjectsRecoverable is what INV-14 stands on: the GC
 // only marks, and a mark is a delete marker over a version that still exists.
 func TestVersioningKeepsDeletedObjectsRecoverable(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "versioned", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "versioned", false)
 
 	if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket:                  aws.String("versioned"),
+		Bucket:                  aws.String(bucket),
 		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
 	}); err != nil {
 		t.Fatalf("versioning must be supported (§6.1): %v", err)
 	}
-	status, err := c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String("versioned")})
+	status, err := c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
 	if err != nil || status.Status != types.BucketVersioningStatusEnabled {
 		t.Fatalf("versioning status = %v err=%v", status.Status, err)
 	}
 
-	if _, err := put(ctx, c, "versioned", "orphan.wal", "payload", nil); err != nil {
+	if _, err := put(ctx, c, bucket, "orphan.wal", "payload", nil); err != nil {
 		t.Fatal(err)
 	}
 	del, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String("versioned"), Key: aws.String("orphan.wal"),
+		Bucket: aws.String(bucket), Key: aws.String("orphan.wal"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -218,7 +215,7 @@ func TestVersioningKeepsDeletedObjectsRecoverable(t *testing.T) {
 	}
 
 	versions, err := c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-		Bucket: aws.String("versioned"), Prefix: aws.String("orphan.wal"),
+		Bucket: aws.String(bucket), Prefix: aws.String("orphan.wal"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +226,7 @@ func TestVersioningKeepsDeletedObjectsRecoverable(t *testing.T) {
 
 	// Reversible: the object's bytes are still readable by version id.
 	restored, err := c.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String("versioned"), Key: aws.String("orphan.wal"),
+		Bucket: aws.String(bucket), Key: aws.String("orphan.wal"),
 		VersionId: versions.Versions[0].VersionId,
 	})
 	if err != nil {
@@ -244,20 +241,20 @@ func TestVersioningKeepsDeletedObjectsRecoverable(t *testing.T) {
 // TestObjectLockRefusesPermanentDeletion is the structural half of INV-14: even a
 // caller that asks for a permanent delete cannot destroy data under retention.
 func TestObjectLockRefusesPermanentDeletion(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "locked", true)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "locked", true)
 
-	cfg, err := c.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: aws.String("locked")})
+	cfg, err := c.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: aws.String(bucket)})
 	if err != nil || cfg.ObjectLockConfiguration == nil ||
 		cfg.ObjectLockConfiguration.ObjectLockEnabled != types.ObjectLockEnabledEnabled {
 		t.Fatalf("Object Lock must be supported (§6.1, §10): cfg=%v err=%v", cfg, err)
 	}
 
-	if _, err := put(ctx, c, "locked", "manifest.json", "immutable", nil); err != nil {
+	if _, err := put(ctx, c, bucket, "manifest.json", "immutable", nil); err != nil {
 		t.Fatal(err)
 	}
 	versions, err := c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-		Bucket: aws.String("locked"), Prefix: aws.String("manifest.json"),
+		Bucket: aws.String(bucket), Prefix: aws.String("manifest.json"),
 	})
 	if err != nil || len(versions.Versions) == 0 {
 		t.Fatalf("list versions: %v", err)
@@ -266,7 +263,7 @@ func TestObjectLockRefusesPermanentDeletion(t *testing.T) {
 
 	retainUntil := mustTime("2030-01-01T00:00:00Z")
 	if _, err := c.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
-		Bucket: aws.String("locked"), Key: aws.String("manifest.json"),
+		Bucket: aws.String(bucket), Key: aws.String("manifest.json"),
 		Retention: &types.ObjectLockRetention{
 			Mode: types.ObjectLockRetentionModeGovernance, RetainUntilDate: aws.Time(retainUntil),
 		},
@@ -277,7 +274,7 @@ func TestObjectLockRefusesPermanentDeletion(t *testing.T) {
 	// The permanent delete of that version must be refused — this is the property
 	// the GC's credentials rely on, enforced by the backend rather than by us.
 	_, err = c.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String("locked"), Key: aws.String("manifest.json"), VersionId: versionID,
+		Bucket: aws.String(bucket), Key: aws.String("manifest.json"), VersionId: versionID,
 	})
 	if err == nil {
 		t.Fatal("a version under GOVERNANCE retention must not be permanently deletable")
@@ -292,16 +289,16 @@ func TestObjectLockRefusesPermanentDeletion(t *testing.T) {
 // listable. (Recovery also tolerates lag by design; this records what the backend
 // actually offers, which is read-after-write here.)
 func TestListSeesAFreshPut(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "listing", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "listing", false)
 
 	for _, key := range []string{"wal/v/1/1-1.wal", "wal/v/1/2-2.wal", "wal/v/1/3-3.wal"} {
-		if _, err := put(ctx, c, "listing", key, key, nil); err != nil {
+		if _, err := put(ctx, c, bucket, key, key, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
 	out, err := c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String("listing"), Prefix: aws.String("wal/v/1/"),
+		Bucket: aws.String(bucket), Prefix: aws.String("wal/v/1/"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -321,14 +318,14 @@ func TestListSeesAFreshPut(t *testing.T) {
 
 // TestGetOfAMissingKeyIsNotFound: recovery distinguishes "gap" from "error".
 func TestGetOfAMissingKeyIsNotFound(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "missing", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "missing", false)
 
-	_, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("missing"), Key: aws.String("nope")})
+	_, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("nope")})
 	if code := apiErrorCode(err); code != "NoSuchKey" {
 		t.Fatalf("GET of a missing key must be NoSuchKey, got %q (err=%v)", code, err)
 	}
-	_, err = c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String("missing"), Key: aws.String("nope")})
+	_, err = c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("nope")})
 	if code := apiErrorCode(err); code != "NotFound" {
 		t.Fatalf("HEAD of a missing key must be NotFound, got %q (err=%v)", code, err)
 	}
@@ -338,16 +335,16 @@ func TestGetOfAMissingKeyIsNotFound(t *testing.T) {
 // the backend must return byte-identical content for the divergence check to mean
 // anything.
 func TestChecksumRoundTrip(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "checksum", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "checksum", false)
 
 	payload := bytes.Repeat([]byte{0xAB, 0x00, 0xFF, 0x7F}, 4096) // 16 KiB, binary
 	if _, err := c.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String("checksum"), Key: aws.String("wal/bin.wal"), Body: bytes.NewReader(payload),
+		Bucket: aws.String(bucket), Key: aws.String("wal/bin.wal"), Body: bytes.NewReader(payload),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("checksum"), Key: aws.String("wal/bin.wal")})
+	got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("wal/bin.wal")})
 	if err != nil {
 		t.Fatal(err)
 	}

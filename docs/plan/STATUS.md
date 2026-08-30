@@ -66,9 +66,12 @@ Nothing on the §24 list. What is left is in the two sections below.
 
 ## What only a pilot can answer
 
-- **No commit has been published to real S3.** The lanes use the filesystem store or
-  RustFS; `task backend:conformance` stands between those and S3's own `If-Match`. And an
-  upgrade of a running fleet has never been run; INV-19 becomes binding there.
+- **No commit has been published to real S3.** The conformance suite runs there now
+  (`task backend:conformance:aws`), so S3's own `If-Match` and versioned delete are
+  certified — but no *Agent* has: the e2e and guest lanes still use RustFS, and
+  `task measure:publish` has never been pointed at S3, so the rotation default is a
+  laptop's number. An upgrade of a running fleet has never been run either; INV-19
+  becomes binding there.
 
 ## Thin paths that shipped without being deepened
 

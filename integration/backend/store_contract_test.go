@@ -6,10 +6,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/objectstore/storetest"
 	"github.com/spin-stack/storage/internal/simio/real"
@@ -37,19 +33,10 @@ func TestS3StoreSatisfiesTheContract(t *testing.T) {
 }
 
 // newVersionedS3Store creates a versioned bucket and an S3Store over it.
-func newVersionedS3Store(t *testing.T, be testinfra.ObjectStoreBackend, bucket string) *real.S3Store {
+func newVersionedS3Store(t *testing.T, be testinfra.ObjectStoreBackend, name string) *real.S3Store {
 	t.Helper()
 	ctx := t.Context()
-	admin := be.Client()
-	if _, err := admin.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatalf("create bucket %s: %v", bucket, err)
-	}
-	if _, err := admin.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket:                  aws.String(bucket),
-		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
-	}); err != nil {
-		t.Fatalf("enable versioning on %s: %v", bucket, err)
-	}
+	bucket := makeVersionedBucket(t, ctx, be, name)
 	store, err := real.NewS3Store(ctx, real.S3Config{
 		Bucket:    bucket,
 		Endpoint:  be.Endpoint,
@@ -98,8 +85,7 @@ func TestS3StoreListPaginates(t *testing.T) {
 func TestS3StoreChecksumWhenRequiredAlsoWorks(t *testing.T) {
 	be := backendConfig(t)
 	ctx := t.Context()
-	bucket := "contract-checksum-required"
-	makeVersionedBucket(t, ctx, be.Client(), bucket)
+	bucket := makeVersionedBucket(t, ctx, be, "contract-checksum-required")
 	store, err := real.NewS3Store(ctx, real.S3Config{
 		Bucket: bucket, Endpoint: be.Endpoint, Region: be.Region,
 		AccessKey: be.AccessKey, SecretKey: be.SecretKey,

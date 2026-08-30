@@ -24,8 +24,8 @@ import (
 // duplicated WAL upload harmless (INV-21). Simulated concurrency proves nothing
 // about the backend — this races real clients at one key.
 func TestCreateOnlyIsExclusiveUnderConcurrency(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "race-create", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "race-create", false)
 
 	const writers = 16
 	var (
@@ -38,7 +38,7 @@ func TestCreateOnlyIsExclusiveUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := put(ctx, c, "race-create", "wal/contended.wal", fmt.Sprintf("writer-%d", i), func(in *s3.PutObjectInput) {
+			_, err := put(ctx, c, bucket, "wal/contended.wal", fmt.Sprintf("writer-%d", i), func(in *s3.PutObjectInput) {
 				in.IfNoneMatch = aws.String("*")
 			})
 			mu.Lock()
@@ -65,10 +65,10 @@ func TestCreateOnlyIsExclusiveUnderConcurrency(t *testing.T) {
 // TestCASIsExclusiveUnderConcurrency is the §12.4 fence under a real race: many
 // Control Planes holding the same ETag, one advance.
 func TestCASIsExclusiveUnderConcurrency(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "race-cas", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "race-cas", false)
 
-	created, err := put(ctx, c, "race-cas", "epoch", `{"epoch":1}`, nil)
+	created, err := put(ctx, c, bucket, "epoch", `{"epoch":1}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestCASIsExclusiveUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := put(ctx, c, "race-cas", "epoch", fmt.Sprintf(`{"epoch":%d}`, i+2), func(in *s3.PutObjectInput) {
+			_, err := put(ctx, c, bucket, "epoch", fmt.Sprintf(`{"epoch":%d}`, i+2), func(in *s3.PutObjectInput) {
 				in.IfMatch = aws.String(etag)
 			})
 			if err == nil {
@@ -107,21 +107,21 @@ func TestCASIsExclusiveUnderConcurrency(t *testing.T) {
 // exists" — otherwise a retried upload silently stacks a second version and the
 // idempotency argument of INV-21 collapses.
 func TestCreateOnlyOnAVersionedBucket(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "versioned-create-only", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "versioned-create-only", false)
 	if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket:                  aws.String("versioned-create-only"),
+		Bucket:                  aws.String(bucket),
 		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := put(ctx, c, "versioned-create-only", "manifest.json", "v1", func(in *s3.PutObjectInput) {
+	if _, err := put(ctx, c, bucket, "manifest.json", "v1", func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := put(ctx, c, "versioned-create-only", "manifest.json", "v2", func(in *s3.PutObjectInput) {
+	_, err := put(ctx, c, bucket, "manifest.json", "v2", func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	})
 	if code := apiErrorCode(err); code != "PreconditionFailed" {
@@ -129,7 +129,7 @@ func TestCreateOnlyOnAVersionedBucket(t *testing.T) {
 	}
 
 	versions, err := c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-		Bucket: aws.String("versioned-create-only"), Prefix: aws.String("manifest.json"),
+		Bucket: aws.String(bucket), Prefix: aws.String("manifest.json"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -144,10 +144,10 @@ func TestCreateOnlyOnAVersionedBucket(t *testing.T) {
 // key that does not exist. The epoch store has to tell "not initialised yet" from
 // "someone else moved it", and the two cases have different codes.
 func TestConditionalWriteAgainstAMissingKey(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "cas-missing", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "cas-missing", false)
 
-	_, err := put(ctx, c, "cas-missing", "absent", "x", func(in *s3.PutObjectInput) {
+	_, err := put(ctx, c, bucket, "absent", "x", func(in *s3.PutObjectInput) {
 		in.IfMatch = aws.String(`"00000000000000000000000000000000"`)
 	})
 	if err == nil {
@@ -165,8 +165,8 @@ func TestConditionalWriteAgainstAMissingKey(t *testing.T) {
 // objects than that is exactly where a naive scan silently truncates the "contiguous
 // prefix" and declares data lost.
 func TestListPaginatesBeyondOneThousand(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "pagination", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "pagination", false)
 
 	const objects = 1100
 	var wg sync.WaitGroup
@@ -178,7 +178,7 @@ func TestListPaginatesBeyondOneThousand(t *testing.T) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			key := fmt.Sprintf("wal/v/1/%06d.wal", i)
-			if _, err := put(ctx, c, "pagination", key, key, nil); err != nil {
+			if _, err := put(ctx, c, bucket, key, key, nil); err != nil {
 				t.Errorf("put %s: %v", key, err)
 			}
 		}()
@@ -190,7 +190,7 @@ func TestListPaginatesBeyondOneThousand(t *testing.T) {
 
 	// One page is capped...
 	first, err := c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String("pagination"), Prefix: aws.String("wal/v/1/"),
+		Bucket: aws.String(bucket), Prefix: aws.String("wal/v/1/"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestListPaginatesBeyondOneThousand(t *testing.T) {
 		seen  int
 		last  string
 		pager = s3.NewListObjectsV2Paginator(c, &s3.ListObjectsV2Input{
-			Bucket: aws.String("pagination"), Prefix: aws.String("wal/v/1/"),
+			Bucket: aws.String(bucket), Prefix: aws.String("wal/v/1/"),
 		})
 	)
 	for pager.HasMorePages() {
@@ -235,8 +235,8 @@ func TestListPaginatesBeyondOneThousand(t *testing.T) {
 // suffix), so any code that treats an ETag as a checksum breaks here — and CAS must
 // still work on such an object.
 func TestMultipartUploadAndItsETag(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "multipart", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "multipart", false)
 
 	// 12 MiB with a 5 MiB part size → 3 parts.
 	payload := bytes.Repeat([]byte("checkpoint-segment-"), 12*1024*1024/19)
@@ -245,7 +245,7 @@ func TestMultipartUploadAndItsETag(t *testing.T) {
 		u.Concurrency = 3
 	})
 	out, err := uploader.Upload(ctx, &s3.PutObjectInput{
-		Bucket: aws.String("multipart"), Key: aws.String("checkpoints/big.json"),
+		Bucket: aws.String(bucket), Key: aws.String("checkpoints/big.json"),
 		Body: bytes.NewReader(payload),
 	})
 	if err != nil {
@@ -255,7 +255,7 @@ func TestMultipartUploadAndItsETag(t *testing.T) {
 	t.Logf("multipart ETag: %s", etag)
 
 	got, err := c.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String("multipart"), Key: aws.String("checkpoints/big.json"),
+		Bucket: aws.String(bucket), Key: aws.String("checkpoints/big.json"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +270,7 @@ func TestMultipartUploadAndItsETag(t *testing.T) {
 	}
 
 	// CAS on a multipart object still behaves.
-	if _, err := put(ctx, c, "multipart", "checkpoints/big.json", "replaced", func(in *s3.PutObjectInput) {
+	if _, err := put(ctx, c, bucket, "checkpoints/big.json", "replaced", func(in *s3.PutObjectInput) {
 		in.IfMatch = aws.String(etag)
 	}); err != nil {
 		t.Fatalf("CAS with a multipart ETag must work: %v", err)
@@ -279,15 +279,15 @@ func TestMultipartUploadAndItsETag(t *testing.T) {
 
 // TestRangeGet is what lazy loading (§22.4) and partial checkpoint reads need.
 func TestRangeGet(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "ranges", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "ranges", false)
 
 	body := strings.Repeat("0123456789", 1000) // 10 000 bytes
-	if _, err := put(ctx, c, "ranges", "seg", body, nil); err != nil {
+	if _, err := put(ctx, c, bucket, "seg", body, nil); err != nil {
 		t.Fatal(err)
 	}
 	out, err := c.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String("ranges"), Key: aws.String("seg"), Range: aws.String("bytes=100-199"),
+		Bucket: aws.String(bucket), Key: aws.String("seg"), Range: aws.String("bytes=100-199"),
 	})
 	if err != nil {
 		t.Fatalf("range GET: %v", err)
@@ -305,15 +305,15 @@ func TestRangeGet(t *testing.T) {
 // TestZeroByteObject: a summary or manifest can legitimately be empty; an empty
 // object must round-trip rather than 404.
 func TestZeroByteObject(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "empty", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "empty", false)
 
-	if _, err := put(ctx, c, "empty", "zero", "", func(in *s3.PutObjectInput) {
+	if _, err := put(ctx, c, bucket, "zero", "", func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	}); err != nil {
 		t.Fatalf("zero-byte create-only PUT: %v", err)
 	}
-	head, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String("empty"), Key: aws.String("zero")})
+	head, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("zero")})
 	if err != nil {
 		t.Fatalf("HEAD of a zero-byte object: %v", err)
 	}
@@ -325,11 +325,11 @@ func TestZeroByteObject(t *testing.T) {
 // TestDeleteOfAMissingKeyIsNotAnError matches S3: the GC's mark must be idempotent
 // (§21.3) — re-marking an object it already marked cannot become a hard failure.
 func TestDeleteOfAMissingKeyIsNotAnError(t *testing.T) {
-	c, ctx := backendUnderTest(t)
-	makeBucket(t, ctx, c, "idempotent-delete", false)
+	be, c, ctx := backendUnderTest(t)
+	bucket := makeBucket(t, ctx, be, "idempotent-delete", false)
 
 	if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String("idempotent-delete"), Key: aws.String("never-existed"),
+		Bucket: aws.String(bucket), Key: aws.String("never-existed"),
 	}); err != nil {
 		t.Fatalf("DELETE of a missing key must succeed (S3 semantics), got %v", err)
 	}
@@ -355,8 +355,7 @@ func TestSDKChecksumModesBothWork(t *testing.T) {
 			client := be.ClientWith(func(o *s3.Options) {
 				o.RequestChecksumCalculation = tc.mode
 			})
-			bucket := fmt.Sprintf("checksum-mode-%d", i)
-			makeBucket(t, ctx, client, bucket, false)
+			bucket := be.MakeBucket(t, ctx, fmt.Sprintf("checksum-mode-%d", i), false)
 
 			if _, err := put(ctx, client, bucket, "obj", "payload", func(in *s3.PutObjectInput) {
 				in.IfNoneMatch = aws.String("*")

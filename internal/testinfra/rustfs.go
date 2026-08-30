@@ -24,21 +24,36 @@ import (
 // certified. Override with RUSTFS_IMAGE (the Taskfile passes the pinned value).
 const DefaultRustFSImage = "rustfs/rustfs:latest@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
 
-// ObjectStoreBackend is a running S3-compatible backend.
+// ObjectStoreBackend is a running S3-compatible backend. An empty Endpoint means
+// real AWS, which the suite reaches through the ambient credential chain rather
+// than through a key of its own — see AWS.
 type ObjectStoreBackend struct {
-	Endpoint  string // http://host:port
+	Endpoint  string // http://host:port; empty means AWS
 	AccessKey string
 	SecretKey string
 	Region    string
+
+	// namespace prefixes every bucket name so a run cannot collide with another
+	// run, or with a bucket somebody else already owns: on AWS the bucket
+	// namespace is global and the suite's names ("cas", "empty") are long gone.
+	namespace string
+	aws       bool
+	awsConfig aws.Config
 }
 
-// Client returns an S3 client aimed at this backend. Path-style addressing is
-// required: a container has no DNS for bucket-name virtual hosts.
+// Client returns an S3 client aimed at this backend.
 func (b ObjectStoreBackend) Client() *s3.Client { return b.ClientWith() }
 
 // ClientWith is Client with extra option overrides — used by the conformance suite
 // to exercise the SDK knobs that matter against non-AWS backends (checksum mode).
+//
+// Path-style addressing is on for a container, which has no DNS for bucket-name
+// virtual hosts, and off for AWS, where virtual-host style is what production
+// traffic uses and therefore what the suite must certify.
 func (b ObjectStoreBackend) ClientWith(opts ...func(*s3.Options)) *s3.Client {
+	if b.aws {
+		return s3.NewFromConfig(b.awsConfig, opts...)
+	}
 	base := s3.Options{
 		BaseEndpoint: aws.String(b.Endpoint),
 		Region:       b.Region,

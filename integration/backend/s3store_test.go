@@ -16,19 +16,21 @@ import (
 
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/internal/testinfra"
 )
 
 // makeVersionedBucket creates a bucket with versioning Enabled, the way §10 requires
 // every production bucket to be.
-func makeVersionedBucket(t *testing.T, ctx context.Context, c *s3.Client, name string) {
+func makeVersionedBucket(t *testing.T, ctx context.Context, be testinfra.ObjectStoreBackend, name string) string {
 	t.Helper()
-	makeBucket(t, ctx, c, name, false)
-	if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-		Bucket:                  aws.String(name),
+	bucket := be.MakeBucket(t, ctx, name, false)
+	if _, err := be.Client().PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket:                  aws.String(bucket),
 		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
 	}); err != nil {
-		t.Fatalf("enable versioning on %s: %v", name, err)
+		t.Fatalf("enable versioning on %s: %v", bucket, err)
 	}
+	return bucket
 }
 
 // Finding 1. INV-14 says a GC mark is reversible because the bucket is versioned.
@@ -43,39 +45,37 @@ func TestNewS3StoreRefusesABucketWithoutVersioning(t *testing.T) {
 	c := be.Client()
 
 	tests := []struct {
-		name   string
-		bucket string
-		setup  func(t *testing.T, bucket string)
+		name string
+		// setup returns the bucket to point the store at, created or not.
+		setup func(t *testing.T) string
 	}{
 		{
-			name:   "versioning never enabled",
-			bucket: "unversioned-bucket",
-			setup:  func(t *testing.T, b string) { makeBucket(t, ctx, c, b, false) },
+			name:  "versioning never enabled",
+			setup: func(t *testing.T) string { return be.MakeBucket(t, ctx, "unversioned-bucket", false) },
 		},
 		{
-			name:   "versioning suspended by an operator",
-			bucket: "suspended-bucket",
-			setup: func(t *testing.T, b string) {
-				makeVersionedBucket(t, ctx, c, b)
+			name: "versioning suspended by an operator",
+			setup: func(t *testing.T) string {
+				b := makeVersionedBucket(t, ctx, be, "suspended-bucket")
 				if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
 					Bucket:                  aws.String(b),
 					VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusSuspended},
 				}); err != nil {
 					t.Fatalf("suspend versioning: %v", err)
 				}
+				return b
 			},
 		},
 		{
-			name:   "bucket does not exist",
-			bucket: "no-such-bucket-at-all",
-			setup:  func(*testing.T, string) {},
+			name:  "bucket does not exist",
+			setup: func(*testing.T) string { return be.Bucket("no-such-bucket-at-all") },
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.setup(t, tc.bucket)
+			bucket := tc.setup(t)
 			_, err := real.NewS3Store(ctx, real.S3Config{
-				Bucket: tc.bucket, Endpoint: be.Endpoint, Region: be.Region,
+				Bucket: bucket, Endpoint: be.Endpoint, Region: be.Region,
 				AccessKey: be.AccessKey, SecretKey: be.SecretKey,
 			})
 			if !errors.Is(err, real.ErrBucketNotVersioned) {
