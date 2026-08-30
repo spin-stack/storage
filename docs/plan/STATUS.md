@@ -64,17 +64,15 @@ system has no equivalent of vSphere's datastore lock.
 
 Nothing on the §24 list. What is left is in the two sections below.
 
-## What only a pilot can answer
-
-- **No commit has been published to real S3.** The conformance suite runs there now
-  (`task backend:conformance:aws`), so S3's own `If-Match` and versioned delete are
-  certified — but no *Agent* has: the e2e and guest lanes still use RustFS.
-  `task measure:publish:aws` says a commit costs its four round trips and nothing more,
-  from outside the region; what it costs from inside one, nobody has measured. An upgrade
-  of a running fleet has never been run either; INV-19 becomes binding there.
-
 ## Thin paths that shipped without being deepened
 
+- **Nothing large has crossed the wire, and nothing has been timed.** The binaries publish
+  and recover against real S3 (`backend:conformance:aws`, `test:e2e:aws`) but on layers of
+  megabytes: multipart upload and parallel ranged read have never carried a multi-GiB
+  object outside an httptest with a planted ceiling, and no lane times a restore, so the
+  throughput the last commits claim rests on arithmetic. `measure:publish:aws` times a
+  commit from outside its region; `_output/measure-in-region.sh` has never run, and nor
+  has a fleet upgrade, where INV-19 becomes binding.
 - **No RPO target is set anywhere.** The age trigger is in and per-volume
   (`volumes.rpo_target_seconds` → `DesiredVolume`), and what a host measures against it now
   reaches the catalog; every volume carries a target of zero, because a target is a promise
