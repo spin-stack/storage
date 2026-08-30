@@ -654,6 +654,24 @@ tasks:
       - MEASURE=1 RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v -timeout 30m
         -run TestMeasureWhatOneCommitCosts ./integration/backend/...
 
+  measure:transfer:
+    desc: >-
+      What a layer costs out to the bucket and back, at sizes past a gigabyte. The fetch
+      rate is the floor under any recovery-time number: a restore is the time a guest is
+      not running, and it is spent almost entirely pulling layers. Against the pinned
+      container.
+    cmds:
+      - MEASURE=1 RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v -timeout 60m
+        -run TestMeasureWhatALayerCostsBothWays ./integration/backend/...
+
+  measure:transfer:aws:
+    desc: >-
+      The same measurement against real S3. Moves about 7 GiB each way; from outside the
+      region it measures the link, not the store.
+    cmds:
+      - MEASURE=1 SPIN_OBJECT_STORE=aws go test -tags integration -count=1 -v -timeout 60m
+        -run TestMeasureWhatALayerCostsBothWays ./integration/backend/...
+
   measure:publish:aws:
     desc: >-
       The same measurement against real S3. The fixed cost of a commit is three round

@@ -214,9 +214,16 @@ CREATE TABLE volumes (
     --
     -- The dwell is measured from here and not from last_renewal because that answers a
     -- question about the *writer*: a read served by a lagging replica reports one old enough
-    -- that the wait already looks over. This column is written and read back by the promoter,
-    -- so a stale read returns NULL and starts a full dwell. Fail slow, never short — and it
-    -- is what lets a Control Plane restarting mid-fence resume its predecessor's wait.
+    -- that the wait already looks over. A stale read returns NULL and starts a full dwell.
+    -- Fail slow, never short — and it is what lets a Control Plane restarting mid-fence
+    -- resume its predecessor's wait.
+    --
+    -- **Nothing reads it, because there is no promoter.** No code enters FENCING_WAIT: the
+    -- Control Plane writes ACTIVE and DETACHED and no other volume state, and a volume moves
+    -- host only when an operator runs `-attach-volume`. This column and the four states
+    -- between them are the half of §7 that is designed and not wired, and they are a
+    -- liability until they are — the promoter is where the dwell becomes a rule instead of
+    -- a column.
     fencing_started_at TIMESTAMPTZ,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()

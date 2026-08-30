@@ -55,10 +55,10 @@ durability only, and nothing a superseded host writes enters the history without
 CAS it cannot win. What was left was the cost alone, a tenant's VM stopped for a partition
 nobody else had acted on.
 
-**Still unresolved, and now the whole of it:** a host that can reach neither the Control
-Plane nor the object store cannot tell isolation from supersession. It keeps serving. The
-data is safe either way, but nothing stops the successor's guest from starting, and this
-system has no equivalent of vSphere's datastore lock.
+**Still unresolved:** a host that can reach neither the Control Plane nor the object store
+cannot tell isolation from supersession, and keeps serving. The data is safe either way;
+what would make it dangerous is a second guest starting, and nothing starts one — see the
+first thin path below, the other half of the same hole.
 
 ## Do this next
 
@@ -66,13 +66,16 @@ Nothing on the §24 list. What is left is in the two sections below.
 
 ## Thin paths that shipped without being deepened
 
-- **Nothing large has crossed the wire, and nothing has been timed.** The binaries publish
-  and recover against real S3 (`backend:conformance:aws`, `test:e2e:aws`) but on layers of
-  megabytes: multipart upload and parallel ranged read have never carried a multi-GiB
-  object outside an httptest with a planted ceiling, and no lane times a restore, so the
-  throughput the last commits claim rests on arithmetic. `measure:publish:aws` times a
-  commit from outside its region; `_output/measure-in-region.sh` has never run, and nor
-  has a fleet upgrade, where INV-19 becomes binding.
+- **Nothing promotes a volume off a dead host.** The Control Plane writes ACTIVE and
+  DETACHED and no other volume state: the four between them are declared, transition-checked,
+  persisted — and entered by nothing, so the durable dwell (`volumes.fencing_started_at`,
+  ADR-0015) is read by nobody. A volume moves host when an operator runs `-attach-volume`,
+  which places at once and with no dwell: the fleet cannot split-brain, and an operator can,
+  in one command.
+- **Nothing has been measured where it will run.** `measure:transfer` carries 6 GiB both
+  ways, past S3's ceiling on a single PUT, but against the container, and
+  `measure:publish:aws` times a commit from outside its region.
+  `_output/measure-in-region.sh` has never run; nor has a fleet upgrade (INV-19).
 - **No RPO target is set anywhere.** The age trigger is in and per-volume
   (`volumes.rpo_target_seconds` → `DesiredVolume`), and what a host measures against it now
   reaches the catalog; every volume carries a target of zero, because a target is a promise
@@ -95,12 +98,11 @@ Nothing on the §24 list. What is left is in the two sections below.
   RPO and the unpublished backlog reach the catalog and `-fleet-status` per volume. §11's
   other half is built — a host holding a layer it failed to publish is cordoned — but
   nothing else reaches an alert, and nothing measures attachment.
-- **Deleting a clone is a removal and not a shred**, by contract (§10: a lineage shares one
-  DEK). `DeleteVolume` reports which it did; a real shred still rests on the bucket
-  expiring the descriptor's non-current versions.
 - **No alerting, bucket lifecycle, tracing, PITR rehearsal, or `/healthz` on the CP** (whose
-  term is a closure over a constant). The Connect API is unauthenticated on `:8080`, with
-  `GetVolumeKeys` on it.
+  term is a closure over a constant). The lifecycle is also what a shred rests on: deleting
+  a clone is a removal by contract (§10, one DEK per lineage), and only the bucket expiring
+  the descriptor's non-current versions makes it more. The Connect API is unauthenticated on
+  `:8080`, with `GetVolumeKeys` on it.
 
 ## Divergences (DEV entries)
 

@@ -292,6 +292,9 @@ type Volume struct {
 	//
 	// Zero means "no fence is running, or nobody recorded one", which a promoter
 	// answers by starting a full dwell now. Fail slow, never short.
+	//
+	// It is always zero today: nothing enters FENCING_WAIT, because there is no promoter
+	// and a volume changes host only by an operator's `-attach-volume`. See schema.sql.
 	FencingStartedAt time.Time
 }
 
