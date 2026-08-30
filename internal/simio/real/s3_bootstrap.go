@@ -42,7 +42,19 @@ func EnsureBucket(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	}
 	client := s3.New(opts)
 
-	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(cfg.Bucket)}); err != nil {
+	in := &s3.CreateBucketInput{Bucket: aws.String(cfg.Bucket)}
+	// CreateBucket carries the region twice — in the endpoint it is sent to and in a
+	// location constraint in the body — and AWS requires them to agree: without the
+	// constraint it answers 400 IllegalLocationConstraintException in every region but
+	// us-east-1, whose constraint is the empty one and must be left out instead. So this
+	// is not a nicety; without it `-s3-create-bucket` works in one region and nowhere
+	// else, on the one run a deployment cannot skip.
+	if r := opts.Region; r != "us-east-1" {
+		in.CreateBucketConfiguration = &types.CreateBucketConfiguration{
+			LocationConstraint: types.BucketLocationConstraint(r),
+		}
+	}
+	if _, err := client.CreateBucket(ctx, in); err != nil {
 		// Already ours is the normal case on every run after the first. Anything else
 		// — including "someone else owns this name" — is reported, because silently
 		// continuing would then version and write into a bucket we do not control.

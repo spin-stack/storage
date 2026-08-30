@@ -32,12 +32,15 @@ import (
 
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
+	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/testinfra"
 )
 
 const (
 	startup = 60 * time.Second
-	bucket  = "spin-e2e"
+	// bucketName is what this lane asks for; what it gets is namespaced per run, so
+	// SPIN_OBJECT_STORE=aws can point the whole deployment at real S3.
+	bucketName = "spin-e2e"
 )
 
 // deployment is the whole thing, running: Postgres, RustFS, a Control Plane process and
@@ -45,6 +48,7 @@ const (
 type deployment struct {
 	dsn      string
 	store    testinfra.ObjectStoreBackend
+	bucket   string
 	cpURL    string
 	hostID   string
 	dataDir  string
@@ -71,16 +75,18 @@ func start(t *testing.T) *deployment {
 	qemuImg := testinfra.Binary(t, "qemu-img")
 
 	dsn := testinfra.Postgres(t)
-	store := testinfra.RustFS(t, os.Getenv("RUSTFS_IMAGE"))
+	// The pinned container by default, real S3 under SPIN_OBJECT_STORE=aws. Both
+	// binaries already speak to either — an empty -s3-endpoint means AWS and the
+	// credentials come from the SDK's chain — so what this lane was missing was not a
+	// capability but ever having exercised it: until now no Agent in any lane had
+	// published a commit to S3, and the one defect that found (a layer too large for
+	// a single PUT) was invisible to a backend that accepts any size.
+	store := testinfra.ObjectStore(t)
 
 	// Credentials in the environment, never on the command line: storecfg takes them
 	// from the SDK's default chain precisely so a secret does not land in `ps` output
 	// or in a systemd unit (see internal/storecfg).
-	env := []string{
-		"AWS_ACCESS_KEY_ID=" + store.AccessKey,
-		"AWS_SECRET_ACCESS_KEY=" + store.SecretKey,
-		"AWS_REGION=" + store.Region,
-	}
+	env := store.Env()
 	dir := t.TempDir()
 	kekFile := filepath.Join(dir, "kek")
 	kek := bytes.Repeat([]byte{0x3F}, crypto.DEKSize)
@@ -90,6 +96,9 @@ func start(t *testing.T) *deployment {
 
 	d := &deployment{
 		dsn: dsn, store: store,
+		// Reserved and not created: -s3-create-bucket below means the Control Plane
+		// creates it, and this is what makes sure it is also removed.
+		bucket:   store.ReserveBucket(t, bucketName, false),
 		hostID:   ids.New().String(),
 		dataDir:  filepath.Join(dir, "data"),
 		kekFile:  kekFile,
@@ -133,13 +142,29 @@ func start(t *testing.T) *deployment {
 	return d
 }
 
-// storeArgs repeats the object-store flags for a second process.
+// storeArgs repeats the object-store flags for a second process. An empty endpoint is
+// left off entirely rather than passed as "": that is the spelling that means AWS.
 func (d *deployment) storeArgs() []string {
-	return []string{
-		"-s3-bucket", bucket,
-		"-s3-endpoint", d.store.Endpoint,
-		"-s3-region", d.store.Region,
+	args := []string{"-s3-bucket", d.bucket, "-s3-region", d.store.Region}
+	if d.store.Endpoint != "" {
+		args = append(args, "-s3-endpoint", d.store.Endpoint)
 	}
+	return args
+}
+
+// openStore opens the bucket this lane's processes share, the way they open it: empty
+// credentials mean the SDK's default chain, which is what reaches AWS, and the container's
+// static pair is passed only because a container has no chain to find.
+func (d *deployment) openStore(t *testing.T) *real.S3Store {
+	t.Helper()
+	store, err := real.NewS3Store(t.Context(), real.S3Config{
+		Bucket: d.bucket, Endpoint: d.store.Endpoint, Region: d.store.Region,
+		AccessKey: d.store.AccessKey, SecretKey: d.store.SecretKey,
+	})
+	if err != nil {
+		t.Fatalf("opening the bucket this lane's processes share: %v", err)
+	}
+	return store
 }
 
 // startAgent starts a volume-agent against this deployment.

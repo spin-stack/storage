@@ -12,7 +12,6 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
-	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/testinfra"
 )
 
@@ -30,13 +29,7 @@ import (
 func TestGCDeletesOrphansAndKeepsAHistory(t *testing.T) {
 	d := start(t)
 	ctx := t.Context()
-	store, err := real.NewS3Store(ctx, real.S3Config{
-		Bucket: bucket, Endpoint: d.store.Endpoint, Region: d.store.Region,
-		AccessKey: d.store.AccessKey, SecretKey: d.store.SecretKey,
-	})
-	if err != nil {
-		t.Fatalf("opening the bucket this lane's processes share: %v", err)
-	}
+	store := d.openStore(t)
 
 	// A history, published by the real writer: PUT layer, PUT manifest, CAS HEAD. The
 	// volume is not in the catalog, which is deliberate — its HEAD is in the bucket, and

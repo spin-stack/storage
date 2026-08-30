@@ -661,7 +661,7 @@ tasks:
       RPO — the container's says what the code costs, not what the network does. Uploads
       about 1 GiB.
     cmds:
-      - MEASURE=1 SPIN_CONFORMANCE_BACKEND=aws go test -tags integration -count=1 -v -timeout 30m
+      - MEASURE=1 SPIN_OBJECT_STORE=aws go test -tags integration -count=1 -v -timeout 30m
         -run TestMeasureWhatOneCommitCosts ./integration/backend/...
 
   backend:conformance:
@@ -672,7 +672,17 @@ tasks:
   backend:conformance:aws:
     desc: "The same suite against real AWS S3. Needs credentials and creates ~20 buckets it deletes on the way out; not in ci:full, because the merge gate must not need a cloud account."
     cmds:
-      - SPIN_CONFORMANCE_BACKEND=aws go test -tags integration -count=1 -v -timeout 30m ./integration/backend/...
+      - SPIN_OBJECT_STORE=aws go test -tags integration -count=1 -v -timeout 30m ./integration/backend/...
+
+  test:e2e:aws:
+    desc: >-
+      The e2e lane with its object store on real AWS S3: the two binaries publish commits
+      to S3 rather than to a container. Needs credentials, and creates one bucket per test
+      that it purges on the way out. Not in ci:full — the merge gate must not need a cloud
+      account.
+    deps: [build:cmd, qemu:tools]
+    cmds:
+      - SPIN_OBJECT_STORE=aws go test -tags e2e -count=1 -timeout 30m ./integration/e2e/...
 
   backend:conformance:aws:sweep:
     desc: "Delete the buckets an interrupted AWS conformance run left behind (spin-conf-*). Prints what it would remove unless CONFIRM=yes."

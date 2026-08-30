@@ -16,10 +16,10 @@ import (
 	"github.com/spin-stack/storage/internal/ids"
 )
 
-// BackendEnv selects which backend the conformance suite certifies this run.
-// Unset means the pinned container: the suite has to stay runnable on a laptop
-// with no cloud account, because a gate nobody can run locally stops being run.
-const BackendEnv = "SPIN_CONFORMANCE_BACKEND"
+// BackendEnv selects which object store a lane runs against. Unset means the
+// pinned container: every lane has to stay runnable on a laptop with no cloud
+// account, because a gate nobody can run locally stops being run.
+const BackendEnv = "SPIN_OBJECT_STORE"
 
 // bucketPrefix names every bucket a conformance run creates, so `task s3:aws:sweep`
 // can find what an interrupted run left behind. Buckets are global and permanent
@@ -88,13 +88,42 @@ func (b ObjectStoreBackend) Bucket(name string) string {
 	return bucketPrefix + b.namespace + "-" + name
 }
 
+// ReserveBucket claims a bucket name for this test without creating it, for the
+// bucket a *process under test* creates itself, and registers its purge all the
+// same. Nothing else registers one: a bucket nobody claimed is a bucket nobody
+// deletes, and on AWS that is a name and a bill that outlive the run.
+func (b ObjectStoreBackend) ReserveBucket(t *testing.T, name string, objectLock bool) string {
+	t.Helper()
+	bucket := b.Bucket(name)
+	if b.aws {
+		// Not t.Context(): the purge runs from t.Cleanup, after the test context is
+		// cancelled — a cancelled context there leaks real buckets.
+		t.Cleanup(func() { purgeBucket(t, context.Background(), b.Client(), bucket, objectLock) }) //nolint:usetesting // see above
+	}
+	return bucket
+}
+
+// Env is what a process under test needs in its environment to reach this backend.
+// Static credentials for a container; nothing for AWS, where the SDK's default
+// chain is the point — a key pinned here would shadow the operator's own.
+func (b ObjectStoreBackend) Env() []string {
+	if b.aws {
+		return nil
+	}
+	return []string{
+		"AWS_ACCESS_KEY_ID=" + b.AccessKey,
+		"AWS_SECRET_ACCESS_KEY=" + b.SecretKey,
+		"AWS_REGION=" + b.Region,
+	}
+}
+
 // MakeBucket creates one bucket for the test and returns its real name, which is
 // the only name the test may use. On a backend that outlives the process it also
 // registers the purge: a versioned bucket keeps every version and delete marker,
 // and a bucket that still holds one cannot be deleted.
 func (b ObjectStoreBackend) MakeBucket(t *testing.T, ctx context.Context, name string, objectLock bool) string {
 	t.Helper()
-	bucket := b.Bucket(name)
+	bucket := b.ReserveBucket(t, name, objectLock)
 	in := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
 	if objectLock {
 		in.ObjectLockEnabledForBucket = aws.Bool(true)
@@ -107,10 +136,6 @@ func (b ObjectStoreBackend) MakeBucket(t *testing.T, ctx context.Context, name s
 	}
 	if _, err := b.Client().CreateBucket(ctx, in); err != nil {
 		t.Fatalf("create bucket %s: %v", bucket, err)
-	}
-	if b.aws {
-		// Not t.Context(): see AWS.
-		t.Cleanup(func() { purgeBucket(t, context.Background(), b.Client(), bucket, objectLock) }) //nolint:usetesting // see above
 	}
 	return bucket
 }
