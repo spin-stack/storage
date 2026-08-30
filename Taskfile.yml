@@ -648,10 +648,20 @@ tasks:
       What one commit costs against the pinned backend: the fixed cost of a commit and
       the rate its payload moves at. v6 §11 says the rotation threshold and the RPO are
       set by measuring and not by choosing, and these are the two numbers they are set
-      from. Point it at another backend with S3_* to measure that one instead — the rate
-      is a property of the backend, and a deployment gets its own.
+      from. This measures the container on localhost, where the fixed cost is one hop:
+      run measure:publish:aws for the number a deployment actually gets.
     cmds:
       - MEASURE=1 RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v -timeout 30m
+        -run TestMeasureWhatOneCommitCosts ./integration/backend/...
+
+  measure:publish:aws:
+    desc: >-
+      The same measurement against real S3. The fixed cost of a commit is three round
+      trips to a region, not to localhost, so this is the number that bounds a promised
+      RPO — the container's says what the code costs, not what the network does. Uploads
+      about 1 GiB.
+    cmds:
+      - MEASURE=1 SPIN_CONFORMANCE_BACKEND=aws go test -tags integration -count=1 -v -timeout 30m
         -run TestMeasureWhatOneCommitCosts ./integration/backend/...
 
   backend:conformance:

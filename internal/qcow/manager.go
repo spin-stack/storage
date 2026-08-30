@@ -51,6 +51,16 @@ const lockFile = "agent.lock"
 // overhead, too large costs RPO, and the second is the promise. A deployment that wants
 // its own number runs `task measure:publish` against its own store.
 //
+// Measured against real S3 since (`task measure:publish:aws`, us-west-2 from a developer's
+// machine): F = 940 ms, R = 12 MiB/s, which puts S at 105 MiB — outside the band above, and
+// it does not move this default. F there is 940 ms against a measured 220 ms round trip to
+// the region: four round trips and nothing else, so the commit protocol costs exactly the
+// requests it makes and adds nothing of its own. Both terms are the path, not the store —
+// a WAN latency and a domestic uplink. An Agent sits in the region it publishes to, where
+// the same four round trips are single-digit milliseconds and R is a NIC. The band
+// argument holds when F and R describe one machine; it says nothing about a laptop
+// reaching across a continent, and neither does the number it produces.
+//
 // It is a *floor* on the layer, never a bound (§11): the tip is measured once a cycle, so
 // a layer weighs the threshold plus whatever the guest wrote since the last look — measured
 // at 8x under a hard writer. Nothing can bound it while QEMU takes the writes.
