@@ -203,6 +203,32 @@ func RunContract(t *testing.T, newStore NewStore) {
 		}
 	})
 
+	// A layer larger than one request is the case only a real backend can answer. S3
+	// refuses a single PUT over 5 GiB, and a compacted root is bounded by the guest's
+	// disk — so the store has to be able to send a layer in parts, and the conditional
+	// write has to survive the trip. Whether a store splits anything here is its own
+	// business; that create-only still means create-only is not.
+	t.Run("a body too large for one request is still create-only", func(t *testing.T) {
+		s := newStore(t)
+		const size = 12 << 20 // over S3's 5 MiB floor on a part, so this is several
+		first := bytes.Repeat([]byte{0xA5}, size)
+		second := bytes.Repeat([]byte{0x5A}, size)
+		opts := objectstore.PutOptions{IfNoneMatch: true}
+		if _, err := s.PutStream(ctx, "layers/sha256/big", bytes.NewReader(first), size, opts); err != nil {
+			t.Fatalf("a %d-byte layer must be storable: %v", size, err)
+		}
+		if _, err := s.PutStream(ctx, "layers/sha256/big", bytes.NewReader(second), size, opts); !errors.Is(err, objectstore.ErrPreconditionFailed) {
+			t.Fatalf("want ErrPreconditionFailed on the second create, got %v — the condition was lost on the way to a multi-request upload", err)
+		}
+		got, err := s.Get(ctx, "layers/sha256/big")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, first) {
+			t.Fatalf("the object is %d bytes and not the ones that were stored first: a multi-request upload reassembled wrong", len(got))
+		}
+	})
+
 	// A body that ends early must leave nothing. The size is what the caller measured
 	// while it computed the digest, so a short body means the source changed underneath
 	// the upload, and a truncated object at a content-addressed key is an object that

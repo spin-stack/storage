@@ -14,6 +14,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -234,11 +235,85 @@ func (s *S3Store) Put(ctx context.Context, key string, data []byte, opts objects
 // server actually sent. The retry could never have worked, and the commit protocol retries
 // the whole publish next cycle from the same SealedLayer under the same commit id — so a
 // lost connection costs a cycle rather than a commit.
+// A layer too large for one request goes in parts, because there is a ceiling on a single
+// PUT and a layer can cross it. See partSizeFor.
 func (s *S3Store) PutStream(ctx context.Context, key string, body io.Reader, size int64, opts objectstore.PutOptions) (objectstore.PutResult, error) {
 	in := putInput(s.bucket, key, io.LimitReader(body, size), size, opts)
+	if part := partSizeFor(size); size > part {
+		return s.putParts(ctx, in, part)
+	}
 	out, err := s.client.PutObject(ctx, in,
 		s3.WithAPIOptions(v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware),
 		func(o *s3.Options) { o.RetryMaxAttempts = 1 })
+	if err != nil {
+		return objectstore.PutResult{}, translate(err)
+	}
+	return objectstore.PutResult{ETag: aws.ToString(out.ETag)}, nil
+}
+
+// S3 refuses a PutObject whose Content-Length is over 5 GiB with EntityTooLarge, decided
+// on the header before a byte of the body is read, and a layer can be over it: a compacted
+// root is bounded by the guest's disk and by nothing else. That failure is not transient —
+// it is the same failure every cycle, for ever, while the chain walks to its ceiling and
+// the volume stops committing with the guest still running. RustFS accepts a single PUT of
+// any size, which is why the container lane certified a path S3 refuses.
+//
+// minPartSize is S3's floor on every part but the last, and maxParts its cap on how many
+// there may be. A part size is picked from the object's own size rather than fixed, so the
+// cap is never what decides whether a layer can be stored: at 5 MiB parts the cap alone
+// would stop at 50 GiB, which is an ordinary volume.
+const (
+	minPartSize = 5 << 20
+	maxParts    = 10_000
+)
+
+// partSizeFor is also the threshold: a body that fits in one part is sent as one request,
+// exactly as it was before parts existed, and everything above it travels in parts.
+func partSizeFor(size int64) int64 {
+	part := int64(minPartSize)
+	if even := (size + maxParts - 1) / maxParts; even > part {
+		part = even
+	}
+	return part
+}
+
+// putParts sends the body as a multipart upload.
+//
+// The conditional write rides on CompleteMultipartUpload, and the SDK maps it there from
+// the same field a single PUT carries — so create-only and compare-and-swap mean here
+// exactly what they mean above, and the atomicity the commit protocol rests on is
+// unchanged: the key appears when the complete succeeds, or not at all. The two conditions
+// are copied off the input putInput already built rather than decided again, because a
+// vocabulary written twice is a vocabulary that drifts; that they survive the copy is what
+// the store contract's oversized create-only case asserts, against every backend.
+//
+// Both concessions PutStream documents above are lifted here, and by the same fact: a part
+// is buffered before it is sent. That is enough to sign its payload, and enough to send it
+// again, so a lost connection costs a part rather than the layer. What is held in memory is
+// Concurrency × part size — never the layer, which is the point of this method.
+// Parts are abandoned on failure, which is the default and stays that way: they are billed
+// and invisible to LIST, and the caller republishes the same bytes under the same commit id
+// next cycle.
+//
+// feature/s3/manager is the older spelling of this and is deprecated; transfermanager is
+// the successor, and the reason to prefer it here beyond that is that it maps IfNoneMatch
+// onto the complete explicitly rather than by reflecting one struct onto another.
+func (s *S3Store) putParts(ctx context.Context, in *s3.PutObjectInput, part int64) (objectstore.PutResult, error) {
+	tm := transfermanager.New(s.client, func(o *transfermanager.Options) {
+		o.PartSizeBytes = part
+		// This method is only called for a body that does not fit in one part, so the
+		// threshold has nothing left to decide.
+		o.MultipartUploadThreshold = part
+		o.Concurrency = 4
+	})
+	out, err := tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
+		Bucket:        in.Bucket,
+		Key:           in.Key,
+		Body:          in.Body,
+		ContentLength: in.ContentLength,
+		IfMatch:       in.IfMatch,
+		IfNoneMatch:   in.IfNoneMatch,
+	})
 	if err != nil {
 		return objectstore.PutResult{}, translate(err)
 	}
