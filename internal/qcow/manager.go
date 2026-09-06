@@ -1548,6 +1548,69 @@ func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 	return out, nil
 }
 
+// Isolate pauses the guests of these volumes, or resumes them, without the volumes
+// changing hands.
+//
+// Everything Fence does besides stopping the guest is deliberately absent: the chain stays
+// attached, nothing is recorded on disk, and no fork is declared. This host has not been
+// shown it is the wrong writer — it has been shown nothing at all — and the state it is
+// putting the volume into is one that a Control Plane answering again undoes completely.
+//
+// The refusal is set so the fleet learns of it on the first report that gets through, which
+// is necessarily after the fact: a host that could tell anyone was not isolated.
+func (m *Manager) Isolate(_ context.Context, volumeIDs []string, paused bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var failures []error
+	for _, id := range volumeIDs {
+		v, held := m.vols[id]
+		if !held {
+			continue
+		}
+		if paused {
+			m.stopGuest(id)
+			v.refusal = storagev1.VolumeRefusal_VOLUME_REFUSAL_ISOLATED
+			v.detail = "nothing has confirmed this host's claim on this volume: neither the control plane nor the object store is answering, and the fleet may be placing it elsewhere"
+			m.vols[id] = v
+			continue
+		}
+		if err := m.resumeGuest(id); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		v.refusal, v.detail = storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""
+		m.vols[id] = v
+	}
+	return errors.Join(failures...)
+}
+
+// resumeGuest is stopGuest's undo. Its failure *is* returned, where stopGuest's is only
+// logged, and the asymmetry is the point: a stop that does not happen leaves a guest
+// writing where it must not, which nothing here can fix and an operator must read about;
+// a resume that does not happen leaves a guest paused, which the next cycle retries.
+func (m *Manager) resumeGuest(volumeID string) error {
+	ctx, cancel := m.withTimeout(context.Background())
+	defer cancel()
+
+	client, err := qmp.Dial(ctx, m.dialer, QMPSocket(m.cfg.Root, volumeID))
+	if err != nil {
+		if errors.Is(err, qmp.ErrNoEndpoint) {
+			// No VM to resume. It went while this host was isolated, which is whoever
+			// owns its lifetime deciding something — not this Agent's to undo.
+			return nil
+		}
+		return fmt.Errorf("qcow: reaching the VM of volume %s to resume it: %w", volumeID, err)
+	}
+	defer func() { _ = client.Close() }()
+	if err := client.Cont(); err != nil {
+		return fmt.Errorf("qcow: resuming the VM of volume %s: %w", volumeID, err)
+	}
+	slog.Warn("resumed the guest: the control plane and the object store both confirm this volume is still this host's",
+		"volume_id", volumeID)
+	return nil
+}
+
 // Fence stops serving what this host is no longer the writer of, and stops its guest.
 //
 // The two callers want opposite things and the difference is whether the Control Plane

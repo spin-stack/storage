@@ -322,11 +322,17 @@ const (
 	// that is answered by looking at *ownership* instead of at the host that reported it:
 	// who else believes they own this volume, and why was this host not fenced first.
 	RefusalPublishFenced Refusal = "PUBLISH_FENCED"
+	// RefusalIsolated is the host having confirmed nothing about the volume — neither the
+	// Control Plane nor the object store answering — for long enough that the fleet may be
+	// about to place it elsewhere, so it paused the guest rather than let two of them
+	// write. A count of these is a partition, not a sick host.
+	RefusalIsolated Refusal = "ISOLATED"
 )
 
 var refusals = []Refusal{
 	RefusalNone, RefusalImageMissing, RefusalDurabilityLost, RefusalNoReadView,
 	RefusalNoKey, RefusalLeaseLost, RefusalAttachFailed, RefusalPublishFenced,
+	RefusalIsolated,
 }
 
 // Refusals returns every stored value, RefusalNone included.

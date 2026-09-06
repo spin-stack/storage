@@ -34,6 +34,7 @@ func MandatoryScenarios() []MandatoryScenario {
 	all = append(all, reconcileScenarios()...)
 	all = append(all, sweepScenarios()...)
 	all = append(all, fencingScenarios()...)
+	all = append(all, isolationScenarios()...)
 	all = append(all, harnessScenarios()...)
 	return all
 }

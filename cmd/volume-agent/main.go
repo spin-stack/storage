@@ -53,6 +53,14 @@ func main() {
 	}
 }
 
+// The Agent's loop takes a VolumeSource and *discovers* whether it is also a
+// VolumeReconciler, because its own tests drive a source that is not one. That type
+// assertion is silent: a method added to VolumeReconciler compiles everywhere and turns
+// the real Agent into one that records the desired state and acts on none of it, with no
+// build failure and no line in a log. This is the assertion that makes that a compile
+// error, and it belongs here because here is where the two are joined.
+var _ agent.VolumeReconciler = (*qcow.Manager)(nil)
+
 func run() (err error) {
 	var (
 		hostID       = flag.String("host-id", "", "fleet identity of this host: a UUIDv7 (required; mint one with `uuidgen` only if it is v7)")

@@ -130,6 +130,16 @@ type VolumeReconciler interface {
 	// lease is the other case: nothing outside this process knows, and silence there is a
 	// guest with no disk and a fleet that reads healthy.
 	Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error
+	// Isolate pauses the guests of these volumes, or resumes them, without the volumes
+	// changing hands. It is the reversible half of Fence and the two must not be
+	// conflated: fencing is this host being *shown* it is not the writer, and it takes
+	// the chain apart and records a fork; this is this host having been shown nothing at
+	// all, and everything it does is undone by passing true and then false.
+	//
+	// One method rather than a pair because the pause and the resume are one decision
+	// with two answers, and a caller that could reach for one without the other is a
+	// caller that can leave a tenant's VM stopped for ever.
+	Isolate(ctx context.Context, volumeIDs []string, paused bool) error
 }
 
 // VolumeSet is an in-memory VolumeSource: a set of statuses a caller writes directly.

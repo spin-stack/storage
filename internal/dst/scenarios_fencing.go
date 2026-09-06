@@ -21,6 +21,10 @@ import (
 // serving, which is arm 3 and arm 4 below and is safe. A checker that cannot be made to
 // fire is the decoration commitCheckers declined to add for the same reason.
 //
+// What arm 4 now also reaches is the isolation response — a host that can read neither
+// path pauses its guest rather than serve on a guess — and that is its own scenario
+// (scenarios_isolation.go), because its subject is the whole loop and not this one rule.
+//
 // The invariant that a host given up on cannot corrupt the history is not left unchecked
 // either way: it is effective-single-writer, and its subject is the compare-and-set on
 // HEAD, which is where this system's fence is actually enforced.

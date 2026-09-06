@@ -323,6 +323,20 @@ enum VolumeRefusal {
   // volume is the failure this whole design is arranged against, and it is the one
   // refusal that must be countable in a dashboard rather than greppable in a log.
   VOLUME_REFUSAL_PUBLISH_FENCED = 7;
+  // This host has confirmed nothing about the volume for long enough that the fleet may
+  // be about to place it elsewhere, so it paused the guest rather than let two of them
+  // write. Neither the Control Plane nor the object store has answered: with either one
+  // answering the host knows whether it still owns the volume, and keeps serving.
+  //
+  // Its own value, by the argument PUBLISH_FENCED makes: the operator's next move is not
+  // guessable from a detail string, and here it is neither this host's disk nor who owns
+  // the volume — it is this host's *network*, and a count of these is a partition.
+  //
+  // Reported late by construction. A host that cannot reach the Control Plane cannot tell
+  // it anything; this arrives on the first heartbeat that gets through, which may be after
+  // the volume has moved, and the report is refused on the usual host-and-epoch predicate
+  // if it has.
+  VOLUME_REFUSAL_ISOLATED = 8;
 }
 
 // VolumeReport is what one host observes about one volume, qualified by the epoch

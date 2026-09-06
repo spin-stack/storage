@@ -67,6 +67,8 @@ var pinnedMandatorySet = []string{
 	"no-sealed-layer-is-chained-past",
 	// fencing (scenarios_fencing.go)
 	"an-isolated-host-keeps-its-guest",
+	// isolation (scenarios_isolation.go)
+	"an-unconfirmed-host-pauses-its-guest",
 	// harness (scenarios_harness.go)
 	"restored-control-plane",
 }
