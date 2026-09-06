@@ -1909,3 +1909,78 @@ func TestARestartBetweenSealingAndPublishingMintsNoSecondCommitID(t *testing.T) 
 		t.Fatalf("the layer was published under an id the record did not promise: %v, recorded %s", ids, sealed.CommitID)
 	}
 }
+
+// Isolate is Fence's reversible half, and everything worth asserting about it is what it
+// does *not* do. The guest stops, the volume stays this host's — chain attached, pointer
+// where it was, nothing recorded — and passing false gives the guest back.
+//
+// A fence cannot be undone; this is the whole reason the isolation response is allowed to
+// act on a silence rather than on a fact, so a pause that quietly behaved like a fence
+// would take that argument away without failing anything else.
+func TestIsolatePausesTheGuestAndGivesItBack(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 4)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	// The VM launches after the chain is prepared, which is why the script is set here:
+	// the image it has open is the layer Apply chose, and nothing outside can predict one.
+	tip := h.tip(t)
+	h.dialer.scripts[qcow.QMPSocket(root, vol)] = attachedTo(tip)
+
+	h.dialer.reset()
+	// "never-heard-of-it" is here for the same reason it is in TestFence: a host is asked
+	// about volumes it does not hold every time the desired state and its disk disagree.
+	if err := h.m.Isolate(t.Context(), []string{vol, "never-heard-of-it"}, true); err != nil {
+		t.Fatalf("isolating: %v", err)
+	}
+	if got := h.dialer.sent(); !strings.Contains(got, `"execute":"stop"`) {
+		t.Fatalf("QEMU was told %q, want a stop: an isolated host that does not pause the guest is the second writer", got)
+	}
+	v, ok := h.volumes(t)[vol]
+	if !ok {
+		t.Fatal("the isolated volume is not reported; the fleet cannot see a volume that vanishes")
+	}
+	if v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_ISOLATED || v.RefusalDetail == "" {
+		t.Fatalf("reported %v %q, want ISOLATED with a sentence", v.Refusal, v.RefusalDetail)
+	}
+	if got := h.tip(t); got != tip {
+		t.Fatalf("the pointer moved to %q; a pause takes nothing apart", got)
+	}
+
+	h.dialer.reset()
+	if err := h.m.Isolate(t.Context(), []string{vol}, false); err != nil {
+		t.Fatalf("resuming: %v", err)
+	}
+	if got := h.dialer.sent(); !strings.Contains(got, `"execute":"cont"`) {
+		t.Fatalf("QEMU was told %q, want a cont: a pause nobody undoes is a slower way to lose the VM", got)
+	}
+	if v := h.volumes(t)[vol]; v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("the resumed volume still reports %v", v.Refusal)
+	}
+	if got := h.tip(t); got != tip {
+		t.Fatalf("the pointer is %q after a resume, want the tip it was paused on %q", got, tip)
+	}
+}
+
+// A volume whose VM is gone resumes without an error, and the distinction is the reason
+// resumeGuest's failure is returned at all: a socket nothing is listening at is whoever
+// owns the VM's lifetime having ended it, which this Agent has nothing to undo, while a
+// QEMU that answers and refuses is a guest left paused that an operator must hear about.
+func TestResumingAVolumeWhoseVMIsGoneIsNotAnError(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	if err := h.m.Apply(t.Context(), []*storagev1.DesiredVolume{active(vol, 4)}); err != nil {
+		t.Fatalf("applying: %v", err)
+	}
+	// No script for the socket, which is a prepared volume whose VM was never launched.
+	if err := h.m.Isolate(t.Context(), []string{vol}, true); err != nil {
+		t.Fatalf("isolating: %v", err)
+	}
+	if err := h.m.Isolate(t.Context(), []string{vol}, false); err != nil {
+		t.Fatalf("resuming a volume with no VM: %v", err)
+	}
+	if v := h.volumes(t)[vol]; v.Refusal != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("the volume still reports %v after the resume", v.Refusal)
+	}
+}

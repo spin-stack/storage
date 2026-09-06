@@ -36,7 +36,9 @@ func TestDetachWillNotTakeAVolumeFromAHostStillServingIt(t *testing.T) {
 		heartbeatAgo time.Duration
 		refusal      lifecycle.Refusal
 		force        bool
-		wantRefused  bool
+		// hostMissing places the volume on a host id nothing was upserted for.
+		hostMissing bool
+		wantRefused bool
 	}{{
 		name:         "a host that reports it is serving, and was heard from just now",
 		heartbeatAgo: time.Second,
@@ -63,6 +65,14 @@ func TestDetachWillNotTakeAVolumeFromAHostStillServingIt(t *testing.T) {
 		name:         "silent, but not for long enough",
 		heartbeatAgo: dwell - time.Second,
 		wantRefused:  true,
+	}, {
+		// A volume placed on a host the catalog does not have is a broken row and not a
+		// running writer, and it is still refused: guessing here is guessing about a
+		// guest, and the operator is one -force away.
+		name:         "a volume placed on a host the catalog does not have",
+		heartbeatAgo: time.Second,
+		hostMissing:  true,
+		wantRefused:  true,
 	}}
 
 	for _, tc := range tests {
@@ -84,9 +94,13 @@ func TestDetachWillNotTakeAVolumeFromAHostStillServingIt(t *testing.T) {
 				t.Fatal(err)
 			}
 			clk.Advance(tc.heartbeatAgo)
+			primary := host
+			if tc.hostMissing {
+				primary = "00000000-0000-7000-8000-0000000000a3"
+			}
 			if err := md.CreateVolume(ctx, term, metadata.Volume{
 				VolumeID: vol, SizeBytes: 1 << 30, BlockSize: 65536,
-				State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: host,
+				State: lifecycle.VolumeActive, CurrentEpoch: 1, PrimaryHostID: primary,
 				DEKWrapped: []byte{7}, KEKID: "kek", DEKKeyID: 42,
 				Progress: metadata.VolumeProgress{Refusal: tc.refusal},
 			}, nil); err != nil {
@@ -104,7 +118,7 @@ func TestDetachWillNotTakeAVolumeFromAHostStillServingIt(t *testing.T) {
 				if gerr != nil {
 					t.Fatal(gerr)
 				}
-				if v.PrimaryHostID != host {
+				if v.PrimaryHostID != primary {
 					t.Fatalf("the volume was detached anyway: primary_host_id = %q", v.PrimaryHostID)
 				}
 				return

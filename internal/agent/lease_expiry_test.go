@@ -661,3 +661,47 @@ func TestLosingOnlyTheObjectStoreDoesNotPause(t *testing.T) {
 		t.Fatalf("served = %v, want the volume: an unreachable bucket stops no guest", got)
 	}
 }
+
+// The resume asks the object store the same question the give-up does, and this is the
+// answer that must not be read as "still ours": the bucket records an epoch higher than
+// the one this host holds, so the volume was granted elsewhere while this host could see
+// nothing. The guest stays paused, and the next cycle gives the volume up on that fact.
+//
+// It is the case the pause exists for. Resuming here would put a second guest on a volume
+// somebody else is already serving — the failure the whole two-signal rule is arranged
+// against, arrived at through the door that opens when a partition heals.
+func TestAPausedGuestIsNotResumedOntoAVolumeSomebodyElseWasGranted(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	vol := h.desire(1)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+	h.cp.setErr(errUnreachable)
+	h.wit.setErr(errStoreUnreachable)
+	h.clk.Advance(61 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+	if paused := h.paused(t); len(paused) != 1 {
+		t.Fatalf("paused = %v, want the one volume past the grace", paused)
+	}
+
+	// The partition heals, and what it reveals is that the fleet moved on: the volume was
+	// granted at a higher epoch to somebody else.
+	h.cp.setErr(nil)
+	h.wit.setErr(nil)
+	h.wit.grant(vol.GetVolumeId(), 2)
+	h.clk.Advance(time.Second)
+	_ = h.loop.Reconcile(ctx)
+
+	if paused := h.paused(t); len(paused) != 1 {
+		// The volume may be given up in the same cycle, but it must never be resumed.
+		if !h.rec.fencedAt(vol.GetVolumeId()) {
+			t.Fatalf("the guest was resumed onto a volume granted to another host: paused = %v", paused)
+		}
+	}
+	if got := h.served(t); len(got) != 0 {
+		t.Fatalf("the host is still serving %v after the bucket said the volume was granted elsewhere", got)
+	}
+}

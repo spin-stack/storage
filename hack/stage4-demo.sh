@@ -177,8 +177,13 @@ for i in $(seq 1 100); do
   [ "$i" = 100 ] && die "the second host never registered: $(tail -8 "$DIR/logs/fleet-b.txt")"
   sleep 0.2
 done
+# -force, and what it asserts is true here and nowhere by default: detaching a volume
+# whose host is answering and reports no refusal is refused, because the incumbent goes on
+# serving until its next poll and an operator who places it elsewhere in between has put
+# two guests on one volume. This script is the operator that can assert otherwise — it owns
+# both hosts, and the second one is killed below without ever having served anything.
 "$CP" -database-url "$DSN" -object-store-dir "$DIR/store" -holder-id cp-move \
-  -detach-volume "$VOLUME" >"$DIR/logs/move.log" 2>&1 ||
+  -detach-volume "$VOLUME" -force >"$DIR/logs/move.log" 2>&1 ||
   die "detach failed: $(tail -3 "$DIR/logs/move.log")"
 "$CP" -database-url "$DSN" -object-store-dir "$DIR/store" -holder-id cp-move \
   -max-used-ratio 0.99 -attach-volume "$VOLUME" -attach-host "$OTHER" >>"$DIR/logs/move.log" 2>&1 ||
