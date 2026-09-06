@@ -75,8 +75,8 @@
 <title>agent&#45;&gt;chain</title>
 <path fill="none" stroke="#475569" stroke-dasharray="5,2" d="M388.5728,-315.6525C391.8327,-253.3121 395.612,-121.979 372.5,-84 370.1321,-80.109 367.3471,-76.4822 364.254,-73.106"/>
 <polygon fill="#475569" stroke="#475569" points="366.6507,-70.5547 357.0333,-66.1099 361.7798,-75.5821 366.6507,-70.5547"/>
-<text text-anchor="start" x="390.5" y="-177.5" font-family="Arial" font-size="10.00" fill="#000000"> &#160;qemu&#45;img create / info / rebase</text>
-<text text-anchor="start" x="390.5" y="-166.5" font-family="Arial" font-size="10.00" fill="#000000"> &#160;(no parser of our own, §7)</text>
+<text text-anchor="start" x="391.5" y="-177.5" font-family="Arial" font-size="10.00" fill="#000000"> &#160;qemu&#45;img create / info / rebase</text>
+<text text-anchor="start" x="391.5" y="-166.5" font-family="Arial" font-size="10.00" fill="#000000"> &#160;(no parser of our own, §7)</text>
 </g>
 <!-- state -->
 <g id="node5" class="node">
@@ -117,33 +117,34 @@
 <!-- cp -->
 <g id="node6" class="node">
 <title>cp</title>
-<path fill="#f8fafc" stroke="#334155" d="M371,-493C371,-493 132,-493 132,-493 126,-493 120,-487 120,-481 120,-481 120,-452 120,-452 120,-446 126,-440 132,-440 132,-440 371,-440 371,-440 377,-440 383,-446 383,-452 383,-452 383,-481 383,-481 383,-487 377,-493 371,-493"/>
-<text text-anchor="middle" x="251.5" y="-476.4" font-family="Arial" font-size="12.00" fill="#000000">Control Plane</text>
-<text text-anchor="middle" x="251.5" y="-463.4" font-family="Arial" font-size="12.00" fill="#000000">term&#45;guarded catalogue · desired state</text>
-<text text-anchor="middle" x="251.5" y="-450.4" font-family="Arial" font-size="12.00" fill="#000000">leases · GetVolumeKeys</text>
+<path fill="#f8fafc" stroke="#334155" d="M341,-493C341,-493 102,-493 102,-493 96,-493 90,-487 90,-481 90,-481 90,-452 90,-452 90,-446 96,-440 102,-440 102,-440 341,-440 341,-440 347,-440 353,-446 353,-452 353,-452 353,-481 353,-481 353,-487 347,-493 341,-493"/>
+<text text-anchor="middle" x="221.5" y="-476.4" font-family="Arial" font-size="12.00" fill="#000000">Control Plane</text>
+<text text-anchor="middle" x="221.5" y="-463.4" font-family="Arial" font-size="12.00" fill="#000000">term&#45;guarded catalogue · desired state</text>
+<text text-anchor="middle" x="221.5" y="-450.4" font-family="Arial" font-size="12.00" fill="#000000">leases · GetVolumeKeys</text>
 </g>
 <!-- cp&#45;&gt;agent -->
 <g id="edge6" class="edge">
 <title>cp&#45;&gt;agent</title>
-<path fill="none" stroke="#475569" d="M282.1336,-439.8374C299.3638,-424.8408 321.2171,-405.8203 340.4694,-389.0637"/>
-<polygon fill="#475569" stroke="#475569" points="343.0148,-391.4883 348.26,-382.2829 338.4191,-386.2081 343.0148,-391.4883"/>
-<text text-anchor="start" x="327.5" y="-414" font-family="Arial" font-size="10.00" fill="#000000"> &#160;desired state · epoch</text>
-<text text-anchor="start" x="327.5" y="-403" font-family="Arial" font-size="10.00" fill="#000000"> &#160;heartbeat / lease</text>
+<path fill="none" stroke="#475569" d="M258.9411,-439.8374C280.4596,-424.5136 307.8779,-404.9885 331.7758,-387.9702"/>
+<polygon fill="#475569" stroke="#475569" points="333.9511,-390.718 340.0666,-382.0662 329.8906,-385.016 333.9511,-390.718"/>
+<text text-anchor="start" x="314.5" y="-414" font-family="Arial" font-size="10.00" fill="#000000"> &#160;desired state · epoch</text>
+<text text-anchor="start" x="314.5" y="-403" font-family="Arial" font-size="10.00" fill="#000000"> &#160;heartbeat / lease</text>
 </g>
 <!-- kms -->
 <g id="node7" class="node">
 <title>kms</title>
-<path fill="#f8fafc" stroke="#334155" d="M629.5,-486.5C629.5,-486.5 413.5,-486.5 413.5,-486.5 407.5,-486.5 401.5,-480.5 401.5,-474.5 401.5,-474.5 401.5,-458.5 401.5,-458.5 401.5,-452.5 407.5,-446.5 413.5,-446.5 413.5,-446.5 629.5,-446.5 629.5,-446.5 635.5,-446.5 641.5,-452.5 641.5,-458.5 641.5,-458.5 641.5,-474.5 641.5,-474.5 641.5,-480.5 635.5,-486.5 629.5,-486.5"/>
-<text text-anchor="middle" x="521.5" y="-469.9" font-family="Arial" font-size="12.00" fill="#000000">KMS / Vault (KEK)</text>
-<text text-anchor="middle" x="521.5" y="-456.9" font-family="Arial" font-size="12.00" fill="#000000">wrapped DEK, bound to the volume</text>
+<path fill="#f8fafc" stroke="#334155" d="M722,-493C722,-493 383,-493 383,-493 377,-493 371,-487 371,-481 371,-481 371,-452 371,-452 371,-446 377,-440 383,-440 383,-440 722,-440 722,-440 728,-440 734,-446 734,-452 734,-452 734,-481 734,-481 734,-487 728,-493 722,-493"/>
+<text text-anchor="middle" x="552.5" y="-476.4" font-family="Arial" font-size="12.00" fill="#000000">KMS / Vault (KEK)</text>
+<text text-anchor="middle" x="552.5" y="-463.4" font-family="Arial" font-size="12.00" fill="#000000">one key for the fleet: this host reads the file the CP read</text>
+<text text-anchor="middle" x="552.5" y="-450.4" font-family="Arial" font-size="12.00" fill="#000000">wrapped DEK, bound to the volume</text>
 </g>
 <!-- kms&#45;&gt;agent -->
 <g id="edge7" class="edge">
 <title>kms&#45;&gt;agent</title>
-<path fill="none" stroke="#475569" stroke-dasharray="5,2" d="M498.2927,-446.301C480.1522,-430.5121 454.3703,-408.0723 432.1364,-388.7206"/>
-<polygon fill="#475569" stroke="#475569" points="434.2792,-385.9456 424.4383,-382.0204 429.6835,-391.2257 434.2792,-385.9456"/>
-<text text-anchor="start" x="469.5" y="-414" font-family="Arial" font-size="10.00" fill="#000000"> &#160;unwrap the DEK</text>
-<text text-anchor="start" x="469.5" y="-403" font-family="Arial" font-size="10.00" fill="#000000"> &#160;(only for as long as the operation lasts)</text>
+<path fill="none" stroke="#475569" stroke-dasharray="5,2" d="M514.832,-439.8374C493.183,-424.5136 465.5986,-404.9885 441.5558,-387.9702"/>
+<polygon fill="#475569" stroke="#475569" points="443.3992,-384.9869 433.2148,-382.0662 439.3549,-390.7005 443.3992,-384.9869"/>
+<text text-anchor="start" x="488.5" y="-414" font-family="Arial" font-size="10.00" fill="#000000"> &#160;unwrap the DEK</text>
+<text text-anchor="start" x="488.5" y="-403" font-family="Arial" font-size="10.00" fill="#000000"> &#160;(only for as long as the operation lasts)</text>
 </g>
 <!-- s3&#45;&gt;agent -->
 <g id="edge9" class="edge">

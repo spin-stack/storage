@@ -97,7 +97,10 @@ type VolumeKeys struct {
 	VolumeID string
 	// DEKWrapped is the volume's data-encryption key sealed under the KEK.
 	DEKWrapped []byte
-	// KEKID names the key that wraps it, for a host holding more than one.
+	// KEKID names the key that wrapped it. There is one key in the fleet today, so this
+	// is what a host compares its own against — a mismatch is a wrong -kek-file, which is
+	// worth a refusal and not a guess. It is a column and a field rather than an
+	// assumption so that rotating the key is a migration and not a redesign.
 	KEKID string
 	// DEKKeyID is the DEK's version (§15.1). It is not decoration: crypto.DevKMS binds
 	// it as GCM additional authenticated

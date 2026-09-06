@@ -64,6 +64,7 @@ mkfifo "$DIR/ctl"
 # guest's console does not see EOF the moment the stop word has been sent.
 exec 9<>"$DIR/ctl"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=$CHURN" \
@@ -137,6 +138,7 @@ echo "    qemu-img check: all $LAYERS layers sound"
 
 say "8. a second boot, reading only, through the whole chain"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=verify" \

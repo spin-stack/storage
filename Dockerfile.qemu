@@ -1,25 +1,29 @@
-# QEMU build for the remote-volumes work (Phases 02/03).
+# QEMU build for the remote-volumes work.
 #
 # Modelled on spin-stack/spinbox's Dockerfile.qemu (same BuildKit cache-mount
-# strategy, same debloat flags) with three differences that matter here:
+# strategy, same debloat flags) with two differences that matter here:
 #
 #   1. QEMU is pinned to 11.1.1 — the version CLAUDE.md pins for CI and prod —
 #      not spinbox's 11.0.1.
-#   2. --enable-vhost-user-blk-server builds qemu-storage-daemon, QEMU's own
-#      vhost-user-blk backend.
-#   3. --enable-tools keeps qemu-img / qemu-nbd / qemu-storage-daemon, which the
-#      guest-layout tests need to build and inspect the three devices of §9.
+#   2. --enable-tools keeps qemu-img, which is not a convenience: v6 forbids a
+#      qcow2 parser of our own, so every chain this system creates and inspects
+#      is that binary being run.
 #
-# The `extract` stage writes the binary + firmware to _output/ (task build:qemu).
+# What is *not* built: --enable-vhost-user-blk-server and the storage daemon it
+# served. The guest gets an ordinary virtio-blk-pci disk over a local qcow2 chain,
+# and the vhost-user data path went with the local block engine — a flag that
+# lengthens every build for a device nothing asks for is not a spare part.
+#
+# The `extract` stage writes the binary + firmware to _output/ (task qemu:build).
 
 FROM ubuntu:26.04 AS builder
 
 ARG QEMU_VERSION=11.1.1
 ARG JOBS=8
-# Bump when the configure flags below change: the build directory lives in a cache
-# mount and configure only runs when there is no Makefile, so without this a flag
-# change would silently reuse the previous configuration.
-ARG QEMU_CONFIG_REV=2
+# Bump when the configure flags or hack/qemu-devices.mak change: the build directories
+# live in cache mounts and configure only runs when one holds no config.status, so
+# without this a flag change would silently reuse the previous configuration.
+ARG QEMU_CONFIG_REV=6
 ARG DEBIAN_FRONTEND=noninteractive
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -75,50 +79,144 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
         tar -xf "/var/cache/qemu/qemu-${QEMU_VERSION}.tar.xz" -C /var/cache/qemu; \
     fi
 
-# Configure + build. vhost-user (our data path) and the storage daemon are the
-# reason this image exists; the display/audio stack is dead weight for a microVM.
+# The device set (see hack/qemu-devices.mak) and the flags both builds share.
 #
-# NOTE: do not re-add spinbox's `CONFIG_CXL=n` debloat here. On 11.0.2 it broke the
-# link — the PCI expander bridge (pxb_cxl_realize, acpi_build) still references
-# cxl_component_register_block_init / cxl_fmws_get_all_sorted — and a few hundred KiB
-# of binary is not worth a build that fails only at the last step. Not re-tested on
-# 11.1.1: the sed that removes it is still here, so nothing has had the chance to.
+# ENV rather than a list repeated twice: the two builds below differ in exactly one thing,
+# and a copied flag list is a place for them to drift into differing in two.
+COPY hack/qemu-devices.mak /build/spin-devices.mak
+
+ENV QEMU_FLAGS="\
+    --target-list=x86_64-softmmu \
+    --with-devices-x86_64=spin \
+    --enable-system \
+    --disable-user \
+    --enable-tools \
+    --enable-kvm \
+    --enable-linux-aio \
+    --enable-linux-io-uring \
+    --enable-cap-ng \
+    --enable-seccomp \
+    --enable-lto \
+    --enable-strip \
+    --disable-containers \
+    --disable-docs \
+    --disable-debug-info \
+    --disable-werror \
+    --disable-plugins \
+    --disable-xen \
+    --disable-xen-pci-passthrough \
+    --disable-whpx \
+    --disable-hvf \
+    --disable-nvmm \
+    --disable-vhost-user-blk-server \
+    --disable-sdl \
+    --disable-gtk \
+    --disable-curses \
+    --disable-opengl \
+    --disable-virglrenderer \
+    --disable-spice \
+    --disable-vnc \
+    --disable-png \
+    --disable-vte \
+    --disable-xkbcommon \
+    --disable-brlapi \
+    --disable-alsa \
+    --disable-coreaudio \
+    --disable-oss \
+    --disable-pa \
+    --disable-jack \
+    --disable-sndio \
+    --disable-pipewire \
+    --disable-slirp \
+    --disable-passt \
+    --disable-vde \
+    --disable-netmap \
+    --disable-gio \
+    --disable-curl \
+    --disable-libssh \
+    --disable-libnfs \
+    --disable-libiscsi \
+    --disable-rbd \
+    --disable-vvfat \
+    --disable-vdi \
+    --disable-vmdk \
+    --disable-qed \
+    --disable-qcow1 \
+    --disable-bochs \
+    --disable-cloop \
+    --disable-dmg \
+    --disable-parallels \
+    --disable-vhdx \
+    --disable-vpc \
+    --disable-tpm \
+    --disable-libusb \
+    --disable-usb-redir \
+    --disable-smartcard \
+    --disable-u2f \
+    --disable-canokey \
+    --disable-guest-agent \
+    --disable-guest-agent-msi \
+    --disable-capstone \
+    --disable-fuse \
+    --disable-fuse-lseek \
+    --disable-multiprocess \
+    --disable-replication \
+    --disable-rdma \
+    --disable-libdw \
+    --disable-gettext \
+    --disable-virtfs \
+    --disable-hv-balloon"
+
+# What is *not* in that list, and why, because the tempting ones fail late:
+#   pixman, glib, gnutls/nettle  — q35's display and qcow2's crypto still want them.
+#   fdt                          — MICROVM depends on it (hw/i386/Kconfig).
+#   CONFIG_CXL                   — not offered as optional by upstream; turning it off
+#                                  broke the 11.0.2 link (pxb_cxl_realize, acpi_build).
+#   --without-default-features   — then every device q35 needs is ours to enumerate, and
+#                                  a missing one is a link error or an unusable machine.
+
+# The guard is config.status and not Makefile, and the directory is emptied before a
+# configure runs. configure writes the Makefile early and config.status only once it has
+# finished, so a configure that failed leaves a build directory that looks configured and
+# a `make` that dies at `./config.status: No such file or directory` — in a cache mount,
+# on every later build, until somebody thinks to prune it.
+#
+# Two builds, differing in one flag: whether TCG is compiled in.
+#
+# /opt/qemu is what a host serving tenants runs, and it cannot emulate. A machine with no
+# /dev/kvm gets an error at start-up instead of a guest at a tenth of the speed producing
+# timings that read like measurements — which is a failure mode this repository has already
+# paid for once, and the reason hack/demo-lib.sh prints the accelerator it chose.
+#
+# /opt/qemu-tcg is for CI, where the runner has no /dev/kvm and the guest boots a kernel,
+# an initramfs and one disk. Only its system binary is kept: qemu-img and qemu-nbd link no
+# accelerator at all, so there is one of each and they come from the build above.
 RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/cache/qemu \
-    --mount=type=cache,sharing=locked,id=qemu-build-${QEMU_VERSION}-${QEMU_CONFIG_REV},target=/build/qemu-build \
-    sed -i '/^CONFIG_CXL=n$/d' \
-        "/var/cache/qemu/qemu-${QEMU_VERSION}/configs/devices/x86_64-softmmu/default.mak" && \
-    mkdir -p qemu-build && cd qemu-build && \
-    if [ ! -f Makefile ]; then \
+    --mount=type=cache,sharing=locked,id=qemu-build-kvm-${QEMU_VERSION}-${QEMU_CONFIG_REV},target=/build/qemu-build-kvm \
+    cp /build/spin-devices.mak \
+       "/var/cache/qemu/qemu-${QEMU_VERSION}/configs/devices/x86_64-softmmu/spin.mak" && \
+    mkdir -p qemu-build-kvm && cd qemu-build-kvm && \
+    if [ ! -f config.status ]; then \
+        rm -rf ./* && \
         /var/cache/qemu/qemu-${QEMU_VERSION}/configure \
             --prefix=/opt/qemu \
-            --target-list=x86_64-softmmu \
-            --enable-tools \
-            --enable-vhost-user-blk-server \
-            --enable-kvm \
-            --enable-linux-aio \
-            --enable-linux-io-uring \
-            --enable-cap-ng \
-            --enable-seccomp \
-            --enable-lto \
-            --enable-strip \
-            --disable-containers \
-            --disable-docs \
-            --disable-debug-info \
-            --disable-werror \
-            --disable-sdl \
-            --disable-gtk \
-            --disable-opengl \
-            --disable-virglrenderer \
-            --disable-spice \
-            --disable-vnc \
-            --disable-alsa \
-            --disable-coreaudio \
-            --disable-oss \
-            --disable-pa \
-            --disable-jack \
-            --disable-sndio \
-            --disable-slirp \
-            --disable-gio; \
+            --disable-tcg \
+            ${QEMU_FLAGS}; \
+    fi && \
+    make -j${JOBS} && \
+    make install
+
+RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/cache/qemu \
+    --mount=type=cache,sharing=locked,id=qemu-build-tcg-${QEMU_VERSION}-${QEMU_CONFIG_REV},target=/build/qemu-build-tcg \
+    cp /build/spin-devices.mak \
+       "/var/cache/qemu/qemu-${QEMU_VERSION}/configs/devices/x86_64-softmmu/spin.mak" && \
+    mkdir -p qemu-build-tcg && cd qemu-build-tcg && \
+    if [ ! -f config.status ]; then \
+        rm -rf ./* && \
+        /var/cache/qemu/qemu-${QEMU_VERSION}/configure \
+            --prefix=/opt/qemu-tcg \
+            --enable-tcg \
+            ${QEMU_FLAGS}; \
     fi && \
     make -j${JOBS} && \
     make install
@@ -132,11 +230,22 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
     cp /var/cache/qemu/qemu-${QEMU_VERSION}/pc-bios/vgabios-stdvga.bin /build/pc-bios/
 
 # Fail the build here, not in a lane three phases later, if this configuration did not
-# produce the devices and tools the image ships.
-RUN /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'vhost-user-blk-pci' && \
-    test -x /opt/qemu/bin/qemu-storage-daemon && \
+# produce the devices, the tools and the two accelerators the image ships.
+#
+# The last two lines are the split itself: the binary a tenant's host runs must refuse to
+# emulate, and CI's must be able to. Neither is visible in a file listing, and getting them
+# backwards is a fleet that quietly runs at a tenth of the speed or a CI lane that cannot
+# boot at all.
+RUN /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'virtio-blk-pci' && \
+    /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'virtio-net-pci' && \
+    ! /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -qE '^name "(e1000e?|rtl8139|pcnet|vmxnet3|igb|ne2k_pci|tulip)"' && \
+    /opt/qemu/bin/qemu-system-x86_64 -machine help | grep -q '^q35 ' && \
+    ! /opt/qemu/bin/qemu-system-x86_64 -machine help | grep -q '^pc-i440fx' && \
     test -x /opt/qemu/bin/qemu-img && \
-    /opt/qemu/bin/qemu-system-x86_64 --version
+    /opt/qemu/bin/qemu-system-x86_64 --version && \
+    /opt/qemu-tcg/bin/qemu-system-x86_64 --version && \
+    ! /opt/qemu/bin/qemu-system-x86_64 -accel help | grep -qx tcg && \
+    /opt/qemu-tcg/bin/qemu-system-x86_64 -accel help | grep -qx tcg
 
 # ============================================
 # Runtime image (used by the integration lane)
@@ -167,10 +276,22 @@ RUN --mount=type=cache,sharing=locked,id=qemu-runtime-aptlib,target=/var/lib/apt
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/qemu/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64
-COPY --from=builder /opt/qemu/bin/qemu-storage-daemon /usr/local/bin/qemu-storage-daemon
+COPY --from=builder /opt/qemu-tcg/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64-tcg
 COPY --from=builder /opt/qemu/bin/qemu-img /usr/local/bin/qemu-img
 COPY --from=builder /opt/qemu/bin/qemu-nbd /usr/local/bin/qemu-nbd
-COPY --from=builder /opt/qemu/share/qemu/ /usr/share/spin-stack/qemu/
+# The firmware this project boots with, and not `share/qemu/` — that directory is 331 MB,
+# of which 317 MB is edk2 for aarch64, arm, riscv and loongarch, in a build whose target
+# list is x86_64-softmmu. `task qemu:tools` copies this tree out of the image on every
+# developer machine and every CI run, so the whole of it was moving on every run.
+#
+# The same five files the extract stage below takes, and that set is proven by execution:
+# every demo boots a real guest against it.
+COPY --from=builder /opt/qemu/share/qemu/bios.bin /usr/share/spin-stack/qemu/bios.bin
+COPY --from=builder /opt/qemu/share/qemu/bios-256k.bin /usr/share/spin-stack/qemu/bios-256k.bin
+COPY --from=builder /opt/qemu/share/qemu/pvh.bin /usr/share/spin-stack/qemu/pvh.bin
+COPY --from=builder /opt/qemu/share/qemu/efi-virtio.rom /usr/share/spin-stack/qemu/efi-virtio.rom
+COPY --from=builder /build/pc-bios/kvmvapic.bin /usr/share/spin-stack/qemu/kvmvapic.bin
+COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /usr/share/spin-stack/qemu/vgabios-stdvga.bin
 
 ENTRYPOINT ["/usr/local/bin/qemu-system-x86_64"]
 
@@ -180,12 +301,13 @@ ENTRYPOINT ["/usr/local/bin/qemu-system-x86_64"]
 FROM scratch AS extract
 
 COPY --from=builder /opt/qemu/bin/qemu-system-x86_64 /bin/qemu-system-x86_64
-COPY --from=builder /opt/qemu/bin/qemu-storage-daemon /bin/qemu-storage-daemon
+COPY --from=builder /opt/qemu-tcg/bin/qemu-system-x86_64 /bin/qemu-system-x86_64-tcg
 COPY --from=builder /opt/qemu/bin/qemu-img /bin/qemu-img
 COPY --from=builder /opt/qemu/bin/qemu-nbd /bin/qemu-nbd
 COPY --from=builder /opt/qemu/share/qemu/bios.bin /share/spin-stack/qemu/bios.bin
 COPY --from=builder /opt/qemu/share/qemu/bios-256k.bin /share/spin-stack/qemu/bios-256k.bin
 COPY --from=builder /opt/qemu/share/qemu/pvh.bin /share/spin-stack/qemu/pvh.bin
+COPY --from=builder /opt/qemu/share/qemu/efi-virtio.rom /share/spin-stack/qemu/efi-virtio.rom
 COPY --from=builder /build/pc-bios/kvmvapic.bin /share/spin-stack/qemu/kvmvapic.bin
 COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /share/spin-stack/qemu/vgabios-stdvga.bin
 # pvh.bin above is the one that matters for the guest lane: the kernel we boot is an ELF
@@ -193,3 +315,16 @@ COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /share/spin-stack/qemu/vga
 # no bzImage boot protocol. linuxboot_dma.bin is deliberately NOT extracted: it is the
 # option ROM for a *bzImage* boot, which nothing here does. Verified by execution: the
 # guest boots with this exact set and boots identically with linuxboot_dma.bin removed.
+#
+# efi-virtio.rom is the sixth file and the one that is not about booting: a NIC whose
+# option ROM is missing does not slow a VM down, it stops it from starting at all —
+# `failed to find romfile`, at realize, before any guest code runs. That is how the first
+# cut of this list was found to be wrong, and virtio-net is the one card this build keeps
+# (hack/qemu-devices.mak). Every other card's model is gone, so no other ROM can be asked
+# for; a caller that adds one back has to add its ROM here too.
+#
+# `-net none` is on every demo's machine line for the same argument one level down: a card
+# nobody attaches is still a device the guest enumerates.
+#
+# Shipping the whole pc-bios tree instead is how 317 MB of firmware for aarch64, riscv and
+# loongarch ended up in an image whose target list is x86_64-softmmu.

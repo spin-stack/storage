@@ -26,7 +26,11 @@ OUT=$ROOT/_output
 
 # The pinned artefacts. Every one of them has a task that produces it, named in the
 # error, because "missing file" is not something a reader can act on.
+# Two binaries, and which one runs is the same decision as which accelerator: the
+# production build has no TCG compiled in at all, so it is not a binary a machine without
+# KVM can run slowly — it is one that will not start. See ACCEL below.
 QEMU=$OUT/bin/qemu-system-x86_64
+QEMU_TCG=$OUT/bin/qemu-system-x86_64-tcg
 QEMU_IMG=$OUT/bin/qemu-img
 KERNEL=$OUT/guest/vmlinux
 INITRAMFS=$OUT/guest/initramfs.cpio.gz
@@ -40,14 +44,15 @@ DB=${DB:-${DEMO_NAME}_$$}
 
 DIR=${DEMO_DIR:-$(mktemp -d /tmp/${DEMO_NAME}-XXXXXX)}
 SIZE=${SIZE:-268435456}
-# `kvm:tcg` and not `kvm`: QEMU takes KVM where the caller can open /dev/kvm and falls
-# back to emulation where it cannot, which is a developer not in the `kvm` group and every
-# hosted CI runner. What Stage 1 demonstrates is a Linux guest reaching a qcow2 through
-# virtio, and that is true at either speed; refusing to run without KVM would make the one
-# command a human runs unrunnable on most of the machines that would run it.
-# Chosen here rather than left to QEMU's `kvm:tcg` fallback list, which picks the same
-# thing and says nothing. The silence is the problem: a machine that should have KVM and
-# does not — a developer outside the `kvm` group, a runner that lost nested virt — runs
+# Emulation is allowed here and nowhere else. What a demo demonstrates is a Linux guest
+# reaching a qcow2 through virtio, and that is true at either speed; refusing to run
+# without KVM would make the one command a human runs unrunnable on a developer outside
+# the `kvm` group and on every hosted CI runner. A host serving tenants is the opposite
+# case, which is why the binary it runs has no TCG in it at all (Dockerfile.qemu).
+#
+# Chosen here rather than left to QEMU's `kvm:tcg` fallback list, which would pick the
+# same thing and say nothing. The silence is the problem: a machine that should have KVM
+# and does not — a developer outside the group, a runner that lost nested virt — runs
 # emulated at a tenth of the speed, and every timing the run prints is a measurement of
 # something else. Several numbers in this repository's comments came out of these demos.
 if [ -z "${ACCEL:-}" ]; then
@@ -57,15 +62,19 @@ if [ -z "${ACCEL:-}" ]; then
     ACCEL=tcg
   fi
 fi
+# And the binary follows the accelerator, because only one of the two carries TCG.
+if [ "$ACCEL" = tcg ]; then
+  QEMU=$QEMU_TCG
+fi
 
 say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 
 need() { test -x "$1" || test -f "$1" || die "missing $1 — run: $2"; }
-need "$QEMU"      "task build:qemu"
-need "$QEMU_IMG"  "task build:qemu"
-need "$KERNEL"    "task fetch:kernel"
-need "$INITRAMFS" "task build:guest"
+need "$QEMU"      "task qemu:build"
+need "$QEMU_IMG"  "task qemu:build"
+need "$KERNEL"    "task guest:kernel:fetch"
+need "$INITRAMFS" "task guest:build"
 need "$CP"        "task build:cmd"
 need "$AGENT"     "task build:cmd"
 docker exec "$PGC" true 2>/dev/null || die "no Postgres container named $PGC — run: task db:dev:up"

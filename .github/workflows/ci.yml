@@ -112,11 +112,12 @@ jobs:
   # silently skips when they are missing is the defect this whole file is shaped against.
   # Here their absence is a red job with a name that says which one.
   #
-  # No KVM is asked for. hack/demo-lib.sh takes `kvm:tcg`, so a runner without
-  # /dev/kvm emulates instead — slower, and the same code path through everything this
-  # lane is actually about. Measured under TCG on a developer machine: stage1 in 5s, all
-  # four well under a minute; the timeout below is a ceiling for a two-core runner, not a
-  # budget.
+  # No KVM is asked for, and this is the lane the second QEMU binary exists for: with no
+  # /dev/kvm, hack/demo-lib.sh runs qemu-system-x86_64-tcg and emulates — slower, and the
+  # same code path through everything this lane is actually about. The production binary
+  # has no TCG compiled in and would refuse here, which is the point of building two.
+  # Measured under TCG on a developer machine: stage1 in 5s, all four well under a minute;
+  # the timeout below is a ceiling for a two-core runner, not a budget.
   guest:
     runs-on: ubuntu-latest
     permissions:
@@ -171,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
           tag=$(task guest:kernel:tag)
-          task fetch:kernel GUEST_KERNEL_IMAGE=ghcr.io/${{ github.repository }}/guest-kernel:"$tag"
+          task guest:kernel:fetch GUEST_KERNEL_IMAGE=ghcr.io/${{ github.repository }}/guest-kernel:"$tag"
 
       # Asserts the lane's inputs before anything boots: the kernel is the one that was
       # pinned, is a PVH ELF, carries the four config options a boot depends on, and the

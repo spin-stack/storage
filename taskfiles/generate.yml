@@ -1,0 +1,66 @@
+version: "3"
+
+# Generated code: sqlc from the schema and the queries, buf from the protobuf schema.
+# Both have a `:check` twin, because generated code that is committed and stale is a
+# source file nobody wrote and nobody reviewed. `lint:proto` is here rather than with the
+# other linters: what it guards is the wire, which is this file's subject.
+
+tasks:
+
+  generate:
+    desc: Regenerate every committed generated artifact (sqlc + protobuf/Connect).
+    cmds:
+      - task: generate:sqlc
+      - task: generate:proto
+
+  generate:check:
+    desc: Fail if any committed generated output is stale.
+    cmds:
+      - task: generate:sqlc:check
+      - task: generate:proto:check
+
+  generate:sqlc:
+    desc: Regenerate sqlc code from schema + queries.
+    deps: [tools:sqlc]
+    cmds:
+      - "{{.TOOLS_BIN}}/sqlc generate"
+
+  generate:sqlc:check:
+    desc: Fail if the committed sqlc output is stale (generate produced a diff).
+    deps: [tools:sqlc]
+    cmds:
+      - "{{.TOOLS_BIN}}/sqlc generate"
+      # Only the generated files: hand-written tests living in internal/db must not
+      # make this fail (it is about staleness, not about uncommitted work).
+      - git diff --exit-code -- 'internal/db/*.go' ':!internal/db/*_test.go'
+
+  generate:proto:
+    desc: Regenerate the protobuf + Connect stubs in api/gen (ADR-0018).
+    deps: [tools:buf, tools:protoc-plugins]
+    dir: api
+    cmds:
+      - "{{.TOOLS_BIN}}/buf generate"
+
+  generate:proto:check:
+    desc: Fail if the committed protobuf/Connect output is stale.
+    deps: [tools:buf, tools:protoc-plugins]
+    cmds:
+      - task: generate:proto
+      - git diff --exit-code -- api/gen
+
+  lint:proto:
+    desc: Lint and format-check the protobuf schema (buf STANDARD).
+    deps: [tools:buf]
+    dir: api
+    cmds:
+      - "{{.TOOLS_BIN}}/buf lint"
+      - "{{.TOOLS_BIN}}/buf format --diff --exit-code"
+      # buf.yaml has declared `breaking: use: [FILE]` since the schema existed and
+      # nothing ran it, so the strictest compatibility level in the file was a
+      # preference nobody was held to. FILE is the level that catches a rename, which
+      # is the change that looks like a refactor and is not: the field number survives
+      # it, and every generated accessor and every JSON key does not.
+      #
+      # Against main and not against a tag: main is what spin will be built against.
+      # It needs the history, which is why ci.yml checks out with fetch-depth 0.
+      - "{{.TOOLS_BIN}}/buf breaking --against '../.git#branch=main,subdir=api'"

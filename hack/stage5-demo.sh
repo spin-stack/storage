@@ -43,6 +43,7 @@ say "3. a Linux guest boots off it and starts writing"
 mkfifo "$DIR/ctl"
 exec 9<>"$DIR/ctl"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=$CHURN" \

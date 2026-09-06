@@ -45,6 +45,7 @@ FIRST=$(cat "$POINTER")
 mkfifo "$DIR/ctl"
 exec 9<>"$DIR/ctl"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=$CHURN" \
@@ -139,6 +140,7 @@ echo "    qemu-img check: every downloaded layer is sound"
 
 say "9. a guest reads back what a guest on a host that no longer exists wrote"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+  -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=verify" \

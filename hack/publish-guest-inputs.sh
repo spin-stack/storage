@@ -206,7 +206,7 @@ check_docker() {
 # The one precondition that genuinely needs a human, and the reason this task cannot be a
 # workflow: storage does not build a kernel (ADR-0021). It has to come off a machine that
 # has spinbox's already-built artefact, either at the canonical path (a previous `task
-# fetch:kernel`) or in a sibling checkout.
+# guest:kernel:fetch`) or in a sibling checkout.
 check_kernel() {
 	if [ -z "$KERNEL_SHA256" ]; then
 		missing "GUEST_KERNEL_SHA256" \
@@ -315,7 +315,7 @@ cmd_publish() {
 	if published "$qemu_image" && readable_by_ci "$qemu_image"; then
 		echo "QEMU runtime image: already published ($qemu_image)"
 	else
-		# Dispatch rather than build. A local `task build:qemu:push` is tens of minutes
+		# Dispatch rather than build. A local `task qemu:push` is tens of minutes
 		# with a cold cache and produces the same image the workflow does — from the same
 		# Taskfile target, with the same pinned version — while the workflow has the shared
 		# BuildKit cache and does not hold a laptop hostage.
@@ -333,7 +333,7 @@ cmd_publish() {
 		echo "guest kernel: publishing $kernel_source as $kernel_image"
 		# Through the Taskfile target, not through a second buildx invocation: the image's
 		# shape (one file on scratch, the source label that links the package to the
-		# repository) is defined once, at `guest:kernel:push`, and `task fetch:kernel`
+		# repository) is defined once, at `guest:kernel:push`, and `task guest:kernel:fetch`
 		# depends on that shape.
 		$TASK_EXE guest:kernel:push \
 			"GUEST_KERNEL_IMAGE=$REGISTRY/$REPO/guest-kernel" \

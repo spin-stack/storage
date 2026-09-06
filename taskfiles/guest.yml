@@ -1,0 +1,143 @@
+version: "3"
+
+# The guest lane's two artefacts: the initramfs, which is built here from a static Go
+# /init, and the kernel, which is not — it is spinbox's output, consumed and never
+# compiled here. `guest:kernel:fetch` is the one path a kernel arrives by; nothing else
+# resolves one.
+
+tasks:
+
+  guest:build:
+    desc: Build the initramfs the guest lane boots (a static Go /init). The kernel comes from `task guest:kernel:fetch`.
+    sources:
+      - integration/guestinit/**/*.go
+      - hack/build-guest-initramfs.sh
+    generates:
+      - '{{.OUTPUT_DIR}}/guest/initramfs.cpio.gz'
+    cmds:
+      - OUT_DIR={{.OUTPUT_DIR}}/guest bash hack/build-guest-initramfs.sh
+
+  guest:kernel:fetch:
+    desc: >-
+      Put the pinned guest kernel at _output/guest/vmlinux, from a sibling spinbox
+      checkout or from the mirrored image (ADR-0022). Idempotent; storage never builds one.
+    env: &guest_kernel_env
+      KERNEL: '{{.GUEST_KERNEL}}'
+      KERNEL_SHA256: '{{.GUEST_KERNEL_SHA256}}'
+      KERNEL_VERSION: '{{.GUEST_KERNEL_VERSION}}'
+      SPINBOX_KERNEL: '{{.SPINBOX_KERNEL}}'
+      KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE}}'
+    cmds:
+      - bash hack/guest-kernel.sh fetch
+
+  guest:verify:
+    desc: Assert the guest lane's inputs — the initramfs we build, and that the kernel is the one we pinned.
+    deps: [guest:build, guest:kernel:fetch]
+    env: *guest_kernel_env
+    cmds:
+      # The artefact is opened, not stat'ed: `test -f` says OK for a zero-byte file, a
+      # half-written one and an archive with no /init, and `guest:build` fingerprints its
+      # *sources*, so a truncated artefact is "up to date" (verified 2026-08-04 by emptying
+      # the file: the old target printed OK and exited 0). cpio is required, not optional.
+      - |
+        set -euo pipefail
+        img={{.OUTPUT_DIR}}/guest/initramfs.cpio.gz
+        test -f "$img" || { echo "no initramfs at $img — run: task guest:build" >&2; exit 1; }
+        command -v cpio >/dev/null || {
+          echo "cpio is missing, so $img cannot be inspected (apt-get install cpio)" >&2; exit 1; }
+        gzip -t "$img" 2>/dev/null || {
+          echo "$img is not a valid gzip stream — a truncated or interrupted build; rebuild: task guest:build" >&2
+          exit 1; }
+        # ./init is the whole contract with the kernel: it mounts the archive as rootfs and
+        # execs /init, and an archive without one panics with "no working init found",
+        # which reads like a kernel problem rather than a missing build step.
+        listing=$(gzip -dc "$img" | cpio --list --quiet 2>/dev/null || true)
+        grep -qE '^(\./)?init$' <<<"$listing" || {
+          echo "$img contains no ./init — the kernel would mount it and panic with no PID 1; rebuild: task guest:build" >&2
+          exit 1; }
+        echo "OK: $img — gzip cpio carrying ./init"
+      - bash hack/guest-kernel.sh verify
+
+  guest:kernel:pin:
+    desc: "Print the sha256 of a kernel artefact, for bumping GUEST_KERNEL_SHA256. Usage: task guest:kernel:pin -- <file>"
+    env: *guest_kernel_env
+    cmds:
+      - bash hack/guest-kernel.sh pin {{.CLI_ARGS}}
+
+  guest:kernel:tag:
+    desc: >-
+      Print the content tag of the pinned guest kernel (sha256-<pin>) — the tag
+      `guest:kernel:push` publishes alongside the version. CI resolves the mirror from
+      this so no workflow spells the pin out a second time, and the tag is
+      content-addressed for the same reason ADR-0022 pins by hash: a tag that can be
+      moved is a kernel that can be swapped under a lane that already certified it.
+    silent: true
+    cmds:
+      - echo "sha256-{{.GUEST_KERNEL_SHA256}}"
+
+  guest:kernel:push:
+    desc: >-
+      Mirror the pinned kernel into a registry so machines with no spinbox checkout can
+      run the lane (ADR-0022). Usage:
+      task guest:kernel:push GUEST_KERNEL_IMAGE=ghcr.io/<owner>/<repo>/guest-kernel
+      Requires a `docker login` to that registry.
+    deps: [guest:kernel:fetch]
+    cmds:
+      - |
+        set -euo pipefail
+        test -n "{{.GUEST_KERNEL_IMAGE}}" || {
+          echo "set GUEST_KERNEL_IMAGE=<registry>/<path>/guest-kernel"; exit 1; }
+        # A build context holding exactly the artefact: the image is one file on
+        # scratch, so its digest is a hash of the kernel and of nothing else.
+        ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
+        cp {{.GUEST_KERNEL}} "$ctx/vmlinux"
+        # org.opencontainers.image.source links a ghcr.io package to a repository — and
+        # only when Actions is the pusher; see readable_by_ci in
+        # hack/publish-guest-inputs.sh. Derived from the target path rather than
+        # configured: the only namespace CI resolves is ghcr.io/<owner>/<repo>/...
+        # Same derivation in qemu:push.
+        src=""
+        case "{{.GUEST_KERNEL_IMAGE}}" in
+          ghcr.io/*/*/*) slug={{.GUEST_KERNEL_IMAGE}}; slug=${slug#ghcr.io/}; slug=${slug%/*}
+                         src="--label org.opencontainers.image.source=https://github.com/$slug" ;;
+        esac
+        docker buildx build \
+          --file Dockerfile.guest-kernel \
+          --target package \
+          --platform linux/amd64 \
+          $src \
+          --tag {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}} \
+          --tag {{.GUEST_KERNEL_IMAGE}}:sha256-{{.GUEST_KERNEL_SHA256}} \
+          --push \
+          "$ctx"
+        echo
+        echo "pull it back with the digest, not the tag:"
+        echo "  task guest:kernel:fetch GUEST_KERNEL_IMAGE={{.GUEST_KERNEL_IMAGE}}@\$(docker buildx imagetools inspect --format '{{`{{.Manifest.Digest}}`}}' {{.GUEST_KERNEL_IMAGE}}:{{.GUEST_KERNEL_VERSION}})"
+
+  # The two artefacts CI's guest job needs and this repository does not build: the pinned
+  # QEMU and the pinned kernel. `guest:inputs:check` names every input publishing them
+  # needs; `guest:inputs:publish` performs the procedure rather than documenting it.
+
+  guest:inputs:check:
+    desc: >-
+      Name every input publishing the guest artefacts needs (gh, a token with
+      write:packages, docker, the pinned kernel), and say which are missing. No side effects.
+    env: &publish_guest_env
+      REPO: '{{.REPO | default ""}}'
+      KERNEL: '{{.GUEST_KERNEL}}'
+      KERNEL_SHA256: '{{.GUEST_KERNEL_SHA256}}'
+      KERNEL_VERSION: '{{.GUEST_KERNEL_VERSION}}'
+      SPINBOX_KERNEL: '{{.SPINBOX_KERNEL}}'
+      QEMU_VERSION: '{{.QEMU_VERSION}}'
+      TASK_EXE: '{{.TASK_EXE}}'
+    cmds:
+      - bash hack/publish-guest-inputs.sh check
+
+  guest:inputs:publish:
+    desc: >-
+      Publish both guest artefacts — the pinned QEMU image (by dispatching the QEMU
+      workflow) and the pinned guest kernel — then verify both resolve. Idempotent.
+      Usage: task guest:inputs:publish REPO=<owner>/<repo>
+    env: *publish_guest_env
+    cmds:
+      - bash hack/publish-guest-inputs.sh publish

@@ -20,7 +20,7 @@ digraph G {
   agent  [label="Volume Agent\ndoes NOT launch the VM: it prepares the chain and speaks QMP\nrotates by size, by the RPO age target, or when a snapshot asks\npublishes · recovers", fillcolor="#eef2f7"];
   state  [label="state.json\ncommits this host holds · sealed layer not yet published\nthe epoch it last held · fencing record"];
   cp     [label="Control Plane\nterm-guarded catalogue · desired state\nleases · GetVolumeKeys"];
-  kms    [label="KMS / Vault (KEK)\nwrapped DEK, bound to the volume"];
+  kms    [label="KMS / Vault (KEK)\none key for the fleet: this host reads the file the CP read\nwrapped DEK, bound to the volume"];
   s3     [label="Object store\nlayers/sha256/… (immutable, content-addressed)\nvolumes/<id>/commits/<commit>.json (create-only)\nvolumes/<id>/HEAD (the one mutable object, under CAS)\nvolumes/<id>/epoch · descriptor.json", fillcolor="#eef2f7"];
 
   guest -> qemu   [label="  READ · WRITE · FLUSH"];
