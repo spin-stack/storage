@@ -23,7 +23,7 @@ ARG JOBS=8
 # Bump when the configure flags or hack/qemu-devices.mak change: the build directories
 # live in cache mounts and configure only runs when one holds no config.status, so
 # without this a flag change would silently reuse the previous configuration.
-ARG QEMU_CONFIG_REV=4
+ARG QEMU_CONFIG_REV=6
 ARG DEBIAN_FRONTEND=noninteractive
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -237,6 +237,8 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
 # backwards is a fleet that quietly runs at a tenth of the speed or a CI lane that cannot
 # boot at all.
 RUN /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'virtio-blk-pci' && \
+    /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'virtio-net-pci' && \
+    ! /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -qE '^name "(e1000e?|rtl8139|pcnet|vmxnet3|igb|ne2k_pci|tulip)"' && \
     /opt/qemu/bin/qemu-system-x86_64 -machine help | grep -q '^q35 ' && \
     ! /opt/qemu/bin/qemu-system-x86_64 -machine help | grep -q '^pc-i440fx' && \
     test -x /opt/qemu/bin/qemu-img && \
@@ -287,6 +289,7 @@ COPY --from=builder /opt/qemu/bin/qemu-nbd /usr/local/bin/qemu-nbd
 COPY --from=builder /opt/qemu/share/qemu/bios.bin /usr/share/spin-stack/qemu/bios.bin
 COPY --from=builder /opt/qemu/share/qemu/bios-256k.bin /usr/share/spin-stack/qemu/bios-256k.bin
 COPY --from=builder /opt/qemu/share/qemu/pvh.bin /usr/share/spin-stack/qemu/pvh.bin
+COPY --from=builder /opt/qemu/share/qemu/efi-virtio.rom /usr/share/spin-stack/qemu/efi-virtio.rom
 COPY --from=builder /build/pc-bios/kvmvapic.bin /usr/share/spin-stack/qemu/kvmvapic.bin
 COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /usr/share/spin-stack/qemu/vgabios-stdvga.bin
 
@@ -304,6 +307,7 @@ COPY --from=builder /opt/qemu/bin/qemu-nbd /bin/qemu-nbd
 COPY --from=builder /opt/qemu/share/qemu/bios.bin /share/spin-stack/qemu/bios.bin
 COPY --from=builder /opt/qemu/share/qemu/bios-256k.bin /share/spin-stack/qemu/bios-256k.bin
 COPY --from=builder /opt/qemu/share/qemu/pvh.bin /share/spin-stack/qemu/pvh.bin
+COPY --from=builder /opt/qemu/share/qemu/efi-virtio.rom /share/spin-stack/qemu/efi-virtio.rom
 COPY --from=builder /build/pc-bios/kvmvapic.bin /share/spin-stack/qemu/kvmvapic.bin
 COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /share/spin-stack/qemu/vgabios-stdvga.bin
 # pvh.bin above is the one that matters for the guest lane: the kernel we boot is an ELF
@@ -312,9 +316,15 @@ COPY --from=builder /build/pc-bios/vgabios-stdvga.bin /share/spin-stack/qemu/vga
 # option ROM for a *bzImage* boot, which nothing here does. Verified by execution: the
 # guest boots with this exact set and boots identically with linuxboot_dma.bin removed.
 #
-# The set is what a q35 with `-net none` needs, and that flag is now in every demo for this
-# reason: q35 creates a default e1000e otherwise, and QEMU dies at start-up with `failed to
-# find romfile "efi-e1000e.rom"` — one more file to ship for a NIC no guest here is given.
-# A caller that does attach an emulated NIC has to add its option ROM above. Shipping the
-# whole pc-bios tree instead is how 317 MB of firmware for aarch64, riscv and loongarch
-# ended up in an image whose target list is x86_64-softmmu.
+# efi-virtio.rom is the sixth file and the one that is not about booting: a NIC whose
+# option ROM is missing does not slow a VM down, it stops it from starting at all —
+# `failed to find romfile`, at realize, before any guest code runs. That is how the first
+# cut of this list was found to be wrong, and virtio-net is the one card this build keeps
+# (hack/qemu-devices.mak). Every other card's model is gone, so no other ROM can be asked
+# for; a caller that adds one back has to add its ROM here too.
+#
+# `-net none` is on every demo's machine line for the same argument one level down: a card
+# nobody attaches is still a device the guest enumerates.
+#
+# Shipping the whole pc-bios tree instead is how 317 MB of firmware for aarch64, riscv and
+# loongarch ended up in an image whose target list is x86_64-softmmu.

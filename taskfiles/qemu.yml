@@ -56,6 +56,10 @@ tasks:
         # reads like a backend bug.
         test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin || {
           echo "missing pvh.bin — a direct kernel boot (-kernel) cannot work; rebuild with: task qemu:build"; exit 1; }
+        # The option ROM of the one NIC this build keeps. A device model without its ROM is
+        # a VM that dies at start-up, and no lane here attaches a NIC to find out.
+        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/efi-virtio.rom || {
+          echo "missing efi-virtio.rom — a VM given a virtio-net-pci cannot start; rebuild with: task qemu:build"; exit 1; }
         echo "OK: the extracted tree carries both qemu-system binaries, qemu-img and the firmware (incl. pvh)"
       - task: qemu:verify:behaviour
 
@@ -107,6 +111,19 @@ tasks:
           "$tcgbin" -accel help | grep -qx tcg || {
             echo "$tcgbin cannot emulate, so a runner without /dev/kvm has nothing to boot with"; exit 1; }
           echo "OK: the production binary refuses to emulate and the CI one can"
+          # And the one network card this build keeps actually starts, against the firmware
+          # tree the lanes pass with -L. This is the assertion the firmware trim needed and
+          # did not have: a NIC whose option ROM is not shipped fails at *start-up* with
+          # `failed to find romfile`, and nothing here attaches a NIC, so no lane would have
+          # noticed until spin's runner did. Emulated on purpose — loading a ROM has nothing
+          # to do with the accelerator, and this must run where there is no /dev/kvm.
+          fw={{.OUTPUT_DIR}}/share/spin-stack/qemu
+          nic=$(printf '{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n' | \
+            "$tcgbin" -machine q35,accel=tcg -m 64 -display none -serial none -monitor none \
+              -L "$fw" -netdev socket,id=n0,listen=127.0.0.1:0 \
+              -device virtio-net-pci,netdev=n0 -qmp stdio 2>&1 >/dev/null) || {
+            echo "a VM with the one NIC this build keeps does not start: $nic"; exit 1; }
+          echo "OK: a VM with virtio-net-pci starts against the shipped firmware"
         fi
         echo "OK: $(printf '%s' "$out" | head -1), virtio-blk-pci present — verified in $where"
 
