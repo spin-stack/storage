@@ -41,13 +41,14 @@ digraph G {
   }
 
   s3  [label="Object store (S3 or filesystem)\nimmutable layers · create-only manifests · HEAD under CAS\nthe AUTHORITY on what survives losing a host", fillcolor="#eef2f7"];
-  kms [label="KMS / Vault\nTHIS host's KEK (-kek-file)"];
+  kms [label="KMS / Vault\none KEK for the fleet (-kek-file)\nthe Control Plane wraps with it, every host unwraps with it"];
 
   cli -> cp [label="  Connect/gRPC"];
   cp  -> agentA [label="  desired state · epoch\l  heartbeat every N s → lease\l"];
   cp  -> agentB [label="  (same channel)"];
   cp  -> agentA [label="  GetVolumeKeys → the WRAPPED DEK\l  (the CP never sees the KEK nor the key in the clear)\l", style=dashed];
-  kms -> agentA [label="  unwrap, bound to the volume\l  (another volume's DEK opens nothing)\l", style=dashed];
+  kms -> cp [label="  the CP wraps each volume's DEK at provision\l  and records which key did it (kek_id)\l", style=dashed];
+  kms -> agentA [label="  the same key unwraps it here, bound to the volume\l  (another volume's DEK opens nothing, and a host that\l  read a different file refuses the volume)\l", style=dashed];
 
   agentA -> runnerA [label="  the contract is two paths:\l  active/current (which qcow2 to open)\l  qmp.sock (where the Agent finds it)\l", style=dashed];
   agentA -> s3 [label="  publishes: layer → manifest → CAS on HEAD"];

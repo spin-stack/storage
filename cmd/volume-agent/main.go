@@ -75,7 +75,8 @@ func run() (err error) {
 			"OTLP/HTTP collector to export metrics to, e.g. http://collector:4318 (empty disables telemetry)")
 		metricsListen = flag.String("metrics-listen", "",
 			"host:port for the operator endpoint: GET /metrics (Prometheus text) and GET /healthz. Empty disables it, and then this process holds no listening socket at all")
-		kekFile = flag.String("kek-file", "", "path to this host's 32-byte key-encryption key (§15.1). Without it the Agent holds no key material, which is dev mode only")
+		kekFile = flag.String("kek-file", "",
+			"path to the fleet's 32-byte key-encryption key: the same key the Control Plane wrapped the DEKs under, or this Agent can open nothing. Without it the Agent holds no key material, which is dev mode only")
 		qemuImg = flag.String("qemu-img", "",
 			"path to the pinned qemu-img binary, which creates and inspects every qcow2 chain (required)")
 		probeTimeout = flag.Duration("qemu-timeout", 5*time.Second,
