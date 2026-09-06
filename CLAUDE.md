@@ -126,9 +126,11 @@ concurrency to the caller.
 ## Stack
 
 **Go 1.26**, module `github.com/spin-stack/storage`; conventions mirror `spin`/`spinbox`.
-Taskfile (go-task), golangci-lint v2, OpenTelemetry v1.38.x, QEMU pinned 11.1.1 (CI and
-prod). Layout: `internal/`, `cmd/`, `api/` (proto), `integration/`, `hack/`, `deploy/`,
-`migrations/`, `internal/schema/`, `internal/db/` (generated).
+Taskfile (go-task), golangci-lint v2, OpenTelemetry v1.38.x, QEMU pinned 11.1.1, built
+twice from one flag list — the binary a host runs has no TCG in it, and
+`qemu-system-x86_64-tcg` is for CI, where there is no `/dev/kvm`. Layout: `internal/`,
+`cmd/`, `api/` (proto), `integration/`, `hack/`, `deploy/`, `migrations/`,
+`internal/schema/`, `internal/db/` (generated).
 
 **Everything goes through Taskfile targets.** Versions pinned in `Taskfile.yml`,
 installed into `./.tools/bin` by `task tools`; CI runs the same tasks. Never invoke
