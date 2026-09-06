@@ -1,0 +1,57 @@
+// What process runs where, and what it promises whom. Source of deployment_v6.svg.
+//
+// Generated with `task diagrams`; the SVG is output and is never edited by hand.
+digraph G {
+  rankdir=TB;
+  bgcolor="white";
+  labelloc="t";
+  label="Deployment — v6";
+  fontname="Arial"; fontsize=13;
+  node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#334155",
+        fontname="Arial", fontsize=12, margin="0.18,0.10"];
+  edge [color="#475569", fontname="Arial", fontsize=10];
+
+  cli [label="CLI / API client"];
+
+  subgraph cluster_cp {
+    label="Control Plane (one elected leader · every mutation carries a term guard)";
+    fontname="Arial"; fontsize=11; color="#94a3b8"; style=rounded;
+    cp [label="control-plane\nattach · detach · snapshot · clone · delete\ngc · cordon · rebuild-metadata"];
+    pg [label="PostgreSQL 18\ncatalogue: ownership, epoch, metadata\n(rebuildable from the object store)"];
+    cp -> pg [label="  sqlc / TLS"];
+  }
+
+  subgraph cluster_a {
+    label="Host A";
+    fontname="Arial"; fontsize=11; color="#94a3b8"; style=rounded;
+    agentA  [label="volume-agent\nprepares the chain · rotates · publishes · recovers\npauses the guest when nothing confirms its claim"];
+    runnerA [label="spin's runner\nlaunches QEMU and owns its lifetime (ADR-0021)"];
+    vmA     [label="VMs  ·  QEMU  ·  /dev/vda"];
+    diskA   [label="local NVMe\nlayers/<layer-id>.qcow2 — one store for every volume\nvolumes/<id>/active/current points into it", fillcolor="#eef2f7"];
+    runnerA -> vmA;
+    vmA -> diskA [label="  local I/O"];
+  }
+
+  subgraph cluster_b {
+    label="Host B — not a standby: any other host";
+    fontname="Arial"; fontsize=11; color="#94a3b8"; style=rounded;
+    agentB [label="volume-agent"];
+    diskB  [label="local NVMe\nempty until a volume is granted to it", fillcolor="#eef2f7"];
+    agentB -> diskB [style=invis];
+  }
+
+  s3  [label="Object store (S3 or filesystem)\nimmutable layers · create-only manifests · HEAD under CAS\nthe AUTHORITY on what survives losing a host", fillcolor="#eef2f7"];
+  kms [label="KMS / Vault\nTHIS host's KEK (-kek-file)"];
+
+  cli -> cp [label="  Connect/gRPC"];
+  cp  -> agentA [label="  desired state · epoch\l  heartbeat every N s → lease\l"];
+  cp  -> agentB [label="  (same channel)"];
+  cp  -> agentA [label="  GetVolumeKeys → the WRAPPED DEK\l  (the CP never sees the KEK nor the key in the clear)\l", style=dashed];
+  kms -> agentA [label="  unwrap, bound to the volume\l  (another volume's DEK opens nothing)\l", style=dashed];
+
+  agentA -> runnerA [label="  the contract is two paths:\l  active/current (which qcow2 to open)\l  qmp.sock (where the Agent finds it)\l", style=dashed];
+  agentA -> s3 [label="  publishes: layer → manifest → CAS on HEAD"];
+  s3 -> agentA [label="  volumes/<id>/epoch: the path that does not run\l  through the CP. With the CP silent it is what says\l  the volume is still this host's; both silent past the\l  grace and the Agent pauses the guest\l", style=dashed, constraint=false];
+  s3 -> agentB [label="  host A is lost → B rebuilds the chain\l  from HEAD, with nothing local\l", style=dashed];
+  s3 -> cp [label="  rebuild-metadata\l  (verifies every descriptor with the KEK)\l", style=dashed, constraint=false];
+}

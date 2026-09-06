@@ -1,0 +1,39 @@
+// One host, and where the bytes go. Source of node_and_flows_v6.svg.
+//
+// Generated with `task diagrams`; the SVG is output and is never edited by hand. The v5
+// version of this diagram described an engine that no longer existed for a month —
+// vhost-user, an encrypted WAL, CoW extents, a batcher — because nothing could notice it
+// had stopped being true. `task diagrams:check` is what notices now.
+digraph G {
+  rankdir=TB;
+  bgcolor="white";
+  labelloc="t";
+  label="Node and flows — v6";
+  fontname="Arial"; fontsize=13;
+  node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#334155",
+        fontname="Arial", fontsize=12, margin="0.18,0.10"];
+  edge [color="#475569", fontname="Arial", fontsize=10];
+
+  guest  [label="Linux guest\n/dev/vda"];
+  qemu   [label="QEMU  ·  virtio-blk\nowns the local CoW format (§7)"];
+  chain  [label="local qcow2 chain\nlayers/<layer-id>.qcow2 — one store for every volume\non the host, so a clone shares its parent's files\nvolumes/<id>/active/current → the tip", fillcolor="#eef2f7"];
+  agent  [label="Volume Agent\ndoes NOT launch the VM: it prepares the chain and speaks QMP\nrotates by size, by the RPO age target, or when a snapshot asks\npublishes · recovers", fillcolor="#eef2f7"];
+  state  [label="state.json\ncommits this host holds · sealed layer not yet published\nthe epoch it last held · fencing record"];
+  cp     [label="Control Plane\nterm-guarded catalogue · desired state\nleases · GetVolumeKeys"];
+  kms    [label="KMS / Vault (KEK)\nwrapped DEK, bound to the volume"];
+  s3     [label="Object store\nlayers/sha256/… (immutable, content-addressed)\nvolumes/<id>/commits/<commit>.json (create-only)\nvolumes/<id>/HEAD (the one mutable object, under CAS)\nvolumes/<id>/epoch · descriptor.json", fillcolor="#eef2f7"];
+
+  guest -> qemu   [label="  READ · WRITE · FLUSH"];
+  qemu  -> chain  [label="  WRITE → qcow2 → ACK\l  FLUSH → fdatasync → ACK\l  (LOCAL durability, §6)\l"];
+  agent -> qemu   [label="  QMP: query-block\l  blockdev-snapshot-sync (rotate)\l  stop (fence, and pause when nothing\l  confirms this host's claim)\l  cont (give the guest back when both\l  paths answer again)\l", style=dashed];
+  agent -> chain  [label="  qemu-img create / info / rebase\l  (no parser of our own, §7)\l", style=dashed];
+  agent -> state  [label="  durable, read on open", style=dashed];
+  cp    -> agent  [label="  desired state · epoch\l  heartbeat / lease\l"];
+  kms   -> agent  [label="  unwrap the DEK\l  (only for as long as the operation lasts)\l", style=dashed];
+  agent -> s3     [label="  COMMIT, always in this order:\l  1. seal the layer with the DEK (64 KiB frames)\l  2. PUT layer\l  3. PUT manifest\l  4. CAS on HEAD  ← the commit exists only here\l"];
+  s3    -> agent  [label="  RECOVERY: read HEAD, walk parent_commit_id,\l  fetch and verify every layer, re-point the backings,\l  a new tip on top\l", style=dashed, constraint=false];
+  s3    -> agent  [label="  volumes/<id>/epoch: the second signal, read over\l  a path that does not run through the CP. Higher than\l  the epoch this host holds → give the volume up;\l  no answer, and no CP either → pause the guest\l", style=dashed, constraint=false];
+
+  { rank=same; state; agent; }
+  { rank=same; cp; kms; }
+}
