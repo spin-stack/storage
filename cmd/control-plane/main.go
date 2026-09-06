@@ -155,6 +155,8 @@ func run() error {
 		// so one write would have two Agents serving it). -attach-host is optional; without
 		// it the placement order decides. controlplane.Place carries the reasoning.
 		detachVolume = flag.String("detach-volume", "", "clear this volume's placement and exit, instead of serving")
+		force        = flag.Bool("force", false,
+			"detach a volume whose host has neither reported it stopped serving it nor gone silent for the dwell — the operator asserting they observed the guest stop")
 		attachVolume = flag.String("attach-volume", "", "place this volume and exit, instead of serving")
 		attachHost   = flag.String("attach-host", "",
 			"with -attach-volume: the host that will serve it (a UUIDv7); empty asks placement to choose")
@@ -377,7 +379,13 @@ func run() error {
 				"epoch", placed.Epoch, "chosen_by", chooser(*attachHost))
 			return nil
 		}
-		if err := md.SetVolumePrimaryHost(ctx, leader.Term, *detachVolume, ""); err != nil {
+		// The dwell is the lease TTL times three, and the multiple is the whole of the
+		// argument: the Agent pauses its own guests after twice the TTL of confirming
+		// nothing (agent.Loop.isolationGrace), so this waits past that with a TTL to
+		// spare for a clock that disagrees. Derived from the same flag, so an operator
+		// who lengthens one lengthens both and the inequality cannot be tuned apart.
+		if err := controlplane.Detach(ctx, md, leader.Term, *detachVolume,
+			3*(*leaseTTL), real.NewClock().Wall(), *force); err != nil {
 			return err
 		}
 		// The Agent finds out on its next GetDesiredState poll, and its teardown is
@@ -385,7 +393,7 @@ func run() error {
 		// an operator who reads "detached" and immediately re-places the volume has
 		// re-created the window this command exists to avoid.
 		slog.Info("volume detached; its host stops serving it on its next poll, and publishes the session's image as it does",
-			"volume_id", *detachVolume)
+			"volume_id", *detachVolume, "forced", *force)
 		return nil
 	}
 

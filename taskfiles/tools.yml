@@ -1,0 +1,71 @@
+version: "3"
+
+# The pinned toolchain. Every tool this repository runs is installed here into
+# ./.tools/bin at the version declared in the root Taskfile's vars, so no task depends on
+# what is on the developer's PATH and CI runs what a laptop runs.
+
+tasks:
+
+  tools:
+    desc: Install every pinned tool into ./.tools/bin (sqlc, pgschema, golangci-lint, buf + proto plugins).
+    cmds:
+      - task: tools:sqlc
+      - task: tools:pgschema
+      - task: tools:golangci
+      - task: tools:buf
+      - task: tools:protoc-plugins
+      - task: tools:deadcode
+
+  tools:sqlc:
+    desc: Install the pinned sqlc.
+    status:
+      - test -x {{.TOOLS_BIN}}/sqlc && {{.TOOLS_BIN}}/sqlc version | grep -q '{{.SQLC_VERSION}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/sqlc-dev/sqlc/cmd/sqlc@{{.SQLC_VERSION}}
+
+  tools:pgschema:
+    desc: Install the pinned pgschema (ADR-0019) — the schema tool.
+    # Built from source at an exact tag rather than downloading a release binary:
+    # the module proxy and go.sum give the same reproducibility a published
+    # checksum would, through the toolchain every other tool here already uses.
+    status:
+      - test -x {{.TOOLS_BIN}}/pgschema && {{.TOOLS_BIN}}/pgschema --help | grep -q '{{.PGSCHEMA_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/pgplex/pgschema@{{.PGSCHEMA_VERSION}}
+
+  tools:golangci:
+    desc: Install the pinned golangci-lint v2.
+    status:
+      - test -x {{.TOOLS_BIN}}/golangci-lint && {{.TOOLS_BIN}}/golangci-lint version | grep -q '{{.GOLANGCI_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_VERSION}}
+
+  tools:buf:
+    desc: Install the pinned buf (ADR-0018) — the only protobuf compiler this project uses.
+    status:
+      - test -x {{.TOOLS_BIN}}/buf && {{.TOOLS_BIN}}/buf --version | grep -q '{{.BUF_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install github.com/bufbuild/buf/cmd/buf@{{.BUF_VERSION}}
+
+  tools:protoc-plugins:
+    desc: Install the pinned protoc-gen-go and protoc-gen-connect-go (ADR-0018).
+    status:
+      - test -x {{.TOOLS_BIN}}/protoc-gen-go && {{.TOOLS_BIN}}/protoc-gen-go --version | grep -q '{{.PROTOC_GEN_GO_VERSION}}'
+      - test -x {{.TOOLS_BIN}}/protoc-gen-connect-go && {{.TOOLS_BIN}}/protoc-gen-connect-go --version | grep -q '{{.PROTOC_GEN_CONNECT_GO_VERSION | trimPrefix "v"}}'
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install google.golang.org/protobuf/cmd/protoc-gen-go@{{.PROTOC_GEN_GO_VERSION}}
+      - GOBIN={{.TOOLS_BIN}} go install connectrpc.com/connect/cmd/protoc-gen-connect-go@{{.PROTOC_GEN_CONNECT_GO_VERSION}}
+
+  tools:deadcode:
+    desc: Install the pinned golang.org/x/tools/cmd/deadcode (the `deadcode` task's analyzer).
+    # The status reads the version out of the built binary rather than trusting the file
+    # exists: `go version -m` prints the module the binary was built from, so a stale
+    # .tools/bin from an older pin reinstalls instead of silently reporting on the wrong
+    # analysis.
+    status:
+      - test -x {{.TOOLS_BIN}}/deadcode && go version -m {{.TOOLS_BIN}}/deadcode | grep -qE 'mod[[:space:]]+golang.org/x/tools[[:space:]]+{{.XTOOLS_VERSION}}'
+    preconditions:
+      - sh: grep -q 'golang.org/x/tools {{.XTOOLS_VERSION}}$' go.mod
+        msg: "XTOOLS_VERSION ({{.XTOOLS_VERSION}}) is not the golang.org/x/tools in go.mod — bump both together."
+    cmds:
+      - GOBIN={{.TOOLS_BIN}} go install golang.org/x/tools/cmd/deadcode@{{.XTOOLS_VERSION}}

@@ -1,0 +1,78 @@
+version: "3"
+
+# The demos are the end-to-end proofs a human runs: real binaries, a real guest, and an
+# assertion at every step. They are what the gate asks for when a new path claims to work,
+# and `soak` is the same scenes on a loop with a seed.
+
+tasks:
+
+  demo:stage1:
+    desc: >-
+      Stage 1 end to end with the real binaries and a real Linux guest: a volume is
+      provisioned, the Agent prepares its qcow2 chain, a guest boots off that file and
+      writes, the Agent is killed and restarted under the running guest, and a second
+      boot reads the bytes back. Needs `task db:dev:up`, KVM, and the pinned artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage1-demo.sh
+
+  demo:stage2:
+    desc: >-
+      Stage 2 end to end: a Linux guest writes continuously while the Agent seals its tip
+      and starts a new layer under it, several times, and a second boot reads every byte
+      back through the resulting chain. Prints the measured snapshot pause, which is what
+      v6 §11's defaults are waiting on. Needs `task db:dev:up`, KVM, and the pinned
+      artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage2-demo.sh
+
+  demo:stage3:
+    desc: >-
+      Stage 3 end to end: a Linux guest writes while the Agent seals each tip and
+      publishes it — layer, immutable manifest, compare-and-set on HEAD — and the bucket
+      is then read back with `cat` to show the chain from HEAD is complete, every layer
+      matches its digest, and none of them carries the guest's bytes in the clear. Needs
+      `task db:dev:up`, KVM, and the pinned artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage3-demo.sh
+
+  demo:stage4:
+    desc: >-
+      Stage 4 end to end: a guest writes and its Agent publishes, then the host is
+      destroyed — the process killed and its whole data directory deleted — and a rebuilt
+      machine with the same host id and an empty disk brings the volume back from the
+      object store alone. A guest then reads what a guest on a host that no longer exists
+      wrote. Needs `task db:dev:up`, KVM, and the pinned artefacts.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage4-demo.sh
+
+  demo:stage5:
+    desc: >-
+      Stage 5 end to end: an operator asks for a snapshot while a guest is writing, the
+      Agent seals the tip because it was asked, and the catalog names a commit the bucket
+      holds.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage5-demo.sh
+
+  demo:stage6:
+    desc: >-
+      Stage 6 end to end: a snapshot is cloned and a second guest boots the clone and reads
+      back the bytes the parent's guest wrote.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/stage6-demo.sh
+
+  soak:
+    desc: >-
+      Run everything, over and over, until something breaks — the DST set across hundreds
+      of seeds, the suites under -race, the three demonstrations with their parameters
+      moved, and one with the Agent killed while it publishes. Runs in a git worktree
+      pinned to a commit, so the checkout it came from can be edited while it runs.
+      SOAK_SEEDS, SOAK_ROUNDS (0 = until stopped), SOAK_REF, SOAK_DIR.
+    deps: [build:cmd, guest:verify]
+    cmds:
+      - DEVDB_PORT={{.DEVDB_PORT}} bash hack/soak.sh

@@ -78,9 +78,58 @@ func (r *fakeReconciler) Apply(_ context.Context, desired []*storagev1.DesiredVo
 			}
 			continue
 		}
+		// An isolation pause survives Apply, the way it does on the real manager: a volume
+		// already being served at this epoch is not started again, so nothing here can
+		// give a guest back. Overwriting it made every assertion that a guest was resumed
+		// pass on the resume that Apply performed, and the loop resumed the wrong set for
+		// as long as that was true.
+		if v, held := r.vols[d.GetVolumeId()]; held && v.Refusal == storagev1.VolumeRefusal_VOLUME_REFUSAL_ISOLATED {
+			continue
+		}
 		r.vols[d.GetVolumeId()] = agent.VolumeStatus{VolumeID: d.GetVolumeId(), Epoch: d.GetEpoch()}
 	}
 	return r.applyErr
+}
+
+// Isolate is the reversible half: the guests stop, the volumes do not move. Recorded and
+// not reproduced — unlike fencing, nothing about a pause changes what the next Apply may
+// do, which is the difference this stand-in has to keep visible.
+func (r *fakeReconciler) Isolate(_ context.Context, volumeIDs []string, paused bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range volumeIDs {
+		v := r.vols[id]
+		v.VolumeID = id
+		if paused {
+			v.Refusal = storagev1.VolumeRefusal_VOLUME_REFUSAL_ISOLATED
+			v.RefusalDetail = "paused: nothing has confirmed this host's claim"
+		} else {
+			v.Refusal, v.RefusalDetail = storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED, ""
+		}
+		r.vols[id] = v
+	}
+	return nil
+}
+
+// paused is the set of volume ids whose guests this host has paused for isolation.
+func (r *fakeReconciler) pausedIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for id, v := range r.vols {
+		if v.Refusal == storagev1.VolumeRefusal_VOLUME_REFUSAL_ISOLATED {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// fencedAt reports whether this volume was given up, which a pause must never do.
+func (r *fakeReconciler) fencedAt(volumeID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.fenced[volumeID]
+	return ok
 }
 
 func (r *fakeReconciler) Fence(_ context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error {
@@ -186,6 +235,12 @@ func (h *leaseHarness) served(t *testing.T) []string {
 		}
 	}
 	return out
+}
+
+// paused is the set of volume ids whose guests are paused for isolation.
+func (h *leaseHarness) paused(t *testing.T) []string {
+	t.Helper()
+	return h.rec.pausedIDs()
 }
 
 func (h *leaseHarness) desire(epoch int64) *storagev1.DesiredVolume {
@@ -503,5 +558,150 @@ func TestARefusedRenewalStopsTheHostServing(t *testing.T) {
 
 	if got := h.served(t); len(got) != 0 {
 		t.Fatalf("the host is still serving %v after the Control Plane refused to renew its lease", got)
+	}
+}
+
+// The third thing a lapsed lease can mean, and the one that had no answer: this host can
+// reach neither the Control Plane nor the object store, so it cannot tell isolation from
+// supersession — and the fleet, seeing the same silence from its side, may be about to
+// place the volume somewhere else.
+//
+// Keeping the guest running is what the two tests above are right to do, and both of them
+// have a fact behind them: a lease still inside its TTL, or a bucket saying the volume is
+// still ours. This case has neither. The host stops guessing and pauses, which is the only
+// move that cannot end with two guests writing one volume — and it is a pause and not a
+// power-off precisely so that being wrong costs a resume.
+func TestAHostThatCanConfirmNothingPausesItsGuests(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	vol := h.desire(1)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+
+	// Both paths go at once, which is what makes this case different from the other two.
+	h.cp.setErr(errUnreachable)
+	h.wit.setErr(errStoreUnreachable)
+
+	// Past the lease TTL, and still inside the grace: the volume is not confirmed and not
+	// confirmed *gone* either, and until the fleet could plausibly have moved it the right
+	// answer is still to serve.
+	h.clk.Advance(31 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+	if paused := h.paused(t); len(paused) != 0 {
+		t.Fatalf("guests paused inside the grace: %v — a blip on both paths is not a partition", paused)
+	}
+	if got := h.served(t); len(got) != 1 {
+		t.Fatalf("the volume was given up inside the grace: served = %v", got)
+	}
+
+	// Past the grace. Nothing has confirmed this host's claim for long enough that the
+	// fleet may be placing the volume elsewhere.
+	h.clk.Advance(30 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+	if paused := h.paused(t); len(paused) != 1 || paused[0] != vol.GetVolumeId() {
+		t.Fatalf("paused = %v, want the one volume: nothing has confirmed it for longer than the grace", paused)
+	}
+
+	// The volume is *not* given up. This host still believes it owns it, and it does: the
+	// pause is a wager on silence, not a fence, and giving the volume up would take the
+	// chain apart and record a fork over a partition that may be about to heal.
+	if given := h.rec.fencedAt(vol.GetVolumeId()); given {
+		t.Fatal("an isolated host gave the volume up; the pause must be reversible")
+	}
+
+	// It heals, and both facts come back: the Control Plane answers, and the bucket still
+	// records the epoch this host holds. Two facts, the same two whose silence paused it.
+	h.cp.setErr(nil)
+	h.wit.setErr(nil)
+	h.wit.grant(vol.GetVolumeId(), 1)
+	h.clk.Advance(time.Second)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the healing cycle failed: %v", err)
+	}
+	if paused := h.paused(t); len(paused) != 0 {
+		t.Fatalf("still paused after the partition healed: %v", paused)
+	}
+
+	// And the fleet is told it happened, on the first heartbeat that got through — which
+	// is necessarily after the fact, because a host that could tell anyone was not
+	// isolated.
+	if got := lastReportOf(t, h.cp, vol.GetVolumeId()); got.GetRefusal() != storagev1.VolumeRefusal_VOLUME_REFUSAL_UNSPECIFIED {
+		t.Fatalf("the report after the volume resumed says refusal=%s, want none", got.GetRefusal())
+	}
+}
+
+// A host that loses only the object store keeps serving, and this is the guard on the
+// test above: the pause must need *both* silences. The Control Plane answering is a fact
+// about this host's claim, and the design's whole argument is that one fact is enough.
+func TestLosingOnlyTheObjectStoreDoesNotPause(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	vol := h.desire(1)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+	h.wit.setErr(errStoreUnreachable)
+
+	// Far past any grace. The lease keeps being renewed, so nothing here is a guess.
+	for range 20 {
+		h.clk.Advance(10 * time.Second)
+		if err := h.loop.Reconcile(ctx); err != nil {
+			t.Fatalf("a cycle with a healthy Control Plane failed: %v", err)
+		}
+	}
+	if paused := h.paused(t); len(paused) != 0 {
+		t.Fatalf("paused %v with the Control Plane answering every cycle", paused)
+	}
+	if got := h.served(t); len(got) != 1 || got[0] != vol.GetVolumeId() {
+		t.Fatalf("served = %v, want the volume: an unreachable bucket stops no guest", got)
+	}
+}
+
+// The resume asks the object store the same question the give-up does, and this is the
+// answer that must not be read as "still ours": the bucket records an epoch higher than
+// the one this host holds, so the volume was granted elsewhere while this host could see
+// nothing. The guest stays paused, and the next cycle gives the volume up on that fact.
+//
+// It is the case the pause exists for. Resuming here would put a second guest on a volume
+// somebody else is already serving — the failure the whole two-signal rule is arranged
+// against, arrived at through the door that opens when a partition heals.
+func TestAPausedGuestIsNotResumedOntoAVolumeSomebodyElseWasGranted(t *testing.T) {
+	t.Parallel()
+	h := newLeaseHarness(t)
+	ctx := t.Context()
+
+	vol := h.desire(1)
+	if err := h.loop.Reconcile(ctx); err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+	h.cp.setErr(errUnreachable)
+	h.wit.setErr(errStoreUnreachable)
+	h.clk.Advance(61 * time.Second)
+	_ = h.loop.Reconcile(ctx)
+	if paused := h.paused(t); len(paused) != 1 {
+		t.Fatalf("paused = %v, want the one volume past the grace", paused)
+	}
+
+	// The partition heals, and what it reveals is that the fleet moved on: the volume was
+	// granted at a higher epoch to somebody else.
+	h.cp.setErr(nil)
+	h.wit.setErr(nil)
+	h.wit.grant(vol.GetVolumeId(), 2)
+	h.clk.Advance(time.Second)
+	_ = h.loop.Reconcile(ctx)
+
+	if paused := h.paused(t); len(paused) != 1 {
+		// The volume may be given up in the same cycle, but it must never be resumed.
+		if !h.rec.fencedAt(vol.GetVolumeId()) {
+			t.Fatalf("the guest was resumed onto a volume granted to another host: paused = %v", paused)
+		}
+	}
+	if got := h.served(t); len(got) != 0 {
+		t.Fatalf("the host is still serving %v after the bucket said the volume was granted elsewhere", got)
 	}
 }

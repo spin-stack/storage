@@ -200,7 +200,7 @@ CREATE TABLE volumes (
     refusal            TEXT NOT NULL DEFAULT ''
                          CHECK (refusal IN ('', 'IMAGE_MISSING', 'DURABILITY_LOST',
                                             'NO_READ_VIEW', 'NO_KEY', 'LEASE_LOST',
-                                            'ATTACH_FAILED', 'PUBLISH_FENCED')),
+                                            'ATTACH_FAILED', 'PUBLISH_FENCED', 'ISOLATED')),
     -- The sentence the Agent sent with the refusal, printed verbatim by `-fleet-status` and
     -- branched on by nothing: the token above is what a column, a grep and an alert key on.
     -- Emptied with the refusal, for the reason hosts.cordon_reason is.

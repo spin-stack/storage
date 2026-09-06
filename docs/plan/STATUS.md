@@ -55,10 +55,10 @@ durability only, and nothing a superseded host writes enters the history without
 CAS it cannot win. What was left was the cost alone, a tenant's VM stopped for a partition
 nobody else had acted on.
 
-**Still unresolved:** a host that can reach neither the Control Plane nor the object store
-cannot tell isolation from supersession, and keeps serving. The data is safe either way;
-what would make it dangerous is a second guest starting, and nothing starts one — see the
-first thin path below, the other half of the same hole.
+A host that can reach neither pauses its guests after twice the lease TTL, and resumes them
+when both answer again (`agent.Loop.pauseIsolated`). **What it does not survive is its own
+restart while isolated:** QEMU outlives the Agent, so the guest stays paused and no record
+says who paused it.
 
 ## Do this next
 
@@ -69,9 +69,9 @@ Nothing on the §24 list. What is left is in the two sections below.
 - **Nothing promotes a volume off a dead host.** The Control Plane writes ACTIVE and
   DETACHED and no other volume state: the four between them are declared, transition-checked,
   persisted — and entered by nothing, so the durable dwell (`volumes.fencing_started_at`,
-  ADR-0015) is read by nobody. A volume moves host when an operator runs `-attach-volume`,
-  which places at once and with no dwell: the fleet cannot split-brain, and an operator can,
-  in one command.
+  ADR-0015) is read by nobody. A volume moves host when an operator detaches and
+  re-places it, and `-detach-volume` refuses until the incumbent reported it stopped or went
+  silent for three lease TTLs — the dwell the pause above must lose to; `-force` overrides.
 - **Nothing has been measured where it will run.** `measure:transfer` carries 6 GiB both
   ways against real S3, past its ceiling on a single PUT, at ~30 MiB/s each way — which is
   this link and not the store, as is the F = 966 ms `measure:publish:aws` fits.

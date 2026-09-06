@@ -14,8 +14,15 @@ import (
 // tampering).
 var ErrUnwrap = errors.New("crypto: DEK unwrap failed")
 
-// KMS wraps and unwraps DEKs with a KEK it holds. In production this is AWS
-// KMS/Vault; on-prem the minimum acceptable is a KEK per host in a file (§15.1).
+// KMS wraps and unwraps DEKs with a KEK it holds. In production this is AWS KMS/Vault;
+// on-prem the minimum acceptable is the key in a file, read with strict permissions.
+//
+// One key, held by the Control Plane and by every Agent, and not one per host: the CP
+// wraps a volume's DEK once at provision and the wrapped bytes travel with the volume, so
+// a host whose file differs cannot open it — which for a volume that moves means it can
+// never be opened again. kek_id records which key wrapped what, and a mismatch is refused
+// rather than guessed at (controlplane.rebuild), because that is the shape a wrong
+// -kek-file has and it must not read as a forged bucket.
 type KMS interface {
 	// WrapDEK returns the DEK sealed under the KEK, bound to volumeID. r supplies
 	// wrap randomness.

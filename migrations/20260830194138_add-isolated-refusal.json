@@ -1,0 +1,32 @@
+{
+  "version": "1.0.0",
+  "pgschema_version": "1.12.0",
+  "created_at": "2026-08-30T16:41:39-03:00",
+  "source_fingerprint": {
+    "hash": "0ec508c1cfab7314b67509201306a0a8bb36641b5c81abe194b7fdad1338b4ed"
+  },
+  "groups": [
+    {
+      "steps": [
+        {
+          "sql": "ALTER TABLE volumes DROP CONSTRAINT volumes_refusal_check;",
+          "type": "table.constraint",
+          "operation": "drop",
+          "path": "public.volumes.volumes_refusal_check"
+        },
+        {
+          "sql": "ALTER TABLE volumes\nADD CONSTRAINT volumes_refusal_check CHECK (refusal IN (''::text, 'IMAGE_MISSING'::text, 'DURABILITY_LOST'::text, 'NO_READ_VIEW'::text, 'NO_KEY'::text, 'LEASE_LOST'::text, 'ATTACH_FAILED'::text, 'PUBLISH_FENCED'::text, 'ISOLATED'::text)) NOT VALID;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.volumes.volumes_refusal_check"
+        },
+        {
+          "sql": "ALTER TABLE volumes VALIDATE CONSTRAINT volumes_refusal_check;",
+          "type": "table.constraint",
+          "operation": "create",
+          "path": "public.volumes.volumes_refusal_check"
+        }
+      ]
+    }
+  ]
+}

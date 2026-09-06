@@ -1,0 +1,79 @@
+version: "3"
+
+# The database, state-based (ADR-0019): internal/schema/schema.sql is the only source of
+# truth and migrations/ is the record of reviewed plans, not the apply path.
+
+tasks:
+
+  #
+  # schema.sql is the declared state; pgschema computes the DDL that takes a live database
+  # there. There is no history table, so the reviewable record is the plan: `db:plan`
+  # writes one into migrations/ and `db:apply` executes *that file* — reviewing plan A and
+  # applying a recomputed plan B is the failure a state-based tool invites; pgschema
+  # refuses a saved plan if the database has moved since it was computed. migrations/ is a
+  # record, not a replay path: `db:verify` rebuilds from schema.sql alone. Each change
+  # leaves a pair — `<ts>_<name>.sql` for review, `<ts>_<name>.json` for apply.
+
+  db:dev:up:
+    desc: Start (or reuse) the local Postgres 18 development database that db:plan diffs against.
+    cmds:
+      - POSTGRES_IMAGE={{.POSTGRES_IMAGE}} DEVDB_CONTAINER={{.DEVDB_CONTAINER}} DEVDB_PORT={{.DEVDB_PORT}} bash hack/db.sh up
+
+  db:dev:down:
+    desc: Remove the local development database.
+    cmds:
+      - DEVDB_CONTAINER={{.DEVDB_CONTAINER}} POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh down
+
+  # Standing a *new* database up is not a plan, and this is the only task that does it:
+  # db:plan/db:apply diff against a database that already exists. It refuses a non-empty
+  # database — see hack/db.sh for why that gate keeps this out of db:plan's review.
+
+  db:init:
+    desc: "Apply schema.sql to an EMPTY database — the supported way to stand a new one up. Usage: task db:init [DB_NAME=... DB_HOST=... DB_PORT=... DB_USER=...]"
+    deps: [tools:pgschema, db:dev:up]
+    cmds:
+      - >-
+        PGSCHEMA={{.TOOLS_BIN}}/pgschema POSTGRES_IMAGE={{.POSTGRES_IMAGE}}
+        TARGET_HOST={{.DB_HOST}} TARGET_PORT={{.DB_PORT}} TARGET_DB={{.DB_NAME}} TARGET_USER={{.DB_USER}}
+        bash hack/db.sh init
+
+  db:plan:
+    desc: "Plan schema.sql against the development database; commit the result under migrations/. Usage: task db:plan -- <name>"
+    deps: [tools:pgschema, db:dev:up]
+    cmds:
+      - |
+        set -euo pipefail
+        name='{{.CLI_ARGS}}'
+        test -n "$name" || { echo "usage: task db:plan -- <name>   (e.g. task db:plan -- revocation_window)"; exit 1; }
+        out="migrations/$(date -u +%Y%m%d%H%M%S)_${name}"
+        export PGPASSWORD="${PGPASSWORD:-cp}" PGSCHEMA_PLAN_PASSWORD="${PGSCHEMA_PLAN_PASSWORD:-$PGPASSWORD}"
+        {{.TOOLS_BIN}}/pgschema plan {{.PGSCHEMA_TARGET}} {{.PGSCHEMA_PLAN}} \
+          --file internal/schema/schema.sql --no-color \
+          --output-human stdout --output-sql "$out.sql" --output-json "$out.json"
+        if ! grep -q '[^[:space:]]' "$out.sql"; then
+          rm -f "$out.sql" "$out.json"
+          echo "nothing to plan: the database already matches internal/schema/schema.sql"
+          exit 0
+        fi
+        echo
+        echo "wrote $out.sql (review this) and $out.json (what db:apply executes)"
+
+  db:apply:
+    desc: "Apply a saved plan — never a recomputed one. Usage: task db:apply PLAN=migrations/<file>.json"
+    deps: [tools:pgschema]
+    cmds:
+      - |
+        set -euo pipefail
+        plan='{{.PLAN}}'
+        test -n "$plan" || { echo "usage: task db:apply PLAN=migrations/<timestamp>_<name>.json"; exit 1; }
+        export PGPASSWORD="${PGPASSWORD:-cp}"
+        {{.TOOLS_BIN}}/pgschema apply {{.PGSCHEMA_TARGET}} --plan "$plan" {{if .AUTO_APPROVE}}--auto-approve{{end}}
+
+  # Runs db:init's code path against a throwaway empty database, so the newcomer's
+  # command is the one the merge gate exercises rather than a second applier nothing runs.
+
+  db:verify:
+    desc: Run db:init against an empty Postgres 18 and assert a plan against the result has nothing to do (replaces atlas.sum).
+    deps: [tools:pgschema]
+    cmds:
+      - PGSCHEMA={{.TOOLS_BIN}}/pgschema POSTGRES_IMAGE={{.POSTGRES_IMAGE}} bash hack/db.sh verify

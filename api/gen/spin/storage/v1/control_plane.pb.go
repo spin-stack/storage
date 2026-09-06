@@ -217,6 +217,20 @@ const (
 	// volume is the failure this whole design is arranged against, and it is the one
 	// refusal that must be countable in a dashboard rather than greppable in a log.
 	VolumeRefusal_VOLUME_REFUSAL_PUBLISH_FENCED VolumeRefusal = 7
+	// This host has confirmed nothing about the volume for long enough that the fleet may
+	// be about to place it elsewhere, so it paused the guest rather than let two of them
+	// write. Neither the Control Plane nor the object store has answered: with either one
+	// answering the host knows whether it still owns the volume, and keeps serving.
+	//
+	// Its own value, by the argument PUBLISH_FENCED makes: the operator's next move is not
+	// guessable from a detail string, and here it is neither this host's disk nor who owns
+	// the volume — it is this host's *network*, and a count of these is a partition.
+	//
+	// Reported late by construction. A host that cannot reach the Control Plane cannot tell
+	// it anything; this arrives on the first heartbeat that gets through, which may be after
+	// the volume has moved, and the report is refused on the usual host-and-epoch predicate
+	// if it has.
+	VolumeRefusal_VOLUME_REFUSAL_ISOLATED VolumeRefusal = 8
 )
 
 // Enum value maps for VolumeRefusal.
@@ -230,6 +244,7 @@ var (
 		5: "VOLUME_REFUSAL_LEASE_LOST",
 		6: "VOLUME_REFUSAL_ATTACH_FAILED",
 		7: "VOLUME_REFUSAL_PUBLISH_FENCED",
+		8: "VOLUME_REFUSAL_ISOLATED",
 	}
 	VolumeRefusal_value = map[string]int32{
 		"VOLUME_REFUSAL_UNSPECIFIED":     0,
@@ -240,6 +255,7 @@ var (
 		"VOLUME_REFUSAL_LEASE_LOST":      5,
 		"VOLUME_REFUSAL_ATTACH_FAILED":   6,
 		"VOLUME_REFUSAL_PUBLISH_FENCED":  7,
+		"VOLUME_REFUSAL_ISOLATED":        8,
 	}
 )
 
@@ -1418,7 +1434,7 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x19VOLUME_STATE_FENCING_WAIT\x10\x03\x12\"\n" +
 	"\x1eVOLUME_STATE_RECOVERY_REQUIRED\x10\x04\x12\x1b\n" +
 	"\x17VOLUME_STATE_RECOVERING\x10\x05\x12\x19\n" +
-	"\x15VOLUME_STATE_DETACHED\x10\x06*\x95\x02\n" +
+	"\x15VOLUME_STATE_DETACHED\x10\x06*\xb2\x02\n" +
 	"\rVolumeRefusal\x12\x1e\n" +
 	"\x1aVOLUME_REFUSAL_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cVOLUME_REFUSAL_IMAGE_MISSING\x10\x01\x12\"\n" +
@@ -1427,7 +1443,8 @@ const file_spin_storage_v1_control_plane_proto_rawDesc = "" +
 	"\x15VOLUME_REFUSAL_NO_KEY\x10\x04\x12\x1d\n" +
 	"\x19VOLUME_REFUSAL_LEASE_LOST\x10\x05\x12 \n" +
 	"\x1cVOLUME_REFUSAL_ATTACH_FAILED\x10\x06\x12!\n" +
-	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a*\xaf\x01\n" +
+	"\x1dVOLUME_REFUSAL_PUBLISH_FENCED\x10\a\x12\x1b\n" +
+	"\x17VOLUME_REFUSAL_ISOLATED\x10\b*\xaf\x01\n" +
 	"\rReportOutcome\x12\x1e\n" +
 	"\x1aREPORT_OUTCOME_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REPORT_OUTCOME_ACCEPTED\x10\x01\x12\x1e\n" +

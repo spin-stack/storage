@@ -53,7 +53,7 @@ from_local() {
 }
 
 # from_image pulls the mirror. buildx with a local output is the same mechanism
-# `task build:qemu` uses to get binaries out of an image, so there is one way in this
+# `task qemu:build` uses to get binaries out of an image, so there is one way in this
 # repository to turn a published artefact into a file in _output/.
 from_image() {
   [ -n "$KERNEL_IMAGE" ] || return 1
@@ -108,7 +108,7 @@ Sources tried, in order:
 Any one of these fixes it:
   cd ../spinbox && task build:kernel     # then re-run; note it may exit non-zero and
                                          # still emit the artefact (cache permissions)
-  task fetch:kernel GUEST_KERNEL_IMAGE=ghcr.io/<owner>/<repo>/guest-kernel:<version>
+  task guest:kernel:fetch GUEST_KERNEL_IMAGE=ghcr.io/<owner>/<repo>/guest-kernel:<version>
   task guest:kernel:push GUEST_KERNEL_IMAGE=...   # publish one you already have
 
 If the kernel legitimately changed, re-pin it rather than clearing the pin:
@@ -152,7 +152,7 @@ readonly REQUIRED_CONFIG=(
 cmd_verify() {
   local fail=0
 
-  test -f "$KERNEL" || { echo "no kernel at $KERNEL — run: task fetch:kernel" >&2; return 1; }
+  test -f "$KERNEL" || { echo "no kernel at $KERNEL — run: task guest:kernel:fetch" >&2; return 1; }
 
   # `fetch` honours an empty pin — bisecting a kernel change needs that — but verifying
   # against no pin is how a lane certifies one kernel and reports on another.
@@ -166,7 +166,7 @@ cmd_verify() {
     echo "$KERNEL is not the pinned kernel:" >&2
     echo "  pinned $KERNEL_SHA256" >&2
     echo "  found  $got" >&2
-    echo "re-fetch it (task fetch:kernel) or re-pin deliberately (task guest:kernel:pin)" >&2
+    echo "re-fetch it (task guest:kernel:fetch) or re-pin deliberately (task guest:kernel:pin)" >&2
     return 1
   fi
 

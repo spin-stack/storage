@@ -1,0 +1,275 @@
+version: "3"
+
+# The pinned QEMU. It is built from Dockerfile.qemu — once into _output/ for the local
+# lanes, once as the runtime image CI's guest jobs pull — and verified in two halves,
+# because the extracted binary links against the build image's libraries and does not run
+# on a bare runner (ADR-0025).
+
+tasks:
+
+  qemu:build:
+    desc: "Build the pinned QEMU into _output/: the system binary, qemu-img and the firmware the guest lane boots with."
+    cmds:
+      # Emptied first: `--output type=local` writes files and removes none, so a binary or
+      # a firmware blob this build no longer produces stays on disk, indistinguishable from
+      # one it does. That is how a 331 MB firmware tree and a qemu-storage-daemon outlived
+      # the builds that stopped shipping them.
+      - rm -rf {{.OUTPUT_DIR}}/bin/qemu-* {{.OUTPUT_DIR}}/share/spin-stack/qemu {{.OUTPUT_DIR}}/lib/qemu
+      - mkdir -p {{.OUTPUT_DIR}}
+      - |
+        docker buildx build \
+          --file Dockerfile.qemu \
+          --target extract \
+          --platform linux/amd64 \
+          --cache-from {{.QEMU_CACHE_FROM}} \
+          --cache-to {{.QEMU_CACHE_TO}} \
+          --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
+          --build-arg JOBS={{.QEMU_JOBS}} \
+          --output type=local,dest={{.OUTPUT_DIR}} \
+          .
+      - task: qemu:verify
+
+  qemu:verify:
+    desc: Verify the built QEMU is the pinned version and exposes the devices we depend on.
+    cmds:
+      # Two halves: the files are checked where they were extracted, the behaviour where
+      # the binary can actually run. The extracted binary is dynamically linked against the
+      # build image's libraries, so it does not run on a bare runner (ADR-0025).
+      - |
+        set -euo pipefail
+        bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
+        test -x "$bin" || { echo "missing $bin — run: task qemu:build"; exit 1; }
+        # qemu-img is not a convenience: the Volume Agent refuses to start without
+        # -qemu-img, because every qcow2 chain is created and inspected by running it
+        # (v6 §7 forbids a parser of our own). Presence only — see qemu:verify:behaviour.
+        test -x {{.OUTPUT_DIR}}/bin/qemu-img || {
+          echo "missing {{.OUTPUT_DIR}}/bin/qemu-img — the Agent cannot create a chain without it; run: task qemu:build"; exit 1; }
+        # The CI binary. It is the one with TCG compiled in, and it exists so that the
+        # production one does not have to carry it: a host serving tenants must fail loudly
+        # with no /dev/kvm rather than emulate. A tree with only one of the two boots
+        # somewhere and not somewhere else, which is the confusion this checks for.
+        test -x {{.OUTPUT_DIR}}/bin/qemu-system-x86_64-tcg || {
+          echo "missing {{.OUTPUT_DIR}}/bin/qemu-system-x86_64-tcg — a runner without KVM has nothing to boot with; run: task qemu:build"; exit 1; }
+        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/bios-256k.bin
+        # pvh.bin is how -kernel enters a PVH ELF kernel, which is the guest lane's
+        # only boot path. Its absence fails at run time as a rom-open error, which
+        # reads like a backend bug.
+        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin || {
+          echo "missing pvh.bin — a direct kernel boot (-kernel) cannot work; rebuild with: task qemu:build"; exit 1; }
+        # The option ROM of the one NIC this build keeps. A device model without its ROM is
+        # a VM that dies at start-up, and no lane here attaches a NIC to find out.
+        test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/efi-virtio.rom || {
+          echo "missing efi-virtio.rom — a VM given a virtio-net-pci cannot start; rebuild with: task qemu:build"; exit 1; }
+        echo "OK: the extracted tree carries both qemu-system binaries, qemu-img and the firmware (incl. pvh)"
+      - task: qemu:verify:behaviour
+
+  qemu:verify:behaviour:
+    desc: Run the pinned QEMU and assert its version and devices, wherever that QEMU is actually runnable.
+    cmds:
+      # Ask whichever QEMU this caller will execute. The extracted binary runs on a
+      # developer machine and inside CI's guest jobs (ADR-0025's runtime image, where there
+      # is no docker to ask about an image — building one unconditionally failed there with
+      # `"docker": executable file not found in $PATH`), and not on a bare runner building
+      # the artefact for others: `liburing.so.2: cannot open shared object file`. So run it
+      # if it runs and fall back to the image if it does not, printing which branch
+      # answered.
+      - |
+        set -euo pipefail
+        bin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64
+        # qemu-img is asked the same question in the same breath, because the Agent
+        # refuses to start without one and a tree that carries a qemu-system nobody can
+        # fault while its qemu-img is the wrong version is a lane that fails three tests
+        # away from the cause.
+        if out=$("$bin" --version 2>/dev/null && echo --- && "$bin" -device help 2>&1 && \
+                 {{.OUTPUT_DIR}}/bin/qemu-img --version); then
+          where="the binaries at {{.OUTPUT_DIR}}/bin"
+        else
+          img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
+          echo "$bin cannot run here (its libraries are the build image's) — asking the runtime image instead"
+          task qemu:image
+          out=$(docker run --rm --entrypoint /bin/sh "$img" -c \
+            '/usr/local/bin/qemu-system-x86_64 --version; echo ---; /usr/local/bin/qemu-system-x86_64 -device help 2>&1; /usr/local/bin/qemu-img --version')
+          where="$img"
+        fi
+        printf '%s' "$out" | grep -c 'version {{.QEMU_VERSION}}' | grep -qx 2 || {
+          echo "in $where, qemu-system and qemu-img are not both the pinned {{.QEMU_VERSION}}:"
+          printf '%s\n' "$out" | grep -i version; exit 1; }
+        printf '%s' "$out" | grep -q '{{.QEMU_VERSION}}' || {
+          echo "the QEMU in $where is not the pinned {{.QEMU_VERSION}}:"; printf '%s\n' "$out" | head -3; exit 1; }
+        # virtio-blk-pci, not vhost-user-blk-pci: the guest gets an ordinary virtio disk
+        # backed by a qcow2 QEMU opens itself. The vhost-user path is not built at all.
+        printf '%s' "$out" | grep -q 'virtio-blk-pci' || {
+          echo "the QEMU in $where has no virtio-blk-pci device, so no guest can be given a qcow2"; exit 1; }
+        # And the split, asserted on the tree the lanes actually execute rather than only
+        # inside the build: the binary a tenant's host runs must not be able to emulate,
+        # and CI's must. Backwards, this is a fleet running at a tenth of the speed or a
+        # guest lane that cannot boot — and neither is visible in a file listing.
+        tcgbin={{.OUTPUT_DIR}}/bin/qemu-system-x86_64-tcg
+        if "$bin" -accel help >/dev/null 2>&1 && [ -x "$tcgbin" ]; then
+          ! "$bin" -accel help | grep -qx tcg || {
+            echo "$bin has TCG compiled in: a host with no /dev/kvm would emulate instead of refusing"; exit 1; }
+          "$tcgbin" -accel help | grep -qx tcg || {
+            echo "$tcgbin cannot emulate, so a runner without /dev/kvm has nothing to boot with"; exit 1; }
+          echo "OK: the production binary refuses to emulate and the CI one can"
+          # And the one network card this build keeps actually starts, against the firmware
+          # tree the lanes pass with -L. This is the assertion the firmware trim needed and
+          # did not have: a NIC whose option ROM is not shipped fails at *start-up* with
+          # `failed to find romfile`, and nothing here attaches a NIC, so no lane would have
+          # noticed until spin's runner did. Emulated on purpose — loading a ROM has nothing
+          # to do with the accelerator, and this must run where there is no /dev/kvm.
+          fw={{.OUTPUT_DIR}}/share/spin-stack/qemu
+          nic=$(printf '{"execute":"qmp_capabilities"}\n{"execute":"quit"}\n' | \
+            "$tcgbin" -machine q35,accel=tcg -m 64 -display none -serial none -monitor none \
+              -L "$fw" -netdev socket,id=n0,listen=127.0.0.1:0 \
+              -device virtio-net-pci,netdev=n0 -qmp stdio 2>&1 >/dev/null) || {
+            echo "a VM with the one NIC this build keeps does not start: $nic"; exit 1; }
+          echo "OK: a VM with virtio-net-pci starts against the shipped firmware"
+        fi
+        echo "OK: $(printf '%s' "$out" | head -1), virtio-blk-pci present — verified in $where"
+
+  qemu:image:
+    desc: >-
+      Build the QEMU runtime image locally (--load, not pushed). Its caller is
+      `qemu:verify:behaviour`: the extracted binary links against the build image's
+      libraries and cannot run on a bare host (ADR-0025), so the behaviour half of the
+      verification runs QEMU inside this image instead.
+    cmds:
+      - |
+        docker buildx build \
+          --file Dockerfile.qemu \
+          --target runtime \
+          --platform linux/amd64 \
+          --cache-from {{.QEMU_CACHE_FROM}} \
+          --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
+          --build-arg JOBS={{.QEMU_JOBS}} \
+          --tag {{.QEMU_IMAGE}}:{{.QEMU_VERSION}} \
+          --load \
+          .
+
+  qemu:version:
+    desc: Print the pinned QEMU version (the single source of truth for CI tags).
+    silent: true
+    cmds:
+      - echo "{{.QEMU_VERSION}}"
+
+  qemu:push:
+    desc: >-
+      Build and push the QEMU runtime image. Usage:
+      task qemu:push QEMU_IMAGE=ghcr.io/<owner>/<repo>/qemu QEMU_IMAGE_EXTRA_TAG=<sha>
+      Requires a `docker login` to that registry.
+    vars:
+      QEMU_IMAGE_EXTRA_TAG: '{{.QEMU_IMAGE_EXTRA_TAG | default ""}}'
+    cmds:
+      - |
+        set -euo pipefail
+        # The package→repository link, exactly as at guest:kernel:push and for the same
+        # reason: an unlinked private package reads to CI as an unpublished one.
+        src=""
+        case "{{.QEMU_IMAGE}}" in
+          ghcr.io/*/*/*) slug={{.QEMU_IMAGE}}; slug=${slug#ghcr.io/}; slug=${slug%/*}
+                         src="--label org.opencontainers.image.source=https://github.com/$slug" ;;
+        esac
+        docker buildx build \
+          --file Dockerfile.qemu \
+          --target runtime \
+          --platform linux/amd64 \
+          --cache-from {{.QEMU_CACHE_FROM}} \
+          --cache-to {{.QEMU_CACHE_TO}} \
+          --build-arg QEMU_VERSION={{.QEMU_VERSION}} \
+          --build-arg JOBS={{.QEMU_JOBS}} \
+          $src \
+          --tag {{.QEMU_IMAGE}}:{{.QEMU_VERSION}} \
+          {{if .QEMU_IMAGE_EXTRA_TAG}}--tag {{.QEMU_IMAGE}}:{{.QEMU_IMAGE_EXTRA_TAG}} \{{end}}
+          --push \
+          .
+
+  qemu:tools:
+    desc: >-
+      Put the pinned qemu-img, both qemu-system binaries and the firmware under _output/, extracting
+      them from the published runtime image when `task qemu:build` has not run here.
+      Idempotent.
+    status:
+      # "it runs", not "the file is there". The two came apart once already: an extracted
+      # binary whose libraries had not come with it is executable, and dies at exit 127 in
+      # whatever lane first needs it — which was three e2e tests, not this task.
+      - "{{.OUTPUT_DIR}}/bin/qemu-img --version"
+      - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64 --version"
+      - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64-tcg --version"
+      - "test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin"
+    cmds:
+      # A second *source* for one artefact, not a second definition of the build — the
+      # shape hack/guest-kernel.sh has for the kernel. `task qemu:build` compiles QEMU from
+      # source, tens of minutes, and every lane that starts an Agent needs qemu-img. The
+      # image is the one the QEMU workflow publishes, from the same builder stage.
+      - |
+        set -euo pipefail
+        img={{.QEMU_IMAGE}}:{{.QEMU_VERSION}}
+        BINARIES="qemu-img qemu-system-x86_64 qemu-system-x86_64-tcg"
+        command -v docker >/dev/null || {
+          echo "no qemu-img at {{.OUTPUT_DIR}}/bin and no docker to fetch one — run: task qemu:build" >&2; exit 1; }
+        docker image inspect "$img" >/dev/null 2>&1 || docker pull "$img" || {
+          # Which of the two causes this is matters, because the fixes are opposites.
+          # The tag is QEMU_VERSION, and the image is published by .github/workflows/qemu.yml
+          # — a separate workflow. So the first push of a version bump races: this gate
+          # starts while the image for the new tag is still being built, and no amount of
+          # rebuilding *here* helps. Waiting does. That happened on the 11.0.2 → 11.1.1 bump,
+          # where the advice below ("build it") was the wrong advice, confidently given.
+          echo "no $img locally and it could not be pulled." >&2
+          echo "  If QEMU_VERSION changed in this commit: .github/workflows/qemu.yml publishes" >&2
+          echo "  that tag and takes tens of minutes. Let it finish, then re-run this." >&2
+          echo "  Otherwise the tag should already exist — build it locally: task qemu:build" >&2
+          exit 1; }
+        mkdir -p {{.OUTPUT_DIR}}/bin
+        cid=$(docker create "$img")
+        trap 'docker rm -f "$cid" >/dev/null' EXIT
+        # Two binaries and one firmware tree, because two different lanes need different
+        # halves and neither is worth a second task: an Agent needs qemu-img to create and
+        # inspect a chain, and the guest lane also needs a QEMU to boot and the firmware
+        # to boot *with* — pvh.bin above all, since a direct kernel boot has no entry
+        # point without it and fails as a rom-open error that reads like a backend bug.
+        for b in $BINARIES; do
+          docker cp -L "$cid":/usr/local/bin/"$b" {{.OUTPUT_DIR}}/bin/"$b".real
+        done
+        rm -rf {{.OUTPUT_DIR}}/share/spin-stack/qemu
+        mkdir -p {{.OUTPUT_DIR}}/share/spin-stack
+        docker cp "$cid":/usr/share/spin-stack/qemu {{.OUTPUT_DIR}}/share/spin-stack/qemu
+
+        # And the libraries it links against, computed *inside the image*: the binary is
+        # dynamically linked (liburing, libaio, glib), and extracting it alone produced a
+        # file that ran on a developer's machine and died on a CI runner with
+        # "liburing.so.2: cannot open shared object file". A hand-written apt-get list is a
+        # second statement of that, kept in step by nobody. The interpreter counts too —
+        # ldd names the loader on its own line, with no `=>`.
+        rm -rf {{.OUTPUT_DIR}}/lib/qemu && mkdir -p {{.OUTPUT_DIR}}/lib/qemu
+        for so in $(docker run --rm --entrypoint sh "$img" -c \
+              "for b in $BINARIES; do ldd /usr/local/bin/\$b; done" \
+              | sed -n -e "s|.*=> \(/[^ ]*\).*|\1|p" -e "s|^\t\(/[^ ]*\) (0x.*|\1|p" | sort -u); do
+          # -L, because these are symlinks: /lib/x86_64-linux-gnu/liburing.so.2 points at
+          # liburing.so.2.14 and /lib64/ld-linux-x86-64.so.2 points out of its own
+          # directory. Copied as links they land dangling, and the failure that produces is
+          # indistinguishable from having copied nothing at all — which is how the first
+          # attempt at this looked like it had worked.
+          docker cp -L "$cid":"$so" {{.OUTPUT_DIR}}/lib/qemu/
+        done
+
+        # A wrapper and not an RPATH rewrite: patchelf would be one more pinned tool in the
+        # gate. It invokes the image's *loader* rather than setting LD_LIBRARY_PATH, so the
+        # host's glibc is not in the picture at all: LD_LIBRARY_PATH would have this
+        # binary's libc.so.6 loaded by whatever loader the host has, and those two are one
+        # unit. Verified by running it on debian:12, whose glibc is older than the image's.
+        ld=$(basename $(ls {{.OUTPUT_DIR}}/lib/qemu/ld-linux-*))
+        for b in $BINARIES; do
+          cat > {{.OUTPUT_DIR}}/bin/"$b" <<WRAP
+        #!/bin/sh
+        # Generated by \`task qemu:tools\`. Runs the pinned binary against the loader and
+        # libraries extracted from the same image, so a host that has neither still works.
+        here=\$(cd "\$(dirname "\$0")" && pwd)
+        exec "\$here/../lib/qemu/$ld" --library-path "\$here/../lib/qemu" \\
+          "\$here/$b.real" "\$@"
+        WRAP
+          sed -i 's/^        //' {{.OUTPUT_DIR}}/bin/"$b"
+          chmod +x {{.OUTPUT_DIR}}/bin/"$b"
+          {{.OUTPUT_DIR}}/bin/"$b" --version >/dev/null || {
+            echo "extracted $b does not run on this host" >&2; exit 1; }
+        done
+        echo "extracted $BINARIES, their loader and $(ls {{.OUTPUT_DIR}}/lib/qemu | wc -l) libraries from $img"

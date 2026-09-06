@@ -69,7 +69,7 @@ func start(t *testing.T) *deployment {
 	agentBin := testinfra.Binary(t, "volume-agent")
 	// The Agent creates and inspects every qcow2 chain by running the pinned qemu-img
 	// (v6 §7 forbids a parser of our own), and refuses to start without it — so this
-	// lane needs the artefact `task build:qemu` produces. testinfra.Binary fails naming
+	// lane needs the artefact `task qemu:build` produces. testinfra.Binary fails naming
 	// that task rather than skipping: a lane that quietly declined to start the Agent
 	// would be the gate reporting success for work it did not do.
 	qemuImg := testinfra.Binary(t, "qemu-img")

@@ -317,6 +317,24 @@ func (c *Client) Stop() error {
 	return err
 }
 
+// Cont resumes a guest this Agent paused, and is why pausing was the right verb.
+//
+// A host that paused because it could confirm nothing, and then confirms again that the
+// volume is still its own, has a VM to give back; a host that had powered one off would
+// have nothing to give back and would need whoever owns the VM's lifetime to notice. That
+// asymmetry is the whole argument for `stop` over `quit` (see Stop), and it is only worth
+// anything if this exists.
+//
+// It is deliberately not the inverse in authority: Stop is called when *one* fact says
+// this host is not the writer, and Cont only when the facts that would have prevented the
+// pause have all come back. Resuming a guest onto a volume somebody else took is the
+// failure this whole design is arranged against, so the caller carries that burden and
+// this is only the verb.
+func (c *Client) Cont() error {
+	_, err := c.execute("cont")
+	return err
+}
+
 // execute sends one command and returns the raw `return` value. Events are skipped rather
 // than delivered: QEMU interleaves them with command answers on the same stream — a
 // `JOB_STATUS_CHANGE` can arrive between the request and its reply — so the loop reads until

@@ -13,6 +13,7 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/crypto"
+	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/lease"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/simio/clock"
@@ -65,6 +66,18 @@ type Loop struct {
 	failures int
 	// term is the Control Plane term that last answered a heartbeat; see noteTerm.
 	term int64
+	// lastConfirmed is the instant something last confirmed this host's claim on its
+	// volumes: a heartbeat the Control Plane answered, or a read the object store
+	// answered. Either one is enough, which is the same two-path rule the rest of this
+	// file turns on — and the isolation response is what happens when neither has spoken
+	// for long enough that the fleet may be placing the volumes elsewhere.
+	lastConfirmed clock.Instant
+	// isolated is the volumes whose guests this host paused for that reason, so that
+	// exactly those are resumed and no guest somebody else paused is ever resumed here.
+	//
+	// In memory only, deliberately: a pause is a wager on silence and nothing about it
+	// belongs on disk the way a fence does. What that costs is stated at pauseIsolated.
+	isolated map[string]bool
 	// keys is key material by volume id, cached with one eviction rule and no expiry: an
 	// entry lives exactly as long as its volume stays in the desired state. When the volume
 	// stops being this host's the entry must go — not because it would be stale, but because
@@ -88,14 +101,24 @@ func New(cfg Config, deps Deps) (*Loop, error) {
 		return nil, errors.New("agent: a volume source must be injected")
 	}
 	l := &Loop{
-		cfg:     cfg,
-		clk:     deps.Clock,
-		cp:      deps.ControlPlane,
-		dev:     deps.Device,
-		vols:    deps.Volumes,
-		rec:     deps.Recorder,
-		witness: deps.Witness,
-		keys:    map[string]VolumeKeys{},
+		cfg:      cfg,
+		clk:      deps.Clock,
+		cp:       deps.ControlPlane,
+		dev:      deps.Device,
+		vols:     deps.Volumes,
+		rec:      deps.Recorder,
+		keys:     map[string]VolumeKeys{},
+		isolated: map[string]bool{},
+		// The grace runs from start-up and not from the zero instant: an Agent that has
+		// just been handed its volumes was told to serve them by a Control Plane that
+		// answered, and starting the clock at zero would pause every guest on the first
+		// cycle a partition began.
+		lastConfirmed: deps.Clock.Now(),
+	}
+	// Wrapped, so that "the object store answered" is recorded wherever it is asked,
+	// rather than at the one call site that happens to ask today.
+	if deps.Witness != nil {
+		l.witness = confirmingWitness{Witness: deps.Witness, loop: l}
 	}
 	if r, ok := deps.Volumes.(VolumeReconciler); ok {
 		l.reconcile = r
@@ -186,6 +209,15 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 	if err := l.heartbeat(ctx, usage, vols); err != nil {
 		return err
 	}
+	// The Control Plane answered, which is one of the two facts that confirm this host's
+	// claim. Stamped here rather than inside heartbeat so that what confirms is an answer
+	// the whole cycle got, not a request it managed to send.
+	l.confirm()
+	// And the guests paused while it was not answering come back, if the object store
+	// agrees they are still ours.
+	if err := l.resumeWhatIsConfirmedOurs(ctx, vols); err != nil {
+		return err
+	}
 	desired, err := l.readDesiredState(ctx)
 	if err != nil {
 		// Nothing was read, so there is nothing new to serve and nothing new to say.
@@ -224,6 +256,47 @@ func (l *Loop) Reconcile(ctx context.Context) error {
 type Witness interface {
 	GrantedEpoch(ctx context.Context, volumeID string) (int64, error)
 }
+
+// confirmingWitness records that the object store answered, whatever it answered.
+//
+// ErrNoEpoch is an answer and not a silence: the store said nothing has been granted,
+// which is this host's claim standing. Superseded is right to put it with the failures —
+// none of them is evidence that somebody *else* is writing — but the isolation response
+// asks a different question, and for that question the distinction is the whole thing.
+type confirmingWitness struct {
+	Witness
+	loop *Loop
+}
+
+func (w confirmingWitness) GrantedEpoch(ctx context.Context, volumeID string) (int64, error) {
+	e, err := w.Witness.GrantedEpoch(ctx, volumeID)
+	if err == nil || errors.Is(err, descriptor.ErrNoEpoch) {
+		w.loop.confirm()
+	}
+	return e, err
+}
+
+// confirm stamps the instant something spoke for this host's claim.
+func (l *Loop) confirm() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lastConfirmed = l.clk.Now()
+}
+
+// isolationGrace is how long this host serves a volume nothing has confirmed before it
+// pauses the guest.
+//
+// Derived from the lease TTL rather than configured beside it, because the two are one
+// decision: the fleet's patience with a silent host is the TTL, and this is the host's own
+// patience with a silent fleet. Twice the TTL leaves room for a heartbeat that is merely
+// slow, and it is the term the promoter's dwell must exceed —
+//
+//	isolationGrace + clock skew < the dwell before a volume may be placed elsewhere
+//
+// — or a host could still be serving when its successor starts. There is no promoter yet
+// (nothing enters FENCING_WAIT), so today this bounds the exposure rather than closing it,
+// and the inequality is what the promoter has to be built against.
+func (l *Loop) isolationGrace() time.Duration { return 2 * l.leaseTTL }
 
 // giveUpWhatIsNoLongerOurs stops serving the volumes this host can confirm belong to
 // somebody else. A lease that merely lapsed is not that confirmation: v5 stopped every
@@ -269,10 +342,9 @@ func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus
 	}
 
 	if len(unconfirmed) > 0 {
-		// Warn, not Error: a degraded host, not a lost volume. It is the only line that says
-		// this host has stopped being able to confirm its claim and is serving anyway.
-		slog.Warn("this host's lease has expired and nothing confirms the volumes were granted elsewhere; it is still serving them",
-			"host_id", l.cfg.HostID, "volumes", unconfirmed, "lease_ttl", ttl)
+		if err := l.pauseIsolated(ctx, unconfirmed); err != nil {
+			return err
+		}
 	}
 	if len(confirmed) == 0 {
 		return nil
@@ -305,6 +377,131 @@ func (l *Loop) giveUpWhatIsNoLongerOurs(ctx context.Context, vols []VolumeStatus
 		fmt.Sprintf("agent: this host's lease (%s) expired and the object store records a higher epoch for these volumes, so another host has been granted them; it will not serve them again until the control plane grants a higher epoch here", ttl),
 	); err != nil {
 		return fmt.Errorf("agent: giving up the volumes of an expired lease: %w", err)
+	}
+	return nil
+}
+
+// pauseIsolated is the answer to the third thing a lapsed lease can mean.
+//
+// The two above it each have a fact behind them: a lease still inside its TTL, or a bucket
+// saying the volume is still this host's. This one has neither — the Control Plane is not
+// answering and neither is the object store — so the host cannot tell isolation from
+// supersession, and the fleet, seeing the same silence from its side, may be about to place
+// the volume somewhere else. Serving on is a guess, and it is the guess that ends with two
+// guests writing one volume.
+//
+// So the guest is paused, and the volume is *not* given up. Pausing is the smallest true
+// move: it stops the writes without taking the chain apart or recording a fork, and the
+// partition healing costs a resume rather than a recovery. That asymmetry is the whole
+// reason it is `stop` and not `quit` (internal/qmp) and the reason this is Isolate and not
+// Fence.
+//
+// Inside the grace it warns and serves on, which is what a blip on both paths deserves.
+//
+// **What this does not survive is this Agent restarting while isolated.** QEMU outlives the
+// Agent (ADR-0021), so the guest stays paused and the new process has no record that it was
+// this host that paused it — and resuming a guest somebody else paused is a worse mistake
+// than leaving one paused. A paused guest is the safe state, so the cost is availability
+// and an operator reading the line below.
+func (l *Loop) pauseIsolated(ctx context.Context, unconfirmed []string) error {
+	l.mu.Lock()
+	since, grace := l.clk.Now().Sub(l.lastConfirmed), l.isolationGrace()
+	// No witness is not a silent witness. A host configured without one has no second
+	// path by construction rather than by partition, so every one of its cycles looks
+	// isolated and a database outage would stop every guest on it after the grace —
+	// which is the exact failure this whole file is arranged against. Such a deployment
+	// has no isolation response, and that is a property of how it was wired.
+	armed := l.witness != nil && since > grace
+	var pause []string
+	if armed {
+		for _, id := range unconfirmed {
+			if !l.isolated[id] {
+				pause = append(pause, id)
+			}
+		}
+	}
+	l.mu.Unlock()
+
+	if !armed {
+		// Warn, not Error: a degraded host, not a lost volume. It is the only line that says
+		// this host has stopped being able to confirm its claim and is serving anyway.
+		slog.Warn("this host's lease has expired and nothing confirms the volumes were granted elsewhere; it is still serving them",
+			"host_id", l.cfg.HostID, "volumes", unconfirmed, "unconfirmed_for", since, "grace", grace)
+		return nil
+	}
+	if len(pause) == 0 {
+		return nil
+	}
+	slog.Error("nothing has confirmed this host's claim on these volumes for longer than the grace; pausing their guests rather than risk a second writer",
+		"host_id", l.cfg.HostID, "volumes", pause, "unconfirmed_for", since, "grace", grace)
+	if err := l.reconcile.Isolate(ctx, pause, true); err != nil {
+		return fmt.Errorf("agent: pausing the guests of volumes nothing confirms: %w", err)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, id := range pause {
+		l.isolated[id] = true
+	}
+	return nil
+}
+
+// resumeWhatIsConfirmedOurs gives back the guests pauseIsolated stopped, and asks for both
+// facts to do it — the Control Plane answering *and* the object store recording the epoch
+// this host holds. The pause needed both to be silent; the resume needs both to speak.
+//
+// One fact would be enough to keep serving a guest that was never paused, and that
+// asymmetry is deliberate: continuing is the state the fleet already believes in, and
+// restarting a writer this host stopped is a new claim.
+func (l *Loop) resumeWhatIsConfirmedOurs(ctx context.Context, vols []VolumeStatus) error {
+	l.mu.Lock()
+	if len(l.isolated) == 0 || l.reconcile == nil || l.lease == nil || !l.lease.Valid() {
+		l.mu.Unlock()
+		return nil
+	}
+	wit := l.witness
+	paused := make([]VolumeStatus, 0, len(l.isolated))
+	for _, v := range vols {
+		if l.isolated[v.VolumeID] {
+			paused = append(paused, v)
+		}
+	}
+	l.mu.Unlock()
+
+	// The object store's half, and it is deliberately not Superseded. That function folds
+	// "the store did not answer" into "the store did not say somebody else has it",
+	// because for *giving a volume up* the two mean the same thing — neither is evidence
+	// of another writer. Here they are opposites: one is the fact the resume waits for and
+	// the other is the silence that caused the pause, and reading them as one resumes
+	// exactly the volumes that were granted elsewhere.
+	var resume []string
+	for _, v := range paused {
+		granted, err := wit.GrantedEpoch(ctx, v.VolumeID)
+		switch {
+		case errors.Is(err, descriptor.ErrNoEpoch):
+			// The store answered: no grant is recorded, so nothing has taken the volume
+			// from this host. The same answer that keeps a running guest running.
+		case err != nil:
+			// No answer. Still half a partition, and the guest stays paused.
+			continue
+		case granted > v.Epoch:
+			// Somebody else holds it. Not resumed, and not left in limbo either: the next
+			// cycle's giveUpWhatIsNoLongerOurs fences it on this same fact.
+			continue
+		}
+		resume = append(resume, v.VolumeID)
+	}
+	if len(resume) == 0 {
+		return nil
+	}
+	slog.Warn("the object store and the control plane both confirm these volumes are still this host's; resuming their guests",
+		"host_id", l.cfg.HostID, "volumes", resume)
+	if err := l.reconcile.Isolate(ctx, resume, false); err != nil {
+		return fmt.Errorf("agent: resuming the guests of volumes now confirmed: %w", err)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, id := range resume {
+		delete(l.isolated, id)
 	}
 	return nil
 }

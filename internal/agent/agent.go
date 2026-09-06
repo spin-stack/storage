@@ -97,7 +97,10 @@ type VolumeKeys struct {
 	VolumeID string
 	// DEKWrapped is the volume's data-encryption key sealed under the KEK.
 	DEKWrapped []byte
-	// KEKID names the key that wraps it, for a host holding more than one.
+	// KEKID names the key that wrapped it. There is one key in the fleet today, so this
+	// is what a host compares its own against — a mismatch is a wrong -kek-file, which is
+	// worth a refusal and not a guess. It is a column and a field rather than an
+	// assumption so that rotating the key is a migration and not a redesign.
 	KEKID string
 	// DEKKeyID is the DEK's version (§15.1). It is not decoration: crypto.DevKMS binds
 	// it as GCM additional authenticated
@@ -130,6 +133,16 @@ type VolumeReconciler interface {
 	// lease is the other case: nothing outside this process knows, and silence there is a
 	// guest with no disk and a fleet that reads healthy.
 	Fence(ctx context.Context, volumeIDs []string, why storagev1.VolumeRefusal, detail string) error
+	// Isolate pauses the guests of these volumes, or resumes them, without the volumes
+	// changing hands. It is the reversible half of Fence and the two must not be
+	// conflated: fencing is this host being *shown* it is not the writer, and it takes
+	// the chain apart and records a fork; this is this host having been shown nothing at
+	// all, and everything it does is undone by passing true and then false.
+	//
+	// One method rather than a pair because the pause and the resume are one decision
+	// with two answers, and a caller that could reach for one without the other is a
+	// caller that can leave a tenant's VM stopped for ever.
+	Isolate(ctx context.Context, volumeIDs []string, paused bool) error
 }
 
 // VolumeSet is an in-memory VolumeSource: a set of statuses a caller writes directly.
