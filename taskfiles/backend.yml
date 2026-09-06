@@ -1,0 +1,62 @@
+version: "3"
+
+# The object store, measured and certified. `backend:conformance` is blocking per backend
+# (§6.1); the `measure:*` tasks produce the two numbers v6 §11 says the rotation threshold
+# and the RPO must be set from — measured, not chosen. The `:aws` twins need credentials
+# and are deliberately outside the merge gate: it must not need a cloud account.
+
+tasks:
+
+  measure:publish:
+    desc: >-
+      What one commit costs against the pinned backend: the fixed cost of a commit and
+      the rate its payload moves at. v6 §11 says the rotation threshold and the RPO are
+      set by measuring and not by choosing, and these are the two numbers they are set
+      from. This measures the container on localhost, where the fixed cost is one hop:
+      run measure:publish:aws for the number a deployment actually gets.
+    cmds:
+      - MEASURE=1 RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v -timeout 30m
+        -run TestMeasureWhatOneCommitCosts ./integration/backend/...
+
+  measure:transfer:
+    desc: >-
+      What a layer costs out to the bucket and back, at sizes past a gigabyte. The fetch
+      rate is the floor under any recovery-time number: a restore is the time a guest is
+      not running, and it is spent almost entirely pulling layers. Against the pinned
+      container.
+    cmds:
+      - MEASURE=1 RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v -timeout 60m
+        -run TestMeasureWhatALayerCostsBothWays ./integration/backend/...
+
+  measure:transfer:aws:
+    desc: >-
+      The same measurement against real S3. Moves about 7 GiB each way; from outside the
+      region it measures the link, not the store.
+    cmds:
+      - MEASURE=1 SPIN_OBJECT_STORE=aws go test -tags integration -count=1 -v -timeout 60m
+        -run TestMeasureWhatALayerCostsBothWays ./integration/backend/...
+
+  measure:publish:aws:
+    desc: >-
+      The same measurement against real S3. The fixed cost of a commit is three round
+      trips to a region, not to localhost, so this is the number that bounds a promised
+      RPO — the container's says what the code costs, not what the network does. Uploads
+      about 1 GiB.
+    cmds:
+      - MEASURE=1 SPIN_OBJECT_STORE=aws go test -tags integration -count=1 -v -timeout 30m
+        -run TestMeasureWhatOneCommitCosts ./integration/backend/...
+
+  backend:conformance:
+    desc: "§6.1/§25.4 object-store conformance suite against the pinned backend image (blocking per backend version)."
+    cmds:
+      - RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags integration -count=1 -v ./integration/backend/...
+
+  backend:conformance:aws:
+    desc: "The same suite against real AWS S3. Needs credentials and creates ~20 buckets it deletes on the way out; not in ci:full, because the merge gate must not need a cloud account."
+    cmds:
+      - SPIN_OBJECT_STORE=aws go test -tags integration -count=1 -v -timeout 30m ./integration/backend/...
+
+  backend:conformance:aws:sweep:
+    desc: "Delete the buckets an interrupted AWS conformance run left behind (spin-conf-*). Prints what it would remove unless CONFIRM=yes."
+    cmds:
+      - ./hack/s3-sweep.sh

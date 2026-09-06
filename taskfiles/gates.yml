@@ -1,0 +1,145 @@
+version: "3"
+
+# The gates that read the tree rather than run it: linters, formatting, coverage, the
+# deterministic simulation set, and the five checks that keep prose and dead code from
+# outliving what they describe (deadcode, comment:rot, refs, status:cap, diagrams:check).
+
+tasks:
+
+  diagrams:
+    desc: Render the architecture diagrams from their .dot sources into the SVGs at the root.
+    cmds:
+      - |
+        set -euo pipefail
+        for src in *.dot; do
+          out=${src%.dot}.svg
+          docker run --rm -i --entrypoint dot {{.DOT_IMAGE}} -Tsvg <"$src" >"$out"
+          echo "rendered $out"
+        done
+
+  diagrams:check:
+    desc: >-
+      Fail if a committed diagram is stale. This is the whole reason the .dot exists: the
+      v5 diagrams described a withdrawn engine for a month — vhost-user, an encrypted WAL,
+      CoW extents — because a picture is the one artefact nothing in a build ever reads.
+    cmds:
+      - task: diagrams
+      - git diff --exit-code -- '*.svg'
+
+  lint:
+    desc: Run golangci-lint plus the custom simulable analyzer (§25.1/INV-01).
+    cmds:
+      - task: lint:golangci
+      - task: lint:simulable
+      - task: lint:proto
+
+  lint:golangci:
+    desc: Run golangci-lint (incl. forbidigo/depguard belt-and-suspenders).
+    deps: [tools:golangci]
+    cmds:
+      # The build tags matter: without them golangci-lint never parses a single file
+      # under `integration/` or `internal/testinfra`, so the entire integration and
+      # e2e surface was unlinted — including the lanes that drive QEMU and Postgres.
+      # Found 2026-08-02, when the e2e lane's own files turned out to be invisible to
+      # the gate that was supposed to check them.
+      - "{{.TOOLS_BIN}}/golangci-lint run --build-tags integration,e2e ./..."
+
+  lint:simulable:
+    desc: Run the authoritative simulable-interfaces analyzer over all packages.
+    cmds:
+      # Same build tags as lint:golangci, one step later, so the authoritative INV-01 layer
+      # does not check a smaller tree than its belt-and-suspenders one.
+      # `-tags` on the analyzer binary is deprecated and does nothing; GOFLAGS is what
+      # reaches go/packages' `go list` child, which is why the tags are environment.
+      - GOFLAGS=-tags=integration,e2e go run {{.SIMULABLE}} ./...
+
+  fmt:
+    desc: Format code with the pinned golangci-lint formatters (gofmt + goimports).
+    deps: [tools:golangci]
+    cmds:
+      - "{{.TOOLS_BIN}}/golangci-lint fmt ./..."
+
+  fmt:check:
+    desc: Fail if any file is unformatted (what CI enforces, before the slower linters).
+    deps: [tools:golangci]
+    cmds:
+      - "{{.TOOLS_BIN}}/golangci-lint fmt --diff ./..."
+
+  cover:
+    desc: Cross-package coverage report; enforces a 90% floor on production code.
+    cmds:
+      - bash hack/coverage.sh
+
+  dst:
+    desc: Run the mandatory Deterministic Simulation Testing scenario set (§25.1, §25.2).
+    cmds:
+      # No `-run` filter, deliberately: `go test -run <regex>` exits 0 printing "[no tests
+      # to run]" when the regex matches nothing, so a list of test names here is a gate
+      # that can report success having proven nothing. A `go test -list` preflight was
+      # rejected — it writes the same names down twice, and in ./internal/dst it exits 1
+      # anyway (TestMain's audit that every checker caught a planted bug skips when
+      # test.run is non-empty). Filtering also switched that audit off. `-count=1` stays.
+      # When the commit protocol's serialize/replay property test lands, its package
+      # belongs on this list too.
+      - go test -race -count=1 ./internal/dst/
+
+  deadcode:
+    desc: >-
+      Fail on a function no binary reaches that neither hack/deadcode-allow.txt nor
+      hack/deadcode-pending.txt accounts for (CLAUDE.md: "a component with no caller is a
+      liability, not progress"). In `ci`.
+    # A ratchet over the set of unreachable symbols, not a count; the two lists, the
+    # rejected alternatives and the blind spots are in hack/deadcode.sh.
+    deps: [tools:deadcode]
+    cmds:
+      - DEADCODE={{.TOOLS_BIN}}/deadcode bash hack/deadcode.sh
+
+  dev:entries:
+    desc: >-
+      List the open DEV entries in STATUS.md and who owes each decision, and fail on one
+      that hack/dev-entries-open.txt does not pin (CLAUDE.md's gate: "No open DEV entry
+      that this increment introduced"). In `ci`.
+    # A ratchet over the set of open DEV entries; the rejected alternatives and the
+    # heading-only parsing are in hack/dev-entries.sh.
+    cmds:
+      - bash hack/dev-entries.sh
+
+  status:cap:
+    desc: "Fail when docs/plan/STATUS.md is over its 120-line cap (CLAUDE.md)."
+    cmds:
+      # STATUS.md holds what to do next and which thin paths are not deepened; a file that
+      # outgrows a screen has started holding history, and history is `git log`.
+      - |
+        set -euo pipefail
+        n=$(wc -l <docs/plan/STATUS.md)
+        test "$n" -le 120 || {
+          echo "docs/plan/STATUS.md is $n lines, over the 120-line cap: something in it is not state" >&2
+          exit 1; }
+        echo "OK: docs/plan/STATUS.md is $n lines"
+
+  comment:rot:
+    desc: >-
+      Fail on a production comment that describes a mechanism ADR-0026 withdrew — the
+      upload chain, the checkpoint, the GC, the lease gate — as if it were still here,
+      unless hack/comment-rot-allow.txt or hack/comment-rot-pending.txt accounts for it.
+      In `ci`.
+    # A ratchet over the set of comments naming a withdrawn mechanism; the two lists, the
+    # rejected alternatives and the identifier-aware matching are in the script.
+    cmds:
+      - bash hack/comment-rot.sh
+
+  refs:
+    desc: >-
+      Fail on prose that points at something that is not there — a repository path, an ADR
+      id, or a symbol of a package this tree deleted — unless hack/refs-allow.txt says
+      naming it is the point. It needs no vocabulary: what is gone is derived from what
+      does not resolve. In `ci`.
+    cmds:
+      - bash hack/refs.sh
+
+  workflows:verify:
+    desc: >-
+      Assert every `task <name>` in .github/workflows resolves against this Taskfile.
+      No workflow here has ever executed, so this is the only thing that checks them.
+    cmds:
+      - TASK_EXE={{.TASK_EXE}} bash hack/workflow-tasks.sh

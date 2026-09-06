@@ -62,10 +62,10 @@ say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 
 need() { test -x "$1" || test -f "$1" || die "missing $1 — run: $2"; }
-need "$QEMU"      "task build:qemu"
-need "$QEMU_IMG"  "task build:qemu"
-need "$KERNEL"    "task fetch:kernel"
-need "$INITRAMFS" "task build:guest"
+need "$QEMU"      "task qemu:build"
+need "$QEMU_IMG"  "task qemu:build"
+need "$KERNEL"    "task guest:kernel:fetch"
+need "$INITRAMFS" "task guest:build"
 need "$CP"        "task build:cmd"
 need "$AGENT"     "task build:cmd"
 docker exec "$PGC" true 2>/dev/null || die "no Postgres container named $PGC — run: task db:dev:up"

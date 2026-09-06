@@ -1,16 +1,20 @@
-# QEMU build for the remote-volumes work (Phases 02/03).
+# QEMU build for the remote-volumes work.
 #
 # Modelled on spin-stack/spinbox's Dockerfile.qemu (same BuildKit cache-mount
-# strategy, same debloat flags) with three differences that matter here:
+# strategy, same debloat flags) with two differences that matter here:
 #
 #   1. QEMU is pinned to 11.1.1 — the version CLAUDE.md pins for CI and prod —
 #      not spinbox's 11.0.1.
-#   2. --enable-vhost-user-blk-server builds qemu-storage-daemon, QEMU's own
-#      vhost-user-blk backend.
-#   3. --enable-tools keeps qemu-img / qemu-nbd / qemu-storage-daemon, which the
-#      guest-layout tests need to build and inspect the three devices of §9.
+#   2. --enable-tools keeps qemu-img, which is not a convenience: v6 forbids a
+#      qcow2 parser of our own, so every chain this system creates and inspects
+#      is that binary being run.
 #
-# The `extract` stage writes the binary + firmware to _output/ (task build:qemu).
+# What is *not* built: --enable-vhost-user-blk-server and the storage daemon it
+# served. The guest gets an ordinary virtio-blk-pci disk over a local qcow2 chain,
+# and the vhost-user data path went with the local block engine — a flag that
+# lengthens every build for a device nothing asks for is not a spare part.
+#
+# The `extract` stage writes the binary + firmware to _output/ (task qemu:build).
 
 FROM ubuntu:26.04 AS builder
 
@@ -19,7 +23,7 @@ ARG JOBS=8
 # Bump when the configure flags below change: the build directory lives in a cache
 # mount and configure only runs when there is no Makefile, so without this a flag
 # change would silently reuse the previous configuration.
-ARG QEMU_CONFIG_REV=2
+ARG QEMU_CONFIG_REV=3
 ARG DEBIAN_FRONTEND=noninteractive
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -75,8 +79,9 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
         tar -xf "/var/cache/qemu/qemu-${QEMU_VERSION}.tar.xz" -C /var/cache/qemu; \
     fi
 
-# Configure + build. vhost-user (our data path) and the storage daemon are the
-# reason this image exists; the display/audio stack is dead weight for a microVM.
+# Configure + build. The system binary and qemu-img are the reason this image exists —
+# QEMU owns the local copy-on-write format and this system runs it; the display/audio
+# stack is dead weight for a microVM.
 #
 # NOTE: do not re-add spinbox's `CONFIG_CXL=n` debloat here. On 11.0.2 it broke the
 # link — the PCI expander bridge (pxb_cxl_realize, acpi_build) still references
@@ -93,7 +98,6 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
             --prefix=/opt/qemu \
             --target-list=x86_64-softmmu \
             --enable-tools \
-            --enable-vhost-user-blk-server \
             --enable-kvm \
             --enable-linux-aio \
             --enable-linux-io-uring \
@@ -133,8 +137,7 @@ RUN --mount=type=cache,sharing=locked,id=qemu-src-${QEMU_VERSION},target=/var/ca
 
 # Fail the build here, not in a lane three phases later, if this configuration did not
 # produce the devices and tools the image ships.
-RUN /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'vhost-user-blk-pci' && \
-    test -x /opt/qemu/bin/qemu-storage-daemon && \
+RUN /opt/qemu/bin/qemu-system-x86_64 -device help 2>&1 | grep -q 'virtio-blk-pci' && \
     test -x /opt/qemu/bin/qemu-img && \
     /opt/qemu/bin/qemu-system-x86_64 --version
 
@@ -167,7 +170,6 @@ RUN --mount=type=cache,sharing=locked,id=qemu-runtime-aptlib,target=/var/lib/apt
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/qemu/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64
-COPY --from=builder /opt/qemu/bin/qemu-storage-daemon /usr/local/bin/qemu-storage-daemon
 COPY --from=builder /opt/qemu/bin/qemu-img /usr/local/bin/qemu-img
 COPY --from=builder /opt/qemu/bin/qemu-nbd /usr/local/bin/qemu-nbd
 COPY --from=builder /opt/qemu/share/qemu/ /usr/share/spin-stack/qemu/
@@ -180,7 +182,6 @@ ENTRYPOINT ["/usr/local/bin/qemu-system-x86_64"]
 FROM scratch AS extract
 
 COPY --from=builder /opt/qemu/bin/qemu-system-x86_64 /bin/qemu-system-x86_64
-COPY --from=builder /opt/qemu/bin/qemu-storage-daemon /bin/qemu-storage-daemon
 COPY --from=builder /opt/qemu/bin/qemu-img /bin/qemu-img
 COPY --from=builder /opt/qemu/bin/qemu-nbd /bin/qemu-nbd
 COPY --from=builder /opt/qemu/share/qemu/bios.bin /share/spin-stack/qemu/bios.bin

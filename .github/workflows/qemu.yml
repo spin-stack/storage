@@ -51,11 +51,11 @@ jobs:
         id: qemu
         run: echo "version=$(task qemu:version)" >> "$GITHUB_OUTPUT"
 
-      # `task build:qemu` runs the same buildx command a developer runs, with the GitHub
+      # `task qemu:build` runs the same buildx command a developer runs, with the GitHub
       # Actions cache backend. It ends in `task qemu:verify`, so a build that produced the
       # wrong version or lost a device we depend on fails here, not in a lane weeks later.
       - name: Build QEMU and verify what came out
-        run: task build:qemu QEMU_CACHE_FROM=type=gha QEMU_CACHE_TO=type=gha,mode=max QEMU_JOBS=4
+        run: task qemu:build QEMU_CACHE_FROM=type=gha QEMU_CACHE_TO=type=gha,mode=max QEMU_JOBS=4
 
       - name: Upload the extracted binaries
         uses: actions/upload-artifact@v4
@@ -81,7 +81,7 @@ jobs:
       - name: Publish the runtime image
         if: github.event_name != 'pull_request'
         run: |
-          task build:qemu:push \
+          task qemu:push \
             QEMU_IMAGE=ghcr.io/${{ github.repository }}/qemu \
             QEMU_IMAGE_EXTRA_TAG=${{ github.sha }} \
             QEMU_CACHE_FROM=type=gha \

@@ -9,7 +9,7 @@
 storage does not build a kernel (ADR-0021). It names spinbox's artefact **by content**,
 obtains it from whichever source has it, and verifies it before booting anything with it.
 
-1. **One canonical path:** `_output/guest/vmlinux`. `task fetch:kernel` puts it there;
+1. **One canonical path:** `_output/guest/vmlinux`. `task guest:kernel:fetch` puts it there;
    every other task and test reads it there. `SPINBOX_KERNEL` survives only as one *source
    to copy from*, not as the place the lane looks.
 2. **Pinned by sha256 in `Taskfile.yml`** (`GUEST_KERNEL_SHA256`), next to

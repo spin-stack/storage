@@ -171,7 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           tag=$(task guest:kernel:tag)
-          task fetch:kernel GUEST_KERNEL_IMAGE=ghcr.io/${{ github.repository }}/guest-kernel:"$tag"
+          task guest:kernel:fetch GUEST_KERNEL_IMAGE=ghcr.io/${{ github.repository }}/guest-kernel:"$tag"
 
       # Asserts the lane's inputs before anything boots: the kernel is the one that was
       # pinned, is a PVH ELF, carries the four config options a boot depends on, and the

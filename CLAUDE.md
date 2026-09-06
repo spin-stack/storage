@@ -133,7 +133,8 @@ prod). Layout: `internal/`, `cmd/`, `api/` (proto), `integration/`, `hack/`, `de
 **Everything goes through Taskfile targets.** Versions pinned in `Taskfile.yml`,
 installed into `./.tools/bin` by `task tools`; CI runs the same tasks. Never invoke
 `sqlc`, `pgschema`, `golangci-lint`, `gofmt` or raw `go test -coverpkg` by hand — if
-something is missing, add a task.
+something is missing, add a task. Targets live in `taskfiles/<group>.yml`, included
+flattened: the group is where a target is written, never part of its name.
 
 ```
 task ci                 # fast local gate: fmt + build + lint + test(-race) + dst
@@ -144,8 +145,8 @@ task db:dev:up|down     # pinned Postgres 18
 task db:plan -- <name>  # DDL for the current schema.sql change → migrations/
 task db:apply PLAN=<f>  # apply a *saved* plan, never a recomputed one
 task db:verify          # schema.sql → empty DB; assert the plan is empty
-task build:qemu / qemu:verify / qemu:version / qemu:tools
-task fetch:kernel / build:guest / guest:verify
+task qemu:build / qemu:verify / qemu:version / qemu:tools
+task guest:kernel:fetch / guest:build / guest:verify
 task demo:stage1        # Stage 1 end to end: a Linux guest boots off our qcow2
 task backend:conformance # §6.1 object-store conformance (blocking per backend)
 ```
