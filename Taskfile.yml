@@ -52,7 +52,7 @@ vars:
   DEVDB_CONTAINER: spin-storage-devdb
   DEVDB_PORT: '{{.DEVDB_PORT | default "55432"}}'
   # The guest kernel, at the one path the lane reads. Put there by `task machine`.
-  GUEST_KERNEL: '{{.OUTPUT_DIR}}/guest/vmlinux'
+  GUEST_KERNEL: '{{.OUTPUT_DIR}}/kernel/vmlinux'
   # Target database for db:plan / db:apply — the local development database by
   # default. Point DB_* at a real one to plan or apply against it; the password
   # comes from the environment (PGPASSWORD), never from a var in this file.

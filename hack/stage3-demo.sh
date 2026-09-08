@@ -45,7 +45,7 @@ mkfifo "$DIR/ctl"
 exec 9<>"$DIR/ctl"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
-  -L "$OUT/share/spin-stack/qemu" \
+  -L "$OUT/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=$CHURN" \
   -drive "file=$FIRST,format=qcow2,if=virtio,cache=writeback" \
@@ -136,7 +136,7 @@ say "9. a second boot, reading only"
 TIP=$(cat "$POINTER")
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
-  -L "$OUT/share/spin-stack/qemu" \
+  -L "$OUT/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=verify" \
   -drive "file=$TIP,format=qcow2,if=virtio,cache=writeback" \
