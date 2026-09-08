@@ -172,11 +172,52 @@ type SealedLayer struct {
 //
 // A nil Publisher is a host that keeps its layers locally and publishes nothing, which
 // is every lane before v6 §23.3 and is not an error.
+//
+// Two of its failures are not failures of the transfer and the Manager branches on them,
+// so an implementation must be able to say them: ErrNotWriter, which stops the volume,
+// and ErrRootSuperseded, which abandons a collapse. Any other error is a publish that did
+// not land and is retried. They are exported for the same reason ErrNoHistory is — a
+// Publisher living in another module has no other way to say either sentence, and an
+// implementation that cannot say ErrNotWriter leaves a fenced host serving a guest whose
+// writes can never be published.
 type Publisher interface {
 	Publish(ctx context.Context, layer SealedLayer) error
 }
 
+// ErrNotWriter means the compare-and-set on HEAD lost: something else published for this
+// volume, so this host is not its writer any more. It is the one publishing failure that
+// stops the volume rather than being retried — a host that goes on taking writes it can
+// never publish is the fencing defect §15 is about.
+//
+// It *is* internal/commit's ErrHeadMoved, under this package's name; ErrNoHistory carries
+// why one value under two names is the shape and two values is not.
+var ErrNotWriter = commit.ErrHeadMoved
+
+// ErrRootSuperseded means a compacted root was published for a HEAD that has moved on:
+// the flattened bytes reconstruct a commit that is no longer the newest, so taking them
+// would move HEAD backwards over a commit that returned SUCCESS. Nobody else took the
+// volume — that is ErrNotWriter — so this host goes on serving it and plans the next
+// collapse over the history as it is now.
+//
+// It *is* internal/commit's ErrRootSuperseded, under the same name.
+var ErrRootSuperseded = commit.ErrRootSuperseded
+
 // Deps are the Manager's injected collaborators (INV-01).
+//
+// **Three of them cannot be supplied from outside this module today, so Manager is not
+// yet the facade ADR-0021 §4 promises spin's runner — Open and the chain functions are.**
+// Clock and Disk are internal/simio interfaces whose own methods return internal types
+// (clock.Instant, clock.Timer, disk.File, disk.Usage), so no implementation of them can
+// be written elsewhere, and internal/simio/real — the implementations a real host wants
+// — is unreachable for the same reason. Dialer is nameable in shape but lives internal
+// too. Closing this means deciding where the simio boundary sits relative to the public
+// surface, which is a decision of its own and not a doc comment's to make; it is not
+// closed by re-exporting, because what a consumer needs is the *real* implementations and
+// those are the ones INV-01 confines.
+//
+// Publisher, Witness, Recovery, Runner and Paths are the ones that were designed to be
+// implemented by a caller, and they are: every type in their signatures is public, and
+// every sentinel their errors must carry is exported by this package.
 type Deps struct {
 	Clock  clock.Clock
 	Disk   disk.Disk
@@ -824,7 +865,7 @@ func (m *Manager) publish(ctx context.Context, v *volume) error {
 		return m.refuse(v, storagev1.VolumeRefusal_VOLUME_REFUSAL_DURABILITY_LOST, err)
 	}
 	if err := m.pub.Publish(ctx, layer); err != nil {
-		if errors.Is(err, commit.ErrHeadMoved) {
+		if errors.Is(err, ErrNotWriter) {
 			// Another host published for this volume, so this one is not its writer: it
 			// would keep accepting writes that can never be published. That is the one
 			// publishing failure that stops the volume.
@@ -1517,6 +1558,9 @@ type volumeGap struct {
 }
 
 // Volumes reports what this host is holding, ordered by volume id (deterministic).
+//
+// It returns internal/agent's type, which a caller outside this module can read but
+// cannot name — part of the same gap Deps carries, and it moves when that one does.
 func (m *Manager) Volumes(context.Context) ([]agent.VolumeStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
