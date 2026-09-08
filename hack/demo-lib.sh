@@ -53,7 +53,7 @@ SIZE=${SIZE:-268435456}
 # reaching a qcow2 through virtio, and that is true at either speed; refusing to run
 # without KVM would make the one command a human runs unrunnable on a developer outside
 # the `kvm` group and on every hosted CI runner. A host serving tenants is the opposite
-# case, which is why the binary it runs has no TCG in it at all (Dockerfile.qemu).
+# case, which is why the production binary in a release has no TCG in it at all.
 #
 # Chosen here rather than left to QEMU's `kvm:tcg` fallback list, which would pick the
 # same thing and say nothing. The silence is the problem: a machine that should have KVM

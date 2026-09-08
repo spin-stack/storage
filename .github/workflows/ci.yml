@@ -21,10 +21,10 @@ permissions:
 
 # ---------------------------------------------------------------------------------
 # Two jobs. It was five, because `task ci:full` could not run on one hosted runner: the
-# guest lanes needed the pinned QEMU, only executable inside the published runtime image
-# (ADR-0025), and a container job gets no Docker daemon for the TestContainers lanes.
-# Nothing in the merge gate needs QEMU now. The `gate` job below stays regardless — its
-# reason never depended on the split.
+# guest lanes needed a QEMU that was dynamically linked and so only executable inside the
+# image that built it, and a container job gets no Docker daemon for the TestContainers
+# lanes. QEMU is static now and nothing in the merge gate needs it anyway. The `gate` job
+# below stays regardless — its reason never depended on the split.
 # ---------------------------------------------------------------------------------
 
 jobs:

@@ -2,11 +2,9 @@ version: "3"
 
 # The machine this repository runs guests on: QEMU, the guest kernel, the firmware.
 #
-# None of it is built here. It used to be — a Dockerfile.qemu modelled on another
-# project's, a device list that was byte-for-byte that project's, and a
-# Dockerfile.guest-kernel that built nothing and existed only to move somebody else's
-# kernel through a registry and back out (ADR-0022). All of that has one home now, and
-# `task machine` is the only path by which a machine arrives.
+# None of it is built here, and none of it is mirrored here. QEMU, the guest kernel and
+# the firmware are one versioned artefact from spin-machine, pinned by version and by
+# SHA-256 below; `task machine` is the only path by which a machine arrives.
 
 tasks:
 
