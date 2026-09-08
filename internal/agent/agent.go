@@ -8,7 +8,7 @@
 // device, and the set of volumes this host is serving. cmd/volume-agent is the only
 // place the real implementations are constructed.
 //
-// The volume manager behind the VolumeSource is internal/qcow: QEMU owns the local
+// The volume manager behind the VolumeSource is qcow: QEMU owns the local
 // copy-on-write format, and what is left in this package is the half that talks to the
 // Control Plane. VolumeReconciler is the seam, qcow.Manager plugs into it, and VolumeSet
 // is what the loop's own tests drive.

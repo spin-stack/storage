@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // sweepScenarios drives the one rule in this system that deletes files.
@@ -14,7 +14,7 @@ import (
 // records and the pointers, and both arrive through I/O this package can break. What it
 // cannot reach is the live QEMU: `Manager.Apply` asks a running guest which image it has
 // open and refuses a volume it cannot account for, and a fake for that here would be a
-// model of qemu-img agreeing with the scenario. That half is internal/qcow's.
+// model of qemu-img agreeing with the scenario. That half is qcow's.
 //
 // The fault is a disk that acknowledges an fsync it does not honour. It is aimed here
 // rather than anywhere else because the sweep's keep-set comes from the records, so a

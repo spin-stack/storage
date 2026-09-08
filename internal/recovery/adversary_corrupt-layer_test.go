@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/spin-stack/storage/internal/commit"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // rottenRunner is a qemu-img that opens the file before it answers about it.

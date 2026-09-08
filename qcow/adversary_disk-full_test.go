@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/disk"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // TestAdversaryTheDeviceFillsWhileALayerIsSealedAndNothingSealedIsForgotten is v6 §22's

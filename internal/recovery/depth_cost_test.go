@@ -18,10 +18,10 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // countingStore records the reads a rebuild makes, in order. Reads only: a restore writes

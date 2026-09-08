@@ -21,9 +21,9 @@ import (
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/obs"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // ErrIncomplete means this volume has published commits and this host could not assemble

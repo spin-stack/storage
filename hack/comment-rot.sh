@@ -2,7 +2,7 @@
 # Which production comments still describe a mechanism this tree withdrew — computed,
 # not remembered.
 #
-# A finding is a (symbol, term) pair — internal/qcow/chain.go:Open:checkpoint. Rejected
+# A finding is a (symbol, term) pair — qcow/chain.go:Open:checkpoint. Rejected
 # keys: file:line (moves on any edit above it), the whole file (collapses a file's eight
 # mentions into one decision), the line's text hashed (a reword fails the gate with a
 # message about a hash).

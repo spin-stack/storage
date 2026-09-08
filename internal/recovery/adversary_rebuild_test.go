@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // TestAdversaryALayerIdThisHostHoldsForAnotherVolumeIsNotStoodInForThisOne.

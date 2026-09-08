@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/real"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // TestAdversaryTheRealAgentRefusesToStartBecauseNothingWiresTheGuard.

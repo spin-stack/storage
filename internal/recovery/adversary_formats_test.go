@@ -8,9 +8,9 @@ import (
 
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/framed"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // putFramed writes a hand-built structural object the way a writer of this format would:

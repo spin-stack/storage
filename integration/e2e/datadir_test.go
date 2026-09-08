@@ -26,7 +26,7 @@ import (
 //
 // The lock has moved twice and this test is why the moves were safe: into `main` when the
 // volume manager that used to take it was withdrawn, and back into the volume manager
-// (internal/qcow) when Stage 1 gave it a directory layout to own. What it asserts is
+// (qcow) when Stage 1 gave it a directory layout to own. What it asserts is
 // about the *process*, not about which type inside it holds the descriptor — which is
 // exactly the property that let the second move happen without a second argument.
 //

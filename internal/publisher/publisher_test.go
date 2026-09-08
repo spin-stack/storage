@@ -16,8 +16,8 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/publisher"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // fakeKeys is the Control Plane's half: it hands over a volume's wrapped DEK, or refuses

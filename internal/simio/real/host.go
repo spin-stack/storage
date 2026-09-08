@@ -18,7 +18,7 @@ import (
 // a stream — and not disk.Disk, which is a rooted namespace of append-only files that
 // deliberately hides absolute paths and any way to hand a file to somebody else. Both are
 // what qcow2 needs: QEMU and `qemu-img` are other processes taking a path on the command
-// line. The interfaces these satisfy are declared where they are consumed (internal/qcow,
+// line. The interfaces these satisfy are declared where they are consumed (qcow,
 // internal/qmp), so a test fakes them without importing this package.
 
 // Runner runs external programs to completion. It is what `qemu-img` is reached

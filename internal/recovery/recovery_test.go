@@ -21,10 +21,10 @@ import (
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 const (

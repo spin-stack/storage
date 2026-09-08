@@ -63,4 +63,22 @@ tasks:
       #
       # Against main and not against a tag: main is what spin will be built against.
       # It needs the history, which is why ci.yml checks out with fetch-depth 0.
-      - "{{.TOOLS_BIN}}/buf breaking --against '../.git#branch=main,subdir=api'"
+      #
+      # `ref=origin/main` and not `branch=main`, because buf treats the path as a
+      # *remote* and asks git for `refs/heads/main` in it. A developer's checkout
+      # has that; a pull request's does not — actions/checkout leaves HEAD detached
+      # at the merge commit and creates no local branch — so every PR this check has
+      # ever run on failed the same way, and it read like an infrastructure fault
+      # rather than like a check that was never running:
+      #
+      #   Failure: could not clone file:///home/runner/work/storage/storage/.git:
+      #   exit status 128
+      #   fatal: couldn't find remote ref main
+      #
+      # A push to main passed, because there HEAD *is* main, which is why this went
+      # unnoticed: the lane was green exactly when it had nothing to compare.
+      # Reproduced 2026-09-08 by detaching HEAD in a clone and deleting the local
+      # branch; `ref=origin/main` exits 0 in that same tree, and is what "main is
+      # what spin will be built against" meant anyway — the remote's main, not
+      # whatever a local branch of that name happens to point at.
+      - "{{.TOOLS_BIN}}/buf breaking --against '../.git#ref=origin/main,subdir=api'"

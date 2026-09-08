@@ -1,6 +1,6 @@
 // Package publisher turns a sealed layer on this host's disk into a published commit.
 //
-// internal/qcow owns a volume's local chain and decides *when* a layer is ready; this is
+// qcow owns a volume's local chain and decides *when* a layer is ready; this is
 // *what* happens then — fetch the volume's key, read the file, and run v6 §9's publish
 // protocol. It needs a Control Plane and an object store; the chain needs neither.
 package publisher
@@ -16,9 +16,9 @@ import (
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/obs"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/clock"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // Keys hands over a volume's wrapped key material. It is agent.Loop in production: the
@@ -81,7 +81,7 @@ func (p *Publisher) Publish(ctx context.Context, l qcow.SealedLayer) error {
 		return err
 	}
 	// The sealed length, which is what left this host and what the bucket is charged
-	// for; the qcow2's own length is the local number and internal/qcow records it.
+	// for; the qcow2's own length is the local number and qcow records it.
 	volume := obs.String("volume", l.VolumeID)
 	p.rec.Observe(ctx, "layer_size_bytes", float64(m.Layer.SizeBytes), volume)
 	p.rec.Count(ctx, "layer_upload_bytes_total", m.Layer.SizeBytes, volume)

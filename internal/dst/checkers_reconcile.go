@@ -22,7 +22,7 @@ func reconcileCheckers() []Checker {
 // A publish naming a layer no seal event named is not this checker's subject and is
 // skipped: `two-hosts-cannot-both-publish` publishes layers that were never rotated into
 // being, and publishing a layer that is *not* sealed — the tip, with a guest still
-// writing into it — is asserted through the Manager in internal/qcow's reconcile
+// writing into it — is asserted through the Manager in qcow's reconcile
 // adversary lane, where the publisher can see which file it was handed.
 type SealOrderChecker struct {
 	sealed    []string

@@ -280,7 +280,7 @@ func (r CordonReason) OverwritableNames() []string { return names(cordonOverwrit
 // `err.Error()`, which embeds a volume id and a path, so no two rows compare equal, the
 // -fleet-status column becomes a vocabulary nobody controls, and the first alert written on
 // it matches a substring. Every value here is a decision at a named line in internal/agent
-// or internal/qcow, so extending the vocabulary is the same commit. The sentence an operator
+// or qcow, so extending the vocabulary is the same commit. The sentence an operator
 // needs — which layer, which key — rides alongside as free text nothing branches on
 // (metadata.VolumeProgress.RefusalDetail).
 //
