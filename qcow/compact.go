@@ -9,7 +9,6 @@ import (
 	"slices"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
-	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/ids"
 )
 
@@ -389,12 +388,12 @@ func (m *Manager) collapse(ctx context.Context, v *volume, st *State) error {
 	}
 	if err := m.pub.Publish(ctx, layer); err != nil {
 		switch {
-		case errors.Is(err, commit.ErrRootSuperseded):
+		case errors.Is(err, ErrRootSuperseded):
 			// The object store's own statement of the check above, for the window this
 			// host cannot see from its record: HEAD is not the commit these bytes
 			// reconstruct.
 			return m.abandonCompaction(v, st, err.Error())
-		case errors.Is(err, commit.ErrHeadMoved):
+		case errors.Is(err, ErrNotWriter):
 			// Another host is this volume's writer. A collapse is a publish, so it meets
 			// the same fence as any other one, and for the same reason: the alternative is
 			// this host serving a guest whose writes can never land.

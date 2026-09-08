@@ -67,6 +67,21 @@ var ErrChainMissing = errors.New("qcow: this volume has published commits and th
 // volume and somebody has to decide which of the two histories is the one to keep.
 var ErrStaleChain = errors.New("qcow: this host's chain is behind the published history")
 
+// ErrNoHistory means the object store holds no HEAD for this volume: nothing has ever
+// published it, and a chain born empty is the correct answer. It is the one condition a
+// Recovery must be able to say, so it has to be sayable with nothing but this package —
+// which is what it was not while the only spelling lived in internal/commit, where a
+// consumer in another module cannot reach it. An implementation there could return every
+// error meaning "refuse" and none meaning "permit", so Open refused every volume.
+//
+// It *is* internal/commit's ErrNoHead and not a second sentinel that means the same
+// thing: two values would have to be kept mutually wrapping by hand, and the day one of
+// them was returned bare, errors.Is would answer differently on the two spellings of one
+// condition. One value under two names cannot drift. The name is this package's because
+// this is where the surface is, and the sentence — "this volume has no history" — is the
+// one a caller of Open is asking.
+var ErrNoHistory = commit.ErrNoHead
+
 // Recovery rebuilds a volume's published chain on this host.
 //
 // An interface and not a bool the caller computes, because the question — may this volume
@@ -78,13 +93,12 @@ var ErrStaleChain = errors.New("qcow: this host's chain is behind the published 
 // "born empty".
 type Recovery interface {
 	// RestoreFrom rebuilds this volume's published chain locally, including its parent's
-	// up to the named commit when it is a clone. A wrapped commit.ErrNoHead means the
+	// up to the named commit when it is a clone. A wrapped ErrNoHistory means the
 	// volume has never published and an empty chain is correct; every other error means
-	// refuse. commit.ErrNoHead is reused rather than a sentinel of our own because the
-	// condition *is* "this volume has no HEAD".
+	// refuse.
 	RestoreFrom(ctx context.Context, l Lineage, sizeBytes int64) (Restored, error)
 	// Current is the commit the object store says is this volume's newest, wrapping
-	// commit.ErrNoHead when it has never published. It is Restore's question without
+	// ErrNoHistory when it has never published. It is Restore's question without
 	// Restore's work, and it is asked on every open of a chain that is already here:
 	// a local chain is only current if the published history has not moved past it.
 	Current(ctx context.Context, volumeID string) (string, error)
@@ -253,6 +267,10 @@ type Paths interface {
 	// List names the entries of a directory, without their paths. What a sweep is looking
 	// for is precisely the files no record names, so it cannot be found by asking about
 	// paths this host already knows.
+	//
+	// A directory that is not there is fs.ErrNotExist and never an empty list: a host on
+	// its first cycle and a listing that failed are the same answer otherwise, and
+	// sweeping against the second deletes every chain on the machine.
 	List(dir string) ([]string, error)
 	// Rename moves a file within the layers directory. It is how a file that is built in
 	// several steps — a compaction's flattened root — only ever appears under its real
@@ -448,7 +466,7 @@ func Open(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 func checkNotStale(ctx context.Context, p Paths, req OpenRequest, image string) error {
 	head, err := req.Recovery.Current(ctx, req.VolumeID)
 	switch {
-	case errors.Is(err, commit.ErrNoHead):
+	case errors.Is(err, ErrNoHistory):
 		return nil
 	case err != nil:
 		return fmt.Errorf("%w: volume %s has a local chain and the object store could not say whether it is current: %w",
@@ -486,7 +504,7 @@ func checkNotStale(ctx context.Context, p Paths, req OpenRequest, image string) 
 func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest, pointer string, local State) (*Chain, error) {
 	restored, err := req.Recovery.RestoreFrom(ctx, req.Lineage, req.SizeBytes)
 	switch {
-	case errors.Is(err, commit.ErrNoHead):
+	case errors.Is(err, ErrNoHistory):
 		// This host's own record outranks the bucket's answer, in exactly one direction and
 		// only here. An Agent that published commits for this volume and is pointed at no
 		// object store — or at the wrong one — is told "never published", and would create a
@@ -543,7 +561,7 @@ func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 //
 // Restore and not Current, and the difference is the whole decision: Current asks whether
 // the local chain is behind and can only refuse, while a host with a guest waiting needs
-// the store to put the history on this disk. Its ErrNoHead is the case that keeps the
+// the store to put the history on this disk. Its ErrNoHistory is the case that keeps the
 // local chain — nothing was ever published by anyone, so replacing the local layers with
 // an empty image is the blank-disk defect with a fence in front of it.
 //
@@ -551,7 +569,7 @@ func born(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenReques
 func regrant(ctx context.Context, r Runner, p Paths, qemuImg string, req OpenRequest, pointer, image string, local State) (chain *Chain, keepLocal bool, err error) {
 	restored, err := req.Recovery.RestoreFrom(ctx, req.Lineage, req.SizeBytes)
 	switch {
-	case errors.Is(err, commit.ErrNoHead):
+	case errors.Is(err, ErrNoHistory):
 		slog.Info("this volume was granted back to this host and the object store holds no history for it, so the local chain is the only one there is",
 			"volume_id", req.VolumeID, "tip", image, "fenced_at_epoch", local.Fenced.Epoch)
 		if err := clearFence(p, req.Root, req.VolumeID); err != nil {
