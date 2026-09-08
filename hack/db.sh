@@ -49,12 +49,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# wait_ready <container> — block until the server accepts connections, or fail
-# loudly with its log rather than letting the next command report a refused socket.
+# wait_ready <container> — block until the server answers a query over TCP, or fail
+# loudly with its log rather than letting the next command report a reset socket.
+#
+# Over TCP, and a real query, because the two weaker signals are not the claim the caller
+# makes. The published port is bound by docker the instant the container starts, so "the
+# port answers" says nothing about the server; and the image's entrypoint runs initdb
+# against a *temporary* server started with listen_addresses='', so `pg_isready` over the
+# Unix socket — what this used to ask — returns 0 while TCP inside the container is still
+# refused. In that window a client connecting through the published port is accepted by
+# docker and then reset, which is exactly what CI reported on 2026-09-08 (run 34185780834,
+# `db:verify`: "read: connection reset by peer" 1.3s after the image finished pulling).
+# internal/testinfra already waits for the *second* "ready to accept connections" line for
+# the same reason; this is the shell path saying the same thing.
+#
+# Polling a real query is not the sleep INV-01 forbids: the loop ends on the signal itself
+# — the server answering the question its client is about to ask, authentication included —
+# and the bound only decides how long we wait before printing the log and giving up.
 wait_ready() {
   local c=$1 i
   for ((i = 0; i < 60; i++)); do
-    if docker exec "$c" pg_isready -q -U "$DB_USER" -d "$DB_NAME" 2>/dev/null; then
+    if docker exec -e PGPASSWORD="$DB_PASSWORD" "$c" \
+      psql -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -tAc 'select 1' >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
