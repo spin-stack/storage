@@ -47,7 +47,7 @@ mkfifo "$DIR/ctl"
 exec 9<>"$DIR/ctl"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
-  -L "$OUT/share/spin-stack/qemu" \
+  -L "$OUT/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.churn=8 spin.slot=0" \
   -drive "file=$(cat "$POINTER"),format=qcow2,if=virtio,cache=writeback" \
@@ -112,7 +112,7 @@ say "7. a second guest boots the clone and reads the FIRST guest's pattern"
 CSOCK=$(grep "volume_id=$CLONE" "$DIR/logs/agent1.log" | grep -m1 -o 'qmp_socket=[^ ]*' | cut -d= -f2)
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
-  -L "$OUT/share/spin-stack/qemu" \
+  -L "$OUT/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=verify spin.slot=0" \
   -drive "file=$CIMAGE,format=qcow2,if=virtio,cache=writeback" \
@@ -132,7 +132,7 @@ mkfifo "$DIR/ctl2"
 exec 8<>"$DIR/ctl2"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
-  -L "$OUT/share/spin-stack/qemu" \
+  -L "$OUT/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=hold spin.slot=1" \
   -drive "file=$CIMAGE,format=qcow2,if=virtio,cache=writeback" \
@@ -182,7 +182,7 @@ echo "    its chain is $GDEPTH layers deep"
 say "12. a guest boots the clone of the clone and reads the ORIGINAL guest's slot"
 "$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
-  -L "$OUT/share/spin-stack/qemu" \
+  -L "$OUT/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
   -append "console=ttyS0 panic=1 spin.mode=verify spin.slot=0" \
   -drive "file=$GIMAGE,format=qcow2,if=virtio,cache=writeback" \

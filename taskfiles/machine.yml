@@ -20,8 +20,8 @@ tasks:
       - "{{.OUTPUT_DIR}}/bin/qemu-img --version"
       - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64 --version"
       - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64-tcg --version"
-      - "test -f {{.OUTPUT_DIR}}/guest/vmlinux"
-      - "test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin"
+      - "test -f {{.OUTPUT_DIR}}/kernel/vmlinux"
+      - "test -f {{.OUTPUT_DIR}}/qemu/pvh.bin"
     cmds:
       - |
         set -euo pipefail

@@ -30,8 +30,12 @@ NAME="spin-machine-${VERSION}-linux-${ARCH}"
 # Both qemu-system binaries: the Agent runs on hosts with /dev/kvm and CI does not, and the
 # split between a binary that refuses to emulate and one that can is the whole reason there
 # are two. qemu-img because every qcow2 chain is created and inspected by running it — v6
-# forbids a parser of our own. The kernel goes to _output/guest/vmlinux, which is the one
-# path the guest lane reads.
+# forbids a parser of our own.
+#
+# Each of them at the path the release already gives it, so _output/ has the release's own
+# shape. What this repository builds for itself — the guest initramfs — keeps its own
+# directory, and the split is worth reading off a listing: bin/, kernel/ and qemu/ came
+# from a release, guest/ was built here.
 #
 # Not taken: the base image. Nothing here boots from it.
 place() {
@@ -48,12 +52,17 @@ place() {
     install -m "$([ -x "${src}" ] && echo 0755 || echo 0644)" "${src}" "${dest}"
   }
 
+  # Each file at the path the release already gives it. This used to rearrange
+  # them — the kernel to guest/, the firmware under share/spin-stack/ — which
+  # meant the same files had one layout in the release and another here, with a
+  # translation between the two that every reader had to know about. There is
+  # nothing to know now: what the tarball says is where it is.
   copy bin/qemu-system-x86_64     bin/qemu-system-x86_64
   copy bin/qemu-system-x86_64-tcg bin/qemu-system-x86_64-tcg
   copy bin/qemu-img               bin/qemu-img
-  copy kernel/vmlinux             guest/vmlinux
+  copy kernel/vmlinux             kernel/vmlinux
   for f in bios.bin bios-256k.bin pvh.bin kvmvapic.bin efi-virtio.rom; do
-    copy "qemu/${f}" "share/spin-stack/qemu/${f}"
+    copy "qemu/${f}" "qemu/${f}"
   done
 
   [ "${missing}" -eq 0 ] || {
@@ -69,20 +78,15 @@ place() {
 # left-hand function, so a copy that failed halfway reports success.
 have_sibling() {
   local out="${SIBLING}/_output"
-  [ -f "${out}/bin/qemu-system-x86_64" ] && [ -f "${out}/vmlinux" ]
+  [ -f "${out}/bin/qemu-system-x86_64" ] && [ -f "${out}/kernel/vmlinux" ]
 }
 
 from_sibling() {
-  local out="${SIBLING}/_output" staged
   echo "Using the machine built in ${SIBLING}"
-  staged="$(mktemp -d)"
-  trap 'rm -rf "${staged}"' RETURN
-  mkdir -p "${staged}/bin" "${staged}/kernel" "${staged}/qemu"
-  cp "${out}/bin/qemu-system-x86_64" "${out}/bin/qemu-system-x86_64-tcg" \
-     "${out}/bin/qemu-img" "${staged}/bin/"
-  cp "${out}/vmlinux" "${staged}/kernel/vmlinux"
-  cp "${out}"/share/spin-stack/qemu/* "${staged}/qemu/"
-  place "${staged}"
+  # A built tree and an unpacked release are the same shape, so this is the same copy
+  # the release path does. It used to stage the files into a third layout first,
+  # because they were not.
+  place "${SIBLING}/_output"
 }
 
 from_release() {
@@ -154,4 +158,4 @@ done
   exit 1
 }
 
-echo "✓ machine ${VERSION}: qemu $("${OUTPUT_DIR}/bin/qemu-img" --version | head -1 | awk '{print $3}'), kernel $(stat -c%s "${OUTPUT_DIR}/guest/vmlinux") bytes"
+echo "✓ machine ${VERSION}: qemu $("${OUTPUT_DIR}/bin/qemu-img" --version | head -1 | awk '{print $3}'), kernel $(stat -c%s "${OUTPUT_DIR}/kernel/vmlinux") bytes"
