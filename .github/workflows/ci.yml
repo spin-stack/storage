@@ -1,17 +1,35 @@
 name: CI
 
+# A branch is tested through its pull request, and main is tested when something lands on
+# it. Not both: `push:` with no filter fires alongside `pull_request:` for every push to a
+# branch that has one open, so every push started two identical runs.
+#
+# The concurrency group used to clean that up afterwards — same key for both events,
+# cancel-in-progress — which worked and cost a run each time: both started, both took a
+# runner, and one was killed. What is left in the run list is a column of `cancelled` that
+# reads like something is wrong, and 14 of the last 40 runs here were exactly that.
+#
+# The cost is not only the runner. On a self-hosted one, two runs of this gate install the
+# same release and restart the same containerd, so the loser does not merely stop — it
+# fails during setup, and the failure is about a machine two runs were fighting over
+# rather than about the change.
+#
+# What is given up: a branch with no pull request open is not tested. That is what
+# opening one is for.
 on:
   push:
+    branches: [main]
   pull_request:
 
-# One run per branch, not one per event. A push to a branch with an open pull request fires
-# both triggers; keying on `head_ref || ref_name` gives both the same string, while
-# `github.ref` — the obvious choice — does not (`refs/pull/N/merge` vs
-# `refs/heads/my-branch`, two groups, nothing de-duplicated). `cancel-in-progress` then
-# makes a new push supersede its predecessor, on main as well.
+# A new push to a branch supersedes the run its predecessor started, because only the tip
+# is worth a verdict.
+#
+# Never on main. A cancelled run there is a merge commit nobody proved, which is the
+# thing this gate exists to make impossible — it already happened once, to the merge of
+# #3. Two merges landing close together are two things to verify, not one.
 concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 # Least privilege by default: the gate reads the tree and nothing else. The jobs that
 # touch GitHub Packages raise it to `packages: read` themselves, at the job, so the
