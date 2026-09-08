@@ -101,7 +101,7 @@ func run() (err error) {
 		// Required rather than defaulted to PATH: v6 pins QEMU to one version for CI
 		// and production, and a chain created by whichever qemu-img a login shell found
 		// is a chain nobody pinned.
-		return errors.New("-qemu-img is required: name the pinned binary (task qemu:build puts it in _output/bin)")
+		return errors.New("-qemu-img is required: name the pinned binary (task machine puts it in _output/bin)")
 	}
 
 	cfg := agent.Config{

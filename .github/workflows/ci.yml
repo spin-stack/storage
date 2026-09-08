@@ -36,10 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     # The gate starts a Volume Agent, and the Agent creates and inspects every qcow2
     # chain by running the pinned qemu-img — v6 §7 forbids a parser of our own — so it
-    # refuses to start without one. `task qemu:tools` pulls the image qemu.yml publishes
-    # and extracts the binary; building QEMU here would be tens of minutes inside a
-    # sixty-minute job. This is the preflight the Taskfile's own comment predicted the
-    # qcow2 lane would need.
+    # refuses to start without one. `task machine` fetches the pinned spin-machine release,
+    # which is minutes of download against the tens of minutes compiling QEMU here would
+    # cost, and this repository no longer has a QEMU to compile.
     permissions:
       contents: read
       packages: read
@@ -94,14 +93,15 @@ jobs:
       # Named as its own step so a missing or unpublished image fails here, under a name
       # that says what is wrong, rather than sixteen minutes into the gate as a lane that
       # cannot start an Agent.
-      - name: The pinned qemu-img the Agent needs
+      # GH_TOKEN because spin-machine is a separate repository: the default token is scoped
+      # to this one, and `gh release download` failing on that reads like a missing tag
+      # rather than a missing permission.
+      - name: The pinned machine (QEMU, qemu-img, the kernel)
         env:
-          QEMU_IMAGE: ghcr.io/${{ github.repository }}/qemu
-        run: task qemu:tools
+          GH_TOKEN: ${{ secrets.SPIN_MACHINE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: task machine
 
       - name: The merge gate (task ci:full)
-        env:
-          QEMU_IMAGE: ghcr.io/${{ github.repository }}/qemu
         run: task ci:full
 
   # The guest lane: the four demos, each booting a real Linux kernel against a qcow2 this
@@ -153,26 +153,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # QEMU *and* qemu-img, with the loader and library closure they were built against.
-      # A bare runner has none of those, which is what ADR-0025 originally answered by
-      # running the lane inside the runtime image; that is not available here, because the
-      # demos start the dev Postgres through Docker and a container job has no daemon.
-      # The wrapper qemu:tools writes solves the same problem from the other side and is
-      # already proven — it is how every lane gets qemu-img today.
-      - name: The pinned QEMU and qemu-img
+      # Both QEMU binaries, qemu-img and the kernel, in one step — they are one artefact.
+      #
+      # This used to be two steps and a paragraph about loaders: the binaries were
+      # dynamically linked against their build image, so a bare runner could not run them
+      # and a wrapper had to carry the loader and the library closure beside them. They are
+      # statically linked now, so an extracted tree runs wherever the kernel does and all
+      # of that is gone.
+      - name: The pinned machine (QEMU, qemu-img, the kernel)
         env:
-          QEMU_IMAGE: ghcr.io/${{ github.repository }}/qemu
-        run: task qemu:tools
-
-      # storage does not build a kernel (ADR-0021). The mirror is the only source on a
-      # machine with no sibling spinbox checkout, and it is resolved by content tag so the
-      # pin is spelled out in exactly one place — the Taskfile — and a moved tag cannot
-      # swap the kernel under a lane that already certified one.
-      - name: The pinned guest kernel
-        run: |
-          set -euo pipefail
-          tag=$(task guest:kernel:tag)
-          task guest:kernel:fetch GUEST_KERNEL_IMAGE=ghcr.io/${{ github.repository }}/guest-kernel:"$tag"
+          GH_TOKEN: ${{ secrets.SPIN_MACHINE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: task machine
 
       # Asserts the lane's inputs before anything boots: the kernel is the one that was
       # pinned, is a PVH ELF, carries the four config options a boot depends on, and the
