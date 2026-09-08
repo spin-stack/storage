@@ -93,11 +93,7 @@ jobs:
       # Named as its own step so a missing or unpublished image fails here, under a name
       # that says what is wrong, rather than sixteen minutes into the gate as a lane that
       # cannot start an Agent.
-      # GH_TOKEN because the fetch uses gh, which wants a token even for a public
-      # repository. The default one is enough — spin-stack/spin-machine is public.
       - name: The pinned machine (QEMU, qemu-img, the kernel)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: task machine
 
       - name: The merge gate (task ci:full)
@@ -160,8 +156,6 @@ jobs:
       # statically linked now, so an extracted tree runs wherever the kernel does and all
       # of that is gone.
       - name: The pinned machine (QEMU, qemu-img, the kernel)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: task machine
 
       # Asserts the lane's inputs before anything boots: the kernel is the one that was
