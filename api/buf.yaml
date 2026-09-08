@@ -1,9 +1,24 @@
+# The lint policy is spin's, copied rather than chosen.
+#
+# spin is the project this schema serves — `api/` is read by spin and by nothing
+# else — and it settled the policy first, in spin/api/proto/buf.yaml. A second
+# opinion about proto style held by a repository spin consumes is not
+# independence, it is drift with a rationale attached.
+#
+# The three exceptions are permissive, so this schema still satisfies the
+# stricter set it was written under; nothing here is loosened by adopting them.
+# What changes is what the next file is judged by, and it is judged the same way
+# on both sides of the seam.
 version: v2
 modules:
   - path: .
 lint:
   use:
     - STANDARD
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
 breaking:
   use:
     - FILE
