@@ -54,13 +54,6 @@ Everything else stays internal and stays free to change. A narrow surface is wha
 format work (a human-review zone) from becoming a compatibility obligation to another
 repository.
 
-### 5. The guest kernel is consumed as an artefact, not as code
-
-storage's test lane needs a Linux guest that can issue FLUSH. spinbox already builds one.
-storage consumes **the built kernel image**, pinned the way `RUSTFS_IMAGE` is pinned — a
-build-time dependency on a binary, reversible by changing a path, with no Go import in
-either direction. storage never builds a kernel.
-
 ## What this does not decide
 
 - **When.** Integration starts when storage serves one volume end to end, not before.

@@ -147,14 +147,14 @@ task db:dev:up|down     # pinned Postgres 18
 task db:plan -- <name>  # DDL for the current schema.sql change → migrations/
 task db:apply PLAN=<f>  # apply a *saved* plan, never a recomputed one
 task db:verify          # schema.sql → empty DB; assert the plan is empty
-task qemu:build / qemu:verify / qemu:version / qemu:tools
-task guest:kernel:fetch / guest:build / guest:verify
+task machine            # fetch the pinned spin-machine release into _output/
+task guest:build / guest:verify
 task demo:stage1        # Stage 1 end to end: a Linux guest boots off our qcow2
 task backend:conformance # §6.1 object-store conformance (blocking per backend)
 ```
 
-QEMU is built by `.github/workflows/qemu.yml` (not the per-push gate), which calls the
-same Taskfile targets a developer runs and publishes `ghcr.io/<owner>/<repo>/qemu:<ver>`.
+QEMU, the guest kernel and the firmware are not built here: `task machine` fetches one
+`spin-stack/spin-machine` release, pinned by version and SHA-256 in `Taskfile.yml`.
 Test object store: RustFS, pinned by digest, via TestContainers (`internal/testinfra`);
 the S3 SDK is confined to `internal/simio/real/s3*.go` behind `objectstore.Store`, and
 nothing else in the tree imports it.

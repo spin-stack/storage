@@ -2,12 +2,8 @@
 #
 # Put a spin-machine release under _output/, from wherever one is available.
 #
-# This repository builds no QEMU and no kernel. It used to do both — a Dockerfile.qemu
-# modelled on another project's, a device list that was byte-for-byte that project's, and a
-# Dockerfile.guest-kernel that built nothing at all and existed only to move somebody
-# else's kernel through a registry and back out. All three are gone: QEMU, the guest kernel
-# and the firmware are one versioned artefact, and this is the only path by which one
-# arrives.
+# This repository builds no QEMU and no kernel. They are one versioned artefact, pinned by
+# version and by SHA-256 in Taskfile.yml, and this is the only path by which one arrives.
 #
 # Two sources, in order:
 #
