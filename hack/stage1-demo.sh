@@ -56,7 +56,7 @@ mkfifo "$DIR/ctl"
 # started yet. Read-write never blocks, and it keeps a writer open so the guest's
 # console does not see EOF the moment the stop word has been sent.
 exec 9<>"$DIR/ctl"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
@@ -95,7 +95,7 @@ wait "$GUEST1" 2>/dev/null || true
 grep -m1 "GUESTINIT-PASS" "$DIR/logs/guest1.log"
 
 say "7. a second boot, reading only"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \

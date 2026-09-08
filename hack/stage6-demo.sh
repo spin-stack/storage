@@ -45,7 +45,7 @@ echo "parent volume $PARENT"
 
 mkfifo "$DIR/ctl"
 exec 9<>"$DIR/ctl"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
@@ -110,7 +110,7 @@ say "7. a second guest boots the clone and reads the FIRST guest's pattern"
 # reports and powers itself off, so waiting for the process is waiting for the answer — and
 # the socket stays free for the guest in step 8, which needs the Agent to reach it.
 CSOCK=$(grep "volume_id=$CLONE" "$DIR/logs/agent1.log" | grep -m1 -o 'qmp_socket=[^ ]*' | cut -d= -f2)
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
@@ -130,7 +130,7 @@ say "8. a guest on the clone, writing a slot of its own so the clone has a commi
 CIMAGE=$(cat "$CPOINTER")
 mkfifo "$DIR/ctl2"
 exec 8<>"$DIR/ctl2"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
@@ -180,7 +180,7 @@ test "$GDEPTH" -ge 3 || die "the grandchild's chain is $GDEPTH layer(s) deep: a 
 echo "    its chain is $GDEPTH layers deep"
 
 say "12. a guest boots the clone of the clone and reads the ORIGINAL guest's slot"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \

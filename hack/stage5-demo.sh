@@ -42,7 +42,7 @@ echo "volume $VOLUME, first layer $(basename "$FIRST")"
 say "3. a Linux guest boots off it and starts writing"
 mkfifo "$DIR/ctl"
 exec 9<>"$DIR/ctl"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \

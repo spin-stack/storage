@@ -19,18 +19,22 @@ vars:
   OUTPUT_DIR: "{{.ROOT_DIR}}/_output"
   # Project-local by default so no task needs root; override for a shared CI cache.
   BUILDKIT_CACHE_DIR: '{{.BUILDKIT_CACHE_DIR | default (printf "%s/.cache/buildkit" .ROOT_DIR)}}'
-  BUILDKIT_CACHE_QEMU: '{{.BUILDKIT_CACHE_DIR}}/storage-qemu'
-  # QEMU is pinned here and in CLAUDE.md; the same version runs in CI and prod.
-  QEMU_VERSION: 11.1.1
-  QEMU_JOBS: '{{.QEMU_JOBS | default 8}}'
-  # BuildKit cache backends. Local by default (a laptop); CI overrides them with
-  # `type=gha` so the build is not duplicated in a workflow file — the Dockerfile and
-  # the flags stay in one place, which is the rule the whole Taskfile exists for.
-  QEMU_CACHE_FROM: '{{.QEMU_CACHE_FROM | default (printf "type=local,src=%s" .BUILDKIT_CACHE_QEMU)}}'
-  QEMU_CACHE_TO: '{{.QEMU_CACHE_TO | default (printf "type=local,dest=%s,mode=max,compression=zstd" .BUILDKIT_CACHE_QEMU)}}'
-  # Where the runtime image is published. Overridden in CI with the GitHub Packages
-  # path; the default is a local tag so `task qemu:image` needs no registry.
-  QEMU_IMAGE: '{{.QEMU_IMAGE | default "spin-stack/storage-qemu"}}'
+  # --- the machine -------------------------------------------------------------------
+  # QEMU, the guest kernel and the firmware are one versioned artefact built in
+  # spin-stack/spin-machine. This repository builds none of them: it used to build a QEMU
+  # from a recipe copied from another project, against a device list that was
+  # byte-for-byte that project's, and it mirrored that project's kernel through a registry
+  # so a machine with no sibling checkout could find one. All of that is what having the
+  # machine in one place replaced.
+  #
+  # Pinned by version and by content, for the reason the kernel used to be pinned by hash:
+  # "which machine did this lane certify?" needs an answer that is not "whatever was
+  # published that day". Bump both together and say in the commit why the machine changed.
+  SPIN_MACHINE_VERSION: '{{.SPIN_MACHINE_VERSION | default "v20260907.01"}}'
+  SPIN_MACHINE_SHA256: '{{.SPIN_MACHINE_SHA256 | default "72db5f9789a37370acaac25bf0aab2490f9b0fa0ee846a65f80651408bb0da47"}}'
+  # A sibling checkout that has already built one wins over the published release.
+  SPIN_MACHINE_DIR: '{{.SPIN_MACHINE_DIR | default "../spin-machine"}}'
+
   # Object-store backend under test (§6.1 conformance suite). Pinned by digest so a
   # re-tagged image cannot silently change what the suite certified.
   RUSTFS_IMAGE: "rustfs/rustfs:latest@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c"
@@ -47,22 +51,8 @@ vars:
   POSTGRES_IMAGE: postgres:18-alpine
   DEVDB_CONTAINER: spin-storage-devdb
   DEVDB_PORT: '{{.DEVDB_PORT | default "55432"}}'
-  # --- the guest kernel (ADR-0021, ADR-0022) ---
-  # storage does not build a kernel: it consumes spinbox's artefact, never its code.
-  # The lane reads it from ONE canonical path, and `task guest:kernel:fetch` puts it there
-  # from whichever source is available. Nothing else resolves a kernel path.
+  # The guest kernel, at the one path the lane reads. Put there by `task machine`.
   GUEST_KERNEL: '{{.OUTPUT_DIR}}/guest/vmlinux'
-  # Pinned by content, the same rule as RUSTFS_IMAGE: "which kernel did the lane
-  # certify" has to have an answer that is not "whatever was in _output that day".
-  # Bump deliberately with `task guest:kernel:pin` and say in the commit why it moved.
-  GUEST_KERNEL_VERSION: 7.2.1
-  GUEST_KERNEL_SHA256: bd0ff2ed66f1837d1f7d26251c61b300d43810c8a320cfc02fd62179821a5c29
-  # Source 1: a sibling spinbox checkout that has already built one (no network).
-  SPINBOX_KERNEL: '{{.SPINBOX_KERNEL | default "../spinbox/_output/spinbox-kernel-x86_64"}}'
-  # Source 2: the mirror. Unset by default — nothing is published yet — so the failure
-  # of `task guest:kernel:fetch` on a machine with no spinbox checkout names it as missing
-  # rather than pointing at a registry path that answers 404.
-  GUEST_KERNEL_IMAGE: '{{.GUEST_KERNEL_IMAGE | default ""}}'
   # Target database for db:plan / db:apply — the local development database by
   # default. Point DB_* at a real one to plan or apply against it; the password
   # comes from the environment (PGPASSWORD), never from a var in this file.
@@ -100,7 +90,7 @@ includes:
   tools: {taskfile: ./taskfiles/tools.yml, flatten: true}
   generate: {taskfile: ./taskfiles/generate.yml, flatten: true}
   db: {taskfile: ./taskfiles/db.yml, flatten: true}
-  qemu: {taskfile: ./taskfiles/qemu.yml, flatten: true}
+  machine: {taskfile: ./taskfiles/machine.yml, flatten: true}
   guest: {taskfile: ./taskfiles/guest.yml, flatten: true}
   demo: {taskfile: ./taskfiles/demo.yml, flatten: true}
   backend: {taskfile: ./taskfiles/backend.yml, flatten: true}
@@ -144,10 +134,9 @@ tasks:
       as processes, against a real Postgres 18 and the pinned RustFS. It is the only
       lane that can see the two binaries disagree — about a key file, about a flag
       nobody passes — because everything else drives Go types in-process.
-    # qemu:tools and not qemu:build: the Agent creates every chain by running the pinned
-    # qemu-img, so this lane cannot start one without it, and compiling QEMU here would
-    # put tens of minutes into the merge gate.
-    deps: [build:cmd, qemu:tools]
+    # The Agent creates and inspects every qcow2 chain by running the pinned qemu-img — v6
+    # forbids a parser of our own — so this lane cannot start one without a machine.
+    deps: [build:cmd, machine]
     cmds:
       - RUSTFS_IMAGE={{.RUSTFS_IMAGE}} go test -tags e2e -count=1 -timeout 15m ./integration/e2e/...
 
@@ -157,7 +146,7 @@ tasks:
       to S3 rather than to a container. Needs credentials, and creates one bucket per test
       that it purges on the way out. Not in ci:full — the merge gate must not need a cloud
       account.
-    deps: [build:cmd, qemu:tools]
+    deps: [build:cmd, machine]
     cmds:
       - SPIN_OBJECT_STORE=aws go test -tags e2e -count=1 -timeout 30m ./integration/e2e/...
 

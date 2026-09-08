@@ -1,0 +1,40 @@
+version: "3"
+
+# The machine this repository runs guests on: QEMU, the guest kernel, the firmware.
+#
+# None of it is built here. It used to be — a Dockerfile.qemu modelled on another
+# project's, a device list that was byte-for-byte that project's, and a
+# Dockerfile.guest-kernel that built nothing and existed only to move somebody else's
+# kernel through a registry and back out (ADR-0022). All of that has one home now, and
+# `task machine` is the only path by which a machine arrives.
+
+tasks:
+
+  machine:
+    desc: >-
+      Put the pinned machine under _output/ — both qemu-system binaries, qemu-img and the
+      guest kernel — from a sibling spin-machine checkout or its published release.
+      Idempotent.
+    status:
+      # "it runs", not "the file is there". Those came apart once already, when the
+      # binaries were dynamically linked and an extracted one died at exit 127 in whatever
+      # lane needed it first. They are static now, and this still asks.
+      - "{{.OUTPUT_DIR}}/bin/qemu-img --version"
+      - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64 --version"
+      - "{{.OUTPUT_DIR}}/bin/qemu-system-x86_64-tcg --version"
+      - "test -f {{.OUTPUT_DIR}}/guest/vmlinux"
+      - "test -f {{.OUTPUT_DIR}}/share/spin-stack/qemu/pvh.bin"
+    cmds:
+      - |
+        set -euo pipefail
+        SPIN_MACHINE_VERSION="{{.SPIN_MACHINE_VERSION}}" \
+        SPIN_MACHINE_SHA256="{{.SPIN_MACHINE_SHA256}}" \
+        SPIN_MACHINE_DIR="{{.SPIN_MACHINE_DIR}}" \
+        OUTPUT_DIR="{{.OUTPUT_DIR}}" \
+          bash hack/spin-machine
+
+  machine:version:
+    desc: Print the pinned machine version (the single source of truth for CI).
+    silent: true
+    cmds:
+      - echo "{{.SPIN_MACHINE_VERSION}}"

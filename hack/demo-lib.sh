@@ -29,6 +29,11 @@ OUT=$ROOT/_output
 # Two binaries, and which one runs is the same decision as which accelerator: the
 # production build has no TCG compiled in at all, so it is not a binary a machine without
 # KVM can run slowly — it is one that will not start. See ACCEL below.
+# Every demo passes `-vga none` as well as `-display none`. The second only says not to
+# open a window; the device is still created, and this machine's QEMU ships no
+# vgabios-stdvga.bin for it — it has no display adapter, on purpose. Without the flag a
+# guest dies at start-up with `failed to find romfile "vgabios-stdvga.bin"`, which reads
+# like a missing firmware file rather than a device nobody wanted.
 QEMU=$OUT/bin/qemu-system-x86_64
 QEMU_TCG=$OUT/bin/qemu-system-x86_64-tcg
 QEMU_IMG=$OUT/bin/qemu-img
@@ -71,9 +76,9 @@ say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 
 need() { test -x "$1" || test -f "$1" || die "missing $1 — run: $2"; }
-need "$QEMU"      "task qemu:build"
-need "$QEMU_IMG"  "task qemu:build"
-need "$KERNEL"    "task guest:kernel:fetch"
+need "$QEMU"      "task machine"
+need "$QEMU_IMG"  "task machine"
+need "$KERNEL"    "task machine"
 need "$INITRAMFS" "task guest:build"
 need "$CP"        "task build:cmd"
 need "$AGENT"     "task build:cmd"

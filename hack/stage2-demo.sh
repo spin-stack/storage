@@ -63,7 +63,7 @@ mkfifo "$DIR/ctl"
 # Read-write, so opening does not block on a QEMU that has not started yet and the
 # guest's console does not see EOF the moment the stop word has been sent.
 exec 9<>"$DIR/ctl"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \
@@ -137,7 +137,7 @@ done
 echo "    qemu-img check: all $LAYERS layers sound"
 
 say "8. a second boot, reading only, through the whole chain"
-"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -monitor none -no-reboot \
+"$QEMU" -machine "q35,accel=$ACCEL" -m 512 -smp 1 -display none -vga none -monitor none -no-reboot \
   -net none \
   -L "$OUT/share/spin-stack/qemu" \
   -kernel "$KERNEL" -initrd "$INITRAMFS" \

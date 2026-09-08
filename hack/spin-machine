@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+#
+# Put a spin-machine release under _output/, from wherever one is available.
+#
+# This repository builds no QEMU and no kernel. It used to do both — a Dockerfile.qemu
+# modelled on another project's, a device list that was byte-for-byte that project's, and a
+# Dockerfile.guest-kernel that built nothing at all and existed only to move somebody
+# else's kernel through a registry and back out. All three are gone: QEMU, the guest kernel
+# and the firmware are one versioned artefact, and this is the only path by which one
+# arrives.
+#
+# Two sources, in order:
+#
+#   1. a sibling spin-machine checkout that has already built one. No network.
+#   2. the published release for the pinned version, fetched with `gh`.
+#
+# Pinned by version and by content, for the same reason the kernel used to be pinned by
+# hash here: "which machine did this lane certify?" cannot be answerable only as "whatever
+# was published that day".
+set -euo pipefail
+
+VERSION="${SPIN_MACHINE_VERSION:?SPIN_MACHINE_VERSION must be set}"
+SHA256="${SPIN_MACHINE_SHA256:-}"
+REPO="${SPIN_MACHINE_REPO:-spin-stack/spin-machine}"
+SIBLING="${SPIN_MACHINE_DIR:-../spin-machine}"
+OUTPUT_DIR="${OUTPUT_DIR:-_output}"
+CACHE="${SPIN_MACHINE_CACHE:-${OUTPUT_DIR}/machine-cache}"
+
+ARCH="$(uname -m)"
+NAME="spin-machine-${VERSION}-linux-${ARCH}"
+
+# What this repository takes, and where it puts it.
+#
+# Both qemu-system binaries: the Agent runs on hosts with /dev/kvm and CI does not, and the
+# split between a binary that refuses to emulate and one that can is the whole reason there
+# are two. qemu-img because every qcow2 chain is created and inspected by running it — v6
+# forbids a parser of our own. The kernel goes to _output/guest/vmlinux, which is the one
+# path the guest lane reads.
+#
+# Not taken: the base image. Nothing here boots from it.
+place() {
+  local root="$1" missing=0
+  copy() {
+    local src="${root}/$1" dest="${OUTPUT_DIR}/$2"
+    if [ ! -f "${src}" ]; then
+      echo "  missing from the machine: $1" >&2
+      missing=1
+      return 0
+    fi
+    mkdir -p "$(dirname "${dest}")"
+    rm -f "${dest}" 2>/dev/null || true
+    install -m "$([ -x "${src}" ] && echo 0755 || echo 0644)" "${src}" "${dest}"
+  }
+
+  copy bin/qemu-system-x86_64     bin/qemu-system-x86_64
+  copy bin/qemu-system-x86_64-tcg bin/qemu-system-x86_64-tcg
+  copy bin/qemu-img               bin/qemu-img
+  copy kernel/vmlinux             guest/vmlinux
+  for f in bios.bin bios-256k.bin pvh.bin kvmvapic.bin efi-virtio.rom; do
+    copy "qemu/${f}" "share/spin-stack/qemu/${f}"
+  done
+
+  [ "${missing}" -eq 0 ] || {
+    echo "👹 that release does not contain a whole machine" >&2
+    exit 1
+  }
+}
+
+# have_sibling only decides; it does no work.
+#
+# The decision and the work are separate because writing it as one `||` expression — try
+# the sibling, fall back to the release — turns off errexit for everything inside the
+# left-hand function, so a copy that failed halfway reports success.
+have_sibling() {
+  local out="${SIBLING}/_output"
+  [ -f "${out}/bin/qemu-system-x86_64" ] && [ -f "${out}/vmlinux" ]
+}
+
+from_sibling() {
+  local out="${SIBLING}/_output" staged
+  echo "Using the machine built in ${SIBLING}"
+  staged="$(mktemp -d)"
+  trap 'rm -rf "${staged}"' RETURN
+  mkdir -p "${staged}/bin" "${staged}/kernel" "${staged}/qemu"
+  cp "${out}/bin/qemu-system-x86_64" "${out}/bin/qemu-system-x86_64-tcg" \
+     "${out}/bin/qemu-img" "${staged}/bin/"
+  cp "${out}/vmlinux" "${staged}/kernel/vmlinux"
+  cp "${out}"/share/spin-stack/qemu/* "${staged}/qemu/"
+  place "${staged}"
+}
+
+from_release() {
+  local tarball="${CACHE}/${NAME}.tar.gz" unpacked
+  mkdir -p "${CACHE}"
+
+  if [ ! -f "${tarball}" ]; then
+    # curl and not `gh`, now that spin-machine is public: a release asset has a plain URL
+    # and needs no authentication at all. `gh` needs a token even to read a public
+    # repository, which meant every job that reaches this — not only the one somebody
+    # remembered — had to carry GH_TOKEN, and the ones that did not failed with gh's
+    # advice about setting it rather than with anything about the machine.
+    #
+    # --fail so a 404 is an error instead of a tarball full of HTML; --location because
+    # the asset redirects to object storage; --retry because this is the one step here
+    # that depends on somebody else's network.
+    echo "Fetching spin-machine ${VERSION}"
+    curl --fail --location --show-error --silent \
+         --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 30 \
+         --output "${tarball}.part" \
+         "https://github.com/${REPO}/releases/download/${VERSION}/${NAME}.tar.gz" || {
+      echo "👹 could not fetch ${NAME}.tar.gz from ${REPO} ${VERSION}" >&2
+      rm -f "${tarball}.part"
+      exit 1
+    }
+    # Renamed only once it is whole: an interrupted download left in place is a cached
+    # tarball that every later run would reuse and every later run would reject.
+    mv "${tarball}.part" "${tarball}"
+  fi
+
+  # Checked on every run and not only after a download: the tarball is cached, so the copy
+  # being unpacked today may have arrived weeks ago.
+  if [ -n "${SHA256}" ]; then
+    echo "${SHA256}  ${tarball}" | sha256sum -c - >/dev/null || {
+      echo "👹 ${tarball} is not the release SPIN_MACHINE_SHA256 pins." >&2
+      exit 1
+    }
+  else
+    echo "  warning: SPIN_MACHINE_SHA256 is unset, so this release is unverified" >&2
+  fi
+
+  unpacked="$(mktemp -d)"
+  trap 'rm -rf "${unpacked}"' RETURN
+  tar -xzf "${tarball}" -C "${unpacked}"
+  place "${unpacked}/${NAME}/usr/share/spin-stack"
+}
+
+if have_sibling; then
+  from_sibling
+else
+  from_release
+fi
+
+# Run, not just present. The binaries are statically linked, so a tree extracted here works
+# here — which was not true when this repository built its own QEMU and had to carry the
+# build image's loader and libraries beside it in order to run anything at all.
+for b in qemu-system-x86_64 qemu-system-x86_64-tcg qemu-img; do
+  "${OUTPUT_DIR}/bin/${b}" --version >/dev/null || {
+    echo "👹 ${OUTPUT_DIR}/bin/${b} does not run on this host" >&2
+    exit 1
+  }
+done
+! "${OUTPUT_DIR}/bin/qemu-system-x86_64" -accel help | grep -qx tcg || {
+  echo "👹 qemu-system-x86_64 can emulate: a host with no /dev/kvm would run at a tenth of the speed" >&2
+  exit 1
+}
+"${OUTPUT_DIR}/bin/qemu-system-x86_64-tcg" -accel help | grep -qx tcg || {
+  echo "👹 qemu-system-x86_64-tcg cannot emulate, so a runner without /dev/kvm has nothing to boot with" >&2
+  exit 1
+}
+
+echo "✓ machine ${VERSION}: qemu $("${OUTPUT_DIR}/bin/qemu-img" --version | head -1 | awk '{print $3}'), kernel $(stat -c%s "${OUTPUT_DIR}/guest/vmlinux") bytes"
