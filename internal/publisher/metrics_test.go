@@ -53,7 +53,7 @@ func TestPublishRecordsWhatLeftTheHost(t *testing.T) {
 	if sent[labels] != stored.Size {
 		t.Errorf("layer_upload_bytes_total = %d, want %d", sent[labels], stored.Size)
 	}
-	// The plaintext is the number this must *not* be: it is what internal/qcow measures
+	// The plaintext is the number this must *not* be: it is what qcow measures
 	// locally, and reporting it here would understate the bucket by a tag per frame.
 	if stored.Size == int64(len(w.plain)) {
 		t.Fatal("the sealed object is the same length as the plaintext; this test proves nothing")

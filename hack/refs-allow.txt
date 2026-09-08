@@ -36,7 +36,6 @@ hack/analyzers/simulable/simulable.go	internal/testinfradriver  # deliberately h
 docs/plan/DECISIONS/ADR-0026-v1-accepts-session-rpo.md	internal/wal  # an ADR records the decision as it was taken; the package it names is what the decision was about
 
 # --- other repositories -----------------------------------------------------------------
-internal/qcow/chain.go	cmd/runner  # spin's runner, which launches the VMs (ADR-0021). Not ours to resolve.
 docs/plan/DECISIONS/ADR-0021-integration-with-spin.md	cmd/cli  # spin's operator CLI, the reason storage ships no volctl
 
 # --- a regex that reads as a path --------------------------------------------------------

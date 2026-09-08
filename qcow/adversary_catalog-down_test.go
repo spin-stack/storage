@@ -12,8 +12,8 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/api/gen/spin/storage/v1/storagev1connect"
 	"github.com/spin-stack/storage/internal/agent"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/disk"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // catalogHost is this host's fleet identity: a real v7 id, because Config.Validate

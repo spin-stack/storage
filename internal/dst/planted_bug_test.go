@@ -292,7 +292,7 @@ func TestSingleWriterCheckerCatchesAdvisoryPreconditions(t *testing.T) {
 //
 // Each was written, run, and watched go red before the line that closes it existed. The
 // second is the sharp one and it is still checkable in one edit: delete the
-// `keep[LayerIDOfImage(open.Path)]` line in internal/qcow/sweep.go and
+// `keep[LayerIDOfImage(open.Path)]` line in qcow/sweep.go and
 // `sweepScenario(true)` removes the layer a guest is writing into, which is how that line
 // came to be there.
 //

@@ -9,7 +9,7 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // rotateOnce runs the cycle that seals `tip` and returns the layer the guest moved on

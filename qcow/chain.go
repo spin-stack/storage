@@ -1,20 +1,33 @@
 // Package qcow owns a volume's local qcow2 chain: where it lives, how it is created,
 // how an existing one is opened and checked, and which file is the tip QEMU writes to.
 //
+// It is public because it spans two repositories. ADR-0021 §4 fixed the shape of this
+// surface and left its name to settle when a consumer existed; a consumer exists, and
+// this is it. Everything under internal/ stays free to change.
+//
 // This process does not launch QEMU. QEMU is the data path (v6 §4) and the Agent only
-// controls it over QMP; spin's `cmd/runner` runs the VMs (ADR-0021), and launching them
-// here would give this daemon a second responsibility — VM supervision, with the process
-// lifetime and crash policy that come with it — which the pivot to qcow2 exists to shed.
+// controls it over QMP; launching VMs here would give this daemon a second
+// responsibility — VM supervision, with the process lifetime and crash policy that come
+// with it — which the pivot to qcow2 exists to shed.
 //
 // # The contract with whoever does launch it
 //
 // Two paths, and nothing else. Whoever boots the VM must give QEMU:
 //
-//   - the image at ActiveImage(root, volumeID) as the disk it writes to, and
-//   - a QMP socket at QMPSocket(root, volumeID), server side.
+//   - the qcow2 named by the one line in the file at ActivePointer(root, volumeID) as
+//     the disk it writes to — the pointer and not a path of the launcher's own, because
+//     rotation replaces the tip under a running VM, and
+//   - a QMP socket at QMPSocket(root, volumeID), server side:
+//     -qmp unix:<path>,server=on,wait=off.
 //
 // Both are derived from the volume's directory, so the launcher needs only the data
-// directory and the volume id. It is small on purpose: it spans two repositories.
+// directory and the volume id.
+//
+// One prohibition comes with them: **the launcher must leave qcow2 file locking on**,
+// which is QEMU's default and which nothing should turn off. It is what makes a running
+// guest visible to a tool that cannot ask QEMU — see writeLockRefusal, where the
+// measurement is. With locking off this package reads a live volume as an idle one and
+// nothing here can detect that.
 //
 // # The rule about offline tools
 //

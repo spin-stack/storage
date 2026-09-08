@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // successorCommit is what the object store's HEAD names after another host took this

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // The rotation seam, killed at the two points either side of the QMP command.

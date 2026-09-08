@@ -48,7 +48,7 @@ internal/lifecycle.RefusalNames     # compared with volumes.refusal's CHECK list
 # --- the observability test provider ----------------------------------------------------
 # obs.NewTestProvider is why every metric in this repository is proven by reading the
 # collected value rather than by checking that a recorder was called. It cannot live in a
-# _test.go file: internal/agent, internal/qcow and internal/obs's own tests all import it.
+# _test.go file: internal/agent, qcow and internal/obs's own tests all import it.
 internal/obs.NewTestProvider          # the in-memory meter provider tests collect from; production wires the OTLP one
 internal/obs.Provider.CollectedMetrics # reading it is how a test asserts on what left the process
 internal/obs.Provider.GaugeValues      # same, for gauges
@@ -82,4 +82,4 @@ package internal/simio/network  # harness-only: the DST partition scenario drive
 # it agreeing with the scenario and with nothing else, which is the shape a checker cannot
 # catch — so the production function is exported and a binary reaches it through
 # Manager.Apply.
-internal/qcow.Sweep  # driven by internal/dst; production reaches the same code through Manager.Apply
+qcow.Sweep  # driven by internal/dst; production reaches the same code through Manager.Apply

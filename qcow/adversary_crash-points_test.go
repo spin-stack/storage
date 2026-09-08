@@ -10,8 +10,8 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/agent"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // These are adversarial tests. Each one puts the crash exactly where the production

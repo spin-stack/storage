@@ -15,8 +15,8 @@ import (
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/commit"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // A chain of four: three published layers and the tip the guest writes to. The sizes are

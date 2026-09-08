@@ -3,7 +3,7 @@
 //
 // # Why there is a client here at all
 //
-// The Agent does not run QEMU (see internal/qcow): it prepares a volume's chain and has no
+// The Agent does not run QEMU (see qcow): it prepares a volume's chain and has no
 // other way to know whether anything is using it. QMP is the only channel that answers, and
 // v6 §7 makes it the mandatory one — flush, snapshot, switch to the new tip, and confirm QEMU
 // is using it.

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // local_disk_bytes is what ONE volume's chain occupies, not what the host holds.

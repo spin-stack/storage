@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // otherVol is a second volume placed on the same host, as two volumes on one Agent are.

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // Two generations of ancestry, spelled out the way the Control Plane sends them: oldest

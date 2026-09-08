@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/spin-stack/storage/internal/commit"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // fakeRunner stands in for `qemu-img`. It records every argv it was handed, which is

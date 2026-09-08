@@ -7,8 +7,8 @@ import (
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/ids"
 	"github.com/spin-stack/storage/internal/obs"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // The §28 recovery numbers. Both are asserted against what the bucket says the chain

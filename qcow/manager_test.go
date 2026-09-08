@@ -13,8 +13,8 @@ import (
 	"github.com/spin-stack/storage/internal/agent"
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/sim"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // scriptConn is a QMP endpoint whose answers were decided in advance. The exchange is

@@ -15,10 +15,10 @@ import (
 	storagev1 "github.com/spin-stack/storage/api/gen/spin/storage/v1"
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/simio/sim"
 	"github.com/spin-stack/storage/internal/testinfra"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // The volume this lane collapses. Small, because every layer of it is written in full.
@@ -104,7 +104,7 @@ func TestACompactedRootReadsBackAsTheChainItReplaced(t *testing.T) {
 		Disk:  sim.NewDisk(),
 		// No VM: the QMP socket does not exist, so the volume is unattached and the
 		// collapse can finish in one cycle. A rebase under a running guest is what v6 §5
-		// forbids, and internal/qcow's own tests hold that end.
+		// forbids, and qcow's own tests hold that end.
 		Runner: real.NewRunner(), Paths: files, Dialer: real.NewUnixDialer(),
 		Recovery: noHistory{}, Publisher: pub,
 	})

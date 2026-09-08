@@ -8,7 +8,7 @@
 //
 // The data path is QEMU's. This process prepares each volume's local qcow2 chain, hands the
 // paths to whoever launches the VM, and speaks QMP to the QEMU that ends up there — it does
-// not start one; internal/qcow carries the two-path contract. So: claim the data directory,
+// not start one; qcow carries the two-path contract. So: claim the data directory,
 // read the key, register, heartbeat, hold a lease, learn which volumes to serve, prepare a
 // chain for each, and report what it saw.
 package main
@@ -32,10 +32,10 @@ import (
 	"github.com/spin-stack/storage/internal/descriptor"
 	"github.com/spin-stack/storage/internal/obs"
 	"github.com/spin-stack/storage/internal/publisher"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
 	"github.com/spin-stack/storage/internal/simio/real"
 	"github.com/spin-stack/storage/internal/storecfg"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // version is the build identity the Agent reports. Overridden at link time with

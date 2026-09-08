@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/recovery"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // TestAGenerationNamingNoCommitIsRefusedRatherThanIndexed.

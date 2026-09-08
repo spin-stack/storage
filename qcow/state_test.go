@@ -14,7 +14,7 @@ import (
 
 	"github.com/spin-stack/storage/internal/framed"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // statePaths is the little filesystem ReadState and WriteState need: names, and the

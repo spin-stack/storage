@@ -9,8 +9,8 @@ import (
 	"github.com/spin-stack/storage/internal/commit"
 	"github.com/spin-stack/storage/internal/crypto"
 	"github.com/spin-stack/storage/internal/ids"
-	"github.com/spin-stack/storage/internal/qcow"
 	"github.com/spin-stack/storage/internal/simio/objectstore"
+	"github.com/spin-stack/storage/qcow"
 )
 
 // reconcileScenarios is the half of the reconciler a simulation can reach.
@@ -19,7 +19,7 @@ import (
 // chain, ask a live QEMU which file it has open, snapshot a new overlay over the tip —
 // is another process's work, and a fake for it here would be a second implementation of
 // qemu-img: a model of a program, agreeing with the scenario and with nothing else. That
-// half is tested against the real binary, in internal/qcow's adversary lane
+// half is tested against the real binary, in qcow's adversary lane
 // (adversary_reconcile, adversary_crash-points, adversary_qcow-restart) and end to end by
 // `task demo:stage2`.
 //
@@ -61,7 +61,7 @@ const reconcileVirtualSize = 1 << 30
 // coming up and the power failure is acknowledged and not persisted, which is what a
 // device with a volatile write cache and no flush does; the power failure then takes them
 // all. Deliberately not from the very first write: a state.json that was never durable at
-// all comes back zero-length, and ReadState refuses that outright (internal/qcow's state
+// all comes back zero-length, and ReadState refuses that outright (qcow's state
 // table covers it). What this reaches is the dangerous shape instead — a record that is
 // framed, digest-sound, believable, and one power failure out of date.
 func reconcileScenario(volatileCache bool) Scenario {
